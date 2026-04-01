@@ -1,0 +1,21 @@
+# Repository Guidance
+- This repository is currently docs-first; the checked-in workspace today is spec and contract Markdown rather than an app/package tree.
+- For JS/TS implementation work, assume Bun + TypeScript with Vitest; prefer Bun-native scripts and commands over npm/yarn or Jest.
+- When a package or workspace is present, default verification commands are `bun run build`, `bun test`, and `bunx vitest run <path>` or `bunx vitest run -t "<name>"`; if the touched workspace defines different scripts, follow its local `package.json`.
+- Useful repo commands: `rg --files -uu` to inspect files, `rg -n "pattern" *.md` to trace terminology and contracts.
+- Primary artifacts are versioned spec docs: `agen-spec-v1.md` (historical v1.2 baseline), `agen-spec-v1.3.md`, and `agen-spec-v1.4.md`.
+- Primary implementation-facing docs are `agen-contracts-v1.3.md`, `agen-contracts-v1.4.md`, and the transitional `agen-contracts-v1.4-multi-agent.md` delta.
+- Runtime behavior for hierarchical delegation is sketched in `agen-runtime-v1.4-algorithms.md`.
+- Treat `agen-spec-v1.4.md` as the current product source of truth unless a task explicitly targets an older version.
+- Treat `agen-contracts-v1.4.md` as the current contract/schema source of truth; it defines internal APIs such as `AdaptiveAgentOptions`, `RunStore`, `PlanStore`, `ToolDefinition`, `ModelAdapter`, and run hierarchy fields.
+- The documented database is PostgreSQL; the current contract describes `agent_runs`, `agent_events`, `run_snapshots`, `plans`, `plan_steps`, and `plan_executions`.
+- Core architecture in the docs is split into `@adaptive-agent/core`, `@adaptive-agent/store-postgres`, and `@adaptive-agent/dashboard-example`.
+- Preserve the central design boundary: `Tool` is the only first-class executable primitive; plans are separate artifacts; v1.4 delegation is modeled as synthetic `delegate.*` tools plus child runs.
+- Keep terminology precise and consistent: use `run`, `plan`, `plan execution`, `delegate profile`, `child run`, and `replan.required` exactly as defined.
+- Do not reintroduce deferred concepts casually: skills runtime, DAG execution, parallel child runs, child messaging, or chain-of-thought persistence are out of scope unless the task explicitly changes the spec.
+- Prefer additive edits over rewriting history: update the newest v1.4 docs, and only touch v1.3/v1.2 docs when the task is about comparison, migration, or historical context.
+- Keep edits ASCII and Markdown-first; use short sections, flat bullets, fenced `ts`/`sql` blocks, and backticks for identifiers and event names.
+- In TypeScript examples, prefer explicit interfaces/types, Bun + TypeScript assumptions, named concepts, and avoid `any` unless the spec genuinely leaves a type open.
+- In schema examples, preserve deterministic and resumability semantics: event log + snapshots, leases/heartbeats, optimistic versioning, and explicit compatibility checks.
+- Call out breaking changes clearly when moving between versions, especially around public API, persistence, event types, or replay behavior.
+- No Cursor, Claude, Windsurf, Cline, Goose, or Copilot rule files are present in this repository at the time this file was created.
