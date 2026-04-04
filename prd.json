@@ -30,8 +30,8 @@
         "Typecheck passes"
       ],
       "priority": 2,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Expanded the CLI with command-specific help, documented file/directory/glob inputs, and a working analyze flow that summarizes discovered files, parsed events, malformed lines, and diagnostics."
     },
     {
       "id": "US-003",
@@ -45,8 +45,8 @@
         "Typecheck passes"
       ],
       "priority": 3,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Added input discovery for direct files, recursive directories, and glob patterns with deterministic ordering plus non-fatal diagnostics for missing or unreadable paths."
     },
     {
       "id": "US-004",
@@ -61,8 +61,8 @@
         "Typecheck passes"
       ],
       "priority": 4,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Implemented a streaming NDJSON parser over file streams and readline that preserves source file/line metadata and reports malformed lines as diagnostics with parser tests."
     },
     {
       "id": "US-005",

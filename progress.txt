@@ -1,5 +1,6 @@
 ## Codebase Patterns
 - Keep new workspace TypeScript configs self-contained; this repo does not currently install `bun-types`, so package-level typecheck should not assume those globals exist.
+- When a workspace starts importing Node built-ins directly, add `@types/node` and keep any Bun-only globals limited to the specific shims still needed, such as `import.meta.main`.
 
 ## 2026-04-04 19:23:30 +0530 - US-001
 Thread: https://ampcode.com/threads/T-019d582c-894a-7338-9b55-494b9c388f89
@@ -11,4 +12,34 @@ Thread: https://ampcode.com/threads/T-019d582c-894a-7338-9b55-494b9c388f89
   - New workspaces can be added under `packages/*` without changing the root workspace list.
   - `bun test` works in package-local workspaces even when package typecheck excludes `*.test.ts` files.
   - The first iteration should avoid depending on Bun-specific ambient types unless the dependency is explicitly installed.
+---
+
+## 2026-04-04T14:00:07.932Z - US-002
+Thread: https://ampcode.com/threads/T-019d58c6-302d-77a5-a127-7e059eb9d32b
+- Expanded the `analysis analyze` command with dedicated help output, documented file/directory/glob inputs, and an integrated summary that reports inputs, matched files, parsed events, malformed lines, and diagnostics.
+- Added CLI coverage for help text and end-to-end analysis output.
+- Files changed: `prd.json`, `progress.txt`, `bun.lock`, `packages/analysis/package.json`, `packages/analysis/tsconfig.json`, `packages/analysis/src/cli.ts`, `packages/analysis/src/index.ts`, `packages/analysis/src/cli.test.ts`, `packages/analysis/src/globals.d.ts`, `packages/analysis/src/discovery.ts`, `packages/analysis/src/discovery.test.ts`, `packages/analysis/src/parser.ts`, `packages/analysis/src/parser.test.ts`
+- **Learnings for future iterations:**
+  - Keep the CLI thin and push reusable behavior into exported library modules so future report modes can reuse the same discovery and parsing pipeline.
+  - Command help is easiest to keep consistent when the top-level and subcommand help are rendered by separate formatters.
+---
+
+## 2026-04-04T14:00:07.932Z - US-003
+Thread: https://ampcode.com/threads/T-019d58c6-302d-77a5-a127-7e059eb9d32b
+- Implemented deterministic input discovery for literal files, recursive directories, and glob patterns with deduped file lists and preserved discovery provenance.
+- Added non-fatal diagnostics for missing or unreadable inputs so one bad path does not abort the rest of the analysis.
+- Files changed: `prd.json`, `progress.txt`, `bun.lock`, `packages/analysis/package.json`, `packages/analysis/src/discovery.ts`, `packages/analysis/src/discovery.test.ts`, `packages/analysis/src/cli.ts`, `packages/analysis/src/cli.test.ts`, `packages/analysis/src/index.ts`
+- **Learnings for future iterations:**
+  - Preserve both a deduped file set and per-input discovery provenance; later reporting work will need stable file lists while still knowing whether a file came from a literal path, directory walk, or glob.
+  - Sort discovered paths before returning them so tests and downstream reports stay deterministic.
+---
+
+## 2026-04-04T14:00:07.932Z - US-004
+Thread: https://ampcode.com/threads/T-019d58c6-302d-77a5-a127-7e059eb9d32b
+- Added a streaming NDJSON parser built on file streams plus `readline`, returning raw event objects with source file and line metadata.
+- Counted malformed lines separately from parsed events and surfaced each malformed line as a parser diagnostic instead of aborting the file.
+- Files changed: `prd.json`, `progress.txt`, `packages/analysis/src/parser.ts`, `packages/analysis/src/parser.test.ts`, `packages/analysis/src/cli.ts`, `packages/analysis/src/cli.test.ts`, `packages/analysis/src/index.ts`
+- **Learnings for future iterations:**
+  - Skip blank lines during NDJSON parsing so mixed log files remain parseable without inflating malformed-line counts.
+  - Preserve source file and line metadata at parse time; later normalization and drill-down stories will need it for diagnostics and deep inspection views.
 ---
