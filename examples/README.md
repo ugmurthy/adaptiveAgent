@@ -14,11 +14,14 @@ Edit `.env` and fill in the keys you need:
 |----------|----------|---------|
 | `OPENROUTER_API_KEY` | If using OpenRouter | [Get key →](https://openrouter.ai/keys) |
 | `MISTRAL_API_KEY` | If using Mistral | [Get key →](https://console.mistral.ai/api-keys) |
+| `MESH_API_KEY` | If using Mesh | [Docs →](https://docs.meshapi.ai/) |
 | `WEB_SEARCH_PROVIDER` | Optional | Set to `brave` or `duckduckgo` for `web_search` |
 | `BRAVE_SEARCH_API_KEY` | If `WEB_SEARCH_PROVIDER=brave` | [Get key →](https://api.search.brave.com/app/keys) |
 | `AGENT_MAX_STEPS` | Optional | Override the sample agent's max steps; when unset it uses the core default of 30 |
 | `WEB_TOOL_TIMEOUT_MS` | Optional | Override the timeout for `web_search` and `read_web_page` in milliseconds |
 | `MODEL_TIMEOUT_MS` | Optional | Override the agent-side timeout for each model turn in milliseconds; set to `0` to disable |
+
+Mesh uses the OpenAI-compatible gateway documented at `docs.meshapi.ai` and defaults to `https://api.meshapi.ai/v1`, so only the base URL and API key differ from a standard OpenAI client setup.
 
 **Ollama requires no API key** — just have it running locally (`ollama serve`). The example now relies on the runtime's longer default model timeout for `ollama` because local inference can take longer.
 
@@ -49,6 +52,9 @@ PROVIDER=openrouter OPENROUTER_API_KEY=sk-or-... bun run examples/run-agent.ts
 
 # Use Mistral
 PROVIDER=mistral MISTRAL_API_KEY=... bun run examples/run-agent.ts
+
+# Use Mesh
+PROVIDER=mesh MESH_API_KEY=... bun run examples/run-agent.ts
 
 # Use DuckDuckGo for web_search instead of Brave
 WEB_SEARCH_PROVIDER=duckduckgo bun run examples/run-agent.ts

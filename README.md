@@ -17,7 +17,7 @@ Implemented in the prototype today:
 - typed tool registration and tool-call execution
 - synthetic `delegate.*` tools backed by child runs
 - in-memory run, event, snapshot, and plan stores for local development
-- model adapters for Ollama, OpenRouter, and Mistral
+- model adapters for Ollama, OpenRouter, Mistral, and Mesh
 - structured runtime logging with Pino
 - skill loading from `SKILL.md` files and conversion into delegate profiles
 - executable skills with dynamically imported handler modules (handler-as-tool)
@@ -50,7 +50,7 @@ Not implemented yet:
 
 - `AdaptiveAgent`
 - in-memory stores for runs, events, snapshots, and plans
-- model adapters for Ollama, OpenRouter, and Mistral
+- model adapters for Ollama, OpenRouter, Mistral, and Mesh
 - built-in tools including `read_file`, `list_directory`, `write_file`, `shell_exec`, `web_search`, and `read_web_page`
 - skill parsing utilities that load `SKILL.md` files and turn them into delegate definitions, with optional handler module loading for executable skills
 - structured logging helpers for model requests, tool calls, outputs, and delegation lifecycle events
@@ -88,6 +88,7 @@ Use a hosted provider instead:
 ```bash
 PROVIDER=openrouter OPENROUTER_API_KEY=... bun run examples/run-agent.ts
 PROVIDER=mistral MISTRAL_API_KEY=... bun run examples/run-agent.ts
+PROVIDER=mesh MESH_API_KEY=... bun run examples/run-agent.ts
 ```
 
 The sample script:

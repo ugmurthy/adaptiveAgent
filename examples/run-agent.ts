@@ -3,7 +3,7 @@
  * AdaptiveAgent sample script.
  *
  * Demonstrates:
- *   - creating a provider-agnostic model adapter (Ollama, OpenRouter, or Mistral)
+ *   - creating a provider-agnostic model adapter (Ollama, OpenRouter, Mistral, or Mesh)
  *   - registering built-in tools
  *   - loading skills from disk and using them as delegate profiles
  *   - running the agent with delegation to sub-agents
@@ -20,6 +20,9 @@
  *
  *   # Using Mistral
  *   PROVIDER=mistral MISTRAL_API_KEY=... bun run examples/run-agent.ts
+ *
+ *   # Using Mesh's OpenAI-compatible gateway
+ *   PROVIDER=mesh MESH_API_KEY=... bun run examples/run-agent.ts
  *
  *   # Custom goal
  *   bun run examples/run-agent.ts "Summarize the files in this project"
@@ -73,12 +76,13 @@ marked.use(markedTerminal());
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
-const PROVIDER = (process.env.PROVIDER ?? 'ollama') as 'ollama' | 'openrouter' | 'mistral';
+const PROVIDER = (process.env.PROVIDER ?? 'ollama') as 'ollama' | 'openrouter' | 'mistral' | 'mesh';
 
 const MODEL_DEFAULTS: Record<string, string> = {
   ollama: process.env.OLLAMA_MODEL ?? 'qwen3.5',
   openrouter: process.env.OPENROUTER_MODEL ?? 'anthropic/claude-sonnet-4',
   mistral: process.env.MISTRAL_MODEL ?? 'mistral-large-latest',
+  mesh: process.env.MESH_MODEL ?? 'openai/gpt-4o',
 };
 
 const PROJECT_ROOT = resolve(import.meta.dir, '..');

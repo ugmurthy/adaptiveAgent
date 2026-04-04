@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ModelRequest } from '../types.js';
 import { BaseOpenAIChatAdapter, ModelRequestError } from './base-openai-chat-adapter.js';
+import { MeshAdapter } from './mesh-adapter.js';
 import { OllamaAdapter } from './ollama-adapter.js';
 import { OpenRouterAdapter } from './openrouter-adapter.js';
 import { MistralAdapter } from './mistral-adapter.js';
@@ -441,6 +442,20 @@ describe('MistralAdapter', () => {
   });
 });
 
+describe('MeshAdapter', () => {
+  it('uses Mesh base URL and auth', async () => {
+    const adapter = new MeshAdapter({ model: 'openai/gpt-4o', apiKey: 'mesh-key' });
+    mockFetchResponse(STOP_RESPONSE);
+
+    await adapter.generate(simpleRequest());
+
+    expect(fetchSpy.mock.calls[0][0]).toBe('https://api.meshapi.ai/v1/chat/completions');
+    expect(fetchSpy.mock.calls[0][1].headers['Authorization']).toBe('Bearer mesh-key');
+    expect(adapter.provider).toBe('mesh');
+    expect(adapter.capabilities.usage).toBe(true);
+  });
+});
+
 describe('createModelAdapter', () => {
   it('creates an OpenRouterAdapter', () => {
     const adapter = createModelAdapter({
@@ -468,12 +483,26 @@ describe('createModelAdapter', () => {
     expect(adapter.model).toBe('mistral-large-latest');
   });
 
+  it('creates a MeshAdapter', () => {
+    const adapter = createModelAdapter({
+      provider: 'mesh',
+      model: 'openai/gpt-4o',
+      apiKey: 'key',
+    });
+    expect(adapter.provider).toBe('mesh');
+    expect(adapter.model).toBe('openai/gpt-4o');
+  });
+
   it('throws when OpenRouter is missing apiKey', () => {
     expect(() => createModelAdapter({ provider: 'openrouter', model: 'x' })).toThrow('apiKey');
   });
 
   it('throws when Mistral is missing apiKey', () => {
     expect(() => createModelAdapter({ provider: 'mistral', model: 'x' })).toThrow('apiKey');
+  });
+
+  it('throws when Mesh is missing apiKey', () => {
+    expect(() => createModelAdapter({ provider: 'mesh', model: 'x' })).toThrow('apiKey');
   });
 
   it('throws on unknown provider', () => {

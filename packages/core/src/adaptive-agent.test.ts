@@ -166,6 +166,12 @@ describe('AdaptiveAgent', () => {
     const model = new SequenceModel([
       {
         finishReason: 'tool_calls',
+        usage: {
+          promptTokens: 10,
+          completionTokens: 4,
+          totalTokens: 14,
+          estimatedCostUSD: 0,
+        },
         toolCalls: [
           {
             id: 'call-1',
@@ -181,6 +187,12 @@ describe('AdaptiveAgent', () => {
       },
       {
         finishReason: 'stop',
+        usage: {
+          promptTokens: 20,
+          completionTokens: 6,
+          totalTokens: 26,
+          estimatedCostUSD: 0,
+        },
         structuredOutput: {
           report: 'complete',
         },
@@ -200,6 +212,12 @@ describe('AdaptiveAgent', () => {
       status: 'success',
       output: { report: 'complete' },
       stepsUsed: 3,
+      usage: {
+        promptTokens: 30,
+        completionTokens: 10,
+        totalTokens: 40,
+        estimatedCostUSD: 0,
+      },
     });
 
     const followupRequest = model.receivedRequests[1];

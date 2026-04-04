@@ -1891,8 +1891,12 @@ function mergeUsage(current: UsageSummary, delta: UsageSummary): UsageSummary {
   const promptTokens = current.promptTokens + delta.promptTokens;
   const completionTokens = current.completionTokens + delta.completionTokens;
   const reasoningTokens = (current.reasoningTokens ?? 0) + (delta.reasoningTokens ?? 0);
-  const totalTokens =
-    delta.totalTokens ?? current.totalTokens ?? promptTokens + completionTokens + reasoningTokens;
+  const currentTotalTokens =
+    current.totalTokens ??
+    current.promptTokens + current.completionTokens + (current.reasoningTokens ?? 0);
+  const deltaTotalTokens =
+    delta.totalTokens ?? delta.promptTokens + delta.completionTokens + (delta.reasoningTokens ?? 0);
+  const totalTokens = currentTotalTokens + deltaTotalTokens;
 
   return {
     promptTokens,

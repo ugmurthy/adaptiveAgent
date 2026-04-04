@@ -1,10 +1,11 @@
 import type { ModelAdapter } from '../types.js';
+import { MeshAdapter } from './mesh-adapter.js';
 import { MistralAdapter } from './mistral-adapter.js';
 import { OllamaAdapter } from './ollama-adapter.js';
 import { OpenRouterAdapter } from './openrouter-adapter.js';
 
 export interface ModelAdapterConfig {
-  provider: 'openrouter' | 'ollama' | 'mistral';
+  provider: 'openrouter' | 'ollama' | 'mistral' | 'mesh';
   model: string;
   apiKey?: string;
   baseUrl?: string;
@@ -40,6 +41,18 @@ export function createModelAdapter(config: ModelAdapterConfig): ModelAdapter {
       }
 
       return new MistralAdapter({
+        model: config.model,
+        apiKey: config.apiKey,
+        baseUrl: config.baseUrl,
+      });
+    }
+
+    case 'mesh': {
+      if (!config.apiKey) {
+        throw new Error('Mesh requires an apiKey');
+      }
+
+      return new MeshAdapter({
         model: config.model,
         apiKey: config.apiKey,
         baseUrl: config.baseUrl,

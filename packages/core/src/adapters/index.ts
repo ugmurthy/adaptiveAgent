@@ -10,5 +10,8 @@ export type { OllamaAdapterConfig } from './ollama-adapter.js';
 export { MistralAdapter } from './mistral-adapter.js';
 export type { MistralAdapterConfig } from './mistral-adapter.js';
 
+export { MeshAdapter } from './mesh-adapter.js';
+export type { MeshAdapterConfig } from './mesh-adapter.js';
+
 export { createModelAdapter } from './create-model-adapter.js';
 export type { ModelAdapterConfig } from './create-model-adapter.js';
