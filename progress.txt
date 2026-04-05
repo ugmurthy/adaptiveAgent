@@ -1,6 +1,12 @@
 ## Codebase Patterns
 - Keep new workspace TypeScript configs self-contained; this repo does not currently install `bun-types`, so package-level typecheck should not assume those globals exist.
 - When a workspace starts importing Node built-ins directly, add `@types/node` and keep any Bun-only globals limited to the specific shims still needed, such as `import.meta.main`.
+- Adaptive-agent delegation logs do not always carry `runId`; normalize a canonical subject run as `runId ?? parentRunId ?? childRunId` before grouping events into run timelines.
+- In `packages/analysis`, add new output formats by extending the canonical `buildAnalysisReport` shape first, then render terminal or JSON views from that shared report model.
+- In `packages/analysis`, treat `tool.completed` and `run.completed` as potentially failed unless their structured payloads say success; code-executor-style tools often report errors via `output.success = false` instead of emitting `*.failed`.
+- Run drill-down mode should resolve selection from the reconstructed run graph, not raw events, so `--run` and `--root-run` can reuse the same child-run tree and failure summaries.
+- In `packages/analysis`, build exporter-specific outputs from a shared enriched analysis bundle so Markdown/HTML/CSV and JSON stay aligned on the same run, cohort, and anomaly data.
+- In `packages/analysis`, watch mode should diff discovered file fingerprints (`path + size + mtime`) and then rerun the normal full analysis pipeline instead of trying to maintain incremental parser state.
 
 ## 2026-04-04 19:23:30 +0530 - US-001
 Thread: https://ampcode.com/threads/T-019d582c-894a-7338-9b55-494b9c388f89
@@ -42,4 +48,116 @@ Thread: https://ampcode.com/threads/T-019d58c6-302d-77a5-a127-7e059eb9d32b
 - **Learnings for future iterations:**
   - Skip blank lines during NDJSON parsing so mixed log files remain parseable without inflating malformed-line counts.
   - Preserve source file and line metadata at parse time; later normalization and drill-down stories will need it for diagnostics and deep inspection views.
+---
+
+## 2026-04-04T14:06:30Z - US-005
+Thread: https://ampcode.com/threads/T-019d58cc-53a0-765a-9c32-6390aae89885
+- Added normalized log-event records that extract canonical fields like event name, timestamps, run identifiers, tool names, durations, status transitions, and provider/model metadata while preserving each raw payload.
+- Added normalization coverage for both known lifecycle events and unknown forward-compatible event types.
+- Files changed: `prd.json`, `progress.txt`, `packages/analysis/src/analyze.ts`, `packages/analysis/src/normalize.ts`, `packages/analysis/src/normalize.test.ts`, `packages/analysis/src/index.ts`, `packages/analysis/src/cli.ts`
+- **Learnings for future iterations:**
+  - Treat unknown event names as generic normalized events instead of rejecting them so new runtime events do not break offline analysis.
+  - Normalize numeric log timestamps to both `timeMs` and ISO `time` so later reports can sort deterministically and still print human-friendly times.
+---
+
+## 2026-04-04T14:06:30Z - US-006
+Thread: https://ampcode.com/threads/T-019d58cc-53a0-765a-9c32-6390aae89885
+- Implemented run-graph reconstruction that groups normalized events into runs, links parent and child runs from delegation metadata, and sorts each run timeline deterministically.
+- Exposed run summaries with root/parent relationships, start and end times, terminal status, duration, and event counts.
+- Files changed: `prd.json`, `progress.txt`, `packages/analysis/src/analyze.ts`, `packages/analysis/src/runs.ts`, `packages/analysis/src/runs.test.ts`, `packages/analysis/src/index.ts`, `packages/analysis/src/cli.ts`
+- **Learnings for future iterations:**
+  - `delegate.spawned` is the key bridge between parent and child runs; use it to backfill child metadata even before the child emits its own events.
+  - Sort timelines by normalized timestamp first, then by source file and line, so multi-file analyses stay deterministic when timestamps tie or are missing.
+---
+
+## 2026-04-04T14:06:30Z - US-007
+Thread: https://ampcode.com/threads/T-019d58cc-53a0-765a-9c32-6390aae89885
+- Replaced the parse-only CLI summary with an overview report that includes run totals, success/failure counts, duration statistics, top tools, unassigned-event counts, and diagnostics.
+- Added formatter coverage with representative fixtures and updated the CLI integration test to exercise the new default output.
+- Files changed: `prd.json`, `progress.txt`, `packages/analysis/src/report.ts`, `packages/analysis/src/report.test.ts`, `packages/analysis/src/cli.ts`, `packages/analysis/src/cli.test.ts`, `packages/analysis/src/index.ts`
+- **Learnings for future iterations:**
+  - Count top tools by unique `(runId, stepId, toolName)` invocation keys so `tool.started` and `tool.completed` do not double-count the same tool call.
+  - Keep the CLI as a thin shell around discovery, parsing, normalization, reconstruction, and formatting modules so later JSON and drill-down modes can reuse the same pipeline.
+---
+
+## 2026-04-04T14:12:11Z - US-008
+Thread: https://ampcode.com/threads/T-019d58d1-c758-706c-8cd8-143a70f1a0ca
+- Added a canonical analysis report object with stable top-level `summary`, `runs`, `tools`, and `diagnostics` keys, and exposed JSON serialization from the shared reporting module.
+- Extended the CLI with `--format json` and `--output` so reports can be emitted to stdout or written to a file path.
+- Added JSON-focused coverage in the report and CLI tests for structure stability plus stdout/file output flows.
+- Files changed: `prd.json`, `progress.txt`, `packages/analysis/src/report.ts`, `packages/analysis/src/report.test.ts`, `packages/analysis/src/cli.ts`, `packages/analysis/src/cli.test.ts`, `packages/analysis/src/index.ts`
+- **Learnings for future iterations:**
+  - Keep JSON and terminal output on the same underlying report model so new metrics land in one place and do not drift between renderers.
+  - Let the CLI handle destination concerns like stdout vs file writes while the report layer stays pure and serialization-focused.
+---
+
+## 2026-04-04T14:12:11Z - US-009
+Thread: https://ampcode.com/threads/T-019d58d1-c758-706c-8cd8-143a70f1a0ca
+- Added per-tool aggregation that computes invocation counts, success/failure totals, success rate, latency summaries, and direct-vs-delegate classification from tool lifecycle events.
+- Reused the tool aggregation for both JSON output and terminal top-tool summaries so usage rankings and counts stay consistent across formats.
+- Added regression coverage for mixed direct and `delegate.*` tools, including failed and completed invocations with latency samples.
+- Files changed: `prd.json`, `progress.txt`, `packages/analysis/src/report.ts`, `packages/analysis/src/report.test.ts`, `packages/analysis/src/cli.ts`, `packages/analysis/src/cli.test.ts`, `packages/analysis/src/index.ts`
+- **Learnings for future iterations:**
+  - Aggregate tool calls by a stable invocation key like `(runId, stepId ?? childRunId, toolName)` so `tool.started`, `tool.completed`, and `tool.failed` collapse into one logical invocation.
+  - Classify synthetic delegation calls from the `delegate.` tool-name prefix early so later failure and bottleneck stories can slice direct and delegated work without re-deriving the distinction.
+---
+
+## 2026-04-05T01:02:37Z - US-010
+Thread: https://ampcode.com/threads/T-019d5b1f-c423-77df-beb6-cfc28b6d552b
+- Added structured failure normalization so `tool.completed` and `run.completed` events can be treated as failures when their payloads carry `success: false` or `status: failure`.
+- Added failure clustering by tool name, error name, and error snippet, plus retry heuristics for repeated step and tool invocations.
+- Files changed: `prd.json`, `progress.txt`, `packages/analysis/src/normalize.ts`, `packages/analysis/src/normalize.test.ts`, `packages/analysis/src/report.ts`, `packages/analysis/src/report.test.ts`, `packages/analysis/src/cli.ts`, `packages/analysis/src/cli.test.ts`, `packages/analysis/src/index.ts`, `packages/analysis/src/runs.ts`
+- **Learnings for future iterations:**
+  - Do not rely on `tool.failed` alone; some tools surface logical failures through structured output on `tool.completed`.
+  - Retry detection is most useful when grouped from normalized invocation keys instead of raw event counts so started/completed pairs do not double-count attempts.
+---
+
+## 2026-04-05T01:02:37Z - US-011
+Thread: https://ampcode.com/threads/T-019d5b1f-c423-77df-beb6-cfc28b6d552b
+- Added bottleneck metrics for slowest runs, slowest steps, longest inter-event gaps, and estimated waiting time across delegated work and resolvable status waits.
+- Extended the overview formatter and JSON report so the new bottleneck data is visible from the shared report model.
+- Files changed: `prd.json`, `progress.txt`, `packages/analysis/src/report.ts`, `packages/analysis/src/report.test.ts`, `packages/analysis/src/index.ts`
+- **Learnings for future iterations:**
+  - Parent delegate tool spans are a reliable proxy for child-run waiting time when explicit parent-side duration fields are absent.
+  - Step bottlenecks should be computed from the per-run timeline so delegate steps and direct-tool steps are measured consistently.
+---
+
+## 2026-04-05T01:02:37Z - US-012
+Thread: https://ampcode.com/threads/T-019d5b1f-c423-77df-beb6-cfc28b6d552b
+- Added CLI drill-down selection with `--run` and `--root-run`, including terminal and JSON output for the focus timeline, failure clusters, and child-run tree.
+- Added report-layer drill-down builders so the CLI stays thin and shares the same reconstructed run graph as overview and JSON reporting.
+- Files changed: `prd.json`, `progress.txt`, `packages/analysis/src/cli.ts`, `packages/analysis/src/cli.test.ts`, `packages/analysis/src/report.ts`, `packages/analysis/src/report.test.ts`, `packages/analysis/src/index.ts`
+- **Learnings for future iterations:**
+  - Resolve drill-down targets from reconstructed runs instead of raw events so root-run selection works even when parent/child linkage is inferred across multiple event types.
+  - Keep drill-down failures scoped to the selected run subtree so root-run debugging surfaces child failures without duplicating unrelated runs.
+---
+
+## 2026-04-05T01:27:44Z - US-013
+Thread: https://ampcode.com/threads/T-019d5b33-842b-73f8-8e63-0e2e3c127e23
+- Added a new exporter layer with Markdown, HTML, and CSV emitters for runs, tools, failures, and cohorts.
+- Extended the CLI to accept repeated or comma-separated `--format` values and to write multi-format output into a directory in one invocation.
+- Files changed: `prd.json`, `progress.txt`, `packages/analysis/src/cli.ts`, `packages/analysis/src/cli.test.ts`, `packages/analysis/src/exporters.ts`, `packages/analysis/src/exporters.test.ts`, `packages/analysis/src/index.ts`
+- **Learnings for future iterations:**
+  - Keep the CLI focused on argument resolution and file writes; exporter modules should own format-specific serialization details.
+  - Treat `csv` as a convenience alias that expands to the concrete dataset exports so new CSV datasets can be added without changing the CLI contract.
+---
+
+## 2026-04-05T01:27:44Z - US-014
+Thread: https://ampcode.com/threads/T-019d5b33-842b-73f8-8e63-0e2e3c127e23
+- Added an enriched analysis bundle that decorates runs with provider/model/usage/tool-count data and groups cohorts by provider, model, delegate, and time window.
+- Implemented baseline comparisons plus rule-based anomaly findings for duration, success rate, token usage, and tool-count regressions.
+- Files changed: `prd.json`, `progress.txt`, `packages/analysis/src/compare.ts`, `packages/analysis/src/compare.test.ts`, `packages/analysis/src/exporters.ts`, `packages/analysis/src/cli.ts`, `packages/analysis/src/index.ts`
+- **Learnings for future iterations:**
+  - Run-level usage metrics can be recovered from raw event payloads even when only `run.completed` or `delegate.child_result` carries token totals.
+  - Cohort comparisons stay deterministic when they bucket by normalized start-time windows and then compare against explicit `overall` and `previous_window` baselines.
+---
+
+## 2026-04-05T01:27:44Z - US-015
+Thread: https://ampcode.com/threads/T-019d5b33-842b-73f8-8e63-0e2e3c127e23
+- Added `analysis.config.json` support for default inputs, output formats, thresholds, and compare-window settings, plus built-in and config-defined named profiles.
+- Implemented polling watch mode that reruns analysis when matched files are appended to or when new matching files appear.
+- Files changed: `prd.json`, `progress.txt`, `packages/analysis/src/cli.ts`, `packages/analysis/src/cli.test.ts`, `packages/analysis/src/config.ts`, `packages/analysis/src/config.test.ts`, `packages/analysis/src/watch.ts`, `packages/analysis/src/watch.test.ts`, `packages/analysis/src/index.ts`
+- **Learnings for future iterations:**
+  - Resolve profile defaults before explicit CLI overrides so command-line flags can remain the final source of truth without losing reusable config presets.
+  - A practical watch-mode test can stay stable by bounding poll iterations and scheduling file appends/new files a little ahead of the next poll cycle.
 ---

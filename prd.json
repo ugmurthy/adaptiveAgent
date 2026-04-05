@@ -76,8 +76,8 @@
         "Typecheck passes"
       ],
       "priority": 5,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Added normalized event records that extract canonical lifecycle fields like time, run IDs, tool names, durations, status transitions, and provider/model metadata while preserving unknown events as generic records with raw payloads."
     },
     {
       "id": "US-006",
@@ -92,8 +92,8 @@
         "Typecheck passes"
       ],
       "priority": 6,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Implemented run-graph reconstruction that groups normalized events by run, links parent/child relationships, sorts per-run timelines deterministically, and exposes start/end time plus event-count summaries."
     },
     {
       "id": "US-007",
@@ -107,8 +107,8 @@
         "Typecheck passes"
       ],
       "priority": 7,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Replaced the parse-only CLI summary with a terminal overview report that shows run counts, success/failure counts, duration stats, top tools, and diagnostics, with formatter coverage using representative fixtures."
     },
     {
       "id": "US-008",
@@ -122,8 +122,8 @@
         "Typecheck passes"
       ],
       "priority": 8,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Added a canonical analysis report model with stable top-level JSON keys (`summary`, `runs`, `tools`, `diagnostics`), exposed `--format json` plus `--output`, and covered stdout/file JSON flows with tests."
     },
     {
       "id": "US-009",
@@ -138,8 +138,8 @@
         "Typecheck passes"
       ],
       "priority": 9,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Added per-tool aggregation for invocation counts, success/failure rates, direct-vs-delegate classification, and latency summaries from tool lifecycle events, with focused aggregation coverage in report tests."
     },
     {
       "id": "US-010",
@@ -154,8 +154,8 @@
         "Typecheck passes"
       ],
       "priority": 10,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Normalized structured `*.completed` payloads into explicit success/failure outcomes, added clustered failure summaries by tool/error signature, and flagged repeated step/tool retries with focused report and CLI coverage."
     },
     {
       "id": "US-011",
@@ -169,8 +169,8 @@
         "Typecheck passes"
       ],
       "priority": 11,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Added bottleneck reporting for slowest runs, slowest steps, longest inter-event gaps, and estimated waiting time across delegated child runs and resolvable status waits, with fixture-backed tests."
     },
     {
       "id": "US-012",
@@ -184,8 +184,8 @@
         "Typecheck passes"
       ],
       "priority": 12,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Extended `analysis analyze` with `--run` and `--root-run` selection, plus terminal and JSON drill-down output that includes the focus timeline, failure clusters, and child-run tree relationships."
     },
     {
       "id": "US-013",
@@ -200,8 +200,8 @@
         "Typecheck passes"
       ],
       "priority": 13,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Added Markdown, HTML, and CSV exporters plus multi-format CLI output so one analysis run can emit shareable docs and spreadsheet-friendly datasets together."
     },
     {
       "id": "US-014",
@@ -216,8 +216,8 @@
         "Typecheck passes"
       ],
       "priority": 14,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Built cohort aggregation over provider/model/delegate/time windows with baseline comparisons for duration, success rate, token usage, and tool counts, then surfaced rule-based anomaly findings in the shared analysis bundle."
     },
     {
       "id": "US-015",
@@ -232,8 +232,8 @@
         "Typecheck passes"
       ],
       "priority": 15,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Added config-file defaults, named profiles, and polling watch mode so repeated analyses can reuse saved settings and refresh when matched logs change."
     }
   ]
 }
