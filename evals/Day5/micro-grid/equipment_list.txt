@@ -1,0 +1,5 @@
+Equipment List:
+- Solar: 100 kW
+- Inverter for Solar: 120.0 kVA
+- MPPT for Solar
+- Load: Community Load

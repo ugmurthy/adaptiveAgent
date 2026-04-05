@@ -1,0 +1,20 @@
+### Business-Related Prompt
+
+You are an expert strategic consultant tasked with creating a comprehensive go-to-market strategy for a mid-sized SaaS company (50 employees, $10M ARR) that has developed an AI-powered supply chain optimization platform. The company is currently focused on the US manufacturing sector and wants to expand into the European market (specifically Germany, France, and the UK) within the next 18 months while achieving €15M in additional ARR from Europe by year 3 post-launch.
+
+Produce a complete, actionable strategy plan that covers **all** of the following areas in depth:
+
+1. Market analysis: size, growth, segmentation, regulatory environment (including GDPR compliance), competitive landscape, and buyer personas for European enterprises.
+2. Entry strategy options: evaluate and recommend direct sales, partnerships, distributors, acquisitions, or joint ventures.
+3. Product localization requirements: technical adaptations, language support, pricing adjustments, and feature prioritization for European needs.
+4. Go-to-market roadmap: phased timeline (0-6 months, 6-12 months, 12-18 months) with specific milestones, resource requirements, and budget estimates.
+5. Sales and marketing plan: channel strategy, demand generation tactics, content strategy, events, ABM approach, and localization of messaging.
+6. Partner ecosystem development: identification of potential technology partners, resellers, and system integrators.
+7. Organizational requirements: hiring plan, team structure, training, and leadership roles needed in Europe.
+8. Financial projections: revenue forecasts, cost structure, break-even analysis, and funding requirements.
+9. Risk assessment and mitigation: identify top 10 risks (economic, regulatory, competitive, operational) and detailed mitigation strategies.
+10. Success metrics and KPIs: define measurable outcomes at each phase, including leading and lagging indicators.
+
+The plan must be structured as a professional consulting deck outline with detailed content under each section, supported by data-driven assumptions and justifications. Break down the work into explicit steps, reason step-by-step, and iterate where necessary to refine recommendations. Use tables for comparisons, timelines, and financial models where appropriate. The final output must be a cohesive, board-ready strategy document.
+
+Write the full plan in markdown format to business-plan.md 

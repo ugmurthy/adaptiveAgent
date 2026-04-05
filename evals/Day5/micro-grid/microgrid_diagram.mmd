@@ -1,0 +1,23 @@
+```mermaid
+graph TD
+    A[Solar Array] -->|DC Power| B[MPPT Controller]
+    B -->|DC Link| C[Inverter]
+    C -->|AC Power| D[Point of Common Coupling]
+    D --> E[Community Load]
+    D --> F[Grid Connection]
+    G[Primary Control] -->|Power Setpoint| C
+    H[Secondary Control] -->|Voltage Setpoint| C
+    I[SCADA System] -->|Monitoring| C
+    I -->|Data Logging| G
+    I -->|Data Logging| H
+
+    style A fill:#f9f,stroke:#333
+    style B fill:#bbf,stroke:#333
+    style C fill:#f96,stroke:#333
+    style D fill:#6f9,stroke:#333
+    style E fill:#9f6,stroke:#333
+    style F fill:#999,stroke:#333
+    style G fill:#69f,stroke:#333
+    style H fill:#69f,stroke:#333
+    style I fill:#96f,stroke:#333
+```

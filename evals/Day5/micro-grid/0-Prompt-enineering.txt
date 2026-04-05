@@ -1,0 +1,21 @@
+
+You are a senior systems engineer leading the design of a fully off-grid, resilient microgrid system for a remote coastal research station in Arctic conditions. The station requires 150 kW average load (with peaks up to 300 kW) to support scientific instruments, housing for 20 personnel, water desalination, heating, and electric vehicle charging. The system must operate reliably for 20 years with minimal maintenance and survive extreme weather (-50°C temperatures, high winds, polar night for months).
+
+Design a complete engineering solution that includes:
+
+1. Load profiling and demand analysis, including seasonal variations and critical vs. non-critical loads.
+2. Energy source selection and sizing: evaluate and combine solar PV, wind turbines, diesel generators, hydrogen fuel cells, and battery storage; justify the optimal hybrid mix.
+3. Energy storage system design: battery chemistry, capacity, depth of discharge, thermal management for extreme cold, and redundancy.
+4. Power electronics and control system: inverters, MPPT controllers, microgrid controller architecture, islanding capability, and SCADA integration.
+5. Backup and redundancy systems: multiple fuel options, automatic failover logic, and spare parts strategy.
+6. Thermal integration: waste heat recovery from generators/fuel cells for heating and desalination.
+7. Civil and structural requirements: foundation design for permafrost, wind/ice loading, corrosion protection.
+8. Installation and logistics plan: phased deployment considering Arctic shipping windows and helicopter access.
+9. Operations and maintenance plan: predictive maintenance, remote monitoring, spare inventory, and personnel training.
+10. Safety, environmental, and regulatory compliance: hazard analysis, spill prevention, wildlife impact, and permitting requirements.
+11. Full cost estimate: CapEx, OpEx over 20 years, and levelized cost of energy (LCOE) calculation.
+12. Performance modeling: simulate annual energy yield, reliability (99.9% uptime), and sensitivity analysis for key variables.
+
+Provide detailed calculations, diagrams (mermaid), sizing formulas, and references to relevant standards (IEC, IEEE, etc.). Break down the solution into explicit steps, perform iterative calculations where needed, and justify every major design decision with engineering reasoning. The final output must be a complete preliminary design report suitable for peer review and funding approval.
+
+Write the final report in markdown format to engineer-solution.md
