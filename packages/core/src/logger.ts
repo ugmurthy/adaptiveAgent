@@ -1,12 +1,12 @@
-import { mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync, mkdirSync } from 'node:fs';
+import { dirname, join, parse } from 'node:path';
 
 import pino, { type DestinationStream, type Logger, type LoggerOptions } from 'pino';
 import pretty from 'pino-pretty';
 
 import type { CaptureMode, JsonValue } from './types.js';
 
-export type AdaptiveAgentLogger = Logger;
+export type AdaptiveAgentLogger = Logger & { readonly filePath?: string };
 export type AdaptiveAgentLogLevel = LoggerOptions['level'] | 'silent';
 export type AdaptiveAgentLogDestination = 'console' | 'file' | 'both';
 export const DEFAULT_LOG_LEVEL: AdaptiveAgentLogLevel = 'silent';
@@ -36,17 +36,21 @@ export function createAdaptiveAgentLogger(options: AdaptiveAgentLoggerOptions = 
     return consoleDestination ? pino(loggerOptions, consoleDestination) : pino(loggerOptions);
   }
 
-  const fileDestination = createFileDestination(requireLogFilePath(options, destination));
+  const filePath = resolveLogFilePath(requireLogFilePath(options, destination));
+  const fileDestination = createFileDestination(filePath);
   if (destination === 'file') {
-    return pino(loggerOptions, fileDestination);
+    return attachFilePath(pino(loggerOptions, fileDestination), filePath);
   }
 
-  return pino(
-    loggerOptions,
-    pino.multistream([
-      { stream: createConsoleStream(options.pretty) },
-      { stream: fileDestination },
-    ]),
+  return attachFilePath(
+    pino(
+      loggerOptions,
+      pino.multistream([
+        { stream: createConsoleStream(options.pretty) },
+        { stream: fileDestination },
+      ]),
+    ),
+    filePath,
   );
 }
 
@@ -70,6 +74,51 @@ function createPrettyDestination(): DestinationStream {
 function createFileDestination(filePath: string): DestinationStream {
   mkdirSync(dirname(filePath), { recursive: true });
   return pino.destination({ dest: filePath, sync: true });
+}
+
+function resolveLogFilePath(filePath: string, now = new Date()): string {
+  const parsedPath = parse(filePath);
+  const baseName = normalizeLogFileBaseName(parsedPath.name);
+  const dateStamp = formatLogDate(now);
+  const datedFileName = `${baseName}-${dateStamp}${parsedPath.ext}`;
+  const datedFilePath = join(parsedPath.dir, datedFileName);
+
+  if (!existsSync(datedFilePath)) {
+    return datedFilePath;
+  }
+
+  let serial = 2;
+  while (true) {
+    const rotatedFilePath = join(parsedPath.dir, `${baseName}-${dateStamp}-${serial}${parsedPath.ext}`);
+    if (!existsSync(rotatedFilePath)) {
+      return rotatedFilePath;
+    }
+
+    serial += 1;
+  }
+}
+
+function normalizeLogFileBaseName(fileName: string): string {
+  const normalizedFileName = fileName.replace(/-\d{4}-\d{2}-\d{2}(?:-\d+)?$/, '');
+  return normalizedFileName.length > 0 ? normalizedFileName : fileName;
+}
+
+function formatLogDate(date: Date): string {
+  const year = String(date.getFullYear());
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function attachFilePath(logger: Logger, filePath: string): AdaptiveAgentLogger {
+  Object.defineProperty(logger, 'filePath', {
+    value: filePath,
+    enumerable: true,
+    configurable: false,
+    writable: false,
+  });
+
+  return logger as AdaptiveAgentLogger;
 }
 
 function requireLogFilePath(options: AdaptiveAgentLoggerOptions, destination: AdaptiveAgentLogDestination): string {

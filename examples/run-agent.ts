@@ -30,13 +30,16 @@
  *   # Auto-approve gated tools in non-interactive runs
  *   bun run examples/run-agent.ts --auto-approve
  *
+ *   # Print persisted agent events as they happen
+ *   bun run examples/run-agent.ts --live-event
+ *
  *   # Allow more model/tool turns before MAX_STEPS
  *   AGENT_MAX_STEPS=60 bun run examples/run-agent.ts
  *
  *   # Enable lifecycle logging explicitly (default is silent)
  *   AGENT_LOG_LEVEL=info bun run examples/run-agent.ts
  *
- *   # Write structured logs to PROJECT_ROOT/logs/adaptive-agent-example.log
+ *   # Write structured logs to PROJECT_ROOT/logs/adaptive-agent-example-YYYY-MM-DD.log
  *   LOG_DEST=file AGENT_LOG_LEVEL=info bun run examples/run-agent.ts
  *
  *   # Mirror logs to console and file, with a custom log directory
@@ -48,11 +51,7 @@ import { isAbsolute, resolve } from 'node:path';
 import { stdin as input, stdout as output } from 'node:process';
 import { createInterface } from 'node:readline/promises';
 
-import { AdaptiveAgent } from '../packages/core/src/adaptive-agent.js';
-import { InMemoryEventStore } from '../packages/core/src/in-memory-event-store.js';
-import { InMemoryRunStore } from '../packages/core/src/in-memory-run-store.js';
-import { InMemorySnapshotStore } from '../packages/core/src/in-memory-snapshot-store.js';
-import { createModelAdapter } from '../packages/core/src/adapters/create-model-adapter.js';
+import { createAdaptiveAgent } from '../packages/core/src/create-adaptive-agent.js';
 import { createReadFileTool } from '../packages/core/src/tools/read-file.js';
 import { createListDirectoryTool } from '../packages/core/src/tools/list-directory.js';
 import { createWriteFileTool } from '../packages/core/src/tools/write-file.js';
@@ -67,7 +66,7 @@ import {
   DEFAULT_LOG_LEVEL,
   type AdaptiveAgentLogDestination,
 } from '../packages/core/src/logger.js';
-import type { DelegateDefinition, RunResult, ToolDefinition } from '../packages/core/src/types.js';
+import type { AgentEvent, DelegateDefinition, RunResult, ToolDefinition } from '../packages/core/src/types.js';
 //-markdown//
 import { marked } from 'marked';
 import { markedTerminal } from 'marked-terminal';
@@ -90,7 +89,8 @@ const SKILLS_DIR = resolve(import.meta.dir, 'skills');
 const cliArgs = process.argv.slice(2);
 const verbose = cliArgs.includes('--verbose') || cliArgs.includes('-v');
 const autoApprove = cliArgs.includes('--auto-approve') || process.env.AUTO_APPROVE === '1';
-const positionalArgs = cliArgs.filter((arg) => !['--verbose', '-v', '--auto-approve'].includes(arg));
+const liveEvent = cliArgs.includes('--live-event');
+const positionalArgs = cliArgs.filter((arg) => !['--verbose', '-v', '--auto-approve', '--live-event'].includes(arg));
 const webSearchProviderEnv = process.env.WEB_SEARCH_PROVIDER;
 const logDestinationEnv = process.env.LOG_DEST;
 const webSearchProvider =
@@ -105,17 +105,8 @@ const maxSteps = parseOptionalPositiveInt(process.env.AGENT_MAX_STEPS);
 const webToolTimeoutMs = parseOptionalPositiveInt(process.env.WEB_TOOL_TIMEOUT_MS);
 const modelTimeoutMs = parseOptionalNonNegativeInt(process.env.MODEL_TIMEOUT_MS);
 
-// ─── Build the model adapter ────────────────────────────────────────────────
-
 console.log(`\n🤖 Provider: ${PROVIDER}`);
 console.log(`📦 Model:    ${MODEL_DEFAULTS[PROVIDER]}\n`);
-
-const model = createModelAdapter({
-  provider: PROVIDER,
-  model: MODEL_DEFAULTS[PROVIDER],
-  apiKey: process.env[`${PROVIDER.toUpperCase()}_API_KEY`] ?? process.env.OPENROUTER_API_KEY,
-  baseUrl: process.env[`${PROVIDER.toUpperCase()}_BASE_URL`],
-});
 
 // ─── Register built-in tools ────────────────────────────────────────────────
 
@@ -199,9 +190,6 @@ for (const entry of skillEntries) {
 
 // ─── Create the agent ───────────────────────────────────────────────────────
 
-const runStore = new InMemoryRunStore();
-const eventStore = new InMemoryEventStore();
-const snapshotStore = new InMemorySnapshotStore();
 const logger = createAdaptiveAgentLogger({
   name: 'adaptive-agent-example'+process.env.RUN_SUFFIX,
   destination: logDestination,
@@ -211,20 +199,25 @@ const logger = createAdaptiveAgentLogger({
 });
 
 if (logDestination === 'file' || logDestination === 'both') {
-  console.log(`🪵 Logs:     ${logDestination} (${logFilePath}, level=${agentLogLevel})`);
+  console.log(`🪵 Logs:     ${logDestination} (${logger.filePath ?? logFilePath}, level=${agentLogLevel})`);
 }
 
-const agent = new AdaptiveAgent({
-  model,
+const {
+  agent,
+  runtime: { runStore, eventStore },
+} = createAdaptiveAgent({
+  model: {
+    provider: PROVIDER,
+    model: MODEL_DEFAULTS[PROVIDER],
+    apiKey: process.env[`${PROVIDER.toUpperCase()}_API_KEY`] ?? process.env.OPENROUTER_API_KEY,
+    baseUrl: process.env[`${PROVIDER.toUpperCase()}_BASE_URL`],
+  },
   tools,
   delegates,
   delegation: {
     maxDepth: 1,
     maxChildrenPerRun: 7,
   },
-  runStore,
-  eventStore,
-  snapshotStore,
   logger,
   defaults: {
     ...(maxSteps === undefined ? {} : { maxSteps }),
@@ -240,9 +233,13 @@ const agent = new AdaptiveAgent({
 const goal = positionalArgs[0] ?? 'List the top-level files in this project and summarize what each one is for.';
 
 console.log(`\n🎯 Goal: ${goal}\n`);
+if (liveEvent) {
+  console.log('📡 Live events: on');
+}
 console.log('─'.repeat(60));
 
 const startTime = Date.now();
+const unsubscribeLiveEvents = liveEvent ? eventStore.subscribe((event) => console.log(formatLiveEvent(event))) : undefined;
 
 async function promptForApproval(toolName: string): Promise<boolean> {
   if (autoApprove) {
@@ -310,6 +307,109 @@ function resolveLogDir(value: string | undefined): string {
   }
 
   return isAbsolute(trimmed) ? trimmed : resolve(PROJECT_ROOT, trimmed);
+}
+
+function formatLiveEvent(event: AgentEvent): string {
+  const payload = asRecord(event.payload);
+  const prefix = `[${formatEventTime(event.createdAt)}] ${shortRunId(event.runId)} #${event.seq}`;
+
+  switch (event.type) {
+    case 'run.created':
+      return `${prefix} run created`;
+    case 'run.status_changed': {
+      const fromStatus = typeof payload.fromStatus === 'string' ? payload.fromStatus : 'unknown';
+      const toStatus = typeof payload.toStatus === 'string' ? payload.toStatus : 'unknown';
+      return `${prefix} status ${fromStatus} -> ${toStatus}`;
+    }
+    case 'run.interrupted':
+      return `${prefix} run interrupted`;
+    case 'run.resumed':
+      return `${prefix} run resumed`;
+    case 'run.completed':
+      return `${prefix} run completed`;
+    case 'run.failed': {
+      const error = typeof payload.error === 'string' ? `: ${payload.error}` : '';
+      return `${prefix} run failed${error}`;
+    }
+    case 'plan.created':
+      return `${prefix} plan created`;
+    case 'plan.execution_started':
+      return `${prefix} plan execution started`;
+    case 'step.started':
+      return `${prefix} step ${event.stepId ?? 'unknown'} started`;
+    case 'step.completed':
+      return `${prefix} step ${event.stepId ?? 'unknown'} completed`;
+    case 'tool.started':
+      return `${prefix} tool ${readString(payload, 'toolName') ?? 'unknown'} started`;
+    case 'tool.completed':
+      return `${prefix} tool ${readString(payload, 'toolName') ?? 'unknown'} completed`;
+    case 'tool.failed': {
+      const toolName = readString(payload, 'toolName') ?? 'unknown';
+      const error = readString(payload, 'error');
+      return `${prefix} tool ${toolName} failed${error ? `: ${error}` : ''}`;
+    }
+    case 'delegate.spawned': {
+      const delegateName = readString(payload, 'delegateName') ?? 'unknown';
+      const childRunId = readString(payload, 'childRunId');
+      return `${prefix} delegate.${delegateName} spawned ${childRunId ? shortRunId(childRunId) : 'child run'}`;
+    }
+    case 'approval.requested':
+      return `${prefix} approval requested for ${readString(payload, 'toolName') ?? 'unknown'}`;
+    case 'approval.resolved': {
+      const toolName = readString(payload, 'toolName');
+      const approved = payload.approved === true ? 'approved' : payload.approved === false ? 'rejected' : 'resolved';
+      return `${prefix} approval ${approved}${toolName ? ` for ${toolName}` : ''}`;
+    }
+    case 'clarification.requested': {
+      const message = readString(payload, 'message');
+      return `${prefix} clarification requested${message ? `: ${message}` : ''}`;
+    }
+    case 'usage.updated': {
+      const usage = asRecord(payload.usage);
+      const promptTokens = readNumber(usage, 'promptTokens');
+      const completionTokens = readNumber(usage, 'completionTokens');
+      const totalTokens = readNumber(usage, 'totalTokens');
+      const parts = [
+        promptTokens === undefined ? undefined : `prompt=${promptTokens}`,
+        completionTokens === undefined ? undefined : `completion=${completionTokens}`,
+        totalTokens === undefined ? undefined : `total=${totalTokens}`,
+      ].filter((part): part is string => part !== undefined);
+      return `${prefix} usage updated${parts.length > 0 ? ` (${parts.join(', ')})` : ''}`;
+    }
+    case 'snapshot.created': {
+      const status = readString(payload, 'status');
+      return `${prefix} snapshot created${status ? ` (${status})` : ''}`;
+    }
+    case 'replan.required': {
+      const reason = readString(payload, 'reason') ?? readString(payload, 'replanReason');
+      return `${prefix} replan required${reason ? `: ${reason}` : ''}`;
+    }
+    default:
+      return `${prefix} ${event.type}`;
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function readString(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === 'string' ? value : undefined;
+}
+
+function readNumber(record: Record<string, unknown>, key: string): number | undefined {
+  const value = record[key];
+  return typeof value === 'number' ? value : undefined;
+}
+
+function formatEventTime(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.valueOf()) ? value : date.toISOString().slice(11, 19);
+}
+
+function shortRunId(runId: string): string {
+  return `run:${runId.slice(0, 8)}`;
 }
 
 function printResult(result: RunResult, elapsedSeconds: string): void {
@@ -398,4 +498,6 @@ try {
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
   console.error(`\n💥 Error after ${elapsed}s:`, error);
   process.exit(1);
+} finally {
+  unsubscribeLiveEvents?.();
 }

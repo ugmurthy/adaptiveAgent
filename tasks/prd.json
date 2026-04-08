@@ -1,0 +1,426 @@
+{
+  "project": "adaptive-agent-monorepo",
+  "branchName": "ralph/adaptive-agent-websocket-gateway",
+  "description": "Build a Bun + Fastify WebSocket gateway for AdaptiveAgent with deterministic routing, gateway-owned sessions, run orchestration, channel fanout, hooks, and scheduled ingress.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Scaffold gateway-fastify workspace",
+      "description": "As a developer, I want a dedicated packages/gateway-fastify workspace so the WebSocket gateway can be implemented independently from the core runtime.",
+      "acceptanceCriteria": [
+        "Create packages/gateway-fastify with package name @adaptive-agent/gateway-fastify",
+        "Add Bun scripts for build, test, and typecheck",
+        "Add a TypeScript package entrypoint and minimal server bootstrap stub",
+        "Running bun run --cwd packages/gateway-fastify build succeeds",
+        "Typecheck passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-002",
+      "title": "Define gateway and agent config schemas",
+      "description": "As a platform engineer, I want explicit config schemas for gateway and agent JSON files so startup validation is deterministic and actionable.",
+      "acceptanceCriteria": [
+        "Add TypeScript types and validators for gateway config and agent config files",
+        "Agent config requires stable id, name, invocationModes, defaultInvocationMode, and model configuration",
+        "Invalid config reports actionable startup errors",
+        "Add tests for valid and invalid config loading",
+        "Tests pass",
+        "Typecheck passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-003",
+      "title": "Add module registries for tools delegates hooks and auth",
+      "description": "As a platform engineer, I want explicit registries for executable behavior so JSON config stays declarative and safe.",
+      "acceptanceCriteria": [
+        "Implement registries that resolve configured tool, delegate, hook, and auth provider references",
+        "Unknown registry references fail fast with actionable errors",
+        "Hook and auth loading do not evaluate arbitrary inline code from JSON",
+        "Add tests for successful and failed registry resolution",
+        "Tests pass",
+        "Typecheck passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-004",
+      "title": "Build lazy agent registry",
+      "description": "As a platform engineer, I want agent configs materialized lazily into AdaptiveAgent instances so startup remains predictable and agent identity is cached by id.",
+      "acceptanceCriteria": [
+        "Agent registry loads validated agent configs and exposes them by agentId",
+        "AdaptiveAgent instances are created lazily on first use and cached",
+        "Registry exposes invocation capability metadata needed by the gateway",
+        "Add tests for lazy instantiation and cache reuse",
+        "Tests pass",
+        "Typecheck passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-005",
+      "title": "Define WebSocket protocol types and validation",
+      "description": "As a client integrator, I want stable frame contracts so the gateway protocol is explicit and rejects malformed traffic consistently.",
+      "acceptanceCriteria": [
+        "Define inbound frame types for session.open, message.send, run.start, approval.resolve, channel.subscribe, session.close, and ping",
+        "Define outbound frame types for session.opened, session.updated, agent.event, message.output, run.output, approval.requested, error, and pong",
+        "Malformed or unknown frames are rejected with stable protocol error codes",
+        "Add tests for protocol validation and error mapping",
+        "Tests pass",
+        "Typecheck passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-006",
+      "title": "Bootstrap Fastify WebSocket server",
+      "description": "As an operator, I want the gateway server to start on Bun with a configured WebSocket endpoint so clients can connect to a real transport.",
+      "acceptanceCriteria": [
+        "Start Fastify on the configured host, port, and websocketPath",
+        "WebSocket connections are wired to the validated frame protocol",
+        "Optional health endpoint returns service status when configured",
+        "Add a server bootstrap smoke test or integration test",
+        "Tests pass",
+        "Typecheck passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-007",
+      "title": "Authenticate upgrades with JWT",
+      "description": "As a platform engineer, I want JWT authentication on WebSocket upgrade so every session runs under an explicit trusted principal.",
+      "acceptanceCriteria": [
+        "Validate bearer JWTs before session creation unless a channel is configured as public",
+        "Normalize auth context with subject, optional tenantId, roles, and claims",
+        "Expired or invalid tokens return stable auth errors",
+        "Reconnect requires a fresh valid JWT rather than reusing expired authorization",
+        "Add tests for valid, invalid, and expired token flows",
+        "Tests pass",
+        "Typecheck passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-008",
+      "title": "Add gateway store interfaces and in-memory stores",
+      "description": "As a platform engineer, I want gateway-owned store interfaces with in-memory implementations so session and cron state can be built independently of the runtime stores.",
+      "acceptanceCriteria": [
+        "Define store interfaces for sessions, transcript messages, session-run links, cron jobs, and cron runs",
+        "Provide in-memory implementations for tests and local development",
+        "Gateway stores remain authoritative for client and session facts instead of duplicating runtime execution facts",
+        "Add tests for the in-memory store behaviors",
+        "Tests pass",
+        "Typecheck passes"
+      ],
+      "priority": 8,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-009",
+      "title": "Implement session open and reattach lifecycle",
+      "description": "As an authenticated user, I want to create or reopen a session across reconnects so my gateway conversation state persists for the same principal.",
+      "acceptanceCriteria": [
+        "session.open creates a new session or reattaches to an existing session for the same principal",
+        "Session records include channelId, principal ownership, status, transcript version, timestamps, and active run pointers",
+        "Different principals cannot attach to an existing session",
+        "Multiple same-principal connections can attach to observe the same session",
+        "Add tests for create, reattach, and ownership rejection flows",
+        "Tests pass",
+        "Typecheck passes"
+      ],
+      "priority": 9,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-010",
+      "title": "Implement deterministic bindings router",
+      "description": "As a platform engineer, I want routing decided by bindings and defaults so the gateway chooses the correct agent without model involvement.",
+      "acceptanceCriteria": [
+        "Routing evaluates session pinning before channel, tenant, role, and default bindings",
+        "Normal chat traffic cannot override routing by supplying agentId directly",
+        "Session records retain their resolved agentId unless an explicit host rebind occurs",
+        "Add tests for binding priority and fallback behavior",
+        "Tests pass",
+        "Typecheck passes"
+      ],
+      "priority": 10,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-011",
+      "title": "Persist transcript history and replay envelope",
+      "description": "As a platform engineer, I want the gateway to own transcript replay so multi-turn chat can work with the current agent.chat contract without unbounded history growth.",
+      "acceptanceCriteria": [
+        "Persist session transcript messages in gateway storage",
+        "Build chat replay envelopes from recent raw messages plus a rolling summary field",
+        "Summary refresh triggers are configurable and run after successful turns or when the recent window exceeds a threshold",
+        "Add tests for transcript persistence and replay envelope composition",
+        "Tests pass",
+        "Typecheck passes"
+      ],
+      "priority": 11,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-012",
+      "title": "Execute chat turns through agent.chat",
+      "description": "As an authenticated user, I want message.send to run a conversational turn against the routed agent so I can have a persistent multi-turn chat session.",
+      "acceptanceCriteria": [
+        "message.send loads the session replay envelope, appends the inbound user message, and invokes agent.chat",
+        "Persist run linkage for the resulting root run on the session",
+        "Successful assistant output is appended to the transcript and delivered via message.output or session frames",
+        "Failed turns preserve prior transcript history and update session status consistently",
+        "Add tests for successful and failed chat turns",
+        "Tests pass",
+        "Typecheck passes"
+      ],
+      "priority": 12,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-013",
+      "title": "Execute structured runs through agent.run",
+      "description": "As an integrator, I want run.start requests to invoke agent.run so structured commands and automation can execute without chat transcript semantics.",
+      "acceptanceCriteria": [
+        "run.start validates that the target agent and endpoint allow run mode",
+        "Build a RunRequest from goal, optional input, optional context, and metadata",
+        "Persist runId, rootRunId, and session linkage for session-bound structured runs",
+        "Return terminal run output through the gateway response path",
+        "Add tests for session-bound and isolated structured runs",
+        "Tests pass",
+        "Typecheck passes"
+      ],
+      "priority": 13,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-014",
+      "title": "Resume paused runs from approval frames",
+      "description": "As an authenticated user, I want approval.resolve to continue a paused run so approval-required work can resume without starting over.",
+      "acceptanceCriteria": [
+        "approval.resolve is accepted only when the session has an authorized pending runId",
+        "Approval resolution calls resolveApproval and resume on the same run rather than creating a new root run",
+        "Session status moves back to running, idle, or failed based on the resumed result",
+        "Add tests for approve, reject, and unauthorized approval flows",
+        "Tests pass",
+        "Typecheck passes"
+      ],
+      "priority": 14,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-015",
+      "title": "Enforce single-writer session concurrency",
+      "description": "As a platform engineer, I want one active root run and one write lane per session so multiple tabs or devices cannot race gateway state.",
+      "acceptanceCriteria": [
+        "Only one active root run is allowed per session",
+        "Additional message.send and run.start frames are rejected while a session is running",
+        "Only approval-related writes are accepted while a session is awaiting_approval",
+        "Same-principal observers can remain attached without gaining a second write lane",
+        "Add tests for running and awaiting_approval concurrency rules",
+        "Tests pass",
+        "Typecheck passes"
+      ],
+      "priority": 15,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-016",
+      "title": "Bridge runtime events onto gateway channels",
+      "description": "As a client developer, I want channel subscriptions and correlated runtime events so I can render progress for sessions and runs.",
+      "acceptanceCriteria": [
+        "Implement channel subscriptions for at least session, run, root-run, and agent scopes",
+        "Bridge runtime events such as run.created, run.status_changed, tool.started, tool.completed, delegate.spawned, approval.requested, approval.resolved, run.completed, run.failed, and snapshot.created",
+        "Outbound events include correlation metadata such as sessionId, agentId, runId, rootRunId, and parentRunId when available",
+        "Add tests for subscription fanout and event correlation",
+        "Tests pass",
+        "Typecheck passes"
+      ],
+      "priority": 16,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-017",
+      "title": "Authorize outbound delivery and redact sensitive metadata",
+      "description": "As a platform engineer, I want outbound events filtered and redacted so clients only receive authorized data.",
+      "acceptanceCriteria": [
+        "Channel subscriptions are authorized against the caller auth context",
+        "Sensitive auth claims are redacted before outbound delivery",
+        "Unauthorized channel deliveries are dropped or rejected with stable errors",
+        "Add tests for outbound authorization and redaction behavior",
+        "Tests pass",
+        "Typecheck passes"
+      ],
+      "priority": 17,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-018",
+      "title": "Add gateway hook lifecycle",
+      "description": "As a platform engineer, I want lifecycle hooks around gateway actions so auth policy, rate limits, auditing, and outbound filtering can be extended safely.",
+      "acceptanceCriteria": [
+        "Implement configured hook slots for onAuthenticate, onSessionResolve, beforeRoute, beforeInboundMessage, beforeRunStart, afterRunResult, onAgentEvent, beforeOutboundFrame, onDisconnect, and onError",
+        "before hooks can reject or enrich request metadata",
+        "Hook failure policy supports fail, warn, and ignore",
+        "Add tests for hook ordering and failure policy behavior",
+        "Tests pass",
+        "Typecheck passes"
+      ],
+      "priority": 18,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-019",
+      "title": "Implement file-backed gateway persistence",
+      "description": "As a developer, I want a durable single-node storage backend so sessions and scheduled work survive restarts during local development.",
+      "acceptanceCriteria": [
+        "Add a file-backed store for sessions, transcript messages, session-run links, cron jobs, and cron runs",
+        "Use a documented on-disk layout that matches the logical gateway artifacts",
+        "Session and cron state can be reloaded after process restart in local development",
+        "Add tests for file-backed persistence and reload behavior",
+        "Tests pass",
+        "Typecheck passes"
+      ],
+      "priority": 19,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-020",
+      "title": "Add Postgres session transcript and linkage stores",
+      "description": "As an operator, I want PostgreSQL-backed gateway state for sessions and transcripts so production deployments have durable multi-process storage.",
+      "acceptanceCriteria": [
+        "Define Postgres-backed persistence for gateway sessions, transcript messages, and session-run links",
+        "Session and transcript queries preserve principal ownership, status, active run pointers, and turn ordering",
+        "Runtime execution facts remain authoritative in runtime stores while gateway facts stay in gateway tables",
+        "Add tests for the Postgres store contract or SQL mapping layer",
+        "Tests pass",
+        "Typecheck passes"
+      ],
+      "priority": 20,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-021",
+      "title": "Add Postgres cron store and lease claiming",
+      "description": "As an operator, I want durable cron jobs with lease-based claiming so scheduled work executes once per fire time across multiple workers.",
+      "acceptanceCriteria": [
+        "Define Postgres-backed persistence for cron jobs and cron runs",
+        "Implement lease-based claiming so only one worker can execute a due fire time",
+        "Claimed jobs record run history and terminal status",
+        "Add tests for lease claim and release behavior",
+        "Tests pass",
+        "Typecheck passes"
+      ],
+      "priority": 21,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-022",
+      "title": "Add scheduler loop and cron target dispatch",
+      "description": "As an operator, I want due cron jobs to flow through the same orchestrator as live traffic so scheduled work behaves like normal gateway work.",
+      "acceptanceCriteria": [
+        "Implement a scheduler loop that claims due jobs and dispatches them through the shared orchestrator",
+        "Support cron target kinds session_event, isolated_run, and isolated_chat",
+        "session_event uses the session flow while isolated targets avoid inheriting arbitrary user transcript state",
+        "Add tests for scheduler dispatch and target-kind mapping",
+        "Tests pass",
+        "Typecheck passes"
+      ],
+      "priority": 22,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-023",
+      "title": "Add cron delivery modes and approval policy",
+      "description": "As an operator, I want scheduled results delivered predictably so cron executions can write back to sessions, announce summaries, or notify external systems.",
+      "acceptanceCriteria": [
+        "Support cron delivery modes session, announce, webhook, and none",
+        "Webhook delivery posts a completion payload after the run result is finalized",
+        "Cron executions that reach approval state are marked failed or needs-review instead of blocking indefinitely",
+        "Add tests for delivery-mode routing and approval policy behavior",
+        "Tests pass",
+        "Typecheck passes"
+      ],
+      "priority": 23,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-024",
+      "title": "Restore active sessions on reconnect",
+      "description": "As an authenticated user, I want reconnecting sockets to recover active session state so pending approvals and current status remain visible after transport interruptions.",
+      "acceptanceCriteria": [
+        "Reattached connections receive the current session status and active run linkage",
+        "Pending approval sessions surface their outstanding run state after reconnect",
+        "Observers rejoin the correct authorized channels after reconnect",
+        "Add tests for reconnect recovery with idle, running, and awaiting_approval sessions",
+        "Tests pass",
+        "Typecheck passes"
+      ],
+      "priority": 24,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-025",
+      "title": "Add gateway health checks metrics and structured logs",
+      "description": "As an operator, I want operational signals for the gateway so startup failures, degraded backends, and runtime activity are observable.",
+      "acceptanceCriteria": [
+        "Expose health or readiness surfaces for normal, startup-failed, and degraded states",
+        "Emit structured logs for auth failures, routing decisions, session lifecycle, run dispatch, hook failures, and cron activity",
+        "Track basic counters for sessions, active runs, auth failures, routing misses, and cron claims",
+        "Add tests for health-state reporting and logging integration points where practical",
+        "Tests pass",
+        "Typecheck passes"
+      ],
+      "priority": 25,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-026",
+      "title": "Document gateway config protocol and local operations",
+      "description": "As a developer or operator, I want documentation for the gateway so I can run it locally, configure routing, and integrate against the WebSocket protocol.",
+      "acceptanceCriteria": [
+        "Document gateway and agent config structure with example JSON files",
+        "Document the supported inbound and outbound WebSocket frames",
+        "Document local development flow for in-memory, file-backed, and Postgres-backed modes",
+        "Document scheduler behavior, delivery modes, and reconnect expectations",
+        "Typecheck passes"
+      ],
+      "priority": 26,
+      "passes": false,
+      "notes": ""
+    }
+  ]
+}

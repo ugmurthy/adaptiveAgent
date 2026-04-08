@@ -56,6 +56,73 @@ function createLookupTool(): ToolDefinition {
 }
 
 describe('AdaptiveAgent', () => {
+  it('uses transcript messages for chat-style runs', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const model = new SequenceModel([
+      {
+        finishReason: 'stop',
+        text: 'Paris is the capital of France.',
+      },
+    ]);
+
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore,
+      systemInstructions: 'Reply in one sentence.',
+    });
+
+    const result = await agent.chat({
+      messages: [
+        { role: 'system', content: 'Call the user Sam.' },
+        { role: 'assistant', content: 'Hi Sam! What would you like to know?' },
+        { role: 'user', content: 'What is the capital of France?' },
+      ],
+      context: { locale: 'en-US' },
+      metadata: { channel: 'cli' },
+    });
+
+    expect(result).toMatchObject({
+      status: 'success',
+      output: 'Paris is the capital of France.',
+      stepsUsed: 1,
+    });
+
+    expect(model.receivedRequests[0]).toMatchObject({
+      tools: [],
+      metadata: { channel: 'cli' },
+      messages: [
+        {
+          role: 'system',
+          content: expect.stringContaining('Reply in one sentence.'),
+        },
+        {
+          role: 'system',
+          content: expect.stringContaining('"locale": "en-US"'),
+        },
+        {
+          role: 'system',
+          content: 'Call the user Sam.',
+        },
+        {
+          role: 'assistant',
+          content: 'Hi Sam! What would you like to know?',
+        },
+        {
+          role: 'user',
+          content: 'What is the capital of France?',
+        },
+      ],
+    });
+
+    const storedRun = await runStore.getRun(result.runId);
+    expect(storedRun?.goal).toBe('What is the capital of France?');
+  });
+
   it('emits structured lifecycle logs with model, tool, and delegation context', async () => {
     const runStore = new InMemoryRunStore();
     const eventStore = new InMemoryEventStore();

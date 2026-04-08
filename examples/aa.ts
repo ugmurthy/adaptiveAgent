@@ -31,11 +31,7 @@ import { marked } from 'marked';
 import { markedTerminal } from 'marked-terminal';
 
 import { resolveAaConfig } from './aa-config.js';
-import { AdaptiveAgent } from '../packages/core/src/adaptive-agent.js';
-import { createModelAdapter } from '../packages/core/src/adapters/create-model-adapter.js';
-import { InMemoryEventStore } from '../packages/core/src/in-memory-event-store.js';
-import { InMemoryRunStore } from '../packages/core/src/in-memory-run-store.js';
-import { InMemorySnapshotStore } from '../packages/core/src/in-memory-snapshot-store.js';
+import { createAdaptiveAgent } from '../packages/core/src/create-adaptive-agent.js';
 import { createAdaptiveAgentLogger } from '../packages/core/src/logger.js';
 import { loadSkillFromDirectory } from '../packages/core/src/skills/load-skill.js';
 import { skillToDelegate } from '../packages/core/src/skills/skill-to-delegate.js';
@@ -54,15 +50,6 @@ const config = await resolveAaConfig();
 console.log(`\nConfig:    ${config.configPath}`);
 console.log(`Provider:  ${config.provider}`);
 console.log(`Model:     ${config.model}\n`);
-
-const model = createModelAdapter({
-  provider: config.provider,
-  model: config.model,
-  apiKey: config.apiKey,
-  baseUrl: config.baseUrl,
-  siteUrl: config.siteUrl,
-  siteName: config.siteName,
-});
 
 const tools: ToolDefinition[] = [
   createReadFileTool({ allowedRoot: config.projectRoot }),
@@ -126,9 +113,6 @@ for (const entry of skillEntries) {
   }
 }
 
-const runStore = new InMemoryRunStore();
-const eventStore = new InMemoryEventStore();
-const snapshotStore = new InMemorySnapshotStore();
 const logger = createAdaptiveAgentLogger({
   name: config.logging.name,
   destination: config.logging.destination,
@@ -143,17 +127,24 @@ if (config.logging.destination === 'file' || config.logging.destination === 'bot
   console.log(`Logs:      ${config.logging.destination} (${config.logging.filePath}, level=${config.logging.level})`);
 }
 
-const agent = new AdaptiveAgent({
-  model,
+const {
+  agent,
+  runtime: { runStore, eventStore },
+} = createAdaptiveAgent({
+  model: {
+    provider: config.provider,
+    model: config.model,
+    apiKey: config.apiKey,
+    baseUrl: config.baseUrl,
+    siteUrl: config.siteUrl,
+    siteName: config.siteName,
+  },
   tools,
   delegates,
   delegation: {
     maxDepth: config.agent.delegation.maxDepth,
     maxChildrenPerRun: config.agent.delegation.maxChildrenPerRun,
   },
-  runStore,
-  eventStore,
-  snapshotStore,
   logger,
   defaults: {
     ...(config.agent.maxSteps === undefined ? {} : { maxSteps: config.agent.maxSteps }),

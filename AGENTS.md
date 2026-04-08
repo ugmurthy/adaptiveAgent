@@ -16,6 +16,7 @@
 - Prefer additive edits over rewriting history: update the newest v1.4 docs, and only touch v1.3/v1.2 docs when the task is about comparison, migration, or historical context.
 - Keep edits ASCII and Markdown-first; use short sections, flat bullets, fenced `ts`/`sql` blocks, and backticks for identifiers and event names.
 - In TypeScript examples, prefer explicit interfaces/types, Bun + TypeScript assumptions, named concepts, and avoid `any` unless the spec genuinely leaves a type open.
+- In `packages/gateway-fastify`, prefer unit-testing upgrade auth helpers and pure protocol handlers directly; Bun's `@fastify/websocket` `injectWS` harness is unreliable for live-upgrade tests, so keep one HTTP/listen smoke test and cover upgrade policy with focused auth tests.
 - In schema examples, preserve deterministic and resumability semantics: event log + snapshots, leases/heartbeats, optimistic versioning, and explicit compatibility checks.
 - Call out breaking changes clearly when moving between versions, especially around public API, persistence, event types, or replay behavior.
 - No Cursor, Claude, Windsurf, Cline, Goose, or Copilot rule files are present in this repository at the time this file was created.

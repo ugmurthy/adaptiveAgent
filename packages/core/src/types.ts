@@ -103,6 +103,18 @@ export interface RunRequest {
   metadata?: Record<string, JsonValue>;
 }
 
+export interface ChatMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
+export interface ChatRequest {
+  messages: ChatMessage[];
+  context?: Record<string, JsonValue>;
+  outputSchema?: JsonSchema;
+  metadata?: Record<string, JsonValue>;
+}
+
 export interface PlanRequest {
   goal: string;
   input?: JsonValue;
@@ -409,6 +421,8 @@ export interface RunStore {
 export interface EventStore {
   append(event: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>): Promise<AgentEvent>;
   listByRun(runId: UUID, afterSeq?: number): Promise<AgentEvent[]>;
+  /** Optional live subscription hook for persisted events. Returns an unsubscribe function. */
+  subscribe?(listener: (event: AgentEvent) => void): () => void;
 }
 
 export interface SnapshotStore {
@@ -463,3 +477,5 @@ export type RunResult<T extends JsonValue = JsonValue> =
       message: string;
       toolName: string;
     };
+
+export type ChatResult<T extends JsonValue = JsonValue> = RunResult<T>;

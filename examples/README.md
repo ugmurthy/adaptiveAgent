@@ -41,6 +41,9 @@ ollama serve
 # Default: uses Ollama with qwen3.5
 bun run examples/run-agent.ts
 
+# Interactive chat demo
+bun run examples/run-chat.ts
+
 # Custom goal
 bun run examples/run-agent.ts "Explain the architecture of this project"
 
@@ -68,6 +71,9 @@ AGENT_MAX_STEPS=60 bun run examples/run-agent.ts
 # Let model turns run longer, or disable the agent-side timeout entirely
 MODEL_TIMEOUT_MS=300000 bun run examples/run-agent.ts
 MODEL_TIMEOUT_MS=0 bun run examples/run-agent.ts
+
+# Set a persistent chat persona
+CHAT_SYSTEM_PROMPT="You are a terse staff engineer." bun run examples/run-chat.ts
 ```
 
 ## What the sample does
@@ -77,6 +83,15 @@ MODEL_TIMEOUT_MS=0 bun run examples/run-agent.ts
 3. Loads skills from `examples/skills/` as delegate profiles
 4. Runs the agent with your goal
 5. Prints the result, event timeline, and any child runs
+
+## Chat Demo
+
+`examples/run-chat.ts` shows the smallest chat-style integration on top of `agent.chat(...)`.
+
+- It keeps an in-memory transcript of `system`, `user`, and `assistant` messages.
+- Each turn sends the full transcript back through `agent.chat({ messages })`.
+- It uses no tools, so it behaves like a plain conversational assistant.
+- `/clear` resets the transcript, `/history` prints the current transcript, and `/exit` quits.
 
 ## Skills
 

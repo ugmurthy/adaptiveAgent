@@ -113,6 +113,18 @@ export interface RunRequest {
   metadata?: Record<string, JsonValue>;
 }
 
+export interface ChatMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
+export interface ChatRequest {
+  messages: ChatMessage[];
+  context?: Record<string, JsonValue>;
+  outputSchema?: JsonSchema;
+  metadata?: Record<string, JsonValue>;
+}
+
 export interface PlanRequest {
   goal: string;
   input?: JsonValue;
@@ -211,6 +223,7 @@ export interface ModelMessage {
   content: string;
   name?: string;
   toolCallId?: string;
+  toolCalls?: ModelToolCall[];
 }
 
 export interface ModelToolCall {
@@ -411,6 +424,7 @@ export interface RunStore {
 export interface EventStore {
   append(event: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>): Promise<AgentEvent>;
   listByRun(runId: UUID, afterSeq?: number): Promise<AgentEvent[]>;
+  subscribe?(listener: (event: AgentEvent) => void): () => void;
 }
 
 export interface SnapshotStore {
@@ -457,7 +471,15 @@ export type RunResult<T extends JsonValue = JsonValue> =
       message: string;
       toolName: string;
     };
+
+export type ChatResult<T extends JsonValue = JsonValue> = RunResult<T>;
 ```
+
+Additive runtime note:
+
+- `AdaptiveAgent.chat(request)` is the transcript-oriented companion to `run(request)`.
+- `chat()` seeds the run snapshot with transcript messages instead of the JSON `{ goal, input, context }` envelope used by `run()`.
+- `chat()` still uses the same run lifecycle, event log, snapshots, tool execution path, and `RunResult` union as `run()`.
 
 ## 2. Contract Notes
 

@@ -1,0 +1,83 @@
+## Codebase Patterns
+- Keep `session` as a gateway-owned host artifact; do not add it to `@adaptive-agent/core` contracts.
+- Preserve the v1.4 boundary: `run` is the execution unit, `rootRunId` identifies a run tree, and delegation remains synthetic `delegate.*` tools plus child runs.
+- Prefer Bun + Fastify in `packages/gateway-fastify`, with explicit JSON-friendly config and protocol types.
+- In `packages/gateway-fastify`, route TypeScript imports through `src/core.ts` so the package can typecheck against the built core runtime without inheriting unrelated `packages/core/src` errors.
+- Keep WebSocket protocol routing in a pure helper such as `handleGatewaySocketMessage(...)` so protocol behavior can be tested without depending on Bun/WebSocket client teardown semantics.
+- Keep routing deterministic and host-owned; bindings and session pinning decide `agentId`, not model output.
+- Gateway stores own sessions, transcripts, session-run links, and cron metadata; runtime stores remain authoritative for execution facts.
+- Per session, enforce a single write lane and a single active root run while allowing multiple same-principal observers.
+- Reuse one orchestrator for WebSocket traffic and cron-triggered work so chat, run, and approval behavior stay aligned.
+
+
+## 2026-04-08 16:01 IST - US-001
+Thread: https://ampcode.com/threads/T-019d6c97-de3e-720f-918f-a2391c84675e
+- Implemented the new `packages/gateway-fastify` workspace with Bun `build`, `test`, and `typecheck` scripts, a package entrypoint, a Fastify WebSocket bootstrap stub, and a higher-level gateway bootstrap helper.
+- Files changed: `packages/gateway-fastify/package.json`, `packages/gateway-fastify/tsconfig.json`, `packages/gateway-fastify/src/index.ts`, `packages/gateway-fastify/src/server.ts`, `packages/gateway-fastify/src/bootstrap.ts`, `packages/gateway-fastify/src/core.ts`, `packages/gateway-fastify/src/core-runtime.d.ts`, `bun.lock`.
+- **Learnings for future iterations:**
+  - The gateway package can already load config, agents, and registries before the protocol layer exists, so later stories can wire behavior into `bootstrapGateway(...)` instead of adding a second startup path.
+  - The initial WebSocket route intentionally closes connections with a stable stub until protocol validation lands.
+---
+
+## 2026-04-08 16:01 IST - US-002
+Thread: https://ampcode.com/threads/T-019d6c97-de3e-720f-918f-a2391c84675e
+- Added typed gateway and agent config loaders with deterministic validation for server, auth, channels, bindings, hooks, invocation modes, model config, defaults, routing, and metadata.
+- Files changed: `packages/gateway-fastify/src/config.ts`, `packages/gateway-fastify/src/config.test.ts`.
+- **Learnings for future iterations:**
+  - Gateway auth config is normalized into `{ provider, settings }`, which preserves JSON-friendly provider-specific fields without allowing inline executable behavior.
+  - Hook slots default to empty arrays when omitted, so config can stay terse while validation remains explicit.
+---
+
+## 2026-04-08 16:01 IST - US-003
+Thread: https://ampcode.com/threads/T-019d6c97-de3e-720f-918f-a2391c84675e
+- Added explicit registries for tools, delegates, hooks, and auth providers, along with fast-fail resolution helpers for gateway and agent config references.
+- Files changed: `packages/gateway-fastify/src/registries.ts`, `packages/gateway-fastify/src/registries.test.ts`.
+- **Learnings for future iterations:**
+  - Unknown registry references now fail with the source label and the currently registered names, which makes startup errors much easier to act on.
+  - Hook and auth references stay declarative strings resolved by code-owned registries rather than file paths or inline code in JSON.
+---
+
+## 2026-04-08 16:01 IST - US-004
+Thread: https://ampcode.com/threads/T-019d6c97-de3e-720f-918f-a2391c84675e
+- Added a lazy `AgentRegistry` that resolves validated configs up front, exposes invocation metadata synchronously, and materializes cached `AdaptiveAgent` bundles only on first use.
+- Files changed: `packages/gateway-fastify/src/agent-registry.ts`, `packages/gateway-fastify/src/agent-registry.test.ts`, `packages/gateway-fastify/src/bootstrap.ts`.
+- **Learnings for future iterations:**
+  - The registry caches the in-flight materialization promise, so concurrent first-use lookups for the same `agentId` collapse onto a single factory call.
+  - Routing-level checks for `defaultAgentId` and binding `agentId` references are already centralized in `bootstrapGateway(...)`, which is the right place to extend startup validation later.
+---
+
+## 2026-04-08 16:14 IST - US-005
+Thread: https://ampcode.com/threads/T-019d6c97-de3e-720f-918f-a2391c84675e
+- Added a concrete WebSocket protocol contract with inbound and outbound frame types, stable protocol error codes, runtime parsing/validation, and helpers for `pong` and error responses.
+- Files changed: `packages/gateway-fastify/src/protocol.ts`, `packages/gateway-fastify/src/protocol.test.ts`, `packages/gateway-fastify/src/index.ts`.
+- **Learnings for future iterations:**
+  - The protocol layer now distinguishes `invalid_json`, `invalid_frame`, `unknown_frame_type`, and `unsupported_frame`, which gives later session/auth work a stable error surface to build on.
+  - `run.start` already accepts `goal`, optional `input`, optional `context`, and optional `metadata`, so future orchestration work can plug into the current frame shape instead of redefining it.
+---
+
+## 2026-04-08 16:14 IST - US-006
+Thread: https://ampcode.com/threads/T-019d6c97-de3e-720f-918f-a2391c84675e
+- Wired the Fastify WebSocket route through the validated protocol handler, added a minimal health response that exposes the configured WebSocket path, and added a real listen smoke test for server startup.
+- Files changed: `packages/gateway-fastify/src/server.ts`, `packages/gateway-fastify/src/server.test.ts`.
+- **Learnings for future iterations:**
+  - The server now routes every socket message through `handleGatewaySocketMessage(...)`, so later features can extend one shared ingress path instead of scattering frame logic across route handlers.
+  - Under Bun, pure protocol-handler tests are more reliable than full live WebSocket teardown tests for iteration speed, while a simple `listen()` smoke test still covers server bootstrap.
+---
+
+## 2026-04-08 16:30 IST - US-007
+Thread: https://ampcode.com/threads/T-019d6cb7-6510-71ae-88d2-c0982d274fb2
+- Implemented JWT-backed upgrade authentication with a built-in `jwt` auth provider, normalized auth contexts, public-channel bypass via upgrade `channelId`, and stable `auth_required`, `invalid_token`, and `token_expired` error codes.
+- Files changed: `packages/gateway-fastify/package.json`, `bun.lock`, `packages/gateway-fastify/src/auth.ts`, `packages/gateway-fastify/src/protocol.ts`, `packages/gateway-fastify/src/registries.ts`, `packages/gateway-fastify/src/bootstrap.ts`, `packages/gateway-fastify/src/server.ts`, `packages/gateway-fastify/src/index.ts`, `packages/gateway-fastify/src/auth.test.ts`, `packages/gateway-fastify/src/registries.test.ts`.
+- **Learnings for future iterations:**
+  - The gateway can resolve a built-in JWT provider through the same auth registry mechanism used for custom providers, so future auth hardening can extend the registry rather than bypassing it.
+  - Under Bun, `@fastify/websocket` route behavior is easier to verify by testing `authenticateGatewayUpgrade(...)` directly and keeping the server suite focused on HTTP/listen smoke coverage.
+---
+
+## 2026-04-08 16:30 IST - US-008
+Thread: https://ampcode.com/threads/T-019d6cb7-6510-71ae-88d2-c0982d274fb2
+- Added gateway-owned store interfaces and in-memory implementations for sessions, transcript messages, session-run links, cron jobs, and cron runs, plus regression tests that cover ordering, lookup, due-job filtering, and clone isolation.
+- Files changed: `packages/gateway-fastify/src/stores.ts`, `packages/gateway-fastify/src/stores.test.ts`, `packages/gateway-fastify/src/index.ts`.
+- **Learnings for future iterations:**
+  - The in-memory stores already model the core ownership split the gateway needs later: session and cron facts stay in gateway records while run execution details remain linked by IDs.
+  - Returning cloned records from store reads and writes protects tests and future orchestrator code from mutating authoritative in-memory state by accident.
+---

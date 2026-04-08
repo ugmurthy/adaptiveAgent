@@ -1,5 +1,6 @@
 export * from './types.js';
 export * from './adaptive-agent.js';
+export * from './create-adaptive-agent.js';
 export * from './in-memory-event-store.js';
 export * from './in-memory-plan-store.js';
 export * from './in-memory-run-store.js';

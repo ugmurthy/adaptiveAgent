@@ -14,6 +14,9 @@ import type {
   AgentEvent,
   AgentRun,
   CaptureMode,
+  ChatMessage,
+  ChatRequest,
+  ChatResult,
   ExecutePlanRequest,
   EventSink,
   JsonObject,
@@ -75,6 +78,7 @@ const TERMINAL_RUN_STATUSES = new Set<RunStatus>([
 ]);
 
 const RESERVED_DELEGATE_PREFIX = 'delegate.';
+const CHAT_GOAL_MAX_LENGTH = 120;
 
 export class AdaptiveAgent {
   private readonly toolRegistry = new Map<string, ToolDefinition>();
@@ -162,6 +166,42 @@ export class AdaptiveAgent {
     });
 
     const initialState = this.createInitialExecutionState(createdRun, request.outputSchema);
+    await this.saveExecutionSnapshot(createdRun, initialState, createdRun.status);
+    return this.runWithExistingRun(createdRun.id, { outputSchema: request.outputSchema });
+  }
+
+  async chat(request: ChatRequest): Promise<ChatResult> {
+    const initialMessages = buildInitialChatMessages(request.messages, request.context, this.options.systemInstructions);
+    const goal = summarizeChatGoal(request.messages);
+    const createdRun = await this.options.runStore.createRun({
+      goal,
+      context: request.context,
+      metadata: request.metadata,
+      status: 'queued',
+    });
+
+    this.logLifecycle('info', 'run.created', {
+      ...runLogBindings(createdRun),
+      goal: summarizeValueForLog(goal),
+      context: captureValueForLog(request.context, { mode: this.defaultCaptureMode }),
+      metadata: captureValueForLog(request.metadata, { mode: 'summary' }),
+      outputSchema: request.outputSchema ? summarizeValueForLog(request.outputSchema) : undefined,
+      chat: true,
+      messageCount: request.messages.length,
+    });
+
+    await this.emit({
+      runId: createdRun.id,
+      type: 'run.created',
+      schemaVersion: 1,
+      payload: {
+        goal: createdRun.goal,
+        rootRunId: createdRun.rootRunId,
+        delegationDepth: createdRun.delegationDepth,
+      },
+    });
+
+    const initialState = this.createExecutionState(initialMessages, request.outputSchema);
     await this.saveExecutionSnapshot(createdRun, initialState, createdRun.status);
     return this.runWithExistingRun(createdRun.id, { outputSchema: request.outputSchema });
   }
@@ -1120,14 +1160,18 @@ export class AdaptiveAgent {
     };
   }
 
-  private createInitialExecutionState(run: AgentRun, outputSchema?: JsonSchema): ExecutionState {
+  private createExecutionState(messages: ModelMessage[], outputSchema?: JsonSchema): ExecutionState {
     return {
-      messages: buildInitialMessages(run, outputSchema, this.options.systemInstructions),
+      messages,
       stepsUsed: 0,
       pendingToolCalls: [],
       approvedToolCallIds: [],
       outputSchema,
     };
+  }
+
+  private createInitialExecutionState(run: AgentRun, outputSchema?: JsonSchema): ExecutionState {
+    return this.createExecutionState(buildInitialMessages(run, outputSchema, this.options.systemInstructions), outputSchema);
   }
 
   private async loadExecutionState(run: AgentRun, outputSchema?: JsonSchema): Promise<ExecutionState> {
@@ -1677,6 +1721,20 @@ function resolveDefaultModelTimeoutMs(provider: string): number {
   return DEFAULT_AGENT_DEFAULTS.modelTimeoutMs;
 }
 
+function buildAgentSystemMessage(systemInstructions?: string): ModelMessage {
+  const baseSystemPrompt =
+    'You are AdaptiveAgent. Use the available tools when needed. Keep execution linear. When the task is complete, return the final answer directly. If a tool has already completed the requested save or write action, do not call more tools just to verify or restate success unless the user explicitly asked for verification. When reporting saved artifacts, preserve the exact path returned by the tool.';
+
+  const systemContent = systemInstructions
+    ? `${baseSystemPrompt}\n\n## Skill Instructions\n\n${systemInstructions}`
+    : baseSystemPrompt;
+
+  return {
+    role: 'system',
+    content: systemContent,
+  };
+}
+
 function buildInitialMessages(run: AgentRun, outputSchema?: JsonSchema, systemInstructions?: string): ModelMessage[] {
   const requestPayload: JsonObject = {
     goal: run.goal,
@@ -1688,23 +1746,58 @@ function buildInitialMessages(run: AgentRun, outputSchema?: JsonSchema, systemIn
     requestPayload.outputSchema = outputSchema as unknown as JsonValue;
   }
 
-  const baseSystemPrompt =
-    'You are AdaptiveAgent. Use the available tools when needed. Keep execution linear. When the task is complete, return the final answer directly. If a tool has already completed the requested save or write action, do not call more tools just to verify or restate success unless the user explicitly asked for verification. When reporting saved artifacts, preserve the exact path returned by the tool.';
-
-  const systemContent = systemInstructions
-    ? `${baseSystemPrompt}\n\n## Skill Instructions\n\n${systemInstructions}`
-    : baseSystemPrompt;
-
   return [
-    {
-      role: 'system',
-      content: systemContent,
-    },
+    buildAgentSystemMessage(systemInstructions),
     {
       role: 'user',
       content: JSON.stringify(requestPayload, null, 2),
     },
   ];
+}
+
+function buildInitialChatMessages(
+  messages: ChatMessage[],
+  context?: Record<string, JsonValue>,
+  systemInstructions?: string,
+): ModelMessage[] {
+  if (messages.length === 0) {
+    throw new Error('chat() requires at least one message');
+  }
+
+  const contextMessage =
+    context && Object.keys(context).length > 0
+      ? [
+          {
+            role: 'system' as const,
+            content: `## Additional Context\n\n${JSON.stringify(context, null, 2)}`,
+          },
+        ]
+      : [];
+
+  return [
+    buildAgentSystemMessage(systemInstructions),
+    ...contextMessage,
+    ...messages.map((message) => ({
+      role: message.role,
+      content: message.content,
+    })),
+  ];
+}
+
+function summarizeChatGoal(messages: ChatMessage[]): string {
+  if (messages.length === 0) {
+    return 'Continue the conversation.';
+  }
+
+  const latestUserMessage = [...messages]
+    .reverse()
+    .find((message) => message.role === 'user' && message.content.trim().length > 0);
+  const basis = latestUserMessage?.content.trim() || messages[messages.length - 1]?.content.trim() || '';
+  if (!basis) {
+    return 'Continue the conversation.';
+  }
+
+  return basis.length > CHAT_GOAL_MAX_LENGTH ? `${basis.slice(0, CHAT_GOAL_MAX_LENGTH - 3)}...` : basis;
 }
 
 function serializeExecutionState(state: ExecutionState): JsonObject {

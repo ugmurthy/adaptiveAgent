@@ -35,6 +35,7 @@ Not implemented yet:
 .
 |- packages/core/                     # runtime prototype
 |- examples/run-agent.ts             # end-to-end sample script
+|- examples/run-chat.ts              # interactive chat demo
 |- examples/skills/                  # sample SKILL.md delegates
 |- agen-spec-v1.4.md                 # current product spec
 |- agen-contracts-v1.4.md            # current implementation contracts
@@ -46,16 +47,62 @@ Not implemented yet:
 
 ## What The Core Package Does
 
-`packages/core` is the executable heart of the repo. It exposes:
-
-- `AdaptiveAgent`
-- in-memory stores for runs, events, snapshots, and plans
-- model adapters for Ollama, OpenRouter, Mistral, and Mesh
-- built-in tools including `read_file`, `list_directory`, `write_file`, `shell_exec`, `web_search`, and `read_web_page`
-- skill parsing utilities that load `SKILL.md` files and turn them into delegate definitions, with optional handler module loading for executable skills
-- structured logging helpers for model requests, tool calls, outputs, and delegation lifecycle events
+`packages/core` is the executable heart of the repo. Its package entrypoint is `packages/core/src/index.ts`, and that entrypoint re-exports the runtime, stores, adapters, tools, skills, logging helpers, and core contracts used by the prototype.
 
 The delegation model follows the v1.4 design boundary: tools remain the only first-class executable primitive, and delegation is represented as synthetic `delegate.<name>` tools plus normal child runs.
+
+## @adaptive-agent/core API
+
+The workspace-local package entrypoint is `./packages/core/src/index.js`:
+
+```ts
+import {
+  AdaptiveAgent,
+  createAdaptiveAgent,
+  createAdaptiveAgentRuntime,
+  createListDirectoryTool,
+  createModelAdapter,
+  createReadFileTool,
+} from "./packages/core/src/index.js";
+```
+
+### Runtime Surface
+
+- `AdaptiveAgent` is the main runtime class. Its public methods are `run(request)`, `chat(request)`, `resume(runId)`, `interrupt(runId)`, `resolveApproval(runId, approved)`, `executePlan(request)`, and `plan(request)`.
+- `createAdaptiveAgent(options)` is the higher-level constructor for the common case: it resolves a model adapter from config when needed, creates default in-memory runtime stores, merges optional `skills` into `delegates`, and returns both `{ agent, runtime }`.
+- `createAdaptiveAgentRuntime(options?)` creates the in-memory-backed runtime bundle used by the helper and can also be reused directly when you want explicit access to the stores.
+- `plan(request)` is exported, but currently throws because plan generation is not implemented in the scaffold yet.
+- `DelegationExecutor`, `DelegationError`, `ExecuteChildRunRequest`, and `ParentResumeResult` are also exported for lower-level delegation orchestration.
+
+### Core Contracts
+
+- The package re-exports the runtime contracts from `src/types.ts`, including `AdaptiveAgentOptions`, `AgentDefaults`, `DelegationPolicy`, `RunRequest`, `ChatRequest`, `ChatMessage`, `PlanRequest`, `ExecutePlanRequest`, `RunResult`, `ChatResult`, `ToolDefinition`, `ToolContext`, `DelegateDefinition`, `ModelAdapter`, `RunStore`, `EventStore`, `SnapshotStore`, `PlanStore`, `AgentRun`, `AgentEvent`, `RunSnapshot`, `PlanStep`, `PlanExecution`, and `UsageSummary`.
+- Those types are the implementation-facing API for host applications that want to provide custom tools, stores, model adapters, delegates, or event sinks.
+
+### In-Memory Stores
+
+- `InMemoryRunStore`, `InMemoryEventStore`, `InMemorySnapshotStore`, and `InMemoryPlanStore` are included for local development and examples.
+- `OptimisticConcurrencyError` is exported from the run store implementation for callers that want to handle version conflicts explicitly.
+
+### Model Adapters
+
+- `createModelAdapter(config)` creates a `ModelAdapter` for `ollama`, `openrouter`, `mistral`, or `mesh`.
+- The concrete adapter classes are also exported: `OllamaAdapter`, `OpenRouterAdapter`, `MistralAdapter`, `MeshAdapter`, and the shared `BaseOpenAIChatAdapter`.
+- Related config and error exports are available as part of the public API: `ModelAdapterConfig`, `OllamaAdapterConfig`, `OpenRouterAdapterConfig`, `MistralAdapterConfig`, `MeshAdapterConfig`, `BaseOpenAIChatAdapterConfig`, and `ModelRequestError`.
+
+### Built-In Tool Factories
+
+- `createReadFileTool(config)` creates `read_file`; `ReadFileToolConfig` supports `allowedRoot` and `maxSizeBytes`.
+- `createListDirectoryTool(config)` creates `list_directory`; `ListDirectoryToolConfig` supports `allowedRoot`.
+- `createWriteFileTool(config)` creates `write_file`; `WriteFileToolConfig` supports `allowedRoot` and `createDirectories`. This tool requires approval.
+- `createShellExecTool(config)` creates `shell_exec`; `ShellExecToolConfig` supports `cwd`, `maxOutputBytes`, and `shell`. This tool requires approval.
+- `createWebSearchTool(config)` creates `web_search`; `WebSearchToolConfig` supports `provider`, `apiKey`, `maxResults`, `baseUrl`, and `timeoutMs`.
+- `createReadWebPageTool(config)` creates `read_web_page`; `ReadWebPageToolConfig` supports `maxSizeBytes`, `maxTextLength`, and `timeoutMs`.
+
+### Skills And Logging
+
+- Skill-loading exports include `loadSkillFromDirectory`, `loadSkillFromFile`, `parseSkillMarkdown`, `skillToDelegate`, `skillsToDelegate`, `SkillLoadError`, `LoadSkillOptions`, and `SkillDefinition`.
+- Logging exports include `createAdaptiveAgentLogger`, `DEFAULT_LOG_LEVEL`, `DEFAULT_LOG_DESTINATION`, `captureValueForLog`, `summarizeValueForLog`, `errorForLog`, `runLogBindings`, `summarizeModelRequestForLog`, `summarizeModelResponseForLog`, `captureToolInputForLog`, and `captureToolOutputForLog`.
 
 ## Quick Start
 
@@ -83,6 +130,13 @@ Run the sample with a custom goal:
 bun run examples/run-agent.ts "Explain the architecture of this repository"
 ```
 
+Run the interactive chat demo:
+
+```bash
+bun run examples/run-chat.ts
+CHAT_SYSTEM_PROMPT="You are a terse staff engineer." bun run examples/run-chat.ts
+```
+
 Use a hosted provider instead:
 
 ```bash
@@ -106,28 +160,23 @@ Additional setup details and environment variable notes live in `examples/README
 This repository is a monorepo prototype rather than a published package, so local examples import from the workspace source directly:
 
 ```ts
-import { AdaptiveAgent } from "./packages/core/src/adaptive-agent.js";
-import { InMemoryEventStore } from "./packages/core/src/in-memory-event-store.js";
-import { InMemoryRunStore } from "./packages/core/src/in-memory-run-store.js";
-import { InMemorySnapshotStore } from "./packages/core/src/in-memory-snapshot-store.js";
-import { createModelAdapter } from "./packages/core/src/adapters/create-model-adapter.js";
-import { createListDirectoryTool } from "./packages/core/src/tools/list-directory.js";
-import { createReadFileTool } from "./packages/core/src/tools/read-file.js";
+import {
+  createAdaptiveAgent,
+  createListDirectoryTool,
+  createReadFileTool,
+} from "./packages/core/src/index.js";
 
 const projectRoot = process.cwd();
 
-const agent = new AdaptiveAgent({
-  model: createModelAdapter({
+const { agent } = createAdaptiveAgent({
+  model: {
     provider: "ollama",
     model: process.env.OLLAMA_MODEL ?? "qwen3.5",
-  }),
+  },
   tools: [
     createReadFileTool({ allowedRoot: projectRoot }),
     createListDirectoryTool({ allowedRoot: projectRoot }),
   ],
-  runStore: new InMemoryRunStore(),
-  eventStore: new InMemoryEventStore(),
-  snapshotStore: new InMemorySnapshotStore(),
 });
 
 const result = await agent.run({
@@ -138,6 +187,8 @@ console.log(result);
 ```
 
 For a fuller example with delegates, approvals, provider selection, markdown rendering, and optional web tools, see `examples/run-agent.ts`.
+
+For a minimal multi-turn chat loop that passes transcript messages into `agent.chat(...)`, see `examples/run-chat.ts`.
 
 ## Skills And Delegation
 
@@ -248,8 +299,6 @@ bun test
 ```
 
 The root workspace is mostly a container for docs, examples, and the `packages/core` prototype. Most implementation work happens inside `packages/core/src`.
-
-## License
 
 ## License
 
