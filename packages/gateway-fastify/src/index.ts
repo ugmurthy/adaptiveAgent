@@ -4,6 +4,7 @@ export * from './config.js';
 export * from './protocol.js';
 export * from './registries.js';
 export * from './agent-registry.js';
+export * from './session.js';
 export * from './server.js';
 export * from './bootstrap.js';
 export * from './stores.js';

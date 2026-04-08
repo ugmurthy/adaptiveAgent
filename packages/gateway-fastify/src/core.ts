@@ -1,11 +1,14 @@
-// @ts-expect-error The built core bundle is used as a runtime dependency, but it does not ship declarations yet.
-import * as coreRuntime from '../../core/dist/index.js';
-
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
 export type JsonSchema = Record<string, unknown>;
 export type CaptureMode = 'full' | 'summary' | 'none';
+
+interface CoreRuntimeModule {
+  createAdaptiveAgent(options: CreateAdaptiveAgentOptions): unknown;
+}
+
+let coreRuntimePromise: Promise<CoreRuntimeModule> | undefined;
 
 export interface AgentDefaults {
   maxSteps?: number;
@@ -76,6 +79,13 @@ export interface CreateAdaptiveAgentOptions {
   systemInstructions?: string;
 }
 
-export const createAdaptiveAgent = coreRuntime.createAdaptiveAgent as (
-  options: CreateAdaptiveAgentOptions,
-) => CreatedAdaptiveAgent;
+export async function createAdaptiveAgent(options: CreateAdaptiveAgentOptions): Promise<CreatedAdaptiveAgent> {
+  const coreRuntime = await loadCoreRuntime();
+  return coreRuntime.createAdaptiveAgent(options) as CreatedAdaptiveAgent;
+}
+
+function loadCoreRuntime(): Promise<CoreRuntimeModule> {
+  // @ts-expect-error The built core bundle is a runtime-only dependency without emitted declarations.
+  coreRuntimePromise ??= import('../../core/dist/index.js') as Promise<CoreRuntimeModule>;
+  return coreRuntimePromise;
+}

@@ -29,6 +29,8 @@ export const PROTOCOL_ERROR_CODES = [
   'auth_required',
   'invalid_token',
   'token_expired',
+  'session_not_found',
+  'session_forbidden',
 ] as const;
 
 export type InboundFrameType = (typeof INBOUND_FRAME_TYPES)[number];

@@ -91,11 +91,11 @@ describe('gateway protocol validation', () => {
       type: 'pong',
       id: 'abc',
     });
-    expect(createProtocolErrorFrame(createUnsupportedFrameError('session.open'))).toEqual({
+    expect(createProtocolErrorFrame(createUnsupportedFrameError('run.start'))).toEqual({
       type: 'error',
       code: 'unsupported_frame',
-      message: 'Inbound frame type "session.open" is valid but not implemented yet.',
-      requestType: 'session.open',
+      message: 'Inbound frame type "run.start" is valid but not implemented yet.',
+      requestType: 'run.start',
       details: undefined,
     });
   });

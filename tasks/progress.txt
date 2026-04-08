@@ -3,6 +3,7 @@
 - Preserve the v1.4 boundary: `run` is the execution unit, `rootRunId` identifies a run tree, and delegation remains synthetic `delegate.*` tools plus child runs.
 - Prefer Bun + Fastify in `packages/gateway-fastify`, with explicit JSON-friendly config and protocol types.
 - In `packages/gateway-fastify`, route TypeScript imports through `src/core.ts` so the package can typecheck against the built core runtime without inheriting unrelated `packages/core/src` errors.
+- When `packages/gateway-fastify` needs runtime access to `../../core/dist/index.js`, load it lazily inside `src/core.ts`; eager imports make Vitest execute Bun-specific bundle helpers before tests can substitute their own factories.
 - Keep WebSocket protocol routing in a pure helper such as `handleGatewaySocketMessage(...)` so protocol behavior can be tested without depending on Bun/WebSocket client teardown semantics.
 - Keep routing deterministic and host-owned; bindings and session pinning decide `agentId`, not model output.
 - Gateway stores own sessions, transcripts, session-run links, and cron metadata; runtime stores remain authoritative for execution facts.
@@ -80,4 +81,14 @@ Thread: https://ampcode.com/threads/T-019d6cb7-6510-71ae-88d2-c0982d274fb2
 - **Learnings for future iterations:**
   - The in-memory stores already model the core ownership split the gateway needs later: session and cron facts stay in gateway records while run execution details remain linked by IDs.
   - Returning cloned records from store reads and writes protects tests and future orchestrator code from mutating authoritative in-memory state by accident.
+---
+
+## 2026-04-08 17:34 IST - US-009
+Thread: https://ampcode.com/threads/T-019d6cf4-6f04-73a2-85a6-ae341f37db42
+- Implemented authenticated `session.open` handling so the gateway now creates session records, reattaches same-principal reconnects, rejects cross-principal attachment attempts, and threads a shared gateway store instance through bootstrap/server startup.
+- Files changed: `packages/gateway-fastify/src/session.ts`, `packages/gateway-fastify/src/server.ts`, `packages/gateway-fastify/src/server.test.ts`, `packages/gateway-fastify/src/protocol.ts`, `packages/gateway-fastify/src/protocol.test.ts`, `packages/gateway-fastify/src/bootstrap.ts`, `packages/gateway-fastify/src/index.ts`, `packages/gateway-fastify/src/core.ts`, `tasks/prd.json`, `tasks/progress.txt`.
+- **Learnings for future iterations:**
+  - The session opener is now a dedicated helper that takes `authContext`, `stores`, `now`, and `sessionIdFactory`, which makes session lifecycle behavior deterministic in tests and reusable for later message/run orchestration.
+  - Sharing one `GatewayStores` instance across `bootstrapGateway(...)` and `createGatewayServer(...)` keeps reconnects and multi-connection observers attached to the same authoritative session state.
+  - Lazy-loading the built core runtime in `src/core.ts` keeps gateway tests from evaluating Bun-specific bundle helpers unless the default agent factory is actually used.
 ---

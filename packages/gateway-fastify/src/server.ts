@@ -5,6 +5,7 @@ import {
   GatewayAuthError,
   authenticateGatewayUpgrade,
   createAuthErrorFrame,
+  type GatewayAuthContext,
   type GatewayUpgradeQuery,
 } from './auth.js';
 import type { GatewayConfig } from './config.js';
@@ -18,10 +19,22 @@ import {
   serializeOutboundFrame,
 } from './protocol.js';
 import type { ResolvedGatewayAuthProvider } from './registries.js';
+import { openGatewaySession } from './session.js';
+import { createInMemoryGatewayStores, type GatewayStores } from './stores.js';
 
 export interface CreateGatewayServerOptions {
   fastify?: FastifyServerOptions;
   auth?: ResolvedGatewayAuthProvider;
+  stores?: GatewayStores;
+  now?: () => Date;
+  sessionIdFactory?: () => string;
+}
+
+export interface GatewaySocketMessageContext {
+  authContext?: GatewayAuthContext;
+  stores?: GatewayStores;
+  now?: () => Date;
+  sessionIdFactory?: () => string;
 }
 
 export async function createGatewayServer(
@@ -29,6 +42,7 @@ export async function createGatewayServer(
   options: CreateGatewayServerOptions = {},
 ): Promise<FastifyInstance> {
   const app = Fastify(options.fastify);
+  const stores = options.stores ?? createInMemoryGatewayStores();
 
   await app.register(websocket);
 
@@ -57,10 +71,17 @@ export async function createGatewayServer(
         }
       },
     },
-    (socket) => {
-    socket.on('message', (message: unknown) => {
-      socket.send(serializeOutboundFrame(handleGatewaySocketMessage(message)));
-    });
+    (socket, request) => {
+      socket.on('message', async (message: unknown) => {
+        const frame = await handleGatewaySocketMessage(message, {
+          authContext: request.gatewayAuthContext,
+          stores,
+          now: options.now,
+          sessionIdFactory: options.sessionIdFactory,
+        });
+
+        socket.send(serializeOutboundFrame(frame));
+      });
     },
   );
 
@@ -74,11 +95,23 @@ export async function createGatewayServer(
   return app;
 }
 
-export function handleGatewaySocketMessage(message: unknown): OutboundFrame {
+export async function handleGatewaySocketMessage(
+  message: unknown,
+  context: GatewaySocketMessageContext = {},
+): Promise<OutboundFrame> {
   try {
     const frame = parseInboundFrame(message);
     if (frame.type === 'ping') {
       return createPongFrame(frame);
+    }
+
+    if (frame.type === 'session.open' && context.stores) {
+      return await openGatewaySession(frame, {
+        authContext: context.authContext,
+        stores: context.stores,
+        now: context.now,
+        sessionIdFactory: context.sessionIdFactory,
+      });
     }
 
     return createProtocolErrorFrame(createUnsupportedFrameError(frame.type));

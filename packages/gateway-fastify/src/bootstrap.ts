@@ -12,6 +12,7 @@ import { AgentRegistry, createAgentRegistry, type AgentFactory } from './agent-r
 import { createJwtAuthProvider } from './auth.js';
 import { createGatewayServer } from './server.js';
 import { createModuleRegistry, ModuleRegistry, type ResolvedGatewayModules } from './registries.js';
+import { createInMemoryGatewayStores, type GatewayStores } from './stores.js';
 
 export interface BootstrapGatewayOptions {
   cwd?: string;
@@ -20,6 +21,7 @@ export interface BootstrapGatewayOptions {
   moduleRegistry?: ModuleRegistry;
   agentFactory?: AgentFactory;
   fastify?: FastifyServerOptions;
+  stores?: GatewayStores;
 }
 
 export interface BootstrappedGateway {
@@ -29,6 +31,7 @@ export interface BootstrappedGateway {
   agentConfigs: Array<LoadedConfig<AgentConfig>>;
   agentRegistry: AgentRegistry;
   gatewayModules: ResolvedGatewayModules;
+  stores: GatewayStores;
 }
 
 export async function bootstrapGateway(options: BootstrapGatewayOptions = {}): Promise<BootstrappedGateway> {
@@ -52,12 +55,14 @@ export async function bootstrapGateway(options: BootstrapGatewayOptions = {}): P
     moduleRegistry,
     agentFactory: options.agentFactory,
   });
+  const stores = options.stores ?? createInMemoryGatewayStores();
 
   validateRoutingReferences(loadedGatewayConfig.config, agentRegistry, loadedGatewayConfig.path);
 
   const app = await createGatewayServer(loadedGatewayConfig.config, {
     fastify: options.fastify,
     auth: gatewayModules.auth,
+    stores,
   });
 
   return {
@@ -67,6 +72,7 @@ export async function bootstrapGateway(options: BootstrapGatewayOptions = {}): P
     agentConfigs: loadedAgentConfigs,
     agentRegistry,
     gatewayModules,
+    stores,
   };
 }
 
