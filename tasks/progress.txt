@@ -15,6 +15,9 @@
 - Channel subscriptions use `scope:id` format; parse with `parseChannelId(...)` and manage with `createChannelSubscriptionManager()`.
 - Redact outbound event data with `redactSensitiveMetadata(...)` and project auth contexts with `redactAuthClaims(...)` before delivering to clients.
 - Execute gateway hooks via `executeHookSlot(hooks, slot, context)` which handles ordering, rejection, enrichment, and failure policy consistently.
+- File-backed stores use `createFileGatewayStores({ baseDir })` for local dev; Postgres stores use `createPostgresSessionStores({ client })` and `createPostgresCronStores({ client })` for production.
+- The `PostgresClient` interface is a minimal `query<T>(sql, params)` contract; any pg-compatible driver works.
+- Lease-based cron claiming uses atomic conditional UPDATEs; `claimLease` returns `undefined` when another worker holds the lease.
 
 
 ## 2026-04-08 16:01 IST - US-001
@@ -187,4 +190,34 @@ Thread: https://ampcode.com/threads/T-019d707b-b23c-7138-9830-a0838054d9e2
   - Before hooks can reject by returning `{ rejected: true, rejectionReason }` or enrich by returning `{ metadata }`, and enriched metadata flows forward to subsequent hooks in the same slot.
   - `HookExecutionError` captures `hookId` and `slot` so callers can map failures to specific protocol error codes.
   - `createEmptyResolvedHooks(...)` is the canonical way to get a hook structure with all slots initialized to empty arrays, useful for tests and default construction.
+---
+
+## 2026-04-09 10:11 IST - US-019
+Thread: https://ampcode.com/threads/T-019d707b-b23c-7138-9830-a0838054d9e2
+- Added file-backed stores for all 5 gateway store interfaces with a documented on-disk layout: sessions, transcripts (per-session subdirs), session-run-links, cron-jobs, and cron-runs.
+- Files changed: `packages/gateway-fastify/src/stores-file.ts`, `packages/gateway-fastify/src/stores-file.test.ts`, `packages/gateway-fastify/src/index.ts`.
+- **Learnings for future iterations:**
+  - The on-disk layout uses `<baseDir>/<collection>/<id>.json` for flat stores and `<baseDir>/transcripts/<sessionId>/<messageId>.json` for session-scoped transcript messages.
+  - File stores read all records on every list/filter call, which is fine for local dev but not for production; Postgres stores are the production path.
+  - `createFileGatewayStores({ baseDir })` is the canonical factory; reloading from the same `baseDir` after restart recovers all state.
+---
+
+## 2026-04-09 10:14 IST - US-020
+Thread: https://ampcode.com/threads/T-019d707b-b23c-7138-9830-a0838054d9e2
+- Added PostgreSQL-backed stores for sessions, transcript messages, and session-run links with documented schema, typed SQL queries, and bidirectional row↔record mapping.
+- Files changed: `packages/gateway-fastify/src/stores-postgres.ts`, `packages/gateway-fastify/src/stores-postgres.test.ts`, `packages/gateway-fastify/src/index.ts`.
+- **Learnings for future iterations:**
+  - The `PostgresClient` interface (`query<T>(sql, params) => { rows, rowCount }`) is intentionally minimal so any pg-compatible driver can be plugged in.
+  - All SQL is exposed as named query constants (`POSTGRES_SESSION_QUERIES`, etc.) so schema migrations and query audits can reference stable string keys.
+  - Gateway tables (`gateway_sessions`, `gateway_transcript_messages`, `gateway_session_run_links`) are namespaced to avoid collisions with runtime execution tables.
+---
+
+## 2026-04-09 10:16 IST - US-021
+Thread: https://ampcode.com/threads/T-019d707b-b23c-7138-9830-a0838054d9e2
+- Added PostgreSQL-backed cron job and cron run stores with lease-based claiming via atomic `claimLease(...)` and `releaseLease(...)` SQL operations.
+- Files changed: `packages/gateway-fastify/src/stores-postgres-cron.ts`, `packages/gateway-fastify/src/stores-postgres-cron.test.ts`, `packages/gateway-fastify/src/index.ts`.
+- **Learnings for future iterations:**
+  - `claimLease` uses a conditional UPDATE (`WHERE lease_owner IS NULL OR lease_expires_at < now`) so only one worker can claim a due fire time; returns `undefined` if the lease is already held.
+  - `releaseLease` requires the caller to prove ownership via `lease_owner` match, preventing accidental release of another worker's lease.
+  - Cron stores extend the base `CronJobStore`/`CronRunStore` interfaces with lease-aware methods, so the scheduler can use them while generic code keeps the simpler interface.
 ---
