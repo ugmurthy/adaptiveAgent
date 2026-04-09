@@ -2,10 +2,10 @@ import type { AgentRegistry } from './agent-registry.js';
 import type { GatewayAuthContext } from './auth.js';
 import type { GatewayConfig } from './config.js';
 import type { JsonObject, JsonValue, RunResult } from './core.js';
-import type { ApprovalRequestedFrame, RunOutputFrame, RunStartFrame } from './protocol.js';
+import type { ApprovalRequestedFrame, ApprovalResolveFrame, RunOutputFrame, RunStartFrame } from './protocol.js';
 import { ProtocolValidationError } from './protocol.js';
 import { resolveGatewayRoute } from './routing.js';
-import { getAuthorizedGatewaySession } from './session.js';
+import { assertGatewayPendingApproval, getAuthorizedGatewaySession } from './session.js';
 import type { GatewaySessionRecord, GatewayStores } from './stores.js';
 
 export interface ExecuteGatewayRunStartOptions {
@@ -14,6 +14,13 @@ export interface ExecuteGatewayRunStartOptions {
   stores: GatewayStores;
   authContext?: GatewayAuthContext;
   requestedChannelId?: string;
+  now?: () => Date;
+}
+
+export interface ExecuteGatewayApprovalResolutionOptions {
+  agentRegistry: AgentRegistry;
+  stores: GatewayStores;
+  authContext?: GatewayAuthContext;
   now?: () => Date;
 }
 
@@ -122,6 +129,88 @@ export async function executeGatewayRunStart(
   }
 }
 
+export async function executeGatewayApprovalResolution(
+  frame: ApprovalResolveFrame,
+  options: ExecuteGatewayApprovalResolutionOptions,
+): Promise<RunOutputFrame | ApprovalRequestedFrame> {
+  const nowIso = (options.now ?? (() => new Date()))().toISOString();
+  const session = await getAuthorizedGatewaySession(frame.sessionId, {
+    authContext: options.authContext,
+    stores: options.stores,
+    requestType: frame.type,
+  });
+  assertGatewayPendingApproval(session, frame.runId, frame.type);
+
+  const agentId = session.agentId;
+  if (!agentId) {
+    throw new ProtocolValidationError(
+      'run_failed',
+      `Session "${session.id}" does not have a routed agent for approval resolution.`,
+      {
+        requestType: frame.type,
+        details: { sessionId: session.id, runId: frame.runId },
+      },
+    );
+  }
+
+  const agent = await options.agentRegistry.getAgent(agentId);
+  if (!agent.agent.resolveApproval || !agent.agent.resume) {
+    throw new ProtocolValidationError(
+      'run_failed',
+      `Agent "${agentId}" does not support approval resolution.`,
+      {
+        requestType: frame.type,
+        details: { sessionId: session.id, runId: frame.runId, agentId },
+      },
+    );
+  }
+
+  const runningSession = await options.stores.sessions.update({
+    ...session,
+    status: 'running',
+    updatedAt: nowIso,
+  });
+
+  try {
+    await agent.agent.resolveApproval(frame.runId, frame.approved);
+    const resumedResult = await agent.agent.resume(frame.runId);
+    const rootRunId = (await resolveRootRunId(agent.runtime.runStore, resumedResult.runId)) ?? session.currentRootRunId ?? frame.runId;
+
+    return settleStructuredRunResult(resumedResult, rootRunId, {
+      agentId,
+      session: runningSession,
+      authContext: options.authContext,
+      agentRegistry: options.agentRegistry,
+      stores: options.stores,
+      nowIso,
+    });
+  } catch (error) {
+    if (error instanceof ProtocolValidationError) {
+      throw error;
+    }
+
+    await settleSession(options.stores, runningSession, {
+      status: 'failed',
+      currentRunId: undefined,
+      currentRootRunId: undefined,
+      updatedAt: nowIso,
+    });
+
+    throw new ProtocolValidationError(
+      'run_failed',
+      error instanceof Error ? error.message : 'Approval resolution failed unexpectedly.',
+      {
+        requestType: frame.type,
+        details: {
+          sessionId: runningSession.id,
+          runId: frame.runId,
+          agentId,
+        },
+      },
+    );
+  }
+}
+
 interface ExecuteResolvedGatewayRunOptions {
   agentId: string;
   session?: GatewaySessionRecord;
@@ -150,7 +239,7 @@ async function executeResolvedGatewayRun(
     context: buildGatewayRunContext(frame, options.session, options.authContext, options.requestedChannelId),
     metadata: buildGatewayRunMetadata(frame, options.session?.id, options.agentId),
   });
-  const rootRunId = await resolveRootRunId(agent.runtime.runStore, runResult.runId);
+  const rootRunId = (await resolveRootRunId(agent.runtime.runStore, runResult.runId)) ?? runResult.runId;
 
   if (options.session) {
     await options.stores.sessionRunLinks.append({
@@ -360,8 +449,8 @@ function assertChannelAllowsInvocation(
 async function resolveRootRunId(
   runStore: { getRun(runId: string): Promise<{ rootRunId: string } | null> },
   runId: string,
-): Promise<string> {
-  return (await runStore.getRun(runId))?.rootRunId ?? runId;
+): Promise<string | undefined> {
+  return (await runStore.getRun(runId))?.rootRunId;
 }
 
 function serializeClarificationRequest(result: Extract<RunResult, { status: 'clarification_requested' }>): JsonValue {

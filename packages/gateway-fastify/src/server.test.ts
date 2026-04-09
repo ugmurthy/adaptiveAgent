@@ -591,6 +591,373 @@ describe('createGatewayServer', () => {
     expect(await stores.sessionRunLinks.listBySession('session-1')).toEqual([]);
     expect(await stores.sessions.listByAuthSubject('user-123')).toEqual([]);
   });
+
+  it('resolves approval on the same session run and returns terminal output', async () => {
+    const stores = createInMemoryGatewayStores();
+    const authContext = createAuthContext('user-123');
+    const run = vi.fn(async () => ({
+      status: 'approval_requested' as const,
+      runId: 'run-approve-1',
+      message: 'Approval required before invoking write_file',
+      toolName: 'write_file',
+    }));
+    const resolveApproval = vi.fn(async () => undefined);
+    const resume = vi.fn(async () => ({
+      status: 'success' as const,
+      runId: 'run-approve-1',
+      output: { approved: true },
+      stepsUsed: 2,
+      usage: { promptTokens: 6, completionTokens: 4, estimatedCostUSD: 0.0008 },
+    }));
+    const agentRegistry = createGatewayTestAgentRegistry({
+      run,
+      resolveApproval,
+      resume,
+      runtimeRuns: {
+        'run-approve-1': { id: 'run-approve-1', rootRunId: 'root-run-approve-1', status: 'awaiting_approval' },
+      },
+    });
+
+    await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'session.open',
+        channelId: 'webchat',
+      }),
+      {
+        authContext,
+        stores,
+        now: () => new Date('2026-04-08T10:00:00.000Z'),
+        sessionIdFactory: () => 'session-1',
+      },
+    );
+
+    const approvalRequested = await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'run.start',
+        sessionId: 'session-1',
+        goal: 'Write a protected file',
+      }),
+      {
+        gatewayConfig: createChatGatewayConfig(),
+        agentRegistry,
+        authContext,
+        stores,
+        now: () => new Date('2026-04-08T10:04:00.000Z'),
+      },
+    );
+
+    expect(approvalRequested).toEqual({
+      type: 'approval.requested',
+      runId: 'run-approve-1',
+      rootRunId: 'root-run-approve-1',
+      sessionId: 'session-1',
+      toolName: 'write_file',
+      reason: 'Approval required before invoking write_file',
+    });
+    expect(await stores.sessions.get('session-1')).toMatchObject({
+      status: 'awaiting_approval',
+      currentRunId: 'run-approve-1',
+      currentRootRunId: 'root-run-approve-1',
+    });
+
+    const response = await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'approval.resolve',
+        sessionId: 'session-1',
+        runId: 'run-approve-1',
+        approved: true,
+      }),
+      {
+        agentRegistry,
+        authContext,
+        stores,
+        now: () => new Date('2026-04-08T10:05:00.000Z'),
+      },
+    );
+
+    expect(response).toEqual({
+      type: 'run.output',
+      runId: 'run-approve-1',
+      rootRunId: 'root-run-approve-1',
+      sessionId: 'session-1',
+      status: 'succeeded',
+      output: { approved: true },
+    });
+    expect(resolveApproval).toHaveBeenCalledWith('run-approve-1', true);
+    expect(resume).toHaveBeenCalledWith('run-approve-1');
+    expect(await stores.sessions.get('session-1')).toMatchObject({
+      status: 'idle',
+      currentRunId: undefined,
+      currentRootRunId: undefined,
+      lastCompletedRootRunId: 'root-run-approve-1',
+      updatedAt: '2026-04-08T10:05:00.000Z',
+    });
+    expect(await stores.sessionRunLinks.listBySession('session-1')).toEqual([
+      {
+        sessionId: 'session-1',
+        runId: 'run-approve-1',
+        rootRunId: 'root-run-approve-1',
+        invocationKind: 'run',
+        metadata: undefined,
+        createdAt: '2026-04-08T10:04:00.000Z',
+      },
+    ]);
+  });
+
+  it('marks the session failed when approval is rejected and resumed on the same run', async () => {
+    const stores = createInMemoryGatewayStores();
+    const authContext = createAuthContext('user-123');
+    const run = vi.fn(async () => ({
+      status: 'approval_requested' as const,
+      runId: 'run-approve-2',
+      message: 'Approval required before invoking write_file',
+      toolName: 'write_file',
+    }));
+    const resolveApproval = vi.fn(async () => undefined);
+    const resume = vi.fn(async () => ({
+      status: 'failure' as const,
+      runId: 'run-approve-2',
+      error: 'Approval rejected for write_file',
+      code: 'APPROVAL_REJECTED' as const,
+      stepsUsed: 2,
+      usage: { promptTokens: 6, completionTokens: 0, estimatedCostUSD: 0.0004 },
+    }));
+    const agentRegistry = createGatewayTestAgentRegistry({
+      run,
+      resolveApproval,
+      resume,
+      runtimeRuns: {
+        'run-approve-2': { id: 'run-approve-2', rootRunId: 'root-run-approve-2', status: 'failed' },
+      },
+    });
+
+    await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'session.open',
+        channelId: 'webchat',
+      }),
+      {
+        authContext,
+        stores,
+        now: () => new Date('2026-04-08T10:00:00.000Z'),
+        sessionIdFactory: () => 'session-1',
+      },
+    );
+
+    await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'run.start',
+        sessionId: 'session-1',
+        goal: 'Write another protected file',
+      }),
+      {
+        gatewayConfig: createChatGatewayConfig(),
+        agentRegistry,
+        authContext,
+        stores,
+        now: () => new Date('2026-04-08T10:06:00.000Z'),
+      },
+    );
+
+    const response = await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'approval.resolve',
+        sessionId: 'session-1',
+        runId: 'run-approve-2',
+        approved: false,
+      }),
+      {
+        agentRegistry,
+        authContext,
+        stores,
+        now: () => new Date('2026-04-08T10:07:00.000Z'),
+      },
+    );
+
+    expect(response).toEqual({
+      type: 'run.output',
+      runId: 'run-approve-2',
+      rootRunId: 'root-run-approve-2',
+      sessionId: 'session-1',
+      status: 'failed',
+      error: 'Approval rejected for write_file',
+    });
+    expect(resolveApproval).toHaveBeenCalledWith('run-approve-2', false);
+    expect(resume).toHaveBeenCalledWith('run-approve-2');
+    expect(await stores.sessions.get('session-1')).toMatchObject({
+      status: 'failed',
+      currentRunId: undefined,
+      currentRootRunId: undefined,
+      lastCompletedRootRunId: 'root-run-approve-2',
+      updatedAt: '2026-04-08T10:07:00.000Z',
+    });
+  });
+
+  it('rejects approval.resolve from a different principal', async () => {
+    const stores = createInMemoryGatewayStores();
+    const run = vi.fn(async () => ({
+      status: 'approval_requested' as const,
+      runId: 'run-approve-3',
+      message: 'Approval required before invoking write_file',
+      toolName: 'write_file',
+    }));
+    const resolveApproval = vi.fn(async () => undefined);
+    const resume = vi.fn(async () => ({
+      status: 'success' as const,
+      runId: 'run-approve-3',
+      output: { approved: true },
+      stepsUsed: 2,
+      usage: { promptTokens: 6, completionTokens: 4, estimatedCostUSD: 0.0008 },
+    }));
+    const agentRegistry = createGatewayTestAgentRegistry({
+      run,
+      resolveApproval,
+      resume,
+      runtimeRuns: {
+        'run-approve-3': { id: 'run-approve-3', rootRunId: 'root-run-approve-3', status: 'awaiting_approval' },
+      },
+    });
+
+    await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'session.open',
+        channelId: 'webchat',
+      }),
+      {
+        authContext: createAuthContext('user-123'),
+        stores,
+        now: () => new Date('2026-04-08T10:00:00.000Z'),
+        sessionIdFactory: () => 'session-1',
+      },
+    );
+
+    await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'run.start',
+        sessionId: 'session-1',
+        goal: 'Write a protected file',
+      }),
+      {
+        gatewayConfig: createChatGatewayConfig(),
+        agentRegistry,
+        authContext: createAuthContext('user-123'),
+        stores,
+        now: () => new Date('2026-04-08T10:08:00.000Z'),
+      },
+    );
+
+    const response = await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'approval.resolve',
+        sessionId: 'session-1',
+        runId: 'run-approve-3',
+        approved: true,
+      }),
+      {
+        agentRegistry,
+        authContext: createAuthContext('user-999'),
+        stores,
+        now: () => new Date('2026-04-08T10:09:00.000Z'),
+      },
+    );
+
+    expect(response).toEqual({
+      type: 'error',
+      code: 'session_forbidden',
+      message: 'Session "session-1" belongs to a different authenticated principal.',
+      requestType: 'approval.resolve',
+      details: {
+        sessionId: 'session-1',
+        channelId: 'webchat',
+      },
+    });
+    expect(resolveApproval).not.toHaveBeenCalled();
+    expect(resume).not.toHaveBeenCalled();
+  });
+
+  it('rejects approval.resolve when the session is awaiting a different run id', async () => {
+    const stores = createInMemoryGatewayStores();
+    const authContext = createAuthContext('user-123');
+    const run = vi.fn(async () => ({
+      status: 'approval_requested' as const,
+      runId: 'run-approve-4',
+      message: 'Approval required before invoking write_file',
+      toolName: 'write_file',
+    }));
+    const resolveApproval = vi.fn(async () => undefined);
+    const resume = vi.fn(async () => ({
+      status: 'success' as const,
+      runId: 'run-approve-4',
+      output: { approved: true },
+      stepsUsed: 2,
+      usage: { promptTokens: 6, completionTokens: 4, estimatedCostUSD: 0.0008 },
+    }));
+    const agentRegistry = createGatewayTestAgentRegistry({
+      run,
+      resolveApproval,
+      resume,
+      runtimeRuns: {
+        'run-approve-4': { id: 'run-approve-4', rootRunId: 'root-run-approve-4', status: 'awaiting_approval' },
+      },
+    });
+
+    await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'session.open',
+        channelId: 'webchat',
+      }),
+      {
+        authContext,
+        stores,
+        now: () => new Date('2026-04-08T10:00:00.000Z'),
+        sessionIdFactory: () => 'session-1',
+      },
+    );
+
+    await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'run.start',
+        sessionId: 'session-1',
+        goal: 'Write a protected file',
+      }),
+      {
+        gatewayConfig: createChatGatewayConfig(),
+        agentRegistry,
+        authContext,
+        stores,
+        now: () => new Date('2026-04-08T10:10:00.000Z'),
+      },
+    );
+
+    const response = await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'approval.resolve',
+        sessionId: 'session-1',
+        runId: 'run-other',
+        approved: true,
+      }),
+      {
+        agentRegistry,
+        authContext,
+        stores,
+        now: () => new Date('2026-04-08T10:11:00.000Z'),
+      },
+    );
+
+    expect(response).toEqual({
+      type: 'error',
+      code: 'invalid_frame',
+      message: 'Session "session-1" is awaiting approval for run "run-approve-4", not "run-other".',
+      requestType: 'approval.resolve',
+      details: {
+        sessionId: 'session-1',
+        runId: 'run-other',
+        currentRunId: 'run-approve-4',
+      },
+    });
+    expect(resolveApproval).not.toHaveBeenCalled();
+    expect(resume).not.toHaveBeenCalled();
+  });
 });
 
 function createAuthContext(subject: string): GatewayAuthContext {

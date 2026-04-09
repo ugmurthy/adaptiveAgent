@@ -146,3 +146,39 @@ export async function getAuthorizedGatewaySession(
 
   return session;
 }
+
+export function assertGatewayPendingApproval(
+  session: GatewaySessionRecord,
+  runId: string,
+  requestType: string,
+): void {
+  if (session.status !== 'awaiting_approval' || !session.currentRunId) {
+    throw new ProtocolValidationError(
+      'invalid_frame',
+      `Session "${session.id}" is not awaiting approval for frame type "${requestType}".`,
+      {
+        requestType,
+        details: {
+          sessionId: session.id,
+          status: session.status,
+          currentRunId: session.currentRunId ?? null,
+        },
+      },
+    );
+  }
+
+  if (session.currentRunId !== runId) {
+    throw new ProtocolValidationError(
+      'invalid_frame',
+      `Session "${session.id}" is awaiting approval for run "${session.currentRunId}", not "${runId}".`,
+      {
+        requestType,
+        details: {
+          sessionId: session.id,
+          runId,
+          currentRunId: session.currentRunId,
+        },
+      },
+    );
+  }
+}

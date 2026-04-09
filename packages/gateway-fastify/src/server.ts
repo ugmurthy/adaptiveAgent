@@ -21,7 +21,7 @@ import {
   serializeOutboundFrame,
 } from './protocol.js';
 import type { ResolvedGatewayAuthProvider } from './registries.js';
-import { executeGatewayRunStart } from './run.js';
+import { executeGatewayApprovalResolution, executeGatewayRunStart } from './run.js';
 import { openGatewaySession } from './session.js';
 import { createInMemoryGatewayStores, type GatewayStores } from './stores.js';
 
@@ -145,6 +145,15 @@ export async function handleGatewaySocketMessage(
         stores: context.stores,
         authContext: context.authContext,
         requestedChannelId: context.requestedChannelId,
+        now: context.now,
+      });
+    }
+
+    if (frame.type === 'approval.resolve' && context.stores && context.agentRegistry) {
+      return await executeGatewayApprovalResolution(frame, {
+        agentRegistry: context.agentRegistry,
+        stores: context.stores,
+        authContext: context.authContext,
         now: context.now,
       });
     }

@@ -135,3 +135,13 @@ Thread: https://ampcode.com/threads/T-019d700a-a7d9-7318-9eb6-9a2bd8444606
   - Structured run handlers should resolve `rootRunId` from the runtime store for both success and failure paths before publishing gateway output or mutating session linkage.
   - Session-bound `run.start` pins the session to invocation mode `run`, which gives later approval and concurrency checks one consistent source of truth.
 ---
+
+## 2026-04-09 08:00 IST - US-014
+Thread: https://ampcode.com/threads/T-019d700a-a7d9-7318-9eb6-9a2bd8444606
+- Implemented `approval.resolve` handling that validates the authorized pending session run, calls `resolveApproval(...)` and `resume(...)` on the same run handle, and maps the resumed result back onto gateway session state and `run.output` frames.
+- Files changed: `packages/gateway-fastify/src/session.ts`, `packages/gateway-fastify/src/run.ts`, `packages/gateway-fastify/src/server.ts`, `packages/gateway-fastify/src/server.test.ts`, `tasks/prd.json`, `tasks/progress.txt`.
+- **Learnings for future iterations:**
+  - Approval frames should key off the session's `currentRunId` rather than trusting a client-supplied `runId`; that keeps resume authorization host-owned and deterministic.
+  - Approval resume should reuse the original session-run link instead of appending a second link, because the resumed work is still part of the same root run.
+  - Moving the session back to `running` before `resume(...)` keeps the gateway's write lane aligned with the runtime while the paused run is being continued.
+---
