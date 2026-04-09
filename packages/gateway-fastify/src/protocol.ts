@@ -31,6 +31,7 @@ export const PROTOCOL_ERROR_CODES = [
   'token_expired',
   'session_not_found',
   'session_forbidden',
+  'route_not_found',
 ] as const;
 
 export type InboundFrameType = (typeof INBOUND_FRAME_TYPES)[number];
