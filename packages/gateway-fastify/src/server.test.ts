@@ -71,11 +71,11 @@ describe('createGatewayServer', () => {
       type: 'pong',
       id: 'heartbeat-1',
     });
-    expect(await handleGatewaySocketMessage(JSON.stringify({ type: 'run.start', goal: 'Inspect logs' }))).toEqual({
+    expect(await handleGatewaySocketMessage(JSON.stringify({ type: 'channel.subscribe', channels: ['session:1'] }))).toEqual({
       type: 'error',
       code: 'unsupported_frame',
-      message: 'Inbound frame type "run.start" is valid but not implemented yet.',
-      requestType: 'run.start',
+      message: 'Inbound frame type "channel.subscribe" is valid but not implemented yet.',
+      requestType: 'channel.subscribe',
       details: undefined,
     });
     expect(await handleGatewaySocketMessage(JSON.stringify({ type: 'mystery.frame' }))).toEqual({
@@ -235,8 +235,11 @@ describe('createGatewayServer', () => {
       stepsUsed: 1,
       usage: { promptTokens: 11, completionTokens: 5, estimatedCostUSD: 0.001 },
     }));
-    const agentRegistry = createGatewayTestAgentRegistry(chat, {
-      'run-1': { id: 'run-1', rootRunId: 'run-1', status: 'succeeded' },
+    const agentRegistry = createGatewayTestAgentRegistry({
+      chat,
+      runtimeRuns: {
+        'run-1': { id: 'run-1', rootRunId: 'run-1', status: 'succeeded' },
+      },
     });
     const chatConfig = createChatGatewayConfig();
 
@@ -353,8 +356,11 @@ describe('createGatewayServer', () => {
       stepsUsed: 1,
       usage: { promptTokens: 7, completionTokens: 0, estimatedCostUSD: 0.0004 },
     }));
-    const agentRegistry = createGatewayTestAgentRegistry(chat, {
-      'run-2': { id: 'run-2', rootRunId: 'run-2', status: 'failed' },
+    const agentRegistry = createGatewayTestAgentRegistry({
+      chat,
+      runtimeRuns: {
+        'run-2': { id: 'run-2', rootRunId: 'run-2', status: 'failed' },
+      },
     });
 
     await handleGatewaySocketMessage(
@@ -419,6 +425,171 @@ describe('createGatewayServer', () => {
         createdAt: '2026-04-08T10:01:00.000Z',
       },
     ]);
+  });
+
+  it('executes session-bound run.start through agent.run and persists session linkage', async () => {
+    const stores = createInMemoryGatewayStores();
+    const authContext = createAuthContext('user-123');
+    const run = vi.fn(async () => ({
+      status: 'success' as const,
+      runId: 'run-3',
+      output: { ticketId: 'T-42', priority: 'high' },
+      stepsUsed: 2,
+      usage: { promptTokens: 9, completionTokens: 4, estimatedCostUSD: 0.0012 },
+    }));
+    const agentRegistry = createGatewayTestAgentRegistry({
+      run,
+      runtimeRuns: {
+        'run-3': { id: 'run-3', rootRunId: 'root-run-3', status: 'succeeded' },
+      },
+    });
+
+    await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'session.open',
+        channelId: 'webchat',
+      }),
+      {
+        authContext,
+        stores,
+        now: () => new Date('2026-04-08T10:00:00.000Z'),
+        sessionIdFactory: () => 'session-1',
+      },
+    );
+
+    const response = await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'run.start',
+        sessionId: 'session-1',
+        goal: 'Create a high-priority support ticket',
+        input: { priority: 'high' },
+        context: { locale: 'en-US' },
+        metadata: { source: 'dashboard' },
+      }),
+      {
+        gatewayConfig: createChatGatewayConfig(),
+        agentRegistry,
+        authContext,
+        stores,
+        now: () => new Date('2026-04-08T10:02:00.000Z'),
+      },
+    );
+
+    expect(response).toEqual({
+      type: 'run.output',
+      runId: 'run-3',
+      rootRunId: 'root-run-3',
+      sessionId: 'session-1',
+      status: 'succeeded',
+      output: { ticketId: 'T-42', priority: 'high' },
+    });
+    expect(run).toHaveBeenCalledWith({
+      goal: 'Create a high-priority support ticket',
+      input: { priority: 'high' },
+      context: {
+        locale: 'en-US',
+        sessionId: 'session-1',
+        channelId: 'webchat',
+        authSubject: 'user-123',
+        invocationMode: 'run',
+        tenantId: 'acme',
+        roles: ['member'],
+      },
+      metadata: {
+        source: 'dashboard',
+        gateway: {
+          sessionId: 'session-1',
+          agentId: 'support-agent',
+          invocationMode: 'run',
+        },
+      },
+    });
+    expect(await stores.sessions.get('session-1')).toMatchObject({
+      agentId: 'support-agent',
+      invocationMode: 'run',
+      status: 'idle',
+      currentRunId: undefined,
+      currentRootRunId: undefined,
+      lastCompletedRootRunId: 'root-run-3',
+      transcriptVersion: 0,
+      updatedAt: '2026-04-08T10:02:00.000Z',
+    });
+    expect(await stores.sessionRunLinks.listBySession('session-1')).toEqual([
+      {
+        sessionId: 'session-1',
+        runId: 'run-3',
+        rootRunId: 'root-run-3',
+        invocationKind: 'run',
+        metadata: { source: 'dashboard' },
+        createdAt: '2026-04-08T10:02:00.000Z',
+      },
+    ]);
+  });
+
+  it('executes isolated run.start requests without creating session state', async () => {
+    const stores = createInMemoryGatewayStores();
+    const authContext = createAuthContext('user-123');
+    const run = vi.fn(async () => ({
+      status: 'success' as const,
+      runId: 'run-4',
+      output: { ok: true },
+      stepsUsed: 1,
+      usage: { promptTokens: 3, completionTokens: 2, estimatedCostUSD: 0.0003 },
+    }));
+    const agentRegistry = createGatewayTestAgentRegistry({
+      run,
+      runtimeRuns: {
+        'run-4': { id: 'run-4', rootRunId: 'run-4', status: 'succeeded' },
+      },
+    });
+
+    const response = await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'run.start',
+        agentId: 'support-agent',
+        goal: 'Check service readiness',
+        context: { dryRun: true },
+        metadata: { source: 'cli' },
+      }),
+      {
+        gatewayConfig: createChatGatewayConfig(),
+        agentRegistry,
+        authContext,
+        requestedChannelId: 'webchat',
+        stores,
+        now: () => new Date('2026-04-08T10:03:00.000Z'),
+      },
+    );
+
+    expect(response).toEqual({
+      type: 'run.output',
+      runId: 'run-4',
+      rootRunId: 'run-4',
+      sessionId: undefined,
+      status: 'succeeded',
+      output: { ok: true },
+    });
+    expect(run).toHaveBeenCalledWith({
+      goal: 'Check service readiness',
+      input: undefined,
+      context: {
+        dryRun: true,
+        invocationMode: 'run',
+        channelId: 'webchat',
+        authSubject: 'user-123',
+        tenantId: 'acme',
+        roles: ['member'],
+      },
+      metadata: {
+        source: 'cli',
+        gateway: {
+          agentId: 'support-agent',
+          invocationMode: 'run',
+        },
+      },
+    });
+    expect(await stores.sessionRunLinks.listBySession('session-1')).toEqual([]);
+    expect(await stores.sessions.listByAuthSubject('user-123')).toEqual([]);
   });
 });
 
@@ -486,8 +657,13 @@ function createLoadedAgentConfig(): LoadedConfig<AgentConfig> {
 }
 
 function createGatewayTestAgentRegistry(
-  chat: CreatedAdaptiveAgent['agent']['chat'],
-  runtimeRuns: Record<string, { id: string; rootRunId: string; status: string }>,
+  options: {
+    chat?: CreatedAdaptiveAgent['agent']['chat'];
+    run?: NonNullable<CreatedAdaptiveAgent['agent']['run']>;
+    resolveApproval?: NonNullable<CreatedAdaptiveAgent['agent']['resolveApproval']>;
+    resume?: NonNullable<CreatedAdaptiveAgent['agent']['resume']>;
+    runtimeRuns: Record<string, { id: string; rootRunId: string; status: string }>;
+  },
 ) {
   return createAgentRegistry({
     agents: [createLoadedAgentConfig()],
@@ -497,11 +673,22 @@ function createGatewayTestAgentRegistry(
     }),
     agentFactory: async () => ({
       agent: {
-        chat,
+        chat:
+          options.chat ??
+          (async () => ({
+            status: 'success',
+            runId: 'default-chat-run',
+            output: 'ok',
+            stepsUsed: 1,
+            usage: { promptTokens: 0, completionTokens: 0, estimatedCostUSD: 0 },
+          })),
+        run: options.run,
+        resolveApproval: options.resolveApproval,
+        resume: options.resume,
       },
       runtime: {
         runStore: {
-          getRun: async (runId: string) => runtimeRuns[runId] ?? null,
+          getRun: async (runId: string) => options.runtimeRuns[runId] ?? null,
         },
         eventStore: {},
         snapshotStore: {},

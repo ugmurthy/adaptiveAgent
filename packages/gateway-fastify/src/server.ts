@@ -21,6 +21,7 @@ import {
   serializeOutboundFrame,
 } from './protocol.js';
 import type { ResolvedGatewayAuthProvider } from './registries.js';
+import { executeGatewayRunStart } from './run.js';
 import { openGatewaySession } from './session.js';
 import { createInMemoryGatewayStores, type GatewayStores } from './stores.js';
 
@@ -38,6 +39,7 @@ export interface GatewaySocketMessageContext {
   gatewayConfig?: GatewayConfig;
   agentRegistry?: AgentRegistry;
   authContext?: GatewayAuthContext;
+  requestedChannelId?: string;
   stores?: GatewayStores;
   now?: () => Date;
   sessionIdFactory?: () => string;
@@ -84,6 +86,7 @@ export async function createGatewayServer(
           gatewayConfig: config,
           agentRegistry: options.agentRegistry,
           authContext: request.gatewayAuthContext,
+          requestedChannelId: request.gatewayRequestedChannelId,
           stores,
           now: options.now,
           sessionIdFactory: options.sessionIdFactory,
@@ -132,6 +135,17 @@ export async function handleGatewaySocketMessage(
         authContext: context.authContext,
         now: context.now,
         transcriptMessageIdFactory: context.transcriptMessageIdFactory,
+      });
+    }
+
+    if (frame.type === 'run.start' && context.stores && context.gatewayConfig && context.agentRegistry) {
+      return await executeGatewayRunStart(frame, {
+        gatewayConfig: context.gatewayConfig,
+        agentRegistry: context.agentRegistry,
+        stores: context.stores,
+        authContext: context.authContext,
+        requestedChannelId: context.requestedChannelId,
+        now: context.now,
       });
     }
 

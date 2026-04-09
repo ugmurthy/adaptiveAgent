@@ -125,3 +125,13 @@ Thread: https://ampcode.com/threads/T-019d6fa7-b7b4-71ec-ac7f-decdeb062504
   - The chat orchestrator resolves `rootRunId` from the runtime run store after `agent.chat(...)`, which keeps gateway linkage authoritative without assuming `runId === rootRunId` forever.
   - Approval-requested chat turns already persist the user message and leave the session in `awaiting_approval`, which gives later approval/resume work a stable starting point.
 ---
+
+## 2026-04-09 07:57 IST - US-013
+Thread: https://ampcode.com/threads/T-019d700a-a7d9-7318-9eb6-9a2bd8444606
+- Implemented `run.start` orchestration for both session-bound and isolated structured runs, including run-mode routing, channel-mode validation, `agent.run(...)` invocation, root-run lookup, session-run linkage persistence, and `run.output` responses.
+- Files changed: `packages/gateway-fastify/src/run.ts`, `packages/gateway-fastify/src/server.ts`, `packages/gateway-fastify/src/server.test.ts`, `packages/gateway-fastify/src/index.ts`, `tasks/prd.json`, `tasks/progress.txt`.
+- **Learnings for future iterations:**
+  - Sessionless structured runs should still carry the upgrade `channelId` into routing and run context so endpoint policy stays deterministic without fabricating gateway session state.
+  - Structured run handlers should resolve `rootRunId` from the runtime store for both success and failure paths before publishing gateway output or mutating session linkage.
+  - Session-bound `run.start` pins the session to invocation mode `run`, which gives later approval and concurrency checks one consistent source of truth.
+---
