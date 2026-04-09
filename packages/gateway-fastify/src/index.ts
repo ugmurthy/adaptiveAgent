@@ -19,3 +19,4 @@ export * from './stores-file.js';
 export * from './stores-postgres.js';
 export * from './stores-postgres-cron.js';
 export * from './scheduler.js';
+export * from './cron-delivery.js';
