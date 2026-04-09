@@ -52,6 +52,13 @@ export interface GatewayCronConfig {
   maxConcurrentJobs: number;
 }
 
+export interface GatewayTranscriptConfig {
+  recentMessageWindow: number;
+  summaryTriggerWindow: number;
+  summaryMaxMessages: number;
+  summaryLineMaxLength: number;
+}
+
 export interface GatewayChannelDefaults {
   sessionConcurrency: number;
 }
@@ -94,6 +101,7 @@ export interface GatewayConfig {
   server: GatewayServerConfig;
   auth?: GatewayAuthConfig;
   cron?: GatewayCronConfig;
+  transcript?: GatewayTranscriptConfig;
   channels?: {
     defaults: GatewayChannelDefaults;
     list: GatewayChannelConfig[];
@@ -206,6 +214,7 @@ function validateGatewayConfig(value: unknown, sourcePath: string): GatewayConfi
   const server = parseGatewayServerConfig(root?.server, 'server', issues);
   const auth = parseGatewayAuthConfig(root?.auth, 'auth', issues);
   const cron = parseGatewayCronConfig(root?.cron, 'cron', issues);
+  const transcript = parseGatewayTranscriptConfig(root?.transcript, 'transcript', issues);
   const channels = parseGatewayChannelsConfig(root?.channels, 'channels', issues);
   const bindings = parseGatewayBindings(root?.bindings, 'bindings', issues);
   const defaultAgentId = expectOptionalNonEmptyString(root?.defaultAgentId, 'defaultAgentId', issues);
@@ -234,6 +243,7 @@ function validateGatewayConfig(value: unknown, sourcePath: string): GatewayConfi
     server,
     auth,
     cron,
+    transcript,
     channels,
     bindings,
     defaultAgentId,
@@ -335,6 +345,24 @@ function parseGatewayAuthConfig(value: unknown, path: string, issues: string[]):
   return {
     provider,
     settings,
+  };
+}
+
+function parseGatewayTranscriptConfig(value: unknown, path: string, issues: string[]): GatewayTranscriptConfig | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const transcript = expectObject(value, path, issues);
+
+  return {
+    recentMessageWindow:
+      expectPositiveInteger(transcript?.recentMessageWindow, `${path}.recentMessageWindow`, issues) ?? 0,
+    summaryTriggerWindow:
+      expectPositiveInteger(transcript?.summaryTriggerWindow, `${path}.summaryTriggerWindow`, issues) ?? 0,
+    summaryMaxMessages: expectPositiveInteger(transcript?.summaryMaxMessages, `${path}.summaryMaxMessages`, issues) ?? 0,
+    summaryLineMaxLength:
+      expectPositiveInteger(transcript?.summaryLineMaxLength, `${path}.summaryLineMaxLength`, issues) ?? 0,
   };
 }
 

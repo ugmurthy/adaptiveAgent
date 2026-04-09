@@ -20,6 +20,7 @@ export interface GatewaySessionRecord {
   currentRootRunId?: string;
   lastCompletedRootRunId?: string;
   transcriptVersion: number;
+  transcriptSummary?: string;
   metadata?: JsonObject;
   createdAt: string;
   updatedAt: string;

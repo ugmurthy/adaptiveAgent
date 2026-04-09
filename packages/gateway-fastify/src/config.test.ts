@@ -42,6 +42,12 @@ describe('gateway config loading', () => {
             issuer: 'https://auth.example.com',
             audience: 'adaptive-agent-gateway',
           },
+          transcript: {
+            recentMessageWindow: 4,
+            summaryTriggerWindow: 4,
+            summaryMaxMessages: 8,
+            summaryLineMaxLength: 120,
+          },
           channels: {
             defaults: {
               sessionConcurrency: 1,
@@ -103,6 +109,12 @@ describe('gateway config loading', () => {
         issuer: 'https://auth.example.com',
         audience: 'adaptive-agent-gateway',
       },
+    });
+    expect(loadedGatewayConfig.config.transcript).toEqual({
+      recentMessageWindow: 4,
+      summaryTriggerWindow: 4,
+      summaryMaxMessages: 8,
+      summaryLineMaxLength: 120,
     });
     expect(loadedGatewayConfig.config.hooks.onAuthenticate).toEqual(['audit']);
     expect(loadedAgentConfigs).toHaveLength(1);

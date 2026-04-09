@@ -29,6 +29,93 @@ export interface ModelAdapterConfig {
   siteName?: string;
 }
 
+export interface UsageSummary {
+  promptTokens: number;
+  completionTokens: number;
+  reasoningTokens?: number;
+  totalTokens?: number;
+  estimatedCostUSD: number;
+  provider?: string;
+  model?: string;
+}
+
+export type RunFailureCode =
+  | 'MAX_STEPS'
+  | 'TOOL_ERROR'
+  | 'MODEL_ERROR'
+  | 'APPROVAL_REJECTED'
+  | 'REPLAN_REQUIRED'
+  | 'INTERRUPTED';
+
+export interface ChatMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
+export interface ChatRequest {
+  messages: ChatMessage[];
+  context?: JsonObject;
+  outputSchema?: JsonSchema;
+  metadata?: JsonObject;
+}
+
+export type RunResult<TOutput extends JsonValue = JsonValue> =
+  | {
+      status: 'success';
+      runId: string;
+      planId?: string;
+      output: TOutput;
+      stepsUsed: number;
+      usage: UsageSummary;
+    }
+  | {
+      status: 'failure';
+      runId: string;
+      error: string;
+      code: RunFailureCode;
+      stepsUsed: number;
+      usage: UsageSummary;
+    }
+  | {
+      status: 'clarification_requested';
+      runId: string;
+      message: string;
+      suggestedQuestions?: string[];
+    }
+  | {
+      status: 'approval_requested';
+      runId: string;
+      message: string;
+      toolName: string;
+    };
+
+export type ChatResult<TOutput extends JsonValue = JsonValue> = RunResult<TOutput>;
+
+export interface RuntimeRunRecord {
+  id: string;
+  rootRunId: string;
+  parentRunId?: string;
+  status: string;
+  errorMessage?: string;
+  result?: JsonValue;
+}
+
+export interface RuntimeRunStore {
+  getRun(runId: string): Promise<RuntimeRunRecord | null>;
+}
+
+export interface AdaptiveAgentHandle {
+  chat(request: ChatRequest): Promise<ChatResult>;
+  run?(request: {
+    goal: string;
+    input?: JsonValue;
+    context?: JsonObject;
+    metadata?: JsonObject;
+  }): Promise<RunResult>;
+  resolveApproval?(runId: string, approved: boolean): Promise<void>;
+  resume?(runId: string): Promise<RunResult>;
+}
+
 export interface ToolContext {
   [key: string]: unknown;
 }
@@ -62,9 +149,9 @@ export interface DelegateDefinition {
 }
 
 export interface CreatedAdaptiveAgent {
-  agent: unknown;
+  agent: AdaptiveAgentHandle;
   runtime: {
-    runStore: unknown;
+    runStore: RuntimeRunStore;
     eventStore: unknown;
     snapshotStore: unknown;
     planStore: unknown;
