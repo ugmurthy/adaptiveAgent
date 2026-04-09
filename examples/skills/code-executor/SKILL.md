@@ -2,6 +2,7 @@
 name: code-executor
 description: Execute code in a secure E2B cloud sandbox. Supports bash, javascript, typescript, and python. Returns structured results with stdout, stderr, error details, and rich outputs (text, json, html, png, etc.).
 handler: handler.ts
+defaults.toolTimeoutMs: 120000
 allowedTools:
   - write_file
 ---

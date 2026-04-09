@@ -1,7 +1,7 @@
 import { readFile, access } from 'node:fs/promises';
 import { join, basename, resolve } from 'node:path';
 
-import type { ToolDefinition, JsonValue } from '../types.js';
+import type { AgentDefaults, ToolDefinition, JsonValue } from '../types.js';
 import type { SkillDefinition } from './types.js';
 
 export interface LoadSkillOptions {
@@ -16,7 +16,8 @@ export interface LoadSkillOptions {
  * Markdown body as the skill instructions.
  *
  * Required frontmatter fields: `name`, `description`.
- * Optional frontmatter fields: `triggers`, `allowedTools`, `handler`.
+ * Optional frontmatter fields: `triggers`, `allowedTools`, `handler`, and
+ * dotted `defaults.*` keys such as `defaults.toolTimeoutMs: 120000`.
  *
  * `allowedTools` can be specified in frontmatter or passed via `options`.
  * The `options` value takes precedence.
@@ -74,6 +75,7 @@ export function parseSkillMarkdown(
 
   const triggers = parseStringArray(meta.triggers);
   const allowedTools = options?.allowedTools ?? parseStringArray(meta.allowedTools) ?? [];
+  const defaults = parseSkillDefaults(meta, source);
 
   const instructions = body.trim();
   if (!instructions) {
@@ -88,6 +90,7 @@ export function parseSkillMarkdown(
     instructions,
     allowedTools,
     triggers: triggers && triggers.length > 0 ? triggers : undefined,
+    defaults,
     handler,
   };
 }
@@ -208,6 +211,111 @@ function parseStringArray(value: unknown): string[] | undefined {
   }
 
   return undefined;
+}
+
+function parseSkillDefaults(
+  meta: Record<string, string | string[]>,
+  source: string,
+): Partial<AgentDefaults> | undefined {
+  const defaults: Partial<AgentDefaults> = {};
+
+  const maxSteps = parseOptionalInteger(meta, 'defaults.maxSteps', source, { minimum: 1 });
+  if (maxSteps !== undefined) {
+    defaults.maxSteps = maxSteps;
+  }
+
+  const toolTimeoutMs = parseOptionalInteger(meta, 'defaults.toolTimeoutMs', source, { minimum: 0 });
+  if (toolTimeoutMs !== undefined) {
+    defaults.toolTimeoutMs = toolTimeoutMs;
+  }
+
+  const modelTimeoutMs = parseOptionalInteger(meta, 'defaults.modelTimeoutMs', source, { minimum: 0 });
+  if (modelTimeoutMs !== undefined) {
+    defaults.modelTimeoutMs = modelTimeoutMs;
+  }
+
+  const maxRetriesPerStep = parseOptionalInteger(meta, 'defaults.maxRetriesPerStep', source, { minimum: 0 });
+  if (maxRetriesPerStep !== undefined) {
+    defaults.maxRetriesPerStep = maxRetriesPerStep;
+  }
+
+  const requireApprovalForWriteTools = parseOptionalBoolean(meta, 'defaults.requireApprovalForWriteTools', source);
+  if (requireApprovalForWriteTools !== undefined) {
+    defaults.requireApprovalForWriteTools = requireApprovalForWriteTools;
+  }
+
+  const autoApproveAll = parseOptionalBoolean(meta, 'defaults.autoApproveAll', source);
+  if (autoApproveAll !== undefined) {
+    defaults.autoApproveAll = autoApproveAll;
+  }
+
+  const capture = parseOptionalCaptureMode(meta, 'defaults.capture', source);
+  if (capture !== undefined) {
+    defaults.capture = capture;
+  }
+
+  return Object.keys(defaults).length > 0 ? defaults : undefined;
+}
+
+function parseOptionalInteger(
+  meta: Record<string, string | string[]>,
+  key: string,
+  source: string,
+  options: { minimum: number },
+): number | undefined {
+  const value = meta[key];
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) {
+    throw new SkillLoadError(`SKILL.md at ${source} has invalid integer for '${key}'`);
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  if (parsed < options.minimum) {
+    throw new SkillLoadError(`SKILL.md at ${source} requires '${key}' to be >= ${options.minimum}`);
+  }
+
+  return parsed;
+}
+
+function parseOptionalBoolean(
+  meta: Record<string, string | string[]>,
+  key: string,
+  source: string,
+): boolean | undefined {
+  const value = meta[key];
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (value === 'true') {
+    return true;
+  }
+
+  if (value === 'false') {
+    return false;
+  }
+
+  throw new SkillLoadError(`SKILL.md at ${source} has invalid boolean for '${key}'`);
+}
+
+function parseOptionalCaptureMode(
+  meta: Record<string, string | string[]>,
+  key: string,
+  source: string,
+): AgentDefaults['capture'] | undefined {
+  const value = meta[key];
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (value === 'full' || value === 'summary' || value === 'none') {
+    return value;
+  }
+
+  throw new SkillLoadError(`SKILL.md at ${source} has invalid capture mode for '${key}'`);
 }
 
 // ── handler loading ─────────────────────────────────────────────────────────

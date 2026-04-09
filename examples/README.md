@@ -18,6 +18,7 @@ Edit `.env` and fill in the keys you need:
 | `WEB_SEARCH_PROVIDER` | Optional | Set to `brave` or `duckduckgo` for `web_search` |
 | `BRAVE_SEARCH_API_KEY` | If `WEB_SEARCH_PROVIDER=brave` | [Get key →](https://api.search.brave.com/app/keys) |
 | `AGENT_MAX_STEPS` | Optional | Override the sample agent's max steps; when unset it uses the core default of 30 |
+| `TOOL_TIMEOUT_MS` | Optional | Override the sample agent's default timeout for all tool calls in milliseconds; set to `0` to disable |
 | `WEB_TOOL_TIMEOUT_MS` | Optional | Override the timeout for `web_search` and `read_web_page` in milliseconds |
 | `MODEL_TIMEOUT_MS` | Optional | Override the agent-side timeout for each model turn in milliseconds; set to `0` to disable |
 
@@ -65,6 +66,10 @@ WEB_SEARCH_PROVIDER=duckduckgo bun run examples/run-agent.ts
 # Give web tools more time for slower sites
 WEB_TOOL_TIMEOUT_MS=120000 bun run examples/run-agent.ts
 
+# Raise or disable the default timeout for all tool calls
+TOOL_TIMEOUT_MS=120000 bun run examples/run-agent.ts
+TOOL_TIMEOUT_MS=0 bun run examples/run-agent.ts
+
 # Allow longer delegated research runs before MAX_STEPS
 AGENT_MAX_STEPS=60 bun run examples/run-agent.ts
 
@@ -104,5 +109,7 @@ examples/skills/
 ```
 
 Skills are automatically converted to delegate profiles (`delegate.researcher`, `delegate.file-analyst`). The agent can choose to invoke them when it determines a sub-agent is appropriate for part of the task.
+
+Skills can also override child-run defaults with dotted frontmatter keys such as `defaults.toolTimeoutMs: 120000` or `defaults.modelTimeoutMs: 0`. That is the most precise way to give a delegate like `code-executor` more time without slowing down every other tool.
 
 Skills whose required tools are unavailable (e.g. `researcher` when `WEB_SEARCH_PROVIDER=brave` and `BRAVE_SEARCH_API_KEY` is missing) are skipped automatically.

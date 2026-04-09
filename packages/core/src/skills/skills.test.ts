@@ -210,6 +210,45 @@ Calculate stuff.
     expect(skill.handler).toBe('handler.ts');
   });
 
+  it('parses delegate defaults from dotted frontmatter keys', () => {
+    const md = `---
+name: code-executor
+description: Execute code
+defaults.toolTimeoutMs: 120000
+defaults.modelTimeoutMs: 0
+defaults.maxSteps: 12
+defaults.autoApproveAll: true
+defaults.capture: full
+---
+
+Execute code carefully.
+`;
+
+    const skill = parseSkillMarkdown(md, 'test');
+
+    expect(skill.defaults).toEqual({
+      toolTimeoutMs: 120000,
+      modelTimeoutMs: 0,
+      maxSteps: 12,
+      autoApproveAll: true,
+      capture: 'full',
+    });
+  });
+
+  it('throws for invalid dotted default values', () => {
+    const md = `---
+name: code-executor
+description: Execute code
+defaults.toolTimeoutMs: nope
+---
+
+Execute code carefully.
+`;
+
+    expect(() => parseSkillMarkdown(md, 'test')).toThrow(SkillLoadError);
+    expect(() => parseSkillMarkdown(md, 'test')).toThrow("invalid integer for 'defaults.toolTimeoutMs'");
+  });
+
   it('sets handler to undefined when not present', () => {
     const md = `---
 name: plain

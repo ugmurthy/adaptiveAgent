@@ -35,6 +35,7 @@
  *
  *   # Allow more model/tool turns before MAX_STEPS
  *   AGENT_MAX_STEPS=60 bun run examples/run-agent.ts
+ *   TOOL_TIMEOUT_MS=120000 bun run examples/run-agent.ts
  *
  *   # Enable lifecycle logging explicitly (default is silent)
  *   AGENT_LOG_LEVEL=info bun run examples/run-agent.ts
@@ -103,6 +104,7 @@ const logFilePath = resolve(logDir, 'adaptive-agent-example.log');
 const agentLogLevel = process.env.AGENT_LOG_LEVEL ?? (verbose ? 'debug' : DEFAULT_LOG_LEVEL);
 const maxSteps = parseOptionalPositiveInt(process.env.AGENT_MAX_STEPS);
 const webToolTimeoutMs = parseOptionalPositiveInt(process.env.WEB_TOOL_TIMEOUT_MS);
+const toolTimeoutMs = parseOptionalNonNegativeInt(process.env.TOOL_TIMEOUT_MS);
 const modelTimeoutMs = parseOptionalNonNegativeInt(process.env.MODEL_TIMEOUT_MS);
 
 console.log(`\n🤖 Provider: ${PROVIDER}`);
@@ -135,6 +137,12 @@ if (process.env.MODEL_TIMEOUT_MS && modelTimeoutMs === undefined) {
   );
 }
 
+if (process.env.TOOL_TIMEOUT_MS && toolTimeoutMs === undefined) {
+  console.warn(
+    `⚠️  Ignoring invalid TOOL_TIMEOUT_MS='${process.env.TOOL_TIMEOUT_MS}' (expected a non-negative integer)`,
+  );
+}
+
 if (process.env.AGENT_MAX_STEPS && maxSteps === undefined) {
   console.warn(`⚠️  Ignoring invalid AGENT_MAX_STEPS='${process.env.AGENT_MAX_STEPS}' (expected a positive integer)`);
 }
@@ -164,6 +172,9 @@ if (maxSteps !== undefined) {
 }
 if (modelTimeoutMs !== undefined) {
   console.log(`⏱️  Model timeout: ${modelTimeoutMs === 0 ? 'disabled' : `${modelTimeoutMs}ms`}`);
+}
+if (toolTimeoutMs !== undefined) {
+  console.log(`⏱️  Tool timeout: ${toolTimeoutMs === 0 ? 'disabled' : `${toolTimeoutMs}ms`}`);
 }
 
 // ─── Load skills as delegates ───────────────────────────────────────────────
@@ -221,7 +232,7 @@ const {
   logger,
   defaults: {
     ...(maxSteps === undefined ? {} : { maxSteps }),
-    toolTimeoutMs: 30_000,
+    toolTimeoutMs: toolTimeoutMs ?? 30_000,
     ...(modelTimeoutMs === undefined ? {} : { modelTimeoutMs }),
     autoApproveAll: autoApprove,
     capture: verbose ? 'full' : 'summary',
