@@ -6,6 +6,9 @@
   "main": "src/index.ts",
   "scripts": {
     "build": "bun build ./src/index.ts --outdir dist --target bun",
+    "client:local": "bun run ./src/local-ws-client.ts",
+    "mint:local-jwt": "bun run ./src/mint-local-jwt.ts",
+    "start:local": "bun run ./src/start-local.ts",
     "test": "bunx vitest run",
     "test:watch": "bunx vitest",
     "typecheck": "bunx tsc --noEmit"

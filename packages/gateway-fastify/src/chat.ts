@@ -6,6 +6,8 @@ import type { GatewayConfig } from './config.js';
 import type { JsonObject, JsonValue } from './core.js';
 import type { ApprovalRequestedFrame, MessageOutputFrame, MessageSendFrame } from './protocol.js';
 import { ProtocolValidationError } from './protocol.js';
+import type { RealtimeEventForwardingContext } from './realtime-events.js';
+import { withForwardedRealtimeEvents } from './realtime-events.js';
 import { resolveGatewayRoute } from './routing.js';
 import { assertGatewaySessionWriteAllowed, getAuthorizedGatewaySession } from './session.js';
 import type { GatewaySessionRecord, GatewayStores, TranscriptMessageRecord, TranscriptMessageRole } from './stores.js';
@@ -18,6 +20,7 @@ export interface ExecuteGatewayChatTurnOptions {
   authContext?: GatewayAuthContext;
   now?: () => Date;
   transcriptMessageIdFactory?: () => string;
+  realtimeEvents?: Omit<RealtimeEventForwardingContext, 'fallbackAgentId' | 'fallbackSessionId'>;
 }
 
 export async function executeGatewayChatTurn(
@@ -54,11 +57,22 @@ export async function executeGatewayChatTurn(
 
   try {
     const replayEnvelope = buildTranscriptReplayEnvelope(runningSession, transcriptMessages, transcriptPolicy);
-    const chatResult = await agent.agent.chat({
-      messages: [...replayEnvelope, { role: 'user', content: frame.content }],
-      context: buildGatewayChatContext(runningSession, options.authContext),
-      metadata: buildGatewayChatMetadata(frame, route.agentId),
-    });
+    const chatResult = await withForwardedRealtimeEvents(
+      agent,
+      options.realtimeEvents
+        ? {
+            ...options.realtimeEvents,
+            fallbackAgentId: route.agentId,
+            fallbackSessionId: runningSession.id,
+          }
+        : undefined,
+      () =>
+        agent.agent.chat({
+          messages: [...replayEnvelope, { role: 'user', content: frame.content }],
+          context: buildGatewayChatContext(runningSession, options.authContext),
+          metadata: buildGatewayChatMetadata(frame, route.agentId, options.realtimeEvents?.requestId),
+        }),
+    );
     const rootRunId = (await agent.runtime.runStore.getRun(chatResult.runId))?.rootRunId ?? chatResult.runId;
 
     await options.stores.sessionRunLinks.append({
@@ -231,13 +245,14 @@ function buildGatewayChatContext(session: GatewaySessionRecord, authContext?: Ga
   return context;
 }
 
-function buildGatewayChatMetadata(frame: MessageSendFrame, agentId: string): JsonObject {
+function buildGatewayChatMetadata(frame: MessageSendFrame, agentId: string, requestId?: string): JsonObject {
   return {
     ...(frame.metadata ?? {}),
     gateway: {
       sessionId: frame.sessionId,
       agentId,
       invocationMode: 'chat',
+      ...(requestId ? { requestId } : {}),
     },
   };
 }

@@ -5,6 +5,7 @@ export const INBOUND_FRAME_TYPES = [
   'message.send',
   'run.start',
   'approval.resolve',
+  'clarification.resolve',
   'channel.subscribe',
   'session.close',
   'ping',
@@ -74,6 +75,14 @@ export interface ApprovalResolveFrame {
   metadata?: JsonObject;
 }
 
+export interface ClarificationResolveFrame {
+  type: 'clarification.resolve';
+  sessionId: string;
+  runId: string;
+  message: string;
+  metadata?: JsonObject;
+}
+
 export interface ChannelSubscribeFrame {
   type: 'channel.subscribe';
   channels: string[];
@@ -94,6 +103,7 @@ export type InboundFrame =
   | MessageSendFrame
   | RunStartFrame
   | ApprovalResolveFrame
+  | ClarificationResolveFrame
   | ChannelSubscribeFrame
   | SessionCloseFrame
   | PingFrame;
@@ -119,6 +129,9 @@ export interface AgentEventFrame {
   type: 'agent.event';
   eventType: string;
   data: JsonValue;
+  seq?: number;
+  stepId?: string;
+  createdAt?: string;
   sessionId?: string;
   agentId?: string;
   runId?: string;
@@ -235,6 +248,9 @@ export function validateInboundFrame(value: unknown): InboundFrame {
     case 'approval.resolve': {
       return validateApprovalResolveFrame(frame, issues);
     }
+    case 'clarification.resolve': {
+      return validateClarificationResolveFrame(frame, issues);
+    }
     case 'channel.subscribe': {
       return validateChannelSubscribeFrame(frame, issues);
     }
@@ -318,6 +334,21 @@ function validateApprovalResolveFrame(frame: Record<string, unknown>, issues: st
     sessionId: expectNonEmptyString(frame.sessionId, 'frame.sessionId', issues) ?? 'invalid-session-id',
     runId: expectNonEmptyString(frame.runId, 'frame.runId', issues) ?? 'invalid-run-id',
     approved: expectBoolean(frame.approved, 'frame.approved', issues) ?? false,
+    metadata: expectOptionalJsonObject(frame.metadata, 'frame.metadata', issues),
+  };
+
+  return finalizeFrame(validatedFrame, issues);
+}
+
+function validateClarificationResolveFrame(
+  frame: Record<string, unknown>,
+  issues: string[],
+): ClarificationResolveFrame {
+  const validatedFrame: ClarificationResolveFrame = {
+    type: 'clarification.resolve',
+    sessionId: expectNonEmptyString(frame.sessionId, 'frame.sessionId', issues) ?? 'invalid-session-id',
+    runId: expectNonEmptyString(frame.runId, 'frame.runId', issues) ?? 'invalid-run-id',
+    message: expectNonEmptyString(frame.message, 'frame.message', issues) ?? 'invalid-message',
     metadata: expectOptionalJsonObject(frame.metadata, 'frame.metadata', issues),
   };
 

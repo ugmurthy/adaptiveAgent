@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 import Fastify, { type FastifyInstance, type FastifyServerOptions } from 'fastify';
 import websocket from '@fastify/websocket';
 
@@ -26,7 +28,7 @@ import {
   serializeOutboundFrame,
 } from './protocol.js';
 import type { ResolvedGatewayAuthProvider } from './registries.js';
-import { executeGatewayApprovalResolution, executeGatewayRunStart } from './run.js';
+import { executeGatewayApprovalResolution, executeGatewayClarificationResolution, executeGatewayRunStart } from './run.js';
 import { openGatewaySession } from './session.js';
 import { createInMemoryGatewayStores, type GatewayStores } from './stores.js';
 
@@ -47,6 +49,7 @@ export interface GatewaySocketMessageContext {
   requestedChannelId?: string;
   stores?: GatewayStores;
   channelManager?: ChannelSubscriptionManager;
+  emitFrame?: (frame: OutboundFrame) => void;
   now?: () => Date;
   sessionIdFactory?: () => string;
   transcriptMessageIdFactory?: () => string;
@@ -87,6 +90,11 @@ export async function createGatewayServer(
       },
     },
     (socket, request) => {
+      const channelManager = createChannelSubscriptionManager();
+      const emitFrame = (frame: OutboundFrame) => {
+        socket.send(serializeOutboundFrame(frame));
+      };
+
       socket.on('message', async (message: unknown) => {
         const frame = await handleGatewaySocketMessage(message, {
           gatewayConfig: config,
@@ -94,6 +102,8 @@ export async function createGatewayServer(
           authContext: request.gatewayAuthContext,
           requestedChannelId: request.gatewayRequestedChannelId,
           stores,
+          channelManager,
+          emitFrame,
           now: options.now,
           sessionIdFactory: options.sessionIdFactory,
           transcriptMessageIdFactory: options.transcriptMessageIdFactory,
@@ -120,6 +130,8 @@ export async function handleGatewaySocketMessage(
 ): Promise<OutboundFrame> {
   try {
     const frame = parseInboundFrame(message);
+    const realtimeRequestId = context.emitFrame ? randomUUID() : undefined;
+
     if (frame.type === 'ping') {
       return createPongFrame(frame);
     }
@@ -141,6 +153,13 @@ export async function handleGatewaySocketMessage(
         authContext: context.authContext,
         now: context.now,
         transcriptMessageIdFactory: context.transcriptMessageIdFactory,
+        realtimeEvents:
+          realtimeRequestId && context.emitFrame
+            ? {
+                requestId: realtimeRequestId,
+                emitFrame: context.emitFrame,
+              }
+            : undefined,
       });
     }
 
@@ -152,6 +171,13 @@ export async function handleGatewaySocketMessage(
         authContext: context.authContext,
         requestedChannelId: context.requestedChannelId,
         now: context.now,
+        realtimeEvents:
+          realtimeRequestId && context.emitFrame
+            ? {
+                requestId: realtimeRequestId,
+                emitFrame: context.emitFrame,
+              }
+            : undefined,
       });
     }
 
@@ -161,6 +187,27 @@ export async function handleGatewaySocketMessage(
         stores: context.stores,
         authContext: context.authContext,
         now: context.now,
+        realtimeEvents: context.emitFrame
+          ? {
+              rootRunId: frame.runId,
+              emitFrame: context.emitFrame,
+            }
+          : undefined,
+      });
+    }
+
+    if (frame.type === 'clarification.resolve' && context.stores && context.agentRegistry) {
+      return await executeGatewayClarificationResolution(frame, {
+        agentRegistry: context.agentRegistry,
+        stores: context.stores,
+        authContext: context.authContext,
+        now: context.now,
+        realtimeEvents: context.emitFrame
+          ? {
+              rootRunId: frame.runId,
+              emitFrame: context.emitFrame,
+            }
+          : undefined,
       });
     }
 

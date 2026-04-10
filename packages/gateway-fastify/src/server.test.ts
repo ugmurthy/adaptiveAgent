@@ -1,6 +1,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { CreatedAdaptiveAgent, DelegateDefinition, ToolDefinition } from './core.js';
+import type {
+  CreatedAdaptiveAgent,
+  DelegateDefinition,
+  JsonObject,
+  JsonValue,
+  RuntimeAgentEvent,
+  RuntimeEventStore,
+  RuntimeRunRecord,
+  ToolDefinition,
+} from './core.js';
 import type { GatewayAuthContext } from './auth.js';
 import { createAgentRegistry } from './agent-registry.js';
 import type { GatewayConfig } from './config.js';
@@ -523,6 +532,138 @@ describe('createGatewayServer', () => {
         invocationKind: 'run',
         metadata: { source: 'dashboard' },
         createdAt: '2026-04-08T10:02:00.000Z',
+      },
+    ]);
+  });
+
+  it('forwards realtime agent events to the websocket while a session run is executing', async () => {
+    const stores = createInMemoryGatewayStores();
+    const authContext = createAuthContext('user-123');
+    const runtimeRuns: Record<string, RuntimeRunRecord> = {};
+    const listeners = new Set<(event: RuntimeAgentEvent) => void>();
+    const eventStore: RuntimeEventStore = {
+      subscribe(listener) {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+    };
+    const emitRuntimeEvent = (event: RuntimeAgentEvent) => {
+      for (const listener of listeners) {
+        listener(event);
+      }
+    };
+    const emittedFrames: unknown[] = [];
+    const run = vi.fn(async (request) => {
+      runtimeRuns['run-live-1'] = {
+        id: 'run-live-1',
+        rootRunId: 'root-live-1',
+        status: 'running',
+        metadata: request.metadata as JsonObject | undefined,
+      };
+      runtimeRuns['root-live-1'] = {
+        id: 'root-live-1',
+        rootRunId: 'root-live-1',
+        status: 'running',
+        metadata: request.metadata as JsonObject | undefined,
+      };
+
+      emitRuntimeEvent({
+        id: 'evt-1',
+        runId: 'run-live-1',
+        seq: 1,
+        type: 'run.created',
+        payload: { rootRunId: 'root-live-1' } satisfies JsonValue,
+        createdAt: '2026-04-08T10:02:00.100Z',
+      });
+      emitRuntimeEvent({
+        id: 'evt-2',
+        runId: 'run-live-1',
+        seq: 2,
+        type: 'tool.started',
+        payload: { toolName: 'read_file' } satisfies JsonValue,
+        createdAt: '2026-04-08T10:02:00.200Z',
+      });
+
+      runtimeRuns['run-live-1'].status = 'succeeded';
+      runtimeRuns['root-live-1'].status = 'succeeded';
+
+      return {
+        status: 'success' as const,
+        runId: 'run-live-1',
+        output: { ok: true },
+        stepsUsed: 1,
+        usage: { promptTokens: 3, completionTokens: 2, estimatedCostUSD: 0.0003 },
+      };
+    });
+    const agentRegistry = createGatewayTestAgentRegistry({
+      run,
+      runtimeRuns,
+      eventStore,
+    });
+
+    await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'session.open',
+        channelId: 'webchat',
+      }),
+      {
+        authContext,
+        stores,
+        now: () => new Date('2026-04-08T10:00:00.000Z'),
+        sessionIdFactory: () => 'session-1',
+      },
+    );
+
+    const response = await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'run.start',
+        sessionId: 'session-1',
+        goal: 'Stream live events',
+      }),
+      {
+        gatewayConfig: createChatGatewayConfig(),
+        agentRegistry,
+        authContext,
+        stores,
+        emitFrame: (frame) => emittedFrames.push(frame),
+        now: () => new Date('2026-04-08T10:02:00.000Z'),
+      },
+    );
+
+    expect(response).toEqual({
+      type: 'run.output',
+      runId: 'run-live-1',
+      rootRunId: 'root-live-1',
+      sessionId: 'session-1',
+      status: 'succeeded',
+      output: { ok: true },
+    });
+    expect(emittedFrames).toEqual([
+      {
+        type: 'agent.event',
+        eventType: 'run.created',
+        data: { rootRunId: 'root-live-1' },
+        seq: 1,
+        stepId: undefined,
+        createdAt: '2026-04-08T10:02:00.100Z',
+        sessionId: 'session-1',
+        agentId: 'support-agent',
+        runId: 'run-live-1',
+        rootRunId: 'root-live-1',
+        parentRunId: undefined,
+      },
+      {
+        type: 'agent.event',
+        eventType: 'tool.started',
+        data: { toolName: 'read_file' },
+        seq: 2,
+        stepId: undefined,
+        createdAt: '2026-04-08T10:02:00.200Z',
+        sessionId: 'session-1',
+        agentId: 'support-agent',
+        runId: 'run-live-1',
+        rootRunId: 'root-live-1',
+        parentRunId: undefined,
       },
     ]);
   });
@@ -1198,6 +1339,62 @@ describe('createGatewayServer', () => {
     expect(resolveApproval).toHaveBeenCalledWith('run-awaiting', true);
     expect(resume).toHaveBeenCalledWith('run-awaiting');
   });
+
+  it('routes clarification.resolve to the linked run session', async () => {
+    const stores = createInMemoryGatewayStores();
+    const authContext = createAuthContext('user-123');
+    const resolveClarification = vi.fn(async () => ({
+      status: 'success' as const,
+      runId: 'run-clarify',
+      output: { clarified: true },
+      stepsUsed: 2,
+      usage: { promptTokens: 0, completionTokens: 0, estimatedCostUSD: 0 },
+    }));
+    const agentRegistry = createGatewayTestAgentRegistry({
+      resolveClarification,
+      runtimeRuns: {
+        'run-clarify': { id: 'run-clarify', rootRunId: 'root-run-clarify', status: 'succeeded' },
+      },
+    });
+
+    await createStoredSession(stores, {
+      agentId: 'support-agent',
+      invocationMode: 'run',
+      status: 'idle',
+    });
+    await stores.sessionRunLinks.append({
+      sessionId: 'session-1',
+      runId: 'run-clarify',
+      rootRunId: 'root-run-clarify',
+      invocationKind: 'run',
+      createdAt: '2026-04-08T10:17:00.000Z',
+    });
+
+    const response = await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'clarification.resolve',
+        sessionId: 'session-1',
+        runId: 'run-clarify',
+        message: 'Use markdown output.',
+      }),
+      {
+        agentRegistry,
+        authContext,
+        stores,
+        now: () => new Date('2026-04-08T10:18:00.000Z'),
+      },
+    );
+
+    expect(response).toEqual({
+      type: 'run.output',
+      runId: 'run-clarify',
+      rootRunId: 'root-run-clarify',
+      sessionId: 'session-1',
+      status: 'succeeded',
+      output: { clarified: true },
+    });
+    expect(resolveClarification).toHaveBeenCalledWith('run-clarify', 'Use markdown output.');
+  });
 });
 
 function createAuthContext(subject: string): GatewayAuthContext {
@@ -1268,8 +1465,10 @@ function createGatewayTestAgentRegistry(
     chat?: CreatedAdaptiveAgent['agent']['chat'];
     run?: NonNullable<CreatedAdaptiveAgent['agent']['run']>;
     resolveApproval?: NonNullable<CreatedAdaptiveAgent['agent']['resolveApproval']>;
+    resolveClarification?: NonNullable<CreatedAdaptiveAgent['agent']['resolveClarification']>;
     resume?: NonNullable<CreatedAdaptiveAgent['agent']['resume']>;
-    runtimeRuns: Record<string, { id: string; rootRunId: string; status: string }>;
+    runtimeRuns: Record<string, RuntimeRunRecord>;
+    eventStore?: RuntimeEventStore;
   },
 ) {
   return createAgentRegistry({
@@ -1291,13 +1490,14 @@ function createGatewayTestAgentRegistry(
           })),
         run: options.run,
         resolveApproval: options.resolveApproval,
+        resolveClarification: options.resolveClarification,
         resume: options.resume,
       },
       runtime: {
         runStore: {
           getRun: async (runId: string) => options.runtimeRuns[runId] ?? null,
         },
-        eventStore: {},
+        eventStore: options.eventStore ?? {},
         snapshotStore: {},
         planStore: undefined,
       },

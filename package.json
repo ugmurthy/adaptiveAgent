@@ -6,6 +6,11 @@
   "workspaces": [
     "packages/*"
   ],
+  "scripts": {
+    "gateway:ws-client": "bun run ./packages/gateway-fastify/src/local-ws-client.ts",
+    "gateway:mint-jwt": "bun run ./packages/gateway-fastify/src/mint-local-jwt.ts",
+    "gateway:start": "bun run ./packages/gateway-fastify/src/start-local.ts"
+  },
   "dependencies": {
     "@e2b/code-interpreter": "^2.4.0",
     "@types/marked-terminal": "^6.1.1",

@@ -1059,6 +1059,67 @@ describe('AdaptiveAgent', () => {
     expect(approvalEvents.some((event) => event.type === 'approval.resolved')).toBe(true);
   });
 
+  it('continues a clarification-requested run after resolveClarification()', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const model = new SequenceModel([
+      {
+        finishReason: 'stop',
+        structuredOutput: { format: 'markdown' },
+      },
+    ]);
+
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const run = await runStore.createRun({
+      goal: 'Prepare the final report',
+      status: 'clarification_requested',
+    });
+    await snapshotStore.save({
+      runId: run.id,
+      snapshotSeq: 1,
+      status: 'clarification_requested',
+      currentStepId: 'step-1',
+      summary: {
+        status: 'clarification_requested',
+        stepsUsed: 1,
+      },
+      state: {
+        messages: [
+          { role: 'system', content: 'You are AdaptiveAgent.' },
+          { role: 'user', content: '{"goal":"Prepare the final report"}' },
+          { role: 'assistant', content: 'What format should the report use?' },
+        ],
+        stepsUsed: 1,
+      },
+    });
+
+    const result = await agent.resolveClarification(run.id, 'Use markdown with headings');
+
+    expect(result).toMatchObject({
+      status: 'success',
+      runId: run.id,
+      output: { format: 'markdown' },
+    });
+    expect(model.receivedRequests[0]?.messages.at(-1)).toEqual({
+      role: 'user',
+      content: 'Use markdown with headings',
+    });
+
+    const storedRun = await runStore.getRun(run.id);
+    expect(storedRun?.status).toBe('succeeded');
+
+    const runEvents = await eventStore.listByRun(run.id);
+    expect(runEvents.some((event) => event.type === 'run.resumed')).toBe(true);
+  });
+
   it('rejects persisted delegate steps during executePlan with replan.required', async () => {
     const runStore = new InMemoryRunStore();
     const eventStore = new InMemoryEventStore();

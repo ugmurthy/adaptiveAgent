@@ -2,8 +2,16 @@ import type { AgentRegistry } from './agent-registry.js';
 import type { GatewayAuthContext } from './auth.js';
 import type { GatewayConfig } from './config.js';
 import type { JsonObject, JsonValue, RunResult } from './core.js';
-import type { ApprovalRequestedFrame, ApprovalResolveFrame, RunOutputFrame, RunStartFrame } from './protocol.js';
+import type {
+  ApprovalRequestedFrame,
+  ApprovalResolveFrame,
+  ClarificationResolveFrame,
+  RunOutputFrame,
+  RunStartFrame,
+} from './protocol.js';
 import { ProtocolValidationError } from './protocol.js';
+import type { RealtimeEventForwardingContext } from './realtime-events.js';
+import { withForwardedRealtimeEvents } from './realtime-events.js';
 import { resolveGatewayRoute } from './routing.js';
 import { assertGatewaySessionWriteAllowed, getAuthorizedGatewaySession } from './session.js';
 import type { GatewaySessionRecord, GatewayStores } from './stores.js';
@@ -15,6 +23,7 @@ export interface ExecuteGatewayRunStartOptions {
   authContext?: GatewayAuthContext;
   requestedChannelId?: string;
   now?: () => Date;
+  realtimeEvents?: Omit<RealtimeEventForwardingContext, 'fallbackAgentId' | 'fallbackSessionId' | 'rootRunId'>;
 }
 
 export interface ExecuteGatewayApprovalResolutionOptions {
@@ -22,6 +31,15 @@ export interface ExecuteGatewayApprovalResolutionOptions {
   stores: GatewayStores;
   authContext?: GatewayAuthContext;
   now?: () => Date;
+  realtimeEvents?: Omit<RealtimeEventForwardingContext, 'fallbackAgentId' | 'fallbackSessionId' | 'requestId'>;
+}
+
+export interface ExecuteGatewayClarificationResolutionOptions {
+  agentRegistry: AgentRegistry;
+  stores: GatewayStores;
+  authContext?: GatewayAuthContext;
+  now?: () => Date;
+  realtimeEvents?: Omit<RealtimeEventForwardingContext, 'fallbackAgentId' | 'fallbackSessionId' | 'requestId'>;
 }
 
 export async function executeGatewayRunStart(
@@ -69,6 +87,7 @@ export async function executeGatewayRunStart(
         stores: options.stores,
         requestedChannelId: options.requestedChannelId,
         nowIso,
+        realtimeEvents: options.realtimeEvents,
       });
     } catch (error) {
       if (error instanceof ProtocolValidationError) {
@@ -113,6 +132,7 @@ export async function executeGatewayRunStart(
       stores: options.stores,
       requestedChannelId: options.requestedChannelId,
       nowIso,
+      realtimeEvents: options.realtimeEvents,
     });
   } catch (error) {
     if (error instanceof ProtocolValidationError) {
@@ -175,8 +195,17 @@ export async function executeGatewayApprovalResolution(
   });
 
   try {
-    await agent.agent.resolveApproval(frame.runId, frame.approved);
-    const resumedResult = await agent.agent.resume(frame.runId);
+    const realtimeEvents = options.realtimeEvents
+      ? {
+          ...options.realtimeEvents,
+          fallbackAgentId: agentId,
+          fallbackSessionId: runningSession.id,
+          rootRunId: session.currentRootRunId ?? frame.runId,
+        }
+      : undefined;
+
+    await withForwardedRealtimeEvents(agent, realtimeEvents, () => agent.agent.resolveApproval!(frame.runId, frame.approved));
+    const resumedResult = await withForwardedRealtimeEvents(agent, realtimeEvents, () => agent.agent.resume!(frame.runId));
     const rootRunId = (await resolveRootRunId(agent.runtime.runStore, resumedResult.runId)) ?? session.currentRootRunId ?? frame.runId;
 
     return settleStructuredRunResult(resumedResult, rootRunId, {
@@ -214,6 +243,116 @@ export async function executeGatewayApprovalResolution(
   }
 }
 
+export async function executeGatewayClarificationResolution(
+  frame: ClarificationResolveFrame,
+  options: ExecuteGatewayClarificationResolutionOptions,
+): Promise<RunOutputFrame | ApprovalRequestedFrame> {
+  const nowIso = (options.now ?? (() => new Date()))().toISOString();
+  const session = await getAuthorizedGatewaySession(frame.sessionId, {
+    authContext: options.authContext,
+    stores: options.stores,
+    requestType: frame.type,
+  });
+  assertGatewaySessionWriteAllowed(session, frame.type);
+
+  const sessionRunLink = await options.stores.sessionRunLinks.getByRunId(frame.runId);
+  if (!sessionRunLink || sessionRunLink.sessionId !== session.id) {
+    throw new ProtocolValidationError(
+      'invalid_frame',
+      `Run "${frame.runId}" is not linked to session "${session.id}" for clarification resolution.`,
+      {
+        requestType: frame.type,
+        details: {
+          sessionId: session.id,
+          runId: frame.runId,
+        },
+      },
+    );
+  }
+
+  const agentId = session.agentId;
+  if (!agentId) {
+    throw new ProtocolValidationError(
+      'run_failed',
+      `Session "${session.id}" does not have a routed agent for clarification resolution.`,
+      {
+        requestType: frame.type,
+        details: { sessionId: session.id, runId: frame.runId },
+      },
+    );
+  }
+
+  const agent = await options.agentRegistry.getAgent(agentId);
+  if (!agent.agent.resolveClarification) {
+    throw new ProtocolValidationError(
+      'run_failed',
+      `Agent "${agentId}" does not support clarification resolution.`,
+      {
+        requestType: frame.type,
+        details: { sessionId: session.id, runId: frame.runId, agentId },
+      },
+    );
+  }
+
+  const runningSession = await options.stores.sessions.update({
+    ...session,
+    status: 'running',
+    currentRunId: frame.runId,
+    currentRootRunId: sessionRunLink.rootRunId,
+    updatedAt: nowIso,
+  });
+
+  try {
+    const clarifiedResult = await withForwardedRealtimeEvents(
+      agent,
+      options.realtimeEvents
+        ? {
+            ...options.realtimeEvents,
+            fallbackAgentId: agentId,
+            fallbackSessionId: runningSession.id,
+            rootRunId: sessionRunLink.rootRunId,
+          }
+        : undefined,
+      () => agent.agent.resolveClarification!(frame.runId, frame.message),
+    );
+    const rootRunId =
+      (await resolveRootRunId(agent.runtime.runStore, clarifiedResult.runId)) ?? sessionRunLink.rootRunId ?? frame.runId;
+
+    return settleStructuredRunResult(clarifiedResult, rootRunId, {
+      agentId,
+      session: runningSession,
+      authContext: options.authContext,
+      agentRegistry: options.agentRegistry,
+      stores: options.stores,
+      nowIso,
+    });
+  } catch (error) {
+    if (error instanceof ProtocolValidationError) {
+      throw error;
+    }
+
+    await settleSession(options.stores, runningSession, {
+      status: 'failed',
+      currentRunId: undefined,
+      currentRootRunId: undefined,
+      updatedAt: nowIso,
+    });
+
+    throw new ProtocolValidationError(
+      'run_failed',
+      error instanceof Error ? error.message : 'Clarification resolution failed unexpectedly.',
+      {
+        requestType: frame.type,
+        details: {
+          sessionId: runningSession.id,
+          runId: frame.runId,
+          agentId,
+        },
+      },
+    );
+  }
+}
+
 interface ExecuteResolvedGatewayRunOptions {
   agentId: string;
   session?: GatewaySessionRecord;
@@ -222,6 +361,7 @@ interface ExecuteResolvedGatewayRunOptions {
   stores: GatewayStores;
   requestedChannelId?: string;
   nowIso: string;
+  realtimeEvents?: Omit<RealtimeEventForwardingContext, 'fallbackAgentId' | 'fallbackSessionId' | 'rootRunId'>;
 }
 
 async function executeResolvedGatewayRun(
@@ -236,12 +376,23 @@ async function executeResolvedGatewayRun(
     });
   }
 
-  const runResult = await agent.agent.run({
-    goal: frame.goal,
-    input: frame.input,
-    context: buildGatewayRunContext(frame, options.session, options.authContext, options.requestedChannelId),
-    metadata: buildGatewayRunMetadata(frame, options.session?.id, options.agentId),
-  });
+  const runResult = await withForwardedRealtimeEvents(
+    agent,
+    options.realtimeEvents
+      ? {
+          ...options.realtimeEvents,
+          fallbackAgentId: options.agentId,
+          fallbackSessionId: options.session?.id,
+        }
+      : undefined,
+    () =>
+      agent.agent.run!({
+        goal: frame.goal,
+        input: frame.input,
+        context: buildGatewayRunContext(frame, options.session, options.authContext, options.requestedChannelId),
+        metadata: buildGatewayRunMetadata(frame, options.session?.id, options.agentId, options.realtimeEvents?.requestId),
+      }),
+  );
   const rootRunId = (await resolveRootRunId(agent.runtime.runStore, runResult.runId)) ?? runResult.runId;
 
   if (options.session) {
@@ -388,7 +539,12 @@ function buildGatewayRunContext(
   return context;
 }
 
-function buildGatewayRunMetadata(frame: RunStartFrame, sessionId: string | undefined, agentId: string): JsonObject {
+function buildGatewayRunMetadata(
+  frame: RunStartFrame,
+  sessionId: string | undefined,
+  agentId: string,
+  requestId?: string,
+): JsonObject {
   const gatewayMetadata: JsonObject = {
     agentId,
     invocationMode: 'run',
@@ -396,6 +552,10 @@ function buildGatewayRunMetadata(frame: RunStartFrame, sessionId: string | undef
 
   if (sessionId) {
     gatewayMetadata.sessionId = sessionId;
+  }
+
+  if (requestId) {
+    gatewayMetadata.requestId = requestId;
   }
 
   return {

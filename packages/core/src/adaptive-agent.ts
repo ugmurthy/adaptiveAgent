@@ -642,6 +642,49 @@ export class AdaptiveAgent {
     await this.saveExecutionSnapshot(resumedRun, state, resumedRun.status);
   }
 
+  async resolveClarification(runId: UUID, message: string): Promise<RunResult> {
+    const trimmedMessage = message.trim();
+    if (!trimmedMessage) {
+      throw new Error('Clarification message must not be empty');
+    }
+
+    const run = await this.options.runStore.getRun(runId);
+    if (!run) {
+      throw new Error(`Run ${runId} does not exist`);
+    }
+
+    if (run.status !== 'clarification_requested') {
+      throw new Error(`Run ${runId} is not awaiting clarification`);
+    }
+
+    this.logLifecycle('info', 'run.clarification_resolved', {
+      ...runLogBindings(run),
+      stepId: run.currentStepId,
+      clarification: summarizeValueForLog(trimmedMessage),
+    });
+
+    const state = await this.loadExecutionState(run);
+    state.messages.push({
+      role: 'user',
+      content: trimmedMessage,
+    });
+
+    const resumedRun = await this.transitionRun(run, 'running');
+    await this.emit({
+      runId,
+      stepId: resumedRun.currentStepId,
+      type: 'run.resumed',
+      schemaVersion: 1,
+      payload: {
+        status: 'running',
+        clarification: trimmedMessage,
+      },
+    });
+    await this.saveExecutionSnapshot(resumedRun, state, resumedRun.status);
+
+    return this.runWithExistingRun(runId, { outputSchema: state.outputSchema });
+  }
+
   async resume(runId: UUID): Promise<RunResult> {
     const run = await this.options.runStore.getRun(runId);
     if (!run) {

@@ -54,6 +54,60 @@ const gateway = await startGateway({
 // Listening on http://{host}:{port}
 ```
 
+### Managed Local Launcher
+
+This package also includes a Bun launcher that creates the requested local config and file-backed store directories under `~/.adaptiveAgent`, then starts the gateway on port `8959`.
+
+From the repository root:
+
+```bash
+bun run gateway:start
+```
+
+From `packages/gateway-fastify/`:
+
+```bash
+bun run start:local
+```
+
+Mint a matching local dev JWT:
+
+```bash
+bun run gateway:mint-jwt
+bun run gateway:mint-jwt --sub alice --tenant acme --role admin
+```
+
+Run the local WebSocket client:
+
+```bash
+bun run gateway:ws-client
+bun run gateway:ws-client --message "Hello there"
+bun run gateway:ws-client --run "Summarize this repository"
+```
+
+The launcher uses these paths:
+
+- gateway store base dir: `~/.adaptiveAgent/data/gateway`
+- gateway config: `~/.adaptiveAgent/config/gateway.json`
+- agent config dir: `~/.adaptiveAgent/agents`
+- default agent config: `~/.adaptiveAgent/agents/default-agent.json`
+
+The generated default agent uses:
+
+- `provider: "mesh"`
+- `model: "qwen/qwen3.5-27b"`
+- `apiKey: process.env.MESH_API_KEY` at generation time
+- `systemInstructions: "You are a helpful assistant and you names is adaptiveAgent "`
+- built-in local tools: `read_file`, `list_directory`, `write_file`, `shell_exec`, `web_search`, `read_web_page`
+- delegate loading from `~/.adaptiveAgent/skills` first, then the repository's bundled `examples/skills`
+- gateway auth provider `jwt` with `secret: process.env.GATEWAY_JWT_SECRET ?? "adaptive-agent-local-dev-secret"`
+
+The JWT helper reads `auth.secret`, `auth.issuer`, `auth.audience`, `auth.tenantIdClaim`, and `auth.rolesClaim` from the local gateway config when present, so minted tokens stay aligned with your local auth configuration.
+
+The WebSocket client auto-mints a matching local JWT unless you pass `--token`, connects with Bun's WebSocket client using an `Authorization: Bearer ...` header, opens a chat session, and supports an interactive prompt with `/run`, `/approve`, `/clarify`, `/events on|off`, `/ping`, `/session`, and `/exit`. Realtime `agent.event` frames are shown by default in interactive mode, and `/events off` hides them until you re-enable them. Interactive `/run` commands use a separate dedicated run session so chat and structured-run traffic do not collide with the gateway's session mode pinning.
+
+The launcher updates an existing gateway config when the auth block is missing, and it also flattens older `auth.settings`-style configs into the runtime shape the code actually reads.
+
 ---
 
 ## Gateway Config
@@ -70,10 +124,11 @@ File: `config/gateway.json`
   },
   "auth": {
     "provider": "jwt",
-    "settings": {
-      "secret": "your-jwt-secret",
-      "algorithms": ["HS256"]
-    }
+    "secret": "your-jwt-secret",
+    "issuer": "https://auth.example.com",
+    "audience": "adaptive-agent-gateway",
+    "tenantIdClaim": "tenantId",
+    "rolesClaim": "roles"
   },
   "cron": {
     "enabled": true,
@@ -126,7 +181,11 @@ File: `config/gateway.json`
 | `server.websocketPath` | Yes | WebSocket upgrade path (must start with `/`) |
 | `server.healthPath` | No | HTTP health endpoint path |
 | `auth.provider` | No | Auth provider name (e.g., `jwt`) |
-| `auth.settings` | No | Provider-specific settings |
+| `auth.secret` | No | Shared JWT secret for the built-in `jwt` auth provider |
+| `auth.issuer` | No | Expected JWT issuer |
+| `auth.audience` | No | Expected JWT audience |
+| `auth.tenantIdClaim` | No | Claim name used for tenant routing; defaults to `tenantId` |
+| `auth.rolesClaim` | No | Claim name used for roles; defaults to `roles` |
 | `cron.enabled` | No | Enable the scheduler loop |
 | `cron.schedulerLeaseMs` | No | Lease duration for cron claiming |
 | `cron.maxConcurrentJobs` | No | Max concurrent cron dispatches |
@@ -235,6 +294,14 @@ Approve or reject a paused run.
 
 ```json
 { "type": "approval.resolve", "sessionId": "s-1", "runId": "r-1", "approved": true }
+```
+
+#### `clarification.resolve`
+
+Provide clarification text back to a session-bound structured run that previously asked a question.
+
+```json
+{ "type": "clarification.resolve", "sessionId": "s-1", "runId": "r-1", "message": "Use markdown output." }
 ```
 
 #### `channel.subscribe`

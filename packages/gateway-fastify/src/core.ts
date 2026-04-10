@@ -6,6 +6,20 @@ export type CaptureMode = 'full' | 'summary' | 'none';
 
 interface CoreRuntimeModule {
   createAdaptiveAgent(options: CreateAdaptiveAgentOptions): unknown;
+  createReadFileTool(config?: { allowedRoot?: string; maxSizeBytes?: number }): ToolDefinition;
+  createListDirectoryTool(config?: { allowedRoot?: string }): ToolDefinition;
+  createWriteFileTool(config?: { allowedRoot?: string; createDirectories?: boolean }): ToolDefinition;
+  createShellExecTool(config?: { cwd?: string; maxOutputBytes?: number; shell?: string }): ToolDefinition;
+  createWebSearchTool(config: {
+    provider?: 'brave' | 'duckduckgo';
+    apiKey?: string;
+    maxResults?: number;
+    baseUrl?: string;
+    timeoutMs?: number;
+  }): ToolDefinition;
+  createReadWebPageTool(config?: { maxSizeBytes?: number; maxTextLength?: number; timeoutMs?: number }): ToolDefinition;
+  loadSkillFromDirectory(skillDir: string): Promise<LoadedSkillDefinition>;
+  skillToDelegate(skill: LoadedSkillDefinition): DelegateDefinition;
 }
 
 let coreRuntimePromise: Promise<CoreRuntimeModule> | undefined;
@@ -98,10 +112,25 @@ export interface RuntimeRunRecord {
   status: string;
   errorMessage?: string;
   result?: JsonValue;
+  metadata?: JsonObject;
 }
 
 export interface RuntimeRunStore {
   getRun(runId: string): Promise<RuntimeRunRecord | null>;
+}
+
+export interface RuntimeAgentEvent {
+  id: string;
+  runId: string;
+  seq: number;
+  type: string;
+  stepId?: string;
+  payload: JsonValue;
+  createdAt: string;
+}
+
+export interface RuntimeEventStore {
+  subscribe?(listener: (event: RuntimeAgentEvent) => void): () => void;
 }
 
 export interface AdaptiveAgentHandle {
@@ -113,6 +142,7 @@ export interface AdaptiveAgentHandle {
     metadata?: JsonObject;
   }): Promise<RunResult>;
   resolveApproval?(runId: string, approved: boolean): Promise<void>;
+  resolveClarification?(runId: string, message: string): Promise<RunResult>;
   resume?(runId: string): Promise<RunResult>;
 }
 
@@ -152,7 +182,7 @@ export interface CreatedAdaptiveAgent {
   agent: AdaptiveAgentHandle;
   runtime: {
     runStore: RuntimeRunStore;
-    eventStore: unknown;
+    eventStore: RuntimeEventStore | unknown;
     snapshotStore: unknown;
     planStore: unknown;
   };
@@ -166,9 +196,69 @@ export interface CreateAdaptiveAgentOptions {
   systemInstructions?: string;
 }
 
+export interface LoadedSkillDefinition {
+  name: string;
+  description: string;
+  instructions: string;
+  allowedTools: string[];
+  defaults?: Partial<AgentDefaults>;
+  handler?: string;
+  handlerTools?: ToolDefinition[];
+}
+
+export interface CreateBuiltinToolsOptions {
+  rootDir?: string;
+  webSearchProvider?: 'brave' | 'duckduckgo';
+  braveSearchApiKey?: string;
+  webToolTimeoutMs?: number;
+}
+
+export interface LoadedSkillDelegate {
+  name: string;
+  allowedTools: string[];
+  delegate: DelegateDefinition;
+}
+
 export async function createAdaptiveAgent(options: CreateAdaptiveAgentOptions): Promise<CreatedAdaptiveAgent> {
   const coreRuntime = await loadCoreRuntime();
   return coreRuntime.createAdaptiveAgent(options) as CreatedAdaptiveAgent;
+}
+
+export async function createBuiltinTools(options: CreateBuiltinToolsOptions = {}): Promise<ToolDefinition[]> {
+  const coreRuntime = await loadCoreRuntime();
+  const rootDir = options.rootDir ?? process.cwd();
+  const preferredWebSearchProvider = options.webSearchProvider ?? 'duckduckgo';
+  const webSearchProvider =
+    preferredWebSearchProvider === 'brave' && !options.braveSearchApiKey ? 'duckduckgo' : preferredWebSearchProvider;
+
+  return [
+    coreRuntime.createReadFileTool({ allowedRoot: rootDir }),
+    coreRuntime.createListDirectoryTool({ allowedRoot: rootDir }),
+    coreRuntime.createWriteFileTool({ allowedRoot: rootDir }),
+    coreRuntime.createShellExecTool({ cwd: rootDir }),
+    webSearchProvider === 'brave'
+      ? coreRuntime.createWebSearchTool({
+          provider: 'brave',
+          apiKey: options.braveSearchApiKey,
+          timeoutMs: options.webToolTimeoutMs,
+        })
+      : coreRuntime.createWebSearchTool({
+          provider: 'duckduckgo',
+          timeoutMs: options.webToolTimeoutMs,
+        }),
+    coreRuntime.createReadWebPageTool({ timeoutMs: options.webToolTimeoutMs }),
+  ];
+}
+
+export async function loadSkillDelegateFromDirectory(skillDir: string): Promise<LoadedSkillDelegate> {
+  const coreRuntime = await loadCoreRuntime();
+  const skill = await coreRuntime.loadSkillFromDirectory(skillDir);
+
+  return {
+    name: skill.name,
+    allowedTools: [...skill.allowedTools],
+    delegate: coreRuntime.skillToDelegate(skill),
+  };
 }
 
 function loadCoreRuntime(): Promise<CoreRuntimeModule> {
