@@ -1,4 +1,4 @@
-import { createAdaptiveAgent, type CreatedAdaptiveAgent } from './core.js';
+import { createAdaptiveAgent, type AdaptiveAgentLogger, type CreatedAdaptiveAgent } from './core.js';
 
 import type { AgentConfig, InvocationMode, LoadedConfig } from './config.js';
 import { ModuleRegistry, type ResolvedAgentModules } from './registries.js';
@@ -21,6 +21,7 @@ export interface RegisteredAgentDefinition extends AgentCapabilitiesMetadata {
 export interface AgentRegistryEntry {
   definition: RegisteredAgentDefinition;
   modules: ResolvedAgentModules;
+  logger?: AdaptiveAgentLogger;
 }
 
 export type AgentFactory = (entry: AgentRegistryEntry) => Promise<CreatedAdaptiveAgent> | CreatedAdaptiveAgent;
@@ -29,6 +30,7 @@ export interface CreateAgentRegistryOptions {
   agents: Array<LoadedConfig<AgentConfig>>;
   moduleRegistry: ModuleRegistry;
   agentFactory?: AgentFactory;
+  logger?: AdaptiveAgentLogger;
 }
 
 export class AgentRegistry {
@@ -63,6 +65,7 @@ export class AgentRegistry {
       this.entries.set(definition.agentId, {
         definition,
         modules,
+        logger: options.logger?.child({ agentId: definition.agentId }),
       });
     }
   }
@@ -134,4 +137,5 @@ const defaultAgentFactory: AgentFactory = (entry) =>
     delegates: entry.modules.delegates.length > 0 ? entry.modules.delegates : undefined,
     defaults: entry.definition.config.defaults,
     systemInstructions: entry.definition.config.systemInstructions,
+    logger: entry.logger,
   });

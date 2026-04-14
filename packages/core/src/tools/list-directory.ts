@@ -24,6 +24,10 @@ export function createListDirectoryTool(config?: ListDirectoryToolConfig): ToolD
     name: 'list_directory',
     description:
       'List the entries in a directory. Returns each entry name and whether it is a file or directory.',
+    retryPolicy: {
+      retryable: true,
+      retryOn: ['timeout', 'network', 'not_found', 'unknown'],
+    },
     inputSchema: {
       type: 'object',
       required: ['path'],

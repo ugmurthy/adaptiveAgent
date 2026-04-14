@@ -1,7 +1,7 @@
 import { readdir, readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
-import type { AgentDefaults, JsonObject, JsonValue, ModelAdapterConfig } from './core.js';
+import type { AdaptiveAgentLogDestination, AdaptiveAgentLogLevel, AgentDefaults, JsonObject, JsonValue, ModelAdapterConfig } from './core.js';
 
 import { ConfigValidationError } from './errors.js';
 
@@ -24,6 +24,8 @@ const INVOCATION_MODES = ['chat', 'run'] as const;
 const CAPTURE_MODES = ['full', 'summary', 'none'] as const;
 const HOOK_FAILURE_POLICIES = ['fail', 'warn', 'ignore'] as const;
 const REQUEST_LOG_DESTINATIONS = ['console', 'file', 'both'] as const;
+const AGENT_RUNTIME_LOG_DESTINATIONS = ['console', 'file', 'both'] as const satisfies readonly AdaptiveAgentLogDestination[];
+const AGENT_RUNTIME_LOG_LEVELS = ['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent'] as const satisfies readonly AdaptiveAgentLogLevel[];
 const MODEL_PROVIDERS: ModelAdapterConfig['provider'][] = ['openrouter', 'ollama', 'mistral', 'mesh'];
 
 export type InvocationMode = (typeof INVOCATION_MODES)[number];
@@ -103,6 +105,7 @@ export interface GatewayHooksConfig {
 
 export interface GatewayConfig {
   server: GatewayServerConfig;
+  agentRuntimeLogging?: GatewayAgentRuntimeLoggingConfig;
   auth?: GatewayAuthConfig;
   cron?: GatewayCronConfig;
   transcript?: GatewayTranscriptConfig;
@@ -113,6 +116,13 @@ export interface GatewayConfig {
   bindings: GatewayBinding[];
   defaultAgentId?: string;
   hooks: GatewayHooksConfig;
+}
+
+export interface GatewayAgentRuntimeLoggingConfig {
+  enabled: boolean;
+  level?: AdaptiveAgentLogLevel;
+  destination?: AdaptiveAgentLogDestination;
+  filePath?: string;
 }
 
 export interface AgentRoutingConfig {
@@ -216,6 +226,11 @@ function validateGatewayConfig(value: unknown, sourcePath: string): GatewayConfi
   const root = expectObject(value, 'gateway', issues);
 
   const server = parseGatewayServerConfig(root?.server, 'server', issues);
+  const agentRuntimeLogging = parseGatewayAgentRuntimeLoggingConfig(
+    root?.agentRuntimeLogging,
+    'agentRuntimeLogging',
+    issues,
+  );
   const auth = parseGatewayAuthConfig(root?.auth, 'auth', issues);
   const cron = parseGatewayCronConfig(root?.cron, 'cron', issues);
   const transcript = parseGatewayTranscriptConfig(root?.transcript, 'transcript', issues);
@@ -245,6 +260,7 @@ function validateGatewayConfig(value: unknown, sourcePath: string): GatewayConfi
 
   return {
     server,
+    agentRuntimeLogging,
     auth,
     cron,
     transcript,
@@ -326,6 +342,31 @@ function parseGatewayServerConfig(value: unknown, path: string, issues: string[]
       server?.requestLoggingDestination === undefined
         ? undefined
         : expectEnum(server.requestLoggingDestination, REQUEST_LOG_DESTINATIONS, `${path}.requestLoggingDestination`, issues),
+  };
+}
+
+function parseGatewayAgentRuntimeLoggingConfig(
+  value: unknown,
+  path: string,
+  issues: string[],
+): GatewayAgentRuntimeLoggingConfig | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const logging = expectObject(value, path, issues);
+
+  return {
+    enabled: expectBoolean(logging?.enabled, `${path}.enabled`, issues) ?? false,
+    level:
+      logging?.level === undefined
+        ? undefined
+        : expectEnum(logging.level, AGENT_RUNTIME_LOG_LEVELS, `${path}.level`, issues),
+    destination:
+      logging?.destination === undefined
+        ? undefined
+        : expectEnum(logging.destination, AGENT_RUNTIME_LOG_DESTINATIONS, `${path}.destination`, issues),
+    filePath: expectOptionalNonEmptyString(logging?.filePath, `${path}.filePath`, issues),
   };
 }
 

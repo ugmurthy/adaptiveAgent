@@ -57,6 +57,9 @@ function createCreatedAgent(agentId: string): CreatedAdaptiveAgent {
 
 describe('AgentRegistry', () => {
   it('loads metadata without instantiating agents and caches materialized agents by id', async () => {
+    const agentLogger = {
+      child: vi.fn(() => ({ child: vi.fn() })),
+    };
     const agentFactory = vi.fn((entry) => createCreatedAgent(entry.definition.agentId));
     const registry = createAgentRegistry({
       agents: [createAgentConfig()],
@@ -65,6 +68,7 @@ describe('AgentRegistry', () => {
         delegates: [createDelegate('researcher')],
       }),
       agentFactory,
+      logger: agentLogger,
     });
 
     expect(agentFactory).not.toHaveBeenCalled();
@@ -85,6 +89,8 @@ describe('AgentRegistry', () => {
 
     expect(firstMaterializedAgent).toBe(secondMaterializedAgent);
     expect(agentFactory).toHaveBeenCalledTimes(1);
+    expect(agentLogger.child).toHaveBeenCalledWith({ agentId: 'support-agent' });
+    expect(agentFactory.mock.calls[0]?.[0].logger).toBe(agentLogger.child.mock.results[0]?.value);
     expect(registry.getDefinition('support-agent')).toMatchObject({
       agentId: 'support-agent',
       toolNames: ['read_file'],

@@ -1,4 +1,7 @@
 import { PassThrough } from 'node:stream';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 import pino from 'pino';
 import { describe, expect, it, vi } from 'vitest';
@@ -8,7 +11,9 @@ import { InMemoryEventStore } from './in-memory-event-store.js';
 import { InMemoryPlanStore } from './in-memory-plan-store.js';
 import { InMemoryRunStore } from './in-memory-run-store.js';
 import { InMemorySnapshotStore } from './in-memory-snapshot-store.js';
-import type { ModelAdapter, ModelRequest, ModelResponse, ToolDefinition } from './types.js';
+import { InMemoryToolExecutionStore } from './in-memory-tool-execution-store.js';
+import { createReadFileTool } from './tools/read-file.js';
+import type { ModelAdapter, ModelRequest, ModelResponse, RuntimeStores, ToolDefinition } from './types.js';
 
 class SequenceModel implements ModelAdapter {
   readonly provider: string;
@@ -23,7 +28,7 @@ class SequenceModel implements ModelAdapter {
   readonly receivedRequests: ModelRequest[] = [];
 
   constructor(
-    private readonly responses: ModelResponse[],
+    private readonly responses: Array<ModelResponse | Error>,
     provider = 'test',
   ) {
     this.provider = provider;
@@ -35,6 +40,10 @@ class SequenceModel implements ModelAdapter {
     const nextResponse = this.responses.shift();
     if (!nextResponse) {
       throw new Error('SequenceModel received an unexpected generate() call');
+    }
+
+    if (nextResponse instanceof Error) {
+      throw nextResponse;
     }
 
     return structuredClone(nextResponse);
@@ -121,6 +130,413 @@ describe('AdaptiveAgent', () => {
 
     const storedRun = await runStore.getRun(result.runId);
     expect(storedRun?.goal).toBe('What is the capital of France?');
+  });
+
+  it('retries a failed model timeout from the same run and step', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const model = new SequenceModel([
+      new Error('Model timed out after 90000ms'),
+      {
+        finishReason: 'stop',
+        text: 'Recovered from the same step.',
+      },
+    ]);
+
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const failed = await agent.run({
+      goal: 'Retry this run',
+    });
+
+    expect(failed).toMatchObject({
+      status: 'failure',
+      code: 'MODEL_ERROR',
+      error: 'Model timed out after 90000ms',
+      stepsUsed: 0,
+    });
+
+    const retried = await agent.retry(failed.runId);
+
+    expect(retried).toMatchObject({
+      status: 'success',
+      runId: failed.runId,
+      output: 'Recovered from the same step.',
+      stepsUsed: 1,
+    });
+    expect(model.receivedRequests).toHaveLength(2);
+
+    const storedRun = await runStore.getRun(failed.runId);
+    expect(storedRun).toMatchObject({
+      status: 'succeeded',
+      errorCode: undefined,
+      errorMessage: undefined,
+      metadata: {
+        retryAttempts: 1,
+        lastRetryFailureKind: 'timeout',
+      },
+    });
+
+    const retryEvents = (await eventStore.listByRun(failed.runId)).filter((event) => event.type === 'run.retry_started');
+    expect(retryEvents).toHaveLength(1);
+    expect(retryEvents[0].payload).toMatchObject({
+      failureKind: 'timeout',
+      retryAttempts: 1,
+    });
+  });
+
+  it('retries a read_file not_found failure after the file is created', async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), 'adaptive-agent-read-retry-'));
+    try {
+      const runStore = new InMemoryRunStore();
+      const eventStore = new InMemoryEventStore();
+      const snapshotStore = new InMemorySnapshotStore();
+      const toolExecutionStore = new InMemoryToolExecutionStore();
+      const model = new SequenceModel([
+        {
+          finishReason: 'tool_calls',
+          toolCalls: [
+            {
+              id: 'read-call-1',
+              name: 'read_file',
+              input: { path: 'lic.txt' },
+            },
+          ],
+        },
+        {
+          finishReason: 'stop',
+          structuredOutput: { status: 'read after retry' },
+        },
+      ]);
+
+      const agent = new AdaptiveAgent({
+        model,
+        tools: [createReadFileTool({ allowedRoot: tempDir })],
+        runStore,
+        eventStore,
+        snapshotStore,
+        toolExecutionStore,
+      });
+
+      const failed = await agent.run({ goal: 'Read lic.txt' });
+      expect(failed).toMatchObject({
+        status: 'failure',
+        code: 'TOOL_ERROR',
+      });
+
+      await writeFile(join(tempDir, 'lic.txt'), 'license text', 'utf-8');
+
+      const retried = await agent.retry(failed.runId);
+      expect(retried).toMatchObject({
+        status: 'success',
+        runId: failed.runId,
+        output: { status: 'read after retry' },
+      });
+
+      const storedRun = await runStore.getRun(failed.runId);
+      expect(storedRun?.metadata).toMatchObject({
+        retryAttempts: 1,
+        lastRetryFailureKind: 'not_found',
+      });
+      expect(model.receivedRequests.at(-1)?.messages.at(-1)).toMatchObject({
+        role: 'tool',
+        name: 'read_file',
+        toolCallId: 'read-call-1',
+        content: expect.stringContaining('license text'),
+      });
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('uses a transaction store for initial run creation and snapshot persistence', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const runInTransaction = vi.fn(async (operation: (stores: RuntimeStores) => Promise<unknown>) =>
+      operation({
+        runStore,
+        eventStore,
+        snapshotStore,
+      }),
+    );
+    const agent = new AdaptiveAgent({
+      model: new SequenceModel([
+        {
+          finishReason: 'stop',
+          text: 'done',
+        },
+      ]),
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore,
+      transactionStore: {
+        runStore,
+        eventStore,
+        snapshotStore,
+        runInTransaction,
+      },
+    });
+
+    const result = await agent.run({ goal: 'Persist the initial state transactionally' });
+
+    expect(result.status).toBe('success');
+    expect(runInTransaction).toHaveBeenCalledTimes(2);
+    const events = await eventStore.listByRun(result.runId);
+    expect(events[0]?.type).toBe('run.created');
+    expect(events[1]?.type).toBe('snapshot.created');
+    const latestSnapshot = await snapshotStore.getLatest(result.runId);
+    expect(latestSnapshot?.state).toMatchObject({
+      schemaVersion: 1,
+      stepsUsed: 1,
+    });
+  });
+
+  it('uses a transaction store for terminal failure persistence', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const runInTransaction = vi.fn(async (operation: (stores: RuntimeStores) => Promise<unknown>) =>
+      operation({
+        runStore,
+        eventStore,
+        snapshotStore,
+      }),
+    );
+    const agent = new AdaptiveAgent({
+      model: new SequenceModel([]),
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore,
+      transactionStore: {
+        runStore,
+        eventStore,
+        snapshotStore,
+        runInTransaction,
+      },
+    });
+
+    const result = await agent.run({ goal: 'Fail transactionally' });
+
+    expect(result.status).toBe('failure');
+    expect(runInTransaction).toHaveBeenCalledTimes(2);
+    const events = await eventStore.listByRun(result.runId);
+    expect(events.at(-2)?.type).toBe('snapshot.created');
+    expect(events.at(-1)?.type).toBe('run.failed');
+    const storedRun = await runStore.getRun(result.runId);
+    expect(storedRun?.status).toBe('failed');
+    expect(storedRun?.errorCode).toBe('MODEL_ERROR');
+  });
+
+  it('uses a transaction store for model tool-call queue snapshots', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const runInTransaction = vi.fn(async (operation: (stores: RuntimeStores) => Promise<unknown>) =>
+      operation({
+        runStore,
+        eventStore,
+        snapshotStore,
+      }),
+    );
+    const agent = new AdaptiveAgent({
+      model: new SequenceModel([
+        {
+          finishReason: 'tool_calls',
+          toolCalls: [
+            {
+              id: 'lookup-call-1',
+              name: 'lookup',
+              input: { topic: 'transactions' },
+            },
+          ],
+        },
+        {
+          finishReason: 'stop',
+          structuredOutput: { report: 'queued and resumed' },
+        },
+      ]),
+      tools: [createLookupTool()],
+      runStore,
+      eventStore,
+      snapshotStore,
+      transactionStore: {
+        runStore,
+        eventStore,
+        snapshotStore,
+        runInTransaction,
+      },
+    });
+
+    const result = await agent.run({ goal: 'Queue a tool call transactionally' });
+
+    expect(result.status).toBe('success');
+    expect(runInTransaction).toHaveBeenCalledTimes(4);
+    const events = await eventStore.listByRun(result.runId);
+    const snapshotEvents = events.filter((event) => event.type === 'snapshot.created');
+    expect(snapshotEvents.length).toBeGreaterThanOrEqual(3);
+    const toolQueueSnapshotEvent = snapshotEvents.find(
+      (event) =>
+        typeof event.payload === 'object' &&
+        event.payload !== null &&
+        !Array.isArray(event.payload) &&
+        event.payload.snapshotSeq === 2,
+    );
+    expect(toolQueueSnapshotEvent).toBeDefined();
+  });
+
+  it('uses a transaction store for tool completion ledger and event persistence', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const toolExecutionStore = new InMemoryToolExecutionStore();
+    const runInTransaction = vi.fn(async (operation: (stores: RuntimeStores) => Promise<unknown>) =>
+      operation({
+        runStore,
+        eventStore,
+        snapshotStore,
+        toolExecutionStore,
+      }),
+    );
+    const agent = new AdaptiveAgent({
+      model: new SequenceModel([
+        {
+          finishReason: 'tool_calls',
+          toolCalls: [
+            {
+              id: 'lookup-call-1',
+              name: 'lookup',
+              input: { topic: 'tool-ledger' },
+            },
+          ],
+        },
+        {
+          finishReason: 'stop',
+          structuredOutput: { report: 'tool completed transactionally' },
+        },
+      ]),
+      tools: [createLookupTool()],
+      runStore,
+      eventStore,
+      snapshotStore,
+      toolExecutionStore,
+      transactionStore: {
+        runStore,
+        eventStore,
+        snapshotStore,
+        toolExecutionStore,
+        runInTransaction,
+      },
+    });
+
+    const result = await agent.run({ goal: 'Complete a tool call transactionally' });
+
+    expect(result.status).toBe('success');
+    expect(runInTransaction).toHaveBeenCalledTimes(4);
+    const events = await eventStore.listByRun(result.runId);
+    expect(events.some((event) => event.type === 'tool.completed')).toBe(true);
+    const record = await toolExecutionStore.getByIdempotencyKey(`${result.runId}:step-1:lookup-call-1`);
+    expect(record).toMatchObject({
+      status: 'completed',
+      output: { finding: 'researched:tool-ledger' },
+    });
+  });
+
+  it('uses a transaction store for child spawn and parent delegate resolution', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const transactionEventGroups: string[][] = [];
+    const runInTransaction = vi.fn(async (operation: (stores: RuntimeStores) => Promise<unknown>) => {
+      const eventTypes: string[] = [];
+      try {
+        return await operation({
+          runStore,
+          eventStore: {
+            append: async (event) => {
+              eventTypes.push(event.type);
+              return eventStore.append(event);
+            },
+            listByRun: (runId, afterSeq) => eventStore.listByRun(runId, afterSeq),
+            subscribe: (listener) => eventStore.subscribe(listener),
+          },
+          snapshotStore,
+        });
+      } finally {
+        transactionEventGroups.push(eventTypes);
+      }
+    });
+    const agent = new AdaptiveAgent({
+      model: new SequenceModel([
+        {
+          finishReason: 'tool_calls',
+          toolCalls: [
+            {
+              id: 'parent-call-1',
+              name: 'delegate.researcher',
+              input: {
+                goal: 'Research transactional delegation',
+                input: { topic: 'transactions' },
+              },
+            },
+          ],
+        },
+        {
+          finishReason: 'stop',
+          structuredOutput: {
+            finding: 'child result',
+          },
+        },
+        {
+          finishReason: 'stop',
+          structuredOutput: {
+            report: 'parent result',
+          },
+        },
+      ]),
+      tools: [createLookupTool()],
+      delegates: [
+        {
+          name: 'researcher',
+          description: 'Researches a topic using the lookup tool.',
+          allowedTools: ['lookup'],
+        },
+      ],
+      runStore,
+      eventStore,
+      snapshotStore,
+      transactionStore: {
+        runStore,
+        eventStore,
+        snapshotStore,
+        runInTransaction,
+      },
+    });
+
+    const result = await agent.run({ goal: 'Delegate transactionally' });
+
+    expect(result).toMatchObject({
+      status: 'success',
+      output: {
+        report: 'parent result',
+      },
+    });
+    expect(transactionEventGroups).toContainEqual([
+      'run.status_changed',
+      'snapshot.created',
+      'delegate.spawned',
+      'run.created',
+    ]);
+    expect(transactionEventGroups).toContainEqual(['run.status_changed', 'tool.completed']);
   });
 
   it('emits structured lifecycle logs with model, tool, and delegation context', async () => {
@@ -976,6 +1392,208 @@ describe('AdaptiveAgent', () => {
     });
   });
 
+  it('recovers a resolved parent delegate snapshot without spawning another child run', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const parentRun = await runStore.createRun({
+      goal: 'Recover a resolved delegation boundary',
+      status: 'queued',
+    });
+    const childRun = await runStore.createRun({
+      rootRunId: parentRun.id,
+      parentRunId: parentRun.id,
+      parentStepId: 'step-1',
+      delegateName: 'researcher',
+      delegationDepth: 1,
+      goal: 'Research a topic',
+      status: 'queued',
+    });
+    await runStore.updateRun(
+      childRun.id,
+      {
+        status: 'succeeded',
+        result: {
+          finding: 'already-resolved',
+        },
+      },
+      childRun.version,
+    );
+    const runningParent = await runStore.updateRun(
+      parentRun.id,
+      {
+        status: 'running',
+        currentChildRunId: undefined,
+        currentStepId: 'step-1',
+      },
+      parentRun.version,
+    );
+
+    await snapshotStore.save({
+      runId: runningParent.id,
+      snapshotSeq: 1,
+      status: 'awaiting_subagent',
+      currentStepId: 'step-1',
+      summary: {
+        status: 'awaiting_subagent',
+        stepsUsed: 0,
+      },
+      state: {
+        schemaVersion: 1,
+        messages: [
+          { role: 'system', content: 'You are AdaptiveAgent.' },
+          { role: 'user', content: 'Resume after a crash.' },
+        ],
+        stepsUsed: 0,
+        pendingToolCall: {
+          id: 'parent-call-1',
+          name: 'delegate.researcher',
+          input: {
+            goal: 'Research a topic',
+          },
+          stepId: 'step-1',
+        },
+        waitingOnChildRunId: childRun.id,
+      },
+    });
+
+    const agent = new AdaptiveAgent({
+      model: new SequenceModel([
+        {
+          finishReason: 'stop',
+          structuredOutput: {
+            report: 'continued from child result',
+          },
+        },
+      ]),
+      tools: [createLookupTool()],
+      delegates: [
+        {
+          name: 'researcher',
+          description: 'Researches a topic using the lookup tool.',
+          allowedTools: ['lookup'],
+        },
+      ],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.resume(parentRun.id);
+
+    expect(result).toMatchObject({
+      status: 'success',
+      output: {
+        report: 'continued from child result',
+      },
+    });
+    await expect(runStore.listChildren(parentRun.id)).resolves.toHaveLength(1);
+    const parentEvents = await eventStore.listByRun(parentRun.id);
+    expect(parentEvents.some((event) => event.type === 'delegate.spawned')).toBe(false);
+    expect(parentEvents.some((event) => event.type === 'step.completed')).toBe(true);
+  });
+
+  it('fails a waiting parent when the claimed child run belongs to another parent', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const parentRun = await runStore.createRun({
+      goal: 'Reject mismatched child linkage',
+      status: 'queued',
+    });
+    const otherParentRun = await runStore.createRun({
+      goal: 'Own the child run',
+      status: 'queued',
+    });
+    const childRun = await runStore.createRun({
+      rootRunId: otherParentRun.id,
+      parentRunId: otherParentRun.id,
+      parentStepId: 'step-1',
+      delegateName: 'researcher',
+      delegationDepth: 1,
+      goal: 'Research for the other parent',
+      status: 'queued',
+    });
+    await runStore.updateRun(
+      childRun.id,
+      {
+        status: 'succeeded',
+        result: {
+          finding: 'wrong-parent',
+        },
+      },
+      childRun.version,
+    );
+    const waitingParent = await runStore.updateRun(
+      parentRun.id,
+      {
+        status: 'awaiting_subagent',
+        currentChildRunId: childRun.id,
+        currentStepId: 'step-1',
+      },
+      parentRun.version,
+    );
+
+    await snapshotStore.save({
+      runId: waitingParent.id,
+      snapshotSeq: 1,
+      status: 'awaiting_subagent',
+      currentStepId: 'step-1',
+      summary: {
+        status: 'awaiting_subagent',
+        stepsUsed: 0,
+      },
+      state: {
+        schemaVersion: 1,
+        messages: [
+          { role: 'system', content: 'You are AdaptiveAgent.' },
+          { role: 'user', content: 'Resume with a bad child link.' },
+        ],
+        stepsUsed: 0,
+        pendingToolCall: {
+          id: 'parent-call-1',
+          name: 'delegate.researcher',
+          input: {
+            goal: 'Research a topic',
+          },
+          stepId: 'step-1',
+        },
+        waitingOnChildRunId: childRun.id,
+      },
+    });
+
+    const agent = new AdaptiveAgent({
+      model: new SequenceModel([]),
+      tools: [createLookupTool()],
+      delegates: [
+        {
+          name: 'researcher',
+          description: 'Researches a topic using the lookup tool.',
+          allowedTools: ['lookup'],
+        },
+      ],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.resume(parentRun.id);
+
+    expect(result).toMatchObject({
+      status: 'failure',
+      code: 'TOOL_ERROR',
+    });
+    if (result.status !== 'failure') {
+      throw new Error(`Expected failure, received ${result.status}`);
+    }
+    expect(result.error).toContain('is not linked to parent run');
+    const storedParent = await runStore.getRun(parentRun.id);
+    expect(storedParent).toMatchObject({
+      status: 'failed',
+      currentChildRunId: undefined,
+    });
+  });
+
   it('executes a gated tool after approval is resolved', async () => {
     const runStore = new InMemoryRunStore();
     const eventStore = new InMemoryEventStore();
@@ -1026,6 +1644,7 @@ describe('AdaptiveAgent', () => {
     const latestSnapshot = await snapshotStore.getLatest(firstResult.runId);
     expect(latestSnapshot?.status).toBe('awaiting_approval');
     expect(latestSnapshot?.state).toMatchObject({
+      schemaVersion: 1,
       pendingToolCall: {
         name: 'secure.write',
       },
@@ -1043,6 +1662,7 @@ describe('AdaptiveAgent', () => {
     const approvedSnapshot = await snapshotStore.getLatest(firstResult.runId);
     expect(approvedSnapshot?.status).toBe('running');
     expect(approvedSnapshot?.state).toMatchObject({
+      schemaVersion: 1,
       approvedToolCallIds: ['approval-call-1'],
     });
 
@@ -1118,6 +1738,270 @@ describe('AdaptiveAgent', () => {
 
     const runEvents = await eventStore.listByRun(run.id);
     expect(runEvents.some((event) => event.type === 'run.resumed')).toBe(true);
+  });
+
+  it('rejects incompatible versioned snapshot state during resume', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const run = await runStore.createRun({
+      goal: 'Resume from a future snapshot',
+      status: 'interrupted',
+    });
+    await snapshotStore.save({
+      runId: run.id,
+      snapshotSeq: 1,
+      status: 'interrupted',
+      currentStepId: 'step-1',
+      summary: {
+        status: 'interrupted',
+        stepsUsed: 1,
+      },
+      state: {
+        schemaVersion: 999,
+        messages: [
+          { role: 'system', content: 'You are AdaptiveAgent.' },
+          { role: 'user', content: '{"goal":"Resume from a future snapshot"}' },
+        ],
+        stepsUsed: 1,
+      },
+    });
+
+    const agent = new AdaptiveAgent({
+      model: new SequenceModel([]),
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    await expect(agent.resume(run.id)).rejects.toThrow('latest snapshot state is not compatible');
+  });
+
+  it('reuses a completed tool execution ledger entry during resume', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const toolExecutionStore = new InMemoryToolExecutionStore();
+    const execute = vi.fn(async () => ({ finding: 'fresh' }));
+    const run = await runStore.createRun({
+      goal: 'Resume a cached tool call',
+      status: 'interrupted',
+    });
+    await snapshotStore.save({
+      runId: run.id,
+      snapshotSeq: 1,
+      status: 'interrupted',
+      currentStepId: 'step-1',
+      summary: {
+        status: 'interrupted',
+        stepsUsed: 0,
+      },
+      state: {
+        schemaVersion: 1,
+        messages: [
+          { role: 'system', content: 'You are AdaptiveAgent.' },
+          { role: 'user', content: '{"goal":"Resume a cached tool call"}' },
+        ],
+        stepsUsed: 0,
+        pendingToolCall: {
+          id: 'call-1',
+          name: 'lookup',
+          input: {
+            topic: 'resumability',
+          },
+          stepId: 'step-1',
+        },
+      },
+    });
+    await toolExecutionStore.markStarted({
+      runId: run.id,
+      stepId: 'step-1',
+      toolCallId: 'call-1',
+      toolName: 'lookup',
+      idempotencyKey: `${run.id}:step-1:call-1`,
+      inputHash: '{"topic":"resumability"}',
+    });
+    await toolExecutionStore.markCompleted(`${run.id}:step-1:call-1`, { finding: 'cached' });
+
+    const model = new SequenceModel([
+      {
+        finishReason: 'stop',
+        structuredOutput: { report: 'used cached tool result' },
+      },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [
+        {
+          name: 'lookup',
+          description: 'Looks up a topic.',
+          inputSchema: { type: 'object', additionalProperties: true },
+          execute,
+        },
+      ],
+      runStore,
+      eventStore,
+      snapshotStore,
+      toolExecutionStore,
+    });
+
+    const result = await agent.resume(run.id);
+
+    expect(result).toMatchObject({
+      status: 'success',
+      output: { report: 'used cached tool result' },
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(model.receivedRequests[0]?.messages.at(-1)).toEqual({
+      role: 'tool',
+      name: 'lookup',
+      toolCallId: 'call-1',
+      content: JSON.stringify({ finding: 'cached' }),
+    });
+  });
+
+  it('continues from a model tool-call snapshot after a crash window', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const execute = vi.fn(async () => ({ finding: 'fresh after restart' }));
+    const run = await runStore.createRun({
+      goal: 'Resume a queued tool call',
+      status: 'running',
+    });
+    await snapshotStore.save({
+      runId: run.id,
+      snapshotSeq: 1,
+      status: 'running',
+      currentStepId: 'step-1',
+      summary: {
+        status: 'running',
+        stepsUsed: 0,
+      },
+      state: {
+        schemaVersion: 1,
+        messages: [
+          { role: 'system', content: 'You are AdaptiveAgent.' },
+          { role: 'user', content: '{"goal":"Resume a queued tool call"}' },
+          {
+            role: 'assistant',
+            content: '',
+            toolCalls: [
+              {
+                id: 'call-queued',
+                name: 'lookup',
+                input: { topic: 'crash-window' },
+              },
+            ],
+          },
+        ],
+        stepsUsed: 0,
+        pendingToolCall: {
+          id: 'call-queued',
+          name: 'lookup',
+          input: {
+            topic: 'crash-window',
+          },
+          stepId: 'step-1',
+        },
+      },
+    });
+
+    const model = new SequenceModel([
+      {
+        finishReason: 'stop',
+        structuredOutput: { report: 'continued after queued tool call' },
+      },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [
+        {
+          name: 'lookup',
+          description: 'Looks up a topic.',
+          inputSchema: { type: 'object', additionalProperties: true },
+          execute,
+        },
+      ],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.resume(run.id);
+
+    expect(result).toMatchObject({
+      status: 'success',
+      output: { report: 'continued after queued tool call' },
+    });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledWith(
+      { topic: 'crash-window' },
+      expect.objectContaining({
+        runId: run.id,
+        stepId: 'step-1',
+        idempotencyKey: `${run.id}:step-1:call-queued`,
+      }),
+    );
+    expect(model.receivedRequests[0]?.messages.at(-1)).toEqual({
+      role: 'tool',
+      name: 'lookup',
+      toolCallId: 'call-queued',
+      content: JSON.stringify({ finding: 'fresh after restart' }),
+    });
+  });
+
+  it('returns the stored terminal result on repeated resume attempts', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const run = await runStore.createRun({
+      goal: 'Repeated terminal resume',
+      status: 'succeeded',
+    });
+    await runStore.updateRun(run.id, {
+      result: { stable: true },
+      status: 'succeeded',
+    });
+    await snapshotStore.save({
+      runId: run.id,
+      snapshotSeq: 1,
+      status: 'succeeded',
+      summary: {
+        status: 'succeeded',
+        stepsUsed: 2,
+      },
+      state: {
+        schemaVersion: 1,
+        messages: [
+          { role: 'system', content: 'You are AdaptiveAgent.' },
+          { role: 'user', content: '{"goal":"Repeated terminal resume"}' },
+          { role: 'assistant', content: JSON.stringify({ stable: true }) },
+        ],
+        stepsUsed: 2,
+      },
+    });
+
+    const model = new SequenceModel([]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const first = await agent.resume(run.id);
+    const second = await agent.resume(run.id);
+
+    expect(first).toMatchObject({
+      status: 'success',
+      output: { stable: true },
+      stepsUsed: 2,
+    });
+    expect(second).toEqual(first);
+    expect(model.receivedRequests).toHaveLength(0);
   });
 
   it('rejects persisted delegate steps during executePlan with replan.required', async () => {

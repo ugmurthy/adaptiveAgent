@@ -30,6 +30,23 @@ describe('gateway protocol validation', () => {
     });
   });
 
+  it('parses run.retry frames', () => {
+    const frame = parseInboundFrame(
+      JSON.stringify({
+        type: 'run.retry',
+        sessionId: 'session-1',
+        runId: 'run-1',
+      }),
+    );
+
+    expect(frame).toEqual({
+      type: 'run.retry',
+      sessionId: 'session-1',
+      runId: 'run-1',
+      metadata: undefined,
+    });
+  });
+
   it('maps invalid JSON to a stable protocol error', () => {
     expect(() => parseInboundFrame('{"type":"ping"')).toThrowError(ProtocolValidationError);
 

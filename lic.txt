@@ -1,0 +1,6 @@
+
+# Fixed the duplicate retry realtime frames.
+
+The cause was the reconnect observer: after reconnecting to a running session, that socket already had a persistent observer for the run’s rootRunId. When /retry came in, the retry path also installed a temporary realtime forwarder for the same root run, so retry events were sent twice to the same socket.
+
+I changed server.ts to track active root-run observers per WebSocket connection, and changed run.ts so retry, approval, and clarification continuations skip the temporary forwarder when a reconnect observer is already active for that resolved rootRunId. I also added a regression test in server.test.ts for the reconnect-observer plus retry cas

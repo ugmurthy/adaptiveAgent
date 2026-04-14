@@ -30,6 +30,10 @@ export function createReadFileTool(config?: ReadFileToolConfig): ToolDefinition 
     name: 'read_file',
     description:
       'Read the text content of a file at the given path. Returns the file content, resolved path, and size in bytes.',
+    retryPolicy: {
+      retryable: true,
+      retryOn: ['timeout', 'network', 'not_found', 'unknown'],
+    },
     inputSchema: {
       type: 'object',
       required: ['path'],

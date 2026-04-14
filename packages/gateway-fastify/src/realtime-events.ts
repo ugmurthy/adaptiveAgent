@@ -6,7 +6,7 @@ export interface RealtimeEventForwardingContext {
   rootRunId?: string;
   fallbackSessionId?: string;
   fallbackAgentId: string;
-  emitFrame: (frame: AgentEventFrame) => void;
+  emitFrame: (frame: AgentEventFrame) => Promise<void> | void;
 }
 
 interface GatewayMetadata {
@@ -20,7 +20,7 @@ export async function withForwardedRealtimeEvents<T>(
   context: RealtimeEventForwardingContext | undefined,
   operation: () => Promise<T>,
 ): Promise<T> {
-  const unsubscribe = subscribeToRealtimeEvents(agent, context);
+  const unsubscribe = subscribeToForwardedRealtimeEvents(agent, context);
 
   try {
     return await operation();
@@ -31,7 +31,7 @@ export async function withForwardedRealtimeEvents<T>(
   }
 }
 
-function subscribeToRealtimeEvents(
+export function subscribeToForwardedRealtimeEvents(
   agent: CreatedAdaptiveAgent,
   context: RealtimeEventForwardingContext | undefined,
 ): (() => Promise<void>) | undefined {
@@ -78,7 +78,7 @@ async function forwardRealtimeEvent(
     return;
   }
 
-  context.emitFrame({
+  await Promise.resolve(context.emitFrame({
     type: 'agent.event',
     eventType: event.type,
     data: event.payload,
@@ -90,7 +90,7 @@ async function forwardRealtimeEvent(
     runId: event.runId,
     rootRunId,
     parentRunId: run.parentRunId,
-  });
+  }));
 }
 
 function matchesRealtimeContext(

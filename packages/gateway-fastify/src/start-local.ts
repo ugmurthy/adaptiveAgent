@@ -2,9 +2,9 @@
 
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 
-import type { AgentConfig, LoadedConfig } from './config.js';
+import type { AgentConfig, GatewayConfig, LoadedConfig } from './config.js';
 import { startGateway } from './bootstrap.js';
 import { loadAgentConfigs } from './config.js';
 import {
@@ -20,6 +20,7 @@ import { createFileGatewayStores } from './stores-file.js';
 async function main(): Promise<void> {
   await mkdir(GATEWAY_STORE_BASE_DIR, { recursive: true });
   await mkdir(AGENT_CONFIG_DIR, { recursive: true });
+  const logDir = join(GATEWAY_STORE_BASE_DIR, 'logs');
 
   const gatewayJwtSecret = process.env.GATEWAY_JWT_SECRET ?? DEFAULT_GATEWAY_JWT_SECRET;
   const gatewayConfigStatus = await ensureGatewayConfig(GATEWAY_CONFIG_PATH, gatewayJwtSecret);
@@ -33,6 +34,7 @@ async function main(): Promise<void> {
   const gateway = await startGateway({
     gatewayConfigPath: GATEWAY_CONFIG_PATH,
     agentConfigDir: AGENT_CONFIG_DIR,
+    logDir,
     moduleRegistry,
     stores: createFileGatewayStores({ baseDir: GATEWAY_STORE_BASE_DIR }),
   });
@@ -46,6 +48,13 @@ async function main(): Promise<void> {
   console.log(`- Agent config dir: ${AGENT_CONFIG_DIR}`);
   console.log(`- Default agent config: ${DEFAULT_AGENT_CONFIG_PATH} (${defaultAgentStatus})`);
   console.log(`- File-backed gateway stores: ${GATEWAY_STORE_BASE_DIR}`);
+  console.log(`- Logs: ${logDir}`);
+  console.log(`- Request logs: ${formatRequestLogDestination(gateway.gatewayConfig, logDir)}`);
+  console.log(`- Runtime logs: ${formatRuntimeLogDestination(gateway.gatewayConfig, logDir)}`);
+  console.log(`- Agents detected: ${gateway.agentConfigs.length}`);
+  for (const agentLine of formatDetectedAgents(gateway.agentConfigs)) {
+    console.log(`  - ${agentLine}`);
+  }
   console.log(`- Cron: ${gateway.gatewayConfig.cron?.enabled ? 'enabled' : 'disabled'}`);
   console.log(
     `- Auth: jwt (${process.env.GATEWAY_JWT_SECRET ? 'secret from GATEWAY_JWT_SECRET' : 'using local dev default; set GATEWAY_JWT_SECRET to override'})`,
@@ -159,6 +168,11 @@ function createGatewayConfig(gatewayJwtSecret: string): Record<string, unknown> 
       healthPath: '/health',
       requestLogging: true,
     },
+    agentRuntimeLogging: {
+      enabled: false,
+      level: 'info',
+      destination: 'file',
+    },
     auth: {
       provider: 'jwt',
       secret: gatewayJwtSecret,
@@ -197,6 +211,47 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function collectDelegateNames(loadedAgentConfigs: Array<LoadedConfig<AgentConfig>>): string[] {
   return [...new Set(loadedAgentConfigs.flatMap((loadedAgentConfig) => loadedAgentConfig.config.delegates))].sort();
+}
+
+function formatDetectedAgents(loadedAgentConfigs: Array<LoadedConfig<AgentConfig>>): string[] {
+  if (loadedAgentConfigs.length === 0) {
+    return ['(none)'];
+  }
+
+  return loadedAgentConfigs
+    .map((loadedAgentConfig) => {
+      const agent = loadedAgentConfig.config;
+      return `${agent.id} (${agent.name}) - ${loadedAgentConfig.path}`;
+    })
+    .sort();
+}
+
+function formatRequestLogDestination(gatewayConfig: GatewayConfig, logDir: string): string {
+  if (!gatewayConfig.server.requestLogging) {
+    return 'disabled';
+  }
+
+  return formatLogDestination(gatewayConfig.server.requestLoggingDestination ?? 'console', logDir);
+}
+
+function formatRuntimeLogDestination(gatewayConfig: GatewayConfig, logDir: string): string {
+  const runtimeLogging = gatewayConfig.agentRuntimeLogging;
+  if (!runtimeLogging?.enabled) {
+    return 'disabled';
+  }
+
+  return formatLogDestination(
+    runtimeLogging.destination ?? 'file',
+    runtimeLogging.filePath ?? join(logDir, 'agent-runtime.log'),
+  );
+}
+
+function formatLogDestination(destination: 'console' | 'file' | 'both', destinationPath: string): string {
+  if (destination === 'console') {
+    return 'console';
+  }
+
+  return `${destination} -> ${destinationPath}`;
 }
 
 await main().catch((error) => {

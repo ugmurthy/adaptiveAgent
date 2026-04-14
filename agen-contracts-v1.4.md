@@ -765,6 +765,35 @@ If compatibility fails, the run should move to `replan_required` and emit a `rep
 
 ## 7. Minimal Resume And Delegation Algorithms
 
+### Operational Guarantees
+
+Runtime persistence provides these guarantees:
+
+- `resume(runId)` loads the latest compatible `run_snapshots` record and fails explicitly if the snapshot shape is missing required fields or uses an incompatible future schema version.
+- New snapshots should use `schemaVersion: 1`; unversioned legacy snapshots may be treated as v1-compatible only during the transition window.
+- Durable stores provide at-least-once execution by default. They do not claim exactly-once model or tool execution without additional idempotency support.
+- Completed durable tool ledger entries keyed by `idempotencyKey` provide runtime-level exactly-once result reuse. If the runtime crashes after a side-effecting tool completes but before the continuation snapshot is saved, a later resume must reuse the completed ledger output instead of invoking the tool again.
+- External side effects are exactly-once only when the tool implementation honors `ToolContext.idempotencyKey` against the external system.
+- Model calls may replay unless the model response was durably represented in a snapshot before tool execution. A snapshotted model tool-call response may resume from the queued pending tool call instead of calling the model again.
+- Terminal run records are stable. Repeated `resume()` calls for `succeeded`, `failed`, or `cancelled` runs should return the stored result or failure without advancing the event log or re-entering the execution loop.
+- Parent and child delegate resolution is idempotent. A parent waiting on a terminal child must consume the existing child result exactly once, and linkage mismatches must fail explicitly.
+- Gateway reconnect is a session reattachment policy, not a new execution primitive. It should re-present pending approval or clarification state, settle terminal run state, resume expired active run leases when supported, and otherwise subscribe the client as an observer.
+- Recovery scanners may identify inconsistent or expired states, but they must acquire the run lease before modifying any run.
+
+### Transaction Boundaries
+
+When the configured stores support transactions, these changes should commit atomically:
+
+- root run creation, initial snapshot, `run.created`, and `snapshot.created`
+- non-terminal continuation snapshots and `snapshot.created`
+- model tool-call queue snapshots and `snapshot.created`
+- tool ledger completion or failure, matching tool event, step completion, and continuation snapshot
+- child run creation, parent `awaiting_subagent` state, waiting snapshot, `delegate.spawned`, and child `run.created`
+- child terminal resolution into the parent delegate step, parent state update, parent event, and parent snapshot
+- terminal run status update, final snapshot, and terminal event
+
+After each transaction, persistent state should describe one valid continuation path. If a process crashes before commit, resume should continue from the previous safe boundary. If it crashes after commit, resume should observe the committed boundary and avoid duplicate side effects.
+
 ### Resume Flow
 
 Recommended resume flow:
@@ -788,6 +817,19 @@ Recommended execution loop:
 4. heartbeat lease periodically
 5. if a delegate tool is selected, create a child run and move the parent to `awaiting_subagent`
 6. release lease on terminal status
+
+### Gateway Reconnect Flow
+
+On `session.open` with an existing session:
+
+1. authenticate the caller and load the gateway session
+2. load `currentRunId`, `currentRootRunId`, and the routed agent when available
+3. if the runtime run is terminal, update the session to idle or failed and emit the stored output or error
+4. if the run is `awaiting_approval`, keep the session in `awaiting_approval` and re-present the approval request state
+5. if the run is `clarification_requested`, re-present the clarification state without starting a new run
+6. if the run is active and its lease is expired, call `resume(currentRunId)` when the agent supports resume
+7. if the run is active and leased elsewhere, subscribe the connection to session, root run, run, and agent channels as an observer
+8. if the runtime run is missing, fail the session explicitly rather than silently clearing it
 
 ## 8. Suggested Next Implementation Order
 

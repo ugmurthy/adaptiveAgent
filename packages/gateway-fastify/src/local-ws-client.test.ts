@@ -1,9 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  type FailedRunTrackingState,
   formatCompactAgentEventFrame,
+  getInteractiveSessionMode,
   parseClarifyCommand,
   parseEventsCommand,
+  parseRetryCommand,
+  recordFailedRunFromAgentEvent,
   recordInteractiveSession,
   selectInteractiveSession,
 } from './local-ws-client.js';
@@ -48,6 +52,59 @@ describe('recordInteractiveSession', () => {
       sessionId: 'chat-1',
       runSessionId: 'run-1',
     });
+  });
+
+  it('moves the same id out of chat state when it is later classified as run', () => {
+    const state = { sessionId: 'shared-1' } as { sessionId?: string; runSessionId?: string };
+
+    recordInteractiveSession(state, 'run', 'shared-1');
+
+    expect(state).toEqual({
+      sessionId: undefined,
+      runSessionId: 'shared-1',
+    });
+  });
+});
+
+describe('getInteractiveSessionMode', () => {
+  it('classifies reattached run sessions from the opened frame', () => {
+    expect(getInteractiveSessionMode({ invocationMode: 'run' })).toBe('run');
+  });
+
+  it('defaults opened sessions without a pinned invocation mode to chat', () => {
+    expect(getInteractiveSessionMode({})).toBe('chat');
+  });
+});
+
+describe('recordFailedRunFromAgentEvent', () => {
+  it('tracks replayed run.failed events for retry without an explicit runId', () => {
+    const state: FailedRunTrackingState = {
+      failedRunSessionIds: new Map<string, string>(),
+    };
+
+    recordFailedRunFromAgentEvent(state, {
+      eventType: 'run.failed',
+      runId: 'run-failed',
+      sessionId: 'session-1',
+    });
+
+    expect(parseRetryCommand('/retry', state.lastFailedRunId)).toBe('run-failed');
+    expect(state.failedRunSessionIds.get('run-failed')).toBe('session-1');
+  });
+
+  it('ignores non-failure events', () => {
+    const state: FailedRunTrackingState = {
+      failedRunSessionIds: new Map<string, string>(),
+    };
+
+    recordFailedRunFromAgentEvent(state, {
+      eventType: 'run.completed',
+      runId: 'run-ok',
+      sessionId: 'session-1',
+    });
+
+    expect(state.lastFailedRunId).toBeUndefined();
+    expect(state.failedRunSessionIds.size).toBe(0);
   });
 });
 

@@ -12,10 +12,14 @@ import type {
 } from './core.js';
 import type { GatewayAuthContext } from './auth.js';
 import { createAgentRegistry } from './agent-registry.js';
+import { createChannelSubscriptionManager } from './channels.js';
 import type { GatewayConfig } from './config.js';
 import type { AgentConfig, LoadedConfig } from './config.js';
+import { createEmptyResolvedHooks } from './hooks.js';
+import type { OutboundFrame } from './protocol.js';
+import { subscribeToForwardedRealtimeEvents } from './realtime-events.js';
 import { createModuleRegistry } from './registries.js';
-import { createGatewayServer, handleGatewaySocketMessage } from './server.js';
+import { createGatewayServer, handleGatewaySocketMessage, type RuntimeObserverRegistration } from './server.js';
 import { createInMemoryGatewayStores, type GatewaySessionRecord } from './stores.js';
 
 const baseConfig: GatewayConfig = {
@@ -345,6 +349,604 @@ describe('createGatewayServer', () => {
     });
   });
 
+  it('emits reconnect state and restores channel subscriptions when a session is reattached', async () => {
+    const stores = createInMemoryGatewayStores();
+    const authContext = createAuthContext('user-123');
+    const channelManager = createChannelSubscriptionManager();
+    const emittedFrames: OutboundFrame[] = [];
+    const postResponseTasks: Array<() => Promise<void>> = [];
+
+    await createStoredSession(stores, {
+      agentId: 'support-agent',
+      status: 'running',
+      currentRunId: 'run-live',
+      currentRootRunId: 'root-live',
+      transcriptVersion: 4,
+    });
+
+    const response = await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'session.open',
+        sessionId: 'session-1',
+        channelId: 'webchat',
+      }),
+      {
+        authContext,
+        stores,
+        channelManager,
+        postResponseTasks,
+        emitFrame: async (frame) => {
+          emittedFrames.push(frame);
+        },
+        now: () => new Date('2026-04-08T10:05:00.000Z'),
+      },
+    );
+
+    expect(response).toEqual({
+      type: 'session.opened',
+      sessionId: 'session-1',
+      channelId: 'webchat',
+      agentId: 'support-agent',
+      status: 'running',
+    });
+
+    for (const task of postResponseTasks) {
+      await task();
+    }
+
+    expect(emittedFrames).toEqual([
+      {
+        type: 'session.updated',
+        sessionId: 'session-1',
+        status: 'running',
+        transcriptVersion: 4,
+        activeRunId: 'run-live',
+        activeRootRunId: 'root-live',
+      },
+    ]);
+    expect(channelManager.getSubscriptions().map((subscription) => subscription.channel)).toEqual([
+      'session:session-1',
+      'root-run:root-live',
+      'run:run-live',
+      'agent:support-agent',
+    ]);
+  });
+
+  it('registers a runtime observer when a running session is reattached', async () => {
+    const stores = createInMemoryGatewayStores();
+    const authContext = createAuthContext('user-123');
+    const channelManager = createChannelSubscriptionManager();
+    const emittedFrames: OutboundFrame[] = [];
+    const postResponseTasks: Array<() => Promise<void>> = [];
+    const registerRuntimeObserver = vi.fn(async () => undefined);
+
+    await createStoredSession(stores, {
+      agentId: 'support-agent',
+      status: 'running',
+      currentRunId: 'run-live',
+      currentRootRunId: 'root-live',
+      transcriptVersion: 4,
+    });
+
+    const response = await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'session.open',
+        sessionId: 'session-1',
+        channelId: 'webchat',
+      }),
+      {
+        authContext,
+        stores,
+        agentRegistry: createGatewayTestAgentRegistry({
+          runtimeRuns: {
+            'run-live': {
+              id: 'run-live',
+              rootRunId: 'root-live',
+              status: 'running',
+              leaseOwner: 'worker-live',
+              leaseExpiresAt: '2026-04-08T10:06:00.000Z',
+            },
+          },
+        }),
+        channelManager,
+        postResponseTasks,
+        emitFrame: async (frame) => {
+          emittedFrames.push(frame);
+        },
+        registerRuntimeObserver,
+        now: () => new Date('2026-04-08T10:05:00.000Z'),
+      },
+    );
+
+    expect(response).toEqual({
+      type: 'session.opened',
+      sessionId: 'session-1',
+      channelId: 'webchat',
+      agentId: 'support-agent',
+      status: 'running',
+    });
+
+    for (const task of postResponseTasks) {
+      await task();
+    }
+
+    expect(emittedFrames).toEqual([
+      {
+        type: 'session.updated',
+        sessionId: 'session-1',
+        status: 'running',
+        transcriptVersion: 4,
+        activeRunId: 'run-live',
+        activeRootRunId: 'root-live',
+      },
+    ]);
+    expect(registerRuntimeObserver).toHaveBeenCalledWith({
+      agentId: 'support-agent',
+      rootRunId: 'root-live',
+      sessionId: 'session-1',
+    });
+  });
+
+  it('replays a pending approval request when an awaiting approval session is reattached', async () => {
+    const stores = createInMemoryGatewayStores();
+    const authContext = createAuthContext('user-123');
+    const channelManager = createChannelSubscriptionManager();
+    const emittedFrames: OutboundFrame[] = [];
+    const postResponseTasks: Array<() => Promise<void>> = [];
+
+    await createStoredSession(stores, {
+      agentId: 'support-agent',
+      status: 'awaiting_approval',
+      currentRunId: 'run-approval',
+      currentRootRunId: 'root-approval',
+      transcriptVersion: 6,
+    });
+
+    const response = await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'session.open',
+        sessionId: 'session-1',
+        channelId: 'webchat',
+      }),
+      {
+        authContext,
+        stores,
+        agentRegistry: createGatewayTestAgentRegistry({
+          runtimeRuns: {
+            'run-approval': {
+              id: 'run-approval',
+              rootRunId: 'root-approval',
+              status: 'awaiting_approval',
+            },
+          },
+        }),
+        channelManager,
+        postResponseTasks,
+        emitFrame: async (frame) => {
+          emittedFrames.push(frame);
+        },
+        now: () => new Date('2026-04-08T10:05:00.000Z'),
+      },
+    );
+
+    expect(response).toEqual({
+      type: 'session.opened',
+      sessionId: 'session-1',
+      channelId: 'webchat',
+      agentId: 'support-agent',
+      status: 'awaiting_approval',
+    });
+
+    for (const task of postResponseTasks) {
+      await task();
+    }
+
+    expect(emittedFrames).toEqual([
+      {
+        type: 'session.updated',
+        sessionId: 'session-1',
+        status: 'awaiting_approval',
+        transcriptVersion: 6,
+        activeRunId: 'run-approval',
+        activeRootRunId: 'root-approval',
+      },
+      {
+        type: 'approval.requested',
+        runId: 'run-approval',
+        rootRunId: 'root-approval',
+        sessionId: 'session-1',
+      },
+    ]);
+    expect(channelManager.getSubscriptions().map((subscription) => subscription.channel)).toEqual([
+      'session:session-1',
+      'root-run:root-approval',
+      'run:run-approval',
+      'agent:support-agent',
+    ]);
+  });
+
+  it('emits recovered run output after reconnecting an expired active run', async () => {
+    const stores = createInMemoryGatewayStores();
+    const authContext = createAuthContext('user-123');
+    const channelManager = createChannelSubscriptionManager();
+    const emittedFrames: OutboundFrame[] = [];
+    const postResponseTasks: Array<() => Promise<void>> = [];
+    const resume = vi.fn(async () => ({
+      status: 'success' as const,
+      runId: 'run-live',
+      output: { recovered: true },
+      stepsUsed: 3,
+      usage: { promptTokens: 1, completionTokens: 1, estimatedCostUSD: 0 },
+    }));
+
+    await createStoredSession(stores, {
+      agentId: 'support-agent',
+      status: 'running',
+      currentRunId: 'run-live',
+      currentRootRunId: 'root-live',
+      transcriptVersion: 4,
+    });
+
+    const response = await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'session.open',
+        sessionId: 'session-1',
+        channelId: 'webchat',
+      }),
+      {
+        authContext,
+        stores,
+        agentRegistry: createGatewayTestAgentRegistry({
+          resume,
+          runtimeRuns: {
+            'run-live': {
+              id: 'run-live',
+              rootRunId: 'root-live',
+              status: 'running',
+              leaseOwner: 'worker-old',
+              leaseExpiresAt: '2026-04-08T10:04:00.000Z',
+            },
+          },
+        }),
+        channelManager,
+        postResponseTasks,
+        emitFrame: async (frame) => {
+          emittedFrames.push(frame);
+        },
+        now: () => new Date('2026-04-08T10:05:00.000Z'),
+      },
+    );
+
+    expect(response).toEqual({
+      type: 'session.opened',
+      sessionId: 'session-1',
+      channelId: 'webchat',
+      agentId: 'support-agent',
+      status: 'idle',
+    });
+
+    for (const task of postResponseTasks) {
+      await task();
+    }
+
+    expect(resume).toHaveBeenCalledWith('run-live');
+    expect(emittedFrames).toEqual([
+      {
+        type: 'session.updated',
+        sessionId: 'session-1',
+        status: 'idle',
+        transcriptVersion: 4,
+        activeRunId: undefined,
+        activeRootRunId: undefined,
+      },
+      {
+        type: 'run.output',
+        runId: 'run-live',
+        rootRunId: 'root-live',
+        sessionId: 'session-1',
+        status: 'succeeded',
+        output: { recovered: true },
+      },
+    ]);
+    expect(channelManager.getSubscriptions().map((subscription) => subscription.channel)).toEqual([
+      'session:session-1',
+      'agent:support-agent',
+    ]);
+  });
+
+  it('replays completed run output after reconnecting an idle completed session', async () => {
+    const stores = createInMemoryGatewayStores();
+    const authContext = createAuthContext('user-123');
+    const channelManager = createChannelSubscriptionManager();
+    const emittedFrames: OutboundFrame[] = [];
+    const postResponseTasks: Array<() => Promise<void>> = [];
+
+    await createStoredSession(stores, {
+      agentId: 'support-agent',
+      invocationMode: 'run',
+      status: 'idle',
+      lastCompletedRootRunId: 'root-finished',
+      transcriptVersion: 4,
+    });
+    await stores.sessionRunLinks.append({
+      sessionId: 'session-1',
+      runId: 'run-finished',
+      rootRunId: 'root-finished',
+      invocationKind: 'run',
+      createdAt: '2026-04-08T10:04:00.000Z',
+    });
+
+    const response = await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'session.open',
+        sessionId: 'session-1',
+        channelId: 'webchat',
+      }),
+      {
+        authContext,
+        stores,
+        agentRegistry: createGatewayTestAgentRegistry({
+          runtimeRuns: {
+            'run-finished': {
+              id: 'run-finished',
+              rootRunId: 'root-finished',
+              status: 'succeeded',
+              result: { report: 'finished before reconnect' },
+            },
+          },
+        }),
+        channelManager,
+        postResponseTasks,
+        emitFrame: async (frame) => {
+          emittedFrames.push(frame);
+        },
+        now: () => new Date('2026-04-08T10:05:00.000Z'),
+      },
+    );
+
+    expect(response).toEqual({
+      type: 'session.opened',
+      sessionId: 'session-1',
+      channelId: 'webchat',
+      agentId: 'support-agent',
+      invocationMode: 'run',
+      status: 'idle',
+    });
+
+    for (const task of postResponseTasks) {
+      await task();
+    }
+
+    expect(emittedFrames).toEqual([
+      {
+        type: 'session.updated',
+        sessionId: 'session-1',
+        status: 'idle',
+        invocationMode: 'run',
+        transcriptVersion: 4,
+        activeRunId: undefined,
+        activeRootRunId: undefined,
+      },
+      {
+        type: 'run.output',
+        runId: 'run-finished',
+        rootRunId: 'root-finished',
+        sessionId: 'session-1',
+        status: 'succeeded',
+        output: { report: 'finished before reconnect' },
+      },
+    ]);
+    expect(channelManager.getSubscriptions().map((subscription) => subscription.channel)).toEqual([
+      'session:session-1',
+      'agent:support-agent',
+    ]);
+  });
+
+  it('retries a failed session-bound run without creating a new run', async () => {
+    const stores = createInMemoryGatewayStores();
+    const authContext = createAuthContext('user-123');
+    const retry = vi.fn(async () => ({
+      status: 'success' as const,
+      runId: 'run-failed',
+      output: { retried: true },
+      stepsUsed: 2,
+      usage: { promptTokens: 1, completionTokens: 1, estimatedCostUSD: 0 },
+    }));
+
+    await createStoredSession(stores, {
+      agentId: 'support-agent',
+      invocationMode: 'run',
+      status: 'failed',
+      currentRunId: undefined,
+      currentRootRunId: undefined,
+    });
+    await stores.sessionRunLinks.append({
+      sessionId: 'session-1',
+      runId: 'run-failed',
+      rootRunId: 'root-failed',
+      invocationKind: 'run',
+      createdAt: '2026-04-08T10:04:00.000Z',
+    });
+
+    const response = await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'run.retry',
+        sessionId: 'session-1',
+        runId: 'run-failed',
+      }),
+      {
+        authContext,
+        stores,
+        agentRegistry: createGatewayTestAgentRegistry({
+          retry,
+          runtimeRuns: {
+            'run-failed': {
+              id: 'run-failed',
+              rootRunId: 'root-failed',
+              status: 'failed',
+              errorMessage: 'Model timed out after 90000ms',
+            },
+          },
+        }),
+        now: () => new Date('2026-04-08T10:05:00.000Z'),
+      },
+    );
+
+    expect(retry).toHaveBeenCalledWith('run-failed');
+    expect(response).toEqual({
+      type: 'run.output',
+      runId: 'run-failed',
+      rootRunId: 'root-failed',
+      sessionId: 'session-1',
+      status: 'succeeded',
+      output: { retried: true },
+    });
+    expect(await stores.sessions.get('session-1')).toMatchObject({
+      status: 'idle',
+      currentRunId: undefined,
+      currentRootRunId: undefined,
+      lastCompletedRootRunId: 'root-failed',
+    });
+  });
+
+  it('does not double-forward retry events when a reconnect observer is already streaming the run', async () => {
+    const stores = createInMemoryGatewayStores();
+    const authContext = createAuthContext('user-123');
+    const runtimeRuns: Record<string, RuntimeRunRecord> = {
+      'run-failed': {
+        id: 'run-failed',
+        rootRunId: 'root-failed',
+        status: 'failed',
+        errorMessage: 'Model timed out after 90000ms',
+      },
+    };
+    const listeners = new Set<(event: RuntimeAgentEvent) => void>();
+    const eventStore: RuntimeEventStore = {
+      subscribe(listener) {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+    };
+    const emitRuntimeEvent = (event: RuntimeAgentEvent) => {
+      for (const listener of listeners) {
+        listener(event);
+      }
+    };
+    const retry = vi.fn(async () => {
+      runtimeRuns['run-failed'].status = 'running';
+      emitRuntimeEvent({
+        id: 'evt-retry-1',
+        runId: 'run-failed',
+        seq: 11,
+        type: 'run.retry_started',
+        payload: { status: 'running' } satisfies JsonValue,
+        createdAt: '2026-04-08T10:05:00.100Z',
+      });
+      runtimeRuns['run-failed'].status = 'succeeded';
+      return {
+        status: 'success' as const,
+        runId: 'run-failed',
+        output: { retried: true },
+        stepsUsed: 2,
+        usage: { promptTokens: 1, completionTokens: 1, estimatedCostUSD: 0 },
+      };
+    });
+    const agentRegistry = createGatewayTestAgentRegistry({
+      retry,
+      runtimeRuns,
+      eventStore,
+    });
+    const emittedFrames: OutboundFrame[] = [];
+    const activeObserverRootRunIds = new Set<string>();
+    const observerUnsubscribers: Array<() => Promise<void>> = [];
+    const registerRuntimeObserver = async (observer: RuntimeObserverRegistration) => {
+      if (activeObserverRootRunIds.has(observer.rootRunId)) {
+        return;
+      }
+
+      const agent = await agentRegistry.getAgent(observer.agentId);
+      const unsubscribe = subscribeToForwardedRealtimeEvents(agent, {
+        rootRunId: observer.rootRunId,
+        fallbackAgentId: observer.agentId,
+        fallbackSessionId: observer.sessionId,
+        emitFrame: (frame) => {
+          emittedFrames.push(frame);
+        },
+      });
+      if (unsubscribe) {
+        activeObserverRootRunIds.add(observer.rootRunId);
+        observerUnsubscribers.push(unsubscribe);
+      }
+    };
+
+    await createStoredSession(stores, {
+      agentId: 'support-agent',
+      invocationMode: 'run',
+      status: 'failed',
+      currentRunId: undefined,
+      currentRootRunId: undefined,
+    });
+    await stores.sessionRunLinks.append({
+      sessionId: 'session-1',
+      runId: 'run-failed',
+      rootRunId: 'root-failed',
+      invocationKind: 'run',
+      createdAt: '2026-04-08T10:04:00.000Z',
+    });
+    await registerRuntimeObserver({
+      agentId: 'support-agent',
+      rootRunId: 'root-failed',
+      sessionId: 'session-1',
+    });
+
+    const response = await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'run.retry',
+        sessionId: 'session-1',
+        runId: 'run-failed',
+      }),
+      {
+        authContext,
+        stores,
+        agentRegistry,
+        emitFrame: (frame) => {
+          emittedFrames.push(frame);
+        },
+        hasRuntimeObserver: (rootRunId) => activeObserverRootRunIds.has(rootRunId),
+        now: () => new Date('2026-04-08T10:05:00.000Z'),
+      },
+    );
+
+    await waitUntil(async () => emittedFrames.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    for (const unsubscribe of observerUnsubscribers) {
+      await unsubscribe();
+    }
+
+    expect(response).toMatchObject({
+      type: 'run.output',
+      runId: 'run-failed',
+      rootRunId: 'root-failed',
+      sessionId: 'session-1',
+      status: 'succeeded',
+    });
+    expect(emittedFrames).toEqual([
+      {
+        type: 'agent.event',
+        eventType: 'run.retry_started',
+        data: { status: 'running' },
+        seq: 11,
+        stepId: undefined,
+        createdAt: '2026-04-08T10:05:00.100Z',
+        sessionId: 'session-1',
+        agentId: 'support-agent',
+        runId: 'run-failed',
+        rootRunId: 'root-failed',
+        parentRunId: undefined,
+      },
+    ]);
+  });
+
   it('rejects session reattachment from a different principal', async () => {
     const stores = createInMemoryGatewayStores();
 
@@ -381,7 +983,6 @@ describe('createGatewayServer', () => {
       requestType: 'session.open',
       details: {
         sessionId: 'session-1',
-        channelId: 'webchat',
       },
     });
     expect(await stores.sessions.get('session-1')).toMatchObject({
@@ -780,7 +1381,9 @@ describe('createGatewayServer', () => {
         agentRegistry,
         authContext,
         stores,
-        emitFrame: (frame) => emittedFrames.push(frame),
+        emitFrame: (frame) => {
+          emittedFrames.push(frame);
+        },
         now: () => new Date('2026-04-08T10:02:00.000Z'),
       },
     );
@@ -821,6 +1424,255 @@ describe('createGatewayServer', () => {
         parentRunId: undefined,
       },
     ]);
+  });
+
+  it('persists active run linkage while a session run is still executing', async () => {
+    const stores = createInMemoryGatewayStores();
+    const authContext = createAuthContext('user-123');
+    const runtimeRuns: Record<string, RuntimeRunRecord> = {};
+    const listeners = new Set<(event: RuntimeAgentEvent) => void>();
+    const eventStore: RuntimeEventStore = {
+      subscribe(listener) {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+    };
+    const emitRuntimeEvent = (event: RuntimeAgentEvent) => {
+      for (const listener of listeners) {
+        listener(event);
+      }
+    };
+    let finishRun!: () => void;
+    let emittedRunCreated!: () => void;
+    const finishRunPromise = new Promise<void>((resolve) => {
+      finishRun = resolve;
+    });
+    const emittedRunCreatedPromise = new Promise<void>((resolve) => {
+      emittedRunCreated = resolve;
+    });
+    const run = vi.fn(async (request) => {
+      runtimeRuns['root-live-pending'] = {
+        id: 'root-live-pending',
+        rootRunId: 'root-live-pending',
+        status: 'running',
+        metadata: request.metadata as JsonObject | undefined,
+      };
+
+      emitRuntimeEvent({
+        id: 'evt-pending-1',
+        runId: 'root-live-pending',
+        seq: 1,
+        type: 'run.created',
+        payload: { rootRunId: 'root-live-pending' } satisfies JsonValue,
+        createdAt: '2026-04-08T10:02:00.100Z',
+      });
+      emittedRunCreated();
+      await finishRunPromise;
+
+      runtimeRuns['root-live-pending'].status = 'succeeded';
+      return {
+        status: 'success' as const,
+        runId: 'root-live-pending',
+        output: { ok: true },
+        stepsUsed: 1,
+        usage: { promptTokens: 3, completionTokens: 2, estimatedCostUSD: 0.0003 },
+      };
+    });
+    const agentRegistry = createGatewayTestAgentRegistry({
+      run,
+      runtimeRuns,
+      eventStore,
+    });
+
+    await createStoredSession(stores, {
+      agentId: 'support-agent',
+    });
+
+    const responsePromise = handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'run.start',
+        sessionId: 'session-1',
+        goal: 'Keep the active run visible before completion',
+      }),
+      {
+        gatewayConfig: createChatGatewayConfig(),
+        agentRegistry,
+        authContext,
+        stores,
+        emitFrame: async () => undefined,
+        now: () => new Date('2026-04-08T10:02:00.000Z'),
+      },
+    );
+
+    await emittedRunCreatedPromise;
+    await waitUntil(async () => (await stores.sessions.get('session-1'))?.currentRunId === 'root-live-pending');
+
+    expect(await stores.sessions.get('session-1')).toMatchObject({
+      status: 'running',
+      currentRunId: 'root-live-pending',
+      currentRootRunId: 'root-live-pending',
+    });
+    expect(await stores.sessionRunLinks.listBySession('session-1')).toEqual([
+      {
+        sessionId: 'session-1',
+        runId: 'root-live-pending',
+        rootRunId: 'root-live-pending',
+        invocationKind: 'run',
+        metadata: undefined,
+        createdAt: '2026-04-08T10:02:00.000Z',
+      },
+    ]);
+
+    finishRun();
+    await expect(responsePromise).resolves.toMatchObject({
+      type: 'run.output',
+      runId: 'root-live-pending',
+      rootRunId: 'root-live-pending',
+      sessionId: 'session-1',
+      status: 'succeeded',
+    });
+  });
+
+  it('drops realtime agent events that do not match the active subscriptions', async () => {
+    const stores = createInMemoryGatewayStores();
+    const authContext = createAuthContext('user-123');
+    const runtimeRuns: Record<string, RuntimeRunRecord> = {};
+    const listeners = new Set<(event: RuntimeAgentEvent) => void>();
+    const eventStore: RuntimeEventStore = {
+      subscribe(listener) {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+    };
+    const emitRuntimeEvent = (event: RuntimeAgentEvent) => {
+      for (const listener of listeners) {
+        listener(event);
+      }
+    };
+    const channelManager = createChannelSubscriptionManager();
+    channelManager.subscribe(['session:someone-else']);
+    const emittedFrames: unknown[] = [];
+    const run = vi.fn(async (request) => {
+      runtimeRuns['run-live-2'] = {
+        id: 'run-live-2',
+        rootRunId: 'root-live-2',
+        status: 'running',
+        metadata: request.metadata as JsonObject | undefined,
+      };
+      runtimeRuns['root-live-2'] = {
+        id: 'root-live-2',
+        rootRunId: 'root-live-2',
+        status: 'running',
+        metadata: request.metadata as JsonObject | undefined,
+      };
+
+      emitRuntimeEvent({
+        id: 'evt-3',
+        runId: 'run-live-2',
+        seq: 1,
+        type: 'run.created',
+        payload: { rootRunId: 'root-live-2' } satisfies JsonValue,
+        createdAt: '2026-04-08T10:03:00.100Z',
+      });
+
+      runtimeRuns['run-live-2'].status = 'succeeded';
+      runtimeRuns['root-live-2'].status = 'succeeded';
+
+      return {
+        status: 'success' as const,
+        runId: 'run-live-2',
+        output: { ok: true },
+        stepsUsed: 1,
+        usage: { promptTokens: 3, completionTokens: 2, estimatedCostUSD: 0.0003 },
+      };
+    });
+    const agentRegistry = createGatewayTestAgentRegistry({
+      run,
+      runtimeRuns,
+      eventStore,
+    });
+
+    await createStoredSession(stores, {
+      agentId: 'support-agent',
+    });
+
+    const response = await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'run.start',
+        sessionId: 'session-1',
+        goal: 'Filter these events',
+      }),
+      {
+        gatewayConfig: createChatGatewayConfig(),
+        agentRegistry,
+        authContext,
+        stores,
+        channelManager,
+        emitFrame: (frame) => {
+          emittedFrames.push(frame);
+        },
+        now: () => new Date('2026-04-08T10:03:00.000Z'),
+      },
+    );
+
+    expect(response).toEqual({
+      type: 'run.output',
+      runId: 'run-live-2',
+      rootRunId: 'root-live-2',
+      sessionId: 'session-1',
+      status: 'succeeded',
+      output: { ok: true },
+    });
+    expect(emittedFrames).toEqual([]);
+  });
+
+  it('executes beforeInboundMessage hooks in the live chat path', async () => {
+    const stores = createInMemoryGatewayStores();
+    const authContext = createAuthContext('user-123');
+    const hooks = createEmptyResolvedHooks();
+    hooks.beforeInboundMessage = [
+      {
+        id: 'blocker',
+        beforeInboundMessage: (async () => ({
+          rejected: true as const,
+          rejectionReason: 'Inbound messages are temporarily disabled.',
+        })) as unknown as NonNullable<(typeof hooks.beforeInboundMessage)[number]['beforeInboundMessage']>,
+      },
+    ];
+
+    await createStoredSession(stores, {
+      agentId: 'support-agent',
+    });
+
+    const response = await handleGatewaySocketMessage(
+      JSON.stringify({
+        type: 'message.send',
+        sessionId: 'session-1',
+        content: 'Hello?',
+      }),
+      {
+        gatewayConfig: createChatGatewayConfig(),
+        agentRegistry: createGatewayTestAgentRegistry({
+          runtimeRuns: {},
+        }),
+        authContext,
+        hooks,
+        stores,
+        now: () => new Date('2026-04-08T10:20:00.000Z'),
+      },
+    );
+
+    expect(response).toEqual({
+      type: 'error',
+      code: 'invalid_frame',
+      message: 'Inbound messages are temporarily disabled.',
+      requestType: 'message.send',
+      details: {
+        sessionId: 'session-1',
+        channelId: 'webchat',
+        slot: 'beforeInboundMessage',
+      },
+    });
   });
 
   it('executes isolated run.start requests without creating session state', async () => {
@@ -1305,6 +2157,7 @@ describe('createGatewayServer', () => {
       sessionId: 'session-1',
       channelId: 'webchat',
       agentId: 'support-agent',
+      invocationMode: 'chat',
       status: 'running',
     });
 
@@ -1622,6 +2475,7 @@ function createGatewayTestAgentRegistry(
     resolveApproval?: NonNullable<CreatedAdaptiveAgent['agent']['resolveApproval']>;
     resolveClarification?: NonNullable<CreatedAdaptiveAgent['agent']['resolveClarification']>;
     resume?: NonNullable<CreatedAdaptiveAgent['agent']['resume']>;
+    retry?: NonNullable<CreatedAdaptiveAgent['agent']['retry']>;
     runtimeRuns: Record<string, RuntimeRunRecord>;
     eventStore?: RuntimeEventStore;
   },
@@ -1647,6 +2501,7 @@ function createGatewayTestAgentRegistry(
         resolveApproval: options.resolveApproval,
         resolveClarification: options.resolveClarification,
         resume: options.resume,
+        retry: options.retry,
       },
       runtime: {
         runStore: {
@@ -1744,4 +2599,16 @@ async function waitForSocketMessage(socket: WebSocket): Promise<string> {
     socket.addEventListener('message', handleMessage, { once: true });
     socket.addEventListener('error', handleError, { once: true });
   });
+}
+
+async function waitUntil(predicate: () => Promise<boolean>, timeoutMs = 500): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+
+  throw new Error('Timed out waiting for condition.');
 }

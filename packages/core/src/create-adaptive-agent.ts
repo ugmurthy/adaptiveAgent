@@ -14,8 +14,10 @@ import type {
   EventStore,
   ModelAdapter,
   PlanStore,
+  RuntimeTransactionStore,
   RunStore,
   SnapshotStore,
+  ToolExecutionStore,
 } from './types.js';
 
 export type AdaptiveAgentModelInput = ModelAdapter | ModelAdapterConfig;
@@ -30,6 +32,8 @@ export interface AdaptiveAgentRuntime<
   eventStore: TEventStore;
   snapshotStore: TSnapshotStore;
   planStore: TPlanStore;
+  toolExecutionStore?: ToolExecutionStore;
+  transactionStore?: RuntimeTransactionStore;
 }
 
 export interface AdaptiveAgentRuntimeOptions<
@@ -42,6 +46,8 @@ export interface AdaptiveAgentRuntimeOptions<
   eventStore?: TEventStore;
   snapshotStore?: TSnapshotStore;
   planStore?: TPlanStore;
+  toolExecutionStore?: ToolExecutionStore;
+  transactionStore?: RuntimeTransactionStore;
 }
 
 export interface CreateAdaptiveAgentOptions<
@@ -51,7 +57,15 @@ export interface CreateAdaptiveAgentOptions<
   TPlanStore extends PlanStore | undefined = undefined,
 > extends Omit<
     AdaptiveAgentOptions,
-    'model' | 'delegates' | 'runStore' | 'eventStore' | 'snapshotStore' | 'planStore' | 'eventSink' | 'logger'
+    | 'model'
+    | 'delegates'
+    | 'runStore'
+    | 'eventStore'
+    | 'snapshotStore'
+    | 'planStore'
+    | 'toolExecutionStore'
+    | 'eventSink'
+    | 'logger'
   > {
   model: AdaptiveAgentModelInput;
   delegates?: DelegateDefinition[];
@@ -79,11 +93,14 @@ export function createAdaptiveAgentRuntime<
 >(
   options: AdaptiveAgentRuntimeOptions<TRunStore, TEventStore, TSnapshotStore, TPlanStore> = {},
 ): AdaptiveAgentRuntime<TRunStore, TEventStore, TSnapshotStore, TPlanStore> {
+  const transactionStore = isRuntimeTransactionStore(options) ? options : options.transactionStore;
   return {
     runStore: (options.runStore ?? new InMemoryRunStore()) as TRunStore,
     eventStore: (options.eventStore ?? new InMemoryEventStore()) as TEventStore,
     snapshotStore: (options.snapshotStore ?? new InMemorySnapshotStore()) as TSnapshotStore,
     planStore: options.planStore as TPlanStore,
+    toolExecutionStore: options.toolExecutionStore,
+    transactionStore,
   };
 }
 
@@ -106,6 +123,8 @@ export function createAdaptiveAgent<
     eventStore: runtime.eventStore,
     snapshotStore: runtime.snapshotStore,
     planStore: runtime.planStore,
+    toolExecutionStore: runtime.toolExecutionStore,
+    transactionStore: runtime.transactionStore,
     eventSink: options.eventSink,
     logger: options.logger,
     defaults: options.defaults,
@@ -124,6 +143,10 @@ function resolveModelAdapter(model: AdaptiveAgentModelInput): ModelAdapter {
 
 function isModelAdapter(model: AdaptiveAgentModelInput): model is ModelAdapter {
   return typeof (model as ModelAdapter).generate === 'function';
+}
+
+function isRuntimeTransactionStore(value: unknown): value is RuntimeTransactionStore {
+  return typeof (value as RuntimeTransactionStore | undefined)?.runInTransaction === 'function';
 }
 
 function mergeDelegates(

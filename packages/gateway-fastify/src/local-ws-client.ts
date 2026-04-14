@@ -6,7 +6,7 @@ import { createInterface } from 'node:readline/promises';
 import { marked } from 'marked';
 import { markedTerminal } from 'marked-terminal';
 
-import type { AgentEventFrame, OutboundFrame, SessionOpenedFrame } from './protocol.js';
+import type { AgentEventFrame, OutboundFrame, SessionOpenedFrame, SessionUpdatedFrame } from './protocol.js';
 import { GATEWAY_CONFIG_PATH, loadLocalGatewayConnectionConfig } from './local-dev.js';
 import { mintLocalDevJwt } from './local-dev-jwt.js';
 
@@ -35,14 +35,17 @@ interface ClientState {
   runSessionId?: string;
   pendingApprovalRunId?: string;
   pendingClarificationRunId?: string;
+  lastFailedRunId?: string;
   eventMode: EventStreamMode;
   approvalSessionIds: Map<string, string>;
   clarificationSessionIds: Map<string, string>;
+  failedRunSessionIds: Map<string, string>;
 }
 
 const HELP_TEXT = `Commands:
   <text>                     send a chat message with message.send
   /run <goal>                send run.start via a dedicated run session
+  /retry [runId]             retry a failed run in the current run session
   /approve [runId] [yes|no]  resolve the pending approval for the session
   /clarify [runId] <text>    answer a pending clarification for a run
   /event [on [verbose]|off]  stream one-line, detailed, or muted realtime agent.event frames
@@ -86,10 +89,10 @@ async function main(): Promise<void> {
 
   const options = await parseArgs(args);
   const state: ClientState = {
-    sessionId: options.sessionId,
     eventMode: 'compact',
     approvalSessionIds: new Map(),
     clarificationSessionIds: new Map(),
+    failedRunSessionIds: new Map(),
   };
   const token = options.token ?? (await mintLocalDevJwt({
     subject: options.subject,
@@ -112,13 +115,14 @@ async function main(): Promise<void> {
   const sessionOpened = createDeferred<SessionOpenedFrame>();
   let pendingSessionOpen: ReturnType<typeof createDeferred<SessionOpenedFrame>> | undefined;
   const terminalFrame = createDeferred<OutboundFrame>();
+  let terminalFrameRequired = false;
   const closed = createDeferred<{ code: number; reason: string }>();
 
   socket.addEventListener('open', () => {
     sendFrame(socket, {
       type: 'session.open',
       channelId: options.channel,
-      ...(state.sessionId ? { sessionId: state.sessionId } : {}),
+      ...(options.sessionId ? { sessionId: options.sessionId } : {}),
     });
   });
 
@@ -143,6 +147,7 @@ async function main(): Promise<void> {
         }
         break;
       case 'session.updated':
+        hydratePendingApprovalFromSessionUpdate(state, frame);
         console.log(`Session updated: ${frame.status} (activeRunId=${frame.activeRunId ?? 'none'})`);
         break;
       case 'message.output':
@@ -153,6 +158,10 @@ async function main(): Promise<void> {
       case 'run.output':
         if (frame.status === 'failed') {
           console.log(`run failed: ${frame.error ?? 'unknown error'}`);
+          state.lastFailedRunId = frame.runId;
+          if (frame.sessionId) {
+            state.failedRunSessionIds.set(frame.runId, frame.sessionId);
+          }
           if (state.pendingClarificationRunId === frame.runId) {
             state.pendingClarificationRunId = undefined;
             state.clarificationSessionIds.delete(frame.runId);
@@ -193,6 +202,7 @@ async function main(): Promise<void> {
         resolveIfPending(terminalFrame, frame);
         break;
       case 'agent.event':
+        recordFailedRunFromAgentEvent(state, frame);
         if (state.eventMode === 'off') {
           break;
         }
@@ -218,7 +228,9 @@ async function main(): Promise<void> {
       rejectIfPending(pendingSessionOpen, new Error('Socket closed before an additional session.opened was received.'));
       pendingSessionOpen = undefined;
     }
-    rejectIfPending(terminalFrame, new Error('Socket closed before a terminal response was received.'));
+    if (terminalFrameRequired) {
+      rejectIfPending(terminalFrame, new Error('Socket closed before a terminal response was received.'));
+    }
     closed.resolve({ code: event.code, reason: event.reason });
   });
 
@@ -227,7 +239,7 @@ async function main(): Promise<void> {
   });
 
   const openedSession = await sessionOpened.promise;
-  recordInteractiveSession(state, 'chat', openedSession.sessionId);
+  recordInteractiveSession(state, getInteractiveSessionMode(openedSession), openedSession.sessionId);
 
   async function openAdditionalSession(): Promise<SessionOpenedFrame> {
     if (pendingSessionOpen) {
@@ -261,6 +273,7 @@ async function main(): Promise<void> {
 
   if (options.message) {
     ensureSessionId(state);
+    terminalFrameRequired = true;
     sendFrame(socket, {
       type: 'message.send',
       sessionId: state.sessionId,
@@ -273,10 +286,14 @@ async function main(): Promise<void> {
   }
 
   if (options.runGoal) {
-    ensureSessionId(state);
+    const runSessionId = state.runSessionId ?? state.sessionId;
+    if (!runSessionId) {
+      throw new Error('No run-capable sessionId is available yet.');
+    }
+    terminalFrameRequired = true;
     sendFrame(socket, {
       type: 'run.start',
-      sessionId: state.sessionId,
+      sessionId: runSessionId,
       goal: options.runGoal,
     });
     await terminalFrame.promise;
@@ -334,6 +351,20 @@ async function main(): Promise<void> {
           type: 'run.start',
           sessionId: runSessionId,
           goal: line.slice('/run '.length).trim(),
+        });
+        continue;
+      }
+
+      if (line === '/retry' || line.startsWith('/retry ')) {
+        const runId = parseRetryCommand(line, state.lastFailedRunId);
+        const retrySessionId = state.failedRunSessionIds.get(runId) ?? state.runSessionId;
+        if (!retrySessionId) {
+          throw new Error(`No run sessionId is tracked for run "${runId}". Reattach the run session or pass a runId from this client session.`);
+        }
+        sendFrame(socket, {
+          type: 'run.retry',
+          sessionId: retrySessionId,
+          runId,
         });
         continue;
       }
@@ -533,6 +564,11 @@ export interface InteractiveSessionState {
   runSessionId?: string;
 }
 
+export interface FailedRunTrackingState {
+  lastFailedRunId?: string;
+  failedRunSessionIds: Map<string, string>;
+}
+
 export function recordInteractiveSession(
   state: InteractiveSessionState,
   mode: 'chat' | 'run',
@@ -540,10 +576,34 @@ export function recordInteractiveSession(
 ): void {
   if (mode === 'run') {
     state.runSessionId = sessionId;
+    if (state.sessionId === sessionId) {
+      state.sessionId = undefined;
+    }
     return;
   }
 
   state.sessionId = sessionId;
+  if (state.runSessionId === sessionId) {
+    state.runSessionId = undefined;
+  }
+}
+
+export function recordFailedRunFromAgentEvent(
+  state: FailedRunTrackingState,
+  frame: Pick<AgentEventFrame, 'eventType' | 'runId' | 'sessionId'>,
+): void {
+  if (frame.eventType !== 'run.failed' || !frame.runId) {
+    return;
+  }
+
+  state.lastFailedRunId = frame.runId;
+  if (frame.sessionId) {
+    state.failedRunSessionIds.set(frame.runId, frame.sessionId);
+  }
+}
+
+export function getInteractiveSessionMode(frame: Pick<SessionOpenedFrame, 'invocationMode'>): 'chat' | 'run' {
+  return frame.invocationMode === 'run' ? 'run' : 'chat';
 }
 
 export function selectInteractiveSession(
@@ -645,6 +705,20 @@ export function parseEventsCommand(
   throw new Error('Usage: /event [on [verbose]|off]');
 }
 
+export function parseRetryCommand(command: string, lastFailedRunId?: string): string {
+  const parts = command.split(/\s+/).filter((part) => part.length > 0);
+  const args = parts.slice(1);
+  if (args.length === 0 && lastFailedRunId) {
+    return lastFailedRunId;
+  }
+
+  if (args.length !== 1) {
+    throw new Error('Usage: /retry <runId> or retry the most recent failed run with /retry.');
+  }
+
+  return args[0];
+}
+
 function parseApproveCommand(command: string, pendingRunId?: string): { runId: string; approved: boolean } {
   const parts = command.split(/\s+/).filter((part) => part.length > 0);
   const args = parts.slice(1);
@@ -708,6 +782,8 @@ export function formatCompactAgentEventFrame(frame: AgentEventFrame): string {
       return `${prefix} run interrupted`;
     case 'run.resumed':
       return `${prefix} run resumed`;
+    case 'run.retry_started':
+      return `${prefix} retry started`;
     case 'run.completed':
       return `${prefix} run completed`;
     case 'run.failed': {
@@ -902,6 +978,19 @@ function resolveIfPending<T>(deferred: ReturnType<typeof createDeferred<T>>, val
 function rejectIfPending<T>(deferred: ReturnType<typeof createDeferred<T>>, reason: unknown): void {
   if (!deferred.isSettled()) {
     deferred.reject(reason);
+  }
+}
+
+function hydratePendingApprovalFromSessionUpdate(state: ClientState, frame: SessionUpdatedFrame): void {
+  if (frame.status === 'awaiting_approval' && frame.activeRunId) {
+    state.pendingApprovalRunId = frame.activeRunId;
+    state.approvalSessionIds.set(frame.activeRunId, frame.sessionId);
+    return;
+  }
+
+  if (state.pendingApprovalRunId && frame.status !== 'awaiting_approval') {
+    state.approvalSessionIds.delete(state.pendingApprovalRunId);
+    state.pendingApprovalRunId = undefined;
   }
 }
 

@@ -40,6 +40,7 @@ export type EventType =
   | 'run.status_changed'
   | 'run.interrupted'
   | 'run.resumed'
+  | 'run.retry_started'
   | 'run.completed'
   | 'run.failed'
   | 'plan.created'
@@ -138,6 +139,22 @@ export interface ToolRedactionPolicy {
   outputPaths?: string[];
 }
 
+export type FailureKind =
+  | 'timeout'
+  | 'network'
+  | 'rate_limit'
+  | 'provider_error'
+  | 'not_found'
+  | 'tool_error'
+  | 'approval_rejected'
+  | 'max_steps'
+  | 'unknown';
+
+export interface ToolRetryPolicy {
+  retryable: boolean;
+  retryOn?: FailureKind[];
+}
+
 export interface DelegateDefinition {
   name: string;
   description: string;
@@ -176,6 +193,8 @@ export interface AdaptiveAgentOptions {
   eventStore?: EventStore;
   snapshotStore?: SnapshotStore;
   planStore?: PlanStore;
+  toolExecutionStore?: ToolExecutionStore;
+  transactionStore?: RuntimeTransactionStore;
   eventSink?: EventSink;
   /** Optional structured runtime logger. Pino is the intended implementation. */
   logger?: Logger;
@@ -210,6 +229,7 @@ export interface ToolDefinition<I extends JsonValue = JsonValue, O extends JsonV
   requiresApproval?: boolean;
   capture?: CaptureMode;
   redact?: ToolRedactionPolicy;
+  retryPolicy?: ToolRetryPolicy;
   summarizeResult?: (output: O) => JsonValue;
   recoverError?: (error: unknown, input: I) => O | undefined;
   execute(input: I, context: ToolContext): Promise<O>;
@@ -381,6 +401,37 @@ export interface EventSink {
   emit(event: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>): Promise<void> | void;
 }
 
+export type ToolExecutionStatus = 'started' | 'completed' | 'failed';
+
+export interface ToolExecutionRecord {
+  runId: UUID;
+  stepId: string;
+  toolCallId: string;
+  toolName: string;
+  idempotencyKey: string;
+  status: ToolExecutionStatus;
+  inputHash: string;
+  output?: JsonValue;
+  errorCode?: string;
+  errorMessage?: string;
+  startedAt: string;
+  completedAt?: string;
+}
+
+export interface ToolExecutionStore {
+  getByIdempotencyKey(idempotencyKey: string): Promise<ToolExecutionRecord | null>;
+  markStarted(record: {
+    runId: UUID;
+    stepId: string;
+    toolCallId: string;
+    toolName: string;
+    idempotencyKey: string;
+    inputHash: string;
+  }): Promise<ToolExecutionRecord>;
+  markCompleted(idempotencyKey: string, output: JsonValue): Promise<ToolExecutionRecord>;
+  markFailed(idempotencyKey: string, errorCode: string, errorMessage: string): Promise<ToolExecutionRecord>;
+}
+
 export interface RunStore {
   createRun(run: {
     id?: UUID;
@@ -438,6 +489,34 @@ export interface PlanStore {
   createExecution(execution: Omit<PlanExecution, 'createdAt' | 'updatedAt'>): Promise<PlanExecution>;
   getExecution(executionId: UUID): Promise<PlanExecution | null>;
   updateExecution(executionId: UUID, patch: Partial<PlanExecution>): Promise<PlanExecution>;
+}
+
+export interface RuntimeStores {
+  runStore: RunStore;
+  eventStore?: EventStore;
+  snapshotStore?: SnapshotStore;
+  planStore?: PlanStore;
+  toolExecutionStore?: ToolExecutionStore;
+}
+
+export interface RuntimeTransactionStore extends RuntimeStores {
+  runInTransaction<T>(operation: (stores: RuntimeStores) => Promise<T>): Promise<T>;
+}
+
+export type RecoveryScanReason =
+  | 'expired_lease'
+  | 'awaiting_subagent_terminal_child'
+  | 'awaiting_subagent_missing_child'
+  | 'awaiting_subagent_linkage_mismatch'
+  | 'stale_running'
+  | 'pending_interaction'
+  | 'orphan_child';
+
+export interface RuntimeRecoveryCandidate {
+  reason: RecoveryScanReason;
+  run: AgentRun;
+  childRun?: AgentRun;
+  detail?: string;
 }
 
 export type RunFailureCode =

@@ -4,6 +4,7 @@ import { runLogBindings, summarizeRunResultForLog } from './logging.js';
 import { captureValueForLog, summarizeValueForLog } from './logger.js';
 import type {
   AgentDefaults,
+  AgentEvent,
   AgentRun,
   DelegateDefinition,
   DelegateToolInput,
@@ -18,6 +19,8 @@ import type {
   RunResult,
   RunStatus,
   RunStore,
+  RuntimeStores,
+  RuntimeTransactionStore,
   SnapshotStore,
   ToolContext,
   ToolDefinition,
@@ -85,8 +88,10 @@ export interface DelegationExecutorOptions {
   defaults?: AgentDefaults;
   runStore: RunStore;
   eventSink?: EventSink;
+  downstreamEventSink?: EventSink;
   logger?: Logger;
   snapshotStore?: SnapshotStore;
+  transactionStore?: RuntimeTransactionStore;
   executeChildRun(request: ExecuteChildRunRequest): Promise<RunResult>;
 }
 
@@ -195,48 +200,6 @@ export class DelegationExecutor {
       },
     });
 
-    await this.options.runStore.createRun({
-      id: childRunId,
-      rootRunId: parentContext.rootRunId,
-      parentRunId: parentContext.runId,
-      parentStepId: parentContext.stepId,
-      delegateName: delegate.name,
-      delegationDepth: childDepth,
-      goal: input.goal,
-      input: input.input,
-      context: input.context,
-      metadata: input.metadata,
-      status: 'queued',
-    });
-
-    const parentRun = await this.options.runStore.getRun(parentContext.runId);
-    if (!parentRun) {
-      throw new Error(`Parent run ${parentContext.runId} does not exist`);
-    }
-
-    const updatedParent = await this.options.runStore.updateRun(
-      parentContext.runId,
-      {
-        status: 'awaiting_subagent',
-        currentChildRunId: childRunId,
-      },
-      parentRun.version,
-    );
-
-    await this.emitRunEvent({
-      runId: parentContext.runId,
-      stepId: parentContext.stepId,
-      type: 'run.status_changed',
-      schemaVersion: 1,
-      payload: {
-        fromStatus: parentRun.status,
-        toStatus: 'awaiting_subagent',
-        currentChildRunId: childRunId,
-      },
-    });
-
-    await this.persistAwaitingChildSnapshot(updatedParent, childRunId, delegate.name);
-
     const delegatePayload = {
       toolName,
       delegateName: delegate.name,
@@ -247,6 +210,15 @@ export class DelegationExecutor {
       delegationDepth: childDepth,
     } satisfies DelegateSpawnedPayload;
 
+    await this.persistChildSpawnBoundary({
+      parentContext,
+      childRunId,
+      childDepth,
+      delegate,
+      input,
+      delegatePayload,
+    });
+
     this.logLifecycle('info', 'delegate.spawned', {
       ...delegatePayload,
       allowedTools: delegate.allowedTools,
@@ -255,27 +227,6 @@ export class DelegationExecutor {
       context: captureValueForLog(input.context, { mode: this.options.defaults?.capture ?? 'summary' }),
       metadata: captureValueForLog(input.metadata, { mode: 'summary' }),
       outputSchema: input.outputSchema ? summarizeValueForLog(input.outputSchema) : undefined,
-    });
-
-    await parentContext.emit({
-      runId: parentContext.runId,
-      stepId: parentContext.stepId,
-      type: 'delegate.spawned',
-      schemaVersion: 1,
-      payload: delegatePayload,
-    });
-
-    await this.emitRunEvent({
-      runId: childRunId,
-      type: 'run.created',
-      schemaVersion: 1,
-      payload: {
-        rootRunId: parentContext.rootRunId,
-        parentRunId: parentContext.runId,
-        parentStepId: parentContext.stepId,
-        delegateName: delegate.name,
-        delegationDepth: childDepth,
-      },
     });
 
     const childResult = await this.options.executeChildRun({
@@ -337,11 +288,15 @@ export class DelegationExecutor {
       stepId: parentRun.currentStepId,
     });
 
+    const childRunId = parentRun.currentChildRunId ?? (await this.getSnapshotChildRunId(parentRunId));
     if (parentRun.status !== 'awaiting_subagent') {
+      if (parentRun.status === 'running' && childRunId) {
+        return this.resolveStaleParentSnapshot(parentRun, childRunId);
+      }
+
       return { kind: 'not_waiting', parentRun };
     }
 
-    const childRunId = parentRun.currentChildRunId ?? (await this.getSnapshotChildRunId(parentRunId));
     if (!childRunId) {
       const failedParent = await this.failParentRun(parentRun, 'Missing child linkage while awaiting sub-agent');
       return {
@@ -359,6 +314,18 @@ export class DelegationExecutor {
         kind: 'failed',
         parentRun: failedParent,
         error: failedParent.errorMessage ?? 'Child run missing while resolving delegation boundary',
+        code: (failedParent.errorCode as RunFailureCode | undefined) ?? 'TOOL_ERROR',
+      };
+    }
+
+    const linkageError = this.validateChildLinkage(parentRun, childRun, parentRun.currentStepId ?? childRun.parentStepId);
+    if (linkageError) {
+      const failedParent = await this.failParentRun(parentRun, linkageError);
+      return {
+        kind: 'failed',
+        parentRun: failedParent,
+        childRun,
+        error: failedParent.errorMessage ?? linkageError,
         code: (failedParent.errorCode as RunFailureCode | undefined) ?? 'TOOL_ERROR',
       };
     }
@@ -390,6 +357,48 @@ export class DelegationExecutor {
     });
   }
 
+  private async resolveStaleParentSnapshot(parentRun: AgentRun, childRunId: UUID): Promise<ParentResumeResult> {
+    const childRun = await this.options.runStore.getRun(childRunId);
+    if (!childRun) {
+      return {
+        kind: 'failed',
+        parentRun,
+        error: 'Child run missing while recovering resolved delegation snapshot',
+        code: 'TOOL_ERROR',
+      };
+    }
+
+    const stepId = parentRun.currentStepId ?? childRun.parentStepId;
+    const linkageError = this.validateChildLinkage(parentRun, childRun, stepId);
+    if (linkageError) {
+      return {
+        kind: 'failed',
+        parentRun,
+        childRun,
+        error: linkageError,
+        code: 'TOOL_ERROR',
+      };
+    }
+
+    if (!TERMINAL_RUN_STATUSES.has(childRun.status)) {
+      return {
+        kind: 'waiting',
+        parentRun,
+        childRun,
+        reason: this.pendingReason(childRun.status),
+      };
+    }
+
+    const delegateName = childRun.delegateName ?? 'unknown';
+    return this.resolveParentFromChild({
+      parentRunId: parentRun.id,
+      childRunId,
+      stepId,
+      delegateName,
+      toolName: this.toDelegateToolName(delegateName),
+    });
+  }
+
   private async resolveParentFromChild(params: {
     parentRunId: UUID;
     childRunId: UUID;
@@ -408,25 +417,19 @@ export class DelegationExecutor {
 
     const mapped = this.mapChildRun(childRun);
     if (!alreadyResolved) {
-      const refreshedParent = await this.options.runStore.updateRun(
-        parentRun.id,
-        {
-          status: 'running',
-          currentChildRunId: undefined,
-        },
-        parentRun.version,
-      );
-
-      await this.emitRunEvent({
-        runId: refreshedParent.id,
+      const statusChangedEvent = this.runStatusChangedEvent(parentRun, params.stepId, 'running', null);
+      const parentToolEvent = this.parentToolResolutionEvent({
+        parentRunId: parentRun.id,
         stepId: params.stepId,
-        type: 'run.status_changed',
-        schemaVersion: 1,
-        payload: {
-          fromStatus: parentRun.status,
-          toStatus: 'running',
-          currentChildRunId: null,
-        },
+        delegateName: params.delegateName,
+        toolName: params.toolName,
+        childRunId: params.childRunId,
+        mapped,
+      });
+      const refreshedParent = await this.persistParentResolutionBoundary({
+        parentRun,
+        statusChangedEvent,
+        parentToolEvent,
       });
 
       this.logLifecycle('info', 'run.status_changed', {
@@ -446,18 +449,6 @@ export class DelegationExecutor {
           childRunId: params.childRunId,
           output: summarizeValueForLog(mapped.output),
         });
-        await this.emitParentToolEvent({
-          parentContext: refreshedParent,
-          stepId: params.stepId,
-          type: 'tool.completed',
-          payload: {
-            toolName: params.toolName,
-            delegateName: params.delegateName,
-            childRunId: params.childRunId,
-            output: mapped.output,
-          },
-        });
-
         return {
           kind: 'resolved',
           parentRun: refreshedParent,
@@ -474,19 +465,6 @@ export class DelegationExecutor {
         childRunId: params.childRunId,
         error: mapped.error,
         code: mapped.code,
-      });
-
-      await this.emitParentToolEvent({
-        parentContext: refreshedParent,
-        stepId: params.stepId,
-        type: 'tool.failed',
-        payload: {
-          toolName: params.toolName,
-          delegateName: params.delegateName,
-          childRunId: params.childRunId,
-          error: mapped.error,
-          code: mapped.code,
-        },
       });
 
       return {
@@ -514,6 +492,166 @@ export class DelegationExecutor {
       error: mapped.error,
       code: mapped.code,
     };
+  }
+
+  private async persistChildSpawnBoundary(params: {
+    parentContext: ToolContext;
+    childRunId: UUID;
+    childDepth: number;
+    delegate: DelegateDefinition;
+    input: DelegateToolInput;
+    delegatePayload: DelegateSpawnedPayload;
+  }): Promise<AgentRun> {
+    const transactionStore = this.options.transactionStore;
+    if (transactionStore?.eventStore && transactionStore.snapshotStore) {
+      const downstreamEvents: Array<Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>> = [];
+      const updatedParent = await transactionStore.runInTransaction(async (stores) => {
+        if (!stores.eventStore || !stores.snapshotStore) {
+          throw new Error('Transactional child spawn requires eventStore and snapshotStore');
+        }
+
+        const childRun = await stores.runStore.createRun(this.childRunInput(params));
+        const parentRun = await stores.runStore.getRun(params.parentContext.runId);
+        if (!parentRun) {
+          throw new Error(`Parent run ${params.parentContext.runId} does not exist`);
+        }
+
+        const nextParent = await stores.runStore.updateRun(
+          parentRun.id,
+          {
+            status: 'awaiting_subagent',
+            currentChildRunId: params.childRunId,
+          },
+          parentRun.version,
+        );
+
+        const statusChangedEvent = this.runStatusChangedEvent(
+          parentRun,
+          params.parentContext.stepId,
+          'awaiting_subagent',
+          params.childRunId,
+        );
+        await stores.eventStore.append(statusChangedEvent);
+        downstreamEvents.push(statusChangedEvent);
+
+        const snapshotEvent = await this.persistAwaitingChildSnapshotWithStores(
+          stores,
+          nextParent,
+          params.childRunId,
+          params.delegate.name,
+        );
+        if (snapshotEvent) {
+          downstreamEvents.push(snapshotEvent);
+        }
+
+        const delegateSpawnedEvent = this.delegateSpawnedEvent(
+          params.parentContext.runId,
+          params.parentContext.stepId,
+          params.delegatePayload,
+        );
+        await stores.eventStore.append(delegateSpawnedEvent);
+        downstreamEvents.push(delegateSpawnedEvent);
+
+        const childCreatedEvent = this.childRunCreatedEvent(childRun);
+        await stores.eventStore.append(childCreatedEvent);
+        downstreamEvents.push(childCreatedEvent);
+
+        return nextParent;
+      });
+
+      await this.emitDownstreamOnly(downstreamEvents);
+      return updatedParent;
+    }
+
+    const childRun = await this.options.runStore.createRun(this.childRunInput(params));
+    const parentRun = await this.options.runStore.getRun(params.parentContext.runId);
+    if (!parentRun) {
+      throw new Error(`Parent run ${params.parentContext.runId} does not exist`);
+    }
+
+    const updatedParent = await this.options.runStore.updateRun(
+      params.parentContext.runId,
+      {
+        status: 'awaiting_subagent',
+        currentChildRunId: params.childRunId,
+      },
+      parentRun.version,
+    );
+
+    await this.emitRunEvent(
+      this.runStatusChangedEvent(parentRun, params.parentContext.stepId, 'awaiting_subagent', params.childRunId),
+    );
+    await this.persistAwaitingChildSnapshot(updatedParent, params.childRunId, params.delegate.name);
+    await params.parentContext.emit(
+      this.delegateSpawnedEvent(params.parentContext.runId, params.parentContext.stepId, params.delegatePayload),
+    );
+    await this.emitRunEvent(this.childRunCreatedEvent(childRun));
+
+    return updatedParent;
+  }
+
+  private childRunInput(params: {
+    parentContext: ToolContext;
+    childRunId: UUID;
+    childDepth: number;
+    delegate: DelegateDefinition;
+    input: DelegateToolInput;
+  }): Parameters<RunStore['createRun']>[0] {
+    return {
+      id: params.childRunId,
+      rootRunId: params.parentContext.rootRunId,
+      parentRunId: params.parentContext.runId,
+      parentStepId: params.parentContext.stepId,
+      delegateName: params.delegate.name,
+      delegationDepth: params.childDepth,
+      goal: params.input.goal,
+      input: params.input.input,
+      context: params.input.context,
+      metadata: params.input.metadata,
+      status: 'queued',
+    };
+  }
+
+  private async persistParentResolutionBoundary(params: {
+    parentRun: AgentRun;
+    statusChangedEvent: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>;
+    parentToolEvent: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>;
+  }): Promise<AgentRun> {
+    const transactionStore = this.options.transactionStore;
+    if (transactionStore?.eventStore) {
+      const updatedParent = await transactionStore.runInTransaction(async (stores) => {
+        if (!stores.eventStore) {
+          throw new Error('Transactional parent resolution requires eventStore');
+        }
+
+        const nextParent = await stores.runStore.updateRun(
+          params.parentRun.id,
+          {
+            status: 'running',
+            currentChildRunId: undefined,
+          },
+          params.parentRun.version,
+        );
+        await stores.eventStore.append(params.statusChangedEvent);
+        await stores.eventStore.append(params.parentToolEvent);
+        return nextParent;
+      });
+
+      await this.emitDownstreamOnly([params.statusChangedEvent, params.parentToolEvent]);
+      return updatedParent;
+    }
+
+    const updatedParent = await this.options.runStore.updateRun(
+      params.parentRun.id,
+      {
+        status: 'running',
+        currentChildRunId: undefined,
+      },
+      params.parentRun.version,
+    );
+    await this.emitRunEvent(params.statusChangedEvent);
+    await this.emitRunEvent(params.parentToolEvent);
+    return updatedParent;
   }
 
   private async materializeChildTerminalState(childRunId: UUID, result: RunResult): Promise<void> {
@@ -584,14 +722,33 @@ export class DelegationExecutor {
   }
 
   private async persistAwaitingChildSnapshot(parentRun: AgentRun, childRunId: UUID, delegateName: string): Promise<void> {
-    if (!this.options.snapshotStore) {
-      return;
+    const snapshotEvent = await this.persistAwaitingChildSnapshotWithStores(
+      {
+        snapshotStore: this.options.snapshotStore,
+      },
+      parentRun,
+      childRunId,
+      delegateName,
+    );
+    if (snapshotEvent) {
+      await this.emitRunEvent(snapshotEvent);
+    }
+  }
+
+  private async persistAwaitingChildSnapshotWithStores(
+    stores: Pick<RuntimeStores, 'eventStore' | 'snapshotStore'>,
+    parentRun: AgentRun,
+    childRunId: UUID,
+    delegateName: string,
+  ): Promise<Omit<AgentEvent, 'id' | 'seq' | 'createdAt'> | null> {
+    if (!stores.snapshotStore) {
+      return null;
     }
 
-    const latestSnapshot = await this.options.snapshotStore.getLatest(parentRun.id);
+    const latestSnapshot = await stores.snapshotStore.getLatest(parentRun.id);
     const previousState = isJsonObject(latestSnapshot?.state) ? latestSnapshot.state : {};
     const previousSummary = isJsonObject(latestSnapshot?.summary) ? latestSnapshot.summary : {};
-    await this.options.snapshotStore.save({
+    await stores.snapshotStore.save({
       runId: parentRun.id,
       snapshotSeq: (latestSnapshot?.snapshotSeq ?? 0) + 1,
       status: 'awaiting_subagent',
@@ -611,7 +768,7 @@ export class DelegationExecutor {
       },
     });
 
-    await this.emitRunEvent({
+    const snapshotEvent = {
       runId: parentRun.id,
       type: 'snapshot.created',
       stepId: parentRun.currentStepId,
@@ -621,7 +778,9 @@ export class DelegationExecutor {
         waitingOnChildRunId: childRunId,
         waitingOnDelegateName: delegateName,
       },
-    });
+    } satisfies Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>;
+
+    await stores.eventStore?.append(snapshotEvent);
 
     this.logLifecycle('debug', 'snapshot.created', {
       ...runLogBindings(parentRun),
@@ -630,6 +789,106 @@ export class DelegationExecutor {
       waitingOnChildRunId: childRunId,
       waitingOnDelegateName: delegateName,
     });
+
+    return snapshotEvent;
+  }
+
+  private delegateSpawnedEvent(
+    runId: UUID,
+    stepId: string,
+    payload: DelegateSpawnedPayload,
+  ): Omit<AgentEvent, 'id' | 'seq' | 'createdAt'> {
+    return {
+      runId,
+      stepId,
+      type: 'delegate.spawned',
+      schemaVersion: 1,
+      payload,
+    };
+  }
+
+  private childRunCreatedEvent(childRun: AgentRun): Omit<AgentEvent, 'id' | 'seq' | 'createdAt'> {
+    return {
+      runId: childRun.id,
+      type: 'run.created',
+      schemaVersion: 1,
+      payload: {
+        rootRunId: childRun.rootRunId,
+        parentRunId: childRun.parentRunId,
+        parentStepId: childRun.parentStepId,
+        delegateName: childRun.delegateName,
+        delegationDepth: childRun.delegationDepth,
+      },
+    };
+  }
+
+  private runStatusChangedEvent(
+    run: AgentRun,
+    stepId: string | undefined,
+    toStatus: RunStatus,
+    currentChildRunId: UUID | null,
+  ): Omit<AgentEvent, 'id' | 'seq' | 'createdAt'> {
+    return {
+      runId: run.id,
+      stepId,
+      type: 'run.status_changed',
+      schemaVersion: 1,
+      payload: {
+        fromStatus: run.status,
+        toStatus,
+        currentChildRunId,
+      },
+    };
+  }
+
+  private parentToolResolutionEvent(params: {
+    parentRunId: UUID;
+    stepId?: string;
+    delegateName: string;
+    toolName: string;
+    childRunId: UUID;
+    mapped:
+      | { kind: 'success'; output: JsonValue }
+      | { kind: 'failure'; error: string; code: RunFailureCode };
+  }): Omit<AgentEvent, 'id' | 'seq' | 'createdAt'> {
+    if (params.mapped.kind === 'success') {
+      return {
+        runId: params.parentRunId,
+        stepId: params.stepId,
+        type: 'tool.completed',
+        schemaVersion: 1,
+        payload: {
+          toolName: params.toolName,
+          delegateName: params.delegateName,
+          childRunId: params.childRunId,
+          output: params.mapped.output,
+        },
+      };
+    }
+
+    return {
+      runId: params.parentRunId,
+      stepId: params.stepId,
+      type: 'tool.failed',
+      schemaVersion: 1,
+      payload: {
+        toolName: params.toolName,
+        delegateName: params.delegateName,
+        childRunId: params.childRunId,
+        error: params.mapped.error,
+        code: params.mapped.code,
+      },
+    };
+  }
+
+  private async emitDownstreamOnly(events: Array<Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>>): Promise<void> {
+    if (!this.options.downstreamEventSink) {
+      return;
+    }
+
+    for (const event of events) {
+      await this.options.downstreamEventSink.emit(event);
+    }
   }
 
   private async getSnapshotChildRunId(runId: UUID): Promise<UUID | undefined> {
@@ -673,6 +932,22 @@ export class DelegationExecutor {
     });
 
     return failedParent;
+  }
+
+  private validateChildLinkage(parentRun: AgentRun, childRun: AgentRun, stepId?: string): string | null {
+    if (childRun.parentRunId !== parentRun.id) {
+      return `Child run ${childRun.id} is not linked to parent run ${parentRun.id}`;
+    }
+
+    if (childRun.rootRunId !== parentRun.rootRunId) {
+      return `Child run ${childRun.id} root ${childRun.rootRunId} does not match parent root ${parentRun.rootRunId}`;
+    }
+
+    if (stepId && childRun.parentStepId && childRun.parentStepId !== stepId) {
+      return `Child run ${childRun.id} parent step ${childRun.parentStepId} does not match parent step ${stepId}`;
+    }
+
+    return null;
   }
 
   private mapChildRun(childRun: AgentRun):
@@ -785,6 +1060,7 @@ export class DelegationExecutor {
       | 'run.completed'
       | 'run.failed'
       | 'snapshot.created'
+      | 'delegate.spawned'
       | 'tool.completed'
       | 'tool.failed';
     schemaVersion: number;

@@ -1,9 +1,11 @@
 import type { JsonObject, JsonValue } from './core.js';
+import type { InvocationMode } from './config.js';
 
 export const INBOUND_FRAME_TYPES = [
   'session.open',
   'message.send',
   'run.start',
+  'run.retry',
   'approval.resolve',
   'clarification.resolve',
   'channel.subscribe',
@@ -67,6 +69,13 @@ export interface RunStartFrame {
   metadata?: JsonObject;
 }
 
+export interface RunRetryFrame {
+  type: 'run.retry';
+  sessionId: string;
+  runId: string;
+  metadata?: JsonObject;
+}
+
 export interface ApprovalResolveFrame {
   type: 'approval.resolve';
   sessionId: string;
@@ -102,6 +111,7 @@ export type InboundFrame =
   | SessionOpenFrame
   | MessageSendFrame
   | RunStartFrame
+  | RunRetryFrame
   | ApprovalResolveFrame
   | ClarificationResolveFrame
   | ChannelSubscribeFrame
@@ -113,6 +123,7 @@ export interface SessionOpenedFrame {
   sessionId: string;
   channelId: string;
   agentId?: string;
+  invocationMode?: InvocationMode;
   status: SessionStatus;
 }
 
@@ -120,6 +131,7 @@ export interface SessionUpdatedFrame {
   type: 'session.updated';
   sessionId: string;
   status: SessionStatus;
+  invocationMode?: InvocationMode;
   transcriptVersion: number;
   activeRunId?: string;
   activeRootRunId?: string;
@@ -245,6 +257,9 @@ export function validateInboundFrame(value: unknown): InboundFrame {
     case 'run.start': {
       return validateRunStartFrame(frame, issues);
     }
+    case 'run.retry': {
+      return validateRunRetryFrame(frame, issues);
+    }
     case 'approval.resolve': {
       return validateApprovalResolveFrame(frame, issues);
     }
@@ -261,6 +276,17 @@ export function validateInboundFrame(value: unknown): InboundFrame {
       return validatePingFrame(frame, issues);
     }
   }
+}
+
+function validateRunRetryFrame(frame: Record<string, unknown>, issues: string[]): RunRetryFrame {
+  const validatedFrame: RunRetryFrame = {
+    type: 'run.retry',
+    sessionId: expectNonEmptyString(frame.sessionId, 'frame.sessionId', issues) ?? 'invalid-session-id',
+    runId: expectNonEmptyString(frame.runId, 'frame.runId', issues) ?? 'invalid-run-id',
+    metadata: expectOptionalJsonObject(frame.metadata, 'frame.metadata', issues),
+  };
+
+  return finalizeFrame(validatedFrame, issues);
 }
 
 export function createPongFrame(frame: PingFrame): PongFrame {

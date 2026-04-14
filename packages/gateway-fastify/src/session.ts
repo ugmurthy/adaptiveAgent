@@ -92,6 +92,7 @@ function toSessionOpenedFrame(session: GatewaySessionRecord): SessionOpenedFrame
     sessionId: session.id,
     channelId: session.channelId,
     agentId: session.agentId,
+    ...(session.invocationMode ? { invocationMode: session.invocationMode } : {}),
     status: session.status,
   };
 }

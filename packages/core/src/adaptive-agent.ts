@@ -19,6 +19,7 @@ import type {
   ChatResult,
   ExecutePlanRequest,
   EventSink,
+  FailureKind,
   JsonObject,
   JsonSchema,
   JsonValue,
@@ -28,6 +29,7 @@ import type {
   PlanExecution,
   PlanRequest,
   PlanStep,
+  RuntimeStores,
   RunFailureCode,
   RunRequest,
   RunResult,
@@ -45,6 +47,17 @@ interface PendingToolCallState {
   input: JsonValue;
   stepId: string;
   needsStepStarted: boolean;
+}
+
+interface PendingToolCallExecutionResult {
+  output: JsonValue;
+  completion?: ToolExecutionCompletionPersistence;
+}
+
+interface ToolExecutionCompletionPersistence {
+  idempotencyKey: string;
+  output: JsonValue;
+  event?: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>;
 }
 
 interface ExecutionState {
@@ -68,6 +81,8 @@ const DEFAULT_AGENT_DEFAULTS = {
 } as const;
 
 const OLLAMA_MODEL_TIMEOUT_MULTIPLIER = 4;
+const EXECUTION_STATE_SCHEMA_VERSION = 1;
+const DEFAULT_TERMINAL_RETRY_LIMIT = 1;
 
 const TERMINAL_RUN_STATUSES = new Set<RunStatus>([
   'succeeded',
@@ -116,8 +131,10 @@ export class AdaptiveAgent {
       defaults: options.defaults,
       runStore: options.runStore,
       eventSink: this.eventEmitter,
+      downstreamEventSink: options.eventSink,
       logger: this.logger,
       snapshotStore: options.snapshotStore,
+      transactionStore: options.transactionStore,
       executeChildRun: (request) => this.executeChildRun(request),
     });
 
@@ -137,13 +154,13 @@ export class AdaptiveAgent {
   }
 
   async run(request: RunRequest): Promise<RunResult> {
-    const createdRun = await this.options.runStore.createRun({
+    const { run: createdRun } = await this.createRunWithInitialSnapshot({
       goal: request.goal,
       input: request.input,
       context: request.context,
       metadata: request.metadata,
       status: 'queued',
-    });
+    }, (run) => this.createInitialExecutionState(run, request.outputSchema));
 
     this.logLifecycle('info', 'run.created', {
       ...runLogBindings(createdRun),
@@ -154,31 +171,18 @@ export class AdaptiveAgent {
       outputSchema: request.outputSchema ? summarizeValueForLog(request.outputSchema) : undefined,
     });
 
-    await this.emit({
-      runId: createdRun.id,
-      type: 'run.created',
-      schemaVersion: 1,
-      payload: {
-        goal: createdRun.goal,
-        rootRunId: createdRun.rootRunId,
-        delegationDepth: createdRun.delegationDepth,
-      },
-    });
-
-    const initialState = this.createInitialExecutionState(createdRun, request.outputSchema);
-    await this.saveExecutionSnapshot(createdRun, initialState, createdRun.status);
     return this.runWithExistingRun(createdRun.id, { outputSchema: request.outputSchema });
   }
 
   async chat(request: ChatRequest): Promise<ChatResult> {
     const initialMessages = buildInitialChatMessages(request.messages, request.context, this.options.systemInstructions);
     const goal = summarizeChatGoal(request.messages);
-    const createdRun = await this.options.runStore.createRun({
+    const { run: createdRun } = await this.createRunWithInitialSnapshot({
       goal,
       context: request.context,
       metadata: request.metadata,
       status: 'queued',
-    });
+    }, () => this.createExecutionState(initialMessages, request.outputSchema));
 
     this.logLifecycle('info', 'run.created', {
       ...runLogBindings(createdRun),
@@ -190,19 +194,6 @@ export class AdaptiveAgent {
       messageCount: request.messages.length,
     });
 
-    await this.emit({
-      runId: createdRun.id,
-      type: 'run.created',
-      schemaVersion: 1,
-      payload: {
-        goal: createdRun.goal,
-        rootRunId: createdRun.rootRunId,
-        delegationDepth: createdRun.delegationDepth,
-      },
-    });
-
-    const initialState = this.createExecutionState(initialMessages, request.outputSchema);
-    await this.saveExecutionSnapshot(createdRun, initialState, createdRun.status);
     return this.runWithExistingRun(createdRun.id, { outputSchema: request.outputSchema });
   }
 
@@ -713,36 +704,125 @@ export class AdaptiveAgent {
     }
 
     let currentRun = run;
-    if (run.status === 'awaiting_subagent') {
-      try {
-        currentRun = await this.resumeAwaitingParent(run, state);
-      } catch (error) {
-        if (error instanceof DelegationError) {
-          return this.failRun(run, state, error.message, error.code);
-        }
+    await this.acquireLeaseOrThrow(run.id);
 
-        return interruptResult(run.id, state.stepsUsed, run.usage, error instanceof Error ? error.message : String(error));
+    try {
+      currentRun = await this.refreshRun(run.id);
+
+      if (currentRun.status === 'awaiting_subagent') {
+        try {
+          currentRun = await this.resumeAwaitingParent(currentRun, state);
+        } catch (error) {
+          if (error instanceof DelegationError) {
+            return this.failRun(currentRun, state, error.message, error.code);
+          }
+
+          return interruptResult(
+            currentRun.id,
+            state.stepsUsed,
+            currentRun.usage,
+            error instanceof Error ? error.message : String(error),
+          );
+        }
       }
+
+      if (currentRun.status === 'interrupted') {
+        currentRun = await this.transitionRun(currentRun, 'running');
+        this.logLifecycle('info', 'run.resumed', {
+          ...runLogBindings(currentRun),
+          stepId: currentRun.currentStepId,
+        });
+        await this.emit({
+          runId,
+          stepId: currentRun.currentStepId,
+          type: 'run.resumed',
+          schemaVersion: 1,
+          payload: {
+            status: 'running',
+          },
+        });
+      }
+
+      return await this.runWithExistingRun(runId, { outputSchema: state.outputSchema });
+    } finally {
+      await this.releaseLeaseQuietly(run.id);
+    }
+  }
+
+  async retry(runId: UUID): Promise<RunResult> {
+    const run = await this.options.runStore.getRun(runId);
+    if (!run) {
+      throw new Error(`Run ${runId} does not exist`);
     }
 
-    if (currentRun.status === 'interrupted') {
-      currentRun = await this.transitionRun(currentRun, 'running');
-      this.logLifecycle('info', 'run.resumed', {
-        ...runLogBindings(currentRun),
-        stepId: currentRun.currentStepId,
+    this.logLifecycle('info', 'run.retry_requested', {
+      ...runLogBindings(run),
+      status: run.status,
+      stepId: run.currentStepId,
+      errorCode: run.errorCode,
+      errorMessage: run.errorMessage,
+    });
+
+    const state = await this.loadExecutionState(run);
+    if (run.status !== 'failed') {
+      throw new Error(`Run ${runId} is ${run.status}; only failed runs can be retried`);
+    }
+
+    const retryability = this.checkFailedRunRetryability(run, state);
+    if (!retryability.retryable) {
+      throw new Error(retryability.reason);
+    }
+
+    await this.acquireLeaseOrThrow(run.id);
+
+    try {
+      const currentRun = await this.refreshRun(run.id);
+      if (currentRun.status !== 'failed') {
+        throw new Error(`Run ${runId} changed to ${currentRun.status}; retry no longer applies`);
+      }
+
+      const retryAttempts = readRetryAttempts(currentRun.metadata) + 1;
+      const retryingRun = await this.options.runStore.updateRun(
+        currentRun.id,
+        {
+          status: 'running',
+          errorCode: undefined,
+          errorMessage: undefined,
+          result: undefined,
+          completedAt: null,
+          metadata: {
+            ...(currentRun.metadata ?? {}),
+            retryAttempts,
+            lastRetryFailureKind: retryability.failureKind,
+          },
+        } as Partial<AgentRun>,
+        currentRun.version,
+      );
+
+      this.logLifecycle('info', 'run.retry_started', {
+        ...runLogBindings(retryingRun),
+        stepId: retryingRun.currentStepId,
+        failureKind: retryability.failureKind,
+        retryAttempts,
       });
+
       await this.emit({
         runId,
-        stepId: currentRun.currentStepId,
-        type: 'run.resumed',
+        stepId: retryingRun.currentStepId,
+        type: 'run.retry_started',
         schemaVersion: 1,
         payload: {
           status: 'running',
+          failureKind: retryability.failureKind,
+          retryAttempts,
         },
       });
-    }
+      await this.saveExecutionSnapshot(retryingRun, state, retryingRun.status);
 
-    return this.runWithExistingRun(runId, { outputSchema: state.outputSchema });
+      return await this.runWithExistingRun(runId, { outputSchema: state.outputSchema });
+    } finally {
+      await this.releaseLeaseQuietly(run.id);
+    }
   }
 
   private async runWithExistingRun(runId: UUID, options: RunContinuationOptions): Promise<RunResult> {
@@ -764,6 +844,23 @@ export class AdaptiveAgent {
     }
 
     try {
+      if (shouldResolveWaitingDelegateSnapshot(state)) {
+        try {
+          currentRun = await this.resumeAwaitingParent(currentRun, state);
+        } catch (error) {
+          if (error instanceof DelegationError) {
+            return this.failRun(currentRun, state, error.message, error.code);
+          }
+
+          return interruptResult(
+            currentRun.id,
+            state.stepsUsed,
+            currentRun.usage,
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+      }
+
       return await this.executionLoop(currentRun, state);
     } finally {
       await this.releaseLeaseQuietly(run.id);
@@ -809,9 +906,9 @@ export class AdaptiveAgent {
           pendingToolCall.needsStepStarted = false;
         }
 
-        let toolOutput: JsonValue;
+        let toolExecutionResult: PendingToolCallExecutionResult;
         try {
-          toolOutput = await this.executePendingToolCall(currentRun, state, pendingToolCall);
+          toolExecutionResult = await this.executePendingToolCall(currentRun, state, pendingToolCall);
         } catch (error) {
           if (error instanceof ApprovalRequiredError) {
             return {
@@ -834,6 +931,7 @@ export class AdaptiveAgent {
           );
         }
 
+        const toolOutput = toolExecutionResult.output;
         state.messages.push(toolResultMessage(pendingToolCall, toolOutput));
         state.pendingToolCalls.shift();
         state.approvedToolCallIds = removeApprovedToolCallId(state.approvedToolCallIds, pendingToolCall.id);
@@ -846,7 +944,7 @@ export class AdaptiveAgent {
           toolName: pendingToolCall.name,
         });
 
-        await this.emit({
+        const stepCompletedEvent: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'> = {
           runId: currentRun.id,
           stepId,
           type: 'step.completed',
@@ -855,10 +953,15 @@ export class AdaptiveAgent {
             stepId,
             toolName: pendingToolCall.name,
           },
-        });
+        };
 
         currentRun = await this.refreshRun(currentRun.id);
-        await this.saveExecutionSnapshot(currentRun, state, currentRun.status);
+        await this.persistToolCompletionContinuation({
+          run: currentRun,
+          state,
+          completion: toolExecutionResult.completion,
+          stepCompletedEvent,
+        });
         continue;
       }
 
@@ -944,11 +1047,82 @@ export class AdaptiveAgent {
     return this.failRun(latestRun, state, 'Maximum steps exceeded', 'MAX_STEPS');
   }
 
+  private checkFailedRunRetryability(
+    run: AgentRun,
+    state: ExecutionState,
+  ): { retryable: true; failureKind: FailureKind } | { retryable: false; reason: string; failureKind: FailureKind } {
+    const failureKind = classifyFailureKind(run.errorCode as RunFailureCode | undefined, run.errorMessage);
+    const retryAttempts = readRetryAttempts(run.metadata);
+    if (retryAttempts >= DEFAULT_TERMINAL_RETRY_LIMIT) {
+      return {
+        retryable: false,
+        failureKind,
+        reason: `Run ${run.id} has already used its terminal retry attempt`,
+      };
+    }
+
+    if (run.errorCode === 'MODEL_ERROR') {
+      if (isRetryableModelFailureKind(failureKind)) {
+        return { retryable: true, failureKind };
+      }
+
+      return {
+        retryable: false,
+        failureKind,
+        reason: `Run ${run.id} failed with non-retryable model failure kind "${failureKind}"`,
+      };
+    }
+
+    if (run.errorCode === 'TOOL_ERROR') {
+      const pendingToolCall = state.pendingToolCalls[0];
+      if (!pendingToolCall) {
+        return {
+          retryable: false,
+          failureKind,
+          reason: `Run ${run.id} has no pending tool call to retry`,
+        };
+      }
+
+      const tool = this.toolRegistry.get(pendingToolCall.name);
+      if (!tool) {
+        return {
+          retryable: false,
+          failureKind,
+          reason: `Run ${run.id} failed on unavailable tool "${pendingToolCall.name}"`,
+        };
+      }
+
+      if (!tool.retryPolicy?.retryable) {
+        return {
+          retryable: false,
+          failureKind,
+          reason: `Tool "${tool.name}" is not marked retryable`,
+        };
+      }
+
+      if (!toolRetryPolicyAllows(tool, failureKind)) {
+        return {
+          retryable: false,
+          failureKind,
+          reason: `Tool "${tool.name}" does not allow retry for failure kind "${failureKind}"`,
+        };
+      }
+
+      return { retryable: true, failureKind };
+    }
+
+    return {
+      retryable: false,
+      failureKind,
+      reason: `Run ${run.id} failed with non-retryable code "${run.errorCode ?? 'unknown'}"`,
+    };
+  }
+
   private async executePendingToolCall(
     run: AgentRun,
     state: ExecutionState,
     pendingToolCall: PendingToolCallState,
-  ): Promise<JsonValue> {
+  ): Promise<PendingToolCallExecutionResult> {
     const tool = this.toolRegistry.get(pendingToolCall.name);
     if (!tool) {
       throw new Error(`Unknown tool ${pendingToolCall.name}`);
@@ -979,6 +1153,28 @@ export class AdaptiveAgent {
     state.approvedToolCallIds = removeApprovedToolCallId(state.approvedToolCallIds, pendingToolCall.id);
 
     const toolContext = this.createToolContext(run, pendingToolCall.stepId, pendingToolCall.id);
+    const existingExecution = await this.options.toolExecutionStore?.getByIdempotencyKey(toolContext.idempotencyKey);
+    if (existingExecution?.status === 'completed') {
+      this.logLifecycle('info', 'tool.execution_reused', {
+        ...runLogBindings(run),
+        stepId: pendingToolCall.stepId,
+        toolName: tool.name,
+        idempotencyKey: toolContext.idempotencyKey,
+      });
+      return {
+        output: existingExecution.output ?? null,
+      };
+    }
+
+    await this.options.toolExecutionStore?.markStarted({
+      runId: run.id,
+      stepId: pendingToolCall.stepId,
+      toolCallId: pendingToolCall.id,
+      toolName: tool.name,
+      idempotencyKey: toolContext.idempotencyKey,
+      inputHash: stableJsonFingerprint(pendingToolCall.input),
+    });
+
     const emitsToolLifecycle = tool.name.startsWith(RESERVED_DELEGATE_PREFIX);
     const toolStartedAt = Date.now();
 
@@ -1011,25 +1207,34 @@ export class AdaptiveAgent {
           output,
           Date.now() - toolStartedAt,
         );
-        await this.emit({
-          runId: run.id,
-          stepId: pendingToolCall.stepId,
-          type: 'tool.completed',
-          schemaVersion: 1,
-          payload: {
-            toolName: tool.name,
-            output: tool.summarizeResult ? tool.summarizeResult(output) : output,
-          },
-        });
       }
 
-      return output;
+      return {
+        output,
+        completion: {
+          idempotencyKey: toolContext.idempotencyKey,
+          output,
+          event: emitsToolLifecycle
+            ? undefined
+            : {
+                runId: run.id,
+                stepId: pendingToolCall.stepId,
+                type: 'tool.completed',
+                schemaVersion: 1,
+                payload: {
+                  toolName: tool.name,
+                  output: tool.summarizeResult ? tool.summarizeResult(output) : output,
+                },
+              },
+        },
+      };
     } catch (error) {
       if (error instanceof ApprovalRequiredError) {
         throw error;
       }
 
       const recoveredOutput = recoverToolError(tool, error, pendingToolCall.input);
+      let toolFailedEvent: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'> | undefined;
 
       if (!emitsToolLifecycle) {
         this.logToolFailed(
@@ -1047,7 +1252,7 @@ export class AdaptiveAgent {
                 : captureToolOutputForLog(tool, recoveredOutput, this.defaultCaptureMode),
           },
         );
-        await this.emit({
+        toolFailedEvent = {
           runId: run.id,
           stepId: pendingToolCall.stepId,
           type: 'tool.failed',
@@ -1063,12 +1268,26 @@ export class AdaptiveAgent {
                   ? tool.summarizeResult(recoveredOutput)
                   : recoveredOutput,
           },
-        });
+        };
       }
 
       if (recoveredOutput !== undefined) {
-        return recoveredOutput;
+        return {
+          output: recoveredOutput,
+          completion: {
+            idempotencyKey: toolContext.idempotencyKey,
+            output: recoveredOutput,
+            event: toolFailedEvent,
+          },
+        };
       }
+
+      await this.persistToolExecutionFailure({
+        idempotencyKey: toolContext.idempotencyKey,
+        errorCode: error instanceof DelegationError ? error.code : 'TOOL_ERROR',
+        errorMessage: error instanceof Error ? error.message : String(error),
+        event: toolFailedEvent,
+      });
 
       if (error instanceof DelegationError) {
         throw error;
@@ -1151,6 +1370,8 @@ export class AdaptiveAgent {
       eventStore: this.options.eventStore,
       snapshotStore: this.options.snapshotStore,
       planStore: this.options.planStore,
+      toolExecutionStore: this.options.toolExecutionStore,
+      transactionStore: this.options.transactionStore,
       eventSink: this.options.eventSink,
       logger: this.options.logger,
       defaults: { ...this.options.defaults, ...delegate.defaults },
@@ -1217,9 +1438,63 @@ export class AdaptiveAgent {
     return this.createExecutionState(buildInitialMessages(run, outputSchema, this.options.systemInstructions), outputSchema);
   }
 
+  private async createRunWithInitialSnapshot(
+    runInput: Parameters<AdaptiveAgentOptions['runStore']['createRun']>[0],
+    createState: (run: AgentRun) => ExecutionState,
+  ): Promise<{ run: AgentRun; state: ExecutionState }> {
+    const transactionStore = this.options.transactionStore;
+    if (transactionStore?.eventStore && transactionStore.snapshotStore) {
+      const downstreamEvents: Array<Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>> = [];
+      const result = await transactionStore.runInTransaction(async (stores) => {
+        if (!stores.eventStore || !stores.snapshotStore) {
+          throw new Error('Transactional run creation requires eventStore and snapshotStore');
+        }
+
+        const run = await stores.runStore.createRun(runInput);
+        const state = createState(run);
+        const createdEvent = this.runCreatedEvent(run);
+        await stores.eventStore.append(createdEvent);
+
+        const snapshot = await stores.snapshotStore.save({
+          runId: run.id,
+          snapshotSeq: 1,
+          status: run.status,
+          currentStepId: run.currentStepId,
+          currentPlanId: run.currentPlanId,
+          currentPlanExecutionId: run.currentPlanExecutionId,
+          summary: {
+            status: run.status,
+            stepsUsed: state.stepsUsed,
+          },
+          state: serializeExecutionState(state),
+        });
+
+        const snapshotEvent = this.snapshotCreatedEvent(run, snapshot.snapshotSeq, run.status);
+        await stores.eventStore.append(snapshotEvent);
+        downstreamEvents.push(createdEvent, snapshotEvent);
+        this.logSnapshotCreated(run, state, snapshot.snapshotSeq, run.status);
+
+        return { run, state };
+      });
+
+      await this.emitDownstreamOnly(downstreamEvents);
+      return result;
+    }
+
+    const run = await this.options.runStore.createRun(runInput);
+    const state = createState(run);
+    await this.emit(this.runCreatedEvent(run));
+    await this.saveExecutionSnapshot(run, state, run.status);
+    return { run, state };
+  }
+
   private async loadExecutionState(run: AgentRun, outputSchema?: JsonSchema): Promise<ExecutionState> {
     const snapshot = await this.options.snapshotStore?.getLatest(run.id);
     const parsed = snapshot ? deserializeExecutionState(snapshot.state) : null;
+    if (snapshot && !parsed) {
+      throw new Error(`Run ${run.id} latest snapshot state is not compatible with this runtime`);
+    }
+
     return parsed ?? this.createInitialExecutionState(run, outputSchema);
   }
 
@@ -1228,8 +1503,39 @@ export class AdaptiveAgent {
       return;
     }
 
-    const latestSnapshot = await this.options.snapshotStore.getLatest(run.id);
-    const snapshot = await this.options.snapshotStore.save({
+    const transactionStore = this.options.transactionStore;
+    if (transactionStore?.eventStore && transactionStore.snapshotStore) {
+      const snapshotEvent = await transactionStore.runInTransaction((stores) =>
+        this.saveExecutionSnapshotWithStores(stores, run, state, status),
+      );
+
+      await this.emitDownstreamOnly(snapshotEvent ? [snapshotEvent] : []);
+      return;
+    }
+
+    await this.saveExecutionSnapshotWithStores(
+      {
+        eventStore: this.options.eventStore,
+        snapshotStore: this.options.snapshotStore,
+      },
+      run,
+      state,
+      status,
+    );
+  }
+
+  private async saveExecutionSnapshotWithStores(
+    stores: Pick<RuntimeStores, 'eventStore' | 'snapshotStore'>,
+    run: AgentRun,
+    state: ExecutionState,
+    status: RunStatus,
+  ): Promise<Omit<AgentEvent, 'id' | 'seq' | 'createdAt'> | null> {
+    if (!stores.snapshotStore) {
+      return null;
+    }
+
+    const latestSnapshot = await stores.snapshotStore.getLatest(run.id);
+    const snapshot = await stores.snapshotStore.save({
       runId: run.id,
       snapshotSeq: (latestSnapshot?.snapshotSeq ?? 0) + 1,
       status,
@@ -1243,21 +1549,230 @@ export class AdaptiveAgent {
       state: serializeExecutionState(state),
     });
 
-    await this.emit({
+    const snapshotEvent = this.snapshotCreatedEvent(run, snapshot.snapshotSeq, status);
+    await stores.eventStore?.append(snapshotEvent);
+    this.logSnapshotCreated(run, state, snapshot.snapshotSeq, status);
+    return snapshotEvent;
+  }
+
+  private async persistToolExecutionCompletion(params: {
+    idempotencyKey: string;
+    output: JsonValue;
+    event?: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>;
+  }): Promise<void> {
+    const transactionStore = this.options.transactionStore;
+    if (transactionStore?.toolExecutionStore && (transactionStore.eventStore || !params.event)) {
+      await transactionStore.runInTransaction(async (stores) => {
+        if (!stores.toolExecutionStore) {
+          throw new Error('Transactional tool completion requires toolExecutionStore');
+        }
+
+        await stores.toolExecutionStore.markCompleted(params.idempotencyKey, params.output);
+        if (params.event) {
+          if (!stores.eventStore) {
+            throw new Error('Transactional tool completion event requires eventStore');
+          }
+
+          await stores.eventStore.append(params.event);
+        }
+      });
+
+      await this.emitDownstreamOnly(params.event ? [params.event] : []);
+      return;
+    }
+
+    await this.options.toolExecutionStore?.markCompleted(params.idempotencyKey, params.output);
+    if (params.event) {
+      await this.emit(params.event);
+    }
+  }
+
+  private async persistToolExecutionFailure(params: {
+    idempotencyKey: string;
+    errorCode: string;
+    errorMessage: string;
+    event?: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>;
+  }): Promise<void> {
+    const transactionStore = this.options.transactionStore;
+    if (transactionStore?.toolExecutionStore && (transactionStore.eventStore || !params.event)) {
+      await transactionStore.runInTransaction(async (stores) => {
+        if (!stores.toolExecutionStore) {
+          throw new Error('Transactional tool failure requires toolExecutionStore');
+        }
+
+        await stores.toolExecutionStore.markFailed(params.idempotencyKey, params.errorCode, params.errorMessage);
+        if (params.event) {
+          if (!stores.eventStore) {
+            throw new Error('Transactional tool failure event requires eventStore');
+          }
+
+          await stores.eventStore.append(params.event);
+        }
+      });
+
+      await this.emitDownstreamOnly(params.event ? [params.event] : []);
+      return;
+    }
+
+    await this.options.toolExecutionStore?.markFailed(params.idempotencyKey, params.errorCode, params.errorMessage);
+    if (params.event) {
+      await this.emit(params.event);
+    }
+  }
+
+  private async persistToolCompletionContinuation(params: {
+    run: AgentRun;
+    state: ExecutionState;
+    completion?: ToolExecutionCompletionPersistence;
+    stepCompletedEvent: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>;
+  }): Promise<void> {
+    const transactionStore = this.options.transactionStore;
+    if (
+      transactionStore?.eventStore &&
+      transactionStore.snapshotStore &&
+      (!params.completion || transactionStore.toolExecutionStore)
+    ) {
+      const downstreamEvents: Array<Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>> = [];
+      await transactionStore.runInTransaction(async (stores) => {
+        if (!stores.eventStore || !stores.snapshotStore) {
+          throw new Error('Transactional tool continuation requires eventStore and snapshotStore');
+        }
+
+        if (params.completion) {
+          if (!stores.toolExecutionStore) {
+            throw new Error('Transactional tool continuation requires toolExecutionStore');
+          }
+
+          await stores.toolExecutionStore.markCompleted(params.completion.idempotencyKey, params.completion.output);
+          if (params.completion.event) {
+            await stores.eventStore.append(params.completion.event);
+            downstreamEvents.push(params.completion.event);
+          }
+        }
+
+        await stores.eventStore.append(params.stepCompletedEvent);
+        downstreamEvents.push(params.stepCompletedEvent);
+        const snapshotEvent = await this.saveExecutionSnapshotWithStores(
+          stores,
+          params.run,
+          params.state,
+          params.run.status,
+        );
+        if (snapshotEvent) {
+          downstreamEvents.push(snapshotEvent);
+        }
+      });
+
+      await this.emitDownstreamOnly(downstreamEvents);
+      return;
+    }
+
+    if (params.completion) {
+      await this.persistToolExecutionCompletion(params.completion);
+    }
+
+    await this.emit(params.stepCompletedEvent);
+    await this.saveExecutionSnapshot(params.run, params.state, params.run.status);
+  }
+
+  private async persistTerminalRunTransition(params: {
+    run: AgentRun;
+    state: ExecutionState;
+    patch: Partial<AgentRun>;
+    event: (run: AgentRun) => Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>;
+  }): Promise<AgentRun> {
+    const transactionStore = this.options.transactionStore;
+    if (transactionStore?.eventStore && transactionStore.snapshotStore) {
+      const downstreamEvents: Array<Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>> = [];
+      const terminalRun = await transactionStore.runInTransaction(async (stores) => {
+        if (!stores.eventStore || !stores.snapshotStore) {
+          throw new Error('Transactional terminal transition requires eventStore and snapshotStore');
+        }
+
+        const updatedRun = await stores.runStore.updateRun(params.run.id, params.patch, params.run.version);
+        const snapshotEvent = await this.saveExecutionSnapshotWithStores(
+          stores,
+          updatedRun,
+          params.state,
+          updatedRun.status,
+        );
+        if (snapshotEvent) {
+          downstreamEvents.push(snapshotEvent);
+        }
+
+        const terminalEvent = params.event(updatedRun);
+        await stores.eventStore.append(terminalEvent);
+        downstreamEvents.push(terminalEvent);
+        return updatedRun;
+      });
+
+      await this.emitDownstreamOnly(downstreamEvents);
+      return terminalRun;
+    }
+
+    const terminalRun = await this.updateRunForTerminalTransition(params.run, params.patch);
+    await this.saveExecutionSnapshot(terminalRun, params.state, terminalRun.status);
+    await this.emit(params.event(terminalRun));
+    return terminalRun;
+  }
+
+  private async updateRunForTerminalTransition(run: AgentRun, patch: Partial<AgentRun>): Promise<AgentRun> {
+    try {
+      return await this.options.runStore.updateRun(run.id, patch, run.version);
+    } catch (error) {
+      if (!isOptimisticConcurrencyError(error)) {
+        throw error;
+      }
+
+      const refreshedRun = await this.refreshRun(run.id);
+      if (TERMINAL_RUN_STATUSES.has(refreshedRun.status)) {
+        return refreshedRun;
+      }
+
+      return this.options.runStore.updateRun(refreshedRun.id, patch, refreshedRun.version);
+    }
+  }
+
+  private runCreatedEvent(run: AgentRun): Omit<AgentEvent, 'id' | 'seq' | 'createdAt'> {
+    return {
+      runId: run.id,
+      type: 'run.created',
+      schemaVersion: 1,
+      payload: {
+        goal: run.goal,
+        rootRunId: run.rootRunId,
+        delegationDepth: run.delegationDepth,
+      },
+    };
+  }
+
+  private snapshotCreatedEvent(
+    run: AgentRun,
+    snapshotSeq: number,
+    status: RunStatus,
+  ): Omit<AgentEvent, 'id' | 'seq' | 'createdAt'> {
+    return {
       runId: run.id,
       stepId: run.currentStepId,
       type: 'snapshot.created',
       schemaVersion: 1,
       payload: {
-        snapshotSeq: snapshot.snapshotSeq,
+        snapshotSeq,
         status,
       },
-    });
+    };
+  }
 
+  private logSnapshotCreated(
+    run: AgentRun,
+    state: ExecutionState,
+    snapshotSeq: number,
+    status: RunStatus,
+  ): void {
     this.logLifecycle('debug', 'snapshot.created', {
       ...runLogBindings(run),
       stepId: run.currentStepId,
-      snapshotSeq: snapshot.snapshotSeq,
+      snapshotSeq,
       status,
       stepsUsed: state.stepsUsed,
     });
@@ -1367,25 +1882,23 @@ export class AdaptiveAgent {
   }
 
   private async completeRun(run: AgentRun, state: ExecutionState, output: JsonValue): Promise<RunResult> {
-    const completedRun = await this.options.runStore.updateRun(
-      run.id,
-      {
+    const completedRun = await this.persistTerminalRunTransition({
+      run,
+      state,
+      patch: {
         status: 'succeeded',
         result: output,
       },
-      run.version,
-    );
-
-    await this.saveExecutionSnapshot(completedRun, state, 'succeeded');
-    await this.emit({
-      runId: completedRun.id,
-      stepId: completedRun.currentStepId,
-      type: 'run.completed',
-      schemaVersion: 1,
-      payload: {
-        output,
-        stepsUsed: state.stepsUsed,
-      },
+      event: (completedRun) => ({
+        runId: completedRun.id,
+        stepId: completedRun.currentStepId,
+        type: 'run.completed',
+        schemaVersion: 1,
+        payload: {
+          output,
+          stepsUsed: state.stepsUsed,
+        },
+      }),
     });
 
     this.logLifecycle('info', 'run.completed', {
@@ -1413,26 +1926,24 @@ export class AdaptiveAgent {
     code: RunFailureCode,
   ): Promise<RunResult> {
     const currentRun = await this.refreshRun(run.id);
-    const failedRun = await this.options.runStore.updateRun(
-      currentRun.id,
-      {
+    const failedRun = await this.persistTerminalRunTransition({
+      run: currentRun,
+      state,
+      patch: {
         status: code === 'REPLAN_REQUIRED' ? 'replan_required' : 'failed',
         errorCode: code,
         errorMessage: error,
       },
-      currentRun.version,
-    );
-
-    await this.saveExecutionSnapshot(failedRun, state, failedRun.status);
-    await this.emit({
-      runId: failedRun.id,
-      stepId: failedRun.currentStepId,
-      type: code === 'REPLAN_REQUIRED' ? 'replan.required' : 'run.failed',
-      schemaVersion: 1,
-      payload: {
-        error,
-        code,
-      },
+      event: (failedRun) => ({
+        runId: failedRun.id,
+        stepId: failedRun.currentStepId,
+        type: code === 'REPLAN_REQUIRED' ? 'replan.required' : 'run.failed',
+        schemaVersion: 1,
+        payload: {
+          error,
+          code,
+        },
+      }),
     });
 
     this.logLifecycle(code === 'REPLAN_REQUIRED' ? 'warn' : 'error', code === 'REPLAN_REQUIRED' ? 'replan.required' : 'run.failed', {
@@ -1716,6 +2227,16 @@ export class AdaptiveAgent {
   private async emit(event: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>): Promise<void> {
     await this.eventEmitter.emit(event);
   }
+
+  private async emitDownstreamOnly(events: Array<Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>>): Promise<void> {
+    if (!this.options.eventSink || this.options.eventSink === (this.options.eventStore as unknown as EventSink | undefined)) {
+      return;
+    }
+
+    for (const event of events) {
+      await this.options.eventSink.emit(event);
+    }
+  }
 }
 
 class ApprovalRequiredError extends Error {
@@ -1845,6 +2366,7 @@ function summarizeChatGoal(messages: ChatMessage[]): string {
 
 function serializeExecutionState(state: ExecutionState): JsonObject {
   const serialized: JsonObject = {
+    schemaVersion: EXECUTION_STATE_SCHEMA_VERSION,
     messages: state.messages as unknown as JsonValue,
     stepsUsed: state.stepsUsed,
   };
@@ -1873,6 +2395,10 @@ function serializeExecutionState(state: ExecutionState): JsonObject {
 
 function deserializeExecutionState(value: JsonValue): ExecutionState | null {
   if (!isJsonObject(value) || !Array.isArray(value.messages) || typeof value.stepsUsed !== 'number') {
+    return null;
+  }
+
+  if (value.schemaVersion !== undefined && value.schemaVersion !== EXECUTION_STATE_SCHEMA_VERSION) {
     return null;
   }
 
@@ -1946,6 +2472,10 @@ function deserializeApprovedToolCallIds(value: JsonValue | undefined): string[] 
   }
 
   return value.filter((entry): entry is string => typeof entry === 'string');
+}
+
+function stableJsonFingerprint(value: JsonValue): string {
+  return stableJsonStringify(value);
 }
 
 function addApprovedToolCallId(approvedToolCallIds: string[], toolCallId: string): string[] {
@@ -2074,8 +2604,26 @@ function extractWaitingChildRunId(state: ExecutionState): UUID | undefined {
   return state.waitingOnChildRunId;
 }
 
+function shouldResolveWaitingDelegateSnapshot(state: ExecutionState): boolean {
+  const pendingToolCall = state.pendingToolCalls[0];
+  return Boolean(
+    state.waitingOnChildRunId &&
+      pendingToolCall &&
+      pendingToolCall.name.startsWith(RESERVED_DELEGATE_PREFIX),
+  );
+}
+
 function isJsonObject(value: JsonValue | undefined): value is JsonObject {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isOptimisticConcurrencyError(error: unknown): error is Error {
+  return (
+    error instanceof Error &&
+    (error.name === 'OptimisticConcurrencyError' ||
+      error.name === 'PostgresOptimisticConcurrencyError' ||
+      error.message.includes('version mismatch'))
+  );
 }
 
 function planStepPreconditionsMet(
@@ -2240,6 +2788,81 @@ function recoverToolError<O extends JsonValue>(
   input: JsonValue,
 ): O | undefined {
   return tool.recoverError?.(error, input);
+}
+
+function readRetryAttempts(metadata?: Record<string, JsonValue>): number {
+  const attempts = metadata?.retryAttempts;
+  return typeof attempts === 'number' && Number.isFinite(attempts) && attempts > 0 ? attempts : 0;
+}
+
+function classifyFailureKind(code?: RunFailureCode, message?: string): FailureKind {
+  if (code === 'MAX_STEPS') {
+    return 'max_steps';
+  }
+
+  if (code === 'APPROVAL_REJECTED') {
+    return 'approval_rejected';
+  }
+
+  const normalized = (message ?? '').toLowerCase();
+  if (normalized.includes('timed out') || normalized.includes('timeout')) {
+    return 'timeout';
+  }
+
+  if (
+    normalized.includes('network') ||
+    normalized.includes('econnreset') ||
+    normalized.includes('econnrefused') ||
+    normalized.includes('enotfound') ||
+    normalized.includes('fetch failed') ||
+    normalized.includes('socket') ||
+    normalized.includes('connection')
+  ) {
+    return 'network';
+  }
+
+  if (normalized.includes('rate limit') || normalized.includes('429')) {
+    return 'rate_limit';
+  }
+
+  if (
+    normalized.includes('enoent') ||
+    normalized.includes('no such file or directory') ||
+    normalized.includes('not found')
+  ) {
+    return 'not_found';
+  }
+
+  if (
+    normalized.includes('provider') ||
+    normalized.includes('finishreason=error') ||
+    normalized.includes('5xx') ||
+    normalized.includes('500') ||
+    normalized.includes('502') ||
+    normalized.includes('503') ||
+    normalized.includes('504')
+  ) {
+    return 'provider_error';
+  }
+
+  if (code === 'TOOL_ERROR') {
+    return 'tool_error';
+  }
+
+  return 'unknown';
+}
+
+function isRetryableModelFailureKind(failureKind: FailureKind): boolean {
+  return failureKind === 'timeout' || failureKind === 'network' || failureKind === 'rate_limit' || failureKind === 'provider_error';
+}
+
+function toolRetryPolicyAllows(tool: ToolDefinition, failureKind: FailureKind): boolean {
+  const retryOn = tool.retryPolicy?.retryOn;
+  if (!retryOn || retryOn.length === 0) {
+    return isRetryableModelFailureKind(failureKind);
+  }
+
+  return retryOn.includes(failureKind);
 }
 
 function createAbortTimeoutContext(timeoutMs: number): {

@@ -39,6 +39,12 @@ describe('gateway config loading', () => {
             requestLogging: true,
             requestLoggingDestination: 'file',
           },
+          agentRuntimeLogging: {
+            enabled: true,
+            level: 'debug',
+            destination: 'both',
+            filePath: 'data/gateway/logs/custom-agent-runtime.log',
+          },
           auth: {
             provider: 'jwt',
             issuer: 'https://auth.example.com',
@@ -120,6 +126,12 @@ describe('gateway config loading', () => {
     });
     expect(loadedGatewayConfig.config.server.requestLogging).toBe(true);
     expect(loadedGatewayConfig.config.server.requestLoggingDestination).toBe('file');
+    expect(loadedGatewayConfig.config.agentRuntimeLogging).toEqual({
+      enabled: true,
+      level: 'debug',
+      destination: 'both',
+      filePath: 'data/gateway/logs/custom-agent-runtime.log',
+    });
     expect(loadedGatewayConfig.config.hooks.onAuthenticate).toEqual(['audit']);
     expect(loadedAgentConfigs).toHaveLength(1);
     expect(loadedAgentConfigs[0]?.config).toMatchObject({

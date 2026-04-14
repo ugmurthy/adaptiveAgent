@@ -7,6 +7,11 @@
     "requestLogging": true,
     "requestLoggingDestination": "both"
   },
+  "agentRuntimeLogging": {
+    "enabled": false,
+    "level": "info",
+    "destination": "file"
+  },
   "auth": {
     "provider": "jwt",
     "settings": {

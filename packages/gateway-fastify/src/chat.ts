@@ -4,9 +4,11 @@ import type { AgentRegistry } from './agent-registry.js';
 import type { GatewayAuthContext } from './auth.js';
 import type { GatewayConfig } from './config.js';
 import type { JsonObject, JsonValue } from './core.js';
+import { executeHookSlot } from './hooks.js';
 import type { ApprovalRequestedFrame, MessageOutputFrame, MessageSendFrame } from './protocol.js';
 import { ProtocolValidationError } from './protocol.js';
 import type { RealtimeEventForwardingContext } from './realtime-events.js';
+import type { ResolvedGatewayHooks } from './registries.js';
 import { withForwardedRealtimeEvents } from './realtime-events.js';
 import { resolveGatewayRoute } from './routing.js';
 import { assertGatewaySessionWriteAllowed, getAuthorizedGatewaySession } from './session.js';
@@ -18,6 +20,7 @@ export interface ExecuteGatewayChatTurnOptions {
   agentRegistry: AgentRegistry;
   stores: GatewayStores;
   authContext?: GatewayAuthContext;
+  hooks?: ResolvedGatewayHooks;
   now?: () => Date;
   transcriptMessageIdFactory?: () => string;
   realtimeEvents?: Omit<RealtimeEventForwardingContext, 'fallbackAgentId' | 'fallbackSessionId'>;
@@ -33,7 +36,19 @@ export async function executeGatewayChatTurn(
     stores: options.stores,
     requestType: frame.type,
   });
+  let effectiveMetadata = frame.metadata;
+  effectiveMetadata = await runBeforeHook(options.hooks, 'onSessionResolve', frame.type, {
+    authContext: options.authContext,
+    session,
+    metadata: effectiveMetadata,
+  });
   assertGatewaySessionWriteAllowed(session, frame.type);
+  effectiveMetadata = await runBeforeHook(options.hooks, 'beforeRoute', frame.type, {
+    authContext: options.authContext,
+    session,
+    invocationMode: 'chat',
+    metadata: effectiveMetadata,
+  });
   const route = resolveGatewayRoute({
     gatewayConfig: options.gatewayConfig,
     agentRegistry: options.agentRegistry,
@@ -42,6 +57,14 @@ export async function executeGatewayChatTurn(
     invocationMode: 'chat',
     requestType: frame.type,
   });
+  effectiveMetadata = await runBeforeHook(options.hooks, 'beforeInboundMessage', frame.type, {
+    authContext: options.authContext,
+    session,
+    agentId: route.agentId,
+    invocationMode: 'chat',
+    metadata: effectiveMetadata,
+  });
+  const effectiveFrame = effectiveMetadata === frame.metadata ? frame : { ...frame, metadata: effectiveMetadata };
   const transcriptPolicy = resolveGatewayTranscriptPolicy(options.gatewayConfig);
   const transcriptMessages = await options.stores.transcriptMessages.listBySession(session.id);
   const agent = await options.agentRegistry.getAgent(route.agentId);
@@ -68,9 +91,9 @@ export async function executeGatewayChatTurn(
         : undefined,
       () =>
         agent.agent.chat({
-          messages: [...replayEnvelope, { role: 'user', content: frame.content }],
+          messages: [...replayEnvelope, { role: 'user', content: effectiveFrame.content }],
           context: buildGatewayChatContext(runningSession, options.authContext),
-          metadata: buildGatewayChatMetadata(frame, route.agentId, options.realtimeEvents?.requestId),
+          metadata: buildGatewayChatMetadata(effectiveFrame, route.agentId, options.realtimeEvents?.requestId),
         }),
     );
     const rootRunId = (await agent.runtime.runStore.getRun(chatResult.runId))?.rootRunId ?? chatResult.runId;
@@ -81,7 +104,7 @@ export async function executeGatewayChatTurn(
       rootRunId,
       invocationKind: 'chat',
       turnIndex: transcriptMessages.filter((message) => message.role === 'user').length + 1,
-      metadata: frame.metadata,
+      metadata: effectiveFrame.metadata,
       createdAt: nowIso,
     });
 
@@ -93,7 +116,7 @@ export async function executeGatewayChatTurn(
           runningSession,
           transcriptMessages,
           [
-            { role: 'user', content: frame.content, metadata: frame.metadata },
+            { role: 'user', content: effectiveFrame.content, metadata: effectiveFrame.metadata },
             { role: 'assistant', content: assistantContent },
           ],
           nowIso,
@@ -110,7 +133,7 @@ export async function executeGatewayChatTurn(
           updatedAt: nowIso,
         });
 
-        return {
+        const response: MessageOutputFrame = {
           type: 'message.output',
           sessionId: runningSession.id,
           runId: chatResult.runId,
@@ -120,6 +143,16 @@ export async function executeGatewayChatTurn(
             content: assistantContent,
           },
         };
+
+        await runAfterHook(options.hooks, frame.type, {
+          authContext: options.authContext,
+          session: runningSession,
+          agentId: route.agentId,
+          result: response,
+          metadata: effectiveFrame.metadata,
+        });
+
+        return response;
       }
       case 'clarification_requested': {
         const persistedMessages = await appendTranscriptMessages(
@@ -127,7 +160,7 @@ export async function executeGatewayChatTurn(
           runningSession,
           transcriptMessages,
           [
-            { role: 'user', content: frame.content, metadata: frame.metadata },
+            { role: 'user', content: effectiveFrame.content, metadata: effectiveFrame.metadata },
             { role: 'assistant', content: chatResult.message },
           ],
           nowIso,
@@ -144,7 +177,7 @@ export async function executeGatewayChatTurn(
           updatedAt: nowIso,
         });
 
-        return {
+        const response: MessageOutputFrame = {
           type: 'message.output',
           sessionId: runningSession.id,
           runId: chatResult.runId,
@@ -154,13 +187,23 @@ export async function executeGatewayChatTurn(
             content: chatResult.message,
           },
         };
+
+        await runAfterHook(options.hooks, frame.type, {
+          authContext: options.authContext,
+          session: runningSession,
+          agentId: route.agentId,
+          result: response,
+          metadata: effectiveFrame.metadata,
+        });
+
+        return response;
       }
       case 'approval_requested': {
         const persistedMessages = await appendTranscriptMessages(
           options.stores,
           runningSession,
           transcriptMessages,
-          [{ role: 'user', content: frame.content, metadata: frame.metadata }],
+          [{ role: 'user', content: effectiveFrame.content, metadata: effectiveFrame.metadata }],
           nowIso,
           options.transcriptMessageIdFactory,
         );
@@ -174,7 +217,7 @@ export async function executeGatewayChatTurn(
           updatedAt: nowIso,
         });
 
-        return {
+        const response: ApprovalRequestedFrame = {
           type: 'approval.requested',
           runId: chatResult.runId,
           rootRunId,
@@ -182,6 +225,16 @@ export async function executeGatewayChatTurn(
           toolName: chatResult.toolName,
           reason: chatResult.message,
         };
+
+        await runAfterHook(options.hooks, frame.type, {
+          authContext: options.authContext,
+          session: runningSession,
+          agentId: route.agentId,
+          result: response,
+          metadata: effectiveFrame.metadata,
+        });
+
+        return response;
       }
       case 'failure': {
         await settleSession(options.stores, runningSession, {
@@ -301,5 +354,75 @@ async function settleSession(
   return stores.sessions.update({
     ...session,
     ...patch,
+  });
+}
+
+async function runBeforeHook(
+  hooks: ResolvedGatewayHooks | undefined,
+  slot: 'onSessionResolve' | 'beforeRoute' | 'beforeInboundMessage',
+  requestType: string,
+  context: {
+    authContext?: GatewayAuthContext;
+    session: GatewaySessionRecord;
+    invocationMode?: 'chat';
+    agentId?: string;
+    metadata?: JsonObject;
+  },
+): Promise<JsonObject | undefined> {
+  if (!hooks) {
+    return context.metadata;
+  }
+
+  const hookResult = await executeHookSlot(hooks, slot, {
+    slot,
+    requestType,
+    authContext: context.authContext,
+    session: context.session,
+    invocationMode: context.invocationMode,
+    agentId: context.agentId,
+    metadata: context.metadata,
+  });
+
+  if (hookResult.rejected) {
+    throw new ProtocolValidationError(
+      'invalid_frame',
+      hookResult.rejectionReason ?? `Gateway ${slot} hook rejected the request.`,
+      {
+        requestType,
+        details: {
+          sessionId: context.session.id,
+          channelId: context.session.channelId,
+          slot,
+        },
+      },
+    );
+  }
+
+  return hookResult.enrichedMetadata ?? context.metadata;
+}
+
+async function runAfterHook(
+  hooks: ResolvedGatewayHooks | undefined,
+  requestType: string,
+  context: {
+    authContext?: GatewayAuthContext;
+    session: GatewaySessionRecord;
+    agentId: string;
+    result: MessageOutputFrame | ApprovalRequestedFrame;
+    metadata?: JsonObject;
+  },
+): Promise<void> {
+  if (!hooks) {
+    return;
+  }
+
+  await executeHookSlot(hooks, 'afterRunResult', {
+    slot: 'afterRunResult',
+    requestType,
+    authContext: context.authContext,
+    session: context.session,
+    agentId: context.agentId,
+    result: context.result,
+    metadata: context.metadata,
   });
 }

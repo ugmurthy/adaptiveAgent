@@ -3,7 +3,7 @@
 import { stdin as input, stdout as output } from 'node:process';
 import chalk from 'chalk';
 
-import type { AgentEventFrame, OutboundFrame, SessionOpenedFrame } from './protocol.js';
+import type { AgentEventFrame, OutboundFrame, SessionOpenedFrame, SessionUpdatedFrame } from './protocol.js';
 import { GATEWAY_CONFIG_PATH, loadLocalGatewayConnectionConfig } from './local-dev.js';
 import { mintLocalDevJwt } from './local-dev-jwt.js';
 import {
@@ -18,7 +18,15 @@ import {
   type ApprovalInfo,
   type ClarificationInfo,
 } from './tui/index.js';
-import { parseClarifyCommand, parseEventsCommand, recordInteractiveSession, selectInteractiveSession } from './local-ws-client.js';
+import {
+  getInteractiveSessionMode,
+  parseClarifyCommand,
+  parseEventsCommand,
+  parseRetryCommand,
+  recordFailedRunFromAgentEvent,
+  recordInteractiveSession,
+  selectInteractiveSession,
+} from './local-ws-client.js';
 
 import {
   TUI,
@@ -30,6 +38,7 @@ import {
 const HELP_TEXT = `Commands:
   <text>                     send a chat message with message.send
   /run <goal>                send run.start via a dedicated run session
+  /retry [runId]             retry a failed run in the current run session
   /approve [runId] [yes|no]  resolve the pending approval for the session
   /clarify [runId] <text>    answer a pending clarification for a run
   /event [on [verbose]|off]  stream one-line, detailed, or muted realtime agent.event frames
@@ -152,6 +161,8 @@ function formatCompactAgentEventFrame(frame: AgentEventFrame, options: { include
       return `${prefix} run interrupted`;
     case 'run.resumed':
       return `${prefix} run resumed`;
+    case 'run.retry_started':
+      return `${prefix} retry started`;
     case 'run.completed':
       return `${prefix} run completed`;
     case 'run.failed': {
@@ -551,7 +562,7 @@ async function runTuiMode(
     sendFrame({
       type: 'session.open',
       channelId: options.channel,
-      ...(state.sessionId ? { sessionId: state.sessionId } : {}),
+      ...(options.sessionId ? { sessionId: options.sessionId } : {}),
     });
   });
 
@@ -574,7 +585,7 @@ async function runTuiMode(
           timestamp: new Date(),
         });
         if (!sessionOpened.isSettled()) {
-          recordInteractiveSession(state, 'chat', frame.sessionId);
+          recordInteractiveSession(state, getInteractiveSessionMode(frame), frame.sessionId);
         }
         statusBar.invalidate();
         tui.requestRender();
@@ -589,11 +600,13 @@ async function runTuiMode(
         break;
 
       case 'session.updated':
+        hydratePendingApprovalFromSessionUpdate(state, frame);
         messageLog.addMessage({
           type: 'system',
           content: `Session updated: ${frame.status} (activeRunId=${frame.activeRunId ?? 'none'})`,
           timestamp: new Date(),
         });
+        statusBar.invalidate();
         break;
 
       case 'message.output':
@@ -607,6 +620,10 @@ async function runTuiMode(
 
       case 'run.output':
         if (frame.status === 'failed') {
+          state.lastFailedRunId = frame.runId;
+          if (frame.sessionId) {
+            state.failedRunSessionIds.set(frame.runId, frame.sessionId);
+          }
           messageLog.addMessage({
             type: 'system',
             content: `run failed: ${frame.error ?? 'unknown error'}`,
@@ -680,6 +697,7 @@ async function runTuiMode(
 
       case 'agent.event':
         recordLiveAgentEvent(state, frame);
+        recordFailedRunFromAgentEvent(state, frame);
         if (state.eventMode === 'off') {
           tui.requestRender();
           break;
@@ -747,7 +765,7 @@ async function runTuiMode(
   };
 
   const opened = await sessionOpened.promise;
-  recordInteractiveSession(state, 'chat', opened.sessionId);
+  recordInteractiveSession(state, getInteractiveSessionMode(opened), opened.sessionId);
 
   async function openAdditionalSession(): Promise<SessionOpenedFrame> {
     if (pendingSessionOpen) {
@@ -868,6 +886,31 @@ async function runTuiMode(
       return;
     }
 
+    if (trimmed === '/retry' || trimmed.startsWith('/retry ')) {
+      try {
+        const runId = parseRetryCommand(trimmed, state.lastFailedRunId);
+        const retrySessionId = state.failedRunSessionIds.get(runId) ?? state.runSessionId;
+        if (!retrySessionId) {
+          throw new Error(`No run sessionId is tracked for run "${runId}". Reattach the run session or pass a runId from this client session.`);
+        }
+        sendFrame({
+          type: 'run.retry',
+          sessionId: retrySessionId,
+          runId,
+        });
+        statusBar.invalidate();
+        tui.requestRender();
+      } catch (error) {
+        messageLog.addMessage({
+          type: 'system',
+          content: `Error: ${error instanceof Error ? error.message : String(error)}`,
+          timestamp: new Date(),
+        });
+        tui.requestRender();
+      }
+      return;
+    }
+
     if (trimmed.startsWith('/approve')) {
       try {
         const { runId, approved } = parseApproveCommand(trimmed, state.pendingApprovalRunId);
@@ -973,6 +1016,19 @@ function rejectIfPending<T>(deferred: Deferred<T>, reason: unknown): void {
   }
 }
 
+function hydratePendingApprovalFromSessionUpdate(state: TuiClientState, frame: SessionUpdatedFrame): void {
+  if (frame.status === 'awaiting_approval' && frame.activeRunId) {
+    state.pendingApprovalRunId = frame.activeRunId;
+    state.approvalSessionIds.set(frame.activeRunId, frame.sessionId);
+    return;
+  }
+
+  if (state.pendingApprovalRunId && frame.status !== 'awaiting_approval') {
+    state.approvalSessionIds.delete(state.pendingApprovalRunId);
+    state.pendingApprovalRunId = undefined;
+  }
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   if (args.includes('--help')) {
@@ -982,13 +1038,13 @@ async function main(): Promise<void> {
 
   const options = await parseArgs(args);
   const state: TuiClientState = {
-    sessionId: options.sessionId,
     channel: options.channel,
     tenantId: options.tenantId,
     roles: options.roles,
     eventMode: 'compact',
     approvalSessionIds: new Map(),
     clarificationSessionIds: new Map(),
+    failedRunSessionIds: new Map(),
     connected: false,
   };
   const token = options.token ?? (await mintLocalDevJwt({

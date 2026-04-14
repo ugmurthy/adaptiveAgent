@@ -29,15 +29,19 @@ import {
   parseInboundFrame,
   serializeOutboundFrame,
 } from './protocol.js';
-import type { ResolvedGatewayAuthProvider } from './registries.js';
-import { executeGatewayApprovalResolution, executeGatewayClarificationResolution, executeGatewayRunStart } from './run.js';
+import { executeHookSlot } from './hooks.js';
+import { restoreActiveSession } from './reconnect.js';
+import type { ResolvedGatewayAuthProvider, ResolvedGatewayHooks } from './registries.js';
+import { executeGatewayApprovalResolution, executeGatewayClarificationResolution, executeGatewayRunRetry, executeGatewayRunStart } from './run.js';
 import { createGatewayLogger, type GatewayLogger } from './observability.js';
-import { openGatewaySession } from './session.js';
+import { subscribeToForwardedRealtimeEvents } from './realtime-events.js';
+import { getAuthorizedGatewaySession, openGatewaySession } from './session.js';
 import { createInMemoryGatewayStores, type GatewayStores } from './stores.js';
 
 export interface CreateGatewayServerOptions {
   fastify?: FastifyServerOptions;
   auth?: ResolvedGatewayAuthProvider;
+  hooks?: ResolvedGatewayHooks;
   agentRegistry?: AgentRegistry;
   stores?: GatewayStores;
   requestLogger?: GatewayLogger;
@@ -50,13 +54,23 @@ export interface GatewaySocketMessageContext {
   gatewayConfig?: GatewayConfig;
   agentRegistry?: AgentRegistry;
   authContext?: GatewayAuthContext;
+  hooks?: ResolvedGatewayHooks;
   requestedChannelId?: string;
   stores?: GatewayStores;
   channelManager?: ChannelSubscriptionManager;
-  emitFrame?: (frame: OutboundFrame) => void;
+  emitFrame?: (frame: OutboundFrame) => Promise<void> | void;
+  registerRuntimeObserver?: (observer: RuntimeObserverRegistration) => Promise<void>;
+  hasRuntimeObserver?: (rootRunId: string) => boolean;
+  postResponseTasks?: Array<() => Promise<void>>;
   now?: () => Date;
   sessionIdFactory?: () => string;
   transcriptMessageIdFactory?: () => string;
+}
+
+export interface RuntimeObserverRegistration {
+  agentId: string;
+  rootRunId: string;
+  sessionId: string;
 }
 
 export async function createGatewayServer(
@@ -129,6 +143,31 @@ export async function createGatewayServer(
             url: request.raw.url ?? request.url,
           });
 
+          if (options.hooks) {
+            const hookResult = await executeHookSlot(options.hooks, 'onAuthenticate', {
+              slot: 'onAuthenticate',
+              authContext: authResult.authContext,
+              requestedChannelId: authResult.requestedChannelId,
+              isPublicChannel: authResult.isPublicChannel,
+              headers: request.headers,
+              url: request.raw.url ?? request.url,
+            });
+
+            if (hookResult.rejected) {
+              throw new GatewayAuthError(
+                'invalid_frame',
+                hookResult.rejectionReason ?? 'Gateway authentication was rejected by a hook.',
+                {
+                  statusCode: 403,
+                  details: {
+                    ...(authResult.requestedChannelId ? { channelId: authResult.requestedChannelId } : {}),
+                    slot: 'onAuthenticate',
+                  },
+                },
+              );
+            }
+          }
+
           request.gatewayAuthContext = authResult.authContext;
           request.gatewayRequestedChannelId = authResult.requestedChannelId;
           request.gatewayIsPublicChannel = authResult.isPublicChannel;
@@ -143,7 +182,9 @@ export async function createGatewayServer(
     },
     (socket, request) => {
       const channelManager = createChannelSubscriptionManager();
-      const sendFrame = (frame: OutboundFrame, source: 'response' | 'realtime') => {
+      const runtimeObserverUnsubscribers: Array<() => Promise<void>> = [];
+      const runtimeObserverRootRunIds = new Set<string>();
+      const rawSendFrame = (frame: OutboundFrame, source: 'response' | 'realtime') => {
         if (requestLogger) {
           requestLogger.info('ws.frame.sent', 'WebSocket frame sent', {
             requestId: request.id,
@@ -155,29 +196,119 @@ export async function createGatewayServer(
 
         socket.send(serializeOutboundFrame(frame));
       };
-      const emitFrame = (frame: OutboundFrame) => {
-        sendFrame(frame, 'realtime');
-      };
-
-      socket.on('message', async (message: unknown) => {
-        if (requestLogger) {
-          logInboundWebSocketFrame(requestLogger, request.id, request.ip, message);
-        }
-
-        const frame = await handleGatewaySocketMessage(message, {
-          gatewayConfig: config,
-          agentRegistry: options.agentRegistry,
+      const sendResponseFrame = async (frame: OutboundFrame) => {
+        const preparedFrame = await prepareResponseFrame(frame, {
+          hooks: options.hooks,
           authContext: request.gatewayAuthContext,
           requestedChannelId: request.gatewayRequestedChannelId,
-          stores,
-          channelManager,
-          emitFrame,
-          now: options.now,
-          sessionIdFactory: options.sessionIdFactory,
-          transcriptMessageIdFactory: options.transcriptMessageIdFactory,
         });
 
-        sendFrame(frame, 'response');
+        rawSendFrame(preparedFrame, 'response');
+      };
+      const emitFrame = async (frame: OutboundFrame) => {
+        rawSendFrame(frame, 'realtime');
+      };
+      const registerRuntimeObserver = async (observer: RuntimeObserverRegistration) => {
+        if (!options.agentRegistry) {
+          return;
+        }
+
+        if (runtimeObserverRootRunIds.has(observer.rootRunId)) {
+          return;
+        }
+
+        const agent = await options.agentRegistry.getAgent(observer.agentId);
+        const unsubscribe = subscribeToForwardedRealtimeEvents(agent, {
+          rootRunId: observer.rootRunId,
+          fallbackAgentId: observer.agentId,
+          fallbackSessionId: observer.sessionId,
+          emitFrame: async (frame) => {
+            const subscriptions = channelManager.getSubscriptions();
+            if (subscriptions.length > 0 && !channelManager.matches(frame)) {
+              return;
+            }
+
+            if (options.hooks) {
+              await executeHookSlot(options.hooks, 'onAgentEvent', {
+                slot: 'onAgentEvent',
+                authContext: request.gatewayAuthContext,
+                requestedChannelId: request.gatewayRequestedChannelId,
+                frame,
+              });
+            }
+
+            const preparedFrame = await prepareRealtimeFrame(frame, {
+              hooks: options.hooks,
+              authContext: request.gatewayAuthContext,
+              requestedChannelId: request.gatewayRequestedChannelId,
+            });
+            if (preparedFrame) {
+              await emitFrame(preparedFrame);
+            }
+          },
+        });
+
+        if (unsubscribe) {
+          runtimeObserverRootRunIds.add(observer.rootRunId);
+          runtimeObserverUnsubscribers.push(unsubscribe);
+        }
+      };
+
+      socket.on('close', () => {
+        for (const unsubscribe of runtimeObserverUnsubscribers.splice(0)) {
+          void unsubscribe().catch(() => undefined);
+        }
+        runtimeObserverRootRunIds.clear();
+
+        if (!options.hooks) {
+          return;
+        }
+
+        void executeHookSlot(options.hooks, 'onDisconnect', {
+          slot: 'onDisconnect',
+          authContext: request.gatewayAuthContext,
+          requestedChannelId: request.gatewayRequestedChannelId,
+          remoteAddress: request.ip,
+        }).catch(() => undefined);
+      });
+
+      socket.on('message', async (message: unknown) => {
+        try {
+          if (requestLogger) {
+            logInboundWebSocketFrame(requestLogger, request.id, request.ip, message);
+          }
+
+          const postResponseTasks: Array<() => Promise<void>> = [];
+          const frame = await handleGatewaySocketMessage(message, {
+            gatewayConfig: config,
+            agentRegistry: options.agentRegistry,
+            authContext: request.gatewayAuthContext,
+            hooks: options.hooks,
+            requestedChannelId: request.gatewayRequestedChannelId,
+            stores,
+            channelManager,
+            emitFrame,
+            registerRuntimeObserver,
+            hasRuntimeObserver: (rootRunId) => runtimeObserverRootRunIds.has(rootRunId),
+            postResponseTasks,
+            now: options.now,
+            sessionIdFactory: options.sessionIdFactory,
+            transcriptMessageIdFactory: options.transcriptMessageIdFactory,
+          });
+
+          await sendResponseFrame(frame);
+
+          for (const task of postResponseTasks) {
+            await task();
+          }
+        } catch (error) {
+          await executeOnErrorHook(options.hooks, {
+            authContext: request.gatewayAuthContext,
+            requestedChannelId: request.gatewayRequestedChannelId,
+            error,
+          });
+          rawSendFrame(createProtocolErrorFrame(normalizeProtocolValidationError(error)), 'response');
+        }
       });
     },
   );
@@ -198,19 +329,85 @@ export async function handleGatewaySocketMessage(
 ): Promise<OutboundFrame> {
   try {
     const frame = parseInboundFrame(message);
-    const realtimeRequestId = context.emitFrame ? randomUUID() : undefined;
+    const emitRealtimeFrame = createRealtimeFrameEmitter(context);
+    const realtimeRequestId = emitRealtimeFrame ? randomUUID() : undefined;
 
     if (frame.type === 'ping') {
       return createPongFrame(frame);
     }
 
     if (frame.type === 'session.open' && context.stores) {
-      return await openGatewaySession(frame, {
+      if (frame.sessionId) {
+        if (context.hooks) {
+          const session = await getAuthorizedGatewaySession(frame.sessionId, {
+            authContext: context.authContext,
+            stores: context.stores,
+            requestType: frame.type,
+            expectedChannelId: frame.channelId,
+          });
+          await executeSessionResolveHook(context.hooks, frame.type, session, context.authContext);
+        }
+
+        const reconnectState = await restoreActiveSession(frame.sessionId, {
+          stores: context.stores,
+          agentRegistry: context.agentRegistry,
+          authContext: context.authContext,
+          now: context.now,
+        });
+
+        context.channelManager?.subscribe(reconnectState.channels);
+
+        if (context.postResponseTasks && emitRealtimeFrame) {
+          context.postResponseTasks.push(async () => {
+            await emitRealtimeFrame(reconnectState.sessionUpdated);
+            if (reconnectState.recoveryFrame) {
+              await emitRealtimeFrame(reconnectState.recoveryFrame);
+            }
+            if (reconnectState.pendingApproval && reconnectState.recoveryFrame?.type !== 'approval.requested') {
+              await emitRealtimeFrame({
+                type: 'approval.requested',
+                runId: reconnectState.pendingApproval.runId,
+                rootRunId: reconnectState.pendingApproval.rootRunId,
+                sessionId: reconnectState.pendingApproval.sessionId,
+              });
+            }
+            if (
+              reconnectState.session.agentId &&
+              reconnectState.session.currentRootRunId &&
+              (reconnectState.policy === 'observer' ||
+                reconnectState.policy === 'pending_approval' ||
+                reconnectState.policy === 'pending_clarification')
+            ) {
+              await context.registerRuntimeObserver?.({
+                agentId: reconnectState.session.agentId,
+                rootRunId: reconnectState.session.currentRootRunId,
+                sessionId: reconnectState.session.id,
+              });
+            }
+          });
+        }
+
+        return reconnectState.sessionOpened;
+      }
+
+      const openedSession = await openGatewaySession(frame, {
         authContext: context.authContext,
         stores: context.stores,
         now: context.now,
         sessionIdFactory: context.sessionIdFactory,
       });
+
+      if (context.hooks) {
+        const session = await getAuthorizedGatewaySession(openedSession.sessionId, {
+          authContext: context.authContext,
+          stores: context.stores,
+          requestType: frame.type,
+          expectedChannelId: frame.channelId,
+        });
+        await executeSessionResolveHook(context.hooks, frame.type, session, context.authContext);
+      }
+
+      return openedSession;
     }
 
     if (frame.type === 'message.send' && context.stores && context.gatewayConfig && context.agentRegistry) {
@@ -219,13 +416,14 @@ export async function handleGatewaySocketMessage(
         agentRegistry: context.agentRegistry,
         stores: context.stores,
         authContext: context.authContext,
+        hooks: context.hooks,
         now: context.now,
         transcriptMessageIdFactory: context.transcriptMessageIdFactory,
         realtimeEvents:
-          realtimeRequestId && context.emitFrame
+          realtimeRequestId && emitRealtimeFrame
             ? {
                 requestId: realtimeRequestId,
-                emitFrame: context.emitFrame,
+                emitFrame: emitRealtimeFrame,
               }
             : undefined,
       });
@@ -237,15 +435,33 @@ export async function handleGatewaySocketMessage(
         agentRegistry: context.agentRegistry,
         stores: context.stores,
         authContext: context.authContext,
+        hooks: context.hooks,
         requestedChannelId: context.requestedChannelId,
         now: context.now,
         realtimeEvents:
-          realtimeRequestId && context.emitFrame
+          realtimeRequestId && emitRealtimeFrame
             ? {
                 requestId: realtimeRequestId,
-                emitFrame: context.emitFrame,
+                emitFrame: emitRealtimeFrame,
               }
             : undefined,
+      });
+    }
+
+    if (frame.type === 'run.retry' && context.stores && context.agentRegistry) {
+      return await executeGatewayRunRetry(frame, {
+        agentRegistry: context.agentRegistry,
+        stores: context.stores,
+        authContext: context.authContext,
+        hooks: context.hooks,
+        now: context.now,
+        realtimeEvents: emitRealtimeFrame
+          ? {
+              rootRunId: frame.runId,
+              emitFrame: emitRealtimeFrame,
+            }
+          : undefined,
+        hasRuntimeObserver: context.hasRuntimeObserver,
       });
     }
 
@@ -254,13 +470,15 @@ export async function handleGatewaySocketMessage(
         agentRegistry: context.agentRegistry,
         stores: context.stores,
         authContext: context.authContext,
+        hooks: context.hooks,
         now: context.now,
-        realtimeEvents: context.emitFrame
+        realtimeEvents: emitRealtimeFrame
           ? {
               rootRunId: frame.runId,
-              emitFrame: context.emitFrame,
+              emitFrame: emitRealtimeFrame,
             }
           : undefined,
+        hasRuntimeObserver: context.hasRuntimeObserver,
       });
     }
 
@@ -269,13 +487,15 @@ export async function handleGatewaySocketMessage(
         agentRegistry: context.agentRegistry,
         stores: context.stores,
         authContext: context.authContext,
+        hooks: context.hooks,
         now: context.now,
-        realtimeEvents: context.emitFrame
+        realtimeEvents: emitRealtimeFrame
           ? {
               rootRunId: frame.runId,
-              emitFrame: context.emitFrame,
+              emitFrame: emitRealtimeFrame,
             }
           : undefined,
+        hasRuntimeObserver: context.hasRuntimeObserver,
       });
     }
 
@@ -307,10 +527,139 @@ export async function handleGatewaySocketMessage(
 
     return createProtocolErrorFrame(createUnsupportedFrameError(frame.type));
   } catch (error) {
+    await executeOnErrorHook(context.hooks, {
+      authContext: context.authContext,
+      requestedChannelId: context.requestedChannelId,
+      error,
+    });
     const protocolError = normalizeProtocolValidationError(error);
 
     return createProtocolErrorFrame(protocolError);
   }
+}
+
+function createRealtimeFrameEmitter(
+  context: GatewaySocketMessageContext,
+): ((frame: OutboundFrame) => Promise<void>) | undefined {
+  if (!context.emitFrame) {
+    return undefined;
+  }
+
+  const emitFrame = context.emitFrame;
+
+  return async (frame: OutboundFrame) => {
+    if (frame.type === 'agent.event') {
+      const subscriptions = context.channelManager?.getSubscriptions() ?? [];
+      if (subscriptions.length > 0 && !context.channelManager?.matches(frame)) {
+        return;
+      }
+
+      if (context.hooks) {
+        await executeHookSlot(context.hooks, 'onAgentEvent', {
+          slot: 'onAgentEvent',
+          authContext: context.authContext,
+          requestedChannelId: context.requestedChannelId,
+          frame,
+        });
+      }
+    }
+
+    const preparedFrame = await prepareRealtimeFrame(frame, context);
+    if (!preparedFrame) {
+      return;
+    }
+
+    await Promise.resolve(emitFrame(preparedFrame));
+  };
+}
+
+async function prepareResponseFrame(
+  frame: OutboundFrame,
+  context: Pick<GatewaySocketMessageContext, 'hooks' | 'authContext' | 'requestedChannelId'>,
+): Promise<OutboundFrame> {
+  const preparedFrame = await prepareRealtimeFrame(frame, context);
+  if (preparedFrame) {
+    return preparedFrame;
+  }
+
+  return frame.type === 'error'
+    ? frame
+    : {
+        type: 'error',
+        code: 'invalid_frame',
+        message: 'Gateway outbound delivery was rejected by a hook.',
+        requestType: frame.type,
+        details: {
+          slot: 'beforeOutboundFrame',
+        },
+      };
+}
+
+async function prepareRealtimeFrame(
+  frame: OutboundFrame,
+  context: Pick<GatewaySocketMessageContext, 'hooks' | 'authContext' | 'requestedChannelId'>,
+): Promise<OutboundFrame | undefined> {
+  if (!context.hooks) {
+    return frame;
+  }
+
+  const hookResult = await executeHookSlot(context.hooks, 'beforeOutboundFrame', {
+    slot: 'beforeOutboundFrame',
+    authContext: context.authContext,
+    requestedChannelId: context.requestedChannelId,
+    frame,
+  });
+
+  if (hookResult.rejected) {
+    return undefined;
+  }
+
+  return frame;
+}
+
+async function executeSessionResolveHook(
+  hooks: ResolvedGatewayHooks,
+  requestType: string,
+  session: { id: string; channelId: string; status: string },
+  authContext?: GatewayAuthContext,
+): Promise<void> {
+  const hookResult = await executeHookSlot(hooks, 'onSessionResolve', {
+    slot: 'onSessionResolve',
+    authContext,
+    requestType,
+    session,
+  });
+
+  if (hookResult.rejected) {
+    throw new ProtocolValidationError(
+      'invalid_frame',
+      hookResult.rejectionReason ?? 'Session resolution was rejected by a hook.',
+      {
+        requestType,
+        details: {
+          sessionId: session.id,
+          channelId: session.channelId,
+          slot: 'onSessionResolve',
+        },
+      },
+    );
+  }
+}
+
+async function executeOnErrorHook(
+  hooks: ResolvedGatewayHooks | undefined,
+  context: Pick<GatewaySocketMessageContext, 'authContext' | 'requestedChannelId'> & { error: unknown },
+): Promise<void> {
+  if (!hooks) {
+    return;
+  }
+
+  await executeHookSlot(hooks, 'onError', {
+    slot: 'onError',
+    authContext: context.authContext,
+    requestedChannelId: context.requestedChannelId,
+    error: context.error,
+  }).catch(() => undefined);
 }
 
 function logInboundWebSocketFrame(logger: GatewayLogger, requestId: string, remoteAddress: string, message: unknown): void {
@@ -361,6 +710,13 @@ function summarizeInboundFrameForLogging(frame: InboundFrame): JsonObject {
         hasContext: frame.context !== undefined,
         hasMetadata: frame.metadata !== undefined,
       };
+    case 'run.retry':
+      return {
+        frameType: frame.type,
+        sessionId: frame.sessionId,
+        runId: frame.runId,
+        hasMetadata: frame.metadata !== undefined,
+      };
     case 'approval.resolve':
       return {
         frameType: frame.type,
@@ -404,6 +760,7 @@ function summarizeOutboundFrameForLogging(frame: OutboundFrame): JsonObject {
         sessionId: frame.sessionId,
         channelId: frame.channelId,
         ...(frame.agentId ? { agentId: frame.agentId } : {}),
+        ...(frame.invocationMode ? { invocationMode: frame.invocationMode } : {}),
         status: frame.status,
       };
     case 'session.updated':
@@ -411,6 +768,7 @@ function summarizeOutboundFrameForLogging(frame: OutboundFrame): JsonObject {
         frameType: frame.type,
         sessionId: frame.sessionId,
         status: frame.status,
+        ...(frame.invocationMode ? { invocationMode: frame.invocationMode } : {}),
         transcriptVersion: frame.transcriptVersion,
         ...(frame.activeRunId ? { activeRunId: frame.activeRunId } : {}),
         ...(frame.activeRootRunId ? { activeRootRunId: frame.activeRootRunId } : {}),

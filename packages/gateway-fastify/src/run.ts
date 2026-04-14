@@ -2,15 +2,18 @@ import type { AgentRegistry } from './agent-registry.js';
 import type { GatewayAuthContext } from './auth.js';
 import type { GatewayConfig } from './config.js';
 import type { JsonObject, JsonValue, RunResult } from './core.js';
+import { executeHookSlot } from './hooks.js';
 import type {
   ApprovalRequestedFrame,
   ApprovalResolveFrame,
   ClarificationResolveFrame,
   RunOutputFrame,
+  RunRetryFrame,
   RunStartFrame,
 } from './protocol.js';
 import { ProtocolValidationError } from './protocol.js';
 import type { RealtimeEventForwardingContext } from './realtime-events.js';
+import type { ResolvedGatewayHooks } from './registries.js';
 import { withForwardedRealtimeEvents } from './realtime-events.js';
 import { resolveGatewayRoute } from './routing.js';
 import { assertGatewaySessionWriteAllowed, getAuthorizedGatewaySession } from './session.js';
@@ -21,6 +24,7 @@ export interface ExecuteGatewayRunStartOptions {
   agentRegistry: AgentRegistry;
   stores: GatewayStores;
   authContext?: GatewayAuthContext;
+  hooks?: ResolvedGatewayHooks;
   requestedChannelId?: string;
   now?: () => Date;
   realtimeEvents?: Omit<RealtimeEventForwardingContext, 'fallbackAgentId' | 'fallbackSessionId' | 'rootRunId'>;
@@ -30,16 +34,30 @@ export interface ExecuteGatewayApprovalResolutionOptions {
   agentRegistry: AgentRegistry;
   stores: GatewayStores;
   authContext?: GatewayAuthContext;
+  hooks?: ResolvedGatewayHooks;
   now?: () => Date;
   realtimeEvents?: Omit<RealtimeEventForwardingContext, 'fallbackAgentId' | 'fallbackSessionId' | 'requestId'>;
+  hasRuntimeObserver?: (rootRunId: string) => boolean;
 }
 
 export interface ExecuteGatewayClarificationResolutionOptions {
   agentRegistry: AgentRegistry;
   stores: GatewayStores;
   authContext?: GatewayAuthContext;
+  hooks?: ResolvedGatewayHooks;
   now?: () => Date;
   realtimeEvents?: Omit<RealtimeEventForwardingContext, 'fallbackAgentId' | 'fallbackSessionId' | 'requestId'>;
+  hasRuntimeObserver?: (rootRunId: string) => boolean;
+}
+
+export interface ExecuteGatewayRunRetryOptions {
+  agentRegistry: AgentRegistry;
+  stores: GatewayStores;
+  authContext?: GatewayAuthContext;
+  hooks?: ResolvedGatewayHooks;
+  now?: () => Date;
+  realtimeEvents?: Omit<RealtimeEventForwardingContext, 'fallbackAgentId' | 'fallbackSessionId' | 'requestId'>;
+  hasRuntimeObserver?: (rootRunId: string) => boolean;
 }
 
 export async function executeGatewayRunStart(
@@ -47,6 +65,7 @@ export async function executeGatewayRunStart(
   options: ExecuteGatewayRunStartOptions,
 ): Promise<RunOutputFrame | ApprovalRequestedFrame> {
   const nowIso = (options.now ?? (() => new Date()))().toISOString();
+  let effectiveMetadata = frame.metadata;
 
   if (frame.sessionId) {
     const session = await getAuthorizedGatewaySession(frame.sessionId, {
@@ -54,8 +73,20 @@ export async function executeGatewayRunStart(
       stores: options.stores,
       requestType: frame.type,
     });
+    effectiveMetadata = await runBeforeHook(options.hooks, 'onSessionResolve', frame.type, {
+      authContext: options.authContext,
+      session,
+      metadata: effectiveMetadata,
+    });
     assertGatewaySessionWriteAllowed(session, frame.type);
     assertChannelAllowsInvocation(options.gatewayConfig, session.channelId, 'run', frame.type);
+    effectiveMetadata = await runBeforeHook(options.hooks, 'beforeRoute', frame.type, {
+      authContext: options.authContext,
+      session,
+      invocationMode: 'run',
+      requestedAgentId: session.agentId ? undefined : frame.agentId,
+      metadata: effectiveMetadata,
+    });
 
     const route = resolveGatewayRoute({
       gatewayConfig: options.gatewayConfig,
@@ -67,6 +98,14 @@ export async function executeGatewayRunStart(
       requestedAgentId: session.agentId ? undefined : frame.agentId,
       allowExplicitAgentId: true,
     });
+    effectiveMetadata = await runBeforeHook(options.hooks, 'beforeRunStart', frame.type, {
+      authContext: options.authContext,
+      session,
+      invocationMode: 'run',
+      agentId: route.agentId,
+      metadata: effectiveMetadata,
+    });
+    const effectiveFrame = effectiveMetadata === frame.metadata ? frame : { ...frame, metadata: effectiveMetadata };
 
     const runningSession = await options.stores.sessions.update({
       ...session,
@@ -79,16 +118,27 @@ export async function executeGatewayRunStart(
     });
 
     try {
-      return await executeResolvedGatewayRun(frame, {
+      const response = await executeResolvedGatewayRun(effectiveFrame, {
         agentId: route.agentId,
         session: runningSession,
         authContext: options.authContext,
+        hooks: options.hooks,
         agentRegistry: options.agentRegistry,
         stores: options.stores,
         requestedChannelId: options.requestedChannelId,
         nowIso,
         realtimeEvents: options.realtimeEvents,
       });
+
+      await runAfterHook(options.hooks, frame.type, {
+        authContext: options.authContext,
+        session: runningSession,
+        agentId: route.agentId,
+        result: response,
+        metadata: effectiveFrame.metadata,
+      });
+
+      return response;
     } catch (error) {
       if (error instanceof ProtocolValidationError) {
         throw error;
@@ -112,6 +162,21 @@ export async function executeGatewayRunStart(
     }
   }
 
+  effectiveMetadata = await runBeforeIsolatedRunHook(options.hooks, 'beforeRoute', frame.type, {
+    authContext: options.authContext,
+    requestedChannelId: options.requestedChannelId,
+    requestedAgentId: frame.agentId,
+    metadata: effectiveMetadata,
+  });
+
+  effectiveMetadata = await runBeforeIsolatedRunHook(options.hooks, 'beforeRunStart', frame.type, {
+    authContext: options.authContext,
+    requestedChannelId: options.requestedChannelId,
+    requestedAgentId: frame.agentId,
+    metadata: effectiveMetadata,
+  });
+  const effectiveFrame = effectiveMetadata === frame.metadata ? frame : { ...frame, metadata: effectiveMetadata };
+
   const route = resolveGatewayRoute({
     gatewayConfig: options.gatewayConfig,
     agentRegistry: options.agentRegistry,
@@ -125,15 +190,25 @@ export async function executeGatewayRunStart(
   assertChannelAllowsInvocation(options.gatewayConfig, options.requestedChannelId, 'run', frame.type);
 
   try {
-    return await executeResolvedGatewayRun(frame, {
+    const response = await executeResolvedGatewayRun(effectiveFrame, {
       agentId: route.agentId,
       authContext: options.authContext,
+      hooks: options.hooks,
       agentRegistry: options.agentRegistry,
       stores: options.stores,
       requestedChannelId: options.requestedChannelId,
       nowIso,
       realtimeEvents: options.realtimeEvents,
     });
+
+    await runAfterHook(options.hooks, frame.type, {
+      authContext: options.authContext,
+      agentId: route.agentId,
+      result: response,
+      metadata: effectiveFrame.metadata,
+    });
+
+    return response;
   } catch (error) {
     if (error instanceof ProtocolValidationError) {
       throw error;
@@ -159,6 +234,11 @@ export async function executeGatewayApprovalResolution(
     authContext: options.authContext,
     stores: options.stores,
     requestType: frame.type,
+  });
+  await runBeforeHook(options.hooks, 'onSessionResolve', frame.type, {
+    authContext: options.authContext,
+    session,
+    metadata: frame.metadata,
   });
   assertGatewaySessionWriteAllowed(session, frame.type, {
     allowPendingApprovalRunId: frame.runId,
@@ -195,12 +275,13 @@ export async function executeGatewayApprovalResolution(
   });
 
   try {
-    const realtimeEvents = options.realtimeEvents
+    const realtimeRootRunId = session.currentRootRunId ?? frame.runId;
+    const realtimeEvents = options.realtimeEvents && !options.hasRuntimeObserver?.(realtimeRootRunId)
       ? {
           ...options.realtimeEvents,
           fallbackAgentId: agentId,
           fallbackSessionId: runningSession.id,
-          rootRunId: session.currentRootRunId ?? frame.runId,
+          rootRunId: realtimeRootRunId,
         }
       : undefined;
 
@@ -208,14 +289,25 @@ export async function executeGatewayApprovalResolution(
     const resumedResult = await withForwardedRealtimeEvents(agent, realtimeEvents, () => agent.agent.resume!(frame.runId));
     const rootRunId = (await resolveRootRunId(agent.runtime.runStore, resumedResult.runId)) ?? session.currentRootRunId ?? frame.runId;
 
-    return settleStructuredRunResult(resumedResult, rootRunId, {
+    const response = await settleStructuredRunResult(resumedResult, rootRunId, {
       agentId,
       session: runningSession,
       authContext: options.authContext,
+      hooks: options.hooks,
       agentRegistry: options.agentRegistry,
       stores: options.stores,
       nowIso,
     });
+
+    await runAfterHook(options.hooks, frame.type, {
+      authContext: options.authContext,
+      session: runningSession,
+      agentId,
+      result: response,
+      metadata: frame.metadata,
+    });
+
+    return response;
   } catch (error) {
     if (error instanceof ProtocolValidationError) {
       throw error;
@@ -252,6 +344,11 @@ export async function executeGatewayClarificationResolution(
     authContext: options.authContext,
     stores: options.stores,
     requestType: frame.type,
+  });
+  await runBeforeHook(options.hooks, 'onSessionResolve', frame.type, {
+    authContext: options.authContext,
+    session,
+    metadata: frame.metadata,
   });
   assertGatewaySessionWriteAllowed(session, frame.type);
 
@@ -305,7 +402,7 @@ export async function executeGatewayClarificationResolution(
   try {
     const clarifiedResult = await withForwardedRealtimeEvents(
       agent,
-      options.realtimeEvents
+      options.realtimeEvents && !options.hasRuntimeObserver?.(sessionRunLink.rootRunId)
         ? {
             ...options.realtimeEvents,
             fallbackAgentId: agentId,
@@ -318,14 +415,25 @@ export async function executeGatewayClarificationResolution(
     const rootRunId =
       (await resolveRootRunId(agent.runtime.runStore, clarifiedResult.runId)) ?? sessionRunLink.rootRunId ?? frame.runId;
 
-    return settleStructuredRunResult(clarifiedResult, rootRunId, {
+    const response = await settleStructuredRunResult(clarifiedResult, rootRunId, {
       agentId,
       session: runningSession,
       authContext: options.authContext,
+      hooks: options.hooks,
       agentRegistry: options.agentRegistry,
       stores: options.stores,
       nowIso,
     });
+
+    await runAfterHook(options.hooks, frame.type, {
+      authContext: options.authContext,
+      session: runningSession,
+      agentId,
+      result: response,
+      metadata: frame.metadata,
+    });
+
+    return response;
   } catch (error) {
     if (error instanceof ProtocolValidationError) {
       throw error;
@@ -353,10 +461,150 @@ export async function executeGatewayClarificationResolution(
   }
 }
 
+export async function executeGatewayRunRetry(
+  frame: RunRetryFrame,
+  options: ExecuteGatewayRunRetryOptions,
+): Promise<RunOutputFrame | ApprovalRequestedFrame> {
+  const nowIso = (options.now ?? (() => new Date()))().toISOString();
+  const session = await getAuthorizedGatewaySession(frame.sessionId, {
+    authContext: options.authContext,
+    stores: options.stores,
+    requestType: frame.type,
+  });
+  await runBeforeHook(options.hooks, 'onSessionResolve', frame.type, {
+    authContext: options.authContext,
+    session,
+    metadata: frame.metadata,
+  });
+  assertGatewaySessionWriteAllowed(session, frame.type);
+
+  if (session.invocationMode && session.invocationMode !== 'run') {
+    throw new ProtocolValidationError(
+      'invalid_frame',
+      `Session "${session.id}" is not a run session and cannot retry runs.`,
+      {
+        requestType: frame.type,
+        details: {
+          sessionId: session.id,
+          invocationMode: session.invocationMode ?? null,
+        },
+      },
+    );
+  }
+
+  const sessionRunLink = await options.stores.sessionRunLinks.getByRunId(frame.runId);
+  if (!sessionRunLink || sessionRunLink.sessionId !== session.id || sessionRunLink.invocationKind !== 'run') {
+    throw new ProtocolValidationError(
+      'invalid_frame',
+      `Run "${frame.runId}" is not linked to session "${session.id}" for retry.`,
+      {
+        requestType: frame.type,
+        details: {
+          sessionId: session.id,
+          runId: frame.runId,
+        },
+      },
+    );
+  }
+
+  const agentId = session.agentId;
+  if (!agentId) {
+    throw new ProtocolValidationError(
+      'run_failed',
+      `Session "${session.id}" does not have a routed agent for run retry.`,
+      {
+        requestType: frame.type,
+        details: { sessionId: session.id, runId: frame.runId },
+      },
+    );
+  }
+
+  const agent = await options.agentRegistry.getAgent(agentId);
+  if (!agent.agent.retry) {
+    throw new ProtocolValidationError(
+      'run_failed',
+      `Agent "${agentId}" does not support run retry.`,
+      {
+        requestType: frame.type,
+        details: { sessionId: session.id, runId: frame.runId, agentId },
+      },
+    );
+  }
+
+  const runningSession = await options.stores.sessions.update({
+    ...session,
+    status: 'running',
+    currentRunId: frame.runId,
+    currentRootRunId: sessionRunLink.rootRunId,
+    updatedAt: nowIso,
+  });
+
+  try {
+    const retryResult = await withForwardedRealtimeEvents(
+      agent,
+      options.realtimeEvents && !options.hasRuntimeObserver?.(sessionRunLink.rootRunId)
+        ? {
+            ...options.realtimeEvents,
+            fallbackAgentId: agentId,
+            fallbackSessionId: runningSession.id,
+            rootRunId: sessionRunLink.rootRunId,
+          }
+        : undefined,
+      () => agent.agent.retry!(frame.runId),
+    );
+    const rootRunId = (await resolveRootRunId(agent.runtime.runStore, retryResult.runId)) ?? sessionRunLink.rootRunId ?? frame.runId;
+
+    const response = await settleStructuredRunResult(retryResult, rootRunId, {
+      agentId,
+      session: runningSession,
+      authContext: options.authContext,
+      hooks: options.hooks,
+      agentRegistry: options.agentRegistry,
+      stores: options.stores,
+      nowIso,
+    });
+
+    await runAfterHook(options.hooks, frame.type, {
+      authContext: options.authContext,
+      session: runningSession,
+      agentId,
+      result: response,
+      metadata: frame.metadata,
+    });
+
+    return response;
+  } catch (error) {
+    if (error instanceof ProtocolValidationError) {
+      throw error;
+    }
+
+    await settleSession(options.stores, runningSession, {
+      status: 'failed',
+      currentRunId: undefined,
+      currentRootRunId: undefined,
+      updatedAt: nowIso,
+    });
+
+    throw new ProtocolValidationError(
+      'run_failed',
+      error instanceof Error ? error.message : 'Run retry failed unexpectedly.',
+      {
+        requestType: frame.type,
+        details: {
+          sessionId: runningSession.id,
+          runId: frame.runId,
+          agentId,
+        },
+      },
+    );
+  }
+}
+
 interface ExecuteResolvedGatewayRunOptions {
   agentId: string;
   session?: GatewaySessionRecord;
   authContext?: GatewayAuthContext;
+  hooks?: ResolvedGatewayHooks;
   agentRegistry: AgentRegistry;
   stores: GatewayStores;
   requestedChannelId?: string;
@@ -376,6 +624,35 @@ async function executeResolvedGatewayRun(
     });
   }
 
+  let linkedRunId: string | undefined;
+  const rememberActiveRun = async (eventFrame: Parameters<RealtimeEventForwardingContext['emitFrame']>[0]) => {
+    if (!options.session || linkedRunId || eventFrame.type !== 'agent.event' || !eventFrame.runId || !eventFrame.rootRunId) {
+      return;
+    }
+
+    const rootRunId = eventFrame.rootRunId;
+    linkedRunId = rootRunId;
+    await options.stores.sessionRunLinks.append({
+      sessionId: options.session.id,
+      runId: linkedRunId,
+      rootRunId,
+      invocationKind: 'run',
+      metadata: frame.metadata,
+      createdAt: options.nowIso,
+    });
+
+    const latestSession = (await options.stores.sessions.get(options.session.id)) ?? options.session;
+    if (latestSession.status === 'running' && !latestSession.currentRunId) {
+      await options.stores.sessions.update({
+        ...latestSession,
+        status: 'running',
+        currentRunId: linkedRunId,
+        currentRootRunId: rootRunId,
+        updatedAt: options.nowIso,
+      });
+    }
+  };
+
   const runResult = await withForwardedRealtimeEvents(
     agent,
     options.realtimeEvents
@@ -383,6 +660,10 @@ async function executeResolvedGatewayRun(
           ...options.realtimeEvents,
           fallbackAgentId: options.agentId,
           fallbackSessionId: options.session?.id,
+          emitFrame: async (eventFrame) => {
+            await rememberActiveRun(eventFrame);
+            await Promise.resolve(options.realtimeEvents?.emitFrame(eventFrame));
+          },
         }
       : undefined,
     () =>
@@ -395,7 +676,7 @@ async function executeResolvedGatewayRun(
   );
   const rootRunId = (await resolveRootRunId(agent.runtime.runStore, runResult.runId)) ?? runResult.runId;
 
-  if (options.session) {
+  if (options.session && linkedRunId !== runResult.runId) {
     await options.stores.sessionRunLinks.append({
       sessionId: options.session.id,
       runId: runResult.runId,
@@ -632,5 +913,120 @@ async function settleSession(
   return stores.sessions.update({
     ...session,
     ...patch,
+  });
+}
+
+async function runBeforeHook(
+  hooks: ResolvedGatewayHooks | undefined,
+  slot: 'onSessionResolve' | 'beforeRoute' | 'beforeRunStart',
+  requestType: string,
+  context: {
+    authContext?: GatewayAuthContext;
+    session: GatewaySessionRecord;
+    invocationMode?: 'run';
+    requestedAgentId?: string;
+    agentId?: string;
+    metadata?: JsonObject;
+  },
+): Promise<JsonObject | undefined> {
+  if (!hooks) {
+    return context.metadata;
+  }
+
+  const hookResult = await executeHookSlot(hooks, slot, {
+    slot,
+    requestType,
+    authContext: context.authContext,
+    session: context.session,
+    invocationMode: context.invocationMode,
+    requestedAgentId: context.requestedAgentId,
+    agentId: context.agentId,
+    metadata: context.metadata,
+  });
+
+  if (hookResult.rejected) {
+    throw new ProtocolValidationError(
+      'invalid_frame',
+      hookResult.rejectionReason ?? `Gateway ${slot} hook rejected the request.`,
+      {
+        requestType,
+        details: {
+          sessionId: context.session.id,
+          channelId: context.session.channelId,
+          slot,
+        },
+      },
+    );
+  }
+
+  return hookResult.enrichedMetadata ?? context.metadata;
+}
+
+async function runBeforeIsolatedRunHook(
+  hooks: ResolvedGatewayHooks | undefined,
+  slot: 'beforeRoute' | 'beforeRunStart',
+  requestType: string,
+  context: {
+    authContext?: GatewayAuthContext;
+    requestedChannelId?: string;
+    requestedAgentId?: string;
+    metadata?: JsonObject;
+  },
+): Promise<JsonObject | undefined> {
+  if (!hooks) {
+    return context.metadata;
+  }
+
+  const hookResult = await executeHookSlot(hooks, slot, {
+    slot,
+    requestType,
+    authContext: context.authContext,
+    requestedChannelId: context.requestedChannelId,
+    requestedAgentId: context.requestedAgentId,
+    invocationMode: 'run',
+    metadata: context.metadata,
+  });
+
+  if (hookResult.rejected) {
+    throw new ProtocolValidationError(
+      'invalid_frame',
+      hookResult.rejectionReason ?? `Gateway ${slot} hook rejected the request.`,
+      {
+        requestType,
+        details: {
+          ...(context.requestedChannelId ? { channelId: context.requestedChannelId } : {}),
+          ...(context.requestedAgentId ? { agentId: context.requestedAgentId } : {}),
+          slot,
+        },
+      },
+    );
+  }
+
+  return hookResult.enrichedMetadata ?? context.metadata;
+}
+
+async function runAfterHook(
+  hooks: ResolvedGatewayHooks | undefined,
+  requestType: string,
+  context: {
+    authContext?: GatewayAuthContext;
+    session?: GatewaySessionRecord;
+    agentId: string;
+    result: RunOutputFrame | ApprovalRequestedFrame;
+    metadata?: JsonObject;
+  },
+): Promise<void> {
+  if (!hooks) {
+    return;
+  }
+
+  await executeHookSlot(hooks, 'afterRunResult', {
+    slot: 'afterRunResult',
+    requestType,
+    authContext: context.authContext,
+    session: context.session,
+    agentId: context.agentId,
+    result: context.result,
+    metadata: context.metadata,
   });
 }

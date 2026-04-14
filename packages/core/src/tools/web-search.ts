@@ -104,6 +104,10 @@ export function createWebSearchTool(config: WebSearchToolConfig): ToolDefinition
     timeoutMs,
     description:
       'Search the web for information. Returns a list of results with title, URL, and snippet.',
+    retryPolicy: {
+      retryable: true,
+      retryOn: ['timeout', 'network', 'rate_limit', 'provider_error'],
+    },
     inputSchema: {
       type: 'object',
       required: ['query'],

@@ -6,6 +6,7 @@ export interface TuiClientState {
   runSessionId?: string;
   pendingApprovalRunId?: string;
   pendingClarificationRunId?: string;
+  lastFailedRunId?: string;
   latestAgentEvent?: LiveAgentEventSummary;
   channel: string;
   tenantId?: string;
@@ -13,6 +14,7 @@ export interface TuiClientState {
   eventMode: EventStreamMode;
   approvalSessionIds: Map<string, string>;
   clarificationSessionIds: Map<string, string>;
+  failedRunSessionIds: Map<string, string>;
   connected: boolean;
 }
 

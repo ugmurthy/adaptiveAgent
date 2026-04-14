@@ -104,7 +104,7 @@ The generated default agent uses:
 
 The JWT helper reads `auth.secret`, `auth.issuer`, `auth.audience`, `auth.tenantIdClaim`, and `auth.rolesClaim` from the local gateway config when present, so minted tokens stay aligned with your local auth configuration.
 
-The WebSocket client auto-mints a matching local JWT unless you pass `--token`, connects with Bun's WebSocket client using an `Authorization: Bearer ...` header, opens a chat session, and supports an interactive prompt with `/run`, `/approve`, `/clarify`, `/events on|off`, `/ping`, `/session`, and `/exit`. Realtime `agent.event` frames are shown by default in interactive mode, and `/events off` hides them until you re-enable them. Interactive `/run` commands use a separate dedicated run session so chat and structured-run traffic do not collide with the gateway's session mode pinning.
+The WebSocket client auto-mints a matching local JWT unless you pass `--token`, connects with Bun's WebSocket client using an `Authorization: Bearer ...` header, opens a chat session, and supports an interactive prompt with `/run`, `/retry`, `/approve`, `/clarify`, `/events on|off`, `/ping`, `/session`, and `/exit`. Realtime `agent.event` frames are shown by default in interactive mode, and `/events off` hides them until you re-enable them. Interactive `/run` commands use a separate dedicated run session so chat and structured-run traffic do not collide with the gateway's session mode pinning.
 
 The launcher updates an existing gateway config when the auth block is missing, and it also flattens older `auth.settings`-style configs into the runtime shape the code actually reads.
 
@@ -123,6 +123,11 @@ File: `config/gateway.json`
     "healthPath": "/health",
     "requestLogging": true,
     "requestLoggingDestination": "both"
+  },
+  "agentRuntimeLogging": {
+    "enabled": true,
+    "level": "info",
+    "destination": "file"
   },
   "auth": {
     "provider": "jwt",
@@ -184,6 +189,10 @@ File: `config/gateway.json`
 | `server.healthPath` | No | HTTP health endpoint path |
 | `server.requestLogging` | No | Enable structured HTTP request logs, summarized WebSocket frame logs, and scheduler cron lifecycle logs |
 | `server.requestLoggingDestination` | No | Request log sink: `console`, `file`, or `both`; defaults to `console` when request logging is enabled |
+| `agentRuntimeLogging.enabled` | No | Pass a core AdaptiveAgent logger into runtime agent instances |
+| `agentRuntimeLogging.level` | No | Runtime log level: `trace`, `debug`, `info`, `warn`, `error`, `fatal`, or `silent`; defaults to `info` when enabled |
+| `agentRuntimeLogging.destination` | No | Runtime log sink: `console`, `file`, or `both`; defaults to `file` when enabled |
+| `agentRuntimeLogging.filePath` | No | Runtime log base path for file logging; defaults to `data/gateway/logs/agent-runtime.log` |
 | `auth.provider` | No | Auth provider name (e.g., `jwt`) |
 | `auth.secret` | No | Shared JWT secret for the built-in `jwt` auth provider |
 | `auth.issuer` | No | Expected JWT issuer |
@@ -199,7 +208,9 @@ File: `config/gateway.json`
 | `defaultAgentId` | No | Fallback agent when no binding matches |
 | `hooks` | Yes | Hook slot configuration |
 
-When `server.requestLoggingDestination` is `file` or `both`, the gateway writes newline-delimited JSON logs to `data/gateway/logs/gateway-YYYY-MM-DD.log` relative to the current working directory.
+When `server.requestLoggingDestination` is `file` or `both`, the gateway writes newline-delimited JSON logs to `data/gateway/logs/gateway-YYYY-MM-DD.log` relative to the current working directory by default. The local `gateway:start` launcher writes these logs under `~/.adaptiveAgent/data/gateway/logs`.
+
+When `agentRuntimeLogging.destination` is `file` or `both`, the gateway passes `data/gateway/logs/agent-runtime.log` to the core AdaptiveAgent logger by default. The local `gateway:start` launcher uses `~/.adaptiveAgent/data/gateway/logs/agent-runtime.log`. The core logger applies its date and numbered rotation convention, so the resulting files are named `agent-runtime-YYYY-MM-DD.log`, `agent-runtime-YYYY-MM-DD-2.log`, and so on.
 
 ---
 
@@ -294,6 +305,14 @@ Start a structured run (session-bound or isolated).
 { "type": "run.start", "goal": "Process batch", "input": { "ids": [1, 2, 3] } }
 ```
 
+#### `run.retry`
+
+Retry a failed session-bound structured run from its latest persisted snapshot. This is run-session only.
+
+```json
+{ "type": "run.retry", "sessionId": "s-1", "runId": "r-1" }
+```
+
 #### `approval.resolve`
 
 Approve or reject a paused run.
@@ -319,6 +338,8 @@ Subscribe to event channels. Format: `scope:id`.
 ```
 
 Supported scopes: `session`, `run`, `root-run`, `agent`.
+
+When a connection has one or more active subscriptions, realtime `agent.event` delivery is filtered to matching subscriptions only. Reconnect automatically restores the relevant subscriptions for the reattached session.
 
 #### `session.close`
 
@@ -366,7 +387,7 @@ Supported scopes: `session`, `run`, `root-run`, `agent`.
 
 #### `agent.event`
 
-Bridged runtime events. Event types: `run.created`, `run.status_changed`, `tool.started`, `tool.completed`, `delegate.spawned`, `approval.requested`, `approval.resolved`, `run.completed`, `run.failed`, `snapshot.created`.
+Bridged runtime events. Event types: `run.created`, `run.status_changed`, `run.retry_started`, `tool.started`, `tool.completed`, `delegate.spawned`, `approval.requested`, `approval.resolved`, `run.completed`, `run.failed`, `snapshot.created`.
 
 ```json
 { "type": "agent.event", "eventType": "tool.completed", "data": { "toolName": "search" }, "sessionId": "s-1", "runId": "r-1", "rootRunId": "r-1" }
@@ -440,7 +461,7 @@ Cron executions that reach an approval state are marked `needs_review` instead o
 
 When a client reconnects to an existing session via `session.open` with a `sessionId`:
 
-- The gateway returns `session.opened` and `session.updated` frames with current state
+- The gateway returns `session.opened`, then a follow-up `session.updated`, with the current state
 - Active run linkage (`activeRunId`, `activeRootRunId`) is preserved
 - Pending approval sessions surface their outstanding run state
 - The client is auto-subscribed to relevant channels (`session:`, `run:`, `root-run:`, `agent:`)
@@ -464,6 +485,8 @@ The gateway supports lifecycle hooks for extensibility:
 | `beforeOutboundFrame` | Before frame delivery | Yes |
 | `onDisconnect` | On socket close | No |
 | `onError` | On unhandled error | No |
+
+These hook slots are executed in the live gateway path: upgrade authentication, session resolution and reconnect, chat and structured-run dispatch, realtime event forwarding, outbound frame delivery, disconnect handling, and unhandled error reporting.
 
 Hook failure policy (`fail`, `warn`, `ignore`) controls whether hook errors abort the request, log a warning, or are silently ignored.
 

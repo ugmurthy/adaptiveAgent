@@ -1,3 +1,5 @@
+import { join } from 'node:path';
+
 import type { FastifyInstance, FastifyServerOptions } from 'fastify';
 
 import {
@@ -10,7 +12,8 @@ import {
 } from './config.js';
 import { AgentRegistry, createAgentRegistry, type AgentFactory } from './agent-registry.js';
 import { createJwtAuthProvider } from './auth.js';
-import { createGatewayLogger } from './observability.js';
+import { createAdaptiveAgentLogger, type AdaptiveAgentLogger } from './core.js';
+import { createGatewayLogger, DEFAULT_GATEWAY_REQUEST_LOG_DIR } from './observability.js';
 import { createGatewayServer } from './server.js';
 import { createModuleRegistry, ModuleRegistry, type ResolvedGatewayModules } from './registries.js';
 import { createSchedulerLoop, type SchedulerHandle, type SchedulerLoopOptions } from './scheduler.js';
@@ -20,6 +23,7 @@ export interface BootstrapGatewayOptions {
   cwd?: string;
   gatewayConfigPath?: string;
   agentConfigDir?: string;
+  logDir?: string;
   moduleRegistry?: ModuleRegistry;
   agentFactory?: AgentFactory;
   fastify?: FastifyServerOptions;
@@ -54,15 +58,18 @@ export async function bootstrapGateway(options: BootstrapGatewayOptions = {}): P
     loadedGatewayConfig.config,
     `gateway config (${loadedGatewayConfig.path})`,
   );
+  const agentRuntimeLogger = await createAgentRuntimeLogger(loadedGatewayConfig.config, options.logDir);
   const agentRegistry = createAgentRegistry({
     agents: loadedAgentConfigs,
     moduleRegistry,
     agentFactory: options.agentFactory,
+    logger: agentRuntimeLogger,
   });
   const stores = options.stores ?? createInMemoryGatewayStores();
   const requestLogger = loadedGatewayConfig.config.server.requestLogging
     ? createGatewayLogger({
         destination: loadedGatewayConfig.config.server.requestLoggingDestination,
+        logDir: options.logDir,
       })
     : undefined;
 
@@ -71,6 +78,7 @@ export async function bootstrapGateway(options: BootstrapGatewayOptions = {}): P
   const app = await createGatewayServer(loadedGatewayConfig.config, {
     fastify: options.fastify,
     auth: gatewayModules.auth,
+    hooks: gatewayModules.hooks,
     agentRegistry,
     stores,
     requestLogger,
@@ -114,6 +122,7 @@ export async function bootstrapGateway(options: BootstrapGatewayOptions = {}): P
     if (startScheduler) {
       app.server.off('listening', startScheduler);
     }
+    agentRuntimeLogger?.flush?.();
     await requestLogger?.close();
   });
 
@@ -139,6 +148,29 @@ export async function startGateway(options: BootstrapGatewayOptions = {}): Promi
   });
 
   return gateway;
+}
+
+async function createAgentRuntimeLogger(
+  gatewayConfig: GatewayConfig,
+  logDir?: string,
+): Promise<AdaptiveAgentLogger | undefined> {
+  const logging = gatewayConfig.agentRuntimeLogging;
+  if (!logging?.enabled) {
+    return undefined;
+  }
+
+  const destination = logging.destination ?? 'file';
+  const filePath =
+    destination === 'console'
+      ? undefined
+      : logging.filePath ?? join(logDir ?? DEFAULT_GATEWAY_REQUEST_LOG_DIR, 'agent-runtime.log');
+
+  return createAdaptiveAgentLogger({
+    name: 'adaptive-agent-gateway-runtime',
+    level: logging.level ?? 'info',
+    destination,
+    filePath,
+  });
 }
 
 function validateRoutingReferences(gatewayConfig: GatewayConfig, agentRegistry: AgentRegistry, gatewayConfigPath: string): void {

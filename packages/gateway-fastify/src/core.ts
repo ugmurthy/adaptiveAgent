@@ -6,6 +6,7 @@ export type CaptureMode = 'full' | 'summary' | 'none';
 
 interface CoreRuntimeModule {
   createAdaptiveAgent(options: CreateAdaptiveAgentOptions): unknown;
+  createAdaptiveAgentLogger(options?: AdaptiveAgentLoggerOptions): AdaptiveAgentLogger;
   createReadFileTool(config?: { allowedRoot?: string; maxSizeBytes?: number }): ToolDefinition;
   createListDirectoryTool(config?: { allowedRoot?: string }): ToolDefinition;
   createWriteFileTool(config?: { allowedRoot?: string; createDirectories?: boolean }): ToolDefinition;
@@ -61,6 +62,17 @@ export type RunFailureCode =
   | 'REPLAN_REQUIRED'
   | 'INTERRUPTED';
 
+export type FailureKind =
+  | 'timeout'
+  | 'network'
+  | 'rate_limit'
+  | 'provider_error'
+  | 'not_found'
+  | 'tool_error'
+  | 'approval_rejected'
+  | 'max_steps'
+  | 'unknown';
+
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
   content: string;
@@ -110,6 +122,8 @@ export interface RuntimeRunRecord {
   rootRunId: string;
   parentRunId?: string;
   status: string;
+  leaseOwner?: string;
+  leaseExpiresAt?: string;
   errorMessage?: string;
   result?: JsonValue;
   metadata?: JsonObject;
@@ -144,6 +158,7 @@ export interface AdaptiveAgentHandle {
   resolveApproval?(runId: string, approved: boolean): Promise<void>;
   resolveClarification?(runId: string, message: string): Promise<RunResult>;
   resume?(runId: string): Promise<RunResult>;
+  retry?(runId: string): Promise<RunResult>;
 }
 
 export interface ToolContext {
@@ -163,6 +178,10 @@ export interface ToolDefinition<I extends JsonValue = JsonValue, O extends JsonV
   timeoutMs?: number;
   requiresApproval?: boolean;
   capture?: CaptureMode;
+  retryPolicy?: {
+    retryable: boolean;
+    retryOn?: FailureKind[];
+  };
   redact?: ToolRedactionPolicy;
   summarizeResult?: (output: O) => JsonValue;
   recoverError?: (error: unknown, input: I) => O | undefined;
@@ -194,6 +213,23 @@ export interface CreateAdaptiveAgentOptions {
   delegates?: DelegateDefinition[];
   defaults?: Partial<AgentDefaults>;
   systemInstructions?: string;
+  logger?: AdaptiveAgentLogger;
+}
+
+export type AdaptiveAgentLogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'fatal' | 'silent';
+export type AdaptiveAgentLogDestination = 'console' | 'file' | 'both';
+
+export interface AdaptiveAgentLogger {
+  child(bindings: Record<string, unknown>): AdaptiveAgentLogger;
+  flush?(): void;
+}
+
+export interface AdaptiveAgentLoggerOptions {
+  level?: AdaptiveAgentLogLevel;
+  destination?: AdaptiveAgentLogDestination;
+  filePath?: string;
+  name?: string;
+  pretty?: boolean;
 }
 
 export interface LoadedSkillDefinition {
@@ -222,6 +258,13 @@ export interface LoadedSkillDelegate {
 export async function createAdaptiveAgent(options: CreateAdaptiveAgentOptions): Promise<CreatedAdaptiveAgent> {
   const coreRuntime = await loadCoreRuntime();
   return coreRuntime.createAdaptiveAgent(options) as CreatedAdaptiveAgent;
+}
+
+export async function createAdaptiveAgentLogger(
+  options: AdaptiveAgentLoggerOptions = {},
+): Promise<AdaptiveAgentLogger> {
+  const coreRuntime = await loadCoreRuntime();
+  return coreRuntime.createAdaptiveAgentLogger(options);
 }
 
 export async function createBuiltinTools(options: CreateBuiltinToolsOptions = {}): Promise<ToolDefinition[]> {

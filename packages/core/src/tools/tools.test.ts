@@ -91,6 +91,10 @@ describe('createReadFileTool', () => {
     const tool = createReadFileTool();
     expect(tool.name).toBe('read_file');
     expect(tool.requiresApproval).toBeUndefined();
+    expect(tool.retryPolicy).toMatchObject({
+      retryable: true,
+      retryOn: expect.arrayContaining(['not_found']),
+    });
   });
 });
 
@@ -139,6 +143,10 @@ describe('createListDirectoryTool', () => {
     const tool = createListDirectoryTool();
     expect(tool.name).toBe('list_directory');
     expect(tool.requiresApproval).toBeUndefined();
+    expect(tool.retryPolicy).toMatchObject({
+      retryable: true,
+      retryOn: expect.arrayContaining(['not_found']),
+    });
   });
 });
 

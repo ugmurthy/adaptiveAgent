@@ -147,15 +147,16 @@ export class InMemoryRunStore implements RunStore {
 
     const now = new Date();
     const nextStatus = patch.status ?? current.status;
+    const completedAtWasPatched = Object.prototype.hasOwnProperty.call(patch, 'completedAt');
+    const patchedCompletedAt = (patch as { completedAt?: string | null }).completedAt;
     const nextRun: AgentRun = {
       ...current,
       ...patch,
       version: current.version + 1,
       updatedAt: toIsoString(now),
-      completedAt:
-        patch.completedAt ??
-        current.completedAt ??
-        (isTerminalRunStatus(nextStatus) ? toIsoString(now) : undefined),
+      completedAt: completedAtWasPatched
+        ? (patchedCompletedAt ?? undefined)
+        : current.completedAt ?? (isTerminalRunStatus(nextStatus) ? toIsoString(now) : undefined),
     };
 
     this.runs.set(runId, nextRun);

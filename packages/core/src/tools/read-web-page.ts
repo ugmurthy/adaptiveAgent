@@ -46,6 +46,10 @@ export function createReadWebPageTool(config?: ReadWebPageToolConfig): ToolDefin
     timeoutMs,
     description:
       'Fetch a web page and extract its text content. Returns the URL, page title, and extracted text.',
+    retryPolicy: {
+      retryable: true,
+      retryOn: ['timeout', 'network', 'rate_limit', 'provider_error'],
+    },
     inputSchema: {
       type: 'object',
       required: ['url'],

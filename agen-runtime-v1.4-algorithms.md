@@ -223,6 +223,17 @@ When `resume(parentRunId)` is called:
 8. Persist a new parent snapshot once the wait boundary has been resolved.
 9. Continue the parent loop.
 
+Resume must be lease-protected and idempotent:
+
+- If the parent run is already terminal, return the stored terminal result without emitting more parent events.
+- If the latest snapshot is absent, corrupt, or uses an incompatible future `schemaVersion`, fail explicitly instead of rebuilding state from partial events.
+- If the parent snapshot says it is waiting on a child, prefer the run row linkage and fall back to snapshot `waitingOnChildRunId`; both must identify a child linked to the same parent.
+- If the child is terminal and the parent is still waiting, resolve the delegate step from the stored child result and persist the parent update and continuation snapshot once.
+- If the child linkage is missing or points at another parent, fail the parent with a tool error because the delegation boundary cannot be trusted.
+- If a repeated `resume(parentRunId)` races with a previous successful parent resolution, the second call should observe the resolved parent state or terminal state and must not emit a second parent `tool.completed`.
+- If the child is active but its lease is expired, resume the child or hand it to the recovery scanner before advancing the parent.
+- If the child is active and leased elsewhere, keep the parent waiting.
+
 Pseudo-code:
 
 ```ts
@@ -269,7 +280,37 @@ When `resume(childRunId)` is called directly:
 
 This requires idempotent parent resolution logic so repeated resumes do not double-complete the same parent step.
 
-## 8. Interrupt Cascade Algorithm
+## 8. Tool Ledger Resume Algorithm
+
+When a snapshot contains a pending tool call:
+
+1. Recreate the `idempotencyKey` from `runId`, `stepId`, and `toolCallId`.
+2. Read the durable tool execution ledger by `idempotencyKey`.
+3. If the ledger status is `completed`, append the stored output as the tool result message, complete the pending step, and continue without invoking the tool.
+4. If the ledger status is `failed`, return or replay the stored failure according to the tool retry policy.
+5. If the ledger row is missing or still `started`, retry according to host policy. For side-effecting tools, the tool must use `ToolContext.idempotencyKey` to make external calls safe to retry.
+6. When a fresh tool execution completes, persist the ledger completion, `tool.completed`, `step.completed`, and continuation snapshot in one transaction when a transaction store is configured.
+
+This gives runtime-level exactly-once result reuse for completed tool calls. It does not guarantee external exactly-once side effects unless the tool cooperates with the external system.
+
+## 9. Gateway Reconnect Algorithm
+
+When a client reconnects with `session.open` and an existing `sessionId`:
+
+1. Authenticate the caller and verify the session owner.
+2. Update the session `updatedAt` timestamp.
+3. Subscribe the connection to the session channel, active root run channel, active run channel, and agent channel after runtime recovery decisions are applied.
+4. If the session has no active run, emit `session.opened` and a `session.updated` state frame.
+5. If the active runtime run is terminal, clear `currentRunId` and `currentRootRunId`, set `lastCompletedRootRunId`, and emit the stored `run.output`.
+6. If the run is `awaiting_approval`, keep the session in `awaiting_approval` and re-present the pending approval state.
+7. If the run is `clarification_requested`, emit the clarification request state and wait for `clarification.resolve`.
+8. If the run is `running`, `planning`, `queued`, or `awaiting_subagent` with an expired lease, call `resume(currentRunId)` when supported and then settle the session from the returned `RunResult`.
+9. If the active run is leased by another worker, reattach as an observer and do not mutate the run.
+10. If the active runtime run is missing, fail the session explicitly.
+
+Gateway reconnect must not spawn a new root run for an existing active session.
+
+## 10. Interrupt Cascade Algorithm
 
 When `interrupt(parentRunId)` is called:
 
@@ -280,7 +321,7 @@ When `interrupt(parentRunId)` is called:
 
 The parent should not continue until the child boundary is resolved.
 
-## 9. Event Sequence Example
+## 11. Event Sequence Example
 
 A typical delegated sequence should look like this:
 
@@ -299,7 +340,7 @@ A typical delegated sequence should look like this:
 
 Every run keeps its own sequence numbers. Tree reconstruction happens from run linkage rather than a global event order.
 
-## 10. Failure Modes To Handle Explicitly
+## 12. Failure Modes To Handle Explicitly
 
 The runtime should make deliberate decisions for these cases:
 
@@ -310,8 +351,12 @@ The runtime should make deliberate decisions for these cases:
 - child run succeeds but output fails parent-side schema validation
 - child run requests approval or clarification in a mode that disallows it
 - repeated resume calls race to resolve the same parent wait boundary
+- completed tool ledger exists but the latest continuation snapshot is stale
+- gateway session points at a missing runtime run
+- active run lease is expired at reconnect time
+- snapshot schema version is newer than this runtime supports
 
-## 11. Recommended Tests
+## 13. Recommended Tests
 
 High-value behavioral tests for this design are:
 
@@ -321,3 +366,7 @@ High-value behavioral tests for this design are:
 4. interrupting the parent interrupts the child or leaves the parent safely blocked
 5. persisted plans reject `delegate.*` steps with `replan.required`
 6. recursive delegation is blocked when `maxDepth = 1`
+7. completed tool ledger entry is reused without invoking the tool again
+8. model tool-call snapshot resumes from the queued tool call without calling the model again
+9. repeated `resume()` on a terminal run returns the stored result
+10. gateway reconnect settles terminal runs and resumes expired active leases

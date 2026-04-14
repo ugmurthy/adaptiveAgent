@@ -8,6 +8,7 @@ export type ChannelScope = (typeof CHANNEL_SCOPES)[number];
 export const BRIDGED_RUNTIME_EVENTS = [
   'run.created',
   'run.status_changed',
+  'run.retry_started',
   'tool.started',
   'tool.completed',
   'delegate.spawned',

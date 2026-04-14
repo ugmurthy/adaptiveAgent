@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -33,6 +33,13 @@ function createStubAgent(): CreatedAdaptiveAgent {
 
 async function createTempWorkspace(): Promise<string> {
   return mkdtemp(join(tmpdir(), 'gateway-bootstrap-test-'));
+}
+
+function formatLogDate(date = new Date()): string {
+  const year = String(date.getFullYear());
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
 }
 
 async function waitFor(condition: () => Promise<boolean>, timeoutMs = 500): Promise<void> {
@@ -163,5 +170,86 @@ describe('bootstrapGateway cron lifecycle', () => {
     } finally {
       await gateway.app.close();
     }
+  });
+
+  it('writes request logs to the configured bootstrap log directory', async () => {
+    const workspace = await createTempWorkspace();
+    tempDirectories.push(workspace);
+
+    const gatewayConfigPath = join(workspace, 'gateway.json');
+    const agentDirectory = join(workspace, 'agents');
+    const logDir = join(workspace, 'logs');
+    const agentConfigPath = join(agentDirectory, 'test-agent.json');
+
+    await mkdir(agentDirectory, { recursive: true });
+    await writeFile(
+      gatewayConfigPath,
+      JSON.stringify(
+        {
+          server: {
+            host: '127.0.0.1',
+            port: 3000,
+            websocketPath: '/ws',
+            healthPath: '/health',
+            requestLogging: true,
+            requestLoggingDestination: 'file',
+          },
+          bindings: [],
+          defaultAgentId: 'test-agent',
+          hooks: {
+            failurePolicy: 'fail',
+            modules: [],
+            onAuthenticate: [],
+            onSessionResolve: [],
+            beforeRoute: [],
+            beforeInboundMessage: [],
+            beforeRunStart: [],
+            afterRunResult: [],
+            onAgentEvent: [],
+            beforeOutboundFrame: [],
+            onDisconnect: [],
+            onError: [],
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    await writeFile(
+      agentConfigPath,
+      JSON.stringify(
+        {
+          id: 'test-agent',
+          name: 'Test Agent',
+          invocationModes: ['chat', 'run'],
+          defaultInvocationMode: 'chat',
+          model: {
+            provider: 'openrouter',
+            model: 'test',
+          },
+          tools: [],
+          delegates: [],
+        },
+        null,
+        2,
+      ),
+    );
+
+    const gateway = await bootstrapGateway({
+      gatewayConfigPath,
+      agentConfigDir: agentDirectory,
+      agentFactory: () => createStubAgent(),
+      logDir,
+    });
+
+    try {
+      await gateway.app.inject({ method: 'GET', url: '/health' });
+    } finally {
+      await gateway.app.close();
+    }
+
+    const logContents = await readFile(join(logDir, `gateway-${formatLogDate()}.log`), 'utf-8');
+    expect(logContents).toContain('"event":"http.request.started"');
+    expect(logContents).toContain('"event":"http.request.completed"');
   });
 });
