@@ -88,6 +88,16 @@ describe('ModuleRegistry', () => {
     expect(resolvedGatewayModules.hooks.onAuthenticate.map((hook) => hook.id)).toEqual(['audit']);
   });
 
+  it('lists available tool and delegate names in sorted order', () => {
+    const registry = createModuleRegistry({
+      tools: [createTool('write_file'), createTool('read_file')],
+      delegates: [createDelegate('researcher'), createDelegate('code-executor')],
+    });
+
+    expect(registry.listToolNames()).toEqual(['read_file', 'write_file']);
+    expect(registry.listDelegateNames()).toEqual(['code-executor', 'researcher']);
+  });
+
   it('fails fast for unknown agent module references', () => {
     const registry = createModuleRegistry();
     const agentConfig: AgentConfig = {

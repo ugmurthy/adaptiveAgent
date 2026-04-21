@@ -266,13 +266,21 @@ describe('bootstrapGateway cron lifecycle', () => {
     const logEntries = logContents
       .trim()
       .split('\n')
-      .map((line) => JSON.parse(line) as { event: string; data?: { bootId?: string; port?: number; durationMs?: number } });
+      .map(
+        (line) =>
+          JSON.parse(line) as {
+            event: string;
+            data?: { bootId?: string; port?: number; durationMs?: number; availableTools?: string[]; availableDelegates?: string[] };
+          },
+      );
     const started = logEntries.find((entry) => entry.event === 'gateway.server.started');
     const stopping = logEntries.find((entry) => entry.event === 'gateway.server.stopping');
     const stopped = logEntries.find((entry) => entry.event === 'gateway.server.stopped');
 
     expect(started?.data?.bootId).toBe(gateway.bootId);
     expect(started?.data?.port).toBeGreaterThan(0);
+    expect(started?.data?.availableTools).toEqual([]);
+    expect(started?.data?.availableDelegates).toEqual([]);
     expect(stopping?.data?.bootId).toBe(gateway.bootId);
     expect(stopped?.data?.bootId).toBe(gateway.bootId);
     expect(stopped?.data?.durationMs).toBeGreaterThanOrEqual(0);

@@ -3,46 +3,64 @@
 import { stdin as input, stdout as output } from 'node:process';
 import { createInterface } from 'node:readline/promises';
 
-import { marked } from 'marked';
-import { markedTerminal } from 'marked-terminal';
-
-import type { AgentEventFrame, OutboundFrame, SessionOpenedFrame, SessionUpdatedFrame } from './protocol.js';
+import type { SessionOpenedFrame } from './protocol.js';
 import { GATEWAY_CONFIG_PATH, loadLocalGatewayConnectionConfig } from './local-dev.js';
 import { mintLocalDevJwt } from './local-dev-jwt.js';
 import { formatCompactAgentEventFrame } from './local-event-format.js';
+import {
+  type ClientOptions,
+  type EventStreamMode,
+  createDeferred,
+  hydratePendingApprovalFromSessionUpdate,
+  normalizeConnectHost,
+  parseCsv,
+  parseFrame,
+  parsePort,
+  rejectIfPending,
+  requireValue,
+  resolveIfPending,
+  resolveSocketUrl,
+  sendFrame,
+} from './local-ws-client/common.js';
+import {
+  getInteractiveSessionMode,
+  isEventsCommand,
+  parseClarifyCommand,
+  parseEventsCommand,
+  parseRetryCommand,
+  parseApproveCommand,
+  recordFailedRunFromAgentEvent,
+  recordInteractiveSession,
+  selectInteractiveSession,
+  type FailedRunTrackingState,
+  type InteractiveSessionState,
+} from './local-ws-client/interactive.js';
+import {
+  formatVerboseAgentEventFrame,
+  isClarificationRequestOutput,
+  renderMarkedValue,
+  shortRunId,
+} from './local-ws-client/render.js';
 
 export { formatCompactAgentEventFrame } from './local-event-format.js';
+export type { EventStreamMode } from './local-ws-client/common.js';
+export type { FailedRunTrackingState } from './local-ws-client/interactive.js';
+export {
+  getInteractiveSessionMode,
+  parseClarifyCommand,
+  parseEventsCommand,
+  parseRetryCommand,
+  recordFailedRunFromAgentEvent,
+  recordInteractiveSession,
+  selectInteractiveSession,
+} from './local-ws-client/interactive.js';
 
-marked.use(markedTerminal() as never);
-
-export type EventStreamMode = 'off' | 'compact' | 'verbose';
-
-interface ClientOptions {
-  url?: string;
-  host?: string;
-  port?: number;
-  path?: string;
-  channel: string;
-  sessionId?: string;
-  subject: string;
-  tenantId?: string;
-  roles: string[];
-  token?: string;
-  message?: string;
-  runGoal?: string;
-  verbose: boolean;
-}
-
-interface ClientState {
-  sessionId?: string;
-  runSessionId?: string;
+interface ClientState extends InteractiveSessionState, FailedRunTrackingState {
   pendingApprovalRunId?: string;
   pendingClarificationRunId?: string;
-  lastFailedRunId?: string;
   eventMode: EventStreamMode;
   approvalSessionIds: Map<string, string>;
   clarificationSessionIds: Map<string, string>;
-  failedRunSessionIds: Map<string, string>;
 }
 
 const HELP_TEXT = `Commands:
@@ -117,7 +135,7 @@ async function main(): Promise<void> {
 
   const socketReady = createDeferred<void>();
   let pendingSessionOpen: ReturnType<typeof createDeferred<SessionOpenedFrame>> | undefined;
-  const terminalFrame = createDeferred<OutboundFrame>();
+  const terminalFrame = createDeferred<unknown>();
   let terminalFrameRequired = false;
   const closed = createDeferred<{ code: number; reason: string }>();
 
@@ -161,26 +179,24 @@ async function main(): Promise<void> {
             state.pendingClarificationRunId = undefined;
             state.clarificationSessionIds.delete(frame.runId);
           }
-        } else {
-          if (isClarificationRequestOutput(frame.output)) {
-            state.pendingClarificationRunId = frame.runId;
-            if (frame.sessionId) {
-              state.clarificationSessionIds.set(frame.runId, frame.sessionId);
-            }
-            console.log(`clarification requested for run ${frame.runId}`);
-            console.log(`question: ${frame.output.message}`);
-            if (frame.output.suggestedQuestions.length > 0) {
-              console.log(`suggested: ${frame.output.suggestedQuestions.join(' | ')}`);
-            }
-            console.log('Use /clarify <text> or /clarify <runId> <text> in interactive mode.');
-          } else {
-            if (state.pendingClarificationRunId === frame.runId) {
-              state.pendingClarificationRunId = undefined;
-              state.clarificationSessionIds.delete(frame.runId);
-            }
-            console.log('run output>');
-            console.log(renderMarkedValue(frame.output));
+        } else if (isClarificationRequestOutput(frame.output)) {
+          state.pendingClarificationRunId = frame.runId;
+          if (frame.sessionId) {
+            state.clarificationSessionIds.set(frame.runId, frame.sessionId);
           }
+          console.log(`clarification requested for run ${frame.runId}`);
+          console.log(`question: ${frame.output.message}`);
+          if (frame.output.suggestedQuestions.length > 0) {
+            console.log(`suggested: ${frame.output.suggestedQuestions.join(' | ')}`);
+          }
+          console.log('Use /clarify <text> or /clarify <runId> <text> in interactive mode.');
+        } else {
+          if (state.pendingClarificationRunId === frame.runId) {
+            state.pendingClarificationRunId = undefined;
+            state.clarificationSessionIds.delete(frame.runId);
+          }
+          console.log('run output>');
+          console.log(renderMarkedValue(frame.output));
         }
         resolveIfPending(terminalFrame, frame);
         break;
@@ -523,371 +539,6 @@ async function parseArgs(args: string[]): Promise<ClientOptions> {
   options.roles = [...new Set(options.roles)];
 
   return options;
-}
-
-async function resolveSocketUrl(options: ClientOptions): Promise<string> {
-  if (options.url) {
-    return options.url;
-  }
-
-  return `ws://${options.host ?? '127.0.0.1'}:${options.port ?? 8959}${options.path ?? '/ws'}?channelId=${encodeURIComponent(options.channel)}`;
-}
-
-function normalizeConnectHost(host: string | undefined): string {
-  if (!host || host === '0.0.0.0' || host === '::') {
-    return '127.0.0.1';
-  }
-
-  return host;
-}
-
-function sendFrame(socket: WebSocket, frame: Record<string, unknown>): void {
-  socket.send(JSON.stringify(frame));
-}
-
-function parseFrame(raw: string | ArrayBuffer | Blob | Uint8Array): OutboundFrame {
-  const text =
-    typeof raw === 'string'
-      ? raw
-      : raw instanceof ArrayBuffer
-        ? new TextDecoder().decode(raw)
-        : raw instanceof Uint8Array
-          ? new TextDecoder().decode(raw)
-          : String(raw);
-
-  return JSON.parse(text) as OutboundFrame;
-}
-
-export interface InteractiveSessionSelection {
-  sessionId?: string;
-  shouldOpenSession: boolean;
-}
-
-export interface InteractiveSessionState {
-  sessionId?: string;
-  runSessionId?: string;
-}
-
-export interface FailedRunTrackingState {
-  lastFailedRunId?: string;
-  failedRunSessionIds: Map<string, string>;
-}
-
-export function recordInteractiveSession(
-  state: InteractiveSessionState,
-  mode: 'chat' | 'run',
-  sessionId: string,
-): void {
-  if (mode === 'run') {
-    state.runSessionId = sessionId;
-    if (state.sessionId === sessionId) {
-      state.sessionId = undefined;
-    }
-    return;
-  }
-
-  state.sessionId = sessionId;
-  if (state.runSessionId === sessionId) {
-    state.runSessionId = undefined;
-  }
-}
-
-export function recordFailedRunFromAgentEvent(
-  state: FailedRunTrackingState,
-  frame: Pick<AgentEventFrame, 'eventType' | 'runId' | 'sessionId'>,
-): void {
-  if (frame.eventType !== 'run.failed' || !frame.runId) {
-    return;
-  }
-
-  state.lastFailedRunId = frame.runId;
-  if (frame.sessionId) {
-    state.failedRunSessionIds.set(frame.runId, frame.sessionId);
-  }
-}
-
-export function getInteractiveSessionMode(frame: Pick<SessionOpenedFrame, 'invocationMode'>): 'chat' | 'run' {
-  return frame.invocationMode === 'run' ? 'run' : 'chat';
-}
-
-export function selectInteractiveSession(
-  mode: 'chat' | 'run',
-  state: Pick<InteractiveSessionState, 'sessionId' | 'runSessionId'>,
-): InteractiveSessionSelection {
-  if (mode === 'run') {
-    if (state.runSessionId) {
-      return {
-        sessionId: state.runSessionId,
-        shouldOpenSession: false,
-      };
-    }
-
-    return { shouldOpenSession: true };
-  }
-
-  if (state.sessionId) {
-    return {
-      sessionId: state.sessionId,
-      shouldOpenSession: false,
-    };
-  }
-
-  return { shouldOpenSession: true };
-}
-
-export function parseClarifyCommand(
-  command: string,
-  pendingRunId?: string,
-  trackedRunIds: ReadonlySet<string> = new Set(),
-): { runId: string; message: string } {
-  const parts = command.split(/\s+/).filter((part) => part.length > 0);
-  const args = parts.slice(1);
-  if (args.length === 0) {
-    throw new Error('No clarification text available for /clarify. Pass /clarify <text> or /clarify <runId> <text>.');
-  }
-
-  let runId = pendingRunId;
-  let messageParts = args;
-  if (args.length >= 2 && trackedRunIds.has(args[0])) {
-    runId = args[0];
-    messageParts = args.slice(1);
-  } else if (!runId && args.length >= 2) {
-    runId = args[0];
-    messageParts = args.slice(1);
-  }
-
-  if (!runId) {
-    throw new Error('No runId available for /clarify. Pass /clarify <runId> <text> or wait for a clarification request.');
-  }
-
-  const message = messageParts.join(' ').trim();
-  if (!message) {
-    throw new Error('Clarification text must not be empty.');
-  }
-
-  return { runId, message };
-}
-
-export function parseEventsCommand(
-  command: string,
-  currentMode: EventStreamMode,
-): { eventMode: EventStreamMode; message: string } {
-  const parts = command.split(/\s+/).filter((part) => part.length > 0);
-  const args = parts.slice(1);
-
-  if (args.length === 0) {
-    return {
-      eventMode: currentMode,
-      message:
-        currentMode === 'off'
-          ? 'Realtime events are off.'
-          : `Realtime events are on (${currentMode === 'compact' ? 'one-line' : 'verbose'}).`,
-    };
-  }
-
-  if (args.length === 1 && args[0] === 'off') {
-    return {
-      eventMode: 'off',
-      message: 'Realtime events disabled.',
-    };
-  }
-
-  if (args.length === 1 && args[0] === 'on') {
-    return {
-      eventMode: 'compact',
-      message: 'Realtime events enabled (one-line).',
-    };
-  }
-
-  if (args.length === 2 && args[0] === 'on' && args[1] === 'verbose') {
-    return {
-      eventMode: 'verbose',
-      message: 'Realtime events enabled (verbose).',
-    };
-  }
-
-  throw new Error('Usage: /event [on [verbose]|off]');
-}
-
-export function parseRetryCommand(command: string, lastFailedRunId?: string): string {
-  const parts = command.split(/\s+/).filter((part) => part.length > 0);
-  const args = parts.slice(1);
-  if (args.length === 0 && lastFailedRunId) {
-    return lastFailedRunId;
-  }
-
-  if (args.length !== 1) {
-    throw new Error('Usage: /retry <runId> or retry the most recent failed run with /retry.');
-  }
-
-  return args[0];
-}
-
-function parseApproveCommand(command: string, pendingRunId?: string): { runId: string; approved: boolean } {
-  const parts = command.split(/\s+/).filter((part) => part.length > 0);
-  const args = parts.slice(1);
-  if (args.length === 0 && pendingRunId) {
-    return { runId: pendingRunId, approved: true };
-  }
-
-  let runId = pendingRunId;
-  let approved = true;
-
-  for (const arg of args) {
-    if (arg === 'yes' || arg === 'true') {
-      approved = true;
-      continue;
-    }
-
-    if (arg === 'no' || arg === 'false') {
-      approved = false;
-      continue;
-    }
-
-    runId = arg;
-  }
-
-  if (!runId) {
-    throw new Error('No runId available for /approve. Pass /approve <runId> yes|no or wait for approval.requested.');
-  }
-
-  return { runId, approved };
-}
-
-function formatValue(value: unknown): string {
-  if (typeof value === 'string') {
-    return value;
-  }
-
-  return JSON.stringify(value, null, 2) ?? String(value);
-}
-
-function renderMarkedValue(value: unknown): string {
-  return marked.parse(formatValue(value)) as string;
-}
-
-function isEventsCommand(command: string): boolean {
-  return command === '/event' || command.startsWith('/event ') || command === '/events' || command.startsWith('/events ');
-}
-
-function formatVerboseAgentEventFrame(frame: AgentEventFrame): string {
-  const correlation = [
-    frame.sessionId ? `session=${frame.sessionId}` : undefined,
-    frame.runId ? `run=${frame.runId}` : undefined,
-    frame.rootRunId ? `root=${frame.rootRunId}` : undefined,
-    frame.parentRunId ? `parent=${frame.parentRunId}` : undefined,
-    frame.agentId ? `agent=${frame.agentId}` : undefined,
-  ].filter((value): value is string => typeof value === 'string');
-
-  const prefix = correlation.length > 0 ? `event> ${frame.eventType} (${correlation.join(', ')})` : `event> ${frame.eventType}`;
-
-  if (frame.data === null || typeof frame.data === 'undefined') {
-    return prefix;
-  }
-
-  const formattedData = formatValue(frame.data);
-  if (formattedData.includes('\n')) {
-    return `${prefix}\ndata: ${formattedData}`;
-  }
-
-  return `${prefix} data=${formattedData}`;
-}
-
-function shortRunId(runId: string): string {
-  return `run:${runId.slice(0, 8)}`;
-}
-
-function isClarificationRequestOutput(
-  value: unknown,
-): value is { status: 'clarification_requested'; message: string; suggestedQuestions: string[] } {
-  if (!value || typeof value !== 'object') {
-    return false;
-  }
-
-  const candidate = value as {
-    status?: unknown;
-    message?: unknown;
-    suggestedQuestions?: unknown;
-  };
-  return (
-    candidate.status === 'clarification_requested' &&
-    typeof candidate.message === 'string' &&
-    Array.isArray(candidate.suggestedQuestions) &&
-    candidate.suggestedQuestions.every((entry) => typeof entry === 'string')
-  );
-}
-
-function parseCsv(value: string): string[] {
-  return value
-    .split(',')
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0);
-}
-
-function parsePort(value: string): number {
-  const port = Number.parseInt(value, 10);
-  if (Number.isInteger(port) && port > 0) {
-    return port;
-  }
-
-  throw new Error(`Invalid port: ${value}`);
-}
-
-function requireValue(flag: string, value: string | undefined): string {
-  if (typeof value === 'string' && value.trim().length > 0) {
-    return value;
-  }
-
-  throw new Error(`Missing value for ${flag}.`);
-}
-
-function createDeferred<T>() {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  let reject!: (reason?: unknown) => void;
-  let settled = false;
-
-  const promise = new Promise<T>((res, rej) => {
-    resolve = (value) => {
-      settled = true;
-      res(value);
-    };
-    reject = (reason) => {
-      settled = true;
-      rej(reason);
-    };
-  });
-
-  return {
-    promise,
-    resolve,
-    reject,
-    isSettled: () => settled,
-  };
-}
-
-function resolveIfPending<T>(deferred: ReturnType<typeof createDeferred<T>>, value: T): void {
-  if (!deferred.isSettled()) {
-    deferred.resolve(value);
-  }
-}
-
-function rejectIfPending<T>(deferred: ReturnType<typeof createDeferred<T>>, reason: unknown): void {
-  if (!deferred.isSettled()) {
-    deferred.reject(reason);
-  }
-}
-
-function hydratePendingApprovalFromSessionUpdate(state: ClientState, frame: SessionUpdatedFrame): void {
-  if (frame.status === 'awaiting_approval' && frame.activeRunId) {
-    state.pendingApprovalRunId = frame.activeRunId;
-    state.approvalSessionIds.set(frame.activeRunId, frame.sessionId);
-    return;
-  }
-
-  if (state.pendingApprovalRunId && frame.status !== 'awaiting_approval') {
-    state.approvalSessionIds.delete(state.pendingApprovalRunId);
-    state.pendingApprovalRunId = undefined;
-  }
 }
 
 if (import.meta.main) {

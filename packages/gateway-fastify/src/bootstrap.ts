@@ -132,6 +132,8 @@ export async function bootstrapGateway(options: BootstrapGatewayOptions = {}): P
         ...(loadedGatewayConfig.config.server.healthPath ? { healthPath: loadedGatewayConfig.config.server.healthPath } : {}),
         storesKind: loadedGatewayConfig.config.stores?.kind ?? 'memory',
         agentCount: loadedAgentConfigs.length,
+        availableTools: moduleRegistry.listToolNames(),
+        availableDelegates: moduleRegistry.listDelegateNames(),
         cronEnabled: loadedGatewayConfig.config.cron?.enabled ?? false,
         ...(options.logDir ? { logDir: options.logDir } : {}),
       });

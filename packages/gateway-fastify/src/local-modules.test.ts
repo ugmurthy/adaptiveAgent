@@ -27,6 +27,15 @@ describe('createLocalModuleRegistry', () => {
 
     const resolvedModules = registry.resolveAgentModules(agentConfig);
 
+    expect(registry.listToolNames()).toEqual([
+      'list_directory',
+      'read_file',
+      'read_web_page',
+      'shell_exec',
+      'web_search',
+      'write_file',
+    ]);
+    expect(registry.listDelegateNames()).toEqual(['code-executor', 'researcher']);
     expect(resolvedModules.tools.map((tool) => tool.name)).toEqual([
       'read_file',
       'list_directory',

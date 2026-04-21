@@ -50,6 +50,8 @@ async function main(): Promise<void> {
   console.log(`- Logs: ${logDir}`);
   console.log(`- Request logs: ${formatRequestLogDestination(gateway.gatewayConfig, logDir)}`);
   console.log(`- Runtime logs: ${formatRuntimeLogDestination(gateway.gatewayConfig, logDir)}`);
+  console.log(`- Available tools: ${formatNameList(moduleRegistry.listToolNames())}`);
+  console.log(`- Available delegates: ${formatNameList(moduleRegistry.listDelegateNames())}`);
   console.log(`- Agents detected: ${gateway.agentConfigs.length}`);
   for (const agentLine of formatDetectedAgents(gateway.agentConfigs)) {
     console.log(`  - ${agentLine}`);
@@ -210,6 +212,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function collectDelegateNames(loadedAgentConfigs: Array<LoadedConfig<AgentConfig>>): string[] {
   return [...new Set(loadedAgentConfigs.flatMap((loadedAgentConfig) => loadedAgentConfig.config.delegates))].sort();
+}
+
+function formatNameList(names: string[]): string {
+  return names.length > 0 ? names.join(', ') : '(none)';
 }
 
 function formatDetectedAgents(loadedAgentConfigs: Array<LoadedConfig<AgentConfig>>): string[] {

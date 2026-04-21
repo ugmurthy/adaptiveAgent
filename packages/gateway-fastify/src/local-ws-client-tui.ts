@@ -7,6 +7,17 @@ import type { AgentEventFrame, OutboundFrame, SessionOpenedFrame, SessionUpdated
 import { GATEWAY_CONFIG_PATH, loadLocalGatewayConnectionConfig } from './local-dev.js';
 import { mintLocalDevJwt } from './local-dev-jwt.js';
 import {
+  type ClientOptions,
+  type Deferred,
+  createDeferred,
+  normalizeConnectHost,
+  parseCsv,
+  parseFrame,
+  parsePort,
+  requireValue,
+  resolveSocketUrl,
+} from './local-ws-client/common.js';
+import {
   defaultEditorTheme,
   StatusBar,
   MessageLog,
@@ -20,14 +31,17 @@ import {
 } from './tui/index.js';
 import {
   getInteractiveSessionMode,
-  formatCompactAgentEventFrame,
+  isEventsCommand,
   parseClarifyCommand,
   parseEventsCommand,
+  parseApproveCommand,
   parseRetryCommand,
   recordFailedRunFromAgentEvent,
   recordInteractiveSession,
   selectInteractiveSession,
-} from './local-ws-client.js';
+} from './local-ws-client/interactive.js';
+import { formatCompactAgentEventFrame } from './local-event-format.js';
+import { isClarificationRequestOutput, shortRunId } from './local-ws-client/render.js';
 
 import {
   TUI,
@@ -75,75 +89,6 @@ Examples:
   bun run gateway:ws-client-tui --run "Summarize the repository"
   bun run gateway:ws-client-tui --sub alice --tenant acme --role admin`;
 
-interface ClientOptions {
-  url?: string;
-  host?: string;
-  port?: number;
-  path?: string;
-  channel: string;
-  sessionId?: string;
-  subject: string;
-  tenantId?: string;
-  roles: string[];
-  token?: string;
-  message?: string;
-  runGoal?: string;
-  verbose: boolean;
-}
-
-interface Deferred<T> {
-  promise: Promise<T>;
-  resolve: (value: T | PromiseLike<T>) => void;
-  reject: (reason?: unknown) => void;
-  isSettled: () => boolean;
-}
-
-function createDeferred<T>(): Deferred<T> {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  let reject!: (reason?: unknown) => void;
-  let settled = false;
-
-  const promise = new Promise<T>((res, rej) => {
-    resolve = (value) => {
-      settled = true;
-      res(value);
-    };
-    reject = (reason) => {
-      settled = true;
-      rej(reason);
-    };
-  });
-
-  return {
-    promise,
-    resolve,
-    reject,
-    isSettled: () => settled,
-  };
-}
-
-function parseCsv(value: string): string[] {
-  return value
-    .split(',')
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0);
-}
-
-function parsePort(value: string): number {
-  const port = Number.parseInt(value, 10);
-  if (Number.isInteger(port) && port > 0) {
-    return port;
-  }
-  throw new Error(`Invalid port: ${value}`);
-}
-
-function requireValue(flag: string, value: string | undefined): string {
-  if (typeof value === 'string' && value.trim().length > 0) {
-    return value;
-  }
-  throw new Error(`Missing value for ${flag}.`);
-}
-
 function recordLiveAgentEvent(state: TuiClientState, frame: AgentEventFrame): void {
   const payload = asRecord(frame.data);
   const status = readString(payload, 'toStatus') ?? readString(payload, 'status');
@@ -176,10 +121,6 @@ function readFailureText(record: Record<string, unknown>): string | undefined {
   return readString(record, 'error') ?? readString(record, 'reason') ?? readString(record, 'message');
 }
 
-function shortRunId(runId: string): string {
-  return `run:${runId.slice(0, 8)}`;
-}
-
 function formatRunOutput(output: unknown): string {
   if (typeof output === 'string') {
     return output;
@@ -187,21 +128,6 @@ function formatRunOutput(output: unknown): string {
 
   const json = JSON.stringify(output, null, 2);
   return json ? `\`\`\`json\n${json}\n\`\`\`` : '';
-}
-
-function isClarificationRequestOutput(
-  value: unknown,
-): value is { status: 'clarification_requested'; message: string; suggestedQuestions: string[] } {
-  if (!value || typeof value !== 'object') {
-    return false;
-  }
-  const candidate = value as { status?: unknown; message?: unknown; suggestedQuestions?: unknown };
-  return (
-    candidate.status === 'clarification_requested' &&
-    typeof candidate.message === 'string' &&
-    Array.isArray(candidate.suggestedQuestions) &&
-    candidate.suggestedQuestions.every((entry) => typeof entry === 'string')
-  );
 }
 
 async function parseArgs(args: string[]): Promise<ClientOptions> {
@@ -293,65 +219,6 @@ async function parseArgs(args: string[]): Promise<ClientOptions> {
 
   options.roles = [...new Set(options.roles)];
   return options;
-}
-
-function normalizeConnectHost(host: string | undefined): string {
-  if (!host || host === '0.0.0.0' || host === '::') {
-    return '127.0.0.1';
-  }
-  return host;
-}
-
-async function resolveSocketUrl(options: ClientOptions): Promise<string> {
-  if (options.url) {
-    return options.url;
-  }
-  return `ws://${options.host ?? '127.0.0.1'}:${options.port ?? 8959}${options.path ?? '/ws'}?channelId=${encodeURIComponent(options.channel)}`;
-}
-
-function parseFrame(raw: string | ArrayBuffer | Blob | Uint8Array): OutboundFrame {
-  const text =
-    typeof raw === 'string'
-      ? raw
-      : raw instanceof ArrayBuffer
-        ? new TextDecoder().decode(raw)
-        : raw instanceof Uint8Array
-          ? new TextDecoder().decode(raw)
-          : String(raw);
-  return JSON.parse(text) as OutboundFrame;
-}
-
-function parseApproveCommand(command: string, pendingRunId?: string): { runId: string; approved: boolean } {
-  const parts = command.split(/\s+/).filter((part) => part.length > 0);
-  const args = parts.slice(1);
-  if (args.length === 0 && pendingRunId) {
-    return { runId: pendingRunId, approved: true };
-  }
-
-  let runId = pendingRunId;
-  let approved = true;
-
-  for (const arg of args) {
-    if (arg === 'yes' || arg === 'true') {
-      approved = true;
-      continue;
-    }
-    if (arg === 'no' || arg === 'false') {
-      approved = false;
-      continue;
-    }
-    runId = arg;
-  }
-
-  if (!runId) {
-    throw new Error('No runId available for /approve. Pass /approve <runId> yes|no or wait for approval.requested.');
-  }
-
-  return { runId, approved };
-}
-
-function isEventsCommand(command: string): boolean {
-  return command === '/event' || command.startsWith('/event ') || command === '/events' || command.startsWith('/events ');
 }
 
 async function runTuiMode(

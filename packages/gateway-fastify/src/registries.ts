@@ -99,6 +99,14 @@ export class ModuleRegistry {
     registerNamedEntry(this.authProviders, authProvider.id, authProvider, 'auth provider');
   }
 
+  listToolNames(): string[] {
+    return [...this.tools.keys()].sort();
+  }
+
+  listDelegateNames(): string[] {
+    return [...this.delegates.keys()].sort();
+  }
+
   resolveAgentModules(agentConfig: AgentConfig, sourceLabel = describeAgentSource(agentConfig)): ResolvedAgentModules {
     return {
       tools: this.resolveMany(this.tools, 'tool', agentConfig.tools, sourceLabel),
