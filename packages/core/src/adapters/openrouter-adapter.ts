@@ -8,6 +8,7 @@ export interface OpenRouterAdapterConfig {
   baseUrl?: string;
   siteUrl?: string;
   siteName?: string;
+  maxConcurrentRequests?: number;
 }
 
 export class OpenRouterAdapter extends BaseOpenAIChatAdapter {
@@ -28,6 +29,7 @@ export class OpenRouterAdapter extends BaseOpenAIChatAdapter {
       baseUrl: config.baseUrl ?? OPENROUTER_BASE_URL,
       apiKey: config.apiKey,
       defaultHeaders: headers,
+      maxConcurrentRequests: config.maxConcurrentRequests,
       capabilities: {
         toolCalling: true,
         jsonOutput: true,

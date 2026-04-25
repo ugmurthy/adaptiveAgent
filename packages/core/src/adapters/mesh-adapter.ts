@@ -6,6 +6,7 @@ export interface MeshAdapterConfig {
   model: string;
   apiKey: string;
   baseUrl?: string;
+  maxConcurrentRequests?: number;
 }
 
 export class MeshAdapter extends BaseOpenAIChatAdapter {
@@ -15,6 +16,7 @@ export class MeshAdapter extends BaseOpenAIChatAdapter {
       model: config.model,
       baseUrl: config.baseUrl ?? MESH_BASE_URL,
       apiKey: config.apiKey,
+      maxConcurrentRequests: config.maxConcurrentRequests,
       capabilities: {
         toolCalling: true,
         jsonOutput: true,

@@ -1,7 +1,7 @@
-import { readFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { readFile, stat } from 'node:fs/promises';
 
 import type { ToolDefinition } from '../types.js';
+import { resolvePathWithinRoot } from './path-utils.js';
 
 export interface ReadFileToolConfig {
   /** Restrict reads to paths under this root. Defaults to `process.cwd()`. */
@@ -46,22 +46,24 @@ export function createReadFileTool(config?: ReadFileToolConfig): ToolDefinition 
       // Some models send tool input as a JSON string instead of an object — normalise.
       const input = typeof rawInput === 'string' ? JSON.parse(rawInput) : rawInput;
       const { path: filePath } = input as unknown as ReadFileInput;
-      const resolved = resolve(allowedRoot, filePath);
+      const resolved = resolvePathWithinRoot(allowedRoot, filePath);
 
-      if (!resolved.startsWith(resolve(allowedRoot))) {
-        throw new Error(`Path ${filePath} is outside the allowed root ${allowedRoot}`);
-      }
-
-      const content = await readFile(resolved, 'utf-8');
-
-      if (Buffer.byteLength(content, 'utf-8') > maxSizeBytes) {
+      const fileStats = await stat(resolved);
+      if (fileStats.size > maxSizeBytes) {
         throw new Error(`File ${resolved} exceeds maximum size of ${maxSizeBytes} bytes`);
       }
+
+      const contentBuffer = await readFile(resolved);
+      if (contentBuffer.byteLength > maxSizeBytes) {
+        throw new Error(`File ${resolved} exceeds maximum size of ${maxSizeBytes} bytes`);
+      }
+
+      const content = contentBuffer.toString('utf-8');
 
       return {
         path: resolved,
         content,
-        sizeBytes: Buffer.byteLength(content, 'utf-8'),
+        sizeBytes: contentBuffer.byteLength,
       } satisfies ReadFileOutput as unknown as ReturnType<ToolDefinition['execute']>;
     },
   };

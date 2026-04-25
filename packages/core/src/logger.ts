@@ -73,7 +73,7 @@ function createPrettyDestination(): DestinationStream {
 
 function createFileDestination(filePath: string): DestinationStream {
   mkdirSync(dirname(filePath), { recursive: true });
-  return pino.destination({ dest: filePath, sync: true });
+  return pino.destination({ dest: filePath, sync: false });
 }
 
 function resolveLogFilePath(filePath: string, now = new Date()): string {

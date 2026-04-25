@@ -109,6 +109,7 @@ const CHAT_GOAL_MAX_LENGTH = 120;
 
 export class AdaptiveAgent {
   private readonly toolRegistry = new Map<string, ToolDefinition>();
+  private readonly plannerTools: Array<Pick<ToolDefinition, 'name' | 'description' | 'inputSchema'>>;
   private readonly resolvedToolBudgets?: Record<string, ToolBudget>;
   private readonly resolvedResearchPolicy?: ResolvedResearchPolicy;
   private readonly defaults: {
@@ -162,6 +163,12 @@ export class AdaptiveAgent {
 
       this.toolRegistry.set(tool.name, tool);
     }
+
+    this.plannerTools = Array.from(this.toolRegistry.values(), (tool) => ({
+      name: tool.name,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+    }));
 
     this.logLifecycle('debug', 'agent.initialized', {
       toolNames: Array.from(this.toolRegistry.keys()),
@@ -2067,7 +2074,7 @@ export class AdaptiveAgent {
 
   private async generateModelResponse(run: AgentRun, state: ExecutionState): Promise<ModelResponse> {
     const modelRequest = {
-      messages: structuredClone(state.messages),
+      messages: [...state.messages],
       tools: this.plannerVisibleTools(),
       outputSchema: state.outputSchema,
       metadata: run.metadata,
@@ -2146,11 +2153,7 @@ export class AdaptiveAgent {
   }
 
   private plannerVisibleTools(): Array<Pick<ToolDefinition, 'name' | 'description' | 'inputSchema'>> {
-    return Array.from(this.toolRegistry.values(), (tool) => ({
-      name: tool.name,
-      description: tool.description,
-      inputSchema: tool.inputSchema,
-    }));
+    return this.plannerTools;
   }
 
   private async ensureRunStep(run: AgentRun, stepId: string): Promise<AgentRun> {

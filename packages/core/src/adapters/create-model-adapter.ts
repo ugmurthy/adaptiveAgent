@@ -11,6 +11,7 @@ export interface ModelAdapterConfig {
   baseUrl?: string;
   siteUrl?: string;
   siteName?: string;
+  maxConcurrentRequests?: number;
 }
 
 export function createModelAdapter(config: ModelAdapterConfig): ModelAdapter {
@@ -26,6 +27,7 @@ export function createModelAdapter(config: ModelAdapterConfig): ModelAdapter {
         baseUrl: config.baseUrl,
         siteUrl: config.siteUrl,
         siteName: config.siteName,
+        maxConcurrentRequests: config.maxConcurrentRequests,
       });
     }
 
@@ -33,6 +35,7 @@ export function createModelAdapter(config: ModelAdapterConfig): ModelAdapter {
       return new OllamaAdapter({
         model: config.model,
         baseUrl: config.baseUrl,
+        maxConcurrentRequests: config.maxConcurrentRequests,
       });
 
     case 'mistral': {
@@ -44,6 +47,7 @@ export function createModelAdapter(config: ModelAdapterConfig): ModelAdapter {
         model: config.model,
         apiKey: config.apiKey,
         baseUrl: config.baseUrl,
+        maxConcurrentRequests: config.maxConcurrentRequests,
       });
     }
 
@@ -56,6 +60,7 @@ export function createModelAdapter(config: ModelAdapterConfig): ModelAdapter {
         model: config.model,
         apiKey: config.apiKey,
         baseUrl: config.baseUrl,
+        maxConcurrentRequests: config.maxConcurrentRequests,
       });
     }
 

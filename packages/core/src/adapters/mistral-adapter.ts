@@ -6,6 +6,7 @@ export interface MistralAdapterConfig {
   model: string;
   apiKey: string;
   baseUrl?: string;
+  maxConcurrentRequests?: number;
 }
 
 export class MistralAdapter extends BaseOpenAIChatAdapter {
@@ -15,6 +16,7 @@ export class MistralAdapter extends BaseOpenAIChatAdapter {
       model: config.model,
       baseUrl: config.baseUrl ?? MISTRAL_BASE_URL,
       apiKey: config.apiKey,
+      maxConcurrentRequests: config.maxConcurrentRequests,
       capabilities: {
         toolCalling: true,
         jsonOutput: true,

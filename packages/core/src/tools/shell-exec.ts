@@ -58,10 +58,11 @@ export function createShellExecTool(config?: ShellExecToolConfig): ToolDefinitio
             shell: shell ?? undefined,
           },
           (error, stdout, stderr) => {
+            const exitCode = typeof error?.code === 'number' ? error.code : error ? 1 : 0;
             resolve({
               stdout: stdout.toString(),
               stderr: stderr.toString(),
-              exitCode: error?.code ?? (typeof error?.code === 'number' ? error.code : 0),
+              exitCode,
             } as ShellExecOutput);
           },
         );

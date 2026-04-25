@@ -19,6 +19,7 @@ export interface BaseOpenAIChatAdapterConfig {
   apiKey?: string;
   defaultHeaders?: Record<string, string>;
   capabilities?: Partial<ModelCapabilities>;
+  maxConcurrentRequests?: number;
 }
 
 interface OpenAIMessage {
@@ -77,8 +78,9 @@ const DEFAULT_MAX_RETRIES = 2;
 const INITIAL_RETRY_DELAY_MS = 500;
 const MAX_RETRY_DELAY_MS = 8_000;
 // Keep the local process from stampeding the same upstream/model when future
-// parallel sub-agents begin issuing requests concurrently.
-const MAX_CONCURRENT_REQUESTS_PER_MODEL = 1;
+// parallel sub-agents begin issuing requests concurrently without forcing the
+// whole process through a single in-flight request per model.
+const DEFAULT_MAX_CONCURRENT_REQUESTS_PER_MODEL = 4;
 
 const modelRequestGates = new Map<string, ModelRequestGate>();
 
@@ -90,10 +92,22 @@ interface GateWaiter {
 }
 
 class ModelRequestGate {
+  private maxConcurrentRequests: number;
   private activeCount = 0;
   private cooldownUntil = 0;
   private readonly waiters: GateWaiter[] = [];
   private drainTimer: ReturnType<typeof setTimeout> | undefined;
+
+  constructor(maxConcurrentRequests: number) {
+    this.maxConcurrentRequests = maxConcurrentRequests;
+  }
+
+  setMaxConcurrentRequests(maxConcurrentRequests: number): void {
+    if (maxConcurrentRequests > this.maxConcurrentRequests) {
+      this.maxConcurrentRequests = maxConcurrentRequests;
+      this.drain();
+    }
+  }
 
   acquire(signal?: AbortSignal): Promise<() => void> {
     return new Promise((resolve, reject) => {
@@ -124,7 +138,7 @@ class ModelRequestGate {
   }
 
   private drain(): void {
-    if (this.activeCount >= MAX_CONCURRENT_REQUESTS_PER_MODEL) {
+    if (this.activeCount >= this.maxConcurrentRequests) {
       return;
     }
 
@@ -136,7 +150,7 @@ class ModelRequestGate {
 
     this.clearDrainTimer();
 
-    while (this.activeCount < MAX_CONCURRENT_REQUESTS_PER_MODEL) {
+    while (this.activeCount < this.maxConcurrentRequests) {
       const waiter = this.waiters.shift();
       if (!waiter) {
         return;
@@ -202,7 +216,11 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
     this.apiKey = config.apiKey;
     this.defaultHeaders = config.defaultHeaders ?? {};
     this.capabilities = { ...DEFAULT_CAPABILITIES, ...config.capabilities };
-    this.requestGate = getOrCreateModelRequestGate(this.provider, this.model);
+    this.requestGate = getOrCreateModelRequestGate(
+      this.provider,
+      this.model,
+      normalizeMaxConcurrentRequests(config.maxConcurrentRequests),
+    );
   }
 
   async generate(request: ModelRequest): Promise<ModelResponse> {
@@ -424,15 +442,29 @@ function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === 'AbortError';
 }
 
-function getOrCreateModelRequestGate(provider: string, model: string): ModelRequestGate {
+function getOrCreateModelRequestGate(provider: string, model: string, maxConcurrentRequests: number): ModelRequestGate {
   const key = `${provider}\u0000${model}`;
   let gate = modelRequestGates.get(key);
   if (!gate) {
-    gate = new ModelRequestGate();
+    gate = new ModelRequestGate(maxConcurrentRequests);
     modelRequestGates.set(key, gate);
+    return gate;
   }
 
+  gate.setMaxConcurrentRequests(maxConcurrentRequests);
   return gate;
+}
+
+function normalizeMaxConcurrentRequests(value: number | undefined): number {
+  if (value === undefined) {
+    return DEFAULT_MAX_CONCURRENT_REQUESTS_PER_MODEL;
+  }
+
+  if (!Number.isInteger(value) || value < 1) {
+    throw new Error('maxConcurrentRequests must be an integer >= 1');
+  }
+
+  return value;
 }
 
 function toOpenAIMessage(msg: ModelMessage): OpenAIMessage {

@@ -91,8 +91,8 @@ export function createReadWebPageTool(config?: ReadWebPageToolConfig): ToolDefin
           });
         }
 
-        const rawBuffer = await response.arrayBuffer();
-        if (rawBuffer.byteLength > maxSizeBytes) {
+        const contentLength = parseContentLength(response.headers.get('content-length'));
+        if (contentLength !== undefined && contentLength > maxSizeBytes) {
           throw createRecoverableReadWebPageError({
             url,
             kind: 'content_error',
@@ -100,6 +100,7 @@ export function createReadWebPageTool(config?: ReadWebPageToolConfig): ToolDefin
           });
         }
 
+        const rawBuffer = await readResponseBodyWithinLimit(response, maxSizeBytes, url);
         const html = new TextDecoder().decode(rawBuffer);
         const title = extractTitle(html);
         let text = stripHtmlToText(html);
@@ -123,6 +124,66 @@ export function createReadWebPageTool(config?: ReadWebPageToolConfig): ToolDefin
       return normalizeReadWebPageError(error, url).output;
     },
   };
+}
+
+function parseContentLength(value: string | null): number | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+async function readResponseBodyWithinLimit(response: Response, maxSizeBytes: number, url: string): Promise<ArrayBuffer> {
+  if (!response.body) {
+    const rawBuffer = await response.arrayBuffer();
+    if (rawBuffer.byteLength > maxSizeBytes) {
+      throw createRecoverableReadWebPageError({
+        url,
+        kind: 'content_error',
+        message: `Response from ${url} exceeds maximum size of ${maxSizeBytes} bytes`,
+      });
+    }
+
+    return rawBuffer;
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    if (!value) {
+      continue;
+    }
+
+    totalBytes += value.byteLength;
+    if (totalBytes > maxSizeBytes) {
+      await reader.cancel();
+      throw createRecoverableReadWebPageError({
+        url,
+        kind: 'content_error',
+        message: `Response from ${url} exceeds maximum size of ${maxSizeBytes} bytes`,
+      });
+    }
+
+    chunks.push(value);
+  }
+
+  const merged = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  return merged.buffer;
 }
 
 function extractTitle(html: string): string {

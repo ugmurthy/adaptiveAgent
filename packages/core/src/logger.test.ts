@@ -14,7 +14,7 @@ describe('createAdaptiveAgentLogger', () => {
     expect(logger.level).toBe('silent');
   });
 
-  it('writes logs to a file destination', () => {
+  it('writes logs to a file destination', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'adaptive-agent-logger-'));
     const logFilePath = join(tempDir, 'agent.log');
 
@@ -27,12 +27,11 @@ describe('createAdaptiveAgentLogger', () => {
       });
 
       logger.info({ runId: 'run-1' }, 'hello file logger');
-      logger.flush();
+      await flushLogger(logger);
 
       expect(logger.filePath).toBe(join(tempDir, `agent-${formatLogDate(new Date())}.log`));
 
-      const lines = readFileSync(logger.filePath ?? logFilePath, 'utf8').trim().split('\n');
-      const entry = JSON.parse(lines.at(-1) ?? '{}') as Record<string, unknown>;
+      const entry = await readLastJsonLogEntry(logger.filePath ?? logFilePath);
 
       expect(entry.msg).toBe('hello file logger');
       expect(entry.runId).toBe('run-1');
@@ -41,7 +40,7 @@ describe('createAdaptiveAgentLogger', () => {
     }
   });
 
-  it('adds a same-day serial when the dated log file already exists', () => {
+  it('adds a same-day serial when the dated log file already exists', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'adaptive-agent-logger-'));
     const logFilePath = join(tempDir, 'agent.log');
     const dateStamp = formatLogDate(new Date());
@@ -58,7 +57,7 @@ describe('createAdaptiveAgentLogger', () => {
       });
 
       logger.info('rotated file logger');
-      logger.flush();
+      await flushLogger(logger);
 
       expect(logger.filePath).toBe(join(tempDir, `agent-${dateStamp}-2.log`));
       expect(existsSync(logger.filePath ?? '')).toBe(true);
@@ -67,6 +66,40 @@ describe('createAdaptiveAgentLogger', () => {
     }
   });
 });
+
+async function flushLogger(logger: ReturnType<typeof createAdaptiveAgentLogger>): Promise<void> {
+  await new Promise<void>((resolve) => {
+    logger.flush(() => resolve());
+  });
+}
+
+async function readLastJsonLogEntry(filePath: string): Promise<Record<string, unknown>> {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const content = readFileSync(filePath, 'utf8');
+    const lastLine = content
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .at(-1);
+
+    if (!lastLine) {
+      await sleep(5);
+      continue;
+    }
+
+    try {
+      return JSON.parse(lastLine) as Record<string, unknown>;
+    } catch {
+      await sleep(5);
+    }
+  }
+
+  throw new Error(`Timed out waiting for a complete JSON log entry in ${filePath}`);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function formatLogDate(date: Date): string {
   const year = String(date.getFullYear());

@@ -5,6 +5,7 @@ const OLLAMA_BASE_URL = 'http://localhost:11434/v1';
 export interface OllamaAdapterConfig {
   model: string;
   baseUrl?: string;
+  maxConcurrentRequests?: number;
 }
 
 export class OllamaAdapter extends BaseOpenAIChatAdapter {
@@ -13,6 +14,7 @@ export class OllamaAdapter extends BaseOpenAIChatAdapter {
       provider: 'ollama',
       model: config.model,
       baseUrl: config.baseUrl ?? OLLAMA_BASE_URL,
+      maxConcurrentRequests: config.maxConcurrentRequests,
       capabilities: {
         toolCalling: true,
         jsonOutput: true,

@@ -422,9 +422,9 @@ describe('BaseOpenAIChatAdapter', () => {
     expect(fetchSpy).toHaveBeenCalledTimes(3);
   });
 
-  it('serializes concurrent requests for the same provider and model in-process', async () => {
-    const firstAdapter = createAdapter({ model: 'serialized-model' });
-    const secondAdapter = createAdapter({ model: 'serialized-model' });
+  it('allows concurrent requests for the same provider and model up to the configured gate limit', async () => {
+    const firstAdapter = createAdapter({ model: 'shared-model', maxConcurrentRequests: 2 });
+    const secondAdapter = createAdapter({ model: 'shared-model', maxConcurrentRequests: 2 });
     const firstResponse = deferred<Response>();
 
     fetchSpy
@@ -442,7 +442,7 @@ describe('BaseOpenAIChatAdapter', () => {
     const secondPromise = secondAdapter.generate(simpleRequest());
     await Promise.resolve();
 
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
 
     firstResponse.resolve(
       new Response(JSON.stringify(STOP_RESPONSE), {

@@ -72,6 +72,18 @@ describe('createReadFileTool', () => {
     ).rejects.toThrow('outside the allowed root');
   });
 
+  it('rejects sibling absolute paths that merely share the root prefix', async () => {
+    const tool = createReadFileTool({ allowedRoot: tempDir });
+    const siblingDir = `${tempDir}-sibling`;
+    await mkdir(siblingDir);
+    const siblingFile = join(siblingDir, 'escape.txt');
+    await writeFile(siblingFile, 'escape');
+
+    await expect(tool.execute({ path: siblingFile } as any, stubToolContext())).rejects.toThrow(
+      'outside the allowed root',
+    );
+  });
+
   it('rejects files exceeding max size', async () => {
     const tool = createReadFileTool({ allowedRoot: tempDir, maxSizeBytes: 5 });
 
@@ -140,6 +152,16 @@ describe('createListDirectoryTool', () => {
     ).rejects.toThrow('outside the allowed root');
   });
 
+  it('rejects sibling absolute directories that merely share the root prefix', async () => {
+    const tool = createListDirectoryTool({ allowedRoot: tempDir });
+    const siblingDir = `${tempDir}-sibling`;
+    await mkdir(siblingDir);
+
+    await expect(tool.execute({ path: siblingDir } as any, stubToolContext())).rejects.toThrow(
+      'outside the allowed root',
+    );
+  });
+
   it('has correct tool metadata', () => {
     const tool = createListDirectoryTool();
     expect(tool.name).toBe('list_directory');
@@ -198,6 +220,15 @@ describe('createWriteFileTool', () => {
     ).rejects.toThrow('outside the allowed root');
   });
 
+  it('rejects sibling absolute paths that merely share the root prefix', async () => {
+    const tool = createWriteFileTool({ allowedRoot: tempDir });
+    const siblingPath = join(`${tempDir}-sibling`, 'evil.txt');
+
+    await expect(tool.execute({ path: siblingPath, content: 'no' } as any, stubToolContext())).rejects.toThrow(
+      'outside the allowed root',
+    );
+  });
+
   it('reports malformed JSON input clearly', async () => {
     const tool = createWriteFileTool({ allowedRoot: tempDir });
 
@@ -246,6 +277,17 @@ describe('createShellExecTool', () => {
     )) as any;
 
     expect(result.exitCode).toBe(42);
+  });
+
+  it('normalizes shell spawn failures to a numeric exit code', async () => {
+    const tool = createShellExecTool({ shell: '/definitely/missing/sh' });
+    const result = (await tool.execute(
+      { command: 'echo "hello from shell"' } as any,
+      stubToolContext(),
+    )) as any;
+
+    expect(typeof result.exitCode).toBe('number');
+    expect(result.exitCode).toBeGreaterThan(0);
   });
 
   it('has requiresApproval set', () => {
@@ -652,6 +694,27 @@ describe('createReadWebPageTool', () => {
       },
     });
     expect(result.error.message).toContain('Unsupported content type');
+  });
+
+  it('returns a recoverable error on oversized responses', async () => {
+    const tool = createReadWebPageTool({ maxSizeBytes: 4 });
+
+    fetchSpy.mockResolvedValueOnce(
+      new Response('hello', {
+        status: 200,
+        headers: { 'Content-Type': 'text/plain' },
+      }),
+    );
+
+    const result = (await executeRecoverableTool(tool, { url: 'https://example.com/large' })) as any;
+
+    expect(result).toMatchObject({
+      url: 'https://example.com/large',
+      error: {
+        kind: 'content_error',
+      },
+    });
+    expect(result.error.message).toContain('exceeds maximum size');
   });
 
   it('returns a recoverable timeout error for slow page reads', () => {

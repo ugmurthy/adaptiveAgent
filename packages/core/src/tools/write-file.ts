@@ -1,7 +1,8 @@
 import { writeFile, mkdir } from 'node:fs/promises';
-import { resolve, dirname } from 'node:path';
+import { dirname } from 'node:path';
 
 import type { ToolDefinition } from '../types.js';
+import { resolvePathWithinRoot } from './path-utils.js';
 
 export interface WriteFileToolConfig {
   /** Restrict writes to paths under this root. Defaults to `process.cwd()`. */
@@ -60,11 +61,7 @@ export function createWriteFileTool(config?: WriteFileToolConfig): ToolDefinitio
         throw new Error('write_file requires a "content" string');
       }
 
-      const resolved = resolve(allowedRoot, filePath);
-
-      if (!resolved.startsWith(resolve(allowedRoot))) {
-        throw new Error(`Path ${filePath} is outside the allowed root ${allowedRoot}`);
-      }
+      const resolved = resolvePathWithinRoot(allowedRoot, filePath);
 
       if (createDirectories) {
         await mkdir(dirname(resolved), { recursive: true });

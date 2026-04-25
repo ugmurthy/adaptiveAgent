@@ -1,7 +1,7 @@
-import { readdir, stat } from 'node:fs/promises';
-import { resolve, join } from 'node:path';
+import { readdir } from 'node:fs/promises';
 
 import type { ToolDefinition } from '../types.js';
+import { resolvePathWithinRoot } from './path-utils.js';
 
 export interface ListDirectoryToolConfig {
   /** Restrict listing to paths under this root. Defaults to `process.cwd()`. */
@@ -40,25 +40,12 @@ export function createListDirectoryTool(config?: ListDirectoryToolConfig): ToolD
       // Some models send tool input as a JSON string instead of an object — normalise.
       const input = typeof rawInput === 'string' ? JSON.parse(rawInput) : rawInput;
       const { path: dirPath } = input as unknown as ListDirectoryInput;
-      const resolved = resolve(allowedRoot, dirPath);
+      const resolved = resolvePathWithinRoot(allowedRoot, dirPath);
 
-      if (!resolved.startsWith(resolve(allowedRoot))) {
-        throw new Error(`Path ${dirPath} is outside the allowed root ${allowedRoot}`);
-      }
-
-      const names = await readdir(resolved);
-      const entries = await Promise.all(
-        names.map(async (name) => {
-          const entryPath = join(resolved, name);
-          const entryStat = await stat(entryPath).catch(() => null);
-          const type = entryStat?.isDirectory()
-            ? 'directory'
-            : entryStat?.isFile()
-              ? 'file'
-              : 'other';
-          return { name, type } as const;
-        }),
-      );
+      const entries = (await readdir(resolved, { withFileTypes: true })).map((entry) => ({
+        name: entry.name,
+        type: entry.isDirectory() ? 'directory' : entry.isFile() ? 'file' : 'other',
+      }));
 
       return {
         path: resolved,
