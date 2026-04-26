@@ -10,11 +10,22 @@ export function DashboardRunList(props: {
   mode: DashboardExplorerMode;
   isLoading: boolean;
   approvalError?: DashboardError;
+  actionError?: DashboardError;
+  actingRunId: string;
+  actionRunId: string;
+  actionKind: 'replay' | 'retry' | '';
+  actionMessage?: {
+    runId: string;
+    kind: 'replay' | 'retry';
+    message: string;
+  };
   approvingRunId: string;
   nextOffset: number | null;
   onSelect: (rootRunId: string) => void;
   onModeChange: (mode: DashboardExplorerMode) => void;
   onLoadMore: () => void;
+  onReplayRun: (rootRunId: string) => void;
+  onRetryRun: (runId: string) => void;
   onResolveApproval: (runId: string, approved: boolean) => void;
 }): ReactElement {
   const [copiedRunId, setCopiedRunId] = useState<string | null>(null);
@@ -72,6 +83,7 @@ export function DashboardRunList(props: {
                 <th>Session</th>
                 <th>Updated</th>
                 <th>Cost</th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -97,6 +109,18 @@ export function DashboardRunList(props: {
                   <td>{item.sessionId ? `linked ${shortId(item.sessionId)}` : 'sessionless'}</td>
                   <td>{formatDateTime(item.updatedAt)}</td>
                   <td>{formatCost(item.estimatedCostUSD)}</td>
+                  <td>
+                    <RowActions
+                      item={item}
+                      actingRunId={props.actingRunId}
+                      actionRunId={props.actionRunId}
+                      actionKind={props.actionKind}
+                      actionError={props.actionError}
+                      actionMessage={props.actionMessage}
+                      onReplayRun={props.onReplayRun}
+                      onRetryRun={props.onRetryRun}
+                    />
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -142,6 +166,16 @@ export function DashboardRunList(props: {
               <span className="dashboard-run-meta">
                 {formatTokens(item.totalPromptTokens + item.totalCompletionTokens + (item.totalReasoningTokens ?? 0))} · {formatCost(item.estimatedCostUSD)}
               </span>
+              <RowActions
+                item={item}
+                actingRunId={props.actingRunId}
+                actionRunId={props.actionRunId}
+                actionKind={props.actionKind}
+                actionError={props.actionError}
+                actionMessage={props.actionMessage}
+                onReplayRun={props.onReplayRun}
+                onRetryRun={props.onRetryRun}
+              />
               {item.pendingApproval ? (
                 <span className="dashboard-approval-band" onClick={(event) => event.stopPropagation()}>
                   {item.pendingApproval.toolName ?? 'Approval required'}
@@ -179,6 +213,44 @@ export function DashboardRunList(props: {
 export function StatusChip(props: { status: string | null | undefined }): ReactElement {
   const status = props.status ?? 'unknown';
   return <span className={`dashboard-status ${status}`}>{status}</span>;
+}
+
+function RowActions(props: {
+  item: DashboardRunListItem;
+  actingRunId: string;
+  actionRunId: string;
+  actionKind: 'replay' | 'retry' | '';
+  actionError?: DashboardError;
+  actionMessage?: {
+    runId: string;
+    kind: 'replay' | 'retry';
+    message: string;
+  };
+  onReplayRun: (rootRunId: string) => void;
+  onRetryRun: (runId: string) => void;
+}): ReactElement {
+  const isRowBusy = props.actingRunId === props.item.rootRunId;
+  const canReplay = props.item.sessionId !== null;
+  const canRetry = props.item.sessionId !== null && props.item.status === 'failed';
+  const rowMessage = props.actionMessage?.runId === props.item.rootRunId ? props.actionMessage.message : null;
+  const rowError = props.actionError && props.actionRunId === props.item.rootRunId
+    ? `${props.actionError.code}: ${props.actionError.message}`
+    : null;
+
+  return (
+    <div className="dashboard-row-actions" onClick={(event) => event.stopPropagation()}>
+      <div className="dashboard-row-action-buttons">
+        <button className="ghost-button" type="button" disabled={!canReplay || isRowBusy} onClick={() => props.onReplayRun(props.item.rootRunId)}>
+          {isRowBusy && props.actionKind === 'replay' ? 'Replaying...' : 'Replay'}
+        </button>
+        <button className="ghost-button" type="button" disabled={!canRetry || isRowBusy} onClick={() => props.onRetryRun(props.item.rootRunId)}>
+          {isRowBusy && props.actionKind === 'retry' ? 'Retrying...' : 'Retry'}
+        </button>
+      </div>
+      {rowMessage ? <span className="dashboard-row-action-note">{rowMessage}</span> : null}
+      {rowError ? <span className="dashboard-row-action-error">{rowError}</span> : null}
+    </div>
+  );
 }
 
 function formatDateTime(value: string): string {

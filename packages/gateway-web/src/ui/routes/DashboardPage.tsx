@@ -179,11 +179,18 @@ export function DashboardPage(): ReactElement {
             mode={dashboard.explorerMode}
             isLoading={dashboard.isLoading}
             approvalError={dashboard.approvalError}
+            actionError={dashboard.actionError}
+            actingRunId={dashboard.actingRunId}
+            actionRunId={dashboard.actionRunId}
+            actionKind={dashboard.actionKind}
+            actionMessage={dashboard.actionMessage}
             approvingRunId={dashboard.approvingRunId}
             nextOffset={dashboard.nextOffset}
             onSelect={dashboard.setSelectedRootRunId}
             onModeChange={dashboard.setExplorerMode}
             onLoadMore={dashboard.loadNextPage}
+            onReplayRun={(rootRunId) => void dashboard.replayRun(rootRunId)}
+            onRetryRun={(runId) => void dashboard.retryRun(runId)}
             onResolveApproval={(runId, approved) => void dashboard.resolveApproval(runId, approved)}
           />
           <DashboardInspector

@@ -281,7 +281,7 @@ export class DelegationExecutor {
     throw new DelegationError('Child run did not reach a terminal state');
   }
 
-  async resumeParentRun(parentRunId: UUID): Promise<ParentResumeResult> {
+  async resumeParentRun(parentRunId: UUID, linkedChildRunId?: UUID): Promise<ParentResumeResult> {
     const parentRun = await this.options.runStore.getRun(parentRunId);
     if (!parentRun) {
       throw new Error(`Parent run ${parentRunId} does not exist`);
@@ -293,7 +293,7 @@ export class DelegationExecutor {
       stepId: parentRun.currentStepId,
     });
 
-    const childRunId = parentRun.currentChildRunId ?? (await this.getSnapshotChildRunId(parentRunId));
+    const childRunId = parentRun.currentChildRunId ?? (await this.getSnapshotChildRunId(parentRunId)) ?? linkedChildRunId;
     if (parentRun.status !== 'awaiting_subagent') {
       if (parentRun.status === 'running' && childRunId) {
         return this.resolveStaleParentSnapshot(parentRun, childRunId);

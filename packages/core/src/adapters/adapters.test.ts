@@ -278,6 +278,47 @@ describe('BaseOpenAIChatAdapter', () => {
     });
   });
 
+  it('annotates fetch failures with the HTTP request phase', async () => {
+    const adapter = createAdapter();
+    fetchSpy.mockRejectedValueOnce(new Error('socket hangup'));
+
+    await expect(adapter.generate(simpleRequest())).rejects.toMatchObject({
+      message: 'socket hangup',
+      modelInvocationPhase: 'http_request',
+      modelInvocationAttempt: 1,
+    });
+  });
+
+  it('annotates gate wait aborts with the gate wait phase', async () => {
+    const adapter = createAdapter({ maxConcurrentRequests: 1 });
+    const firstResponse = deferred<Response>();
+    fetchSpy.mockImplementationOnce(() => firstResponse.promise);
+    const firstRequest = adapter.generate(simpleRequest());
+
+    const controller = new AbortController();
+    const secondRequest = adapter.generate({
+      ...simpleRequest(),
+      signal: controller.signal,
+    });
+    controller.abort(new Error('queue timeout'));
+
+    await expect(secondRequest).rejects.toMatchObject({
+      message: 'queue timeout',
+      modelInvocationPhase: 'gate_wait',
+      modelInvocationAttempt: 1,
+    });
+
+    firstResponse.resolve(
+      new Response(JSON.stringify(STOP_RESPONSE), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    await expect(firstRequest).resolves.toMatchObject({
+      finishReason: 'stop',
+    });
+  });
+
   it('parses structured JSON output from text content', async () => {
     const adapter = createAdapter();
     mockFetchResponse(JSON_OUTPUT_RESPONSE);

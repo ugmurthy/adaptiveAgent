@@ -68,6 +68,13 @@ When a parent run selects a synthetic delegate tool:
 14. Move the parent back to `running`.
 15. Emit `tool.completed` or `tool.failed` on the parent.
 
+Delegate retry rules:
+
+- a retryable transient child model failure such as timeout should prefer child `interrupted` plus in-place `resume(childRunId)`
+- if the child is already terminal `failed` and policy still allows retry, keep the parent on the same logical delegate tool execution and create a new child attempt
+- the parent remains `awaiting_subagent` across retries and must emit `tool.failed` only once the delegation boundary is conclusively terminal
+- every fresh child attempt after the first should emit `delegate.retried`
+
 Pseudo-code:
 
 ```ts
@@ -190,6 +197,12 @@ If the child returns:
 
 then the parent delegate step should fail as a tool failure.
 
+Before surfacing a child failure to the parent, the runtime should evaluate delegate retry policy:
+
+- if `errorCode` is retryable and the child is `interrupted`, resume the same child
+- if `errorCode` is retryable and the child is terminal `failed`, create a fresh child attempt for the same parent delegate execution
+- otherwise map the failure directly to parent `tool.failed`
+
 Recommended mapping:
 
 - parent event: `tool.failed`
@@ -216,8 +229,8 @@ When `resume(parentRunId)` is called:
 6. Load the child run.
 7. Branch on child status:
    - if child is `succeeded`, map the stored child result into the parent step and continue
-   - if child is `failed`, map the error into the parent step and continue failure handling
-   - if child is `interrupted`, resume the child first or fail it explicitly
+   - if child is `failed`, retry the delegate boundary when policy allows, otherwise map the error into the parent step and continue failure handling
+   - if child is `interrupted`, resume the child first when the interruption is retryable, otherwise fail it explicitly
    - if child is `running` or `awaiting_approval`, do not advance the parent; either wait or drive child progress depending on the execution model
    - if child is missing, fail the parent because the waiting boundary cannot be resolved safely
 8. Persist a new parent snapshot once the wait boundary has been resolved.
@@ -233,6 +246,7 @@ Resume must be lease-protected and idempotent:
 - If a repeated `resume(parentRunId)` races with a previous successful parent resolution, the second call should observe the resolved parent state or terminal state and must not emit a second parent `tool.completed`.
 - If the child is active but its lease is expired, resume the child or hand it to the recovery scanner before advancing the parent.
 - If the child is active and leased elsewhere, keep the parent waiting.
+- If the child is terminal `failed` with a retryable delegate error and retry budget remains, create a new child attempt, update `currentChildRunId`, emit `delegate.retried`, and keep the parent waiting.
 
 Pseudo-code:
 
@@ -279,6 +293,24 @@ When `resume(childRunId)` is called directly:
 5. Emit parent-side `tool.completed` or `tool.failed` only once.
 
 This requires idempotent parent resolution logic so repeated resumes do not double-complete the same parent step.
+
+When the child failure was caused by transient model timeout or another retryable runtime interruption, `resume(childRunId)` is the preferred recovery path because it preserves completed child steps and tool ledger reuse inside the same child run.
+
+## 7A. Delegate Retry Attempt Algorithm
+
+When a parent is waiting on a terminal failed child and delegate retry policy allows another attempt:
+
+1. Load the parent run, parent snapshot, and the latest delegate attempt record for the parent tool call.
+2. Confirm the failed child belongs to the same parent run, parent step, and delegate profile.
+3. Confirm the child failure code is retryable and `attempt < maxDelegateRetries + 1`.
+4. Create a new child run for the next attempt with the same `parentRunId`, `parentStepId`, `delegateName`, and inherited `rootRunId`.
+5. Insert a new `delegate_attempts` row for the next attempt.
+6. Update the parent `currentChildRunId` to the new child run and keep status `awaiting_subagent`.
+7. Emit `delegate.retried` on the parent run.
+8. Execute the new child attempt.
+9. Resolve the parent only after one attempt succeeds or the retry budget is exhausted.
+
+This keeps `delegate.*` retryability inside runtime execution state rather than encoding retry as a new persisted plan step.
 
 ## 8. Tool Ledger Resume Algorithm
 
@@ -367,6 +399,8 @@ The runtime should make deliberate decisions for these cases:
 - child run exists but parent linkage fields do not match
 - child run succeeds but output fails parent-side schema validation
 - child run requests approval or clarification in a mode that disallows it
+- child run fails with retryable model timeout after some child steps already succeeded
+- parent resolves a retryable child failure as terminal even though delegate retry budget remains
 - repeated resume calls race to resolve the same parent wait boundary
 - completed tool ledger exists but the latest continuation snapshot is stale
 - gateway session points at a missing runtime run
@@ -387,3 +421,5 @@ High-value behavioral tests for this design are:
 8. model tool-call snapshot resumes from the queued tool call without calling the model again
 9. repeated `resume()` on a terminal run returns the stored result
 10. gateway reconnect settles terminal runs and resumes expired active leases
+11. retryable child timeout resumes the same child run and reuses completed child tool work
+12. terminal failed child with retryable error creates a new delegate attempt and emits `delegate.retried`

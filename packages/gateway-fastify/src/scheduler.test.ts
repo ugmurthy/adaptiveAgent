@@ -603,4 +603,60 @@ describe('createSchedulerLoop', () => {
     const dispatched = await scheduler.tick();
     expect(dispatched).toBe(0);
   });
+
+  it('stop() waits for an in-flight tick to finish', async () => {
+    const releaseTick = createDeferred<void>();
+    const stores = createInMemoryGatewayStores();
+    const scheduler = createSchedulerLoop({
+      gatewayConfig: createTestGatewayConfig(),
+      agentRegistry: createTestAgentRegistry(),
+      stores: {
+        ...stores,
+        cronJobs: {
+          ...stores.cronJobs,
+          listDue: async () => {
+            await releaseTick.promise;
+            return [];
+          },
+        },
+      },
+      pollIntervalMs: 999_999,
+    });
+
+    const tickPromise = scheduler.tick();
+    await Promise.resolve();
+
+    let stopResolved = false;
+    const stopPromise = scheduler.stop().then(() => {
+      stopResolved = true;
+    });
+
+    await Promise.resolve();
+    expect(stopResolved).toBe(false);
+
+    releaseTick.resolve();
+
+    await stopPromise;
+    await expect(tickPromise).resolves.toBe(0);
+    expect(stopResolved).toBe(true);
+  });
 });
+
+function createDeferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+
+  return {
+    promise,
+    resolve,
+    reject,
+  };
+}

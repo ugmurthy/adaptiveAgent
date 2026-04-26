@@ -61,6 +61,7 @@ export type EventType =
   | 'tool.completed'
   | 'tool.failed'
   | 'delegate.spawned'
+  | 'delegate.retried'
   | 'approval.requested'
   | 'approval.resolved'
   | 'clarification.requested'
@@ -78,6 +79,8 @@ export interface DelegationPolicy {
   allowRecursiveDelegation?: boolean;
   childRunsMayRequestApproval?: boolean;
   childRunsMayRequestClarification?: boolean;
+  maxDelegateRetries?: number;
+  retryableChildErrorCodes?: string[];
 }
 
 export interface DelegateDefinition {
@@ -105,6 +108,18 @@ export interface DelegateSpawnedPayload {
   parentStepId: string;
   rootRunId: UUID;
   delegationDepth: number;
+}
+
+export interface DelegateRetriedPayload {
+  toolName: string;
+  delegateName: string;
+  parentRunId: UUID;
+  parentStepId: string;
+  rootRunId: UUID;
+  previousChildRunId: UUID;
+  childRunId: UUID;
+  attempt: number;
+  retryReason: string;
 }
 ```
 
@@ -176,6 +191,7 @@ Semantics:
 - `delegateName` is the stable delegate profile used to create the child.
 - `delegationDepth` is `0` for the root run, `1` for direct children, and so on.
 - `currentChildRunId` is the single active child run the parent is waiting on.
+- delegate retry history belongs to runtime execution state, not to a persisted plan step.
 
 ### 2.4 `RunStore`
 
@@ -234,6 +250,7 @@ When the parent invokes a delegate tool:
 
 - `tool.started` payload should include `toolName`, `delegateName`, and `childRunId`.
 - `delegate.spawned` payload should follow `DelegateSpawnedPayload`.
+- `delegate.retried` payload should follow `DelegateRetriedPayload`.
 - `tool.completed` and `tool.failed` payload should include `toolName`, `delegateName`, and `childRunId`.
 
 The child run continues to emit ordinary `run.*`, `step.*`, and `tool.*` events under its own `runId`.
@@ -291,6 +308,7 @@ The runtime should enforce all of the following:
 - recursive self-delegation is disallowed unless explicitly enabled
 - interrupting a parent should best-effort interrupt its active child
 - resuming a parent in `awaiting_subagent` must inspect the child run before continuing
+- retrying a delegate must stay inside the same logical parent `delegate.*` execution
 
 ### 3.3 Child Run Interactions
 
@@ -336,6 +354,28 @@ create index agent_runs_root_idx on agent_runs (root_run_id, created_at desc);
 create index agent_runs_parent_idx on agent_runs (parent_run_id, created_at desc);
 create index agent_runs_delegate_idx on agent_runs (delegate_name, created_at desc);
 create index agent_runs_current_child_idx on agent_runs (current_child_run_id);
+```
+
+Add a retry history table for logical parent delegate executions:
+
+```sql
+create table delegate_attempts (
+  parent_run_id uuid not null references agent_runs(id) on delete cascade,
+  parent_step_id text not null,
+  parent_tool_call_id text not null,
+  attempt integer not null,
+  delegate_name text not null,
+  child_run_id uuid not null references agent_runs(id) on delete cascade,
+  status text not null,
+  retryable boolean,
+  retry_reason text,
+  error_code text,
+  error_message text,
+  started_at timestamptz not null default now(),
+  completed_at timestamptz,
+  primary key (parent_run_id, parent_step_id, parent_tool_call_id, attempt),
+  unique (child_run_id)
+);
 ```
 
 For a fresh schema, the `agent_runs` table becomes:
@@ -435,3 +475,9 @@ A typical delegated sequence looks like this:
 8. parent continues its own next step
 
 Every run keeps its own event sequence. Tree relationships are reconstructed using `rootRunId`, `parentRunId`, and `currentChildRunId`.
+
+When a child fails with a retryable error such as model timeout:
+
+- if the child is `interrupted`, the runtime should prefer `resume(childRunId)` so completed child work can be reused
+- if the child is terminal `failed`, the runtime may create a fresh child attempt linked to the same parent step and emit `delegate.retried`
+- the parent remains in `awaiting_subagent` until one child attempt succeeds or the retry budget is exhausted

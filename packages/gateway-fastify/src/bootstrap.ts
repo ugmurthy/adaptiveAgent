@@ -37,6 +37,7 @@ export interface BootstrapGatewayOptions {
   stores?: GatewayStores;
   postgresClient?: PostgresClient | PostgresPoolClient;
   scheduler?: Pick<SchedulerLoopOptions, 'idFactory' | 'leaseOwner' | 'now' | 'onError' | 'pollIntervalMs'>;
+  onShutdownProgress?: (message: string) => void;
 }
 
 export interface BootstrappedGateway {
@@ -213,22 +214,26 @@ export async function bootstrapGateway(options: BootstrapGatewayOptions = {}): P
         bootId,
         pid: process.pid,
       });
-      scheduler?.stop();
+      options.onShutdownProgress?.('Draining in-flight background work...');
+      await scheduler?.stop();
       scheduler = undefined;
-      cronFileSync?.stop();
+      await cronFileSync?.stop();
       cronFileSync = undefined;
       if (startScheduler) {
         app.server.off('listening', startScheduler);
       }
       app.server.off('listening', logGatewayStarted);
-      agentRuntimeLogger?.flush?.();
+      options.onShutdownProgress?.('Flushing runtime logs...');
+      await flushAdaptiveAgentLogger(agentRuntimeLogger);
       requestLogger?.info(GATEWAY_LOG_EVENTS.gateway_stopped, 'Gateway server stopped', {
         bootId,
         pid: process.pid,
         durationMs: Date.now() - bootStartedAtMs,
       });
+      options.onShutdownProgress?.('Closing request logs and persistence stores...');
       await requestLogger?.close();
       await storeBundle?.close?.();
+      options.onShutdownProgress?.('Gateway shutdown complete.');
     });
 
     return {
@@ -246,11 +251,43 @@ export async function bootstrapGateway(options: BootstrapGatewayOptions = {}): P
       },
     };
   } catch (error) {
-    agentRuntimeLogger?.flush?.();
+    await flushAdaptiveAgentLogger(agentRuntimeLogger);
     await requestLogger?.close();
     await storeBundle?.close?.();
     throw error;
   }
+}
+
+async function flushAdaptiveAgentLogger(logger: AdaptiveAgentLogger | undefined): Promise<void> {
+  if (!logger || typeof logger.flush !== 'function') {
+    return;
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+
+    const finish = (error?: Error | null) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve();
+    };
+
+    try {
+      logger.flush((error?: Error | null) => {
+        finish(error);
+      });
+    } catch (error) {
+      reject(error);
+    }
+  });
 }
 
 function resolveCronFileSyncOptions(loadedGatewayConfig: LoadedConfig<GatewayConfig>): {

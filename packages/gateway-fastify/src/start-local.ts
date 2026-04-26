@@ -40,6 +40,9 @@ async function main(): Promise<void> {
     agentConfigDir: AGENT_CONFIG_DIR,
     logDir,
     moduleRegistry,
+    onShutdownProgress: (message) => {
+      console.log(message);
+    },
   });
 
   console.log('AdaptiveAgent gateway is running.');
@@ -68,10 +71,29 @@ async function main(): Promise<void> {
     `- Auth: jwt (${process.env.GATEWAY_JWT_SECRET ? 'secret from GATEWAY_JWT_SECRET' : 'using local dev default; set GATEWAY_JWT_SECRET to override'})`,
   );
 
-  const shutdown = async (signal: NodeJS.Signals) => {
-    console.log(`\nReceived ${signal}, shutting down gateway...`);
-    await gateway.app.close();
-    process.exit(0);
+  let shutdownPromise: Promise<void> | undefined;
+
+  const shutdown = (signal: NodeJS.Signals): Promise<void> => {
+    if (shutdownPromise) {
+      return shutdownPromise;
+    }
+
+    shutdownPromise = (async () => {
+      console.log(`\nReceived ${signal}, shutting down gateway...`);
+
+      try {
+        await gateway.app.close();
+        process.exitCode = signal === 'SIGINT' ? 130 : 0;
+      } catch (error) {
+        process.exitCode = 1;
+        console.error(
+          'Gateway shutdown failed.',
+          error instanceof Error ? error.message : 'Unknown shutdown error.',
+        );
+      }
+    })();
+
+    return shutdownPromise;
   };
 
   process.once('SIGINT', () => {

@@ -5,6 +5,8 @@ import type {
   DashboardMessagesResponse,
   DashboardMessagesView,
   DashboardPlansResponse,
+  DashboardReplayRunResult,
+  DashboardRetryRunResult,
   DashboardRunListResult,
   DashboardTimelineResponse,
   TraceReport,
@@ -17,6 +19,8 @@ export interface DashboardClient {
   getTimeline(rootRunId: string, options: { focusRunId: string }): Promise<DashboardTimelineResponse>;
   getPlans(rootRunId: string, options: { focusRunId: string }): Promise<DashboardPlansResponse>;
   deleteRun(rootRunId: string): Promise<DashboardDeleteRunResult>;
+  replayRun(rootRunId: string): Promise<DashboardReplayRunResult>;
+  retryRun(runId: string): Promise<DashboardRetryRunResult>;
   resolveApproval(runId: string, approved: boolean): Promise<void>;
 }
 
@@ -28,6 +32,8 @@ export function createDashboardClient(resolveToken: () => Promise<string>): Dash
     getTimeline: (rootRunId, options) => request(`/api/runs/${encodeURIComponent(rootRunId)}/timeline?${buildDetailSearch(options)}`, resolveToken),
     getPlans: (rootRunId, options) => request(`/api/runs/${encodeURIComponent(rootRunId)}/plans?${buildDetailSearch(options)}`, resolveToken),
     deleteRun: (rootRunId) => request(`/api/runs/${encodeURIComponent(rootRunId)}`, resolveToken, { method: 'DELETE' }),
+    replayRun: (rootRunId) => request(`/api/runs/${encodeURIComponent(rootRunId)}/replay`, resolveToken, { method: 'POST' }),
+    retryRun: (runId) => request(`/api/runs/${encodeURIComponent(runId)}/retry`, resolveToken, { method: 'POST' }),
     resolveApproval: async (runId, approved) => {
       await request(`/api/runs/${encodeURIComponent(runId)}/approval`, resolveToken, {
         method: 'POST',

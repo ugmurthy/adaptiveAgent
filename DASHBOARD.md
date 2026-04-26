@@ -291,6 +291,63 @@ interface DashboardDeleteSessionlessRunResult {
 }
 ```
 
+## Replay Root Run
+
+```txt
+POST /api/runs/:rootRunId/replay
+```
+
+Reconnects the latest linked gateway run session for a root run and restores the latest known runtime state for that session.
+
+This route is intended for dashboard replay buttons on linked runs. Sessionless runs are rejected.
+
+Response:
+
+```ts
+interface DashboardReplayRunResult {
+  sessionId: string;
+  rootRunId: string;
+  runId: string | null;
+  status: string;
+  policy: string;
+  replayedFrameType: 'run.output' | 'approval.requested' | null;
+  pendingApproval: DashboardPendingApproval | null;
+}
+```
+
+Typical `policy` values mirror gateway reconnect behavior such as `terminal_result`, `terminal_replay`, `pending_approval`, `resumed`, or `session_only`.
+
+When no linked run session exists, the route returns:
+
+```json
+{
+  "type": "error",
+  "code": "replay_session_unavailable",
+  "message": "No gateway run session is linked to root run \"...\". Replay is not available from the dashboard for sessionless runs."
+}
+```
+
+## Retry Run
+
+```txt
+POST /api/runs/:runId/retry
+```
+
+Bridges to the existing gateway `run.retry` flow. The `:runId` parameter may be either:
+
+- a failed run id linked to a gateway run session
+- a linked root run id, in which case the gateway resolves the latest run-session link for that root run
+
+The dashboard should normally call this route with the row's `rootRunId`.
+
+Response:
+
+```ts
+type DashboardRetryRunResult =
+  | RunOutputFrame
+  | ApprovalRequestedFrame;
+```
+
 ## Resolve Approval
 
 ```txt
@@ -341,6 +398,7 @@ Common dashboard errors:
 | `401` | `auth_required` | Missing authenticated principal. |
 | `403` | `session_forbidden` | Authenticated principal is not an admin. |
 | `409` | `approval_session_unavailable` | Approval cannot be resolved without a linked gateway session. |
+| `409` | `replay_session_unavailable` | Replay was requested for a root run with no linked gateway run session. |
 | `409` | `session_active` | Session deletion was requested for a running or approval-blocked session. |
 | `409` | `run_linked_to_session` | Sessionless run deletion was requested for a root run linked to a gateway session. |
 | `409` | `run_not_terminal` | Sessionless run deletion was requested for a root run tree with non-terminal runs. |

@@ -62,6 +62,7 @@ export type EventType =
   | 'tool.completed'
   | 'tool.failed'
   | 'delegate.spawned'
+  | 'delegate.retried'
   | 'approval.requested'
   | 'approval.resolved'
   | 'clarification.requested'
@@ -122,6 +123,8 @@ export interface DelegationPolicy {
   allowRecursiveDelegation?: boolean;
   childRunsMayRequestApproval?: boolean;
   childRunsMayRequestClarification?: boolean;
+  maxDelegateRetries?: number;
+  retryableChildErrorCodes?: string[];
 }
 
 export interface RunRequest {
@@ -194,6 +197,18 @@ export interface DelegateSpawnedPayload {
   parentStepId: string;
   rootRunId: UUID;
   delegationDepth: number;
+}
+
+export interface DelegateRetriedPayload {
+  toolName: string;
+  delegateName: string;
+  parentRunId: UUID;
+  parentStepId: string;
+  rootRunId: UUID;
+  previousChildRunId: UUID;
+  childRunId: UUID;
+  attempt: number;
+  retryReason: string;
 }
 
 export interface AdaptiveAgentOptions {
@@ -359,6 +374,22 @@ export interface AgentRun {
   metadata?: Record<string, JsonValue>;
   createdAt: string;
   updatedAt: string;
+  completedAt?: string;
+}
+
+export interface DelegateAttempt {
+  parentRunId: UUID;
+  parentStepId: string;
+  parentToolCallId: string;
+  attempt: number;
+  delegateName: string;
+  childRunId: UUID;
+  status: 'started' | 'succeeded' | 'failed' | 'interrupted';
+  retryable?: boolean;
+  retryReason?: string;
+  errorCode?: string;
+  errorMessage?: string;
+  startedAt: string;
   completedAt?: string;
 }
 
@@ -529,6 +560,7 @@ The reserved `delegate.` namespace belongs to the runtime. Host-authored persist
 - `delegateName` records which delegate profile created the child
 - `delegationDepth` is `0` for root runs
 - `currentChildRunId` is the one active child run the parent is waiting on
+- retry history for a delegate boundary lives in `DelegateAttempt` records rather than by mutating a persisted plan step
 
 This is enough to reconstruct a run tree without creating a general orchestration graph.
 
@@ -551,6 +583,12 @@ The minimal v1.4 contract does not require the runtime to roll descendant usage 
 The first multi-agent iteration keeps child runs non-interactive.
 
 If a child run reaches an approval or clarification terminal envelope, the runtime should surface that to the parent as a delegate tool failure instead of exposing nested interaction state to the caller.
+
+Retryable child failures should stay inside the same parent delegate boundary:
+
+- `interrupted` child runs should be resumed in place when possible
+- terminal child `failed` runs may create a new `DelegateAttempt` when policy allows retry
+- parent `tool.failed` should be emitted only after delegate retry budget is exhausted or the failure is non-retryable
 
 ## 3. Postgres Schema
 
@@ -725,6 +763,28 @@ create table tool_executions (
 create index tool_executions_run_idx on tool_executions (run_id, started_at desc);
 create index tool_executions_status_idx on tool_executions (status, started_at asc);
 create index tool_executions_child_run_idx on tool_executions (child_run_id);
+
+create table delegate_attempts (
+  parent_run_id uuid not null references agent_runs(id) on delete cascade,
+  parent_step_id text not null,
+  parent_tool_call_id text not null,
+  attempt integer not null,
+  delegate_name text not null,
+  child_run_id uuid not null references agent_runs(id) on delete cascade,
+  status text not null,
+  retryable boolean,
+  retry_reason text,
+  error_code text,
+  error_message text,
+  started_at timestamptz not null default now(),
+  completed_at timestamptz,
+  primary key (parent_run_id, parent_step_id, parent_tool_call_id, attempt),
+  unique (child_run_id)
+);
+
+create index delegate_attempts_parent_idx
+  on delegate_attempts (parent_run_id, parent_step_id, parent_tool_call_id, attempt desc);
+create index delegate_attempts_child_idx on delegate_attempts (child_run_id);
 ```
 
 ## 4. Schema Notes
@@ -764,13 +824,22 @@ create index tool_executions_child_run_idx on tool_executions (child_run_id);
 - durable tool execution ledger keyed by `idempotency_key`
 - stores exact start/end timestamps for execution forensics
 - stores raw `input` when capture policy allows so traces do not need to reconstruct from event payloads
-- `child_run_id` links parent `delegate.*` executions to the spawned child run when delegation occurs
+- `child_run_id` links a delegate tool execution to the current or latest child run
+
+### `delegate_attempts`
+
+- preserves retry history for one logical parent `delegate.*` tool execution
+- lets the runtime retry delegation without overwriting the original child run record
+- keeps the parent delegate boundary stable while allowing a fresh terminal child attempt when needed
+- `attempt = 1` is the original child run; later attempts are explicit runtime retries
 
 ### `plan_executions`
 
 - binds a persisted plan to a run
 - allows later analysis of how a preserved plan behaved across multiple executions
 - `attempt` allows explicit retries without overwriting the original execution record
+
+Delegate retries should follow the same principle: retries create a new `DelegateAttempt` row instead of mutating prior child execution history.
 
 ## 5. Migration From v1.3
 
@@ -835,6 +904,7 @@ Runtime persistence provides these guarantees:
 - Model calls may replay unless the model response was durably represented in a snapshot before tool execution. A snapshotted model tool-call response may resume from the queued pending tool call instead of calling the model again.
 - Terminal run records are stable. Repeated `resume()` calls for `succeeded`, `failed`, or `cancelled` runs should return the stored result or failure without advancing the event log or re-entering the execution loop.
 - Parent and child delegate resolution is idempotent. A parent waiting on a terminal child must consume the existing child result exactly once, and linkage mismatches must fail explicitly.
+- Retryable delegate failures are resolved inside the delegation boundary. The parent remains on the same logical delegate tool execution while the runtime resumes an interrupted child or creates a new `DelegateAttempt`.
 - Gateway reconnect is a session reattachment policy, not a new execution primitive. It should re-present pending approval or clarification state, settle terminal run state, resume expired active run leases when supported, and otherwise subscribe the client as an observer.
 - Recovery scanners may identify inconsistent or expired states, but they must acquire the run lease before modifying any run.
 

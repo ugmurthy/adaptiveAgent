@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { syncCronFiles } from './cron-file-sync.js';
+import { createCronFileSyncLoop, syncCronFiles } from './cron-file-sync.js';
 import { createInMemoryGatewayStores, type GatewayCronJobRecord } from './stores.js';
 
 const tempDirectories: string[] = [];
@@ -105,4 +105,70 @@ describe('cron file sync', () => {
       path: join(dir, 'ipl.json'),
     });
   });
+
+  it('stop() waits for an in-flight sync to finish', async () => {
+    const releaseSync = createDeferred<void>();
+    const stores = createInMemoryGatewayStores();
+    const dir = await createTempDir();
+    await writeCronJob(dir, createCronJob());
+    const blockingCronJobs = {
+      get: async (id: string) => {
+        await releaseSync.promise;
+        return stores.cronJobs.get(id);
+      },
+      create: (job: GatewayCronJobRecord) => stores.cronJobs.create(job),
+      update: (job: GatewayCronJobRecord) => stores.cronJobs.update(job),
+      listDue: (nowIso: string) => stores.cronJobs.listDue(nowIso),
+      listAll: () => stores.cronJobs.listAll(),
+      delete: (id: string) => stores.cronJobs.delete(id),
+    };
+    const inFlightSync = createCronFileSyncLoop({
+      dir,
+      stores: {
+        ...stores,
+        cronJobs: blockingCronJobs,
+      },
+      pollIntervalMs: 999_999,
+    });
+
+    try {
+      const tickPromise = inFlightSync.tick();
+      await Promise.resolve();
+
+      let stopResolved = false;
+      const stopPromise = inFlightSync.stop().then(() => {
+        stopResolved = true;
+      });
+
+      await Promise.resolve();
+      expect(stopResolved).toBe(false);
+
+      releaseSync.resolve();
+
+      await stopPromise;
+      await expect(tickPromise).resolves.toMatchObject({ scanned: 1, imported: 1, updated: 0, skipped: 0, failed: 0 });
+      expect(stopResolved).toBe(true);
+    } finally {
+      await inFlightSync.stop();
+    }
+  });
 });
+
+function createDeferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+
+  return {
+    promise,
+    resolve,
+    reject,
+  };
+}

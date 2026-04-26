@@ -307,6 +307,145 @@ describe('createGatewayServer', () => {
     });
   });
 
+  it('replays a linked root run from the dashboard API', async () => {
+    const stores = createInMemoryGatewayStores();
+    await createStoredSession(stores, {
+      id: 'session-replay-1',
+      channelId: 'web',
+      authSubject: 'admin-token',
+      agentId: 'support-agent',
+      invocationMode: 'run',
+      status: 'failed',
+      currentRunId: 'run-replay-1',
+      currentRootRunId: 'root-replay-1',
+      lastCompletedRootRunId: 'root-replay-1',
+    });
+    await stores.sessionRunLinks.append({
+      sessionId: 'session-replay-1',
+      runId: 'run-replay-1',
+      rootRunId: 'root-replay-1',
+      invocationKind: 'run',
+      createdAt: '2026-04-08T10:05:00.000Z',
+    });
+
+    const app = await createGatewayServer(baseConfig, {
+      auth: createStaticAuthProvider(['admin']),
+      stores,
+      agentRegistry: createGatewayTestAgentRegistry({
+        runtimeRuns: {
+          'run-replay-1': {
+            id: 'run-replay-1',
+            rootRunId: 'root-replay-1',
+            status: 'failed',
+            result: { summary: 'replayed result' },
+            errorMessage: 'run failed earlier',
+          } as RuntimeRunRecord,
+        },
+      }),
+    });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/runs/root-replay-1/replay',
+      headers: { authorization: 'Bearer admin-token' },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      sessionId: 'session-replay-1',
+      rootRunId: 'root-replay-1',
+      runId: 'run-replay-1',
+      status: 'failed',
+      policy: 'terminal_result',
+      replayedFrameType: 'run.output',
+      pendingApproval: null,
+    });
+  });
+
+  it('rejects dashboard replay for sessionless runs', async () => {
+    const app = await createGatewayServer(baseConfig, {
+      auth: createStaticAuthProvider(['admin']),
+      stores: createInMemoryGatewayStores(),
+      agentRegistry: createGatewayTestAgentRegistry({ runtimeRuns: {} }),
+    });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/runs/root-sessionless/replay',
+      headers: { authorization: 'Bearer admin-token' },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({
+      type: 'error',
+      code: 'replay_session_unavailable',
+      message: 'No gateway run session is linked to root run "root-sessionless". Replay is not available from the dashboard for sessionless runs.',
+    });
+  });
+
+  it('retries a linked failed run from the dashboard API', async () => {
+    const stores = createInMemoryGatewayStores();
+    await createStoredSession(stores, {
+      id: 'session-retry-1',
+      channelId: 'web',
+      authSubject: 'admin-token',
+      agentId: 'support-agent',
+      invocationMode: 'run',
+      status: 'failed',
+      currentRunId: 'run-failed-1',
+      currentRootRunId: 'root-retry-1',
+    });
+    await stores.sessionRunLinks.append({
+      sessionId: 'session-retry-1',
+      runId: 'run-failed-1',
+      rootRunId: 'root-retry-1',
+      invocationKind: 'run',
+      createdAt: '2026-04-08T10:05:00.000Z',
+    });
+
+    const retry = vi.fn(async () => ({
+      status: 'success' as const,
+      runId: 'run-failed-1',
+      output: { recovered: true },
+      stepsUsed: 4,
+      usage: { promptTokens: 12, completionTokens: 6, estimatedCostUSD: 0.0021 },
+    }));
+
+    const app = await createGatewayServer(baseConfig, {
+      auth: createStaticAuthProvider(['admin']),
+      stores,
+      agentRegistry: createGatewayTestAgentRegistry({
+        retry,
+        runtimeRuns: {
+          'run-failed-1': {
+            id: 'run-failed-1',
+            rootRunId: 'root-retry-1',
+            status: 'failed',
+          } as RuntimeRunRecord,
+        },
+      }),
+    });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/runs/root-retry-1/retry',
+      headers: { authorization: 'Bearer admin-token' },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      type: 'run.output',
+      runId: 'run-failed-1',
+      rootRunId: 'root-retry-1',
+      sessionId: 'session-retry-1',
+      status: 'succeeded',
+    });
+    expect(retry).toHaveBeenCalledWith('run-failed-1');
+  });
+
   it('deletes gateway sessions with no linked root runs', async () => {
     const querySpy = vi.fn(async <TRow extends Record<string, unknown>>(sql: string, params?: unknown[]) => {
       if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') {

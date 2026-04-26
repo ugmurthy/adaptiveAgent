@@ -610,6 +610,81 @@ function registerDashboardRunRoutes(app: FastifyInstance, context: DashboardRunR
       throw error;
     }
   });
+
+  app.post<{ Params: { rootRunId: string } }>('/api/runs/:rootRunId/replay', async (request, reply) => {
+    const authContext = await requireGatewayAdminHttpRequest(request, reply, context.auth);
+    if (!authContext) {
+      return reply;
+    }
+    if (!context.agentRegistry) {
+      return reply.code(503).send(createGatewayHttpError('agent_registry_unavailable', 'Run replay requires an agent registry.'));
+    }
+
+    const links = await context.stores.sessionRunLinks.listByRootRunId(request.params.rootRunId);
+    const latestRunLink = links.filter((link) => link.invocationKind === 'run').at(-1);
+    if (!latestRunLink) {
+      return reply.code(409).send(createGatewayHttpError(
+        'replay_session_unavailable',
+        `No gateway run session is linked to root run "${request.params.rootRunId}". Replay is not available from the dashboard for sessionless runs.`,
+      ));
+    }
+
+    try {
+      const reconnectState = await restoreActiveSession(latestRunLink.sessionId, {
+        stores: context.stores,
+        agentRegistry: context.agentRegistry,
+        authContext,
+        now: context.now,
+        staleLeaseHeartbeatBefore: context.staleLeaseHeartbeatBefore,
+      });
+      return {
+        sessionId: reconnectState.session.id,
+        rootRunId: reconnectState.session.currentRootRunId ?? latestRunLink.rootRunId ?? request.params.rootRunId,
+        runId: reconnectState.session.currentRunId ?? latestRunLink.runId ?? null,
+        status: reconnectState.session.status,
+        policy: reconnectState.policy,
+        replayedFrameType: reconnectState.recoveryFrame?.type ?? null,
+        pendingApproval: reconnectState.pendingApproval ?? null,
+      };
+    } catch (error) {
+      if (error instanceof ProtocolValidationError) {
+        return reply.code(error.code === 'session_forbidden' ? 403 : 409).send(createGatewayHttpError(error.code, error.message, error.details));
+      }
+      throw error;
+    }
+  });
+
+  app.post<{ Params: { runId: string } }>('/api/runs/:runId/retry', async (request, reply) => {
+    const authContext = await requireGatewayAdminHttpRequest(request, reply, context.auth);
+    if (!authContext) {
+      return reply;
+    }
+    if (!context.agentRegistry) {
+      return reply.code(503).send(createGatewayHttpError('agent_registry_unavailable', 'Run retry requires an agent registry.'));
+    }
+
+    try {
+      return await executeGatewayRunRetry({
+        type: 'run.retry',
+        runId: request.params.runId,
+        metadata: {
+          source: 'dashboard',
+        },
+      }, {
+        gatewayConfig: context.gatewayConfig,
+        agentRegistry: context.agentRegistry,
+        stores: context.stores,
+        authContext,
+        hooks: context.hooks,
+        now: context.now,
+      });
+    } catch (error) {
+      if (error instanceof ProtocolValidationError) {
+        return reply.code(error.code === 'session_forbidden' ? 403 : 409).send(createGatewayHttpError(error.code, error.message, error.details));
+      }
+      throw error;
+    }
+  });
 }
 
 async function buildGatewayStatusReport(stores: GatewayStores, nowFactory: (() => Date) | undefined): Promise<JsonObject> {

@@ -30,7 +30,7 @@ export interface SchedulerLoopOptions {
 }
 
 export interface SchedulerHandle {
-  stop(): void;
+  stop(): Promise<void>;
   tick(): Promise<number>;
 }
 
@@ -52,25 +52,45 @@ export function createSchedulerLoop(options: SchedulerLoopOptions): SchedulerHan
   const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   let timer: ReturnType<typeof setInterval> | undefined;
   let running = false;
+  let activeTick: Promise<number> | undefined;
+
+  const runTick = (): Promise<number> => {
+    if (!running) {
+      return Promise.resolve(0);
+    }
+
+    if (activeTick) {
+      return activeTick;
+    }
+
+    const tickPromise = executeTick(options).finally(() => {
+      if (activeTick === tickPromise) {
+        activeTick = undefined;
+      }
+    });
+    activeTick = tickPromise;
+    return tickPromise;
+  };
 
   const handle: SchedulerHandle = {
-    stop() {
+    async stop() {
       if (timer) {
         clearInterval(timer);
         timer = undefined;
       }
       running = false;
+      await activeTick?.catch(() => {});
     },
     async tick(): Promise<number> {
-      return executeTick(options);
+      return runTick();
     },
   };
 
   running = true;
   timer = setInterval(async () => {
-    if (!running) return;
+    if (!running || activeTick) return;
     try {
-      await executeTick(options);
+      await runTick();
     } catch {
       // poll loop swallows top-level errors; per-job errors go to onError
     }

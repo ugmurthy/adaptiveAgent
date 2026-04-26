@@ -82,8 +82,17 @@ interface ToolBudgetUsage {
 
 interface RunContinuationOptions {
   outputSchema?: JsonSchema;
-  retryFailedMaxStepsChild?: boolean;
+  retryFailedChild?: boolean;
 }
+
+type FailedRunRetryability =
+  | { retryable: true; failureKind: FailureKind }
+  | { retryable: false; reason: string; failureKind: FailureKind };
+
+type LinkedDelegateChildRun =
+  | { kind: 'linked'; childRun: AgentRun }
+  | { kind: 'missing'; reason: string }
+  | { kind: 'invalid'; reason: string; childRun?: AgentRun };
 
 const DEFAULT_AGENT_DEFAULTS = {
   maxSteps: 30,
@@ -748,50 +757,10 @@ export class AdaptiveAgent {
       };
     }
 
-    let currentRun = run;
     await this.acquireLeaseOrThrow(run.id);
 
     try {
-      currentRun = await this.refreshRun(run.id);
-
-      if (currentRun.status === 'awaiting_subagent') {
-        try {
-          currentRun = await this.resumeAwaitingParent(currentRun, state, true);
-        } catch (error) {
-          if (error instanceof DelegationError) {
-            return this.failRun(currentRun, state, error.message, error.code);
-          }
-
-          return interruptResult(
-            currentRun.id,
-            state.stepsUsed,
-            currentRun.usage,
-            error instanceof Error ? error.message : String(error),
-          );
-        }
-      }
-
-      if (currentRun.status === 'interrupted') {
-        currentRun = await this.transitionRun(currentRun, 'running');
-        this.logLifecycle('info', 'run.resumed', {
-          ...runLogBindings(currentRun),
-          stepId: currentRun.currentStepId,
-        });
-        await this.emit({
-          runId,
-          stepId: currentRun.currentStepId,
-          type: 'run.resumed',
-          schemaVersion: 1,
-          payload: {
-            status: 'running',
-          },
-        });
-      }
-
-      return await this.runWithExistingRun(runId, {
-        outputSchema: state.outputSchema,
-        retryFailedMaxStepsChild: true,
-      });
+      return await this.continueRunFromState(await this.refreshRun(run.id), state, { retryFailedChild: true });
     } finally {
       await this.releaseLeaseQuietly(run.id);
     }
@@ -816,7 +785,7 @@ export class AdaptiveAgent {
       throw new Error(`Run ${runId} is ${run.status}; only failed runs can be retried`);
     }
 
-    const retryability = this.checkFailedRunRetryability(run, state);
+    const retryability = await this.checkFailedRunRetryability(run, state);
     if (!retryability.retryable) {
       throw new Error(retryability.reason);
     }
@@ -867,7 +836,7 @@ export class AdaptiveAgent {
       });
       await this.saveExecutionSnapshot(retryingRun, state, retryingRun.status);
 
-      return await this.executionLoop(await this.refreshRun(runId), state);
+      return await this.continueRunFromState(await this.refreshRun(runId), state, { retryFailedChild: true });
     } finally {
       await this.releaseLeaseQuietly(run.id);
     }
@@ -886,33 +855,66 @@ export class AdaptiveAgent {
 
     await this.acquireLeaseOrThrow(run.id);
 
-    let currentRun = await this.refreshRun(run.id);
-    if (currentRun.status !== 'running') {
-      currentRun = await this.transitionRun(currentRun, 'running');
-    }
-
     try {
-      if (shouldResolveWaitingDelegateSnapshot(state)) {
-        try {
-          currentRun = await this.resumeAwaitingParent(currentRun, state, options.retryFailedMaxStepsChild ?? false);
-        } catch (error) {
-          if (error instanceof DelegationError) {
-            return this.failRun(currentRun, state, error.message, error.code);
-          }
-
-          return interruptResult(
-            currentRun.id,
-            state.stepsUsed,
-            currentRun.usage,
-            error instanceof Error ? error.message : String(error),
-          );
-        }
-      }
-
-      return await this.executionLoop(currentRun, state);
+      return await this.continueRunFromState(await this.refreshRun(run.id), state, options);
     } finally {
       await this.releaseLeaseQuietly(run.id);
     }
+  }
+
+  private async continueRunFromState(run: AgentRun, state: ExecutionState, options: RunContinuationOptions): Promise<RunResult> {
+    let currentRun = run;
+    if (TERMINAL_RUN_STATUSES.has(currentRun.status)) {
+      return this.resultFromStoredRun(currentRun, state.stepsUsed);
+    }
+
+    const linkedChild = await this.resolveLinkedDelegateChildRun(currentRun, state);
+    if (
+      currentRun.status === 'awaiting_subagent' ||
+      shouldResolveWaitingDelegateSnapshot(state) ||
+      linkedChild.kind !== 'missing'
+    ) {
+      try {
+        currentRun = await this.resumeAwaitingParent(
+          currentRun,
+          state,
+          options.retryFailedChild ?? false,
+          linkedChild,
+        );
+      } catch (error) {
+        if (error instanceof DelegationError) {
+          return this.failRun(currentRun, state, error.message, error.code);
+        }
+
+        return interruptResult(
+          currentRun.id,
+          state.stepsUsed,
+          currentRun.usage,
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    }
+
+    if (currentRun.status === 'interrupted') {
+      currentRun = await this.transitionRun(currentRun, 'running');
+      this.logLifecycle('info', 'run.resumed', {
+        ...runLogBindings(currentRun),
+        stepId: currentRun.currentStepId,
+      });
+      await this.emit({
+        runId: currentRun.id,
+        stepId: currentRun.currentStepId,
+        type: 'run.resumed',
+        schemaVersion: 1,
+        payload: {
+          status: 'running',
+        },
+      });
+    } else if (currentRun.status !== 'running') {
+      currentRun = await this.transitionRun(currentRun, 'running');
+    }
+
+    return await this.executionLoop(currentRun, state);
   }
 
   private async executionLoop(run: AgentRun, state: ExecutionState): Promise<RunResult> {
@@ -1097,11 +1099,16 @@ export class AdaptiveAgent {
     return this.failRun(latestRun, state, 'Maximum steps exceeded', 'MAX_STEPS');
   }
 
-  private checkFailedRunRetryability(
+  private async checkFailedRunRetryability(
     run: AgentRun,
     state: ExecutionState,
-  ): { retryable: true; failureKind: FailureKind } | { retryable: false; reason: string; failureKind: FailureKind } {
+  ): Promise<FailedRunRetryability> {
     const failureKind = classifyFailureKind(run.errorCode as RunFailureCode | undefined, run.errorMessage);
+    const pendingToolCall = state.pendingToolCalls[0];
+    if (isDelegateToolCall(pendingToolCall)) {
+      return this.checkDelegateChildRetryability(run, state, failureKind);
+    }
+
     if (run.errorCode === 'MAX_STEPS') {
       if (this.defaults.maxSteps > state.stepsUsed) {
         return { retryable: true, failureKind };
@@ -1136,7 +1143,6 @@ export class AdaptiveAgent {
     }
 
     if (run.errorCode === 'TOOL_ERROR') {
-      const pendingToolCall = state.pendingToolCalls[0];
       if (!pendingToolCall) {
         return {
           retryable: false,
@@ -1177,6 +1183,59 @@ export class AdaptiveAgent {
       retryable: false,
       failureKind,
       reason: `Run ${run.id} failed with non-retryable code "${run.errorCode ?? 'unknown'}"`,
+    };
+  }
+
+  private async checkDelegateChildRetryability(
+    run: AgentRun,
+    state: ExecutionState,
+    failureKind: FailureKind,
+  ): Promise<FailedRunRetryability> {
+    const linkedChild = await this.resolveLinkedDelegateChildRun(run, state);
+    if (linkedChild.kind === 'missing') {
+      return {
+        retryable: false,
+        failureKind,
+        reason: linkedChild.reason,
+      };
+    }
+
+    if (linkedChild.kind === 'invalid') {
+      return {
+        retryable: false,
+        failureKind,
+        reason: linkedChild.reason,
+      };
+    }
+
+    const { childRun } = linkedChild;
+    if (childRun.status === 'succeeded') {
+      return { retryable: true, failureKind };
+    }
+
+    if (!TERMINAL_RUN_STATUSES.has(childRun.status)) {
+      return { retryable: true, failureKind };
+    }
+
+    if (childRun.status === 'failed') {
+      const childAgent = this.createAgentForChildRun(childRun);
+      const childState = await childAgent.loadExecutionState(childRun);
+      const childRetryability = await childAgent.checkFailedRunRetryability(childRun, childState);
+      if (childRetryability.retryable) {
+        return { retryable: true, failureKind };
+      }
+
+      return {
+        retryable: false,
+        failureKind,
+        reason: `Linked child run ${childRun.id} is not retryable: ${childRetryability.reason}`,
+      };
+    }
+
+    return {
+      retryable: false,
+      failureKind,
+      reason: `Linked child run ${childRun.id} is ${childRun.status} and cannot be retried`,
     };
   }
 
@@ -1430,25 +1489,110 @@ export class AdaptiveAgent {
     return childAgent.runWithExistingRun(request.runId, { outputSchema: request.outputSchema });
   }
 
+  private async resolveLinkedDelegateChildRun(run: AgentRun, state: ExecutionState): Promise<LinkedDelegateChildRun> {
+    const pendingToolCall = state.pendingToolCalls[0];
+    if (!isDelegateToolCall(pendingToolCall)) {
+      return { kind: 'missing', reason: `Run ${run.id} has no pending delegate tool call` };
+    }
+
+    const linkedChildIds = [
+      run.currentChildRunId,
+      state.waitingOnChildRunId,
+      await this.getDelegateToolExecutionChildRunId(run, pendingToolCall),
+    ].filter((childRunId): childRunId is UUID => typeof childRunId === 'string' && childRunId.length > 0);
+    const distinctChildIds = Array.from(new Set(linkedChildIds));
+    if (distinctChildIds.length === 0) {
+      return { kind: 'missing', reason: `Run ${run.id} has no linked child run for ${pendingToolCall.name}` };
+    }
+
+    if (distinctChildIds.length > 1) {
+      return {
+        kind: 'invalid',
+        reason: `Run ${run.id} has conflicting child linkage for ${pendingToolCall.name}: ${distinctChildIds.join(', ')}`,
+      };
+    }
+
+    const childRunId = distinctChildIds[0];
+    const childRun = await this.options.runStore.getRun(childRunId);
+    if (!childRun) {
+      return { kind: 'invalid', reason: `Linked child run ${childRunId} does not exist` };
+    }
+
+    const linkageError = validateLinkedChildRun(run, childRun, pendingToolCall.stepId);
+    if (linkageError) {
+      return { kind: 'invalid', reason: linkageError, childRun };
+    }
+
+    return { kind: 'linked', childRun };
+  }
+
+  private async getDelegateToolExecutionChildRunId(
+    run: AgentRun,
+    pendingToolCall: PendingToolCallState,
+  ): Promise<UUID | undefined> {
+    const record = await this.options.toolExecutionStore?.getByIdempotencyKey(
+      toolCallIdempotencyKey(run.id, pendingToolCall.stepId, pendingToolCall.id),
+    );
+    if (record?.toolName !== pendingToolCall.name) {
+      return undefined;
+    }
+
+    return record.childRunId;
+  }
+
   private async resumeAwaitingParent(
     run: AgentRun,
     state: ExecutionState,
-    retryFailedMaxStepsChild: boolean,
+    retryFailedChild: boolean,
+    linkedChild?: LinkedDelegateChildRun,
   ): Promise<AgentRun> {
-    const childRunId = run.currentChildRunId ?? extractWaitingChildRunId(state);
-    if (childRunId) {
-      const childRun = await this.options.runStore.getRun(childRunId);
-      if (childRun && !TERMINAL_RUN_STATUSES.has(childRun.status)) {
+    linkedChild ??= await this.resolveLinkedDelegateChildRun(run, state);
+
+    let childRunId: UUID | undefined;
+    if (linkedChild.kind === 'invalid') {
+      throw new DelegationError(linkedChild.reason);
+    }
+
+    if (linkedChild.kind === 'linked') {
+      const { childRun } = linkedChild;
+      childRunId = childRun.id;
+      state.waitingOnChildRunId = childRun.id;
+
+      if (run.status === 'running' && retryFailedChild && childRun.status === 'failed') {
+        await this.restoreAwaitingDelegateBoundary(run, childRun.id);
+      }
+
+      if (!TERMINAL_RUN_STATUSES.has(childRun.status)) {
         const childAgent = this.createAgentForChildRun(childRun);
         await childAgent.resume(childRun.id);
-      } else if (childRun && retryFailedMaxStepsChild && childRun.status === 'failed' && childRun.errorCode === 'MAX_STEPS') {
+      } else if (retryFailedChild && childRun.status === 'failed') {
         const childAgent = this.createAgentForChildRun(childRun);
-        await childAgent.retry(childRun.id);
+        const childState = await childAgent.loadExecutionState(childRun);
+        const childRetryability = await childAgent.checkFailedRunRetryability(childRun, childState);
+        if (childRetryability.retryable) {
+          await childAgent.retry(childRun.id);
+        }
       }
     }
 
-    const resolution = await this.delegationExecutor.resumeParentRun(run.id);
+    const resolution = await this.delegationExecutor.resumeParentRun(run.id, childRunId);
     return this.applyParentResumeResolution(run, state, resolution);
+  }
+
+  private async restoreAwaitingDelegateBoundary(run: AgentRun, childRunId: UUID): Promise<AgentRun> {
+    const currentRun = await this.refreshRun(run.id);
+    if (currentRun.status === 'awaiting_subagent' && currentRun.currentChildRunId === childRunId) {
+      return currentRun;
+    }
+
+    return this.options.runStore.updateRun(
+      currentRun.id,
+      {
+        status: 'awaiting_subagent',
+        currentChildRunId: childRunId,
+      },
+      currentRun.version,
+    );
   }
 
   private async applyParentResumeResolution(
@@ -1475,6 +1619,8 @@ export class AdaptiveAgent {
       state.waitingOnChildRunId = undefined;
       state.stepsUsed += 1;
 
+      await this.markExistingToolExecutionCompleted(run, pendingToolCall, resolution.output);
+
       await this.emit({
         runId: run.id,
         stepId: pendingToolCall.stepId,
@@ -1490,6 +1636,23 @@ export class AdaptiveAgent {
     }
 
     return resolution.parentRun;
+  }
+
+  private async markExistingToolExecutionCompleted(
+    run: AgentRun,
+    pendingToolCall: PendingToolCallState,
+    output: JsonValue,
+  ): Promise<void> {
+    const idempotencyKey = toolCallIdempotencyKey(run.id, pendingToolCall.stepId, pendingToolCall.id);
+    const existingExecution = await this.options.toolExecutionStore?.getByIdempotencyKey(idempotencyKey);
+    if (!existingExecution || existingExecution.status === 'completed') {
+      return;
+    }
+
+    await this.persistToolExecutionCompletion({
+      idempotencyKey,
+      output,
+    });
   }
 
   private createScopedAgent(delegate: NonNullable<AdaptiveAgentOptions['delegates']>[number]): AdaptiveAgent {
@@ -2102,6 +2265,10 @@ export class AdaptiveAgent {
         ...runLogBindings(run),
         stepId: run.currentStepId,
         durationMs: Date.now() - startedAt,
+        ...summarizeModelFailureForLog(modelError, {
+          modelTimeoutMs: this.defaults.modelTimeoutMs,
+          timedOut: timeoutContext.didTimeout(),
+        }),
         error: errorForLog(modelError),
       });
       throw modelError;
@@ -2221,6 +2388,7 @@ export class AdaptiveAgent {
       state,
       patch: {
         status: code === 'REPLAN_REQUIRED' ? 'replan_required' : 'failed',
+        ...(isDelegateToolCall(state.pendingToolCalls[0]) ? { currentChildRunId: undefined } : {}),
         errorCode: code,
         errorMessage: error,
       },
@@ -3040,16 +3208,35 @@ function interruptResult(runId: UUID, stepsUsed: number, usage: UsageSummary, er
   };
 }
 
-function extractWaitingChildRunId(state: ExecutionState): UUID | undefined {
-  return state.waitingOnChildRunId;
+function isDelegateToolCall(pendingToolCall: PendingToolCallState | undefined): pendingToolCall is PendingToolCallState {
+  return Boolean(pendingToolCall?.name.startsWith(RESERVED_DELEGATE_PREFIX));
+}
+
+function toolCallIdempotencyKey(runId: UUID, stepId: string, toolCallId: string): string {
+  return `${runId}:${stepId}:${toolCallId}`;
+}
+
+function validateLinkedChildRun(parentRun: AgentRun, childRun: AgentRun, stepId: string): string | null {
+  if (childRun.parentRunId !== parentRun.id) {
+    return `Child run ${childRun.id} is not linked to parent run ${parentRun.id}`;
+  }
+
+  if (childRun.rootRunId !== parentRun.rootRunId) {
+    return `Child run ${childRun.id} root ${childRun.rootRunId} does not match parent root ${parentRun.rootRunId}`;
+  }
+
+  if (childRun.parentStepId && childRun.parentStepId !== stepId) {
+    return `Child run ${childRun.id} parent step ${childRun.parentStepId} does not match parent step ${stepId}`;
+  }
+
+  return null;
 }
 
 function shouldResolveWaitingDelegateSnapshot(state: ExecutionState): boolean {
   const pendingToolCall = state.pendingToolCalls[0];
   return Boolean(
     state.waitingOnChildRunId &&
-      pendingToolCall &&
-      pendingToolCall.name.startsWith(RESERVED_DELEGATE_PREFIX),
+      isDelegateToolCall(pendingToolCall),
   );
 }
 
@@ -3388,4 +3575,38 @@ async function runWithTimeout<T>(timeoutMs: number, _signal: AbortSignal, task: 
       clearTimeout(timeoutId);
     }
   }
+}
+
+function summarizeModelFailureForLog(
+  error: unknown,
+  options: { modelTimeoutMs: number; timedOut: boolean },
+): Record<string, JsonValue | undefined> {
+  return {
+    failurePhase: extractErrorField(error, 'modelInvocationPhase') as string | undefined,
+    failureAttempt: extractNumericErrorField(error, 'modelInvocationAttempt'),
+    statusCode: extractNumericErrorField(error, 'modelInvocationStatusCode'),
+    retryDelayMs: extractNumericErrorField(error, 'modelInvocationRetryDelayMs'),
+    timeoutSource: options.timedOut ? 'agent_model_timeout' : undefined,
+    configuredModelTimeoutMs: options.timedOut ? options.modelTimeoutMs : undefined,
+  };
+}
+
+function extractNumericErrorField(error: unknown, key: string): number | undefined {
+  const value = extractErrorField(error, key);
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function extractErrorField(error: unknown, key: string): unknown {
+  let current: unknown = error;
+
+  while (current instanceof Error) {
+    const value = (current as Record<string, unknown>)[key];
+    if (value !== undefined) {
+      return value;
+    }
+
+    current = (current as Error & { cause?: unknown }).cause;
+  }
+
+  return undefined;
 }

@@ -524,6 +524,7 @@ describe('AdaptiveAgent', () => {
     const runStore = new InMemoryRunStore();
     const eventStore = new InMemoryEventStore();
     const snapshotStore = new InMemorySnapshotStore();
+    const toolExecutionStore = new InMemoryToolExecutionStore();
     const initialModel = new SequenceModel([
       {
         finishReason: 'tool_calls',
@@ -564,6 +565,7 @@ describe('AdaptiveAgent', () => {
       runStore,
       eventStore,
       snapshotStore,
+      toolExecutionStore,
     });
 
     const failed = await initialAgent.run({ goal: 'Delegate then continue' });
@@ -608,6 +610,7 @@ describe('AdaptiveAgent', () => {
       runStore,
       eventStore,
       snapshotStore,
+      toolExecutionStore,
     });
 
     const retried = await restartedAgent.retry(failed.runId);
@@ -622,16 +625,171 @@ describe('AdaptiveAgent', () => {
     });
 
     const retriedChildren = await runStore.listChildren(failed.runId);
-    expect(retriedChildren).toHaveLength(2);
+    expect(retriedChildren).toHaveLength(1);
     expect(retriedChildren[0]).toMatchObject({
-      status: 'failed',
-      errorCode: 'MAX_STEPS',
-    });
-    expect(retriedChildren[1]).toMatchObject({
       status: 'succeeded',
       result: {
         finding: 'recovered child result',
       },
+    });
+
+    const parentEvents = await eventStore.listByRun(failed.runId);
+    expect(parentEvents.filter((event) => event.type === 'delegate.spawned')).toHaveLength(1);
+  });
+
+  it('retries a failed delegated child in place for retryable model timeouts', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const toolExecutionStore = new InMemoryToolExecutionStore();
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'parent-call-1',
+            name: 'delegate.researcher',
+            input: {
+              goal: 'Research after a timeout',
+              input: { topic: 'retry' },
+            },
+          },
+        ],
+      },
+      new Error('Model timed out after 90000ms'),
+      {
+        finishReason: 'stop',
+        structuredOutput: {
+          finding: 'recovered child timeout',
+        },
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: {
+          report: 'parent continued after timeout recovery',
+        },
+      },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [createLookupTool()],
+      delegates: [
+        {
+          name: 'researcher',
+          description: 'Researches a topic using the lookup tool.',
+          allowedTools: ['lookup'],
+        },
+      ],
+      runStore,
+      eventStore,
+      snapshotStore,
+      toolExecutionStore,
+    });
+
+    const failed = await agent.run({ goal: 'Delegate then recover a timeout' });
+    expect(failed).toMatchObject({
+      status: 'failure',
+      code: 'MODEL_ERROR',
+      stepsUsed: 0,
+    });
+
+    const initialChildren = await runStore.listChildren(failed.runId);
+    expect(initialChildren).toHaveLength(1);
+    expect(initialChildren[0]).toMatchObject({
+      status: 'failed',
+      errorCode: 'MODEL_ERROR',
+    });
+
+    const retried = await agent.retry(failed.runId);
+
+    expect(retried).toMatchObject({
+      status: 'success',
+      runId: failed.runId,
+      output: {
+        report: 'parent continued after timeout recovery',
+      },
+    });
+
+    const retriedChildren = await runStore.listChildren(failed.runId);
+    expect(retriedChildren).toHaveLength(1);
+    expect(retriedChildren[0]).toMatchObject({
+      id: initialChildren[0]?.id,
+      status: 'succeeded',
+      result: {
+        finding: 'recovered child timeout',
+      },
+    });
+    const parentEvents = await eventStore.listByRun(failed.runId);
+    expect(parentEvents.filter((event) => event.type === 'delegate.spawned')).toHaveLength(1);
+  });
+
+  it('rejects parent retry when the linked delegated child is not retryable', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const toolExecutionStore = new InMemoryToolExecutionStore();
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'parent-call-1',
+            name: 'delegate.researcher',
+            input: {
+              goal: 'Research with a permanent tool failure',
+            },
+          },
+        ],
+      },
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'child-call-1',
+            name: 'permanent_failure',
+            input: { topic: 'retry' },
+          },
+        ],
+      },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [
+        {
+          name: 'permanent_failure',
+          description: 'Always fails without a retry policy.',
+          inputSchema: { type: 'object', additionalProperties: true },
+          execute: async () => {
+            throw new Error('Permanent child tool failure');
+          },
+        },
+      ],
+      delegates: [
+        {
+          name: 'researcher',
+          description: 'Researches a topic using a tool.',
+          allowedTools: ['permanent_failure'],
+        },
+      ],
+      runStore,
+      eventStore,
+      snapshotStore,
+      toolExecutionStore,
+    });
+
+    const failed = await agent.run({ goal: 'Delegate then reject retry' });
+    expect(failed).toMatchObject({
+      status: 'failure',
+      code: 'TOOL_ERROR',
+      stepsUsed: 0,
+    });
+    await expect(agent.retry(failed.runId)).rejects.toThrow('not marked retryable');
+
+    const childRuns = await runStore.listChildren(failed.runId);
+    expect(childRuns).toHaveLength(1);
+    expect(childRuns[0]).toMatchObject({
+      status: 'failed',
+      errorCode: 'TOOL_ERROR',
     });
   });
 
@@ -2732,6 +2890,59 @@ describe('AdaptiveAgent', () => {
       role: 'tool',
       name: 'web_search',
       content: expect.stringContaining('budget_exhausted'),
+    });
+  });
+
+  it('logs model failure diagnostics for underlying transport timeouts', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const chunks: string[] = [];
+    const stream = new PassThrough();
+    stream.on('data', (chunk) => chunks.push(chunk.toString()));
+    const transportTimeout = Object.assign(new Error('The operation timed out.'), {
+      name: 'TimeoutError',
+      modelInvocationPhase: 'http_request' as const,
+      modelInvocationAttempt: 1,
+    });
+    const agent = new AdaptiveAgent({
+      model: new SequenceModel([transportTimeout]),
+      tools: [],
+      logger: pino({ level: 'debug', base: undefined }, stream),
+      runStore,
+      eventStore,
+      snapshotStore,
+      defaults: {
+        modelTimeoutMs: 900000,
+      },
+    });
+
+    const result = await agent.run({ goal: 'Trigger a timeout' });
+    expect(result).toMatchObject({
+      status: 'failure',
+      code: 'MODEL_ERROR',
+      error: 'The operation timed out.',
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const entries = chunks
+      .join('')
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+
+    const failureLog = entries.find((entry) => entry.event === 'model.failed');
+    expect(failureLog).toMatchObject({
+      failurePhase: 'http_request',
+      failureAttempt: 1,
+    });
+    expect(failureLog?.timeoutSource).toBeUndefined();
+    expect(failureLog?.error).toMatchObject({
+      name: 'TimeoutError',
+      message: 'The operation timed out.',
+      modelInvocationPhase: 'http_request',
+      modelInvocationAttempt: 1,
     });
   });
 });

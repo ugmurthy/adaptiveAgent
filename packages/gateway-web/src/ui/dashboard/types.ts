@@ -238,3 +238,21 @@ export interface DashboardDeleteRunResult {
   deletedCronRuns: number;
   deletedRunAdmissions: number;
 }
+
+export interface DashboardReplayRunResult {
+  sessionId: string;
+  rootRunId: string;
+  runId: string | null;
+  status: string;
+  policy: string;
+  replayedFrameType: string | null;
+  pendingApproval: DashboardPendingApproval | null;
+}
+
+export interface DashboardRetryRunResult {
+  type: 'run.output' | 'approval.requested';
+  runId: string;
+  rootRunId?: string;
+  sessionId?: string;
+  status?: string;
+}

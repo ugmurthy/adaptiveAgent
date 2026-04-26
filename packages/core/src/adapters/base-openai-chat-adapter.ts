@@ -22,6 +22,15 @@ export interface BaseOpenAIChatAdapterConfig {
   maxConcurrentRequests?: number;
 }
 
+export type ModelInvocationPhase = 'gate_wait' | 'http_request' | 'http_status' | 'response_body' | 'retry_backoff';
+
+export interface ModelInvocationDiagnostics {
+  modelInvocationPhase?: ModelInvocationPhase;
+  modelInvocationAttempt?: number;
+  modelInvocationStatusCode?: number;
+  modelInvocationRetryDelayMs?: number;
+}
+
 interface OpenAIMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string | null;
@@ -231,20 +240,49 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
     let attempt = 0;
     while (true) {
       let retryDelayMs: number | undefined;
-      const release = await this.requestGate.acquire(request.signal);
+      let release: (() => void) | undefined;
       try {
-        const response = await fetch(url, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify(body),
-          signal: request.signal,
+        release = await this.requestGate.acquire(request.signal);
+      } catch (error) {
+        throw withModelInvocationDiagnostics(error, {
+          modelInvocationPhase: 'gate_wait',
+          modelInvocationAttempt: attempt + 1,
         });
-
-        if (!response.ok) {
-          throw await toModelRequestError(this.provider, response);
+      }
+      try {
+        let response: Response;
+        try {
+          response = await fetch(url, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(body),
+            signal: request.signal,
+          });
+        } catch (error) {
+          throw withModelInvocationDiagnostics(error, {
+            modelInvocationPhase: 'http_request',
+            modelInvocationAttempt: attempt + 1,
+          });
         }
 
-        const data = (await response.json()) as OpenAIChatCompletionResponse;
+        if (!response.ok) {
+          throw withModelInvocationDiagnostics(await toModelRequestError(this.provider, response), {
+            modelInvocationPhase: 'http_status',
+            modelInvocationAttempt: attempt + 1,
+            modelInvocationStatusCode: response.status,
+          });
+        }
+
+        let data: OpenAIChatCompletionResponse;
+        try {
+          data = (await response.json()) as OpenAIChatCompletionResponse;
+        } catch (error) {
+          throw withModelInvocationDiagnostics(error, {
+            modelInvocationPhase: 'response_body',
+            modelInvocationAttempt: attempt + 1,
+            modelInvocationStatusCode: response.status,
+          });
+        }
         return this.parseResponse(data);
       } catch (error) {
         retryDelayMs = getRetryDelayMs(error, attempt);
@@ -254,10 +292,18 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
 
         this.requestGate.imposeCooldown(retryDelayMs);
       } finally {
-        release();
+        release?.();
       }
 
-      await sleepWithSignal(retryDelayMs, request.signal);
+      try {
+        await sleepWithSignal(retryDelayMs, request.signal);
+      } catch (error) {
+        throw withModelInvocationDiagnostics(error, {
+          modelInvocationPhase: 'retry_backoff',
+          modelInvocationAttempt: attempt + 1,
+          modelInvocationRetryDelayMs: retryDelayMs,
+        });
+      }
       attempt += 1;
     }
   }
@@ -440,6 +486,12 @@ function createAbortError(reason: unknown): Error {
 
 function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === 'AbortError';
+}
+
+function withModelInvocationDiagnostics(error: unknown, diagnostics: ModelInvocationDiagnostics): Error {
+  const normalizedError = error instanceof Error ? error : new Error(String(error));
+  Object.assign(normalizedError, diagnostics);
+  return normalizedError;
 }
 
 function getOrCreateModelRequestGate(provider: string, model: string, maxConcurrentRequests: number): ModelRequestGate {

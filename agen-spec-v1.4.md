@@ -337,6 +337,7 @@ Guidelines:
 - delegate profiles should declare a narrow `allowedTools` boundary
 - delegate profiles should not be used to bypass approval policy
 - self-delegation should be disabled by default
+- retry policy for delegate-bound child runs should be configured at the runtime boundary, not encoded into persisted plans
 
 ## 9. Execution Model
 
@@ -369,6 +370,15 @@ When the planner selects a synthetic delegate tool such as `delegate.researcher`
 6. treat the child result as the delegate tool result when the child completes
 
 v1.4 intentionally allows only one active child run per parent run at a time.
+
+Delegate retries follow the same boundary:
+
+- the parent remains parked on the same delegate tool step while retry is still allowed
+- retry state belongs to runtime execution state, not to a persisted plan artifact
+- transient child model failures such as provider timeout should prefer in-place child `resume()` over spawning a fresh child run
+- if a child has already reached terminal `failed`, the runtime may create a new child attempt for the same parent delegate execution when policy marks the failure as retryable
+- the parent should emit a retry-specific delegation event before the next child attempt starts
+- the parent should fail the delegate tool only after retry budget is exhausted or the child failure is non-retryable
 
 ### `plan()`
 
@@ -407,6 +417,13 @@ Interruption is cooperative. The runtime checks interruption state:
 `resume()` continues from the latest valid snapshot after acquiring the run lease.
 
 If a parent run is in `awaiting_subagent`, `resume()` must inspect the linked child run before the parent continues.
+
+If the child failed with a retryable delegate error and retry budget remains, `resume()` should continue the same delegate boundary instead of failing the parent immediately:
+
+- prefer resuming the same child run from its latest snapshot when the child is `interrupted`
+- if the child is already terminal `failed`, create a new child attempt linked to the same parent step and keep the parent in `awaiting_subagent`
+- preserve already completed child tool work whenever resuming the same child run is possible
+- only emit the parent `tool.failed` once the delegate boundary is conclusively terminal
 
 ### Child Run Interaction Policy
 

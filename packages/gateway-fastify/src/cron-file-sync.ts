@@ -15,7 +15,7 @@ export interface CronFileSyncOptions {
 }
 
 export interface CronFileSyncHandle {
-  stop(): void;
+  stop(): Promise<void>;
   tick(): Promise<CronFileSyncSummary>;
 }
 
@@ -39,25 +39,51 @@ export function createCronFileSyncLoop(options: CronFileSyncOptions): CronFileSy
   const intervalMs = options.intervalMs ?? DEFAULT_SYNC_INTERVAL_MS;
   let timer: ReturnType<typeof setInterval> | undefined;
   let running = false;
+  let activeTick: Promise<CronFileSyncSummary> | undefined;
+
+  const runTick = (): Promise<CronFileSyncSummary> => {
+    if (!running) {
+      return Promise.resolve({
+        scanned: 0,
+        imported: 0,
+        updated: 0,
+        skipped: 0,
+        failed: 0,
+      });
+    }
+
+    if (activeTick) {
+      return activeTick;
+    }
+
+    const tickPromise = syncCronFiles(options).finally(() => {
+      if (activeTick === tickPromise) {
+        activeTick = undefined;
+      }
+    });
+    activeTick = tickPromise;
+    return tickPromise;
+  };
 
   const handle: CronFileSyncHandle = {
-    stop() {
+    async stop() {
       running = false;
       if (timer) {
         clearInterval(timer);
         timer = undefined;
       }
+      await activeTick?.catch(() => {});
     },
     tick() {
-      return syncCronFiles(options);
+      return runTick();
     },
   };
 
   running = true;
   timer = setInterval(async () => {
-    if (!running) return;
+    if (!running || activeTick) return;
     try {
-      await syncCronFiles(options);
+      await runTick();
     } catch (error) {
       options.logger?.warn(GATEWAY_LOG_EVENTS.cron_file_sync_failed, 'Cron file sync failed', {
         dir: resolve(options.dir),

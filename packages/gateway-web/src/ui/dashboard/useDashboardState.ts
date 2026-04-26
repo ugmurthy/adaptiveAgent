@@ -37,12 +37,23 @@ export interface DashboardState {
   error: DashboardError | undefined;
   detailError: DashboardError | undefined;
   approvalError: DashboardError | undefined;
+  actionError: DashboardError | undefined;
   deleteError: DashboardError | undefined;
   approvingRunId: string;
+  actingRunId: string;
+  actionRunId: string;
+  actionKind: 'replay' | 'retry' | '';
+  actionMessage?: {
+    runId: string;
+    kind: 'replay' | 'retry';
+    message: string;
+  };
   deletingRootRunId: string;
   nextOffset: number | null;
   refresh: () => void;
   loadNextPage: () => void;
+  replayRun: (rootRunId: string) => Promise<void>;
+  retryRun: (runId: string) => Promise<void>;
   deleteRun: (rootRunId: string) => Promise<void>;
   resolveApproval: (runId: string, approved: boolean) => Promise<void>;
 }
@@ -63,8 +74,13 @@ export function useDashboardState(client: DashboardClient, basePath: '/monitor' 
   const [error, setError] = useState<DashboardError>();
   const [detailError, setDetailError] = useState<DashboardError>();
   const [approvalError, setApprovalError] = useState<DashboardError>();
+  const [actionError, setActionError] = useState<DashboardError>();
   const [deleteError, setDeleteError] = useState<DashboardError>();
   const [approvingRunId, setApprovingRunId] = useState('');
+  const [actingRunId, setActingRunId] = useState('');
+  const [actionRunId, setActionRunId] = useState('');
+  const [actionKind, setActionKind] = useState<'replay' | 'retry' | ''>('');
+  const [actionMessage, setActionMessage] = useState<DashboardState['actionMessage']>();
   const [deletingRootRunId, setDeletingRootRunId] = useState('');
   const [nextOffset, setNextOffset] = useState<number | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -75,6 +91,7 @@ export function useDashboardState(client: DashboardClient, basePath: '/monitor' 
 
   const setSelectedRootRunId = useCallback((rootRunId: string) => {
     setApprovalError(undefined);
+    setActionError(undefined);
     setDeleteError(undefined);
     setSelectedRootRunIdState(rootRunId);
   }, []);
@@ -204,6 +221,58 @@ export function useDashboardState(client: DashboardClient, basePath: '/monitor' 
     }
   }, [client, refresh]);
 
+  const replayRun = useCallback(async (rootRunId: string) => {
+    if (!rootRunId) {
+      return;
+    }
+
+    setActionError(undefined);
+    setActionMessage(undefined);
+    setActionRunId(rootRunId);
+    setActingRunId(rootRunId);
+    setActionKind('replay');
+    try {
+      const replayResult = await client.replayRun(rootRunId);
+      const message = replayResult.replayedFrameType === 'run.output'
+        ? `Replayed ${replayResult.status} output from ${replayResult.sessionId}.`
+        : replayResult.replayedFrameType === 'approval.requested'
+          ? `Replayed pending approval from ${replayResult.sessionId}.`
+          : `Reattached ${replayResult.sessionId} with ${replayResult.policy} recovery.`;
+      setActionMessage({ runId: rootRunId, kind: 'replay', message });
+      refresh();
+    } catch (actionFailure) {
+      setActionError(normalizeError(actionFailure));
+    } finally {
+      setActingRunId('');
+      setActionKind('');
+    }
+  }, [client, refresh]);
+
+  const retryRun = useCallback(async (runId: string) => {
+    if (!runId) {
+      return;
+    }
+
+    setActionError(undefined);
+    setActionMessage(undefined);
+    setActionRunId(runId);
+    setActingRunId(runId);
+    setActionKind('retry');
+    try {
+      const retryResult = await client.retryRun(runId);
+      const message = retryResult.type === 'approval.requested'
+        ? `Retry paused for approval on ${retryResult.runId}.`
+        : `Retry returned ${retryResult.status ?? 'unknown'} for ${retryResult.runId}.`;
+      setActionMessage({ runId, kind: 'retry', message });
+      refresh();
+    } catch (actionFailure) {
+      setActionError(normalizeError(actionFailure));
+    } finally {
+      setActingRunId('');
+      setActionKind('');
+    }
+  }, [client, refresh]);
+
   const deleteRun = useCallback(async (rootRunId: string) => {
     if (!rootRunId) {
       return;
@@ -247,12 +316,19 @@ export function useDashboardState(client: DashboardClient, basePath: '/monitor' 
     error,
     detailError,
     approvalError,
+    actionError,
     deleteError,
     approvingRunId,
+    actingRunId,
+    actionRunId,
+    actionKind,
+    actionMessage,
     deletingRootRunId,
     nextOffset,
     refresh,
     loadNextPage,
+    replayRun,
+    retryRun,
     deleteRun,
     resolveApproval,
   };

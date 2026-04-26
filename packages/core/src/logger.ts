@@ -156,6 +156,7 @@ export function errorForLog(error: unknown): JsonValue {
       name: error.name,
       message: error.message,
       stack: error.stack ?? null,
+      ...extractErrorProperties(error),
     });
   }
 
@@ -285,6 +286,25 @@ function truncateValue(value: JsonValue, depth = 0): JsonValue {
     next.__truncated__ = `${entries.length - 40} more keys`;
   }
   return next;
+}
+
+function extractErrorProperties(error: Error): Record<string, JsonValue> {
+  const extras: Record<string, JsonValue> = {};
+
+  for (const key of Object.getOwnPropertyNames(error)) {
+    if (key === 'name' || key === 'message' || key === 'stack') {
+      continue;
+    }
+
+    const value = (error as Record<string, unknown>)[key];
+    if (value === undefined) {
+      continue;
+    }
+
+    extras[key] = key === 'cause' && value instanceof Error ? errorForLog(value) : normalizeUnknown(value);
+  }
+
+  return extras;
 }
 
 function summarizeJsonValue(value: JsonValue, depth = 0): JsonValue {

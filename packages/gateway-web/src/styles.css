@@ -1651,6 +1651,36 @@ label {
   min-width: 0;
 }
 
+.dashboard-row-actions {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.dashboard-row-action-buttons {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.dashboard-row-action-buttons .ghost-button {
+  min-width: 5.2rem;
+  padding: 0.38rem 0.62rem;
+}
+
+.dashboard-row-action-note,
+.dashboard-row-action-error {
+  font-size: 0.76rem;
+  line-height: 1.35;
+}
+
+.dashboard-row-action-note {
+  color: #2d6254;
+}
+
+.dashboard-row-action-error {
+  color: #8c2f22;
+}
+
 .dashboard-copy-button {
   align-items: center;
   background: #f4faf6;
