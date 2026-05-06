@@ -582,6 +582,108 @@ label {
   font-size: 0.98rem;
 }
 
+.minimal-output-stream {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.minimal-output-block {
+  border-bottom: 1px solid rgba(192, 209, 201, 0.72);
+  padding: 0.2rem 0 0.95rem;
+}
+
+.minimal-output-block:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.assistant-progress-card {
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.82), rgba(246, 250, 248, 0.62));
+  border: 1px solid rgba(201, 217, 210, 0.86);
+  border-left: 3px solid rgba(22, 112, 94, 0.38);
+  border-radius: 18px;
+  box-shadow: 0 12px 30px rgba(30, 45, 39, 0.06);
+  display: grid;
+  gap: 0.45rem;
+  padding: 0.85rem 0.95rem 0.7rem;
+}
+
+.assistant-progress-content .markdown-body {
+  color: #13241f;
+  font-size: 1rem;
+  line-height: 1.68;
+}
+
+.assistant-progress-content .markdown-body p,
+.assistant-progress-content .markdown-body ul,
+.assistant-progress-content .markdown-body ol,
+.assistant-progress-content .markdown-body blockquote,
+.assistant-progress-content .markdown-body pre,
+.assistant-progress-content .markdown-body table {
+  margin: 0.4rem 0;
+}
+
+.assistant-progress-tools {
+  align-items: center;
+  border-top: 1px solid rgba(205, 220, 213, 0.68);
+  color: #70857d;
+  display: flex;
+  gap: 0.45rem;
+  min-width: 0;
+  padding-top: 0.42rem;
+}
+
+.assistant-progress-tools-label {
+  color: #82958f;
+  flex: 0 0 auto;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.assistant-progress-tool-chips {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
+.assistant-progress-tool-chip {
+  align-items: center;
+  background: rgba(232, 240, 236, 0.72);
+  border: 1px solid rgba(200, 216, 208, 0.82);
+  border-radius: 999px;
+  color: #546b63;
+  display: inline-flex;
+  font-size: 0.72rem;
+  font-weight: 600;
+  gap: 0.3rem;
+  line-height: 1;
+  max-width: 100%;
+  padding: 0.24rem 0.48rem;
+}
+
+.assistant-progress-tool-chip code {
+  background: transparent;
+  color: inherit;
+  font-size: 0.95em;
+  padding: 0;
+}
+
+.assistant-progress-tool-chip.approval {
+  background: rgba(255, 243, 202, 0.68);
+  border-color: rgba(223, 194, 93, 0.55);
+  color: #756029;
+}
+
+.assistant-progress-tool-chip.delegate {
+  background: rgba(221, 241, 232, 0.76);
+  border-color: rgba(151, 198, 179, 0.62);
+  color: #3f695b;
+}
+
 .minimal-toolbar {
   align-items: center;
   background: rgba(255, 255, 255, 0.8);
@@ -1121,15 +1223,21 @@ label {
   width: 0.72rem;
 }
 
+.minimal-composer-input {
+  position: relative;
+}
+
 .minimal-composer textarea {
   background: rgba(255, 255, 255, 0.06);
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 20px;
   box-shadow: none;
   color: #edf7f3;
+  display: block;
   min-height: 6.75rem;
-  padding: 1rem;
+  padding: 1rem 4.25rem 1rem 1rem;
   resize: none;
+  width: 100%;
 }
 
 .minimal-composer textarea::placeholder {
@@ -1153,7 +1261,22 @@ label {
   gap: 0.35rem;
 }
 
-.minimal-composer-file-field span,
+.minimal-composer-file-field {
+  align-items: center;
+  display: grid;
+  gap: 0.5rem;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.minimal-composer-file-input {
+  height: 1px;
+  opacity: 0;
+  overflow: hidden;
+  padding: 0;
+  position: absolute;
+  width: 1px;
+}
+
 .minimal-composer-detail-field span {
   color: #acc3ba;
   font-size: 0.74rem;
@@ -1161,7 +1284,6 @@ label {
   text-transform: uppercase;
 }
 
-.minimal-composer-file-field input,
 .minimal-composer-detail-field select {
   background: rgba(255, 255, 255, 0.06);
   border: 1px solid rgba(255, 255, 255, 0.12);
@@ -1171,24 +1293,92 @@ label {
   padding: 0.75rem 0.9rem;
 }
 
-.minimal-composer-file-field input::placeholder {
-  color: rgba(221, 236, 229, 0.46);
+.minimal-attachment-button {
+  align-items: center;
+  background: rgba(143, 240, 203, 0.1);
+  border: 1px solid rgba(143, 240, 203, 0.24);
+  border-radius: 999px;
+  color: #dff9ef;
+  display: inline-flex;
+  gap: 0.55rem;
+  justify-content: flex-start;
+  min-height: 2.85rem;
+  min-width: 0;
+  overflow: hidden;
+  padding: 0.68rem 0.9rem;
+  transition: background 140ms ease, border-color 140ms ease, transform 140ms ease;
+}
+
+.minimal-attachment-button span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.minimal-attachment-button:hover,
+.minimal-attachment-button:focus-visible {
+  background: rgba(143, 240, 203, 0.16);
+  border-color: rgba(143, 240, 203, 0.46);
+  transform: translateY(-1px);
+}
+
+.minimal-attachment-button:focus-visible,
+.minimal-attachment-clear:focus-visible {
+  box-shadow: 0 0 0 3px rgba(123, 209, 177, 0.22);
+  outline: none;
+}
+
+.minimal-attachment-clear {
+  align-items: center;
+  aspect-ratio: 1;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+  color: #dff9ef;
+  display: inline-flex;
+  justify-content: center;
+  min-height: 2.85rem;
+  padding: 0;
+  width: 2.85rem;
+}
+
+.minimal-attachment-clear:hover {
+  background: rgba(255, 255, 255, 0.14);
 }
 
 .minimal-send-button {
   align-items: center;
   aspect-ratio: 1;
   background: linear-gradient(135deg, #8ff0cb 0%, #2bb08d 100%);
+  border: none;
   border-radius: 999px;
+  box-shadow: 0 6px 18px rgba(16, 54, 47, 0.32);
   color: #10362f;
+  cursor: pointer;
   display: inline-flex;
   justify-content: center;
-  justify-self: end;
   padding: 0;
-  width: 2.95rem;
+  position: absolute;
+  right: 0.65rem;
+  top: 50%;
+  transform: translateY(-50%);
+  transition: transform 140ms ease, box-shadow 140ms ease;
+  width: 2.5rem;
+  z-index: 1;
+}
+
+.minimal-send-button:hover,
+.minimal-send-button:focus-visible {
+  transform: translateY(calc(-50% - 1px));
+}
+
+.minimal-send-button:focus-visible {
+  box-shadow: 0 0 0 3px rgba(123, 209, 177, 0.32), 0 6px 18px rgba(16, 54, 47, 0.32);
+  outline: none;
 }
 
 .minimal-send-button svg,
+.minimal-attachment-button svg,
 .minimal-icon-button svg,
 .minimal-settings-icon-button svg,
 .minimal-toolbar-icon-button svg,
@@ -1197,22 +1387,62 @@ label {
   width: 1.15rem;
 }
 
+.minimal-connect-button svg {
+  height: 1.3rem;
+  width: 1.3rem;
+}
+
 .minimal-status-bar {
   align-items: center;
   background: rgba(255, 255, 255, 0.05);
   border: 1px solid rgba(255, 255, 255, 0.09);
   border-radius: 18px;
+  display: flex;
+  gap: 0.75rem;
+  justify-content: space-between;
   margin-top: 0.75rem;
   min-height: 3.2rem;
   overflow: hidden;
   padding: 0.65rem 0.9rem;
 }
 
-.minimal-status-bar.pending,
-.minimal-status-bar.clarification {
-  display: flex;
-  gap: 0.75rem;
-  justify-content: space-between;
+.minimal-thinking-chip {
+  background: rgba(143, 240, 203, 0.12);
+  border: 1px solid rgba(143, 240, 203, 0.32);
+  border-radius: 999px;
+  color: #d8f4e7;
+  flex-shrink: 0;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.74rem;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  padding: 0.28rem 0.65rem;
+  white-space: nowrap;
+}
+
+.minimal-thinking-chip.thinking {
+  animation: minimal-thinking-pulse 1.6s ease-in-out infinite;
+}
+
+.minimal-thinking-chip.completed {
+  background: rgba(143, 240, 203, 0.18);
+  border-color: rgba(143, 240, 203, 0.45);
+  color: #c9efdc;
+}
+
+.minimal-thinking-chip.failed {
+  background: rgba(255, 138, 121, 0.16);
+  border-color: rgba(255, 138, 121, 0.45);
+  color: #ffd7cf;
+}
+
+@keyframes minimal-thinking-pulse {
+  0%, 100% {
+    opacity: 0.78;
+  }
+  50% {
+    opacity: 1;
+  }
 }
 
 .minimal-status-copy {
@@ -1236,8 +1466,9 @@ label {
 .minimal-status-stack {
   animation: minimal-status-rise 220ms ease;
   display: grid;
+  flex: 1 1 auto;
   gap: 0.22rem;
-  width: 100%;
+  min-width: 0;
 }
 
 .minimal-status-line {

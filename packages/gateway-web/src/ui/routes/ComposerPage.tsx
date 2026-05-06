@@ -1,4 +1,4 @@
-import type { FormEvent } from 'react';
+import type { ChangeEvent, FormEvent } from 'react';
 import { useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import type { ReactElement } from 'react';
 import { marked } from 'marked';
@@ -6,6 +6,7 @@ import { marked } from 'marked';
 import { GatewayWebClient, loadGatewayDefaults } from '../../gateway/client';
 import {
   formatClockTime,
+  formatDuration,
   formatLiveProgressUpdate,
   formatRunOutput,
   formatToolProgressDetail,
@@ -21,6 +22,7 @@ import type {
   GatewayImageInput,
   LiveAgentEventSummary,
   LiveGatewayState,
+  ModelActivitySnapshot,
   PendingApproval,
   RunActivity,
 } from '../../gateway/types';
@@ -31,6 +33,28 @@ type MinimalProgressIndicator = {
   kind: 'delegate' | 'step';
   label: string;
 };
+
+type MinimalOutputBlock =
+  | {
+      kind: 'markdown';
+      id: string;
+      source: string;
+    }
+  | {
+      kind: 'assistant-progress';
+      id: string;
+      assistantContent: string;
+      toolMessages: string[];
+      runId?: string;
+    };
+
+interface ToolActivitySummary {
+  key: string;
+  label: string;
+  tone: 'tool' | 'approval' | 'delegate' | 'activity';
+  count: number;
+  title: string;
+}
 
 type Action =
   | { type: 'socket'; state: LiveGatewayState['socketState']; detail?: string }
@@ -73,20 +97,37 @@ interface SavedConnectionSettings {
   customToken: string;
 }
 
-export function ComposerPage(): ReactElement {
+type ComposerPageVariant = 'composer' | 'run';
+
+interface ComposerPageProps {
+  variant?: ComposerPageVariant;
+}
+
+const runPageDefaultIdentity: GatewayIdentity = {
+  channel: 'web',
+  subject: 'local-dev-user',
+  tenantId: 'free',
+  roles: ['member'],
+};
+
+export function ComposerPage(props: ComposerPageProps = {}): ReactElement {
+  const isRunPage = props.variant === 'run';
+  const routeDefaultIdentity = isRunPage ? runPageDefaultIdentity : defaultIdentity;
+  const liveStateStorageKey = isRunPage ? RUN_LIVE_STATE_STORAGE_KEY : LIVE_STATE_STORAGE_KEY;
+  const connectionSettingsStorageKey = isRunPage ? RUN_CONNECTION_SETTINGS_STORAGE_KEY : CONNECTION_SETTINGS_STORAGE_KEY;
   const [state, dispatch] = useReducer(reducer, initialState);
   const [defaults, setDefaults] = useState<GatewayDefaults>({
     socketUrl: 'ws://127.0.0.1:8959/ws',
-    ...defaultIdentity,
+    ...routeDefaultIdentity,
   });
   const [socketUrl, setSocketUrl] = useState(defaults.socketUrl);
-  const [identity, setIdentity] = useState<GatewayIdentity>(defaultIdentity);
+  const [identity, setIdentity] = useState<GatewayIdentity>(routeDefaultIdentity);
   const [customToken, setCustomToken] = useState('');
   const [useDevToken, setUseDevToken] = useState(true);
   const [showConnect, setShowConnect] = useState(false);
   const [composerMode, setComposerMode] = useState<ComposerMode>('run');
   const [composerText, setComposerText] = useState('');
-  const [composerImagePath, setComposerImagePath] = useState('');
+  const [composerImageFiles, setComposerImageFiles] = useState<File[]>([]);
   const [composerImageDetail, setComposerImageDetail] = useState<GatewayImageInput['detail']>('high');
   const [isComposerCollapsed, setIsComposerCollapsed] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
@@ -95,6 +136,7 @@ export function ComposerPage(): ReactElement {
   const [clockTick, setClockTick] = useState(() => Date.now());
   const clientRef = useRef<GatewayWebClient | null>(null);
   const outputRef = useRef<HTMLDivElement | null>(null);
+  const composerImageInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -104,7 +146,7 @@ export function ComposerPage(): ReactElement {
           return;
         }
 
-        const saved = loadSavedConnectionSettings();
+        const saved = loadSavedConnectionSettings(connectionSettingsStorageKey);
         setDefaults(loaded);
         if (saved) {
           setSocketUrl(saved.socketUrl);
@@ -115,7 +157,7 @@ export function ComposerPage(): ReactElement {
         }
 
         setSocketUrl(loaded.socketUrl);
-        setIdentity(gatewayIdentityFromDefaults(loaded));
+        setIdentity(isRunPage ? gatewayRunIdentityFromDefaults(loaded) : gatewayIdentityFromDefaults(loaded));
         setUseDevToken(true);
         setCustomToken('');
       })
@@ -126,18 +168,18 @@ export function ComposerPage(): ReactElement {
     return () => {
       active = false;
     };
-  }, []);
+  }, [connectionSettingsStorageKey, isRunPage]);
 
   useEffect(() => {
-    const saved = loadSavedLiveState();
+    const saved = loadSavedLiveState(liveStateStorageKey);
     if (saved) {
       dispatch({ type: 'hydrate', state: saved });
     }
-  }, []);
+  }, [liveStateStorageKey]);
 
   useEffect(() => {
-    saveLiveState(state);
-  }, [state]);
+    saveLiveState(liveStateStorageKey, state);
+  }, [liveStateStorageKey, state]);
 
   useEffect(() => {
     return () => {
@@ -169,8 +211,7 @@ export function ComposerPage(): ReactElement {
     return state.runs[0];
   }, [state.runs, state.session.activeRootRunId, state.session.activeRunId]);
 
-  const minimalOutputMarkdown = useMemo(() => buildMinimalOutputMarkdown(state), [state]);
-  const statusLines = useMemo(() => buildStatusLines(state), [state]);
+  const minimalOutputBlocks = useMemo(() => buildMinimalOutputBlocks(state), [state]);
   const exportName = useMemo(() => buildExportFileStem(state), [state]);
   const activeApproval = resolvePendingApproval(state, activeRun);
 
@@ -184,7 +225,7 @@ export function ComposerPage(): ReactElement {
       top: node.scrollHeight,
       behavior: 'auto',
     });
-  }, [minimalOutputMarkdown]);
+  }, [minimalOutputBlocks]);
 
   async function connect(options: { openSession?: boolean } = {}): Promise<boolean> {
     setIsConnecting(true);
@@ -235,8 +276,6 @@ export function ComposerPage(): ReactElement {
   async function submitComposer(event: FormEvent): Promise<void> {
     event.preventDefault();
     const text = composerText.trim();
-    const imagePath = composerImagePath.trim();
-    const images: GatewayImageInput[] | undefined = imagePath.length > 0 ? [{ path: imagePath, detail: composerImageDetail }] : undefined;
     if (!text) {
       return;
     }
@@ -246,7 +285,20 @@ export function ComposerPage(): ReactElement {
     }
 
     try {
-      if (composerMode === 'chat') {
+      let images: GatewayImageInput[] | undefined;
+      if (!isRunPage) {
+        const uploadedImages = await clientRef.current.uploadImages(composerImageFiles);
+        images = uploadedImages.length > 0
+          ? uploadedImages.map((image) => ({
+              uploadId: image.uploadId,
+              mimeType: image.mimeType,
+              name: image.name,
+              detail: composerImageDetail,
+            }))
+          : undefined;
+      }
+
+      if (!isRunPage && composerMode === 'chat') {
         await clientRef.current.sendChat(text, images);
         addFeed('user', describeComposerSubmission(text, images));
       } else {
@@ -254,10 +306,27 @@ export function ComposerPage(): ReactElement {
         addFeed('user', `Run: ${describeComposerSubmission(text, images)}`);
       }
       setComposerText('');
-      setComposerImagePath('');
-      setComposerImageDetail('high');
+      if (!isRunPage) {
+        clearComposerImages();
+        setComposerImageDetail('high');
+      }
     } catch (sendError) {
       addFeed('system', `Send failed: ${sendError instanceof Error ? sendError.message : String(sendError)}`);
+    }
+  }
+
+  function chooseComposerImages(): void {
+    composerImageInputRef.current?.click();
+  }
+
+  function updateComposerImageFiles(event: ChangeEvent<HTMLInputElement>): void {
+    setComposerImageFiles(Array.from(event.target.files ?? []));
+  }
+
+  function clearComposerImages(): void {
+    setComposerImageFiles([]);
+    if (composerImageInputRef.current) {
+      composerImageInputRef.current.value = '';
     }
   }
 
@@ -305,7 +374,7 @@ export function ComposerPage(): ReactElement {
   }
 
   function saveCurrentConnectionSettings(): void {
-    saveConnectionSettings({
+    saveConnectionSettings(connectionSettingsStorageKey, {
       socketUrl,
       identity,
       useDevToken,
@@ -318,7 +387,7 @@ export function ComposerPage(): ReactElement {
 
   function resetConnectionSettingsForm(): void {
     setSocketUrl(defaults.socketUrl);
-    setIdentity(gatewayIdentityFromDefaults(defaults));
+    setIdentity(isRunPage ? gatewayRunIdentityFromDefaults(defaults) : gatewayIdentityFromDefaults(defaults));
     setUseDevToken(true);
     setCustomToken('');
     setError('');
@@ -352,10 +421,10 @@ export function ComposerPage(): ReactElement {
   const pendingClarification = state.pendingClarification;
   const composerPlaceholder = pendingClarification
     ? pendingClarification.message
-    : composerMode === 'chat'
+    : !isRunPage && composerMode === 'chat'
       ? 'Keep it brief. Ask, steer, refine.'
       : 'Describe the run goal in a sentence or two.';
-  const composerActionLabel = pendingClarification ? 'Reply' : composerMode === 'chat' ? 'Send' : 'Run';
+  const composerActionLabel = pendingClarification ? 'Reply' : !isRunPage && composerMode === 'chat' ? 'Send' : 'Run';
   const progressIndicator = useMemo(
     () => resolveMinimalProgressIndicator(activeRun, activeRun?.latestEvent ?? state.events[0], state.session.status),
     [activeRun, state.events, state.session.status],
@@ -366,20 +435,22 @@ export function ComposerPage(): ReactElement {
         <div className="minimal-composer-dock">
           <section className="minimal-session-shell" aria-label="Minimal workspace">
             <section ref={outputRef} className="minimal-markdown-output" aria-label="Rendered session output">
-              <MarkdownBlock source={minimalOutputMarkdown} />
+              <MinimalOutput blocks={minimalOutputBlocks} />
             </section>
 
             <section className="minimal-composer-frame" aria-label="Minimal composer">
               <div className="minimal-composer-top">
                 <div className="minimal-control-cluster">
-                  <div className="minimal-mode-switch" role="group" aria-label="Composer mode">
-                    <button className={composerMode === 'run' ? 'selected' : ''} type="button" onClick={() => setComposerMode('run')}>
-                      Run
-                    </button>
-                    <button className={composerMode === 'chat' ? 'selected' : ''} type="button" onClick={() => setComposerMode('chat')}>
-                      Chat
-                    </button>
-                  </div>
+                  {!isRunPage ? (
+                    <div className="minimal-mode-switch" role="group" aria-label="Composer mode">
+                      <button className={composerMode === 'run' ? 'selected' : ''} type="button" onClick={() => setComposerMode('run')}>
+                        Run
+                      </button>
+                      <button className={composerMode === 'chat' ? 'selected' : ''} type="button" onClick={() => setComposerMode('chat')}>
+                        Chat
+                      </button>
+                    </div>
+                  ) : null}
                   <button
                     className={`minimal-connect-button ${state.socketState}`}
                     type="button"
@@ -410,6 +481,15 @@ export function ComposerPage(): ReactElement {
                   title={isComposerCollapsed ? 'Expand composer' : 'Collapse composer'}
                   onClick={() => setIsComposerCollapsed((value) => !value)}
                 />
+                {state.modelActivity ? (
+                  <span
+                    className={`minimal-thinking-chip ${state.modelActivity.status}`}
+                    aria-live="polite"
+                    title={buildThinkingChipTitle(state.modelActivity)}
+                  >
+                    {buildThinkingChipLabel(state.modelActivity, clockTick)}
+                  </span>
+                ) : null}
                 <span className="minimal-runtime-chip">{buildRuntimeLabel(activeRun, state.session.status, clockTick)}</span>
               </div>
 
@@ -505,37 +585,63 @@ export function ComposerPage(): ReactElement {
                       </span>
                     </div>
                   ) : null}
-                  <textarea
-                    value={composerText}
-                    onChange={(event) => setComposerText(event.target.value)}
-                    placeholder={composerPlaceholder}
-                    rows={4}
-                  />
-                  <div className="minimal-composer-attachments">
-                    <label className="minimal-composer-file-field">
-                      <span>Image path</span>
-                      <input
-                        type="text"
-                        value={composerImagePath}
-                        onChange={(event) => setComposerImagePath(event.target.value)}
-                        placeholder="/Users/me/receipt.png"
-                      />
-                    </label>
-                    <label className="minimal-composer-detail-field">
-                      <span>Detail</span>
-                      <select
-                        value={composerImageDetail ?? 'high'}
-                        onChange={(event) => setComposerImageDetail(event.target.value as GatewayImageInput['detail'])}
-                      >
-                        <option value="high">high</option>
-                        <option value="auto">auto</option>
-                        <option value="low">low</option>
-                      </select>
-                    </label>
+                  <div className="minimal-composer-input">
+                    <textarea
+                      value={composerText}
+                      onChange={(event) => setComposerText(event.target.value)}
+                      placeholder={composerPlaceholder}
+                      rows={4}
+                    />
+                    <button className="minimal-send-button" type="submit" aria-label={composerActionLabel} title={composerActionLabel}>
+                      <SendIcon />
+                    </button>
                   </div>
-                  <button className="minimal-send-button" type="submit" aria-label={composerActionLabel} title={composerActionLabel}>
-                    <SendIcon />
-                  </button>
+                  {!isRunPage ? (
+                    <div className="minimal-composer-attachments">
+                      <div className="minimal-composer-file-field">
+                        <input
+                          ref={composerImageInputRef}
+                          className="minimal-composer-file-input"
+                          type="file"
+                          accept="image/png,image/jpeg,image/webp,image/gif"
+                          multiple
+                          onChange={updateComposerImageFiles}
+                        />
+                        <button
+                          className="minimal-attachment-button"
+                          type="button"
+                          onClick={chooseComposerImages}
+                          aria-label="Attach images"
+                          title="Attach images"
+                        >
+                          <PaperclipIcon />
+                          <span>{formatSelectedImageFiles(composerImageFiles)}</span>
+                        </button>
+                        {composerImageFiles.length > 0 ? (
+                          <button
+                            className="minimal-attachment-clear"
+                            type="button"
+                            onClick={clearComposerImages}
+                            aria-label="Clear attached images"
+                            title="Clear attached images"
+                          >
+                            x
+                          </button>
+                        ) : null}
+                      </div>
+                      <label className="minimal-composer-detail-field">
+                        <span>Detail</span>
+                        <select
+                          value={composerImageDetail ?? 'high'}
+                          onChange={(event) => setComposerImageDetail(event.target.value as GatewayImageInput['detail'])}
+                        >
+                          <option value="high">high</option>
+                          <option value="auto">auto</option>
+                          <option value="low">low</option>
+                        </select>
+                      </label>
+                    </div>
+                  ) : null}
                 </form>
               </div>
 
@@ -573,14 +679,7 @@ export function ComposerPage(): ReactElement {
                     <span>{pendingClarification.message}</span>
                   </div>
                 </div>
-              ) : (
-                <div className="minimal-status-bar">
-                  <div className="minimal-status-stack" aria-live="polite" key={statusLines.join('|')}>
-                    <span className="minimal-status-line current">{statusLines[0]}</span>
-                    <span className="minimal-status-line previous">{statusLines[1]}</span>
-                  </div>
-                </div>
-              )}
+              ) : null}
             </section>
           </section>
         </div>
@@ -741,6 +840,7 @@ function applyFrame(state: LiveGatewayState, frame: OutboundFrame): LiveGatewayS
           status: nextStatus,
           latestEvent: summary,
         }),
+        modelActivity: nextModelActivity(state.modelActivity, frame),
       };
 
       const progressMessage = formatLiveProgressUpdate(frame);
@@ -822,6 +922,86 @@ function upsertRun(runs: RunActivity[], patch: Partial<RunActivity> & { runId: s
   );
 }
 
+function nextModelActivity(
+  current: ModelActivitySnapshot | undefined,
+  frame: { eventType: string; data: unknown; runId?: string; rootRunId?: string; createdAt?: string },
+): ModelActivitySnapshot | undefined {
+  const payload = frame.data && typeof frame.data === 'object' && !Array.isArray(frame.data)
+    ? (frame.data as Record<string, unknown>)
+    : {};
+  const runId = frame.runId ?? frame.rootRunId;
+  const eventTime = frame.createdAt ? new Date(frame.createdAt) : new Date();
+
+  switch (frame.eventType) {
+    case 'model.started': {
+      const provider = readPayloadString(payload, 'provider');
+      const model = readPayloadString(payload, 'model');
+      const target = [provider, model].filter((part): part is string => Boolean(part)).join('/');
+      const timeoutMs = readPayloadNumber(payload, 'modelTimeoutMs');
+      return {
+        status: 'thinking',
+        runId,
+        target: target || undefined,
+        startedAt: eventTime,
+        timeoutMs,
+      };
+    }
+    case 'model.completed': {
+      if (!current || (current.runId && runId && current.runId !== runId)) {
+        return undefined;
+      }
+      return {
+        ...current,
+        status: 'completed',
+        completedAt: eventTime,
+        durationMs: readPayloadNumber(payload, 'durationMs'),
+        finishReason: readPayloadString(payload, 'finishReason'),
+        toolCallCount: readPayloadNumber(payload, 'toolCallCount'),
+      };
+    }
+    case 'model.failed': {
+      if (!current || (current.runId && runId && current.runId !== runId)) {
+        return undefined;
+      }
+      const errorRecord = payload.error && typeof payload.error === 'object' && !Array.isArray(payload.error)
+        ? (payload.error as Record<string, unknown>)
+        : {};
+      const errorMessage =
+        readPayloadString(errorRecord, 'message') ??
+        readPayloadString(payload, 'error') ??
+        readPayloadString(payload, 'reason') ??
+        readPayloadString(payload, 'message');
+      return {
+        ...current,
+        status: 'failed',
+        completedAt: eventTime,
+        durationMs: readPayloadNumber(payload, 'durationMs'),
+        timedOut: payload.timedOut === true,
+        error: errorMessage,
+      };
+    }
+    case 'run.completed':
+    case 'run.failed':
+    case 'run.interrupted':
+      if (!current || (current.runId && runId && current.runId !== runId)) {
+        return current;
+      }
+      return undefined;
+    default:
+      return current;
+  }
+}
+
+function readPayloadString(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function readPayloadNumber(record: Record<string, unknown>, key: string): number | undefined {
+  const value = record[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
 function inferRunStatus(event: LiveAgentEventSummary, sessionStatus: SessionStatus): RunActivity['status'] {
   if (event.eventType.includes('failed')) {
     return 'failed';
@@ -867,6 +1047,49 @@ function parseRoles(value: string): string[] {
   return roles.length > 0 ? roles : ['member'];
 }
 
+function MinimalOutput(props: { blocks: MinimalOutputBlock[] }): ReactElement {
+  if (props.blocks.length === 0) {
+    return <MarkdownBlock source="_No output yet._" />;
+  }
+
+  return (
+    <div className="minimal-output-stream">
+      {props.blocks.map((block) =>
+        block.kind === 'assistant-progress' ? (
+          <AssistantProgressBlock key={block.id} block={block} />
+        ) : (
+          <article key={block.id} className="minimal-output-block">
+            <MarkdownBlock source={block.source} />
+          </article>
+        ),
+      )}
+    </div>
+  );
+}
+
+function AssistantProgressBlock(props: { block: Extract<MinimalOutputBlock, { kind: 'assistant-progress' }> }): ReactElement {
+  const summaries = summarizeToolActivity(props.block.toolMessages);
+
+  return (
+    <article className="assistant-progress-card">
+      <div className="assistant-progress-content">
+        <MarkdownBlock source={props.block.assistantContent} />
+      </div>
+      <div className="assistant-progress-tools" aria-label="Tool activity">
+        <span className="assistant-progress-tools-label">Tools</span>
+        <div className="assistant-progress-tool-chips">
+          {summaries.map((summary) => (
+            <span key={summary.key} className={`assistant-progress-tool-chip ${summary.tone}`} title={summary.title}>
+              <code>{summary.label}</code>
+              {summary.count > 1 ? <span>{`x${summary.count}`}</span> : null}
+            </span>
+          ))}
+        </div>
+      </div>
+    </article>
+  );
+}
+
 function MarkdownBlock(props: { source: string }): ReactElement {
   const html = useMemo(() => marked.parse(props.source.trim().length > 0 ? props.source : '_No output yet._', { async: false }) as string, [props.source]);
   return <div className="markdown-body" dangerouslySetInnerHTML={{ __html: html }} />;
@@ -875,8 +1098,16 @@ function MarkdownBlock(props: { source: string }): ReactElement {
 function SendIcon(): ReactElement {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <path d="M4 12h14" />
-      <path d="m12 5 7 7-7 7" />
+      <path d="M12 20V4" />
+      <path d="m5 11 7-7 7 7" />
+    </svg>
+  );
+}
+
+function PaperclipIcon(): ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="m21 11.5-8.7 8.7a5.1 5.1 0 0 1-7.2-7.2l9.2-9.2a3.4 3.4 0 0 1 4.8 4.8l-9.1 9.1a1.7 1.7 0 0 1-2.4-2.4l8.4-8.4" />
     </svg>
   );
 }
@@ -902,9 +1133,9 @@ function ResetIcon(): ReactElement {
 
 function SettingsIcon(): ReactElement {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <circle cx="12" cy="12" r="3.2" />
-      <path d="M19.4 15a1 1 0 0 0 .2 1.1l.1.1a1 1 0 0 1 0 1.4l-1.1 1.1a1 1 0 0 1-1.4 0l-.1-.1a1 1 0 0 0-1.1-.2 1 1 0 0 0-.6.9V20a1 1 0 0 1-1 1h-1.6a1 1 0 0 1-1-1v-.2a1 1 0 0 0-.6-.9 1 1 0 0 0-1.1.2l-.1.1a1 1 0 0 1-1.4 0l-1.1-1.1a1 1 0 0 1 0-1.4l.1-.1a1 1 0 0 0 .2-1.1 1 1 0 0 0-.9-.6H4a1 1 0 0 1-1-1v-1.6a1 1 0 0 1 1-1h.2a1 1 0 0 0 .9-.6 1 1 0 0 0-.2-1.1l-.1-.1a1 1 0 0 1 0-1.4l1.1-1.1a1 1 0 0 1 1.4 0l.1.1a1 1 0 0 0 1.1.2 1 1 0 0 0 .6-.9V4a1 1 0 0 1 1-1h1.6a1 1 0 0 1 1 1v.2a1 1 0 0 0 .6.9 1 1 0 0 0 1.1-.2l.1-.1a1 1 0 0 1 1.4 0l1.1 1.1a1 1 0 0 1 0 1.4l-.1.1a1 1 0 0 0-.2 1.1 1 1 0 0 0 .9.6h.2a1 1 0 0 1 1 1v1.6a1 1 0 0 1-1 1h-.2a1 1 0 0 0-.9.6" />
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M9.6 2.8h4.8l.6 3.1a7.5 7.5 0 0 1 1.7.9l3-1.1 2.4 4.1-2.4 2a7.9 7.9 0 0 1 0 2l2.4 2-2.4 4.1-3-1.1a7.5 7.5 0 0 1-1.7.9l-.6 3.1H9.6L9 19.7a7.5 7.5 0 0 1-1.7-.9l-3 1.1-2.4-4.1 2.4-2a7.9 7.9 0 0 1 0-2l-2.4-2 2.4-4.1 3 1.1A7.5 7.5 0 0 1 9 5.9z" />
+      <circle cx="12" cy="12.8" r="4.6" />
     </svg>
   );
 }
@@ -929,10 +1160,17 @@ function RejectIcon(): ReactElement {
 function ConnectionIcon(props: { state: LiveGatewayState['socketState'] }): ReactElement {
   if (props.state === 'connected') {
     return (
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-        <path d="M10.5 13.5 8 16a2.8 2.8 0 1 1-4-4l2.4-2.4" />
-        <path d="M13.5 10.5 16 8a2.8 2.8 0 1 1 4 4l-2.4 2.4" />
-        <path d="m8.5 15.5 7-7" />
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <g transform="rotate(-45 12 12)">
+          <path d="M2.6 12h2.6" />
+          <rect x="5.2" y="8.4" width="4.4" height="7.2" rx="1.3" />
+          <path d="M9.6 10.5h2.6" />
+          <path d="M9.6 13.5h2.6" />
+          <path d="M21.4 12h-2.6" />
+          <rect x="14.4" y="8.4" width="4.4" height="7.2" rx="1.3" />
+          <path d="M14.4 10.5h-2.6" />
+          <path d="M14.4 13.5h-2.6" />
+        </g>
       </svg>
     );
   }
@@ -949,16 +1187,25 @@ function ConnectionIcon(props: { state: LiveGatewayState['socketState'] }): Reac
   }
 
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <path d="M10.5 13.5 8 16a2.8 2.8 0 1 1-4-4l2.4-2.4" />
-      <path d="M13.5 10.5 16 8a2.8 2.8 0 1 1 4 4l-2.4 2.4" />
-      <path d="m3 21 18-18" />
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <g transform="rotate(-45 12 12)">
+        <path d="M2.6 12h2.6" />
+        <rect x="5.2" y="8.4" width="4.4" height="7.2" rx="1.3" />
+        <path d="M9.6 10.5h1.6" />
+        <path d="M9.6 13.5h1.6" />
+        <path d="M21.4 12h-2.6" />
+        <rect x="14.4" y="8.4" width="4.4" height="7.2" rx="1.3" />
+        <path d="M14.4 10.5h-1.6" />
+        <path d="M14.4 13.5h-1.6" />
+      </g>
     </svg>
   );
 }
 
 const LIVE_STATE_STORAGE_KEY = 'agent-smith.gateway-web.live-state.v1';
 const CONNECTION_SETTINGS_STORAGE_KEY = 'agent-smith.gateway-web.connection-settings.v1';
+const RUN_LIVE_STATE_STORAGE_KEY = 'agent-smith.gateway-web.run-live-state.v1';
+const RUN_CONNECTION_SETTINGS_STORAGE_KEY = 'agent-smith.gateway-web.run-connection-settings.v1';
 
 function gatewayIdentityFromDefaults(defaults: GatewayDefaults): GatewayIdentity {
   return {
@@ -969,12 +1216,21 @@ function gatewayIdentityFromDefaults(defaults: GatewayDefaults): GatewayIdentity
   };
 }
 
-function saveConnectionSettings(settings: SavedConnectionSettings): void {
-  localStorage.setItem(CONNECTION_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+function gatewayRunIdentityFromDefaults(defaults: GatewayDefaults): GatewayIdentity {
+  return {
+    ...gatewayIdentityFromDefaults(defaults),
+    channel: 'web',
+    tenantId: 'free',
+    roles: ['member'],
+  };
 }
 
-function loadSavedConnectionSettings(): SavedConnectionSettings | undefined {
-  const raw = localStorage.getItem(CONNECTION_SETTINGS_STORAGE_KEY);
+function saveConnectionSettings(storageKey: string, settings: SavedConnectionSettings): void {
+  localStorage.setItem(storageKey, JSON.stringify(settings));
+}
+
+function loadSavedConnectionSettings(storageKey: string): SavedConnectionSettings | undefined {
+  const raw = localStorage.getItem(storageKey);
   if (!raw) {
     return undefined;
   }
@@ -1010,17 +1266,17 @@ function loadSavedConnectionSettings(): SavedConnectionSettings | undefined {
   }
 }
 
-function saveLiveState(state: LiveGatewayState): void {
+function saveLiveState(storageKey: string, state: LiveGatewayState): void {
   const snapshot: LiveGatewayState = {
     ...state,
     socketState: 'idle',
     socketDetail: '',
   };
-  localStorage.setItem(LIVE_STATE_STORAGE_KEY, JSON.stringify(snapshot));
+  localStorage.setItem(storageKey, JSON.stringify(snapshot));
 }
 
-function loadSavedLiveState(): LiveGatewayState | undefined {
-  const raw = localStorage.getItem(LIVE_STATE_STORAGE_KEY);
+function loadSavedLiveState(storageKey: string): LiveGatewayState | undefined {
+  const raw = localStorage.getItem(storageKey);
   if (!raw) {
     return undefined;
   }
@@ -1043,6 +1299,13 @@ function reviveLiveState(state: LiveGatewayState): LiveGatewayState {
       updatedAt: new Date(run.updatedAt),
       latestEvent: run.latestEvent ? { ...run.latestEvent, timestamp: new Date(run.latestEvent.timestamp) } : undefined,
     })),
+    modelActivity: state.modelActivity
+      ? {
+          ...state.modelActivity,
+          startedAt: new Date(state.modelActivity.startedAt),
+          completedAt: state.modelActivity.completedAt ? new Date(state.modelActivity.completedAt) : undefined,
+        }
+      : undefined,
   };
 }
 
@@ -1093,19 +1356,119 @@ function buildMinimalOutputMarkdown(state: LiveGatewayState): string {
     .join('\n\n---\n\n');
 }
 
-function buildStatusLines(state: LiveGatewayState): [string, string] {
-  const latestEvents = state.events.slice(0, 2).map((event) => `${formatClockTime(event.timestamp)} · ${event.compactText}`);
-  const fallback = buildStatusFallback(state);
+function buildMinimalOutputBlocks(state: LiveGatewayState): MinimalOutputBlock[] {
+  const blocks: MinimalOutputBlock[] = [];
+  let activeProgressBlock: Extract<MinimalOutputBlock, { kind: 'assistant-progress' }> | undefined;
 
-  if (latestEvents.length === 0) {
-    return [fallback, 'Waiting for the first live event'];
+  for (const entry of state.feed) {
+    if (entry.kind !== 'assistant' && entry.kind !== 'run') {
+      continue;
+    }
+
+    const progressEntry = entry.kind === 'assistant' ? splitAssistantProgressEntry(entry.content) : undefined;
+    if (progressEntry) {
+      if (
+        activeProgressBlock &&
+        activeProgressBlock.runId === entry.runId &&
+        activeProgressBlock.assistantContent === progressEntry.assistantContent
+      ) {
+        activeProgressBlock.toolMessages.push(progressEntry.toolMessage);
+        continue;
+      }
+
+      activeProgressBlock = {
+        kind: 'assistant-progress',
+        id: entry.id,
+        assistantContent: progressEntry.assistantContent,
+        toolMessages: [progressEntry.toolMessage],
+        runId: entry.runId,
+      };
+      blocks.push(activeProgressBlock);
+      continue;
+    }
+
+    const source = entry.content.trim();
+    if (source.length === 0) {
+      continue;
+    }
+
+    activeProgressBlock = undefined;
+    blocks.push({ kind: 'markdown', id: entry.id, source });
   }
 
-  if (latestEvents.length === 1) {
-    return [latestEvents[0], fallback];
+  return blocks;
+}
+
+function splitAssistantProgressEntry(content: string): { assistantContent: string; toolMessage: string } | undefined {
+  const trimmed = content.trim();
+  const separatorIndex = trimmed.lastIndexOf('\n\n');
+  if (separatorIndex < 0) {
+    return undefined;
   }
 
-  return [latestEvents[0], latestEvents[1]];
+  const assistantContent = trimmed.slice(0, separatorIndex).trim();
+  const toolMessage = trimmed.slice(separatorIndex + 2).trim();
+  if (!assistantContent || !toolMessage || toolMessage.includes('\n') || !isAssistantToolProgressMessage(toolMessage)) {
+    return undefined;
+  }
+
+  return { assistantContent, toolMessage };
+}
+
+function isAssistantToolProgressMessage(value: string): boolean {
+  return (
+    value.startsWith('Running `') ||
+    value.startsWith('Waiting for approval to run `') ||
+    value.startsWith('Delegating to `') ||
+    value === 'Delegating to a child run.'
+  );
+}
+
+function summarizeToolActivity(messages: string[]): ToolActivitySummary[] {
+  const summaries = new Map<string, ToolActivitySummary>();
+
+  for (const message of messages) {
+    const parsed = parseToolActivityMessage(message);
+    const key = `${parsed.tone}:${parsed.label}`;
+    const existing = summaries.get(key);
+    if (existing) {
+      summaries.set(key, {
+        ...existing,
+        count: existing.count + 1,
+        title: `${existing.title}\n${message}`,
+      });
+      continue;
+    }
+
+    summaries.set(key, {
+      key,
+      label: parsed.label,
+      tone: parsed.tone,
+      count: 1,
+      title: message,
+    });
+  }
+
+  return Array.from(summaries.values());
+}
+
+function parseToolActivityMessage(message: string): Pick<ToolActivitySummary, 'label' | 'tone'> {
+  const approvalToolName = message.match(/^Waiting for approval to run `([^`]+)`/)?.[1];
+  if (approvalToolName) {
+    return { label: approvalToolName, tone: 'approval' };
+  }
+
+  const runningToolName = message.match(/^Running `([^`]+)`/)?.[1];
+  if (runningToolName) {
+    return { label: runningToolName, tone: 'tool' };
+  }
+
+  const delegateName = message.match(/^Delegating to `([^`]+)`/)?.[1];
+  if (delegateName) {
+    return { label: delegateName, tone: 'delegate' };
+  }
+
+  return { label: 'activity', tone: 'activity' };
 }
 
 function resolveMinimalProgressIndicator(
@@ -1161,6 +1524,52 @@ function isSettledProgressEvent(eventType: string): boolean {
   return ['completed', 'succeeded', 'resolved', 'failed', 'error'].some((token) => eventType.includes(token));
 }
 
+function buildThinkingChipLabel(activity: ModelActivitySnapshot, now: number): string {
+  if (activity.status === 'thinking') {
+    const elapsed = Math.max(0, now - activity.startedAt.getTime());
+    return `thinking ${formatThinkingElapsed(elapsed)}`;
+  }
+  if (activity.status === 'completed') {
+    return activity.durationMs !== undefined ? `model ${formatDuration(activity.durationMs)}` : 'model done';
+  }
+  if (activity.timedOut) {
+    return activity.durationMs !== undefined
+      ? `model timed out (${formatDuration(activity.durationMs)})`
+      : 'model timed out';
+  }
+  return activity.durationMs !== undefined ? `model failed (${formatDuration(activity.durationMs)})` : 'model failed';
+}
+
+function buildThinkingChipTitle(activity: ModelActivitySnapshot): string {
+  const parts: string[] = [];
+  if (activity.target) {
+    parts.push(activity.target);
+  }
+  if (activity.status === 'thinking' && activity.timeoutMs !== undefined) {
+    parts.push(`timeout ${formatDuration(activity.timeoutMs)}`);
+  }
+  if (activity.status === 'completed') {
+    if (activity.finishReason) parts.push(`finish=${activity.finishReason}`);
+    if (activity.toolCallCount !== undefined && activity.toolCallCount > 0) {
+      parts.push(`toolCalls=${activity.toolCallCount}`);
+    }
+  }
+  if (activity.status === 'failed' && activity.error) {
+    parts.push(activity.error);
+  }
+  return parts.join(' · ');
+}
+
+function formatThinkingElapsed(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  if (totalSeconds < 60) {
+    return `${totalSeconds}s`;
+  }
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return seconds === 0 ? `${minutes}m` : `${minutes}m${seconds}s`;
+}
+
 function buildRuntimeLabel(run: RunActivity | undefined, sessionStatus: SessionStatus, now: number): string {
   if (!run) {
     return `session ${sessionStatus}`;
@@ -1179,13 +1588,33 @@ function buildRuntimeLabel(run: RunActivity | undefined, sessionStatus: SessionS
 }
 
 function describeComposerSubmission(text: string, images?: GatewayImageInput[]): string {
-  const image = images?.[0];
-  if (!image) {
+  if (!images || images.length === 0) {
     return text;
   }
 
-  const detail = image.detail ?? 'auto';
-  return `${text}\n[image: ${image.path} (${detail})]`;
+  const detail = images[0].detail ?? 'auto';
+  const imageNames = images.map(formatImageInputLabel).join(', ');
+  return `${text}\n[image${images.length === 1 ? '' : 's'}: ${imageNames} (${detail})]`;
+}
+
+function formatImageInputLabel(image: GatewayImageInput): string {
+  if ('path' in image) {
+    return image.name ?? image.path;
+  }
+
+  return image.name ?? image.uploadId;
+}
+
+function formatSelectedImageFiles(files: File[]): string {
+  if (files.length === 0) {
+    return 'Attach image';
+  }
+
+  if (files.length === 1) {
+    return files[0].name;
+  }
+
+  return `${files.length} images selected`;
 }
 
 function formatElapsedClock(ms: number): string {
@@ -1205,10 +1634,6 @@ function buildExportFileStem(state: LiveGatewayState): string {
   const sessionId = readCurrentSessionId(state);
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
   return `agent-smith-${sessionId ? shortId(sessionId) : 'session'}-${timestamp}`;
-}
-
-function buildStatusFallback(state: LiveGatewayState): string {
-  return `session ${state.session.status} · run ${shortId(state.session.activeRunId ?? state.session.activeRootRunId)} · socket ${state.socketState}`;
 }
 
 function readCurrentSessionId(state: LiveGatewayState): string | undefined {

@@ -7,6 +7,8 @@
     "packages/*"
   ],
   "scripts": {
+    "core:cli": "bun run ./packages/core-cli/src/cli.ts",
+    "core:cli:link": "bun run --cwd ./packages/core-cli link:global",
     "gateway:ws-client": "bun run ./packages/gateway-fastify/src/local-ws-client.ts",
     "gateway:client:tui": "bun run ./packages/gateway-fastify/src/local-ws-client-tui.ts",
     "gateway:client:web": "bun run --cwd ./packages/gateway-web dev",
@@ -15,7 +17,8 @@
     "gateway:logs:analyze": "bun run ./packages/gateway-fastify/src/analyze-logs.ts",
     "gateway:mint-jwt": "bun run ./packages/gateway-fastify/src/mint-local-jwt.ts",
     "gateway:status": "bun run ./packages/gateway-fastify/src/check-status.ts",
-    "gateway:start": "bun run ./packages/gateway-fastify/src/start-local.ts"
+    "gateway:start": "bun run ./packages/gateway-fastify/src/start-local.ts",
+    "gateway:start:fly": "bun run ./packages/gateway-fastify/src/start-fly.ts"
   },
   "dependencies": {
     "@e2b/code-interpreter": "^2.4.0",

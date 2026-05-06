@@ -32,7 +32,6 @@ async function main(): Promise<void> {
   const loadedAgentConfigs = await loadAgentConfigs({ dir: AGENT_CONFIG_DIR });
   const moduleRegistry = await createLocalModuleRegistry({
     workspaceRoot: ADAPTIVE_AGENT_ARTIFACTS_DIR,
-    requiredDelegateNames: collectDelegateNames(loadedAgentConfigs),
   });
 
   const gateway = await startGateway({
@@ -263,10 +262,6 @@ async function readJsonFile(path: string): Promise<unknown> {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function collectDelegateNames(loadedAgentConfigs: Array<LoadedConfig<AgentConfig>>): string[] {
-  return [...new Set(loadedAgentConfigs.flatMap((loadedAgentConfig) => loadedAgentConfig.config.delegates))].sort();
 }
 
 function formatNameList(names: string[]): string {

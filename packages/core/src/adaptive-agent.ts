@@ -108,7 +108,7 @@ const DEFAULT_AGENT_DEFAULTS = {
 
 const OLLAMA_MODEL_TIMEOUT_MULTIPLIER = 4;
 const EXECUTION_STATE_SCHEMA_VERSION = 1;
-const DEFAULT_TERMINAL_RETRY_LIMIT = 1;
+const DEFAULT_TOOL_TERMINAL_RETRY_LIMIT = 1;
 
 const TERMINAL_RUN_STATUSES = new Set<RunStatus>([
   'succeeded',
@@ -120,6 +120,22 @@ const TERMINAL_RUN_STATUSES = new Set<RunStatus>([
 
 const RESERVED_DELEGATE_PREFIX = 'delegate.';
 const CHAT_GOAL_MAX_LENGTH = 120;
+
+const STEER_METADATA_KEY = 'pendingSteerMessages';
+const STEER_UPDATE_MAX_ATTEMPTS = 5;
+
+export interface SteerInput {
+  message: string;
+  role?: 'user' | 'system';
+  metadata?: JsonObject;
+}
+
+interface PendingSteerMessage {
+  role: 'user' | 'system';
+  content: string;
+  enqueuedAt: string;
+  metadata?: JsonObject;
+}
 
 export class AdaptiveAgent {
   private readonly toolRegistry = new Map<string, ToolDefinition>();
@@ -648,6 +664,149 @@ export class AdaptiveAgent {
     }
   }
 
+  async steer(runId: UUID, input: SteerInput | string): Promise<void> {
+    const normalized: SteerInput = typeof input === 'string' ? { message: input } : input;
+    if (!normalized.message || typeof normalized.message !== 'string' || normalized.message.trim() === '') {
+      throw new Error('steer() requires a non-empty message');
+    }
+
+    const role = normalized.role ?? 'user';
+    if (role !== 'user' && role !== 'system') {
+      throw new Error(`steer() role must be 'user' or 'system'`);
+    }
+
+    const run = await this.options.runStore.getRun(runId);
+    if (!run) {
+      throw new Error(`Run ${runId} does not exist`);
+    }
+
+    if (TERMINAL_RUN_STATUSES.has(run.status)) {
+      throw new Error(`Run ${runId} is ${run.status}; steer() requires an active run`);
+    }
+
+    const pendingEntry: PendingSteerMessage = {
+      role,
+      content: normalized.message,
+      enqueuedAt: new Date().toISOString(),
+      ...(normalized.metadata ? { metadata: normalized.metadata } : {}),
+    };
+
+    const updatedRun = await this.appendPendingSteerMessage(run, pendingEntry);
+
+    this.logLifecycle('info', 'run.steered', {
+      ...runLogBindings(updatedRun),
+      stepId: updatedRun.currentStepId,
+      role,
+      messageSummary: summarizeValueForLog(normalized.message),
+    });
+
+    const eventPayload: JsonObject = {
+      role,
+      message: normalized.message,
+      enqueuedAt: pendingEntry.enqueuedAt,
+    };
+    if (normalized.metadata) {
+      eventPayload.metadata = normalized.metadata;
+    }
+
+    await this.emit({
+      runId: updatedRun.id,
+      stepId: updatedRun.currentStepId,
+      type: 'run.steered',
+      schemaVersion: 1,
+      payload: eventPayload,
+    });
+  }
+
+  private async appendPendingSteerMessage(run: AgentRun, message: PendingSteerMessage): Promise<AgentRun> {
+    let attempt = 0;
+    let currentRun = run;
+    let lastError: unknown;
+    while (attempt < STEER_UPDATE_MAX_ATTEMPTS) {
+      const existing = readPendingSteerMessagesFromMetadata(currentRun.metadata);
+      const nextMessages = [...existing, message];
+      const nextMetadata: Record<string, JsonValue> = {
+        ...(currentRun.metadata ?? {}),
+        [STEER_METADATA_KEY]: nextMessages as unknown as JsonValue,
+      };
+      try {
+        return await this.options.runStore.updateRun(
+          currentRun.id,
+          { metadata: nextMetadata } as Partial<AgentRun>,
+          currentRun.version,
+        );
+      } catch (error) {
+        lastError = error;
+        attempt += 1;
+        if (attempt >= STEER_UPDATE_MAX_ATTEMPTS) {
+          break;
+        }
+        currentRun = await this.refreshRun(currentRun.id);
+      }
+    }
+    throw new Error(
+      `Failed to enqueue steer message for run ${run.id} after ${STEER_UPDATE_MAX_ATTEMPTS} attempts: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+    );
+  }
+
+  private async drainPendingSteerMessages(run: AgentRun, state: ExecutionState): Promise<AgentRun> {
+    const initial = readPendingSteerMessagesFromMetadata(run.metadata);
+    if (initial.length === 0) {
+      return run;
+    }
+
+    const drained: PendingSteerMessage[] = [...initial];
+    for (const message of initial) {
+      state.messages.push({
+        role: message.role,
+        content: message.content,
+      });
+    }
+
+    let attempt = 0;
+    let currentRun = run;
+    let lastError: unknown;
+    while (attempt < STEER_UPDATE_MAX_ATTEMPTS) {
+      const nextMetadata: Record<string, JsonValue> = { ...(currentRun.metadata ?? {}) };
+      delete nextMetadata[STEER_METADATA_KEY];
+      try {
+        currentRun = await this.options.runStore.updateRun(
+          currentRun.id,
+          { metadata: nextMetadata } as Partial<AgentRun>,
+          currentRun.version,
+        );
+        break;
+      } catch (error) {
+        lastError = error;
+        attempt += 1;
+        if (attempt >= STEER_UPDATE_MAX_ATTEMPTS) {
+          throw new Error(
+            `Failed to clear steer queue for run ${run.id} after ${STEER_UPDATE_MAX_ATTEMPTS} attempts: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+          );
+        }
+        currentRun = await this.refreshRun(currentRun.id);
+        const refreshed = readPendingSteerMessagesFromMetadata(currentRun.metadata);
+        if (refreshed.length > drained.length) {
+          for (const message of refreshed.slice(drained.length)) {
+            state.messages.push({
+              role: message.role,
+              content: message.content,
+            });
+            drained.push(message);
+          }
+        }
+      }
+    }
+
+    this.logLifecycle('debug', 'run.steer_drained', {
+      ...runLogBindings(currentRun),
+      stepId: currentRun.currentStepId,
+      drainedCount: drained.length,
+    });
+
+    return currentRun;
+  }
+
   async resolveApproval(runId: UUID, approved: boolean): Promise<void> {
     const run = await this.options.runStore.getRun(runId);
     if (!run) {
@@ -942,6 +1101,14 @@ export class AdaptiveAgent {
       }
 
       const pendingToolCall = state.pendingToolCalls[0];
+      if (!pendingToolCall) {
+        const beforeDrainRun = currentRun;
+        currentRun = await this.drainPendingSteerMessages(currentRun, state);
+        if (currentRun !== beforeDrainRun) {
+          await this.saveExecutionSnapshot(currentRun, state, currentRun.status);
+        }
+      }
+
       const stepId = pendingToolCall?.stepId ?? `step-${state.stepsUsed + 1}`;
       currentRun = await this.ensureRunStep(currentRun, stepId);
 
@@ -1131,15 +1298,6 @@ export class AdaptiveAgent {
       };
     }
 
-    const retryAttempts = readRetryAttempts(run.metadata);
-    if (retryAttempts >= DEFAULT_TERMINAL_RETRY_LIMIT) {
-      return {
-        retryable: false,
-        failureKind,
-        reason: `Run ${run.id} has already used its terminal retry attempt`,
-      };
-    }
-
     if (run.errorCode === 'MODEL_ERROR') {
       if (isRetryableModelFailureKind(failureKind)) {
         return { retryable: true, failureKind };
@@ -1153,6 +1311,15 @@ export class AdaptiveAgent {
     }
 
     if (run.errorCode === 'TOOL_ERROR') {
+      const retryAttempts = readRetryAttempts(run.metadata);
+      if (retryAttempts >= DEFAULT_TOOL_TERMINAL_RETRY_LIMIT) {
+        return {
+          retryable: false,
+          failureKind,
+          reason: `Run ${run.id} has already used its terminal tool retry attempt`,
+        };
+      }
+
       if (!pendingToolCall) {
         return {
           retryable: false,
@@ -1161,7 +1328,7 @@ export class AdaptiveAgent {
         };
       }
 
-      const tool = this.toolRegistry.get(pendingToolCall.name);
+      const tool = this.resolveToolDefinitionByName(pendingToolCall.name);
       if (!tool) {
         return {
           retryable: false,
@@ -1249,12 +1416,75 @@ export class AdaptiveAgent {
     };
   }
 
+  private resolveToolDefinitionByName(name: string): ToolDefinition | undefined {
+    const exactTool = this.toolRegistry.get(name);
+    if (exactTool) {
+      return exactTool;
+    }
+
+    const correctedName = this.resolveMisspelledDelegateToolName(name);
+    if (!correctedName) {
+      return undefined;
+    }
+
+    return this.toolRegistry.get(correctedName);
+  }
+
+  private resolveMisspelledDelegateToolName(name: string): string | undefined {
+    if (!name.startsWith(RESERVED_DELEGATE_PREFIX)) {
+      return undefined;
+    }
+
+    const candidateNames = Array.from(this.toolRegistry.keys()).filter((toolName) =>
+      toolName.startsWith(RESERVED_DELEGATE_PREFIX),
+    );
+    if (candidateNames.length === 0) {
+      return undefined;
+    }
+
+    let bestName: string | undefined;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    let tied = false;
+
+    for (const candidateName of candidateNames) {
+      const distance = boundedLevenshteinDistance(name, candidateName, 2);
+      if (distance === undefined) {
+        continue;
+      }
+
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestName = candidateName;
+        tied = false;
+      } else if (distance === bestDistance) {
+        tied = true;
+      }
+    }
+
+    if (!bestName || tied) {
+      return undefined;
+    }
+
+    return bestName;
+  }
+
   private async executePendingToolCall(
     run: AgentRun,
     state: ExecutionState,
     pendingToolCall: PendingToolCallState,
   ): Promise<PendingToolCallExecutionResult> {
-    const tool = this.toolRegistry.get(pendingToolCall.name);
+    const resolvedTool = this.resolveToolDefinitionByName(pendingToolCall.name);
+    if (resolvedTool && resolvedTool.name !== pendingToolCall.name) {
+      this.logLifecycle('warn', 'tool.name_corrected', {
+        ...runLogBindings(run),
+        stepId: pendingToolCall.stepId,
+        requestedToolName: pendingToolCall.name,
+        resolvedToolName: resolvedTool.name,
+      });
+      pendingToolCall.name = resolvedTool.name;
+    }
+
+    const tool = resolvedTool;
     if (!tool) {
       throw new Error(`Unknown tool ${pendingToolCall.name}`);
     }
@@ -1893,7 +2123,10 @@ export class AdaptiveAgent {
       return undefined;
     }
 
-    return buildRuntimeToolManifestMessage(Array.from(this.toolRegistry.values()));
+    return buildRuntimeToolManifestMessage(
+      Array.from(this.toolRegistry.values()),
+      this.options.model.formatToolName?.bind(this.options.model),
+    );
   }
 
   private async createRunWithInitialSnapshot(
@@ -2288,6 +2521,42 @@ export class AdaptiveAgent {
       response = await this.options.model.generate({
         ...modelRequest,
         signal: timeoutContext.signal,
+        onRetry: async (retry) => {
+          const durationMs = Date.now() - startedAt;
+          this.logLifecycle('warn', 'model.retry', {
+            ...runLogBindings(run),
+            stepId: run.currentStepId,
+            provider: modelProvider,
+            model: modelName,
+            durationMs,
+            attempt: retry.attempt,
+            nextAttempt: retry.nextAttempt,
+            statusCode: retry.statusCode,
+            retryDelayMs: retry.retryDelayMs,
+            reason: retry.reason,
+            phase: retry.phase,
+            message: retry.message,
+          });
+          await this.emit({
+            runId: run.id,
+            stepId: run.currentStepId,
+            type: 'model.retry',
+            schemaVersion: 1,
+            payload: {
+              stepId: run.currentStepId,
+              provider: modelProvider,
+              model: modelName,
+              durationMs,
+              attempt: retry.attempt,
+              nextAttempt: retry.nextAttempt,
+              statusCode: retry.statusCode,
+              retryDelayMs: retry.retryDelayMs,
+              reason: retry.reason,
+              phase: retry.phase,
+              message: retry.message,
+            },
+          });
+        },
       });
     } catch (error) {
       const modelError = timeoutContext.didTimeout()
@@ -2842,10 +3111,13 @@ function buildAgentSystemMessage(systemInstructions?: string): ModelMessage {
   };
 }
 
-function buildRuntimeToolManifestMessage(tools: ToolDefinition[]): ModelMessage {
+function buildRuntimeToolManifestMessage(
+  tools: ToolDefinition[],
+  formatToolName?: (name: string) => string,
+): ModelMessage {
   const manifest = {
     tools: tools.map((tool) => ({
-      name: tool.name,
+      name: formatToolName ? formatToolName(tool.name) : tool.name,
       kind: tool.name.startsWith(RESERVED_DELEGATE_PREFIX) ? 'delegate' : 'tool',
       description: tool.description,
       inputSchema: tool.inputSchema,
@@ -3258,6 +3530,42 @@ function toolResultMessage(pendingToolCall: PendingToolCallState, output: JsonVa
   };
 }
 
+function boundedLevenshteinDistance(left: string, right: string, maxDistance: number): number | undefined {
+  const lengthDelta = Math.abs(left.length - right.length);
+  if (lengthDelta > maxDistance) {
+    return undefined;
+  }
+
+  const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  const current = new Array<number>(right.length + 1);
+
+  for (let i = 1; i <= left.length; i += 1) {
+    current[0] = i;
+    let rowMin = current[0];
+
+    for (let j = 1; j <= right.length; j += 1) {
+      const substitutionCost = left[i - 1] === right[j - 1] ? 0 : 1;
+      current[j] = Math.min(
+        previous[j] + 1,
+        current[j - 1] + 1,
+        previous[j - 1] + substitutionCost,
+      );
+      rowMin = Math.min(rowMin, current[j]);
+    }
+
+    if (rowMin > maxDistance) {
+      return undefined;
+    }
+
+    for (let j = 0; j <= right.length; j += 1) {
+      previous[j] = current[j];
+    }
+  }
+
+  const distance = previous[right.length] ?? 0;
+  return distance <= maxDistance ? distance : undefined;
+}
+
 function isJsonValueArray(value: unknown): value is JsonValue[] {
   return Array.isArray(value) && value.every(isJsonValueLike);
 }
@@ -3417,6 +3725,38 @@ function shouldResolveWaitingDelegateSnapshot(state: ExecutionState): boolean {
 
 function isJsonObject(value: JsonValue | undefined): value is JsonObject {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function readPendingSteerMessagesFromMetadata(
+  metadata: Record<string, JsonValue> | undefined,
+): PendingSteerMessage[] {
+  if (!metadata) {
+    return [];
+  }
+  const raw = metadata[STEER_METADATA_KEY];
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const result: PendingSteerMessage[] = [];
+  for (const entry of raw) {
+    if (!isJsonObject(entry)) {
+      continue;
+    }
+    const role = entry.role;
+    const content = entry.content;
+    if ((role !== 'user' && role !== 'system') || typeof content !== 'string') {
+      continue;
+    }
+    const enqueuedAt = typeof entry.enqueuedAt === 'string' ? entry.enqueuedAt : new Date().toISOString();
+    const metadataField = isJsonObject(entry.metadata) ? entry.metadata : undefined;
+    result.push({
+      role,
+      content,
+      enqueuedAt,
+      ...(metadataField ? { metadata: metadataField } : {}),
+    });
+  }
+  return result;
 }
 
 function isOptimisticConcurrencyError(error: unknown): error is Error {
@@ -3607,7 +3947,7 @@ function classifyFailureKind(code?: RunFailureCode, message?: string): FailureKi
   }
 
   const normalized = (message ?? '').toLowerCase();
-  if (normalized.includes('timed out') || normalized.includes('timeout')) {
+  if (normalized.includes('timed out') || normalized.includes('timeout') || /\b524\b/.test(normalized)) {
     return 'timeout';
   }
 

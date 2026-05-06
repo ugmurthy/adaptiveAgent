@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import type { Socket } from 'node:net';
+import { join } from 'node:path';
 
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest, type FastifyServerOptions } from 'fastify';
+import multipart from '@fastify/multipart';
 import websocket from '@fastify/websocket';
 
 import type { AgentRegistry } from './agent-registry.js';
@@ -52,6 +54,11 @@ import { getAuthorizedGatewaySession, openGatewaySession } from './session.js';
 import { createInMemoryGatewayStores, type GatewayStores } from './stores.js';
 import type { PostgresClient } from './stores-postgres.js';
 import type { MessageView } from './trace-session/types.js';
+import {
+  MAX_GATEWAY_IMAGE_UPLOAD_BYTES,
+  MAX_GATEWAY_IMAGE_UPLOAD_FILES,
+  registerGatewayImageUploadRoutes,
+} from './uploads.js';
 
 export interface CreateGatewayServerOptions {
   fastify?: FastifyServerOptions;
@@ -61,6 +68,7 @@ export interface CreateGatewayServerOptions {
   stores?: GatewayStores;
   traceClient?: PostgresClient;
   requestLogger?: GatewayLogger;
+  imageUploadDir?: string;
   now?: () => Date;
   sessionIdFactory?: () => string;
   transcriptMessageIdFactory?: () => string;
@@ -74,6 +82,7 @@ export interface GatewaySocketMessageContext {
   hooks?: ResolvedGatewayHooks;
   requestedChannelId?: string;
   stores?: GatewayStores;
+  imageUploadDir?: string;
   channelManager?: ChannelSubscriptionManager;
   emitFrame?: (frame: OutboundFrame) => Promise<void> | void;
   registerRuntimeObserver?: (observer: RuntimeObserverRegistration) => Promise<void>;
@@ -97,6 +106,7 @@ export async function createGatewayServer(
 ): Promise<FastifyInstance> {
   const app = Fastify(options.fastify);
   const stores = options.stores ?? createInMemoryGatewayStores();
+  const imageUploadDir = options.imageUploadDir ?? join(process.cwd(), 'data', 'gateway', 'uploads', 'images');
   const activeWebSocketConnections = new Set<Socket>();
   const requestLogLevel = resolveGatewayRequestLogLevel(config.server.requestLogging);
   const requestLogger = options.requestLogger
@@ -154,6 +164,17 @@ export async function createGatewayServer(
 
   app.addHook('onClose', async () => {
     await closeActiveWebSocketConnections(activeWebSocketConnections);
+  });
+
+  await app.register(multipart, {
+    limits: {
+      files: MAX_GATEWAY_IMAGE_UPLOAD_FILES,
+      fileSize: MAX_GATEWAY_IMAGE_UPLOAD_BYTES,
+    },
+  });
+  registerGatewayImageUploadRoutes(app, {
+    auth: options.auth,
+    uploadDir: imageUploadDir,
   });
 
   await app.register(websocket);
@@ -322,6 +343,7 @@ export async function createGatewayServer(
             hooks: options.hooks,
             requestedChannelId: request.gatewayRequestedChannelId,
             stores,
+            imageUploadDir,
             channelManager,
             emitFrame,
             registerRuntimeObserver,
@@ -740,6 +762,121 @@ function registerDashboardRunRoutes(app: FastifyInstance, context: DashboardRunR
       throw error;
     }
   });
+
+  app.post<{ Params: { runId: string } }>('/api/runs/:runId/interrupt', async (request, reply) => {
+    const authContext = await requireGatewayAdminHttpRequest(request, reply, context.auth);
+    if (!authContext) {
+      return reply;
+    }
+    if (!context.agentRegistry) {
+      return reply.code(503).send(createGatewayHttpError('agent_registry_unavailable', 'Run interrupt requires an agent registry.'));
+    }
+
+    try {
+      const agent = await resolveAgentForRun(request.params.runId, context);
+      if (!agent.agent.interrupt) {
+        return reply.code(409).send(createGatewayHttpError('unsupported_action', `Agent does not support interrupt for run "${request.params.runId}".`));
+      }
+      await agent.agent.interrupt(request.params.runId);
+      return { runId: request.params.runId, status: 'interrupted' };
+    } catch (error) {
+      if (error instanceof AgentResolutionError) {
+        return reply.code(error.statusCode).send(createGatewayHttpError(error.code, error.message, error.details));
+      }
+      if (error instanceof ProtocolValidationError) {
+        return reply.code(error.code === 'session_forbidden' ? 403 : 409).send(createGatewayHttpError(error.code, error.message, error.details));
+      }
+      throw error;
+    }
+  });
+
+  app.post<{ Params: { runId: string }; Body: { message?: unknown; role?: unknown; metadata?: JsonObject } }>('/api/runs/:runId/steer', async (request, reply) => {
+    const authContext = await requireGatewayAdminHttpRequest(request, reply, context.auth);
+    if (!authContext) {
+      return reply;
+    }
+    if (!context.agentRegistry) {
+      return reply.code(503).send(createGatewayHttpError('agent_registry_unavailable', 'Run steer requires an agent registry.'));
+    }
+    const message = request.body?.message;
+    if (typeof message !== 'string' || message.trim() === '') {
+      return reply.code(400).send(createGatewayHttpError('invalid_frame', 'Request body must include a non-empty string field "message".'));
+    }
+    const rawRole = request.body?.role;
+    let role: 'user' | 'system' | undefined;
+    if (rawRole !== undefined) {
+      if (rawRole !== 'user' && rawRole !== 'system') {
+        return reply.code(400).send(createGatewayHttpError('invalid_frame', 'Field "role" must be "user" or "system" when provided.'));
+      }
+      role = rawRole;
+    }
+
+    try {
+      const agent = await resolveAgentForRun(request.params.runId, context);
+      if (!agent.agent.steer) {
+        return reply.code(409).send(createGatewayHttpError('unsupported_action', `Agent does not support steer for run "${request.params.runId}".`));
+      }
+      await agent.agent.steer(request.params.runId, {
+        message,
+        ...(role ? { role } : {}),
+        ...(request.body?.metadata ? { metadata: request.body.metadata } : {}),
+      });
+      return { runId: request.params.runId, status: 'steered', role: role ?? 'user' };
+    } catch (error) {
+      if (error instanceof AgentResolutionError) {
+        return reply.code(error.statusCode).send(createGatewayHttpError(error.code, error.message, error.details));
+      }
+      if (error instanceof ProtocolValidationError) {
+        return reply.code(error.code === 'session_forbidden' ? 403 : 409).send(createGatewayHttpError(error.code, error.message, error.details));
+      }
+      if (error instanceof Error && /requires an active run/.test(error.message)) {
+        return reply.code(409).send(createGatewayHttpError('run_not_active', error.message));
+      }
+      throw error;
+    }
+  });
+}
+
+class AgentResolutionError extends Error {
+  readonly code: string;
+  readonly statusCode: number;
+  readonly details?: JsonObject;
+  constructor(code: string, message: string, statusCode: number, details?: JsonObject) {
+    super(message);
+    this.name = 'AgentResolutionError';
+    this.code = code;
+    this.statusCode = statusCode;
+    this.details = details;
+  }
+}
+
+async function resolveAgentForRun(
+  runId: string,
+  context: DashboardRunRouteContext,
+): Promise<import('./core.js').CreatedAdaptiveAgent> {
+  if (!context.agentRegistry) {
+    throw new AgentResolutionError('agent_registry_unavailable', 'Agent registry is not configured.', 503);
+  }
+
+  const link = await resolveDashboardApprovalSessionLink(runId, context);
+  if (link) {
+    const session = await context.stores.sessions.get(link.sessionId);
+    if (session?.agentId && context.agentRegistry.has(session.agentId)) {
+      return await context.agentRegistry.getAgent(session.agentId);
+    }
+  }
+
+  const agentIds = context.agentRegistry.listAgentIds();
+  if (agentIds.length === 1 && agentIds[0]) {
+    return await context.agentRegistry.getAgent(agentIds[0]);
+  }
+
+  throw new AgentResolutionError(
+    'agent_not_found',
+    `Unable to determine agent for run "${runId}". Provide a session-linked run or register exactly one agent.`,
+    409,
+    { runId },
+  );
 }
 
 async function buildGatewayStatusReport(stores: GatewayStores, nowFactory: (() => Date) | undefined): Promise<JsonObject> {
@@ -1090,6 +1227,7 @@ export async function handleGatewaySocketMessage(
         stores: context.stores,
         authContext: context.authContext,
         hooks: context.hooks,
+        imageUploadDir: context.imageUploadDir,
         now: context.now,
         transcriptMessageIdFactory: context.transcriptMessageIdFactory,
         realtimeEvents:
@@ -1109,6 +1247,7 @@ export async function handleGatewaySocketMessage(
         stores: context.stores,
         authContext: context.authContext,
         hooks: context.hooks,
+        imageUploadDir: context.imageUploadDir,
         requestedChannelId: context.requestedChannelId,
         now: context.now,
         realtimeEvents:

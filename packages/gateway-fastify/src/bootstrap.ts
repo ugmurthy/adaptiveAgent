@@ -109,6 +109,7 @@ export async function bootstrapGateway(options: BootstrapGatewayOptions = {}): P
       stores,
       traceClient: storeBundle.postgresClient,
       requestLogger,
+      imageUploadDir: resolve(options.logDir ?? DEFAULT_GATEWAY_REQUEST_LOG_DIR, '..', 'uploads', 'images'),
       staleLeaseHeartbeatBefore: new Date(bootStartedAtMs),
     });
     let scheduler: SchedulerHandle | undefined;

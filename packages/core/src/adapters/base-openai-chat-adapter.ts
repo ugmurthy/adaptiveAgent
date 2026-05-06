@@ -100,7 +100,8 @@ const DEFAULT_CAPABILITIES: ModelCapabilities = {
   imageInput: false,
 };
 
-const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
+const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504, 524]);
+const UNBOUNDED_RETRY_STATUS_CODES = new Set([524]);
 const DEFAULT_MAX_RETRIES = 2;
 const INITIAL_RETRY_DELAY_MS = 500;
 const MAX_RETRY_DELAY_MS = 8_000;
@@ -110,6 +111,8 @@ const SUPPORTED_IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/we
 // parallel sub-agents begin issuing requests concurrently without forcing the
 // whole process through a single in-flight request per model.
 const DEFAULT_MAX_CONCURRENT_REQUESTS_PER_MODEL = 4;
+const DELEGATE_TOOL_PREFIX = 'delegate.';
+const DELEGATE_TOOL_ALIAS_PREFIX = 'delegate__';
 
 const modelRequestGates = new Map<string, ModelRequestGate>();
 
@@ -252,6 +255,10 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
     );
   }
 
+  formatToolName(name: string): string {
+    return toProviderToolName(name);
+  }
+
   async generate(request: ModelRequest): Promise<ModelResponse> {
     const body = await this.buildRequestBody(request);
     const headers = this.buildHeaders();
@@ -310,6 +317,7 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
           throw error;
         }
 
+        await emitRetryEvent(request, error, attempt, retryDelayMs);
         this.requestGate.imposeCooldown(retryDelayMs);
       } finally {
         release?.();
@@ -382,7 +390,7 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
     const toolCalls = choice.message.tool_calls?.map(
       (tc): ModelToolCall => ({
         id: tc.id,
-        name: tc.function.name,
+        name: fromProviderToolName(tc.function.name),
         input: parseToolArguments(tc.function.arguments),
       }),
     );
@@ -444,7 +452,11 @@ function getRetryDelayMs(error: unknown, attempt: number): number | undefined {
     return undefined;
   }
 
-  if (!RETRYABLE_STATUS_CODES.has(error.statusCode) || attempt >= DEFAULT_MAX_RETRIES) {
+  if (!RETRYABLE_STATUS_CODES.has(error.statusCode)) {
+    return undefined;
+  }
+
+  if (!UNBOUNDED_RETRY_STATUS_CODES.has(error.statusCode) && attempt >= DEFAULT_MAX_RETRIES) {
     return undefined;
   }
 
@@ -454,6 +466,27 @@ function getRetryDelayMs(error: unknown, attempt: number): number | undefined {
 
   const cappedDelayMs = Math.min(MAX_RETRY_DELAY_MS, INITIAL_RETRY_DELAY_MS * 2 ** attempt);
   return Math.random() * cappedDelayMs;
+}
+
+async function emitRetryEvent(
+  request: ModelRequest,
+  error: unknown,
+  attempt: number,
+  retryDelayMs: number,
+): Promise<void> {
+  if (!(error instanceof ModelRequestError)) {
+    return;
+  }
+
+  await request.onRetry?.({
+    attempt: attempt + 1,
+    nextAttempt: attempt + 2,
+    statusCode: error.statusCode,
+    retryDelayMs,
+    reason: error.statusCode === 429 ? 'rate_limit' : 'provider_error',
+    phase: 'http_status',
+    message: error.message,
+  });
 }
 
 function parseRetryAfterMs(value: string | null): number | undefined {
@@ -569,7 +602,7 @@ async function toOpenAIMessage(msg: ModelMessage): Promise<OpenAIMessage> {
         id: toolCall.id,
         type: 'function',
         function: {
-          name: toolCall.name,
+          name: toProviderToolName(toolCall.name),
           arguments: JSON.stringify(toolCall.input),
         },
       })),
@@ -678,11 +711,39 @@ function toOpenAITool(
   return {
     type: 'function',
     function: {
-      name: tool.name,
+      name: toProviderToolName(tool.name),
       description: tool.description,
       parameters: tool.inputSchema,
     },
   };
+}
+
+function toProviderToolName(name: string): string {
+  if (!name.startsWith(DELEGATE_TOOL_PREFIX)) {
+    return name;
+  }
+
+  const suffix = name.slice(DELEGATE_TOOL_PREFIX.length);
+  const encodedSuffix = Buffer.from(suffix, 'utf8').toString('hex');
+  return `${DELEGATE_TOOL_ALIAS_PREFIX}${encodedSuffix}`;
+}
+
+function fromProviderToolName(name: string): string {
+  if (!name.startsWith(DELEGATE_TOOL_ALIAS_PREFIX)) {
+    return name;
+  }
+
+  const encodedSuffix = name.slice(DELEGATE_TOOL_ALIAS_PREFIX.length);
+  if (!/^[0-9a-f]+$/i.test(encodedSuffix) || encodedSuffix.length === 0 || encodedSuffix.length % 2 !== 0) {
+    return name;
+  }
+
+  try {
+    const suffix = Buffer.from(encodedSuffix, 'hex').toString('utf8');
+    return `${DELEGATE_TOOL_PREFIX}${suffix}`;
+  } catch {
+    return name;
+  }
 }
 
 function parseToolArguments(args: string): JsonValue {

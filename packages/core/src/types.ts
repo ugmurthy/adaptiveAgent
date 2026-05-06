@@ -41,6 +41,7 @@ export type EventType =
   | 'run.created'
   | 'run.status_changed'
   | 'run.interrupted'
+  | 'run.steered'
   | 'run.resumed'
   | 'run.retry_started'
   | 'run.completed'
@@ -50,6 +51,7 @@ export type EventType =
   | 'step.started'
   | 'step.completed'
   | 'model.started'
+  | 'model.retry'
   | 'model.completed'
   | 'model.failed'
   | 'tool.started'
@@ -309,6 +311,17 @@ export interface ModelRequest {
   outputSchema?: JsonSchema;
   signal?: AbortSignal;
   metadata?: Record<string, JsonValue>;
+  onRetry?: (event: ModelRetryEvent) => Promise<void> | void;
+}
+
+export interface ModelRetryEvent {
+  attempt: number;
+  nextAttempt: number;
+  statusCode: number;
+  retryDelayMs: number;
+  reason: 'rate_limit' | 'provider_error';
+  phase: 'http_status';
+  message: string;
 }
 
 export interface ModelResponse {
@@ -332,6 +345,7 @@ export interface ModelAdapter {
   provider: string;
   model: string;
   capabilities: ModelCapabilities;
+  formatToolName?(name: string): string;
   generate(request: ModelRequest): Promise<ModelResponse>;
   stream?(
     request: ModelRequest,

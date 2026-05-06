@@ -90,6 +90,19 @@ export function formatCompactAgentEventFrame(
       if (toolCallCount !== undefined && toolCallCount > 0) parts.push(`toolCalls=${toolCallCount}`);
       return `${prefix} model completed${parts.length > 0 ? ` (${parts.join(', ')})` : ''}`;
     }
+    case 'model.retry': {
+      const statusCode = readNumber(payload, 'statusCode');
+      const attempt = readNumber(payload, 'attempt');
+      const nextAttempt = readNumber(payload, 'nextAttempt');
+      const retryDelayMs = readNumber(payload, 'retryDelayMs');
+      const reason = readString(payload, 'reason');
+      const parts: string[] = [];
+      if (attempt !== undefined && nextAttempt !== undefined) parts.push(`attempt ${attempt}->${nextAttempt}`);
+      if (statusCode !== undefined) parts.push(`status=${statusCode}`);
+      if (retryDelayMs !== undefined) parts.push(`delay=${formatDurationMs(retryDelayMs)}`);
+      if (reason) parts.push(`reason=${reason}`);
+      return `${prefix} model retry${parts.length > 0 ? ` (${parts.join(', ')})` : ''}`;
+    }
     case 'model.failed': {
       const durationMs = readNumber(payload, 'durationMs');
       const timedOut = payload.timedOut === true;

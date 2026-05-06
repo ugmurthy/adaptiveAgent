@@ -12,6 +12,13 @@ interface DevTokenRequest {
   roles?: unknown;
 }
 
+interface GatewayConnectionConfig {
+  socketUrl?: string;
+  host?: string;
+  port?: number;
+  websocketPath?: string;
+}
+
 const GATEWAY_CONFIG_PATH = join(homedir(), '.adaptiveAgent', 'config', 'gateway.json');
 const DEFAULT_GATEWAY_JWT_SECRET = 'adaptive-agent-local-dev-secret';
 
@@ -22,12 +29,9 @@ function gatewayDevApi(): Plugin {
       server.middlewares.use('/api/gateway-defaults', async (_request, response) => {
         try {
           const connection = await loadLocalGatewayConnectionConfig();
-          const host = normalizeHost(connection?.host);
-          const port = connection?.port ?? 8959;
-          const websocketPath = connection?.websocketPath ?? '/ws';
 
           sendJson(response, 200, {
-            socketUrl: `ws://${host}:${port}${websocketPath}`,
+            socketUrl: resolveGatewaySocketUrl(connection),
             channel: 'web',
             subject: 'local-dev-user',
             tenantId: 'free',
@@ -68,23 +72,21 @@ function gatewayDevApi(): Plugin {
       });
 
       server.middlewares.use(async (request, response, next) => {
-        if (!request.url?.startsWith('/api/runs')) {
+        if (!request.url?.startsWith('/api/runs') && !request.url?.startsWith('/api/images')) {
           next();
           return;
         }
 
-        await proxyGatewayDashboardRequest(request, response);
+        await proxyGatewayApiRequest(request, response);
       });
     },
   };
 }
 
-async function proxyGatewayDashboardRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+async function proxyGatewayApiRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
   try {
     const connection = await loadLocalGatewayConnectionConfig();
-    const host = normalizeHost(connection?.host);
-    const port = connection?.port ?? 8959;
-    const target = new URL(request.url ?? '/api/runs', `http://${host}:${port}`);
+    const target = new URL(request.url ?? '/api/runs', resolveGatewayHttpBaseUrl(connection));
     const body = request.method === 'GET' || request.method === 'HEAD' ? undefined : await readRequestBody(request);
     const upstream = await fetch(target, {
       method: request.method,
@@ -101,12 +103,17 @@ async function proxyGatewayDashboardRequest(request: IncomingMessage, response: 
     sendJson(response, 502, {
       type: 'error',
       code: 'gateway_dashboard_unreachable',
-      message: `Could not proxy dashboard request to the local gateway: ${errorMessage(error)}`,
+      message: `Could not proxy request to the local gateway: ${errorMessage(error)}`,
     });
   }
 }
 
-async function loadLocalGatewayConnectionConfig(): Promise<{ host?: string; port?: number; websocketPath?: string } | undefined> {
+async function loadLocalGatewayConnectionConfig(): Promise<GatewayConnectionConfig | undefined> {
+  const socketUrl = readString(process.env.GATEWAY_WEB_SOCKET_URL) ?? readString(process.env.GATEWAY_SOCKET_URL);
+  if (socketUrl) {
+    return { socketUrl };
+  }
+
   const rawConfig = await loadLocalGatewayConfig();
   if (!isRecord(rawConfig) || !isRecord(rawConfig.server)) {
     return undefined;
@@ -114,10 +121,37 @@ async function loadLocalGatewayConnectionConfig(): Promise<{ host?: string; port
 
   const server = rawConfig.server;
   return {
+    socketUrl: readString(server.publicSocketUrl) ?? readString(server.socketUrl),
     host: readString(server.host),
     port: typeof server.port === 'number' && Number.isInteger(server.port) && server.port > 0 ? server.port : undefined,
     websocketPath: readString(server.websocketPath),
   };
+}
+
+function resolveGatewaySocketUrl(connection: GatewayConnectionConfig | undefined): string {
+  if (connection?.socketUrl) {
+    return normalizeSocketUrl(connection.socketUrl);
+  }
+
+  const host = normalizeHost(connection?.host);
+  const port = connection?.port ?? 8959;
+  const websocketPath = connection?.websocketPath ?? '/ws';
+  return `ws://${host}:${port}${websocketPath}`;
+}
+
+function resolveGatewayHttpBaseUrl(connection: GatewayConnectionConfig | undefined): string {
+  if (!connection?.socketUrl) {
+    const host = normalizeHost(connection?.host);
+    const port = connection?.port ?? 8959;
+    return `http://${host}:${port}`;
+  }
+
+  const url = new URL(normalizeSocketUrl(connection.socketUrl));
+  url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:';
+  url.pathname = '/';
+  url.search = '';
+  url.hash = '';
+  return url.toString();
 }
 
 async function loadLocalGatewayJwtAuthConfig(): Promise<{
@@ -186,6 +220,20 @@ function normalizeHost(host: string | undefined): string {
   }
 
   return host;
+}
+
+function normalizeSocketUrl(value: string): string {
+  const url = new URL(value);
+  if (url.protocol === 'https:') {
+    url.protocol = 'wss:';
+  } else if (url.protocol === 'http:') {
+    url.protocol = 'ws:';
+  }
+  if (url.protocol !== 'ws:' && url.protocol !== 'wss:') {
+    throw new Error('Gateway socket URL must use ws, wss, http, or https.');
+  }
+
+  return url.toString();
 }
 
 function parseJsonBody(body: string): DevTokenRequest {

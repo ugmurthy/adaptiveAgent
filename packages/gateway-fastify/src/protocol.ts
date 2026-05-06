@@ -1,4 +1,4 @@
-import type { ImageInput, JsonObject, JsonValue } from './core.js';
+import type { ImageDetail, ImageInput, JsonObject, JsonValue } from './core.js';
 import type { InvocationMode } from './config.js';
 
 export const INBOUND_FRAME_TYPES = [
@@ -58,7 +58,7 @@ export interface MessageSendFrame {
   type: 'message.send';
   sessionId: string;
   content: string;
-  images?: ImageInput[];
+  images?: GatewayImageInput[];
   metadata?: JsonObject;
 }
 
@@ -68,10 +68,19 @@ export interface RunStartFrame {
   agentId?: string;
   goal: string;
   input?: JsonValue;
-  images?: ImageInput[];
+  images?: GatewayImageInput[];
   context?: JsonObject;
   metadata?: JsonObject;
 }
+
+export interface UploadedImageInput {
+  uploadId: string;
+  mimeType?: string;
+  detail?: ImageDetail;
+  name?: string;
+}
+
+export type GatewayImageInput = ImageInput | UploadedImageInput;
 
 export interface RunRetryFrame {
   type: 'run.retry';
@@ -511,7 +520,7 @@ function expectStringArray(value: unknown, path: string, issues: string[]): stri
   return items;
 }
 
-function expectOptionalImageInputs(value: unknown, path: string, issues: string[]): ImageInput[] | undefined {
+function expectOptionalImageInputs(value: unknown, path: string, issues: string[]): GatewayImageInput[] | undefined {
   if (value === undefined) {
     return undefined;
   }
@@ -521,7 +530,7 @@ function expectOptionalImageInputs(value: unknown, path: string, issues: string[
     return undefined;
   }
 
-  const images: ImageInput[] = [];
+  const images: GatewayImageInput[] = [];
   for (const [index, entry] of value.entries()) {
     const image = expectImageInput(entry, `${path}[${index}]`, issues);
     if (image) {
@@ -532,22 +541,37 @@ function expectOptionalImageInputs(value: unknown, path: string, issues: string[
   return images;
 }
 
-function expectImageInput(value: unknown, path: string, issues: string[]): ImageInput | undefined {
+function expectImageInput(value: unknown, path: string, issues: string[]): GatewayImageInput | undefined {
   const image = expectObject(value, path, issues);
   if (!image) {
     return undefined;
   }
 
-  const pathValue = expectNonEmptyString(image.path, `${path}.path`, issues);
+  const pathValue = expectOptionalNonEmptyString(image.path, `${path}.path`, issues);
+  const uploadId = expectOptionalNonEmptyString(image.uploadId, `${path}.uploadId`, issues);
   const mimeType = expectOptionalNonEmptyString(image.mimeType, `${path}.mimeType`, issues);
   const detail = expectOptionalImageDetail(image.detail, `${path}.detail`, issues);
   const name = expectOptionalNonEmptyString(image.name, `${path}.name`, issues);
-  if (!pathValue) {
+  if (!pathValue && !uploadId) {
+    issues.push(`${path} must include either path or uploadId.`);
+    return undefined;
+  }
+  if (pathValue && uploadId) {
+    issues.push(`${path} cannot include both path and uploadId.`);
     return undefined;
   }
 
+  if (uploadId) {
+    return {
+      uploadId,
+      ...(mimeType ? { mimeType } : {}),
+      ...(detail ? { detail } : {}),
+      ...(name ? { name } : {}),
+    };
+  }
+
   return {
-    path: pathValue,
+    path: pathValue!,
     ...(mimeType ? { mimeType } : {}),
     ...(detail ? { detail } : {}),
     ...(name ? { name } : {}),

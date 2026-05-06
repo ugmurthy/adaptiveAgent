@@ -19,6 +19,7 @@ import { withForwardedRealtimeEvents } from './realtime-events.js';
 import { resolveGatewayRoute } from './routing.js';
 import { assertGatewaySessionWriteAllowed, getAuthorizedGatewaySession, tryAcquireGatewaySessionRun } from './session.js';
 import type { GatewaySessionRecord, GatewayStores, SessionRunLinkRecord } from './stores.js';
+import { resolveGatewayImageInputs } from './uploads.js';
 
 export interface ExecuteGatewayRunStartOptions {
   gatewayConfig: GatewayConfig;
@@ -26,6 +27,7 @@ export interface ExecuteGatewayRunStartOptions {
   stores: GatewayStores;
   authContext?: GatewayAuthContext;
   hooks?: ResolvedGatewayHooks;
+  imageUploadDir?: string;
   requestedChannelId?: string;
   now?: () => Date;
   realtimeEvents?: Omit<RealtimeEventForwardingContext, 'fallbackAgentId' | 'fallbackSessionId' | 'rootRunId'>;
@@ -145,6 +147,7 @@ export async function executeGatewayRunStart(
         hooks: options.hooks,
         agentRegistry: options.agentRegistry,
         stores: options.stores,
+        imageUploadDir: options.imageUploadDir,
         requestedChannelId: options.requestedChannelId,
         nowIso,
         realtimeEvents: options.realtimeEvents,
@@ -235,6 +238,7 @@ export async function executeGatewayRunStart(
         hooks: options.hooks,
         agentRegistry: options.agentRegistry,
         stores: options.stores,
+        imageUploadDir: options.imageUploadDir,
         requestedChannelId: options.requestedChannelId,
         nowIso,
         realtimeEvents: options.realtimeEvents,
@@ -253,14 +257,6 @@ export async function executeGatewayRunStart(
     }
   } catch (error) {
     if (error instanceof ProtocolValidationError) {
-      if (error.code === 'gateway_overloaded') {
-        await settleSession(options.stores, runningSession, {
-          status: session.status,
-          currentRunId: session.currentRunId,
-          currentRootRunId: session.currentRootRunId,
-          updatedAt: nowIso,
-        });
-      }
       throw error;
     }
 
@@ -762,6 +758,7 @@ interface ExecuteResolvedGatewayRunOptions {
   hooks?: ResolvedGatewayHooks;
   agentRegistry: AgentRegistry;
   stores: GatewayStores;
+  imageUploadDir?: string;
   requestedChannelId?: string;
   nowIso: string;
   realtimeEvents?: Omit<RealtimeEventForwardingContext, 'fallbackAgentId' | 'fallbackSessionId' | 'rootRunId'>;
@@ -807,6 +804,11 @@ async function executeResolvedGatewayRun(
       });
     }
   };
+  const images = await resolveGatewayImageInputs(frame.images, {
+    uploadDir: options.imageUploadDir ?? '',
+    authContext: options.authContext,
+    requestType: frame.type,
+  });
 
   const runResult = await withForwardedRealtimeEvents(
     agent,
@@ -825,7 +827,7 @@ async function executeResolvedGatewayRun(
       agent.agent.run!({
         goal: frame.goal,
         input: frame.input,
-        images: frame.images,
+        images,
         context: buildGatewayRunContext(frame, options.session, options.authContext, options.requestedChannelId),
         metadata: buildGatewayRunMetadata(frame, options.session?.id, options.agentId, options.realtimeEvents?.requestId),
       }),

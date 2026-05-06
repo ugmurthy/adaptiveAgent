@@ -31,7 +31,7 @@ describe('gateway protocol validation', () => {
     });
   });
 
-  it('parses local image inputs on chat and run frames', () => {
+  it('parses image inputs on chat and run frames', () => {
     const chatFrame = parseInboundFrame(
       JSON.stringify({
         type: 'message.send',
@@ -44,7 +44,7 @@ describe('gateway protocol validation', () => {
       JSON.stringify({
         type: 'run.start',
         goal: 'Read the receipt total',
-        images: [{ path: '/tmp/receipt.png' }],
+        images: [{ uploadId: '019ddcf3-e4c8-7000-8000-3f3a8f4e51f6', detail: 'low', name: 'receipt.png' }],
       }),
     );
 
@@ -54,8 +54,23 @@ describe('gateway protocol validation', () => {
     });
     expect(runFrame).toMatchObject({
       type: 'run.start',
-      images: [{ path: '/tmp/receipt.png' }],
+      images: [{ uploadId: '019ddcf3-e4c8-7000-8000-3f3a8f4e51f6', detail: 'low', name: 'receipt.png' }],
     });
+  });
+
+  it('rejects image inputs without exactly one source', () => {
+    expectInvalidFrameIssue(() => parseInboundFrame(JSON.stringify({
+      type: 'message.send',
+      sessionId: 'session-1',
+      content: 'Bad image',
+      images: [{ detail: 'high' }],
+    })), 'frame.images[0] must include either path or uploadId.');
+
+    expectInvalidFrameIssue(() => parseInboundFrame(JSON.stringify({
+      type: 'run.start',
+      goal: 'Bad image',
+      images: [{ path: '/tmp/receipt.png', uploadId: '019ddcf3-e4c8-7000-8000-3f3a8f4e51f6' }],
+    })), 'frame.images[0] cannot include both path and uploadId.');
   });
 
   it('parses run.retry frames', () => {
@@ -161,3 +176,14 @@ describe('gateway protocol validation', () => {
     });
   });
 });
+
+function expectInvalidFrameIssue(callback: () => void, issue: string): void {
+  try {
+    callback();
+    throw new Error('expected parseInboundFrame to throw');
+  } catch (error) {
+    expect(error).toBeInstanceOf(ProtocolValidationError);
+    const details = (error as ProtocolValidationError).details;
+    expect(details?.issues).toContain(issue);
+  }
+}

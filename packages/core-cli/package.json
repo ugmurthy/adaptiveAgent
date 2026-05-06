@@ -1,0 +1,29 @@
+{
+  "name": "@adaptive-agent/core-cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "bin": {
+    "core:cli": "./src/cli.ts",
+    "core-agent": "./src/cli.ts",
+    "adaptive-agent-core": "./src/cli.ts"
+  },
+  "scripts": {
+    "build": "bun build ./src/index.ts ./src/cli.ts --outdir dist --target bun",
+    "link:global": "bun run ./scripts/link-global.ts",
+    "test": "bunx vitest run",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "dependencies": {
+    "@adaptive-agent/core": "workspace:*",
+    "pg": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.2",
+    "@types/pg": "^8.20.0",
+    "bun-types": "^1.3.5",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.1"
+  }
+}

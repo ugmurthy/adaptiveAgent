@@ -26,6 +26,53 @@ export function summarizeAgentEvent(frame: AgentEventFrame): LiveAgentEventSumma
 
 export function formatCompactAgentEventFrame(frame: AgentEventFrame): string {
   const payload = asRecord(frame.data);
+
+  switch (frame.eventType) {
+    case 'model.started': {
+      const provider = readString(payload, 'provider');
+      const model = readString(payload, 'model');
+      const timeoutMs = readNumber(payload, 'modelTimeoutMs');
+      const target = [provider, model].filter((part): part is string => Boolean(part)).join('/');
+      const timeoutPart = timeoutMs !== undefined ? ` (timeout ${formatDuration(timeoutMs)})` : '';
+      return `model thinking${target ? ` ${target}` : ''}${timeoutPart}`;
+    }
+    case 'model.completed': {
+      const durationMs = readNumber(payload, 'durationMs');
+      const finishReason = readString(payload, 'finishReason');
+      const toolCallCount = readNumber(payload, 'toolCallCount');
+      const parts: string[] = [];
+      if (durationMs !== undefined) parts.push(formatDuration(durationMs));
+      if (finishReason) parts.push(`finish=${finishReason}`);
+      if (toolCallCount !== undefined && toolCallCount > 0) parts.push(`toolCalls=${toolCallCount}`);
+      return `model completed${parts.length > 0 ? ` (${parts.join(', ')})` : ''}`;
+    }
+    case 'model.retry': {
+      const statusCode = readNumber(payload, 'statusCode');
+      const attempt = readNumber(payload, 'attempt');
+      const nextAttempt = readNumber(payload, 'nextAttempt');
+      const retryDelayMs = readNumber(payload, 'retryDelayMs');
+      const parts: string[] = [];
+      if (attempt !== undefined && nextAttempt !== undefined) parts.push(`attempt ${attempt}->${nextAttempt}`);
+      if (statusCode !== undefined) parts.push(`status=${statusCode}`);
+      if (retryDelayMs !== undefined) parts.push(`delay=${formatDuration(retryDelayMs)}`);
+      return `model retry${parts.length > 0 ? ` (${parts.join(', ')})` : ''}`;
+    }
+    case 'model.failed': {
+      const durationMs = readNumber(payload, 'durationMs');
+      const timedOut = payload.timedOut === true;
+      const error =
+        readString(asRecord(payload.error), 'message') ??
+        readString(payload, 'error') ??
+        readString(payload, 'reason') ??
+        readString(payload, 'message');
+      const parts: string[] = [];
+      if (durationMs !== undefined) parts.push(formatDuration(durationMs));
+      if (timedOut) parts.push('timed out');
+      const detail = error ? `: ${truncate(oneLine(error), 110)}` : '';
+      return `model failed${parts.length > 0 ? ` (${parts.join(', ')})` : ''}${detail}`;
+    }
+  }
+
   const pieces = [frame.eventType];
   const status = readString(payload, 'toStatus') ?? readString(payload, 'status');
   const toolName = readString(payload, 'toolName') ?? readString(payload, 'name');
@@ -93,6 +140,9 @@ export function formatClockTime(value: Date): string {
 }
 
 export function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) {
+    return `${ms}ms`;
+  }
   if (ms < 1000) {
     return `${Math.round(ms)}ms`;
   }
@@ -104,14 +154,14 @@ export function formatDuration(ms: number): string {
 
   const minutes = Math.floor(seconds / 60);
   const remainingSeconds = Math.round(seconds % 60);
-  return `${minutes}m ${remainingSeconds}s`;
+  return remainingSeconds === 0 ? `${minutes}m` : `${minutes}m${remainingSeconds}s`;
 }
 
 export function eventTone(eventType: string): 'good' | 'warn' | 'bad' | 'work' {
   if (eventType.includes('failed') || eventType.includes('error')) {
     return 'bad';
   }
-  if (eventType === 'replan.required' || eventType.includes('approval') || eventType.includes('clarification')) {
+  if (eventType === 'model.retry' || eventType === 'replan.required' || eventType.includes('approval') || eventType.includes('clarification')) {
     return 'warn';
   }
   if (eventType.includes('completed') || eventType.includes('succeeded') || eventType.includes('resolved')) {
@@ -143,6 +193,49 @@ export function formatLiveProgressUpdate(frame: AgentEventFrame): string | undef
       return 'Built a plan for this run.';
     case 'plan.execution_started':
       return 'Working through the plan.';
+    case 'model.started': {
+      const provider = readString(payload, 'provider');
+      const model = readString(payload, 'model');
+      const timeoutMs = readNumber(payload, 'modelTimeoutMs');
+      const target = [provider, model].filter((part): part is string => Boolean(part)).join('/');
+      const timeoutPart = timeoutMs !== undefined ? ` (timeout ${formatDuration(timeoutMs)})` : '';
+      return target ? `Thinking with \`${target}\`${timeoutPart}.` : `Thinking${timeoutPart}.`;
+    }
+    case 'model.completed': {
+      const durationMs = readNumber(payload, 'durationMs');
+      const finishReason = readString(payload, 'finishReason');
+      const toolCallCount = readNumber(payload, 'toolCallCount');
+      const detailParts: string[] = [];
+      if (durationMs !== undefined) detailParts.push(formatDuration(durationMs));
+      if (finishReason) detailParts.push(`finish=${finishReason}`);
+      if (toolCallCount !== undefined && toolCallCount > 0) detailParts.push(`toolCalls=${toolCallCount}`);
+      return detailParts.length > 0 ? `Model completed (${detailParts.join(', ')}).` : 'Model completed.';
+    }
+    case 'model.retry': {
+      const statusCode = readNumber(payload, 'statusCode');
+      const attempt = readNumber(payload, 'attempt');
+      const nextAttempt = readNumber(payload, 'nextAttempt');
+      const retryDelayMs = readNumber(payload, 'retryDelayMs');
+      const detailParts: string[] = [];
+      if (attempt !== undefined && nextAttempt !== undefined) detailParts.push(`attempt ${attempt}->${nextAttempt}`);
+      if (statusCode !== undefined) detailParts.push(`status=${statusCode}`);
+      if (retryDelayMs !== undefined) detailParts.push(`delay=${formatDuration(retryDelayMs)}`);
+      return detailParts.length > 0 ? `Model retrying (${detailParts.join(', ')}).` : 'Model retrying.';
+    }
+    case 'model.failed': {
+      const durationMs = readNumber(payload, 'durationMs');
+      const timedOut = payload.timedOut === true;
+      const error =
+        readString(asRecord(payload.error), 'message') ??
+        readString(payload, 'error') ??
+        readString(payload, 'reason') ??
+        readString(payload, 'message');
+      const detailParts: string[] = [];
+      if (durationMs !== undefined) detailParts.push(formatDuration(durationMs));
+      if (timedOut) detailParts.push('timed out');
+      const head = detailParts.length > 0 ? `Model failed (${detailParts.join(', ')})` : 'Model failed';
+      return error ? `${head}: ${oneLine(error)}.` : `${head}.`;
+    }
     case 'tool.started': {
       const toolName = readString(payload, 'toolName') ?? 'tool';
       const detail = formatToolProgressDetail(toolName, payload.input);

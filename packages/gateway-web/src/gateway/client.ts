@@ -7,7 +7,7 @@ import type {
 } from './protocol';
 
 import { isClarificationRequestOutput } from './format';
-import type { GatewayDefaults, GatewayImageInput, GatewayWebClientOptions, SocketState } from './types';
+import type { GatewayDefaults, GatewayImageInput, GatewayImageUploadResult, GatewayWebClientOptions, SocketState } from './types';
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -113,6 +113,31 @@ export class GatewayWebClient {
       goal,
       images,
     });
+  }
+
+  async uploadImages(files: File[]): Promise<GatewayImageUploadResult[]> {
+    if (files.length === 0) {
+      return [];
+    }
+
+    const formData = new FormData();
+    for (const file of files) {
+      formData.append('images', file, file.name);
+    }
+
+    const response = await fetch('/api/images', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${this.token}`,
+      },
+      body: formData,
+    });
+    const payload = (await response.json().catch(() => ({}))) as { images?: unknown; message?: unknown };
+    if (!response.ok || !Array.isArray(payload.images)) {
+      throw new Error(typeof payload.message === 'string' ? payload.message : `Image upload failed with ${response.status}.`);
+    }
+
+    return payload.images.map((entry) => normalizeImageUploadResult(entry));
   }
 
   retryRun(runId: string): void {
@@ -333,6 +358,24 @@ export function buildUpgradeUrl(socketUrl: string, channel: string, token: strin
   url.searchParams.set('channelId', channel);
   url.searchParams.set('access_token', token);
   return url.toString();
+}
+
+function normalizeImageUploadResult(value: unknown): GatewayImageUploadResult {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Image upload response was invalid.');
+  }
+
+  const image = value as Partial<GatewayImageUploadResult>;
+  if (typeof image.uploadId !== 'string' || typeof image.mimeType !== 'string' || typeof image.sizeBytes !== 'number') {
+    throw new Error('Image upload response was invalid.');
+  }
+
+  return {
+    uploadId: image.uploadId,
+    mimeType: image.mimeType,
+    ...(typeof image.name === 'string' ? { name: image.name } : {}),
+    sizeBytes: image.sizeBytes,
+  };
 }
 
 function parseFrame(raw: unknown): OutboundFrame {

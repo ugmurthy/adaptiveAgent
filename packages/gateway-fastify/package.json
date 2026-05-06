@@ -22,6 +22,7 @@
     "mint:local-jwt": "bun run ./src/mint-local-jwt.ts",
     "status": "bun run ./src/check-status.ts",
     "start:local": "bun run ./src/start-local.ts",
+    "start:fly": "bun run ./src/start-fly.ts",
     "test": "bunx vitest run",
     "test:postgres-integration": "RUN_DOCKER_INTEGRATION_TESTS=1 bunx vitest run --testTimeout 300000 --hookTimeout 300000 src/postgres-restart.integration.test.ts",
     "test:watch": "bunx vitest",
@@ -29,6 +30,7 @@
   },
   "dependencies": {
     "@adaptive-agent/core": "workspace:*",
+    "@fastify/multipart": "^10.0.0",
     "@fastify/websocket": "^11.2.0",
     "@mariozechner/pi-tui": "^0.66.1",
     "chalk": "^5.5.0",

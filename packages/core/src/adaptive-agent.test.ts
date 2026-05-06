@@ -35,7 +35,7 @@ class SequenceModel implements ModelAdapter {
   }
 
   async generate(request: ModelRequest): Promise<ModelResponse> {
-    const { signal: _signal, ...cloneableRequest } = request;
+    const { signal: _signal, onRetry: _onRetry, ...cloneableRequest } = request;
     this.receivedRequests.push(structuredClone(cloneableRequest));
     const nextResponse = this.responses.shift();
     if (!nextResponse) {
@@ -47,6 +47,16 @@ class SequenceModel implements ModelAdapter {
     }
 
     return structuredClone(nextResponse);
+  }
+}
+
+class AliasingSequenceModel extends SequenceModel {
+  formatToolName(name: string): string {
+    if (!name.startsWith('delegate.')) {
+      return name;
+    }
+
+    return `delegate__${Buffer.from(name.slice('delegate.'.length), 'utf8').toString('hex')}`;
   }
 }
 
@@ -231,6 +241,37 @@ describe('AdaptiveAgent', () => {
     });
   });
 
+  it('uses provider-facing delegate names in the runtime tool manifest when the adapter rewrites them', async () => {
+    const runStore = new InMemoryRunStore();
+    const model = new AliasingSequenceModel([
+      {
+        finishReason: 'stop',
+        text: 'Done.',
+      },
+    ]);
+
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [createLookupTool()],
+      delegates: [
+        {
+          name: 'researcher',
+          description: 'Researches a topic.',
+          allowedTools: ['lookup'],
+        },
+      ],
+      runStore,
+    });
+
+    const result = await agent.run({ goal: 'Inspect aliased runtime manifest' });
+    expect(result.status).toBe('success');
+
+    const messages = model.receivedRequests[0]?.messages ?? [];
+    expect(messages[1]?.content).toContain('"name": "lookup"');
+    expect(messages[1]?.content).toContain('"name": "delegate__72657365617263686572"');
+    expect(messages[1]?.content).not.toContain('"name": "delegate.researcher"');
+  });
+
   it('can disable the runtime tool manifest through agent defaults', async () => {
     const runStore = new InMemoryRunStore();
     const model = new SequenceModel([
@@ -348,6 +389,56 @@ describe('AdaptiveAgent', () => {
     expect(retryEvents[0].payload).toMatchObject({
       failureKind: 'timeout',
       retryAttempts: 1,
+    });
+  });
+
+  it('allows repeated retries for timeout and Cloudflare 524 model failures', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const model = new SequenceModel([
+      new Error('Model timed out after 90000ms'),
+      new Error('OpenRouter API returned 524: cloudflare timeout'),
+      {
+        finishReason: 'stop',
+        text: 'Recovered after repeated retries.',
+      },
+    ]);
+
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const failed = await agent.run({ goal: 'Retry until the model recovers' });
+    expect(failed).toMatchObject({
+      status: 'failure',
+      code: 'MODEL_ERROR',
+      error: 'Model timed out after 90000ms',
+    });
+
+    const failedAgain = await agent.retry(failed.runId);
+    expect(failedAgain).toMatchObject({
+      status: 'failure',
+      code: 'MODEL_ERROR',
+      error: 'OpenRouter API returned 524: cloudflare timeout',
+    });
+
+    const retried = await agent.retry(failed.runId);
+    expect(retried).toMatchObject({
+      status: 'success',
+      runId: failed.runId,
+      output: 'Recovered after repeated retries.',
+      stepsUsed: 1,
+    });
+
+    const storedRun = await runStore.getRun(failed.runId);
+    expect(storedRun?.metadata).toMatchObject({
+      retryAttempts: 2,
+      lastRetryFailureKind: 'timeout',
     });
   });
 
@@ -740,6 +831,87 @@ describe('AdaptiveAgent', () => {
       delegateName: 'researcher',
       goal: 'Research delegation',
     });
+  });
+
+  it('corrects a misspelled delegate tool name returned by the model when there is a unique close delegate match', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'delegate-call-1',
+            name: 'delegate.researccher',
+            input: {
+              goal: 'Research typo recovery',
+              input: { topic: 'delegation typo' },
+            },
+          },
+        ],
+      },
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'child-call-1',
+            name: 'lookup',
+            input: { topic: 'delegation typo' },
+          },
+        ],
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: {
+          finding: 'child finished',
+        },
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: {
+          report: 'parent finished',
+        },
+      },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [createLookupTool()],
+      delegates: [
+        {
+          name: 'researcher',
+          description: 'Researches a topic using the lookup tool.',
+          allowedTools: ['lookup'],
+        },
+      ],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.run({ goal: 'Recover delegate typo' });
+    const childRuns = await runStore.listChildren(result.runId);
+
+    expect(result).toMatchObject({
+      status: 'success',
+      output: { report: 'parent finished' },
+    });
+    expect(childRuns).toHaveLength(1);
+    expect(childRuns[0]).toMatchObject({
+      delegateName: 'researcher',
+      status: 'succeeded',
+      result: { finding: 'child finished' },
+    });
+
+    const parentEvents = await eventStore.listByRun(result.runId);
+    expect(
+      parentEvents.some(
+        (event) =>
+          event.type === 'delegate.spawned' &&
+          'toolName' in event.payload &&
+          event.payload.toolName === 'delegate.researcher',
+      ),
+    ).toBe(true);
   });
 
   it('retries a failed delegated child in place for retryable model timeouts', async () => {
@@ -1753,6 +1925,64 @@ describe('AdaptiveAgent', () => {
 
     const storedRun = await runStore.getRun(result.runId);
     expect(storedRun?.status).toBe('failed');
+  });
+
+  it('emits model.retry when the adapter reports an internal retry', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const model: ModelAdapter = {
+      provider: 'test',
+      model: 'retrying-model',
+      capabilities: {
+        toolCalling: true,
+        jsonOutput: true,
+        streaming: false,
+        usage: false,
+      },
+      async generate(request) {
+        await request.onRetry?.({
+          attempt: 1,
+          nextAttempt: 2,
+          statusCode: 524,
+          retryDelayMs: 250,
+          reason: 'provider_error',
+          phase: 'http_status',
+          message: 'mesh API returned 524: cloudflare timeout',
+        });
+        return {
+          finishReason: 'stop',
+          text: 'Recovered after retry.',
+        };
+      },
+    };
+
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.run({ goal: 'Retry internally' });
+    expect(result).toMatchObject({ status: 'success', output: 'Recovered after retry.' });
+
+    const events = await eventStore.listByRun(result.runId);
+    const retryEvent = events.find((event) => event.type === 'model.retry');
+    expect(retryEvent).toMatchObject({
+      stepId: 'step-1',
+      payload: expect.objectContaining({
+        attempt: 1,
+        nextAttempt: 2,
+        statusCode: 524,
+        retryDelayMs: 250,
+        reason: 'provider_error',
+        phase: 'http_status',
+        provider: 'test',
+        model: 'retrying-model',
+      }),
+    });
   });
 
   it('maps delegated child completion back to the parent run', async () => {
@@ -3235,5 +3465,86 @@ describe('AdaptiveAgent', () => {
       modelInvocationPhase: 'http_request',
       modelInvocationAttempt: 1,
     });
+  });
+
+  it('steers an in-progress run by injecting a user message at the next step boundary', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'call-1',
+            name: 'noop',
+            input: {},
+          },
+        ],
+      },
+      {
+        finishReason: 'stop',
+        text: 'Acknowledged steering.',
+      },
+    ]);
+
+    let agent!: AdaptiveAgent;
+    const noopTool: ToolDefinition = {
+      name: 'noop',
+      description: 'No-op that triggers a steer.',
+      inputSchema: { type: 'object', additionalProperties: true },
+      execute: async (_input, ctx) => {
+        await agent.steer(ctx.runId, { message: 'Reply only in French.' });
+        return { ok: true };
+      },
+    };
+
+    agent = new AdaptiveAgent({
+      model,
+      tools: [noopTool],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.run({ goal: 'Test steer' });
+    expect(result).toMatchObject({
+      status: 'success',
+      output: 'Acknowledged steering.',
+    });
+
+    const secondRequestMessages = model.receivedRequests[1]?.messages ?? [];
+    const steeredUser = secondRequestMessages.find(
+      (m) => m.role === 'user' && typeof m.content === 'string' && m.content === 'Reply only in French.',
+    );
+    expect(steeredUser).toBeTruthy();
+
+    const events = await eventStore.listByRun(result.runId);
+    const steeredEvent = events.find((event) => event.type === 'run.steered');
+    expect(steeredEvent).toBeTruthy();
+    expect(steeredEvent?.payload).toMatchObject({
+      role: 'user',
+      message: 'Reply only in French.',
+    });
+
+    const finalRun = await runStore.getRun(result.runId);
+    expect((finalRun?.metadata as Record<string, unknown> | undefined)?.pendingSteerMessages).toBeUndefined();
+  });
+
+  it('rejects steering for a terminal run', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const model = new SequenceModel([
+      {
+        finishReason: 'stop',
+        text: 'done',
+      },
+    ]);
+    const agent = new AdaptiveAgent({ model, tools: [], runStore, eventStore, snapshotStore });
+    const result = await agent.run({ goal: 'short run' });
+    expect(result.status).toBe('success');
+
+    await expect(agent.steer(result.runId, 'too late')).rejects.toThrow(/succeeded/);
   });
 });

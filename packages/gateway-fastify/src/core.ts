@@ -194,6 +194,8 @@ export interface AdaptiveAgentHandle {
   resolveClarification?(runId: string, message: string): Promise<RunResult>;
   resume?(runId: string): Promise<RunResult>;
   retry?(runId: string): Promise<RunResult>;
+  interrupt?(runId: string): Promise<void>;
+  steer?(runId: string, input: string | { message: string; role?: 'user' | 'system'; metadata?: JsonObject }): Promise<void>;
 }
 
 export interface ToolContext {

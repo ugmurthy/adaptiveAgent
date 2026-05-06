@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Leo and the Magic Dragon - A Storybook Adventure</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Comic Sans MS', 'Chalkboard', sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+            overflow: hidden;
+        }
+
+        .storybook {
+            width: 600px;
+            height: 800px;
+            position: relative;
+            perspective: 1500px;
+        }
+
+        .page {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            background: #fff8dc;
+            border-radius: 10px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+            padding: 30px;
+            overflow-y: auto;
+            transition: transform 0.8s cubic-bezier(0.645, 0.045, 0.25, 1);
+            transform-origin: left center;
+            backface-visibility: hidden;
+            clip-path: polygon(0 0, calc(100% - 20px) 0, 100% 20px, 100% 100%, 0 100%);
+        }
+
+        .page.flipped {
+            transform: rotateY(-180deg);
+        }
+
+        .page::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 20px;
+            height: 100%;
+            background: linear-gradient(90deg, #ff6b6b, color);
+            border-radius: 10px 0 0 10px;
+        }
+
+        .cover {
+            writing-mode: vertical-rl;
+            transform: translateX(0%);
+            background: linear-gradient(180deg, #4ecdc4 0%, #44a08c 100%);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+            z-index: 10;
+        }
+
+        .cover h1 {
+            font-size: 3.5em;
+            color: #ffffff;
+            text-shadow: 4px 4px 0px #2d5016;
+            margin-bottom: 30px;
+        }
+
+        .cover .subtitle {
+            font-size: 1.5em;
+            color: #ffffff;
+            text-shadow: 2px 2px 0px rgba(0,0,0,0.3);
+            margin-top: 20px;
+        }
+
+        .content-page {
+            writing-mode: horizontal-tb;
+            z-index: 1;
+            background: linear-gradient(180deg, #fff9e6 0%, #fff3ce 100%);
+            border: 4px solid #8b5a2b;
+        }
+
+        .image-container {
+            text-align: center;
+            margin: 20px 0;
+            font-size: 2em;
+            padding: 20px;
+            background: linear-gradient(180deg, #a8d8ea 0%, #9b59b6 100%);
+            border-radius: 15px;
+            display: inline-block;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+
+        .story-text {
+            font-size: 1.2em;
+            line-height: 1.8;
+            color: #3d3d3d;
+            text-align: justify;
+        }
+
+        .story-text p {
+            margin-bottom: 20px;
+            padding: 10px;
+            background: rgba(255,255,255,0.6);
+            border-radius: 10px;
+        }
+
+        .lesson-box {
+            background: linear-gradient(180deg, #f39c12 0%, #e67e22 100%);
+            border: 3px solid #d35400;
+            border-radius: 15px;
+            padding: 20px;
+            margin-top: 20px;
+            text-align: center;
+            font-size: 1.1em;
+            color: white;
+            box-shadow: 0 5px 15px rgba(211,84,0,0.3);
+        }
+
+        .lesson-box::before {
+            content: '✨';
+            font-size: 2em;
+            margin-right: 10px;
+        }
+
+        .lesson-box::after {
+            content: '✨';
+            font-size: 2em;
+            margin-left: 10px;
+        }
+
+        .lesson-title {
+            font-size: 1.5em;
+            font-weight: bold;
+            margin-bottom: 15px;
+        }
+
+        .lesson-content {
+            font-style: italic;
+        }
+
+        .nav-buttons {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            display: flex;
+            gap: 10px;
+            z-index: 100;
+        }
+
+        .nav-btn {
+            padding: 15px 25px;
+            font-size: 1.2em;
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+            font-family: inherit;
+            font-weight: bold;
+            transition: all 0.3s ease;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+
+        .nav-btn:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 8px 20px rgba(0,0,0,0.3);
+        }
+
+        .nav-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .prev-btn {
+            background: linear-gradient(180deg, #e74c3c 0%, #c0392b 100%);
+            color: white;
+        }
+
+        .next-btn {
+            background: linear-gradient(180deg, #27ae60 0%, #1e8449 100%);
+            color: white;
+        }
+
+        .ending {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            z-index: 50;
+        }
+
+        .ending h3 {
+            font-size: 1.2em;
+            color: white;
+            background: linear-gradient(180deg, #8e44ad 0%, #9b2226 100%);
+            display: inline-block;
+            padding: 10px 20px;
+            border-radius: 25px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+    </style>
+</head>
+<body>
+    <div class="storybook">
+        <!-- Page 1: Cover -->
+        <div class="page cover" id="page1">
+            <h1>🐉 Leo and the Magic Dragon 🐉</h1>
+            <p class="subtitle">A Fun Story with Big Lessons!</p>
+            <div style="font-size: 4em; margin: 30px;">🦁🐉🚀</div>
+        </div>
+
+        <!-- Page 2: Meet Leo -->
+        <div class="page content-page" id="page2">
+            <h2 style="text-align: center; font-size: 2em; margin-bottom: 20px; color: #2c3e50;">🌟 Chapter 1: Meet Our Hero!</h2>
+            <div class="story-text">
+                <p>Once upon a time, in a cozy little house with a red roof, lived a boy named Leo. Leo was only five years old!</p>
+                
+                <p>Leo had wild curly hair, loved shiny toys, and a big, bright smile. But Leo had a secret wish... he wanted to see a magic dragon!</p>
+                
+                <p>"One day," Leo whispered to his stuffed rabbit, "I'll find a dragon and they'll be my best friend!"</p>
+            </div>
+        </div>
+
+        <!-- Page 3: The Dragon Appears -->
+        <div class="page content-page" id="page3">
+            <h2 style="text-align: center; font-size: 2em; margin-bottom: 20px; color: #2c3e50;">🌟 Chapter 2: A Spark in the Sky!</h2>
+            <div class="story-text">
+                <p>One sunny afternoon, Leo was running in the big green yard, chasing butterflies and laughing until his tummy hurt.</p>
+                
+                <p>WHOOOSH! A spark of colorful light fell from the sky! It landed right in front of Leo with a soft <span style="color: #c0392b;">POOF!</span></p>
+                
+                <p>The spark grew bigger and bigger until... WHOA! There was a dragon!</p>
+                
+                <p>But this wasn't a scary dragon. This dragon had feathers like rainbows, wings that sparkled, and eyes that twinkled like stars! His name was Sparkle!</p>
+            </div>
+        </div>
+
+        <!-- Page 4: First Meeting -->
+        <div class="page content-page" id="page4">
+            <h2 style="text-align: center; font-size: 2em; margin-bottom: 20px; color: #2c3e50;">🌟 Chapter 3: Hello, Sparkle!</h2>
+            <div class="story-text">
+                <p>Leo wasn't scared at all. In fact, Leo started to clap his hands!</p>
+                
+                <p>"Hi! Hi! Hello, Sparkle!" Leo giggled.</p>
+                
+                <p>Sparkle didn't roar. Instead, Sparkle let out a happy chirp that sounded just like a bird! The dragon poked Leo gently with his rainbow nose.</p>
+                
+                <p>They played tag in the grass! They raced through the trees! Leo even sat on Sparkle's soft, scaly back.</p>
+                
+                <p>Leo laughed so hard tears came to his eyes. "You're the best dragon ever!" Leo cheered.</p>
+            </div>
+        </div>
+
+        <!-- Page 5: The Big Problem -->
+        <div class="page content-page" id="page5">
+            <h2 style="text-align: center; font-size: 2em; margin-bottom: 20px; color: #2c3e50;">🌟 Chapter 4: A Little Trouble</h2>
+            <div class="story-text">
+                <p>But Sparkle had a problem. Sparkle dropped his shiny belly button ring!</p>
+                
+                <p>"Oh dear!" Sparkle chirped with worry. "I can't find it!"</p>
+                
+                <p>Sparkle was sad. He sat on a big rock with his fluffy rainbow tail curling around himself.</p>
+                
+                <p>Leo looked at Sparkle. Leo knew Sparkle needed help. Leo took a deep breath. Leo was brave!</p>
+            </div>
+        </div>
+
+        <!-- Page 6: Being Brave -->
+        <div class="page content-page" id="page6">
+            <h2 style="text-align: center; font-size: 2em; margin-bottom: 20px; color: #2c3e50;">🌟 Chapter 5: Being Brave</h2>
+            <div class="story-text">
+                <p>Leo said, "Don't worry, Sparkle! I'll find it!"</p>
+                
+                <p>Leo looked everywhere! In the tall grass! Under the bushes! Even in the muddy puddle!</p>
+                
+                <p>Leo's tummy felt a little scared. But Leo thought of Sparkle. Leo remembered that being brave doesn't mean not being scared! It means helping anyway!</p>
+            </div>
+        </div>
+
+        <!-- Page 7: Finding the Ring -->
+        <div class="page content-page" id="page7">
+            <h2 style="text-align: center; font-size: 2em; margin-bottom: 20px; color: #2c3e50;">🌟 Chapter 6: The Magic Discovery!</h2>
+            <div class="story-text">
+                <p>Suddenly—DING! Leo's eyes sparkled!</p>
+                
+                <p>The shiny ring was right there, under a pretty blue flower!</p>
+                
+                <p>"I found it! I found it!" Leo shouted with joy.</p>
+                
+                <p>Sparkle wiggled with happiness! He did happy dragon jumps and his rainbow wings sparkled extra bright!</p>
+            </div>
+        </div>
+
+        <!-- Page 8: Being Kind -->
+        <div class="page content-page" id="page8">
+            <h2 style="text-align: center; font-size: 2em; margin-bottom: 20px; color: #2c3e50;">🌟 Chapter 7: Kindness is Magic</h2>
+            <div class="story-text">
+                <p>Leo learned something special today.</p>
+                
+                <p>Being brave meant helping your friend, even when you were a little scared.</p>
+                
+                <p>Being kind meant taking care of someone who needed help.</p>
+                
+                <p>Leo and Sparkle had a special kind of friendship that felt magical!</p>
+            </div>
+        </div>
+
+        <!-- Page 9: The Magic Gift -->
+        <div class="page content-page" id="page9">
+            <h2 style="text-align: center; font-size: 2em; margin-bottom: 20px; color: #2c3e50;">🌟 Chapter 8: A Magic Present</h2>
+            <div class="story-text">
+                <p>Suddenly, Sparkle got very serious. He cleared all the leaves and flowers in front of him.</p>
+                
+                <p>"Look!" Sparkle chirped happily.</p>
+                
+                <p>Under all the leaves was a beautiful garden with pretty purple flowers! Sparkle had planted them!</p>
+                
+                <p>"These are magic flowers!" Sparkle's eyes sparkled. "They only grow for someone who helps their friend!"</p>
+                
+                <p>Leo smiled so wide his cheeks hurt!</p>
+            </div>
+        </div>
+
+        <!-- Page 10: Working Together -->
+        <div class="page content-page" id="page10">
+            <h2 style="text-align: center; font-size: 2em; margin-bottom: 20px; color: #2c3e50;">🌟 Chapter 9: We're a Team!</h2>
+            <div class="story-text">
+                <p>Leo and Sparkle worked together like a team!</p>
+                
+                <p><strong>Leo taught Sparkle:</strong></p>
+                <ul style="margin-left: 20px; margin-top: 10px;">
+                    <li>How to eat the yummy apples</li>
+                    <li>How to chase butterflies</li>
+                    <li>How to share with Leo's toys</li>
+                </ul>
+                
+                <p><strong>Sparkle taught Leo:</strong></p>
+                <ul style="margin-left: 20px; margin-top: 10px;">
+                    <li>How to make wishes come true</li>
+                    <li>How to be brave</li>
+                    <li>How to be kind</li>
+                    <li>How to help a friend</li>
+                </ul>
+            </div>
+        </div>
+
+        <!-- Page 11: Being Different -->
+        <div class="page content-page" id="page11">
+            <h2 style="text-align: center; font-size: 2em; margin-bottom: 20px; color: #2c3e50;">🌟 Chapter 10: Everyone is Special!</h2>
+            <div class="story-text">
+                <p>Leo and Sparkle learned that everyone is special!</p>
+                
+                <p><strong>Leo is special because:</strong> He's kind and brave and he has the best hugs!</p>
+                
+                <p><strong>Sparkle is special because:</strong> He's magical and helpful and his wings spark!</p>
+                
+                <p>When two different people play together, they have more fun!</p>
+            </div>
+        </div>
+
+        <!-- Page 12: Going Home -->
+        <div class="page content-page" id="page12">
+            <h2 style="text-align: center; font-size: 2em; margin-bottom: 20px; color: #2c3e50;">🌟 Chapter 11: It's Almost Night</h2>
+            <div class="story-text">
+                <p>The sun was getting lower. It was time for Leo to go home.</p>
+                
+                <p>"See you tomorrow, Leo!" Sparkle chirped.</p>
+                
+                <p>"Bye, Sparkle! See you tomorrow!" Leo said back with a big wave.</p>
+            </div>
+        </div>
+
+        <!-- Page 13: Goodnight -->
+        <<div class="page content-page" id="page13">
+            <h2 style="text-align: center; font-size: 2em; margin-bottom: 20px; color: #2c3e50;">🌟 Chapter 12: Goodnight, Dream Big!</h2>
+            <div class="story-text">
+                <p>That night, Leo dreamt of playing with Sparkle!</p>
+                
+                <p>He dreamt of finding more magic dragon eggs!</p>
+                
+                <p>He dreamt of being a brave knight and a kind helper!</p>
+                
+                <p>And he dreamt of all the fun adventures with his magical dragon friend!</p>
+            </div>
+        </div>
+        </div>
+
+        <!-- Page 14: The End -->
+        <div class="page content-page ending" id="page14">
+            <h1 style="text-align: center; font-size: 2.5em; color: #4ecdc4; text-shadow: 3px 3px 0px #333;">The End!</h1>
+            <div style="font-size: 3em; text-align: center; margin: 30px;">🐉✨🦁</div>
+            
+            <div style="text-align: center; margin-top: 30px;">
+                <h2 style="color: #e67e22;">What Did Leo & Sparkle Learn?</h2>
+                <ul style="font-size: 1.3em; margin-top: 20px; text-align: left;">
+                    <li>✨ Being brave means helping even when scared!</li>
+                    <li>✨ Being kind makes friends stronger!</li>
+                    <li>✨ Working together is more fun!</li>
+                    <li>✨ Being different is okay (we all learn from each other!)</li>
+                    <li>✨ Even dragons need help sometimes!</li>
+                </ul>
+            </div>
+            
+            <p style="text-align: center; font-size: 1.1em; margin-top: 30px; color: #7f8c8d;">
+                The End - Now you're brave and kind too!
+            </p>
+        </div>
+
+        <!-- Navigation Buttons -->
+        <div class="nav-buttons">
+            <button class="nav-btn prev-btn" id="prevBtn">❮ Previous</button>
+            <button class="nav-btn next-btn" id="nextBtn">Next ❯</button>
+        </div>
+
+        <!-- Page Counter -->
+        <div class="ending">
+            <h3 id="pageCounter">Page 1 of 14</h3>
+        </div>
+    </div>
+
+    <script>
+        // Page navigation
+        let currentPage = 1;
+        const totalPages = 14;
+        const pages = document.querySelectorAll('.page');
+        const prevBtn = document.getElementById('prevBtn');
+        const nextBtn = document.getElementById('nextBtn');
+        const pageCounter = document.getElementById('pageCounter');
+
+        function updateNavigation() {
+            // Update button states
+            prevBtn.disabled = currentPage === 1;
+            nextBtn.disabled = currentPage === totalPages;
+            
+            // Update page counter
+            pageCounter.textContent = `Page ${currentPage} of ${totalPages}`;
+        }
+
+        function flipPage(forwards) {
+            const targetPage = currentPage + forwards;
+            
+            if (targetPage > 0 && targetPage <= totalPages) {
+                const pageElement = pages[currentPage - 1];
+                pageElement.classList.add('flipped');
+                
+                // Wait for animation to complete before showing next page
+                setTimeout(() => {
+                    if (targetPage === 1) {
+                        // Show cover
+                    } else {
+                        currentPage = targetPage;
+                        updateNavigation();
+                    }
+                }, 800);
+            }
+        }
+
+        prevBtn.addEventListener('click', () => {
+            flipPage(-1);
+        });
+
+        nextBtn.addEventListener('click', () => {
+            flipPage(1);
+        });
+
+        // Initialize
+        updateNavigation();
+    </script>
+</body>
+</html>

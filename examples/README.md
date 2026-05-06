@@ -112,4 +112,6 @@ Skills are automatically converted to delegate profiles (`delegate.researcher`, 
 
 Skills can also override child-run defaults with dotted frontmatter keys such as `defaults.toolTimeoutMs: 120000` or `defaults.modelTimeoutMs: 0`. That is the most precise way to give a delegate like `code-executor` more time without slowing down every other tool.
 
+Skills may also declare `handler: handler.ts`. When present, the handler module is loaded as a child-run tool, which makes it a good fit for integrations such as MCP clients. See `examples/skills/mcp-echo/` for a minimal stdio MCP example that spawns a local server, sends `initialize` and `tools/call`, and returns the result to the delegated skill run.
+
 Skills whose required tools are unavailable (e.g. `researcher` when `WEB_SEARCH_PROVIDER=brave` and `BRAVE_SEARCH_API_KEY` is missing) are skipped automatically.

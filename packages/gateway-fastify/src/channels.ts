@@ -10,6 +10,7 @@ export const BRIDGED_RUNTIME_EVENTS = [
   'run.status_changed',
   'run.retry_started',
   'model.started',
+  'model.retry',
   'model.completed',
   'model.failed',
   'tool.started',

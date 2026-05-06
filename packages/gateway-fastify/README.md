@@ -338,7 +338,7 @@ The gateway still routes only to `strategy-manager`. The listed delegates are re
 
 Root-agent `systemInstructions` should describe when to delegate and who owns the final answer. Delegate instructions should describe the specialist behavior and bounded tool scope for the child run.
 
-For local gateway startup, skills are discovered only from `~/.adaptiveAgent/gateway/skills`. The repository's `examples/skills` directory is for demos and tests and is not trusted by the gateway by default. Skill model overrides must use environment-backed credentials such as `model.apiKeyEnv: MESH_API_KEY`; inline `model.apiKey` values are rejected.
+For local gateway startup, installed skills are discovered from `~/.adaptiveAgent/gateway/skills`. The repository's `examples/skills` directory is for demos and tests and is not trusted by the gateway by default. An installed skill appearing in the launcher output only means the gateway detected it; an agent still needs to list that delegate name in its own `delegates` array before `delegate.<name>` is exposed to that agent. Skill model overrides must use environment-backed credentials such as `model.apiKeyEnv: MESH_API_KEY`; inline `model.apiKey` values are rejected.
 
 ### Agent Config Fields
 

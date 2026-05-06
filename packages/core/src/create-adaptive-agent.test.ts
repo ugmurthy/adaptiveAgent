@@ -1,4 +1,5 @@
 import { PassThrough } from 'node:stream';
+import { fileURLToPath } from 'node:url';
 
 import pino from 'pino';
 import { describe, expect, it } from 'vitest';
@@ -7,6 +8,7 @@ import { InMemoryEventStore } from './in-memory-event-store.js';
 import { InMemoryRunStore } from './in-memory-run-store.js';
 import { InMemorySnapshotStore } from './in-memory-snapshot-store.js';
 import { createAdaptiveAgent, createAdaptiveAgentRuntime } from './create-adaptive-agent.js';
+import { loadSkillFromDirectory } from './skills/load-skill.js';
 import type { ModelAdapter, ModelRequest, ModelResponse, ToolDefinition } from './types.js';
 
 class SequenceModel implements ModelAdapter {
@@ -157,6 +159,63 @@ describe('createAdaptiveAgent', () => {
     });
     expect(childRuns).toHaveLength(1);
     expect(childRuns[0]).toMatchObject({ delegateName: 'researcher' });
+  });
+
+  it('lets a skill handler call a simple MCP service through a delegated child run', async () => {
+    const skillDir = fileURLToPath(new URL('../../../examples/skills/mcp-echo', import.meta.url));
+    const skill = await loadSkillFromDirectory(skillDir);
+    const { agent, runtime } = createAdaptiveAgent({
+      model: new SequenceModel([
+        {
+          finishReason: 'tool_calls',
+          toolCalls: [
+            {
+              id: 'delegate-call-1',
+              name: 'delegate.mcp-echo',
+              input: {
+                goal: 'Call the demo MCP echo service',
+                input: { message: 'hello-mcp' },
+              },
+            },
+          ],
+        },
+        {
+          finishReason: 'tool_calls',
+          toolCalls: [
+            {
+              id: 'mcp-call-1',
+              name: 'mcp_echo',
+              input: { message: 'hello-mcp' },
+            },
+          ],
+        },
+        {
+          finishReason: 'stop',
+          structuredOutput: {
+            reply: 'echo:hello-mcp',
+            server: 'example-mcp-echo',
+          },
+        },
+        {
+          finishReason: 'stop',
+          structuredOutput: {
+            report: 'mcp complete',
+          },
+        },
+      ]),
+      tools: [],
+      skills: [skill],
+    });
+
+    const result = await agent.run({ goal: 'Use the MCP-backed skill' });
+    const childRuns = await runtime.runStore.listChildren(result.runId);
+
+    expect(result).toMatchObject({
+      status: 'success',
+      output: { report: 'mcp complete' },
+    });
+    expect(childRuns).toHaveLength(1);
+    expect(childRuns[0]).toMatchObject({ delegateName: 'mcp-echo' });
   });
 
   it('rejects duplicate delegate names across delegates and skills', () => {

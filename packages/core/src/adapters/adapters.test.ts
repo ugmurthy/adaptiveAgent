@@ -60,6 +60,35 @@ const TOOL_CALL_RESPONSE = {
   },
 };
 
+const DELEGATE_TOOL_CALL_RESPONSE = {
+  id: 'chatcmpl-test-2-delegate',
+  choices: [
+    {
+      index: 0,
+      message: {
+        role: 'assistant' as const,
+        content: null,
+        tool_calls: [
+          {
+            id: 'call-delegate-1',
+            type: 'function' as const,
+            function: {
+              name: 'delegate__72657365617263686572',
+              arguments: '{"goal":"research testing"}',
+            },
+          },
+        ],
+      },
+      finish_reason: 'tool_calls' as const,
+    },
+  ],
+  usage: {
+    prompt_tokens: 20,
+    completion_tokens: 10,
+    total_tokens: 30,
+  },
+};
+
 const TOOL_CALL_RESPONSE_WITH_REASONING = {
   id: 'chatcmpl-test-2b',
   choices: [
@@ -180,6 +209,43 @@ function requestWithAssistantToolCalls(): ModelRequest {
         ],
       },
       { role: 'tool', content: '{"result":"found"}', toolCallId: 'call-1', name: 'lookup' },
+    ],
+  };
+}
+
+function requestWithDelegateTools(): ModelRequest {
+  return {
+    messages: [{ role: 'user', content: 'Research testing' }],
+    tools: [
+      {
+        name: 'delegate.researcher',
+        description: 'Delegates focused research work.',
+        inputSchema: {
+          type: 'object',
+          properties: { goal: { type: 'string' } },
+          required: ['goal'],
+        },
+      },
+    ],
+  };
+}
+
+function requestWithAssistantDelegateToolCalls(): ModelRequest {
+  return {
+    messages: [
+      { role: 'user', content: 'Research testing' },
+      {
+        role: 'assistant',
+        content: '',
+        toolCalls: [
+          {
+            id: 'call-delegate-1',
+            name: 'delegate.researcher',
+            input: { goal: 'research testing' },
+          },
+        ],
+      },
+      { role: 'tool', content: '{"result":"found"}', toolCallId: 'call-delegate-1', name: 'delegate.researcher' },
     ],
   };
 }
@@ -311,6 +377,25 @@ describe('BaseOpenAIChatAdapter', () => {
     });
   });
 
+  it('aliases delegate tool definitions outbound and restores delegate tool calls inbound', async () => {
+    const adapter = createAdapter();
+    mockFetchResponse(DELEGATE_TOOL_CALL_RESPONSE);
+
+    const result = await adapter.generate(requestWithDelegateTools());
+
+    const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    expect(body.tools).toHaveLength(1);
+    expect(body.tools[0].function.name).toBe('delegate__72657365617263686572');
+
+    expect(result.finishReason).toBe('tool_calls');
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls![0]).toMatchObject({
+      id: 'call-delegate-1',
+      name: 'delegate.researcher',
+      input: { goal: 'research testing' },
+    });
+  });
+
   it('round-trips reasoning fields for assistant tool call messages', async () => {
     const adapter = createAdapter();
     mockFetchResponse(TOOL_CALL_RESPONSE_WITH_REASONING);
@@ -381,6 +466,30 @@ describe('BaseOpenAIChatAdapter', () => {
           function: {
             name: 'lookup',
             arguments: '{"topic":"testing"}',
+          },
+        },
+      ],
+    });
+  });
+
+  it('aliases replayed assistant delegate tool call messages outbound', async () => {
+    const adapter = createAdapter();
+    mockFetchResponse(STOP_RESPONSE);
+
+    await adapter.generate(requestWithAssistantDelegateToolCalls());
+
+    const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    const assistantMsg = body.messages.find((m: { role: string }) => m.role === 'assistant');
+    expect(assistantMsg).toMatchObject({
+      role: 'assistant',
+      content: null,
+      tool_calls: [
+        {
+          id: 'call-delegate-1',
+          type: 'function',
+          function: {
+            name: 'delegate__72657365617263686572',
+            arguments: '{"goal":"research testing"}',
           },
         },
       ],
@@ -468,6 +577,10 @@ describe('BaseOpenAIChatAdapter', () => {
 
   it('retries 429 responses with jitter before succeeding', async () => {
     const adapter = createAdapter();
+    const retries: Array<Parameters<NonNullable<ModelRequest['onRetry']>>[0]> = [];
+    const onRetry: NonNullable<ModelRequest['onRetry']> = (retry) => {
+      retries.push(retry);
+    };
     vi.useFakeTimers();
     vi.spyOn(Math, 'random').mockReturnValue(0.5);
 
@@ -485,7 +598,7 @@ describe('BaseOpenAIChatAdapter', () => {
         }),
       );
 
-    const resultPromise = adapter.generate(simpleRequest());
+    const resultPromise = adapter.generate(simpleRequest({ onRetry }));
 
     await vi.advanceTimersByTimeAsync(249);
     expect(fetchSpy).toHaveBeenCalledTimes(1);
@@ -495,6 +608,16 @@ describe('BaseOpenAIChatAdapter', () => {
 
     expect(fetchSpy).toHaveBeenCalledTimes(2);
     expect(result.text).toBe('Hello world');
+    expect(retries).toEqual([
+      expect.objectContaining({
+        attempt: 1,
+        nextAttempt: 2,
+        statusCode: 429,
+        retryDelayMs: 250,
+        reason: 'rate_limit',
+        phase: 'http_status',
+      }),
+    ]);
   });
 
   it('honors Retry-After before retrying', async () => {
@@ -528,6 +651,26 @@ describe('BaseOpenAIChatAdapter', () => {
     await resultPromise;
 
     expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries Cloudflare 524 responses without the default attempt cap', async () => {
+    const adapter = createAdapter();
+
+    fetchSpy
+      .mockResolvedValueOnce(new Response('cloudflare timeout', { status: 524, headers: { 'Retry-After': '0' } }))
+      .mockResolvedValueOnce(new Response('cloudflare timeout', { status: 524, headers: { 'Retry-After': '0' } }))
+      .mockResolvedValueOnce(new Response('cloudflare timeout', { status: 524, headers: { 'Retry-After': '0' } }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(STOP_RESPONSE), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      );
+
+    const result = await adapter.generate(simpleRequest());
+
+    expect(fetchSpy).toHaveBeenCalledTimes(4);
+    expect(result.text).toBe('Hello world');
   });
 
   it('shares provider/model cooldown across adapter instances', async () => {

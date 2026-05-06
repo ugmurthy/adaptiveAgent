@@ -6,9 +6,27 @@ export type FeedKind = 'assistant' | 'user' | 'run' | 'system' | 'event';
 export type TraceView = 'overview' | 'timeline' | 'delegates' | 'messages' | 'plans';
 export type ImageDetail = 'auto' | 'low' | 'high';
 
-export interface GatewayImageInput {
+export interface GatewayLocalImageInput {
   path: string;
+  mimeType?: string;
   detail?: ImageDetail;
+  name?: string;
+}
+
+export interface GatewayUploadedImageInput {
+  uploadId: string;
+  mimeType?: string;
+  detail?: ImageDetail;
+  name?: string;
+}
+
+export type GatewayImageInput = GatewayLocalImageInput | GatewayUploadedImageInput;
+
+export interface GatewayImageUploadResult {
+  uploadId: string;
+  mimeType: string;
+  name?: string;
+  sizeBytes: number;
 }
 
 export interface GatewayDefaults {
@@ -91,6 +109,20 @@ export interface SessionSnapshot {
   activeRootRunId?: string;
 }
 
+export interface ModelActivitySnapshot {
+  status: 'thinking' | 'completed' | 'failed';
+  runId?: string;
+  target?: string;
+  startedAt: Date;
+  completedAt?: Date;
+  durationMs?: number;
+  timeoutMs?: number;
+  finishReason?: string;
+  toolCallCount?: number;
+  timedOut?: boolean;
+  error?: string;
+}
+
 export interface LiveGatewayState {
   socketState: SocketState;
   socketDetail: string;
@@ -100,6 +132,7 @@ export interface LiveGatewayState {
   runs: RunActivity[];
   pendingApproval?: PendingApproval;
   pendingClarification?: PendingClarification;
+  modelActivity?: ModelActivitySnapshot;
 }
 
 export interface GatewayWebClientOptions {

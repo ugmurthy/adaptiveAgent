@@ -15,6 +15,7 @@ import { resolveGatewayRoute } from './routing.js';
 import { assertGatewaySessionWriteAllowed, getAuthorizedGatewaySession, tryAcquireGatewaySessionRun } from './session.js';
 import type { GatewaySessionRecord, GatewayStores, TranscriptMessageRecord, TranscriptMessageRole } from './stores.js';
 import { buildTranscriptReplayEnvelope, buildTranscriptSummary, resolveGatewayTranscriptPolicy } from './transcript.js';
+import { resolveGatewayImageInputs } from './uploads.js';
 
 export interface ExecuteGatewayChatTurnOptions {
   gatewayConfig: GatewayConfig;
@@ -22,6 +23,7 @@ export interface ExecuteGatewayChatTurnOptions {
   stores: GatewayStores;
   authContext?: GatewayAuthContext;
   hooks?: ResolvedGatewayHooks;
+  imageUploadDir?: string;
   now?: () => Date;
   transcriptMessageIdFactory?: () => string;
   realtimeEvents?: Omit<RealtimeEventForwardingContext, 'fallbackAgentId' | 'fallbackSessionId'>;
@@ -96,6 +98,11 @@ export async function executeGatewayChatTurn(
       now,
     });
     const replayEnvelope = buildTranscriptReplayEnvelope(runningSession, transcriptMessages, transcriptPolicy);
+    const images = await resolveGatewayImageInputs(effectiveFrame.images, {
+      uploadDir: options.imageUploadDir ?? '',
+      authContext: options.authContext,
+      requestType: frame.type,
+    });
     const chatResult = await withForwardedRealtimeEvents(
       agent,
       options.realtimeEvents
@@ -107,7 +114,7 @@ export async function executeGatewayChatTurn(
         : undefined,
       () =>
         agent.agent.chat({
-          messages: [...replayEnvelope, { role: 'user', content: effectiveFrame.content, images: effectiveFrame.images }],
+          messages: [...replayEnvelope, { role: 'user', content: effectiveFrame.content, images }],
           context: buildGatewayChatContext(runningSession, options.authContext),
           metadata: buildGatewayChatMetadata(effectiveFrame, route.agentId, options.realtimeEvents?.requestId),
         }),
@@ -272,6 +279,11 @@ export async function executeGatewayChatTurn(
         });
       }
     }
+
+    throw new ProtocolValidationError('run_failed', `Unsupported chat result status "${(chatResult as { status: string }).status}".`, {
+      requestType: frame.type,
+      details: { sessionId: runningSession.id, rootRunId },
+    });
   } catch (error) {
     if (error instanceof ProtocolValidationError) {
       if (error.code === 'gateway_overloaded') {
