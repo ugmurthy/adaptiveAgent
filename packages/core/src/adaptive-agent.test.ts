@@ -7,6 +7,7 @@ import pino from 'pino';
 import { describe, expect, it, vi } from 'vitest';
 
 import { AdaptiveAgent } from './adaptive-agent.js';
+import { InMemoryContinuationStore } from './in-memory-continuation-store.js';
 import { InMemoryEventStore } from './in-memory-event-store.js';
 import { InMemoryPlanStore } from './in-memory-plan-store.js';
 import { InMemoryRunStore } from './in-memory-run-store.js';
@@ -239,6 +240,155 @@ describe('AdaptiveAgent', () => {
       role: 'user',
       content: expect.stringContaining('Inspect runtime manifest'),
     });
+  });
+
+  it('continues a failed run from durable partial progress with a linked audit record', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const continuationStore = new InMemoryContinuationStore();
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'lookup-1',
+            name: 'lookup',
+            input: { topic: 'continuation' },
+          },
+        ],
+      },
+      new Error('HTTP 524 provider timeout'),
+      {
+        finishReason: 'stop',
+        text: 'Recovered from the prior lookup result.',
+      },
+    ]);
+
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [createLookupTool()],
+      runStore,
+      eventStore,
+      snapshotStore,
+      continuationStore,
+      recovery: {
+        continuation: {
+          enabled: true,
+          defaultStrategy: 'hybrid_snapshot_then_step',
+        },
+      },
+    });
+
+    const failedResult = await agent.run({ goal: 'Research continuation recovery' });
+    expect(failedResult).toMatchObject({
+      status: 'failure',
+      code: 'MODEL_ERROR',
+      stepsUsed: 1,
+    });
+
+    const recovery = await agent.getRecoveryOptions(failedResult.runId);
+    expect(recovery).toMatchObject({
+      continuable: true,
+      decision: 'continue_new_run',
+      failureClass: 'provider_transient',
+      lastCompletedStepId: 'step-1',
+      nextStepId: 'step-2',
+    });
+
+    const continuedResult = await agent.continueRun({ fromRunId: failedResult.runId });
+    expect(continuedResult).toMatchObject({
+      status: 'success',
+      output: 'Recovered from the prior lookup result.',
+      stepsUsed: 2,
+    });
+    expect(continuedResult.runId).not.toBe(failedResult.runId);
+
+    const sourceRun = await runStore.getRun(failedResult.runId);
+    const continuationRun = await runStore.getRun(continuedResult.runId);
+    const continuations = await continuationStore.listBySourceRun(failedResult.runId);
+    const continuationEvents = await eventStore.listByRun(continuedResult.runId);
+    const continuationRequest = model.receivedRequests.at(-1);
+
+    expect(sourceRun).toMatchObject({ status: 'failed' });
+    expect(continuationRun).toMatchObject({
+      status: 'succeeded',
+      metadata: expect.objectContaining({
+        continuationOfRunId: failedResult.runId,
+        continuationStrategy: 'hybrid_snapshot_then_step',
+        continuationLastCompletedStepId: 'step-1',
+        continuationNextStepId: 'step-2',
+      }),
+    });
+    expect(continuations).toHaveLength(1);
+    expect(continuations[0]).toMatchObject({
+      sourceRunId: failedResult.runId,
+      continuationRunId: continuedResult.runId,
+      strategy: 'hybrid_snapshot_then_step',
+      failureClass: 'provider_transient',
+      sourceStepId: 'step-1',
+      nextStepId: 'step-2',
+    });
+    expect(continuationEvents.some((event) => event.type === 'run.continuation_created')).toBe(true);
+    expect(continuationRequest?.messages.at(-1)?.content).toContain('Continue the previous failed run');
+    expect(continuationRequest?.messages.at(-1)?.content).toContain('"lastCompletedStepId": "step-1"');
+    expect(continuationRequest?.messages.at(-1)?.content).toContain('"nextStepId": "step-2"');
+  });
+
+  it('blocks continuation when a tool call has no durable completion', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const continuationStore = new InMemoryContinuationStore();
+    const model = new SequenceModel([]);
+    const createdRun = await runStore.createRun({
+      goal: 'Do an unsafe side effect',
+      status: 'failed',
+    });
+    const failedRun = await runStore.updateRun(createdRun.id, {
+      errorCode: 'TOOL_ERROR',
+      errorMessage: 'process crashed during tool execution',
+    });
+    await snapshotStore.save({
+      runId: failedRun.id,
+      snapshotSeq: 1,
+      status: 'running',
+      currentStepId: 'step-1',
+      summary: { stepsUsed: 0 },
+      state: {
+        schemaVersion: 1,
+        messages: [],
+        stepsUsed: 0,
+      },
+    });
+    await eventStore.append({
+      runId: failedRun.id,
+      stepId: 'step-1',
+      toolCallId: 'unsafe-1',
+      type: 'tool.started',
+      schemaVersion: 1,
+      payload: { toolName: 'unsafe_write' },
+    });
+
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore,
+      continuationStore,
+    });
+
+    const recovery = await agent.getRecoveryOptions(failedRun.id);
+    expect(recovery).toMatchObject({
+      continuable: false,
+      decision: 'requires_reconciliation',
+      failureClass: 'tool_uncertain',
+      requiresReconciliation: true,
+    });
+    await expect(agent.createContinuationRun({ fromRunId: failedRun.id })).rejects.toThrow(
+      'started but no durable tool completion was recorded',
+    );
   });
 
   it('uses provider-facing delegate names in the runtime tool manifest when the adapter rewrites them', async () => {
