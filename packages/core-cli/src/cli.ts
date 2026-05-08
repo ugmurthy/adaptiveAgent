@@ -326,14 +326,7 @@ async function runAgentCommand(context: RuntimeContext, command: NormalizedCliCo
       stdout.write(`${JSON.stringify(continuation, null, 2)}\n`);
       return 0;
     } else if (command === 'continue-run') {
-      result = await localAgent.created.agent.continueRun({
-        fromRunId: requireSingleRunId(context.parsed.positionals, 'continue-run'),
-        strategy: context.parsed.continuationStrategy,
-        provider: context.parsed.continuationProvider,
-        model: context.parsed.continuationModel,
-        metadata: context.parsed.continuationMetadata,
-        requireApproval: context.parsed.requireContinuationApproval,
-      });
+      result = await runContinueCommand(context, localAgent);
       result = await resolveInteractiveResult({
         agent: localAgent.created.agent,
         initialResult: result,
@@ -362,6 +355,28 @@ async function runAgentCommand(context: RuntimeContext, command: NormalizedCliCo
   } finally {
     unsubscribe?.();
   }
+}
+
+async function runContinueCommand(
+  context: RuntimeContext,
+  localAgent: ReturnType<typeof createLocalAgent>,
+): Promise<RunResult> {
+  const runId = requireSingleRunId(context.parsed.positionals, 'continue-run');
+  const run = await context.runtime.runtime?.runStore.getRun(runId);
+  const existingContinuation = await context.runtime.runtime?.continuationStore?.getByContinuationRun(runId);
+
+  if (run && run.status !== 'failed' && existingContinuation) {
+    return localAgent.created.agent.resume(runId);
+  }
+
+  return localAgent.created.agent.continueRun({
+    fromRunId: runId,
+    strategy: context.parsed.continuationStrategy,
+    provider: context.parsed.continuationProvider,
+    model: context.parsed.continuationModel,
+    metadata: context.parsed.continuationMetadata,
+    requireApproval: context.parsed.requireContinuationApproval,
+  });
 }
 
 async function inspectRun(context: RuntimeContext): Promise<number> {

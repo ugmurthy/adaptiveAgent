@@ -69,7 +69,7 @@ core-agent config
 
 By default the CLI uses in-memory core runtime stores. `--runtime postgres` enables durable core runtime stores using `DATABASE_URL` and runs the core runtime migrations before creating the agent.
 
-Failed-run continuation commands also accept camelCase aliases matching the core API names: `getRecoveryOptions`, `createContinuationRun`, and `continueRun`. Continuation commands print JSON for recovery/options creation, while `continue-run` creates and executes the linked continuation run.
+Failed-run continuation commands also accept camelCase aliases matching the core API names: `getRecoveryOptions`, `createContinuationRun`, and `continueRun`. Continuation commands print JSON for recovery/options creation. `continue-run` accepts either the original failed source run ID, or a queued continuation run ID returned by `create-continuation-run`.
 
 Continuation options:
 
