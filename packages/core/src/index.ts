@@ -10,6 +10,7 @@ export * from './in-memory-tool-execution-store.js';
 export * from './postgres-runtime-stores.js';
 export * from './postgres-runtime-migrations.js';
 export * from './delegation-executor.js';
+export * from './run-recovery-analyzer.js';
 export * from './adapters/index.js';
 export * from './logger.js';
 export * from './tool-budget-policy.js';
