@@ -17,6 +17,8 @@ import {
   parseCsv,
   parseFrame,
   parsePort,
+  postRunInterrupt,
+  postRunSteer,
   rejectIfPending,
   requireValue,
   resolveIfPending,
@@ -28,8 +30,10 @@ import {
   isEventsCommand,
   parseClarifyCommand,
   parseEventsCommand,
+  parseInterruptCommand,
   parseRetryCommand,
   parseApproveCommand,
+  parseSteerCommand,
   recordFailedRunFromAgentEvent,
   recordInteractiveSession,
   selectInteractiveSession,
@@ -51,7 +55,9 @@ export {
   getInteractiveSessionMode,
   parseClarifyCommand,
   parseEventsCommand,
+  parseInterruptCommand,
   parseRetryCommand,
+  parseSteerCommand,
   recordFailedRunFromAgentEvent,
   recordRootRunRetryTarget,
   recordInteractiveSession,
@@ -86,6 +92,9 @@ const HELP_TEXT = `Commands:
   <text>                     send a chat message with message.send
   /run <goal>                send run.start via a dedicated run session
   /retry [runId]             retry a failed run in the current run session
+  /interrupt <runId>         interrupt an active run via POST /api/runs/:runId/interrupt
+  /steer [--role user|system] <runId> <text>
+                             steer an active run via POST /api/runs/:runId/steer
   /approve [runId] [yes|no]  resolve the pending approval for the session
   /clarify [runId] <text>    answer a pending clarification for a run
   /event [on [verbose]|off]  stream one-line, detailed, or muted realtime agent.event frames
@@ -472,6 +481,20 @@ async function main(): Promise<void> {
           ...(retrySessionId ? { sessionId: retrySessionId } : {}),
           runId,
         });
+        continue;
+      }
+
+      if (line === '/interrupt' || line.startsWith('/interrupt ')) {
+        const runId = parseInterruptCommand(line);
+        await postRunInterrupt(options, token, runId);
+        console.log(`interrupt requested for run ${runId}`);
+        continue;
+      }
+
+      if (line === '/steer' || line.startsWith('/steer ')) {
+        const { runId, message, role } = parseSteerCommand(line);
+        await postRunSteer(options, token, runId, { message, ...(role ? { role } : {}) });
+        console.log(`steer sent for run ${runId}`);
         continue;
       }
 

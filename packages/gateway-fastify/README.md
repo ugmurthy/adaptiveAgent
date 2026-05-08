@@ -121,6 +121,8 @@ bun run gateway:ws-client --message "Hello there"
 bun run gateway:ws-client --run "Summarize this repository"
 ```
 
+In interactive `gateway:ws-client` or `gateway:tui` sessions, use `/interrupt <runId>` to stop an active run and `/steer [--role user|system] <runId> <message>` to send steering input through the gateway admin HTTP routes. These commands require an admin-authorized token, for example by launching the client with `--role admin` in local development.
+
 The launcher uses these paths:
 
 - gateway store base dir: `~/.adaptiveAgent/data/gateway`

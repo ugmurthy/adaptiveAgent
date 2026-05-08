@@ -72,6 +72,81 @@ export async function resolveSocketUrl(options: ClientOptions): Promise<string> 
   return `ws://${options.host ?? '127.0.0.1'}:${options.port ?? 8959}${options.path ?? '/ws'}?channelId=${encodeURIComponent(options.channel)}`;
 }
 
+export function resolveHttpBaseUrl(options: ClientOptions): string {
+  if (!options.url) {
+    return `http://${options.host ?? '127.0.0.1'}:${options.port ?? 8959}`;
+  }
+
+  const url = new URL(options.url);
+  if (url.protocol === 'wss:') {
+    url.protocol = 'https:';
+  } else if (url.protocol === 'ws:') {
+    url.protocol = 'http:';
+  }
+  url.pathname = '';
+  url.search = '';
+  url.hash = '';
+  return url.toString().replace(/\/$/, '');
+}
+
+export async function postRunInterrupt(options: ClientOptions, token: string, runId: string): Promise<unknown> {
+  return postRunAction(options, token, runId, 'interrupt');
+}
+
+export async function postRunSteer(
+  options: ClientOptions,
+  token: string,
+  runId: string,
+  steer: { message: string; role?: 'user' | 'system' },
+): Promise<unknown> {
+  return postRunAction(options, token, runId, 'steer', steer);
+}
+
+async function postRunAction(
+  options: ClientOptions,
+  token: string,
+  runId: string,
+  action: 'interrupt' | 'steer',
+  body?: Record<string, unknown>,
+): Promise<unknown> {
+  const response = await fetch(`${resolveHttpBaseUrl(options)}/api/runs/${encodeURIComponent(runId)}/${action}`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${token}`,
+      ...(body ? { 'content-type': 'application/json' } : {}),
+    },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  const text = await response.text();
+  const responseBody = parseJsonResponse(text);
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status} ${response.statusText}: ${formatHttpResponseBody(responseBody)}`);
+  }
+
+  return responseBody;
+}
+
+function parseJsonResponse(text: string): unknown {
+  if (text.length === 0) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return text;
+  }
+}
+
+function formatHttpResponseBody(body: unknown): string {
+  if (typeof body === 'string') {
+    return body;
+  }
+
+  return JSON.stringify(body);
+}
+
 export function sendFrame(socket: WebSocket, frame: Record<string, unknown>): void {
   socket.send(JSON.stringify(frame));
 }

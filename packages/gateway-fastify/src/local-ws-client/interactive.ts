@@ -180,6 +180,46 @@ export function parseRetryCommand(command: string, lastFailedRunId?: string): st
   return args[0];
 }
 
+export function parseInterruptCommand(command: string): string {
+  const parts = command.split(/\s+/).filter((part) => part.length > 0);
+  const args = parts.slice(1);
+  if (args.length !== 1) {
+    throw new Error('Usage: /interrupt <runId>');
+  }
+
+  return args[0];
+}
+
+export function parseSteerCommand(command: string): { runId: string; message: string; role?: 'user' | 'system' } {
+  let remainder = command.slice('/steer'.length).trim();
+  let role: 'user' | 'system' | undefined;
+
+  if (remainder.startsWith('--role ')) {
+    const roleMatch = /^--role\s+(user|system)\s+(.+)$/s.exec(remainder);
+    if (!roleMatch) {
+      throw new Error('Usage: /steer [--role user|system] <runId> <message>');
+    }
+    role = roleMatch[1] as 'user' | 'system';
+    remainder = roleMatch[2].trim();
+  }
+
+  const runIdMatch = /^(\S+)\s+(.+)$/s.exec(remainder);
+  if (!runIdMatch) {
+    throw new Error('Usage: /steer [--role user|system] <runId> <message>');
+  }
+
+  const message = runIdMatch[2].trim();
+  if (!message) {
+    throw new Error('Steer message must not be empty.');
+  }
+
+  return {
+    runId: runIdMatch[1],
+    message,
+    ...(role ? { role } : {}),
+  };
+}
+
 export function parseApproveCommand(command: string, pendingRunId?: string): { runId: string; approved: boolean } {
   const parts = command.split(/\s+/).filter((part) => part.length > 0);
   const args = parts.slice(1);

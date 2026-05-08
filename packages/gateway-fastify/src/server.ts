@@ -764,7 +764,7 @@ function registerDashboardRunRoutes(app: FastifyInstance, context: DashboardRunR
   });
 
   app.post<{ Params: { runId: string } }>('/api/runs/:runId/interrupt', async (request, reply) => {
-    const authContext = await requireGatewayAdminHttpRequest(request, reply, context.auth);
+    const authContext = await requireGatewayAuthenticatedHttpRequest(request, reply, context.auth, 'Run interrupt');
     if (!authContext) {
       return reply;
     }
@@ -773,6 +773,7 @@ function registerDashboardRunRoutes(app: FastifyInstance, context: DashboardRunR
     }
 
     try {
+      await assertRunActionAuthorized(request.params.runId, authContext, context, 'interrupt');
       const agent = await resolveAgentForRun(request.params.runId, context);
       if (!agent.agent.interrupt) {
         return reply.code(409).send(createGatewayHttpError('unsupported_action', `Agent does not support interrupt for run "${request.params.runId}".`));
@@ -786,12 +787,15 @@ function registerDashboardRunRoutes(app: FastifyInstance, context: DashboardRunR
       if (error instanceof ProtocolValidationError) {
         return reply.code(error.code === 'session_forbidden' ? 403 : 409).send(createGatewayHttpError(error.code, error.message, error.details));
       }
+      if (error instanceof GatewayAuthError) {
+        return reply.code(error.statusCode).send(createAuthErrorFrame(error));
+      }
       throw error;
     }
   });
 
   app.post<{ Params: { runId: string }; Body: { message?: unknown; role?: unknown; metadata?: JsonObject } }>('/api/runs/:runId/steer', async (request, reply) => {
-    const authContext = await requireGatewayAdminHttpRequest(request, reply, context.auth);
+    const authContext = await requireGatewayAuthenticatedHttpRequest(request, reply, context.auth, 'Run steer');
     if (!authContext) {
       return reply;
     }
@@ -812,6 +816,7 @@ function registerDashboardRunRoutes(app: FastifyInstance, context: DashboardRunR
     }
 
     try {
+      await assertRunActionAuthorized(request.params.runId, authContext, context, 'steer');
       const agent = await resolveAgentForRun(request.params.runId, context);
       if (!agent.agent.steer) {
         return reply.code(409).send(createGatewayHttpError('unsupported_action', `Agent does not support steer for run "${request.params.runId}".`));
@@ -828,6 +833,9 @@ function registerDashboardRunRoutes(app: FastifyInstance, context: DashboardRunR
       }
       if (error instanceof ProtocolValidationError) {
         return reply.code(error.code === 'session_forbidden' ? 403 : 409).send(createGatewayHttpError(error.code, error.message, error.details));
+      }
+      if (error instanceof GatewayAuthError) {
+        return reply.code(error.statusCode).send(createAuthErrorFrame(error));
       }
       if (error instanceof Error && /requires an active run/.test(error.message)) {
         return reply.code(409).send(createGatewayHttpError('run_not_active', error.message));
@@ -946,6 +954,63 @@ async function requireGatewayAdminHttpRequest(
     }
     throw error;
   }
+}
+
+async function requireGatewayAuthenticatedHttpRequest(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  auth: ResolvedGatewayAuthProvider | undefined,
+  routeLabel: string,
+): Promise<GatewayAuthContext | undefined> {
+  try {
+    const authContext = await authenticateGatewayHttpRequest({
+      auth,
+      headers: request.headers,
+    });
+
+    if (!authContext) {
+      throw new GatewayAuthError('auth_required', `${routeLabel} requires an authenticated principal.`, {
+        statusCode: 401,
+      });
+    }
+
+    return authContext;
+  } catch (error) {
+    if (error instanceof GatewayAuthError) {
+      void reply.code(error.statusCode).send(createAuthErrorFrame(error));
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+async function assertRunActionAuthorized(
+  runId: string,
+  authContext: GatewayAuthContext,
+  context: DashboardRunRouteContext,
+  action: 'interrupt' | 'steer',
+): Promise<void> {
+  if (authContext.roles.includes('admin')) {
+    return;
+  }
+
+  const link = await resolveDashboardRunSessionLink(runId, context);
+  const session = link ? await context.stores.sessions.get(link.sessionId) : undefined;
+  if (session?.authSubject === authContext.subject) {
+    return;
+  }
+
+  throw new GatewayAuthError(
+    'session_forbidden',
+    `Run ${action} requires the admin role or the authenticated principal that initiated run "${runId}".`,
+    {
+      statusCode: 403,
+      details: {
+        runId,
+        requiredRole: 'admin',
+      },
+    },
+  );
 }
 
 function createGatewayHttpError(code: string, message: string, details?: JsonObject): JsonObject {
@@ -1093,6 +1158,22 @@ async function resolveDashboardApprovalSessionLink(runId: string, context: Dashb
   const links = await context.stores.sessionRunLinks.listByRootRunId(rootRunId);
   const latestRunLink = links.filter((link) => link.invocationKind === 'run').at(-1);
   return latestRunLink ? { sessionId: latestRunLink.sessionId } : undefined;
+}
+
+async function resolveDashboardRunSessionLink(runId: string, context: DashboardRunRouteContext): Promise<{ sessionId: string } | undefined> {
+  const directLink = await context.stores.sessionRunLinks.getByRunId(runId);
+  if (directLink) {
+    return { sessionId: directLink.sessionId };
+  }
+
+  const rootRunId = await resolveDashboardRootRunId(runId, context.traceClient);
+  if (!rootRunId) {
+    return undefined;
+  }
+
+  const links = await context.stores.sessionRunLinks.listByRootRunId(rootRunId);
+  const latestLink = links.at(-1);
+  return latestLink ? { sessionId: latestLink.sessionId } : undefined;
 }
 
 async function resolveDashboardRootRunId(runId: string, traceClient: PostgresClient | undefined): Promise<string | undefined> {

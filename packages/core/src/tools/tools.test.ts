@@ -64,12 +64,21 @@ describe('createReadFileTool', () => {
     expect(result.content).toBe('Hello world');
   });
 
+  it('normalizes alternate absolute paths that clearly embed the workspace root name', async () => {
+    const tool = createReadFileTool({ allowedRoot: tempDir });
+    const rebasedPath = join('/virtual/workspaces', tempDir.split('/').pop() ?? 'workspace', 'hello.txt');
+    const result = (await tool.execute({ path: rebasedPath } as any, stubToolContext())) as any;
+
+    expect(result.content).toBe('Hello world');
+    expect(result.path).toBe(join(tempDir, 'hello.txt'));
+  });
+
   it('rejects paths outside the allowed root', async () => {
     const tool = createReadFileTool({ allowedRoot: tempDir });
 
     await expect(
       tool.execute({ path: '../../../etc/passwd' } as any, stubToolContext()),
-    ).rejects.toThrow('outside the allowed root');
+    ).rejects.toThrow('Use a workspace-relative path');
   });
 
   it('rejects sibling absolute paths that merely share the root prefix', async () => {
@@ -149,7 +158,7 @@ describe('createListDirectoryTool', () => {
 
     await expect(
       tool.execute({ path: '../../../' } as any, stubToolContext()),
-    ).rejects.toThrow('outside the allowed root');
+    ).rejects.toThrow('Use a workspace-relative path');
   });
 
   it('rejects sibling absolute directories that merely share the root prefix', async () => {
@@ -160,6 +169,15 @@ describe('createListDirectoryTool', () => {
     await expect(tool.execute({ path: siblingDir } as any, stubToolContext())).rejects.toThrow(
       'outside the allowed root',
     );
+  });
+
+  it('normalizes alternate absolute directory paths that clearly embed the workspace root name', async () => {
+    const tool = createListDirectoryTool({ allowedRoot: tempDir });
+    const rebasedPath = join('/virtual/workspaces', tempDir.split('/').pop() ?? 'workspace');
+    const result = (await tool.execute({ path: rebasedPath } as any, stubToolContext())) as any;
+
+    expect(result.path).toBe(tempDir);
+    expect(result.entries).toHaveLength(3);
   });
 
   it('has correct tool metadata', () => {
@@ -212,12 +230,25 @@ describe('createWriteFileTool', () => {
     expect(actual).toBe('deep');
   });
 
+  it('normalizes alternate absolute write paths that clearly embed the workspace root name', async () => {
+    const tool = createWriteFileTool({ allowedRoot: tempDir });
+    const rebasedPath = join('/virtual/workspaces', tempDir.split('/').pop() ?? 'workspace', 'nested', 'file.txt');
+    const result = (await tool.execute(
+      { path: rebasedPath, content: 'normalized' } as any,
+      stubToolContext(),
+    )) as any;
+
+    expect(result.path).toBe(join(tempDir, 'nested', 'file.txt'));
+    const actual = await readFile(join(tempDir, 'nested', 'file.txt'), 'utf-8');
+    expect(actual).toBe('normalized');
+  });
+
   it('rejects paths outside the allowed root', async () => {
     const tool = createWriteFileTool({ allowedRoot: tempDir });
 
     await expect(
       tool.execute({ path: '../../../tmp/evil.txt', content: 'no' } as any, stubToolContext()),
-    ).rejects.toThrow('outside the allowed root');
+    ).rejects.toThrow('Use a workspace-relative path');
   });
 
   it('rejects sibling absolute paths that merely share the root prefix', async () => {
@@ -652,6 +683,34 @@ describe('createReadWebPageTool', () => {
     )) as any;
 
     expect(result.text).toContain('Tom & Jerry <3>');
+  });
+
+  it('extracts text from PDFs', async () => {
+    const extractPdfText = vi.fn().mockResolvedValue({
+      title: 'Sample PDF',
+      text: 'First page\n\nSecond page',
+    });
+    const tool = createReadWebPageTool({ extractPdfText });
+
+    fetchSpy.mockResolvedValueOnce(
+      new Response(new Uint8Array([0x25, 0x50, 0x44, 0x46]), {
+        status: 200,
+        headers: { 'Content-Type': 'application/pdf' },
+      }),
+    );
+
+    const result = (await tool.execute(
+      { url: 'https://example.com/file.pdf' } as any,
+      stubToolContext(),
+    )) as any;
+
+    expect(result).toMatchObject({
+      url: 'https://example.com/file.pdf',
+      title: 'Sample PDF',
+      text: 'First page\n\nSecond page',
+    });
+    expect(extractPdfText).toHaveBeenCalledTimes(1);
+    expect(result.bytesFetched).toBe(4);
   });
 
   it('returns a recoverable error on non-OK response', async () => {

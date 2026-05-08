@@ -10,6 +10,7 @@
     "core:cli": "bun run ./packages/core-cli/src/cli.ts",
     "core:cli:link": "bun run --cwd ./packages/core-cli link:global",
     "gateway:ws-client": "bun run ./packages/gateway-fastify/src/local-ws-client.ts",
+    "gateway:tui": "bun run ./packages/gateway-fastify/src/local-ws-client-tui.ts",
     "gateway:client:tui": "bun run ./packages/gateway-fastify/src/local-ws-client-tui.ts",
     "gateway:client:web": "bun run --cwd ./packages/gateway-web dev",
     "gateway:client:web:build": "bun run --cwd ./packages/gateway-web build",

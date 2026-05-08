@@ -8,7 +8,9 @@ import {
   isTopLevelTerminalRunEvent,
   parseClarifyCommand,
   parseEventsCommand,
+  parseInterruptCommand,
   parseRetryCommand,
+  parseSteerCommand,
   recordFailedRunFromAgentEvent,
   recordInteractiveSession,
   recordRootRunRetryTarget,
@@ -292,6 +294,38 @@ describe('parseEventsCommand', () => {
 
   it('rejects invalid realtime event arguments', () => {
     expect(() => parseEventsCommand('/events maybe', 'compact')).toThrow('Usage: /event [on [verbose]|off]');
+  });
+});
+
+describe('parseInterruptCommand', () => {
+  it('requires exactly one run id', () => {
+    expect(parseInterruptCommand('/interrupt run-1')).toBe('run-1');
+    expect(() => parseInterruptCommand('/interrupt')).toThrow('Usage: /interrupt <runId>');
+    expect(() => parseInterruptCommand('/interrupt run-1 extra')).toThrow('Usage: /interrupt <runId>');
+  });
+});
+
+describe('parseSteerCommand', () => {
+  it('parses a run id and steering message', () => {
+    expect(parseSteerCommand('/steer run-1 please stop after this step')).toEqual({
+      runId: 'run-1',
+      message: 'please stop after this step',
+    });
+  });
+
+  it('accepts an explicit steering role', () => {
+    expect(parseSteerCommand('/steer --role system run-1 prefer the fast path')).toEqual({
+      runId: 'run-1',
+      message: 'prefer the fast path',
+      role: 'system',
+    });
+  });
+
+  it('rejects invalid steering commands', () => {
+    expect(() => parseSteerCommand('/steer')).toThrow('Usage: /steer [--role user|system] <runId> <message>');
+    expect(() => parseSteerCommand('/steer --role assistant run-1 no')).toThrow(
+      'Usage: /steer [--role user|system] <runId> <message>',
+    );
   });
 });
 

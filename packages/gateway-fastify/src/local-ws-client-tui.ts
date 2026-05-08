@@ -15,6 +15,8 @@ import {
   parseCsv,
   parseFrame,
   parsePort,
+  postRunInterrupt,
+  postRunSteer,
   requireValue,
   resolveSocketUrl,
 } from './local-ws-client/common.js';
@@ -35,8 +37,10 @@ import {
   isEventsCommand,
   parseClarifyCommand,
   parseEventsCommand,
+  parseInterruptCommand,
   parseApproveCommand,
   parseRetryCommand,
+  parseSteerCommand,
   recordFailedRunFromAgentEvent,
   recordInteractiveSession,
   selectInteractiveSession,
@@ -55,6 +59,9 @@ const HELP_TEXT = `Commands:
   <text>                     send a chat message with message.send
   /run <goal>                send run.start via a dedicated run session
   /retry [runId]             retry a failed run in the current run session
+  /interrupt <runId>         interrupt an active run via POST /api/runs/:runId/interrupt
+  /steer [--role user|system] <runId> <text>
+                             steer an active run via POST /api/runs/:runId/steer
   /approve [runId] [yes|no]  resolve the pending approval for the session
   /clarify [runId] <text>    answer a pending clarification for a run
   /event [on [verbose]|off]  stream one-line, detailed, or muted realtime agent.event frames
@@ -791,6 +798,48 @@ async function runTuiMode(
           runId,
         });
         statusBar.invalidate();
+        tui.requestRender();
+      } catch (error) {
+        messageLog.addMessage({
+          type: 'system',
+          content: `Error: ${error instanceof Error ? error.message : String(error)}`,
+          timestamp: new Date(),
+        });
+        tui.requestRender();
+      }
+      return;
+    }
+
+    if (trimmed === '/interrupt' || trimmed.startsWith('/interrupt ')) {
+      try {
+        const runId = parseInterruptCommand(trimmed);
+        await postRunInterrupt(options, token, runId);
+        messageLog.addMessage({
+          type: 'system',
+          content: `interrupt requested for run ${runId}`,
+          timestamp: new Date(),
+        });
+        tui.requestRender();
+      } catch (error) {
+        messageLog.addMessage({
+          type: 'system',
+          content: `Error: ${error instanceof Error ? error.message : String(error)}`,
+          timestamp: new Date(),
+        });
+        tui.requestRender();
+      }
+      return;
+    }
+
+    if (trimmed === '/steer' || trimmed.startsWith('/steer ')) {
+      try {
+        const { runId, message, role } = parseSteerCommand(trimmed);
+        await postRunSteer(options, token, runId, { message, ...(role ? { role } : {}) });
+        messageLog.addMessage({
+          type: 'system',
+          content: `steer sent for run ${runId}`,
+          timestamp: new Date(),
+        });
         tui.requestRender();
       } catch (error) {
         messageLog.addMessage({

@@ -1,13 +1,68 @@
-import { isAbsolute, relative, resolve } from 'node:path';
+import { basename, isAbsolute, relative, resolve, sep } from 'node:path';
 
 export function resolvePathWithinRoot(allowedRoot: string, requestedPath: string): string {
   const resolvedRoot = resolve(allowedRoot);
   const resolvedPath = resolve(resolvedRoot, requestedPath);
-  const relativePath = relative(resolvedRoot, resolvedPath);
 
-  if (relativePath === '' || (!relativePath.startsWith('..') && !isAbsolute(relativePath))) {
+  if (isPathWithinRoot(resolvedRoot, resolvedPath)) {
     return resolvedPath;
   }
 
-  throw new Error(`Path ${requestedPath} is outside the allowed root ${allowedRoot}`);
+  const normalizedPath = tryNormalizePathWithinRoot(resolvedRoot, requestedPath);
+  if (normalizedPath) {
+    return normalizedPath;
+  }
+
+  const suggestedPath = buildSuggestedWorkspacePath(resolvedRoot, requestedPath);
+  throw new Error(
+    `Path ${requestedPath} is outside the allowed root ${allowedRoot}. ` +
+      `Use a workspace-relative path${suggestedPath ? ` such as "${suggestedPath}"` : ''}.`,
+  );
+}
+
+function isPathWithinRoot(resolvedRoot: string, resolvedPath: string): boolean {
+  const relativePath = relative(resolvedRoot, resolvedPath);
+  return relativePath === '' || (!relativePath.startsWith('..') && !isAbsolute(relativePath));
+}
+
+function tryNormalizePathWithinRoot(resolvedRoot: string, requestedPath: string): string | undefined {
+  if (!isAbsolute(requestedPath)) {
+    return undefined;
+  }
+
+  const rootName = basename(resolvedRoot);
+  const marker = `${sep}${rootName}`;
+  const markerIndex = requestedPath.lastIndexOf(marker);
+  if (markerIndex === -1) {
+    return undefined;
+  }
+
+  const markerEnd = markerIndex + marker.length;
+  const nextCharacter = requestedPath[markerEnd];
+  if (nextCharacter && nextCharacter !== sep) {
+    return undefined;
+  }
+
+  const suffix = requestedPath.slice(markerEnd).replace(new RegExp(`^\\${sep}+`), '');
+  const candidate = resolve(resolvedRoot, suffix);
+  return isPathWithinRoot(resolvedRoot, candidate) ? candidate : undefined;
+}
+
+function buildSuggestedWorkspacePath(resolvedRoot: string, requestedPath: string): string | undefined {
+  if (isAbsolute(requestedPath)) {
+    const normalizedCandidate = tryNormalizePathWithinRoot(resolvedRoot, requestedPath);
+    if (normalizedCandidate) {
+      return relative(resolvedRoot, normalizedCandidate) || '.';
+    }
+
+    return basename(requestedPath);
+  }
+
+  const resolvedRequestedPath = resolve(resolvedRoot, requestedPath);
+  const relativePath = relative(resolvedRoot, resolvedRequestedPath);
+  if (!relativePath || relativePath.startsWith('..') || isAbsolute(relativePath)) {
+    return undefined;
+  }
+
+  return relativePath;
 }

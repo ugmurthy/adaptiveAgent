@@ -446,6 +446,151 @@ describe('createGatewayServer', () => {
     expect(retry).toHaveBeenCalledWith('run-failed-1');
   });
 
+  it('allows the principal that initiated a run to interrupt it without the admin role', async () => {
+    const stores = createInMemoryGatewayStores();
+    await createStoredSession(stores, {
+      id: 'session-owner-1',
+      channelId: 'web',
+      authSubject: 'owner-token',
+      agentId: 'support-agent',
+      invocationMode: 'run',
+      status: 'running',
+      currentRunId: 'run-active-1',
+      currentRootRunId: 'root-active-1',
+    });
+    await stores.sessionRunLinks.append({
+      sessionId: 'session-owner-1',
+      runId: 'run-active-1',
+      rootRunId: 'root-active-1',
+      invocationKind: 'run',
+      createdAt: '2026-04-08T10:05:00.000Z',
+    });
+    const interrupt = vi.fn(async () => undefined);
+
+    const app = await createGatewayServer(baseConfig, {
+      auth: createStaticAuthProvider(['member']),
+      stores,
+      agentRegistry: createGatewayTestAgentRegistry({
+        interrupt,
+        runtimeRuns: {},
+      }),
+    });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/runs/run-active-1/interrupt',
+      headers: { authorization: 'Bearer owner-token' },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      runId: 'run-active-1',
+      status: 'interrupted',
+    });
+    expect(interrupt).toHaveBeenCalledWith('run-active-1');
+  });
+
+  it('allows the principal that initiated a chat run to steer it without the admin role', async () => {
+    const stores = createInMemoryGatewayStores();
+    await createStoredSession(stores, {
+      id: 'session-chat-owner-1',
+      channelId: 'web',
+      authSubject: 'owner-token',
+      agentId: 'support-agent',
+      invocationMode: 'chat',
+      status: 'running',
+      currentRunId: 'run-chat-active-1',
+      currentRootRunId: 'root-chat-active-1',
+    });
+    await stores.sessionRunLinks.append({
+      sessionId: 'session-chat-owner-1',
+      runId: 'run-chat-active-1',
+      rootRunId: 'root-chat-active-1',
+      invocationKind: 'chat',
+      createdAt: '2026-04-08T10:05:00.000Z',
+    });
+    const steer = vi.fn(async () => undefined);
+
+    const app = await createGatewayServer(baseConfig, {
+      auth: createStaticAuthProvider(['member']),
+      stores,
+      agentRegistry: createGatewayTestAgentRegistry({
+        steer,
+        runtimeRuns: {},
+      }),
+    });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/runs/run-chat-active-1/steer',
+      headers: { authorization: 'Bearer owner-token' },
+      payload: { message: 'Please finish after the current step.', role: 'user' },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      runId: 'run-chat-active-1',
+      status: 'steered',
+      role: 'user',
+    });
+    expect(steer).toHaveBeenCalledWith('run-chat-active-1', {
+      message: 'Please finish after the current step.',
+      role: 'user',
+    });
+  });
+
+  it('rejects run interrupt from a non-admin principal that did not initiate the run', async () => {
+    const stores = createInMemoryGatewayStores();
+    await createStoredSession(stores, {
+      id: 'session-owner-1',
+      channelId: 'web',
+      authSubject: 'owner-token',
+      agentId: 'support-agent',
+      invocationMode: 'run',
+      status: 'running',
+      currentRunId: 'run-active-1',
+      currentRootRunId: 'root-active-1',
+    });
+    await stores.sessionRunLinks.append({
+      sessionId: 'session-owner-1',
+      runId: 'run-active-1',
+      rootRunId: 'root-active-1',
+      invocationKind: 'run',
+      createdAt: '2026-04-08T10:05:00.000Z',
+    });
+    const interrupt = vi.fn(async () => undefined);
+
+    const app = await createGatewayServer(baseConfig, {
+      auth: createStaticAuthProvider(['member']),
+      stores,
+      agentRegistry: createGatewayTestAgentRegistry({
+        interrupt,
+        runtimeRuns: {},
+      }),
+    });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/runs/run-active-1/interrupt',
+      headers: { authorization: 'Bearer other-token' },
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toMatchObject({
+      type: 'error',
+      code: 'session_forbidden',
+      message: 'Run interrupt requires the admin role or the authenticated principal that initiated run "run-active-1".',
+      details: {
+        runId: 'run-active-1',
+        requiredRole: 'admin',
+      },
+    });
+    expect(interrupt).not.toHaveBeenCalled();
+  });
+
   it('deletes gateway sessions with no linked root runs', async () => {
     const querySpy = vi.fn(async <TRow extends Record<string, unknown>>(sql: string, params?: unknown[]) => {
       if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') {
@@ -3374,6 +3519,8 @@ function createGatewayTestAgentRegistry(
     resolveClarification?: NonNullable<CreatedAdaptiveAgent['agent']['resolveClarification']>;
     resume?: NonNullable<CreatedAdaptiveAgent['agent']['resume']>;
     retry?: NonNullable<CreatedAdaptiveAgent['agent']['retry']>;
+    interrupt?: NonNullable<CreatedAdaptiveAgent['agent']['interrupt']>;
+    steer?: NonNullable<CreatedAdaptiveAgent['agent']['steer']>;
     runtimeRuns: Record<string, RuntimeRunRecord>;
     eventStore?: RuntimeEventStore;
   },
@@ -3400,6 +3547,8 @@ function createGatewayTestAgentRegistry(
         resolveClarification: options.resolveClarification,
         resume: options.resume,
         retry: options.retry,
+        interrupt: options.interrupt,
+        steer: options.steer,
       },
       runtime: {
         runStore: {

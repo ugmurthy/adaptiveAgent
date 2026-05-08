@@ -7,6 +7,8 @@ export interface ReadWebPageToolConfig {
   maxTextLength?: number;
   /** Tool timeout in milliseconds. Defaults to `90000`. */
   timeoutMs?: number;
+  /** Override PDF extraction for tests or custom runtimes. */
+  extractPdfText?: (rawBuffer: ArrayBuffer) => Promise<{ title: string; text: string }>;
 }
 
 type ReadWebPageInput = {
@@ -40,6 +42,7 @@ export function createReadWebPageTool(config?: ReadWebPageToolConfig): ToolDefin
   const maxSizeBytes = config?.maxSizeBytes ?? DEFAULT_MAX_SIZE;
   const maxTextLength = config?.maxTextLength ?? DEFAULT_MAX_TEXT_LENGTH;
   const timeoutMs = config?.timeoutMs ?? DEFAULT_WEB_TOOL_TIMEOUT_MS;
+  const extractPdfText = config?.extractPdfText ?? extractPdfTextWithPdfJs;
 
   return {
     name: 'read_web_page',
@@ -68,7 +71,7 @@ export function createReadWebPageTool(config?: ReadWebPageToolConfig): ToolDefin
         const response = await fetch(url, {
           headers: {
             'User-Agent': 'AdaptiveAgent/1.0 (compatible; bot)',
-            Accept: 'text/html,application/xhtml+xml,text/plain',
+            Accept: 'text/html,application/xhtml+xml,text/plain,application/pdf',
           },
           signal: context.signal,
         });
@@ -83,7 +86,7 @@ export function createReadWebPageTool(config?: ReadWebPageToolConfig): ToolDefin
         }
 
         const contentType = response.headers.get('content-type') ?? '';
-        if (!contentType.includes('text/') && !contentType.includes('html') && !contentType.includes('xml')) {
+        if (!isSupportedContentType(contentType)) {
           throw createRecoverableReadWebPageError({
             url,
             kind: 'content_error',
@@ -101,18 +104,17 @@ export function createReadWebPageTool(config?: ReadWebPageToolConfig): ToolDefin
         }
 
         const rawBuffer = await readResponseBodyWithinLimit(response, maxSizeBytes, url);
-        const html = new TextDecoder().decode(rawBuffer);
-        const title = extractTitle(html);
-        let text = stripHtmlToText(html);
+        const { title, text } = await extractReadableText(rawBuffer, contentType, extractPdfText);
+        let normalizedText = text;
 
-        if (text.length > maxTextLength) {
-          text = text.slice(0, maxTextLength) + '\n[truncated]';
+        if (normalizedText.length > maxTextLength) {
+          normalizedText = normalizedText.slice(0, maxTextLength) + '\n[truncated]';
         }
 
         return {
           url,
           title,
-          text,
+          text: normalizedText,
           bytesFetched: rawBuffer.byteLength,
         } satisfies ReadWebPageOutput;
       } catch (error) {
@@ -123,6 +125,31 @@ export function createReadWebPageTool(config?: ReadWebPageToolConfig): ToolDefin
       const { url } = input;
       return normalizeReadWebPageError(error, url).output;
     },
+  };
+}
+
+function isSupportedContentType(contentType: string): boolean {
+  return (
+    contentType.includes('text/') ||
+    contentType.includes('html') ||
+    contentType.includes('xml') ||
+    contentType.includes('application/pdf')
+  );
+}
+
+async function extractReadableText(
+  rawBuffer: ArrayBuffer,
+  contentType: string,
+  extractPdfText: (rawBuffer: ArrayBuffer) => Promise<{ title: string; text: string }>,
+): Promise<{ title: string; text: string }> {
+  if (contentType.includes('application/pdf')) {
+    return extractPdfText(rawBuffer);
+  }
+
+  const html = new TextDecoder().decode(rawBuffer);
+  return {
+    title: extractTitle(html),
+    text: stripHtmlToText(html),
   };
 }
 
@@ -228,6 +255,46 @@ function decodeHtmlEntities(text: string): string {
     .replace(/&nbsp;/g, ' ')
     .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
     .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+}
+
+async function extractPdfTextWithPdfJs(rawBuffer: ArrayBuffer): Promise<{ title: string; text: string }> {
+  const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
+  const document = await pdfjs.getDocument({
+    data: new Uint8Array(rawBuffer),
+    useWorkerFetch: false,
+    isEvalSupported: false,
+  }).promise;
+
+  try {
+    const metadata = await document.getMetadata().catch(() => null);
+    const title = normalizePdfTitle(metadata?.info?.Title);
+    const pageTexts: string[] = [];
+
+    for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
+      const page = await document.getPage(pageNumber);
+      const content = await page.getTextContent();
+      const lines = content.items
+        .map((item) => ('str' in item ? item.str : ''))
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      if (lines) {
+        pageTexts.push(lines);
+      }
+    }
+
+    return {
+      title,
+      text: pageTexts.join('\n\n').trim(),
+    };
+  } finally {
+    await document.destroy();
+  }
+}
+
+function normalizePdfTitle(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
 }
 
 function normalizeReadWebPageError(error: unknown, url: string): RecoverableReadWebPageError {
