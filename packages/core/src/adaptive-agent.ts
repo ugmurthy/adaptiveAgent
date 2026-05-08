@@ -1115,7 +1115,7 @@ export class AdaptiveAgent {
       runId: continuationRun.id,
       type: 'run.continuation_created',
       schemaVersion: 1,
-      payload: {
+      payload: removeUndefinedJsonFields({
         sourceRunId: sourceRun.id,
         strategy,
         failureClass: recovery.failureClass,
@@ -1125,7 +1125,7 @@ export class AdaptiveAgent {
         nextStepId: recovery.nextStepId,
         provider: targetProvider,
         model: targetModel,
-      },
+      }),
     });
 
     this.logLifecycle('info', 'run.continuation_created', {
@@ -3963,6 +3963,17 @@ function shouldResolveWaitingDelegateSnapshot(state: ExecutionState): boolean {
 
 function isJsonObject(value: JsonValue | undefined): value is JsonObject {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function removeUndefinedJsonFields(value: Record<string, JsonValue | undefined>): JsonObject {
+  const result: JsonObject = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (entry !== undefined) {
+      result[key] = entry;
+    }
+  }
+
+  return result;
 }
 
 function readPendingSteerMessagesFromMetadata(

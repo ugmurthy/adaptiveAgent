@@ -1,6 +1,7 @@
 import {
   createAdaptiveAgent,
   type AgentDefaults,
+  type ContinuationStore,
   type CreatedAdaptiveAgent,
   type EventStore,
   type JsonObject,
@@ -14,7 +15,7 @@ import { resolveModelConfig, resolveWorkspaceRoot } from './config.js';
 import type { ResolvedLocalModules, RuntimeBundle } from './local-modules.js';
 
 export interface LoadedLocalAgent {
-  created: CreatedAdaptiveAgent<RunStore, EventStore, SnapshotStore, PlanStore | undefined>;
+  created: CreatedAdaptiveAgent<RunStore, EventStore, SnapshotStore, PlanStore | undefined, ContinuationStore>;
   metadata: JsonObject;
 }
 

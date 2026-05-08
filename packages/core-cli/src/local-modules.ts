@@ -16,6 +16,7 @@ import {
   POSTGRES_RUNTIME_MIGRATIONS,
   skillToDelegate,
   type AdaptiveAgentRuntimeOptions,
+  type ContinuationStore,
   type DelegateDefinition,
   type EventStore,
   type PlanStore,
@@ -41,7 +42,13 @@ export const BUILTIN_LOCAL_TOOL_NAMES = [
 
 export type BuiltinLocalToolName = (typeof BUILTIN_LOCAL_TOOL_NAMES)[number];
 export type RuntimeMode = 'memory' | 'postgres';
-export type CoreCliRuntimeOptions = AdaptiveAgentRuntimeOptions<RunStore, EventStore, SnapshotStore, PlanStore | undefined>;
+export type CoreCliRuntimeOptions = AdaptiveAgentRuntimeOptions<
+  RunStore,
+  EventStore,
+  SnapshotStore,
+  PlanStore | undefined,
+  ContinuationStore
+>;
 export type LocalToolDefinition = ToolDefinition<any, any>;
 
 export interface ResolveLocalModulesOptions {
@@ -251,6 +258,7 @@ function postgresStoresToRuntime(stores: PostgresRuntimeStoreBundle): CoreCliRun
     eventStore: stores.eventStore,
     snapshotStore: stores.snapshotStore,
     planStore: stores.planStore,
+    continuationStore: stores.continuationStore,
     toolExecutionStore: stores.toolExecutionStore,
     transactionStore: stores,
   };

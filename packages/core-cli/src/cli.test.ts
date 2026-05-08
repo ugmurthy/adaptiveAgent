@@ -27,6 +27,38 @@ describe('parseCliArgs', () => {
     });
   });
 
+  it('parses recovery command aliases and continuation options', () => {
+    expect(
+      parseCliArgs([
+        'continueRun',
+        'run-1',
+        '--strategy',
+        'hybrid_snapshot_then_step',
+        '--provider',
+        'openrouter',
+        '--model',
+        'qwen/qwen3.5',
+        '--metadata-json',
+        '{"source":"cli"}',
+        '--require-approval',
+      ]),
+    ).toMatchObject({
+      command: 'continueRun',
+      positionals: ['run-1'],
+      continuationStrategy: 'hybrid_snapshot_then_step',
+      continuationProvider: 'openrouter',
+      continuationModel: 'qwen/qwen3.5',
+      continuationMetadata: { source: 'cli' },
+      requireContinuationApproval: true,
+    });
+  });
+
+  it('rejects unsupported continuation strategies', () => {
+    expect(() => parseCliArgs(['create-continuation-run', 'run-1', '--strategy', 'latest_snapshot'])).toThrow(
+      '--strategy must be hybrid_snapshot_then_step',
+    );
+  });
+
   it('rejects unknown options', () => {
     expect(() => parseCliArgs(['--unknown'])).toThrow('Unknown option');
   });

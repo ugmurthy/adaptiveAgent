@@ -60,8 +60,23 @@ core-agent chat
 core-agent chat <message>
 core-agent resume <run-id>
 core-agent retry <run-id>
+core-agent get-recovery-options <run-id>
+core-agent create-continuation-run <run-id>
+core-agent continue-run <run-id>
 core-agent inspect <run-id>
 core-agent config
 ```
 
 By default the CLI uses in-memory core runtime stores. `--runtime postgres` enables durable core runtime stores using `DATABASE_URL` and runs the core runtime migrations before creating the agent.
+
+Failed-run continuation commands also accept camelCase aliases matching the core API names: `getRecoveryOptions`, `createContinuationRun`, and `continueRun`. Continuation commands print JSON for recovery/options creation, while `continue-run` creates and executes the linked continuation run.
+
+Continuation options:
+
+```bash
+core-agent --runtime postgres get-recovery-options <run-id>
+core-agent --runtime postgres create-continuation-run <run-id> --metadata-json '{"source":"cli"}'
+core-agent --runtime postgres continue-run <run-id> --strategy hybrid_snapshot_then_step
+```
+
+MVP continuation only supports `--strategy hybrid_snapshot_then_step`. `--provider` and `--model` may be supplied for audit metadata, but they must match the configured agent; to switch providers/models, invoke the CLI with an agent config that already targets the desired provider/model.

@@ -2,7 +2,7 @@
 import { fileURLToPath } from 'node:url';
 import { stderr, stdout } from 'node:process';
 
-import type { AgentEvent, RunResult } from '@adaptive-agent/core';
+import type { AgentEvent, ContinuationStrategy, JsonValue, RunResult } from '@adaptive-agent/core';
 
 import { createLocalAgent, resolveLoadedWorkspaceRoot } from './agent-loader.js';
 import { loadAgentConfig, type LoadedAgentConfig } from './config.js';
@@ -18,8 +18,35 @@ import {
   type StartupSummary,
 } from './render.js';
 
-const COMMANDS = ['run', 'chat', 'resume', 'retry', 'interrupt', 'steer', 'inspect', 'config'] as const;
+const COMMANDS = [
+  'run',
+  'chat',
+  'resume',
+  'retry',
+  'get-recovery-options',
+  'getRecoveryOptions',
+  'create-continuation-run',
+  'createContinuationRun',
+  'continue-run',
+  'continueRun',
+  'interrupt',
+  'steer',
+  'inspect',
+  'config',
+] as const;
 type CliCommand = (typeof COMMANDS)[number];
+type NormalizedCliCommand =
+  | 'run'
+  | 'chat'
+  | 'resume'
+  | 'retry'
+  | 'get-recovery-options'
+  | 'create-continuation-run'
+  | 'continue-run'
+  | 'interrupt'
+  | 'steer'
+  | 'inspect'
+  | 'config';
 
 export interface ParsedCliArgs {
   command?: CliCommand;
@@ -31,6 +58,11 @@ export interface ParsedCliArgs {
   autoApprove: boolean;
   events: boolean;
   verbose: boolean;
+  continuationStrategy?: ContinuationStrategy;
+  continuationProvider?: string;
+  continuationModel?: string;
+  continuationMetadata?: Record<string, JsonValue>;
+  requireContinuationApproval?: boolean;
   help: boolean;
   version: boolean;
 }
@@ -68,7 +100,7 @@ export async function runCli(argv: string[]): Promise<number> {
   }
 
   const context = await loadCliContext(parsed);
-  const command = parsed.command ?? context.loadedConfig.config.defaultInvocationMode;
+  const command = normalizeCommand(parsed.command ?? context.loadedConfig.config.defaultInvocationMode);
 
   if (command === 'config') {
     stdout.write(`${renderConfigSummary(toStartupSummary(context))}\n`);
@@ -151,6 +183,31 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       continue;
     }
 
+    if (token === '--strategy') {
+      parsed.continuationStrategy = parseContinuationStrategy(requireFlagValue(argv, ++index, token));
+      continue;
+    }
+
+    if (token === '--provider') {
+      parsed.continuationProvider = requireFlagValue(argv, ++index, token);
+      continue;
+    }
+
+    if (token === '--model') {
+      parsed.continuationModel = requireFlagValue(argv, ++index, token);
+      continue;
+    }
+
+    if (token === '--metadata-json') {
+      parsed.continuationMetadata = parseJsonObjectFlag(requireFlagValue(argv, ++index, token), token);
+      continue;
+    }
+
+    if (token === '--require-approval') {
+      parsed.requireContinuationApproval = true;
+      continue;
+    }
+
     if (token.startsWith('--')) {
       throw new Error(`Unknown option: ${token}`);
     }
@@ -194,7 +251,7 @@ async function withRuntime(context: CliContext, operation: (context: RuntimeCont
   }
 }
 
-async function runAgentCommand(context: RuntimeContext, command: CliCommand): Promise<number> {
+async function runAgentCommand(context: RuntimeContext, command: NormalizedCliCommand): Promise<number> {
   const localAgent = createLocalAgent({
     loadedConfig: context.loadedConfig,
     modules: context.modules,
@@ -245,6 +302,38 @@ async function runAgentCommand(context: RuntimeContext, command: CliCommand): Pr
       });
     } else if (command === 'retry') {
       result = await localAgent.created.agent.retry(requireSingleRunId(context.parsed.positionals, 'retry'));
+      result = await resolveInteractiveResult({
+        agent: localAgent.created.agent,
+        initialResult: result,
+        autoApprove: context.parsed.autoApprove,
+        metadata: localAgent.metadata,
+      });
+    } else if (command === 'get-recovery-options') {
+      const recovery = await localAgent.created.agent.getRecoveryOptions(
+        requireSingleRunId(context.parsed.positionals, 'get-recovery-options'),
+      );
+      stdout.write(`${JSON.stringify(recovery, null, 2)}\n`);
+      return recovery.continuable ? 0 : 1;
+    } else if (command === 'create-continuation-run') {
+      const continuation = await localAgent.created.agent.createContinuationRun({
+        fromRunId: requireSingleRunId(context.parsed.positionals, 'create-continuation-run'),
+        strategy: context.parsed.continuationStrategy,
+        provider: context.parsed.continuationProvider,
+        model: context.parsed.continuationModel,
+        metadata: context.parsed.continuationMetadata,
+        requireApproval: context.parsed.requireContinuationApproval,
+      });
+      stdout.write(`${JSON.stringify(continuation, null, 2)}\n`);
+      return 0;
+    } else if (command === 'continue-run') {
+      result = await localAgent.created.agent.continueRun({
+        fromRunId: requireSingleRunId(context.parsed.positionals, 'continue-run'),
+        strategy: context.parsed.continuationStrategy,
+        provider: context.parsed.continuationProvider,
+        model: context.parsed.continuationModel,
+        metadata: context.parsed.continuationMetadata,
+        requireApproval: context.parsed.requireContinuationApproval,
+      });
       result = await resolveInteractiveResult({
         agent: localAgent.created.agent,
         initialResult: result,
@@ -313,9 +402,22 @@ function toStartupSummary(context: CliContext): StartupSummary {
   };
 }
 
-function requireInvocationMode(loadedConfig: LoadedAgentConfig, command: CliCommand): void {
+function requireInvocationMode(loadedConfig: LoadedAgentConfig, command: NormalizedCliCommand): void {
   if ((command === 'run' || command === 'chat') && !loadedConfig.config.invocationModes.includes(command)) {
     throw new Error(`Agent "${loadedConfig.config.id}" does not allow ${command} mode.`);
+  }
+}
+
+function normalizeCommand(command: CliCommand): NormalizedCliCommand {
+  switch (command) {
+    case 'getRecoveryOptions':
+      return 'get-recovery-options';
+    case 'createContinuationRun':
+      return 'create-continuation-run';
+    case 'continueRun':
+      return 'continue-run';
+    default:
+      return command;
   }
 }
 
@@ -356,6 +458,33 @@ function parseRuntimeMode(value: string): RuntimeMode {
   throw new Error('--runtime must be one of: memory, postgres.');
 }
 
+function parseContinuationStrategy(value: string): ContinuationStrategy {
+  if (value === 'hybrid_snapshot_then_step') {
+    return value;
+  }
+
+  throw new Error('--strategy must be hybrid_snapshot_then_step for the MVP.');
+}
+
+function parseJsonObjectFlag(value: string, flagName: string): Record<string, JsonValue> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch (error) {
+    throw new Error(`${flagName} must be valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  if (!isJsonObject(parsed)) {
+    throw new Error(`${flagName} must be a JSON object.`);
+  }
+
+  return parsed as Record<string, JsonValue>;
+}
+
+function isJsonObject(value: unknown): value is Record<string, JsonValue> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 function isCommand(value: string): value is CliCommand {
   return (COMMANDS as readonly string[]).includes(value);
 }
@@ -369,6 +498,9 @@ Commands:
   chat <message>    Send one chat turn and exit
   resume <run-id>   Resume a run from runtime stores
   retry <run-id>    Retry a failed run from runtime stores
+  get-recovery-options <run-id>    Print failed-run recovery options as JSON
+  create-continuation-run <run-id> Create a linked continuation run and print it as JSON
+  continue-run <run-id>            Create and execute a linked continuation run
   interrupt <run-id>          Interrupt a running run cooperatively
   steer <run-id> <message...> Inject a user message into a running run
   inspect <run-id>  Print run details and event timeline
@@ -380,6 +512,11 @@ Options:
   --allow-example-skills        Include ./examples/skills in delegate lookup
   --runtime memory|postgres     Runtime store mode (default: memory)
   --auto-approve                Approve tools requiring approval for this invocation
+  --strategy <name>             Continuation strategy (MVP: hybrid_snapshot_then_step)
+  --provider <name>             Continuation target provider; must match configured agent
+  --model <name>                Continuation target model; must match configured agent
+  --metadata-json <json>        Extra metadata for continuation audit records
+  --require-approval            Confirm continuation when policy requires approval
   --events                      Print compact persisted core events
   --verbose                     Print debug notes such as ignored gateway-only fields
   --help
