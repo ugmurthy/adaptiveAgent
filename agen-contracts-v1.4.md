@@ -47,6 +47,25 @@ export type PlanExecutionStatus =
 
 export type FailurePolicy = 'stop' | 'skip' | 'replan';
 
+export type ContinuationStrategy = 'hybrid_snapshot_then_step';
+
+export type RecoveryDecision =
+  | 'not_recoverable'
+  | 'retry_same_run'
+  | 'continue_new_run'
+  | 'requires_reconciliation'
+  | 'requires_user_action';
+
+export type FailureClass =
+  | 'provider_transient'
+  | 'provider_terminal'
+  | 'agent_invalid_output'
+  | 'tool_uncertain'
+  | 'tool_failed'
+  | 'user_action_required'
+  | 'policy_blocked'
+  | 'unknown';
+
 export type EventType =
   | 'run.created'
   | 'run.status_changed'
@@ -54,6 +73,8 @@ export type EventType =
   | 'run.resumed'
   | 'run.completed'
   | 'run.failed'
+  | 'recovery.analyzed'
+  | 'run.continuation_created'
   | 'plan.created'
   | 'plan.execution_started'
   | 'step.started'
@@ -216,12 +237,29 @@ export interface AdaptiveAgentOptions {
   tools: ToolDefinition[];
   delegates?: DelegateDefinition[];
   delegation?: DelegationPolicy;
+  recovery?: RecoveryPolicy;
   runStore: RunStore;
   eventStore?: EventStore;
   snapshotStore?: SnapshotStore;
   planStore?: PlanStore;
+  continuationStore?: ContinuationStore;
   eventSink?: EventSink;
   defaults?: AgentDefaults;
+}
+
+export interface RecoveryPolicy {
+  continuation?: {
+    enabled: boolean;
+    defaultStrategy?: ContinuationStrategy;
+    requireUserApproval?: boolean;
+  };
+  retryableErrorCodes?: string[];
+  fallbackModels?: Array<{
+    provider: string;
+    model: string;
+    whenFailureClass?: FailureClass[];
+    whenErrorCode?: string[];
+  }>;
 }
 
 export interface ToolContext {
@@ -486,6 +524,57 @@ export interface EventStore {
 export interface SnapshotStore {
   save(snapshot: Omit<RunSnapshot, 'id' | 'createdAt'>): Promise<RunSnapshot>;
   getLatest(runId: UUID): Promise<RunSnapshot | null>;
+}
+
+export interface RunRecoveryOptions {
+  runId: UUID;
+  continuable: boolean;
+  decision: RecoveryDecision;
+  failureClass: FailureClass;
+  reason: string;
+  recommendedStrategy?: ContinuationStrategy;
+  recommendedProvider?: string;
+  recommendedModel?: string;
+  sourceSnapshotId?: UUID;
+  sourceSnapshotSeq?: number;
+  lastSafeEventSeq?: number;
+  lastCompletedStepId?: string;
+  nextStepId?: string;
+  requiresReconciliation?: boolean;
+  unsafeReason?: string;
+}
+
+export interface ContinueRunOptions {
+  fromRunId: UUID;
+  strategy?: ContinuationStrategy;
+  provider?: string;
+  model?: string;
+  metadata?: Record<string, JsonValue>;
+  requireApproval?: boolean;
+}
+
+export interface RunContinuation {
+  id: UUID;
+  sourceRunId: UUID;
+  continuationRunId: UUID;
+  strategy: ContinuationStrategy;
+  failureClass: FailureClass;
+  reason: string;
+  sourceSnapshotId?: UUID;
+  sourceSnapshotSeq?: number;
+  sourceEventSeq?: number;
+  sourceStepId?: string;
+  nextStepId?: string;
+  provider?: string;
+  model?: string;
+  metadata?: Record<string, JsonValue>;
+  createdAt: string;
+}
+
+export interface ContinuationStore {
+  createContinuation(continuation: Omit<RunContinuation, 'id' | 'createdAt'>): Promise<RunContinuation>;
+  listBySourceRun(sourceRunId: UUID): Promise<RunContinuation[]>;
+  getByContinuationRun(continuationRunId: UUID): Promise<RunContinuation | null>;
 }
 
 export interface PlanStore {
@@ -764,6 +853,28 @@ create index tool_executions_run_idx on tool_executions (run_id, started_at desc
 create index tool_executions_status_idx on tool_executions (status, started_at asc);
 create index tool_executions_child_run_idx on tool_executions (child_run_id);
 
+create table run_continuations (
+  id uuid primary key default gen_random_uuid(),
+  source_run_id uuid not null references agent_runs(id) on delete cascade,
+  continuation_run_id uuid not null references agent_runs(id) on delete cascade,
+  strategy text not null,
+  failure_class text not null,
+  reason text not null,
+  source_snapshot_id uuid references run_snapshots(id) on delete set null,
+  source_snapshot_seq bigint,
+  source_event_seq bigint,
+  source_step_id text,
+  next_step_id text,
+  provider text,
+  model text,
+  metadata jsonb,
+  created_at timestamptz not null default now(),
+  unique (continuation_run_id)
+);
+
+create index run_continuations_source_idx
+  on run_continuations (source_run_id, created_at desc);
+
 create table delegate_attempts (
   parent_run_id uuid not null references agent_runs(id) on delete cascade,
   parent_step_id text not null,
@@ -903,6 +1014,11 @@ Runtime persistence provides these guarantees:
 - External side effects are exactly-once only when the tool implementation honors `ToolContext.idempotencyKey` against the external system.
 - Model calls may replay unless the model response was durably represented in a snapshot before tool execution. A snapshotted model tool-call response may resume from the queued pending tool call instead of calling the model again.
 - Terminal run records are stable. Repeated `resume()` calls for `succeeded`, `failed`, or `cancelled` runs should return the stored result or failure without advancing the event log or re-entering the execution loop.
+- `continueRun({ fromRunId })` is separate from `resume(runId)`: it creates a new linked continuation run from a terminal `failed` source run after `getRecoveryOptions(runId)` identifies a safe boundary.
+- The MVP continuation strategy is `hybrid_snapshot_then_step`: use the latest compatible snapshot as the base, reconcile durable events to the last completed step, and start the continuation brief at the next incomplete step.
+- A failed source run remains immutable history. Continuation lineage is recorded in `run_continuations`; `parent_run_id` remains reserved for delegated child runs.
+- If a `tool.started` event has no durable `tool.completed` or `tool.failed`, continuation must return `requires_reconciliation` instead of creating a continuation run.
+- Provider/model fallback recommendations may be returned by `getRecoveryOptions`; the host must instantiate or route to an agent configured with the selected provider/model before calling `continueRun` with that target.
 - Parent and child delegate resolution is idempotent. A parent waiting on a terminal child must consume the existing child result exactly once, and linkage mismatches must fail explicitly.
 - Retryable delegate failures are resolved inside the delegation boundary. The parent remains on the same logical delegate tool execution while the runtime resumes an interrupted child or creates a new `DelegateAttempt`.
 - Gateway reconnect is a session reattachment policy, not a new execution primitive. It should re-present pending approval or clarification state, settle terminal run state, resume expired active run leases when supported, and otherwise subscribe the client as an observer.

@@ -416,6 +416,16 @@ Interruption is cooperative. The runtime checks interruption state:
 
 `resume()` continues from the latest valid snapshot after acquiring the run lease.
 
+`continueRun({ fromRunId })` is a recovery API for terminal `failed` runs. It must not reopen the failed run. The runtime creates a new linked continuation run, records lineage separately from parent/child delegation, and builds a continuation brief from the latest compatible snapshot plus durable progress after that snapshot.
+
+The MVP continuation strategy is `hybrid_snapshot_then_step`:
+
+- restore the latest compatible snapshot as the base state
+- inspect durable events to identify the last safely completed step
+- continue from the next incomplete step
+- block with `requires_reconciliation` if a side-effecting tool may have started without a durable completion record
+- allow the host to route continuation to a different configured provider/model
+
 If a parent run is in `awaiting_subagent`, `resume()` must inspect the linked child run before the parent continues.
 
 If the child failed with a retryable delegate error and retry budget remains, `resume()` should continue the same delegate boundary instead of failing the parent immediately:
@@ -526,8 +536,10 @@ Recommended event types:
 - `snapshot.created`
 - `run.completed`
 - `run.failed`
+- `run.continuation_created`
 - `run.interrupted`
 - `run.resumed`
+- `recovery.analyzed`
 - `replan.required`
 
 The event payload should be structured and versioned. Event ordering should be based on a per-run sequence number.
@@ -612,8 +624,11 @@ The recommended persistence model uses these tables:
 - `plans`
 - `plan_steps`
 - `plan_executions`
+- `run_continuations`
 
 The `agent_runs` table now also carries run-tree linkage for parent and child relationships.
+
+Continuation lineage must use `run_continuations` rather than `parent_run_id`; `parent_run_id` remains reserved for delegated child runs.
 
 The core package should only depend on store interfaces. Postgres details belong in the storage adapter package.
 
