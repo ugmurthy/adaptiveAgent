@@ -2,6 +2,7 @@ import type { Logger } from 'pino';
 
 import { createModelAdapter, type ModelAdapterConfig } from './adapters/create-model-adapter.js';
 import { AdaptiveAgent } from './adaptive-agent.js';
+import { InMemoryContinuationStore } from './in-memory-continuation-store.js';
 import { InMemoryEventStore } from './in-memory-event-store.js';
 import { InMemoryRunStore } from './in-memory-run-store.js';
 import { InMemorySnapshotStore } from './in-memory-snapshot-store.js';
@@ -9,6 +10,7 @@ import { skillsToDelegate } from './skills/skill-to-delegate.js';
 import type { SkillDefinition } from './skills/types.js';
 import type {
   AdaptiveAgentOptions,
+  ContinuationStore,
   DelegateDefinition,
   EventSink,
   EventStore,
@@ -27,11 +29,13 @@ export interface AdaptiveAgentRuntime<
   TEventStore extends EventStore = InMemoryEventStore,
   TSnapshotStore extends SnapshotStore = InMemorySnapshotStore,
   TPlanStore extends PlanStore | undefined = undefined,
+  TContinuationStore extends ContinuationStore = InMemoryContinuationStore,
 > {
   runStore: TRunStore;
   eventStore: TEventStore;
   snapshotStore: TSnapshotStore;
   planStore: TPlanStore;
+  continuationStore: TContinuationStore;
   toolExecutionStore?: ToolExecutionStore;
   transactionStore?: RuntimeTransactionStore;
 }
@@ -41,11 +45,13 @@ export interface AdaptiveAgentRuntimeOptions<
   TEventStore extends EventStore = InMemoryEventStore,
   TSnapshotStore extends SnapshotStore = InMemorySnapshotStore,
   TPlanStore extends PlanStore | undefined = undefined,
+  TContinuationStore extends ContinuationStore = InMemoryContinuationStore,
 > {
   runStore?: TRunStore;
   eventStore?: TEventStore;
   snapshotStore?: TSnapshotStore;
   planStore?: TPlanStore;
+  continuationStore?: TContinuationStore;
   toolExecutionStore?: ToolExecutionStore;
   transactionStore?: RuntimeTransactionStore;
 }
@@ -55,6 +61,7 @@ export interface CreateAdaptiveAgentOptions<
   TEventStore extends EventStore = InMemoryEventStore,
   TSnapshotStore extends SnapshotStore = InMemorySnapshotStore,
   TPlanStore extends PlanStore | undefined = undefined,
+  TContinuationStore extends ContinuationStore = InMemoryContinuationStore,
 > extends Omit<
     AdaptiveAgentOptions,
     | 'model'
@@ -63,6 +70,7 @@ export interface CreateAdaptiveAgentOptions<
     | 'eventStore'
     | 'snapshotStore'
     | 'planStore'
+    | 'continuationStore'
     | 'toolExecutionStore'
     | 'eventSink'
     | 'logger'
@@ -70,7 +78,7 @@ export interface CreateAdaptiveAgentOptions<
   model: AdaptiveAgentModelInput;
   delegates?: DelegateDefinition[];
   skills?: SkillDefinition[];
-  runtime?: AdaptiveAgentRuntimeOptions<TRunStore, TEventStore, TSnapshotStore, TPlanStore>;
+  runtime?: AdaptiveAgentRuntimeOptions<TRunStore, TEventStore, TSnapshotStore, TPlanStore, TContinuationStore>;
   eventSink?: EventSink;
   logger?: Logger;
 }
@@ -80,9 +88,10 @@ export interface CreatedAdaptiveAgent<
   TEventStore extends EventStore = InMemoryEventStore,
   TSnapshotStore extends SnapshotStore = InMemorySnapshotStore,
   TPlanStore extends PlanStore | undefined = undefined,
+  TContinuationStore extends ContinuationStore = InMemoryContinuationStore,
 > {
   agent: AdaptiveAgent;
-  runtime: AdaptiveAgentRuntime<TRunStore, TEventStore, TSnapshotStore, TPlanStore>;
+  runtime: AdaptiveAgentRuntime<TRunStore, TEventStore, TSnapshotStore, TPlanStore, TContinuationStore>;
 }
 
 export function createAdaptiveAgentRuntime<
@@ -90,15 +99,17 @@ export function createAdaptiveAgentRuntime<
   TEventStore extends EventStore = InMemoryEventStore,
   TSnapshotStore extends SnapshotStore = InMemorySnapshotStore,
   TPlanStore extends PlanStore | undefined = undefined,
+  TContinuationStore extends ContinuationStore = InMemoryContinuationStore,
 >(
-  options: AdaptiveAgentRuntimeOptions<TRunStore, TEventStore, TSnapshotStore, TPlanStore> = {},
-): AdaptiveAgentRuntime<TRunStore, TEventStore, TSnapshotStore, TPlanStore> {
+  options: AdaptiveAgentRuntimeOptions<TRunStore, TEventStore, TSnapshotStore, TPlanStore, TContinuationStore> = {},
+): AdaptiveAgentRuntime<TRunStore, TEventStore, TSnapshotStore, TPlanStore, TContinuationStore> {
   const transactionStore = isRuntimeTransactionStore(options) ? options : options.transactionStore;
   return {
     runStore: (options.runStore ?? new InMemoryRunStore()) as TRunStore,
     eventStore: (options.eventStore ?? new InMemoryEventStore()) as TEventStore,
     snapshotStore: (options.snapshotStore ?? new InMemorySnapshotStore()) as TSnapshotStore,
     planStore: options.planStore as TPlanStore,
+    continuationStore: (options.continuationStore ?? new InMemoryContinuationStore()) as TContinuationStore,
     toolExecutionStore: options.toolExecutionStore,
     transactionStore,
   };
@@ -109,9 +120,10 @@ export function createAdaptiveAgent<
   TEventStore extends EventStore = InMemoryEventStore,
   TSnapshotStore extends SnapshotStore = InMemorySnapshotStore,
   TPlanStore extends PlanStore | undefined = undefined,
+  TContinuationStore extends ContinuationStore = InMemoryContinuationStore,
 >(
-  options: CreateAdaptiveAgentOptions<TRunStore, TEventStore, TSnapshotStore, TPlanStore>,
-): CreatedAdaptiveAgent<TRunStore, TEventStore, TSnapshotStore, TPlanStore> {
+  options: CreateAdaptiveAgentOptions<TRunStore, TEventStore, TSnapshotStore, TPlanStore, TContinuationStore>,
+): CreatedAdaptiveAgent<TRunStore, TEventStore, TSnapshotStore, TPlanStore, TContinuationStore> {
   const runtime = createAdaptiveAgentRuntime(options.runtime);
   const delegates = mergeDelegates(options.delegates, options.skills);
   const agent = new AdaptiveAgent({
@@ -119,10 +131,12 @@ export function createAdaptiveAgent<
     tools: options.tools,
     delegates: delegates.length > 0 ? delegates : undefined,
     delegation: options.delegation,
+    recovery: options.recovery,
     runStore: runtime.runStore,
     eventStore: runtime.eventStore,
     snapshotStore: runtime.snapshotStore,
     planStore: runtime.planStore,
+    continuationStore: runtime.continuationStore,
     toolExecutionStore: runtime.toolExecutionStore,
     transactionStore: runtime.transactionStore,
     eventSink: options.eventSink,

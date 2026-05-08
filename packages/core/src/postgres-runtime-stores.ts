@@ -1,8 +1,11 @@
 import type {
   AgentEvent,
   AgentRun,
+  ContinuationStore,
+  ContinuationStrategy,
   EventSink,
   EventStore,
+  FailureClass,
   JsonValue,
   PlanArtifact,
   PlanExecution,
@@ -11,6 +14,7 @@ import type {
   PlanStep,
   RecoveryScanReason,
   PlanStore,
+  RunContinuation,
   RunSnapshot,
   RunStatus,
   RunStore,
@@ -164,6 +168,24 @@ interface ToolExecutionRow {
   error_message: string | null;
   started_at: string;
   completed_at: string | null;
+}
+
+interface RunContinuationRow {
+  id: string;
+  source_run_id: string;
+  continuation_run_id: string;
+  strategy: string;
+  failure_class: string;
+  reason: string;
+  source_snapshot_id: string | null;
+  source_snapshot_seq: string | number | null;
+  source_event_seq: string | number | null;
+  source_step_id: string | null;
+  next_step_id: string | null;
+  provider: string | null;
+  model: string | null;
+  metadata: Record<string, JsonValue> | null;
+  created_at: string;
 }
 
 interface RecoveryCandidateRow extends AgentRunRow {
@@ -403,6 +425,27 @@ export const POSTGRES_RUNTIME_TOOL_EXECUTION_QUERIES = {
     WHERE idempotency_key = $1
     RETURNING *
   `,
+} as const;
+
+export const POSTGRES_RUNTIME_CONTINUATION_QUERIES = {
+  create: `
+    INSERT INTO run_continuations (
+      source_run_id, continuation_run_id, strategy, failure_class, reason,
+      source_snapshot_id, source_snapshot_seq, source_event_seq, source_step_id,
+      next_step_id, provider, model, metadata
+    ) VALUES (
+      $1, $2, $3, $4, $5,
+      $6, $7, $8, $9,
+      $10, $11, $12, $13
+    )
+    RETURNING *
+  `,
+  listBySourceRun: `
+    SELECT * FROM run_continuations
+    WHERE source_run_id = $1
+    ORDER BY created_at ASC, id ASC
+  `,
+  getByContinuationRun: `SELECT * FROM run_continuations WHERE continuation_run_id = $1`,
 } as const;
 
 export const POSTGRES_RUNTIME_RECOVERY_QUERIES = {
@@ -911,6 +954,50 @@ export class PostgresToolExecutionStore implements ToolExecutionStore {
   }
 }
 
+export class PostgresContinuationStore implements ContinuationStore {
+  constructor(private readonly client: PostgresClient) {}
+
+  async createContinuation(
+    continuation: Omit<RunContinuation, 'id' | 'createdAt'>,
+  ): Promise<RunContinuation> {
+    const result = await this.client.query<RunContinuationRow>(POSTGRES_RUNTIME_CONTINUATION_QUERIES.create, [
+      continuation.sourceRunId,
+      continuation.continuationRunId,
+      continuation.strategy,
+      continuation.failureClass,
+      continuation.reason,
+      continuation.sourceSnapshotId ?? null,
+      continuation.sourceSnapshotSeq ?? null,
+      continuation.sourceEventSeq ?? null,
+      continuation.sourceStepId ?? null,
+      continuation.nextStepId ?? null,
+      continuation.provider ?? null,
+      continuation.model ?? null,
+      jsonbParam(continuation.metadata),
+    ]);
+
+    return continuationRowToRecord(
+      firstRow(result, `Failed to create continuation for run ${continuation.continuationRunId}`),
+    );
+  }
+
+  async listBySourceRun(sourceRunId: UUID): Promise<RunContinuation[]> {
+    const result = await this.client.query<RunContinuationRow>(
+      POSTGRES_RUNTIME_CONTINUATION_QUERIES.listBySourceRun,
+      [sourceRunId],
+    );
+    return result.rows.map(continuationRowToRecord);
+  }
+
+  async getByContinuationRun(continuationRunId: UUID): Promise<RunContinuation | null> {
+    const result = await this.client.query<RunContinuationRow>(
+      POSTGRES_RUNTIME_CONTINUATION_QUERIES.getByContinuationRun,
+      [continuationRunId],
+    );
+    return result.rows[0] ? continuationRowToRecord(result.rows[0]) : null;
+  }
+}
+
 export interface PostgresRecoveryScannerOptions {
   now?: Date;
   staleRunMs?: number;
@@ -995,6 +1082,7 @@ export class PostgresRuntimeStoreBundle implements RuntimeTransactionStore {
   readonly eventStore: PostgresEventStore;
   readonly snapshotStore: PostgresSnapshotStore;
   readonly planStore: PostgresPlanStore;
+  readonly continuationStore: PostgresContinuationStore;
   readonly toolExecutionStore: PostgresToolExecutionStore;
   readonly recoveryScanner: PostgresRecoveryScanner;
 
@@ -1003,6 +1091,7 @@ export class PostgresRuntimeStoreBundle implements RuntimeTransactionStore {
     this.eventStore = new PostgresEventStore(client);
     this.snapshotStore = new PostgresSnapshotStore(client);
     this.planStore = new PostgresPlanStore(client);
+    this.continuationStore = new PostgresContinuationStore(client);
     this.toolExecutionStore = new PostgresToolExecutionStore(client);
     this.recoveryScanner = new PostgresRecoveryScanner(client);
   }
@@ -1014,6 +1103,7 @@ export class PostgresRuntimeStoreBundle implements RuntimeTransactionStore {
         eventStore: new PostgresEventStore(client),
         snapshotStore: new PostgresSnapshotStore(client),
         planStore: new PostgresPlanStore(client),
+        continuationStore: new PostgresContinuationStore(client),
         toolExecutionStore: new PostgresToolExecutionStore(client),
       }),
     );
@@ -1172,6 +1262,26 @@ function toolExecutionRowToRecord(row: ToolExecutionRow): ToolExecutionRecord {
     errorMessage: row.error_message ?? undefined,
     startedAt: row.started_at,
     completedAt: row.completed_at ?? undefined,
+  };
+}
+
+function continuationRowToRecord(row: RunContinuationRow): RunContinuation {
+  return {
+    id: row.id,
+    sourceRunId: row.source_run_id,
+    continuationRunId: row.continuation_run_id,
+    strategy: row.strategy as ContinuationStrategy,
+    failureClass: row.failure_class as FailureClass,
+    reason: row.reason,
+    sourceSnapshotId: row.source_snapshot_id ?? undefined,
+    sourceSnapshotSeq: row.source_snapshot_seq === null ? undefined : Number(row.source_snapshot_seq),
+    sourceEventSeq: row.source_event_seq === null ? undefined : Number(row.source_event_seq),
+    sourceStepId: row.source_step_id ?? undefined,
+    nextStepId: row.next_step_id ?? undefined,
+    provider: row.provider ?? undefined,
+    model: row.model ?? undefined,
+    metadata: row.metadata ?? undefined,
+    createdAt: row.created_at,
   };
 }
 

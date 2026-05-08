@@ -37,6 +37,30 @@ export type PlanExecutionStatus =
 
 export type FailurePolicy = 'stop' | 'skip' | 'replan';
 
+export type ContinuationStrategy =
+  | 'hybrid_snapshot_then_step'
+  | 'latest_snapshot'
+  | 'last_successful_step'
+  | 'failure_boundary'
+  | 'manual_checkpoint';
+
+export type RecoveryDecision =
+  | 'not_recoverable'
+  | 'retry_same_run'
+  | 'continue_new_run'
+  | 'requires_reconciliation'
+  | 'requires_user_action';
+
+export type FailureClass =
+  | 'provider_transient'
+  | 'provider_terminal'
+  | 'agent_invalid_output'
+  | 'tool_uncertain'
+  | 'tool_failed'
+  | 'user_action_required'
+  | 'policy_blocked'
+  | 'unknown';
+
 export type EventType =
   | 'run.created'
   | 'run.status_changed'
@@ -46,6 +70,8 @@ export type EventType =
   | 'run.retry_started'
   | 'run.completed'
   | 'run.failed'
+  | 'recovery.analyzed'
+  | 'run.continuation_created'
   | 'plan.created'
   | 'plan.execution_started'
   | 'step.started'
@@ -141,6 +167,21 @@ export interface DelegationPolicy {
   allowRecursiveDelegation?: boolean;
   childRunsMayRequestApproval?: boolean;
   childRunsMayRequestClarification?: boolean;
+}
+
+export interface RecoveryPolicy {
+  continuation?: {
+    enabled: boolean;
+    defaultStrategy?: ContinuationStrategy;
+    requireUserApproval?: boolean;
+  };
+  retryableErrorCodes?: string[];
+  fallbackModels?: Array<{
+    provider: string;
+    model: string;
+    whenFailureClass?: FailureClass[];
+    whenErrorCode?: string[];
+  }>;
 }
 
 export interface RunRequest {
@@ -241,10 +282,12 @@ export interface AdaptiveAgentOptions {
   tools: ToolDefinition[];
   delegates?: DelegateDefinition[];
   delegation?: DelegationPolicy;
+  recovery?: RecoveryPolicy;
   runStore: RunStore;
   eventStore?: EventStore;
   snapshotStore?: SnapshotStore;
   planStore?: PlanStore;
+  continuationStore?: ContinuationStore;
   toolExecutionStore?: ToolExecutionStore;
   transactionStore?: RuntimeTransactionStore;
   eventSink?: EventSink;
@@ -471,6 +514,60 @@ export interface RunSnapshot {
   createdAt: string;
 }
 
+export interface RunRecoveryOptions {
+  runId: UUID;
+  continuable: boolean;
+  decision: RecoveryDecision;
+  failureClass: FailureClass;
+  reason: string;
+  recommendedStrategy?: ContinuationStrategy;
+  recommendedProvider?: string;
+  recommendedModel?: string;
+  sourceSnapshotId?: UUID;
+  sourceSnapshotSeq?: number;
+  lastSafeEventSeq?: number;
+  lastCompletedStepId?: string;
+  nextStepId?: string;
+  requiresReconciliation?: boolean;
+  unsafeReason?: string;
+}
+
+export interface ContinueRunOptions {
+  fromRunId: UUID;
+  strategy?: ContinuationStrategy;
+  provider?: string;
+  model?: string;
+  metadata?: Record<string, JsonValue>;
+  requireApproval?: boolean;
+}
+
+export interface ContinueRunResult {
+  sourceRunId: UUID;
+  continuationRunId: UUID;
+  strategy: ContinuationStrategy;
+  sourceSnapshotSeq?: number;
+  lastCompletedStepId?: string;
+  nextStepId?: string;
+}
+
+export interface RunContinuation {
+  id: UUID;
+  sourceRunId: UUID;
+  continuationRunId: UUID;
+  strategy: ContinuationStrategy;
+  failureClass: FailureClass;
+  reason: string;
+  sourceSnapshotId?: UUID;
+  sourceSnapshotSeq?: number;
+  sourceEventSeq?: number;
+  sourceStepId?: string;
+  nextStepId?: string;
+  provider?: string;
+  model?: string;
+  metadata?: Record<string, JsonValue>;
+  createdAt: string;
+}
+
 export interface EventSink {
   emit(event: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>): Promise<void> | void;
 }
@@ -562,6 +659,12 @@ export interface SnapshotStore {
   getLatest(runId: UUID): Promise<RunSnapshot | null>;
 }
 
+export interface ContinuationStore {
+  createContinuation(continuation: Omit<RunContinuation, 'id' | 'createdAt'>): Promise<RunContinuation>;
+  listBySourceRun(sourceRunId: UUID): Promise<RunContinuation[]>;
+  getByContinuationRun(continuationRunId: UUID): Promise<RunContinuation | null>;
+}
+
 export interface PlanStore {
   createPlan(plan: Omit<PlanArtifact, 'createdAt' | 'archivedAt'>): Promise<PlanArtifact>;
   getPlan(planId: UUID): Promise<PlanArtifact | null>;
@@ -577,6 +680,7 @@ export interface RuntimeStores {
   eventStore?: EventStore;
   snapshotStore?: SnapshotStore;
   planStore?: PlanStore;
+  continuationStore?: ContinuationStore;
   toolExecutionStore?: ToolExecutionStore;
 }
 

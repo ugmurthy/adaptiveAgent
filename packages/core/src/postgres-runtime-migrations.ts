@@ -208,4 +208,30 @@ alter table agent_runs
   add column if not exists model_parameters jsonb;
 `,
   },
+  {
+    name: 'core:004_run_continuations',
+    sql: `
+create table if not exists run_continuations (
+  id uuid primary key default gen_random_uuid(),
+  source_run_id uuid not null references agent_runs(id) on delete cascade,
+  continuation_run_id uuid not null references agent_runs(id) on delete cascade,
+  strategy text not null,
+  failure_class text not null,
+  reason text not null,
+  source_snapshot_id uuid references run_snapshots(id) on delete set null,
+  source_snapshot_seq bigint,
+  source_event_seq bigint,
+  source_step_id text,
+  next_step_id text,
+  provider text,
+  model text,
+  metadata jsonb,
+  created_at timestamptz not null default now(),
+  unique (continuation_run_id)
+);
+
+create index if not exists run_continuations_source_idx
+  on run_continuations (source_run_id, created_at desc);
+`,
+  },
 ];
