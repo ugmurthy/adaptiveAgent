@@ -9,6 +9,7 @@ import {
   summarizeModelResponseForLog,
 } from './logging.js';
 import { captureValueForLog, errorForLog, summarizeValueForLog } from './logger.js';
+import { RunRecoveryAnalyzer } from './run-recovery-analyzer.js';
 import { resolveResearchPolicy, resolveToolBudgets, type ResolvedResearchPolicy } from './tool-budget-policy.js';
 import type {
   AdaptiveAgentOptions,
@@ -18,6 +19,9 @@ import type {
   ChatMessage,
   ChatRequest,
   ChatResult,
+  ContinueRunOptions,
+  ContinueRunResult,
+  ContinuationStrategy,
   ExecutePlanRequest,
   EventSink,
   FailureKind,
@@ -34,6 +38,7 @@ import type {
   PlanExecution,
   PlanRequest,
   PlanStep,
+  RunRecoveryOptions,
   RuntimeStores,
   RunFailureCode,
   RunRequest,
@@ -152,6 +157,7 @@ export class AdaptiveAgent {
   private readonly leaseOwner = `adaptive-agent:${crypto.randomUUID()}`;
   private readonly eventEmitter: EventSink;
   private readonly delegationExecutor: DelegationExecutor;
+  private readonly recoveryAnalyzer: RunRecoveryAnalyzer;
   private readonly logger?: Logger;
 
   constructor(private readonly options: AdaptiveAgentOptions) {
@@ -170,6 +176,17 @@ export class AdaptiveAgent {
       model: options.model.model,
     });
     this.eventEmitter = createCompositeEventSink(options.eventStore, options.eventSink);
+    this.recoveryAnalyzer = new RunRecoveryAnalyzer({
+      recovery: options.recovery,
+      runStore: options.runStore,
+      eventStore: options.eventStore,
+      snapshotStore: options.snapshotStore,
+      planStore: options.planStore,
+      continuationStore: options.continuationStore,
+      toolExecutionStore: options.toolExecutionStore,
+      defaultProvider: options.model.provider,
+      defaultModel: options.model.model,
+    });
     this.delegationExecutor = new DelegationExecutor({
       model: options.model,
       tools: options.tools,
@@ -1007,6 +1024,128 @@ export class AdaptiveAgent {
     } finally {
       await this.releaseLeaseQuietly(run.id);
     }
+  }
+
+  async getRecoveryOptions(runId: UUID): Promise<RunRecoveryOptions> {
+    return this.recoveryAnalyzer.getRecoveryOptions(runId);
+  }
+
+  async continueRun(options: ContinueRunOptions): Promise<RunResult> {
+    const continuation = await this.createContinuationRun(options);
+    return this.runWithExistingRun(continuation.continuationRunId, {});
+  }
+
+  async createContinuationRun(options: ContinueRunOptions): Promise<ContinueRunResult> {
+    const continuationStore = this.options.continuationStore;
+    if (!continuationStore) {
+      throw new Error('continueRun() requires a configured continuationStore');
+    }
+
+    const recovery = await this.getRecoveryOptions(options.fromRunId);
+    if (!recovery.continuable) {
+      throw new Error(recovery.unsafeReason ?? recovery.reason);
+    }
+
+    if (recovery.requiresReconciliation) {
+      throw new Error(recovery.unsafeReason ?? 'Run requires reconciliation before continuation');
+    }
+
+    const sourceRun = await this.refreshRun(options.fromRunId);
+    const sourceSnapshot = await this.options.snapshotStore?.getLatest(sourceRun.id);
+    if (!sourceSnapshot) {
+      throw new Error(`Run ${sourceRun.id} has no snapshot to use as a continuation base`);
+    }
+
+    if ((this.options.recovery?.continuation?.requireUserApproval || options.requireApproval) && options.requireApproval !== true) {
+      throw new Error(`Continuation for run ${sourceRun.id} requires explicit approval`);
+    }
+
+    const strategy = options.strategy ?? recovery.recommendedStrategy ?? 'hybrid_snapshot_then_step';
+    assertSupportedMvpContinuationStrategy(strategy);
+    this.assertContinuationModelMatchesConfigured(options);
+
+    const targetProvider = options.provider ?? this.options.model.provider;
+    const targetModel = options.model ?? this.options.model.model;
+    const sourceState = await this.loadExecutionState(sourceRun);
+    const continuationBrief = await this.buildContinuationBrief(sourceRun, recovery, strategy, targetProvider, targetModel);
+    const continuationMetadata: Record<string, JsonValue> = {
+      ...(sourceRun.metadata ?? {}),
+      ...(options.metadata ?? {}),
+      continuationOfRunId: sourceRun.id,
+      continuationStrategy: strategy,
+      continuationFailureClass: recovery.failureClass,
+      continuationSourceSnapshotSeq: recovery.sourceSnapshotSeq ?? sourceSnapshot.snapshotSeq,
+      ...(recovery.lastCompletedStepId ? { continuationLastCompletedStepId: recovery.lastCompletedStepId } : {}),
+      ...(recovery.nextStepId ? { continuationNextStepId: recovery.nextStepId } : {}),
+    };
+
+    const { run: continuationRun } = await this.createRunWithInitialSnapshot(
+      {
+        goal: sourceRun.goal,
+        input: sourceRun.input,
+        context: {
+          ...(sourceRun.context ?? {}),
+          continuation: continuationBrief,
+        },
+        metadata: continuationMetadata,
+        modelProvider: targetProvider,
+        modelName: targetModel,
+        status: 'queued',
+      },
+      () => this.createContinuationExecutionState(sourceState, continuationBrief),
+    );
+
+    await continuationStore.createContinuation({
+      sourceRunId: sourceRun.id,
+      continuationRunId: continuationRun.id,
+      strategy,
+      failureClass: recovery.failureClass,
+      reason: recovery.reason,
+      sourceSnapshotId: recovery.sourceSnapshotId ?? sourceSnapshot.id,
+      sourceSnapshotSeq: recovery.sourceSnapshotSeq ?? sourceSnapshot.snapshotSeq,
+      sourceEventSeq: recovery.lastSafeEventSeq,
+      sourceStepId: recovery.lastCompletedStepId,
+      nextStepId: recovery.nextStepId,
+      provider: targetProvider,
+      model: targetModel,
+      metadata: options.metadata,
+    });
+
+    await this.emit({
+      runId: continuationRun.id,
+      type: 'run.continuation_created',
+      schemaVersion: 1,
+      payload: {
+        sourceRunId: sourceRun.id,
+        strategy,
+        failureClass: recovery.failureClass,
+        reason: recovery.reason,
+        sourceSnapshotSeq: recovery.sourceSnapshotSeq ?? sourceSnapshot.snapshotSeq,
+        lastCompletedStepId: recovery.lastCompletedStepId,
+        nextStepId: recovery.nextStepId,
+        provider: targetProvider,
+        model: targetModel,
+      },
+    });
+
+    this.logLifecycle('info', 'run.continuation_created', {
+      ...runLogBindings(continuationRun),
+      sourceRunId: sourceRun.id,
+      strategy,
+      failureClass: recovery.failureClass,
+      nextStepId: recovery.nextStepId,
+      provider: targetProvider,
+      model: targetModel,
+    });
+
+    return {
+      sourceRunId: sourceRun.id,
+      continuationRunId: continuationRun.id,
+      strategy,
+      sourceSnapshotSeq: recovery.sourceSnapshotSeq ?? sourceSnapshot.snapshotSeq,
+      lastCompletedStepId: recovery.lastCompletedStepId,
+      nextStepId: recovery.nextStepId,
+    };
   }
 
   private async runWithExistingRun(runId: UUID, options: RunContinuationOptions): Promise<RunResult> {
@@ -1914,6 +2053,7 @@ export class AdaptiveAgent {
       eventStore: this.options.eventStore,
       snapshotStore: this.options.snapshotStore,
       planStore: this.options.planStore,
+      continuationStore: this.options.continuationStore,
       toolExecutionStore: this.options.toolExecutionStore,
       transactionStore: this.options.transactionStore,
       eventSink: this.options.eventSink,
@@ -1967,6 +2107,98 @@ export class AdaptiveAgent {
       signal: controller.signal,
       emit: (event) => Promise.resolve(this.emit(event)),
     };
+  }
+
+  private async buildContinuationBrief(
+    sourceRun: AgentRun,
+    recovery: RunRecoveryOptions,
+    strategy: ContinuationStrategy,
+    provider: string,
+    model: string,
+  ): Promise<JsonObject> {
+    const events = await this.options.eventStore?.listByRun(sourceRun.id, 0) ?? [];
+    const completedSteps = events
+      .filter((event) => event.type === 'step.completed' && event.stepId)
+      .map((event) => ({
+        stepId: event.stepId ?? 'unknown',
+        payload: event.payload,
+      }));
+    const completedToolResults = events
+      .filter((event) => event.type === 'tool.completed' && event.stepId)
+      .map((event) => ({
+        stepId: event.stepId ?? 'unknown',
+        toolCallId: event.toolCallId ?? null,
+        payload: event.payload,
+      }));
+
+    return {
+      sourceRunId: sourceRun.id,
+      originalGoal: sourceRun.goal,
+      strategy,
+      failure: {
+        class: recovery.failureClass,
+        code: sourceRun.errorCode ?? null,
+        message: sourceRun.errorMessage ?? null,
+        provider: sourceRun.modelProvider ?? null,
+        model: sourceRun.modelName ?? null,
+      },
+      continuationModel: {
+        provider,
+        model,
+      },
+      progress: {
+        sourceSnapshotSeq: recovery.sourceSnapshotSeq ?? null,
+        lastSafeEventSeq: recovery.lastSafeEventSeq ?? null,
+        lastCompletedStepId: recovery.lastCompletedStepId ?? null,
+        nextStepId: recovery.nextStepId ?? null,
+        completedSteps: completedSteps as unknown as JsonValue,
+        completedToolResults: completedToolResults as unknown as JsonValue,
+      },
+      instructions: [
+        'You are continuing a previous failed run.',
+        'Use completed work as durable progress and do not repeat completed steps unless verification shows the prior output is missing or invalid.',
+        'Continue from the next incomplete step.',
+        'If prior state is ambiguous, inspect before acting.',
+        'Preserve the original goal and produce the requested final result.',
+      ],
+    };
+  }
+
+  private createContinuationExecutionState(sourceState: ExecutionState, continuationBrief: JsonObject): ExecutionState {
+    const toolManifestMessage = this.buildRuntimeToolManifestMessage();
+    const state = this.createExecutionState(
+      [
+        buildAgentSystemMessage(this.options.systemInstructions),
+        ...(toolManifestMessage ? [toolManifestMessage] : []),
+        {
+          role: 'user',
+          content: [
+            'Continue the previous failed run using this recovery brief.',
+            '',
+            '```json',
+            JSON.stringify(continuationBrief, null, 2),
+            '```',
+          ].join('\n'),
+        },
+      ],
+      sourceState.outputSchema,
+    );
+    state.stepsUsed = sourceState.stepsUsed;
+    return state;
+  }
+
+  private assertContinuationModelMatchesConfigured(options: ContinueRunOptions): void {
+    if (options.provider && options.provider !== this.options.model.provider) {
+      throw new Error(
+        `Continuation target provider ${options.provider} does not match this agent's configured provider ${this.options.model.provider}; instantiate an agent with the target model before continuing`,
+      );
+    }
+
+    if (options.model && options.model !== this.options.model.model) {
+      throw new Error(
+        `Continuation target model ${options.model} does not match this agent's configured model ${this.options.model.model}; instantiate an agent with the target model before continuing`,
+      );
+    }
   }
 
   private createExecutionState(messages: ModelMessage[], outputSchema?: JsonSchema): ExecutionState {
@@ -3095,6 +3327,12 @@ function resolveDefaultModelTimeoutMs(provider: string): number {
   }
 
   return DEFAULT_AGENT_DEFAULTS.modelTimeoutMs;
+}
+
+function assertSupportedMvpContinuationStrategy(strategy: ContinuationStrategy): void {
+  if (strategy !== 'hybrid_snapshot_then_step') {
+    throw new Error(`Continuation strategy ${strategy} is not implemented in the MVP`);
+  }
 }
 
 function buildAgentSystemMessage(systemInstructions?: string): ModelMessage {
