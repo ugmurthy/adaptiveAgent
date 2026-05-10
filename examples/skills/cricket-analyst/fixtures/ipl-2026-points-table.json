@@ -1,0 +1,16 @@
+{
+  "tournament": "IPL 2026",
+  "asOf": "2026-04-28",
+  "teams": [
+    { "name": "Rajasthan Royals",            "code": "RR",   "played": 10, "wins": 8, "losses": 2, "points": 16, "nrr": 0.812 },
+    { "name": "Kolkata Knight Riders",       "code": "KKR",  "played": 10, "wins": 7, "losses": 3, "points": 14, "nrr": 0.598 },
+    { "name": "Chennai Super Kings",         "code": "CSK",  "played": 10, "wins": 6, "losses": 4, "points": 12, "nrr": 0.453 },
+    { "name": "Sunrisers Hyderabad",         "code": "SRH",  "played": 10, "wins": 6, "losses": 4, "points": 12, "nrr": 0.207 },
+    { "name": "Lucknow Super Giants",        "code": "LSG",  "played": 10, "wins": 5, "losses": 5, "points": 10, "nrr": 0.110 },
+    { "name": "Delhi Capitals",              "code": "DC",   "played": 10, "wins": 5, "losses": 5, "points": 10, "nrr": -0.087 },
+    { "name": "Mumbai Indians",              "code": "MI",   "played": 10, "wins": 4, "losses": 6, "points": 8,  "nrr": -0.122 },
+    { "name": "Royal Challengers Bengaluru", "code": "RCB",  "played": 10, "wins": 4, "losses": 6, "points": 8,  "nrr": -0.319 },
+    { "name": "Punjab Kings",                "code": "PBKS", "played": 10, "wins": 3, "losses": 7, "points": 6,  "nrr": -0.611 },
+    { "name": "Gujarat Titans",              "code": "GT",   "played": 10, "wins": 2, "losses": 8, "points": 4,  "nrr": -0.945 }
+  ]
+}

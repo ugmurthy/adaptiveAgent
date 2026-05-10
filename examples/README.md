@@ -115,3 +115,43 @@ Skills can also override child-run defaults with dotted frontmatter keys such as
 Skills may also declare `handler: handler.ts`. When present, the handler module is loaded as a child-run tool, which makes it a good fit for integrations such as MCP clients. See `examples/skills/mcp-echo/` for a minimal stdio MCP example that spawns a local server, sends `initialize` and `tools/call`, and returns the result to the delegated skill run.
 
 Skills whose required tools are unavailable (e.g. `researcher` when `WEB_SEARCH_PROVIDER=brave` and `BRAVE_SEARCH_API_KEY` is missing) are skipped automatically.
+
+## IPL Bulletin
+
+`examples/ipl-bulletin.ts` produces a styled IPL 2026 bulletin (points table, recent matches, upcoming matches, Monte Carlo playoff/winner predictions) end-to-end. It is the deterministic successor to `examples/ipl2.sh`.
+
+### Why this exists
+
+The `21-april-log.md` post-mortem shows the prior IPL run failing at step 5 with a 76-minute model timeout. The root cause was almost certainly the LLM trying to "do" the Monte Carlo simulation by emitting tokens — model providers cannot reliably roll thousands of dice in their output stream. The bulletin pipeline replaces that token-driven simulation with two deterministic skills:
+
+- **`examples/skills/cricket-analyst/`** — `delegate.cricket-analyst` returns IPL points table, fixtures, and player form from a curated JSON source (or bundled fixture). Removes the brittle scraping that ipl2.sh had to blacklist (`espncricinfo.com`, `iplt20.com`).
+- **`examples/skills/monte-carlo/`** — `delegate.monte-carlo` runs `simulate_match` (Bradley-Terry probability) and `simulate_tournament` (10,000 rollouts in TypeScript) deterministically. 10k iterations on the full remainder runs in well under 2 seconds.
+
+### Run it
+
+```bash
+# Default: today's date, online (uses curated mirror if CRICKET_DATA_BASE_URL is set, else fixture)
+bun run examples/ipl-bulletin.ts
+
+# Frozen date for reproducibility
+bun run examples/ipl-bulletin.ts --date 2026-04-28
+
+# Offline / fixtures only — useful in CI and for repeatable bulletins
+bun run examples/ipl-bulletin.ts --no-network
+```
+
+### Env
+
+| Variable                | Required | Purpose |
+| ----------------------- | -------- | ------- |
+| `PROVIDER`              | No       | `ollama` (default), `openrouter`, `mistral`, or `mesh`. |
+| `OLLAMA_MODEL`          | No       | Default `qwen3.5`. |
+| `CRICKET_DATA_BASE_URL` | No       | Optional JSON mirror serving `/ipl-2026-points-table.json`, `/ipl-2026-fixtures.json`, `/ipl-2026-player-form.json`. When unset, the bundled fixtures are used. |
+
+### Output
+
+Writes to `sport-bulletin-<date>.html` in the current working directory. The HTML matches the visual style of `sport.html` (Arial, light-gray container, blue headings) and embeds an attribution footer linking to [@murthyug](https://twitter.com/murthyug).
+
+### Determinism
+
+Same `--date` plus same fixture data plus same seed produces a bit-identical bulletin. The default seed is derived from the date so two runs on the same day match without specifying `--seed`. See `examples/skills/monte-carlo/seeding.test.ts` for the reproducibility contract.
