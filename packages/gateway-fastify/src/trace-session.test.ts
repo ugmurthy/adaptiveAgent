@@ -73,7 +73,7 @@ describe('trace-session CLI helpers', () => {
   });
 
   it('parses the session list flag without a session id', () => {
-    expect(parseArgs(['trace-session', '--ls', '--json'])).toEqual({
+    expect(parseArgs(['trace-session', '--ls', '--json', '--preview-chars', '40'])).toEqual({
       sessionId: undefined,
       json: true,
       listSessions: true,
@@ -83,6 +83,7 @@ describe('trace-session CLI helpers', () => {
       includePlans: false,
       onlyDelegates: false,
       messages: false,
+      previewChars: 40,
       systemOnly: false,
       help: false,
     });
@@ -126,9 +127,14 @@ describe('trace-session CLI helpers', () => {
         {
           sessionId: 'session-newest-full-id',
           startedAt: '2026-04-16T10:00:00.000Z',
+          status: 'succeeded',
           goals: [
             {
               rootRunId: 'root-2',
+              runId: 'root-2',
+              status: 'succeeded',
+              startedAt: '2026-04-16T10:00:01.000Z',
+              completedAt: '2026-04-16T10:00:03.000Z',
               goal: 'Summarize the incident timeline',
               linkedAt: '2026-04-16T10:00:01.000Z',
             },
@@ -137,17 +143,19 @@ describe('trace-session CLI helpers', () => {
         {
           sessionId: 'session-older-full-id',
           startedAt: '2026-04-16T09:00:00.000Z',
+          status: 'unknown',
           goals: [],
         },
       ],
       { json: false },
     );
 
-    expect(output).toContain('session-newest-full-id : 2026-04-16T10:00:00.000Z');
-    expect(output).toContain('Goal : Summarize the incident timeline');
-    expect(output).toContain('-----');
-    expect(output).toContain('session-older-full-id : 2026-04-16T09:00:00.000Z');
-    expect(output).toContain('Goal : (none)');
+    expect(output).toContain('---- session-newest-full-id : succeeded : 2026-04-16T10:00:00.000Z ----');
+    expect(output).toContain('  Goal: Summarize the incident timeline');
+    expect(output).toContain('  - root-2  succeeded  started=2026-04-16 10:00:01.000  elapsed=2.00s');
+    expect(output).toContain('---- session-older-full-id : unknown : 2026-04-16T09:00:00.000Z ----');
+    expect(output).toContain('  Goal: (none)');
+    expect(output).toContain('  Runs: (none)');
   });
 
   it('renders listed sessions as JSON', () => {
@@ -155,7 +163,15 @@ describe('trace-session CLI helpers', () => {
       [{
         sessionId: 'session-1',
         startedAt: now(),
-        goals: [{ rootRunId: 'root-1', goal: 'Finish the task', linkedAt: now() }],
+        goals: [{
+          rootRunId: 'root-1',
+          runId: 'root-1',
+          status: 'succeeded',
+          startedAt: now(),
+          completedAt: now(),
+          goal: 'Finish the task',
+          linkedAt: now(),
+        }],
       }],
       { json: true },
     );
@@ -164,7 +180,15 @@ describe('trace-session CLI helpers', () => {
       {
         sessionId: 'session-1',
         startedAt: now(),
-        goals: [{ rootRunId: 'root-1', goal: 'Finish the task', linkedAt: now() }],
+        goals: [{
+          rootRunId: 'root-1',
+          runId: 'root-1',
+          status: 'succeeded',
+          startedAt: now(),
+          completedAt: now(),
+          goal: 'Finish the task',
+          linkedAt: now(),
+        }],
       },
     ]);
   });

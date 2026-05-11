@@ -517,7 +517,9 @@ describe('createGatewayServer', () => {
       stores,
       agentRegistry: createGatewayTestAgentRegistry({
         steer,
-        runtimeRuns: {},
+        runtimeRuns: {
+          'run-chat-active-1': { id: 'run-chat-active-1', rootRunId: 'root-chat-active-1', status: 'running' },
+        },
       }),
     });
     apps.push(app);
@@ -531,14 +533,215 @@ describe('createGatewayServer', () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({
-      runId: 'run-chat-active-1',
       status: 'steered',
+      requestedRunId: 'run-chat-active-1',
+      resolvedTargetRunId: 'run-chat-active-1',
+      resolution: 'leaf',
       role: 'user',
     });
     expect(steer).toHaveBeenCalledWith('run-chat-active-1', {
       message: 'Please finish after the current step.',
       role: 'user',
     });
+  });
+
+  it('steers the active child leaf by default for run steer', async () => {
+    const stores = createInMemoryGatewayStores();
+    await createStoredSession(stores, {
+      id: 'session-steer-leaf-1',
+      channelId: 'web',
+      authSubject: 'owner-token',
+      agentId: 'support-agent',
+      invocationMode: 'run',
+      status: 'running',
+      currentRunId: 'parent-run',
+      currentRootRunId: 'parent-run',
+    });
+    await stores.sessionRunLinks.append({
+      sessionId: 'session-steer-leaf-1',
+      runId: 'parent-run',
+      rootRunId: 'parent-run',
+      invocationKind: 'run',
+      createdAt: '2026-04-08T10:05:00.000Z',
+    });
+    const steer = vi.fn(async () => undefined);
+
+    const app = await createGatewayServer(baseConfig, {
+      auth: createStaticAuthProvider(['member']),
+      stores,
+      agentRegistry: createGatewayTestAgentRegistry({
+        steer,
+        runtimeRuns: {
+          'parent-run': { id: 'parent-run', rootRunId: 'parent-run', status: 'awaiting_subagent', currentChildRunId: 'child-run' },
+          'child-run': { id: 'child-run', rootRunId: 'parent-run', parentRunId: 'parent-run', status: 'running' },
+        },
+      }),
+    });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/runs/parent-run/steer',
+      headers: { authorization: 'Bearer owner-token' },
+      payload: { message: 'Adjust course.' },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      status: 'steered',
+      requestedRunId: 'parent-run',
+      resolvedTargetRunId: 'child-run',
+      resolution: 'leaf',
+      role: 'user',
+    });
+    expect(steer).toHaveBeenCalledWith('child-run', { message: 'Adjust course.' });
+  });
+
+  it('supports exact run steer mode when a child is active', async () => {
+    const stores = createInMemoryGatewayStores();
+    await createStoredSession(stores, {
+      id: 'session-steer-exact-1',
+      channelId: 'web',
+      authSubject: 'owner-token',
+      agentId: 'support-agent',
+      invocationMode: 'run',
+      status: 'running',
+      currentRunId: 'parent-run',
+      currentRootRunId: 'parent-run',
+    });
+    await stores.sessionRunLinks.append({
+      sessionId: 'session-steer-exact-1',
+      runId: 'parent-run',
+      rootRunId: 'parent-run',
+      invocationKind: 'run',
+      createdAt: '2026-04-08T10:05:00.000Z',
+    });
+    const steer = vi.fn(async () => undefined);
+
+    const app = await createGatewayServer(baseConfig, {
+      auth: createStaticAuthProvider(['member']),
+      stores,
+      agentRegistry: createGatewayTestAgentRegistry({
+        steer,
+        runtimeRuns: {
+          'parent-run': { id: 'parent-run', rootRunId: 'parent-run', status: 'awaiting_subagent', currentChildRunId: 'child-run' },
+          'child-run': { id: 'child-run', rootRunId: 'parent-run', parentRunId: 'parent-run', status: 'running' },
+        },
+      }),
+    });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/runs/parent-run/steer?mode=exact',
+      headers: { authorization: 'Bearer owner-token' },
+      payload: { message: 'Steer parent exactly.' },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      requestedRunId: 'parent-run',
+      resolvedTargetRunId: 'parent-run',
+      resolution: 'exact',
+    });
+    expect(steer).toHaveBeenCalledWith('parent-run', { message: 'Steer parent exactly.' });
+  });
+
+  it('steers a session to the active nested leaf', async () => {
+    const stores = createInMemoryGatewayStores();
+    await createStoredSession(stores, {
+      id: 'session-steer-active-1',
+      channelId: 'web',
+      authSubject: 'owner-token',
+      agentId: 'support-agent',
+      invocationMode: 'run',
+      status: 'running',
+      currentRunId: 'root-run',
+      currentRootRunId: 'root-run',
+    });
+    await stores.sessionRunLinks.append({
+      sessionId: 'session-steer-active-1',
+      runId: 'root-run',
+      rootRunId: 'root-run',
+      invocationKind: 'run',
+      createdAt: '2026-04-08T10:05:00.000Z',
+    });
+    const steer = vi.fn(async () => undefined);
+
+    const app = await createGatewayServer(baseConfig, {
+      auth: createStaticAuthProvider(['member']),
+      stores,
+      agentRegistry: createGatewayTestAgentRegistry({
+        steer,
+        runtimeRuns: {
+          'root-run': { id: 'root-run', rootRunId: 'root-run', status: 'awaiting_subagent', currentChildRunId: 'child-run' },
+          'child-run': { id: 'child-run', rootRunId: 'root-run', parentRunId: 'root-run', status: 'awaiting_subagent', currentChildRunId: 'grandchild-run' },
+          'grandchild-run': { id: 'grandchild-run', rootRunId: 'root-run', parentRunId: 'child-run', status: 'planning' },
+        },
+      }),
+    });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/sessions/session-steer-active-1/steer',
+      headers: { authorization: 'Bearer owner-token' },
+      payload: { message: 'Session steer.' },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      status: 'steered',
+      sessionId: 'session-steer-active-1',
+      requestedRunId: 'root-run',
+      resolvedTargetRunId: 'grandchild-run',
+      resolution: 'session-active',
+      role: 'user',
+    });
+    expect(steer).toHaveBeenCalledWith('grandchild-run', { message: 'Session steer.' });
+  });
+
+  it('rejects leaf steering when an awaiting_subagent run has no current child', async () => {
+    const stores = createInMemoryGatewayStores();
+    await createStoredSession(stores, {
+      id: 'session-steer-missing-child-1',
+      channelId: 'web',
+      authSubject: 'owner-token',
+      agentId: 'support-agent',
+      invocationMode: 'run',
+      status: 'running',
+      currentRunId: 'parent-run',
+      currentRootRunId: 'parent-run',
+    });
+    await stores.sessionRunLinks.append({
+      sessionId: 'session-steer-missing-child-1',
+      runId: 'parent-run',
+      rootRunId: 'parent-run',
+      invocationKind: 'run',
+      createdAt: '2026-04-08T10:05:00.000Z',
+    });
+
+    const app = await createGatewayServer(baseConfig, {
+      auth: createStaticAuthProvider(['member']),
+      stores,
+      agentRegistry: createGatewayTestAgentRegistry({
+        steer: vi.fn(async () => undefined),
+        runtimeRuns: {
+          'parent-run': { id: 'parent-run', rootRunId: 'parent-run', status: 'awaiting_subagent' },
+        },
+      }),
+    });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/runs/parent-run/steer',
+      headers: { authorization: 'Bearer owner-token' },
+      payload: { message: 'Adjust course.' },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ code: 'missing_current_child_run' });
   });
 
   it('rejects run interrupt from a non-admin principal that did not initiate the run', async () => {

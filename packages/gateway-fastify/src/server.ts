@@ -22,7 +22,7 @@ import {
 } from './channels.js';
 import { executeGatewayChatTurn } from './chat.js';
 import { resolveGatewayRequestLogLevel, resolveGatewayRequestLoggerEnabled, type GatewayConfig } from './config.js';
-import type { JsonObject, JsonValue } from './core.js';
+import type { JsonObject, JsonValue, RuntimeRunRecord, RuntimeRunStore } from './core.js';
 import {
   DashboardDeleteConflictError,
   deleteDashboardEmptySessions,
@@ -47,7 +47,7 @@ import {
 import { executeHookSlot } from './hooks.js';
 import { restoreActiveSession } from './reconnect.js';
 import type { ResolvedGatewayAuthProvider, ResolvedGatewayHooks } from './registries.js';
-import { executeGatewayApprovalResolution, executeGatewayClarificationResolution, executeGatewayRunRetry, executeGatewayRunStart } from './run.js';
+import { executeGatewayApprovalResolution, executeGatewayClarificationResolution, executeGatewayRunContinue, executeGatewayRunRetry, executeGatewayRunStart } from './run.js';
 import { createGatewayLogger, type GatewayLogger } from './observability.js';
 import { subscribeToForwardedRealtimeEvents } from './realtime-events.js';
 import { getAuthorizedGatewaySession, openGatewaySession } from './session.js';
@@ -794,7 +794,7 @@ function registerDashboardRunRoutes(app: FastifyInstance, context: DashboardRunR
     }
   });
 
-  app.post<{ Params: { runId: string }; Body: { message?: unknown; role?: unknown; metadata?: JsonObject } }>('/api/runs/:runId/steer', async (request, reply) => {
+  app.post<{ Params: { runId: string }; Querystring: { mode?: string }; Body: { message?: unknown; role?: unknown; metadata?: JsonObject } }>('/api/runs/:runId/steer', async (request, reply) => {
     const authContext = await requireGatewayAuthenticatedHttpRequest(request, reply, context.auth, 'Run steer');
     if (!authContext) {
       return reply;
@@ -815,18 +815,30 @@ function registerDashboardRunRoutes(app: FastifyInstance, context: DashboardRunR
       role = rawRole;
     }
 
+    const mode = request.query.mode ?? 'leaf';
+    if (mode !== 'exact' && mode !== 'leaf') {
+      return reply.code(400).send(createGatewayHttpError('invalid_frame', 'Steer mode must be "exact" or "leaf".'));
+    }
+
     try {
       await assertRunActionAuthorized(request.params.runId, authContext, context, 'steer');
       const agent = await resolveAgentForRun(request.params.runId, context);
       if (!agent.agent.steer) {
         return reply.code(409).send(createGatewayHttpError('unsupported_action', `Agent does not support steer for run "${request.params.runId}".`));
       }
-      await agent.agent.steer(request.params.runId, {
+      const resolved = await resolveSteerTargetForRun(request.params.runId, mode, agent.runtime.runStore);
+      await agent.agent.steer(resolved.resolvedTargetRunId, {
         message,
         ...(role ? { role } : {}),
         ...(request.body?.metadata ? { metadata: request.body.metadata } : {}),
       });
-      return { runId: request.params.runId, status: 'steered', role: role ?? 'user' };
+      return {
+        status: 'steered',
+        requestedRunId: request.params.runId,
+        resolvedTargetRunId: resolved.resolvedTargetRunId,
+        resolution: mode,
+        role: role ?? 'user',
+      };
     } catch (error) {
       if (error instanceof AgentResolutionError) {
         return reply.code(error.statusCode).send(createGatewayHttpError(error.code, error.message, error.details));
@@ -836,6 +848,76 @@ function registerDashboardRunRoutes(app: FastifyInstance, context: DashboardRunR
       }
       if (error instanceof GatewayAuthError) {
         return reply.code(error.statusCode).send(createAuthErrorFrame(error));
+      }
+      if (error instanceof SteerResolutionError) {
+        return reply.code(error.statusCode).send(createGatewayHttpError(error.code, error.message, error.details));
+      }
+      if (error instanceof Error && /requires an active run/.test(error.message)) {
+        return reply.code(409).send(createGatewayHttpError('run_not_active', error.message));
+      }
+      throw error;
+    }
+  });
+
+  app.post<{ Params: { sessionId: string }; Body: { message?: unknown; role?: unknown; metadata?: JsonObject } }>('/api/sessions/:sessionId/steer', async (request, reply) => {
+    const authContext = await requireGatewayAuthenticatedHttpRequest(request, reply, context.auth, 'Session steer');
+    if (!authContext) {
+      return reply;
+    }
+    if (!context.agentRegistry) {
+      return reply.code(503).send(createGatewayHttpError('agent_registry_unavailable', 'Session steer requires an agent registry.'));
+    }
+    const message = request.body?.message;
+    if (typeof message !== 'string' || message.trim() === '') {
+      return reply.code(400).send(createGatewayHttpError('invalid_frame', 'Request body must include a non-empty string field "message".'));
+    }
+    const rawRole = request.body?.role;
+    let role: 'user' | 'system' | undefined;
+    if (rawRole !== undefined) {
+      if (rawRole !== 'user' && rawRole !== 'system') {
+        return reply.code(400).send(createGatewayHttpError('invalid_frame', 'Field "role" must be "user" or "system" when provided.'));
+      }
+      role = rawRole;
+    }
+
+    try {
+      const session = await getAuthorizedGatewaySession(request.params.sessionId, {
+        stores: context.stores,
+        authContext,
+        requestedChannelId: undefined,
+      });
+      const agent = session.agentId && context.agentRegistry.has(session.agentId)
+        ? await context.agentRegistry.getAgent(session.agentId)
+        : await resolveAgentForRun(session.currentRunId ?? session.currentRootRunId ?? '', context);
+      if (!agent.agent.steer) {
+        return reply.code(409).send(createGatewayHttpError('unsupported_action', `Agent does not support steer for session "${request.params.sessionId}".`));
+      }
+      const resolved = await resolveSteerTargetForSession(session.id, context, agent.runtime.runStore);
+      await agent.agent.steer(resolved.resolvedTargetRunId, {
+        message,
+        ...(role ? { role } : {}),
+        ...(request.body?.metadata ? { metadata: request.body.metadata } : {}),
+      });
+      return {
+        status: 'steered',
+        sessionId: session.id,
+        requestedRunId: resolved.requestedRunId,
+        resolvedTargetRunId: resolved.resolvedTargetRunId,
+        resolution: 'session-active',
+        role: role ?? 'user',
+      };
+    } catch (error) {
+      if (error instanceof AgentResolutionError) {
+        return reply.code(error.statusCode).send(createGatewayHttpError(error.code, error.message, error.details));
+      }
+      if (error instanceof ProtocolValidationError) {
+        return reply.code(error.code === 'session_forbidden' ? 403 : 409).send(createGatewayHttpError(error.code, error.message, error.details));
+      }
+      if (error instanceof GatewayAuthError) {
+        return reply.code(error.statusCode).send(createAuthErrorFrame(error));
+      }
+      if (error instanceof SteerResolutionError) {
+        return reply.code(error.statusCode).send(createGatewayHttpError(error.code, error.message, error.details));
       }
       if (error instanceof Error && /requires an active run/.test(error.message)) {
         return reply.code(409).send(createGatewayHttpError('run_not_active', error.message));
@@ -856,6 +938,135 @@ class AgentResolutionError extends Error {
     this.statusCode = statusCode;
     this.details = details;
   }
+}
+
+class SteerResolutionError extends Error {
+  readonly code: string;
+  readonly statusCode: number;
+  readonly details?: JsonObject;
+  constructor(code: string, message: string, statusCode: number, details?: JsonObject) {
+    super(message);
+    this.name = 'SteerResolutionError';
+    this.code = code;
+    this.statusCode = statusCode;
+    this.details = details;
+  }
+}
+
+type SteerResolutionMode = 'exact' | 'leaf' | 'session-active';
+
+interface ResolvedSteerTarget {
+  requestedRunId: string;
+  resolvedTargetRunId: string;
+  resolution: SteerResolutionMode;
+}
+
+const STEER_ALLOWED_RUN_STATUSES = new Set(['running', 'planning', 'queued']);
+const STEER_TERMINAL_RUN_STATUSES = new Set(['interrupted', 'succeeded', 'failed', 'replan_required', 'cancelled']);
+
+async function resolveSteerTargetForRun(
+  runId: string,
+  mode: 'exact' | 'leaf',
+  runStore: RuntimeRunStore,
+): Promise<ResolvedSteerTarget> {
+  const run = await requireRuntimeRun(runId, runStore);
+  if (mode === 'exact') {
+    assertExactSteerable(run);
+    return { requestedRunId: runId, resolvedTargetRunId: run.id, resolution: 'exact' };
+  }
+
+  const leaf = await resolveActiveLeafRun(run, runStore);
+  return { requestedRunId: runId, resolvedTargetRunId: leaf.id, resolution: 'leaf' };
+}
+
+async function resolveSteerTargetForSession(
+  sessionId: string,
+  context: DashboardRunRouteContext,
+  runStore: RuntimeRunStore,
+): Promise<ResolvedSteerTarget> {
+  const session = await context.stores.sessions.get(sessionId);
+  if (!session) {
+    throw new SteerResolutionError('session_not_found', `Session "${sessionId}" does not exist.`, 404, { sessionId });
+  }
+
+  const candidateIds = new Set<string>();
+  if (session.currentRunId) {
+    candidateIds.add(session.currentRunId);
+  }
+  if (session.currentRootRunId) {
+    candidateIds.add(session.currentRootRunId);
+  }
+  const links = await context.stores.sessionRunLinks.listBySession(sessionId);
+  for (const link of links) {
+    candidateIds.add(link.runId);
+    candidateIds.add(link.rootRunId);
+  }
+
+  const activeRuns: RuntimeRunRecord[] = [];
+  for (const candidateId of candidateIds) {
+    const candidate = await runStore.getRun(candidateId);
+    if (candidate && (STEER_ALLOWED_RUN_STATUSES.has(candidate.status) || candidate.status === 'awaiting_subagent')) {
+      activeRuns.push(candidate);
+    }
+  }
+
+  const requestedRuns = activeRuns.filter((run) => !run.parentRunId || !activeRuns.some((candidate) => candidate.id === run.parentRunId));
+  if (requestedRuns.length !== 1) {
+    throw new SteerResolutionError(
+      'ambiguous_session_active_run',
+      `Session "${sessionId}" does not have exactly one active run to steer.`,
+      409,
+      { sessionId, activeRunIds: requestedRuns.map((run) => run.id) },
+    );
+  }
+
+  const leaf = await resolveActiveLeafRun(requestedRuns[0]!, runStore);
+  return { requestedRunId: requestedRuns[0]!.id, resolvedTargetRunId: leaf.id, resolution: 'session-active' };
+}
+
+async function resolveActiveLeafRun(run: RuntimeRunRecord, runStore: RuntimeRunStore): Promise<RuntimeRunRecord> {
+  let current = run;
+  const seen = new Set<string>();
+  while (current.status === 'awaiting_subagent') {
+    if (!current.currentChildRunId) {
+      throw new SteerResolutionError('missing_current_child_run', `Run "${current.id}" is awaiting a subagent but has no currentChildRunId.`, 409, { runId: current.id });
+    }
+    if (seen.has(current.id)) {
+      throw new SteerResolutionError('cyclic_child_run', `Run hierarchy under "${run.id}" contains a cycle.`, 409, { runId: current.id });
+    }
+    seen.add(current.id);
+    current = await requireRuntimeRun(current.currentChildRunId, runStore);
+  }
+  assertLeafSteerable(current);
+  return current;
+}
+
+async function requireRuntimeRun(runId: string, runStore: RuntimeRunStore): Promise<RuntimeRunRecord> {
+  const run = await runStore.getRun(runId);
+  if (!run) {
+    throw new SteerResolutionError('run_not_found', `Run "${runId}" does not exist.`, 404, { runId });
+  }
+  return run;
+}
+
+function assertExactSteerable(run: RuntimeRunRecord): void {
+  if (run.status === 'awaiting_approval') {
+    throw new SteerResolutionError('run_awaiting_approval', `Run "${run.id}" is awaiting approval; use the approval flow instead of steer.`, 409, { runId: run.id, status: run.status });
+  }
+  if (run.status === 'clarification_requested') {
+    throw new SteerResolutionError('run_clarification_requested', `Run "${run.id}" requested clarification; use the clarification flow instead of steer.`, 409, { runId: run.id, status: run.status });
+  }
+  if (STEER_TERMINAL_RUN_STATUSES.has(run.status)) {
+    throw new SteerResolutionError('run_not_active', `Run "${run.id}" is ${run.status}; steer requires an active run.`, 409, { runId: run.id, status: run.status });
+  }
+}
+
+function assertLeafSteerable(run: RuntimeRunRecord): void {
+  if (STEER_ALLOWED_RUN_STATUSES.has(run.status)) {
+    return;
+  }
+  assertExactSteerable(run);
+  throw new SteerResolutionError('run_not_steerable', `Run "${run.id}" is ${run.status}; leaf steering requires a running, planning, or queued run.`, 409, { runId: run.id, status: run.status });
 }
 
 async function resolveAgentForRun(
@@ -1359,6 +1570,24 @@ export async function handleGatewaySocketMessage(
       });
     }
 
+    if (frame.type === 'run.continue' && context.stores && context.agentRegistry) {
+      return await executeGatewayRunContinue(frame, {
+        gatewayConfig: context.gatewayConfig,
+        agentRegistry: context.agentRegistry,
+        stores: context.stores,
+        authContext: context.authContext,
+        hooks: context.hooks,
+        now: context.now,
+        realtimeEvents: emitRealtimeFrame
+          ? {
+              rootRunId: frame.runId,
+              emitFrame: emitRealtimeFrame,
+            }
+          : undefined,
+        hasRuntimeObserver: context.hasRuntimeObserver,
+      });
+    }
+
     if (frame.type === 'approval.resolve' && context.stores && context.agentRegistry) {
       return await executeGatewayApprovalResolution(frame, {
         gatewayConfig: context.gatewayConfig,
@@ -1611,6 +1840,17 @@ function summarizeInboundFrameForLogging(frame: InboundFrame): JsonObject {
         frameType: frame.type,
         sessionId: frame.sessionId,
         runId: frame.runId,
+        hasMetadata: frame.metadata !== undefined,
+      };
+    case 'run.continue':
+      return {
+        frameType: frame.type,
+        sessionId: frame.sessionId,
+        runId: frame.runId,
+        strategy: frame.strategy,
+        provider: frame.provider,
+        model: frame.model,
+        requireApproval: frame.requireApproval,
         hasMetadata: frame.metadata !== undefined,
       };
     case 'approval.resolve':

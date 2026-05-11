@@ -73,6 +73,10 @@ export interface SessionListItem {
   status?: string;
   goals: Array<{
     rootRunId: string;
+    runId: string;
+    status: string | null;
+    startedAt: string | null;
+    completedAt: string | null;
     goal: string | null;
     linkedAt: string;
   }>;

@@ -14,6 +14,7 @@ import { InMemoryRunStore } from './in-memory-run-store.js';
 import { InMemorySnapshotStore } from './in-memory-snapshot-store.js';
 import { InMemoryToolExecutionStore } from './in-memory-tool-execution-store.js';
 import { createReadFileTool } from './tools/read-file.js';
+import { createWriteFileTool } from './tools/write-file.js';
 import type { ModelAdapter, ModelRequest, ModelResponse, RuntimeStores, ToolDefinition } from './types.js';
 
 class SequenceModel implements ModelAdapter {
@@ -3679,6 +3680,195 @@ describe('AdaptiveAgent', () => {
 
     const finalRun = await runStore.getRun(result.runId);
     expect((finalRun?.metadata as Record<string, unknown> | undefined)?.pendingSteerMessages).toBeUndefined();
+  });
+
+  it('reroutes child steer to the parent when the steer requires a missing child capability', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const parentModel = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'parent-call-1',
+            name: 'delegate.researcher',
+            input: {
+              goal: 'Research Tamil Nadu politics',
+            },
+          },
+        ],
+      },
+      {
+        finishReason: 'stop',
+        text: 'Parent handled deferred steer.',
+      },
+    ]);
+    const childModel = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'child-call-1',
+            name: 'lookup',
+            input: { topic: 'tamil-nadu' },
+          },
+        ],
+      },
+      {
+        finishReason: 'stop',
+        text: 'Child completed research.',
+      },
+    ]);
+
+    let agent!: AdaptiveAgent;
+    const lookupTool: ToolDefinition = {
+      name: 'lookup',
+      description: 'Research helper that triggers a steer.',
+      inputSchema: { type: 'object', additionalProperties: true },
+      execute: async (_input, ctx) => {
+        await agent.steer(ctx.runId, { message: 'Write the final report to tn.html' });
+        return { finding: 'researched:tamil-nadu' };
+      },
+    };
+
+    agent = new AdaptiveAgent({
+      model: parentModel,
+      tools: [lookupTool, createWriteFileTool({ allowedRoot: '/tmp' })],
+      delegates: [
+        {
+          name: 'researcher',
+          description: 'Researches using lookup only.',
+          allowedTools: ['lookup'],
+          model: childModel,
+        },
+      ],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.run({ goal: 'Research and report' });
+    expect(result).toMatchObject({
+      status: 'success',
+      output: 'Parent handled deferred steer.',
+    });
+
+    const childRequestMessages = childModel.receivedRequests[1]?.messages ?? [];
+    expect(
+      childRequestMessages.some(
+        (message) =>
+          message.role === 'user' &&
+          typeof message.content === 'string' &&
+          message.content.includes('Write the final report to tn.html'),
+      ),
+    ).toBe(false);
+
+    const parentRequestMessages = parentModel.receivedRequests[1]?.messages ?? [];
+    expect(
+      parentRequestMessages.some(
+        (message) =>
+          message.role === 'user' &&
+          typeof message.content === 'string' &&
+          message.content === 'Write the final report to tn.html',
+      ),
+    ).toBe(true);
+
+    const parentRun = await runStore.getRun(result.runId);
+    expect((parentRun?.metadata as Record<string, unknown> | undefined)?.pendingSteerMessages).toBeUndefined();
+  });
+
+  it('keeps child steer on the child when no extra capability is required', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const parentModel = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'parent-call-1',
+            name: 'delegate.researcher',
+            input: {
+              goal: 'Research Tamil Nadu politics',
+            },
+          },
+        ],
+      },
+      {
+        finishReason: 'stop',
+        text: 'Parent completed.',
+      },
+    ]);
+    const childModel = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'child-call-1',
+            name: 'lookup',
+            input: { topic: 'tamil-nadu' },
+          },
+        ],
+      },
+      {
+        finishReason: 'stop',
+        text: 'Child incorporated steer.',
+      },
+    ]);
+
+    let agent!: AdaptiveAgent;
+    const lookupTool: ToolDefinition = {
+      name: 'lookup',
+      description: 'Research helper that triggers a steer.',
+      inputSchema: { type: 'object', additionalProperties: true },
+      execute: async (_input, ctx) => {
+        await agent.steer(ctx.runId, { message: 'Focus more on alliance reactions.' });
+        return { finding: 'researched:tamil-nadu' };
+      },
+    };
+
+    agent = new AdaptiveAgent({
+      model: parentModel,
+      tools: [lookupTool, createWriteFileTool({ allowedRoot: '/tmp' })],
+      delegates: [
+        {
+          name: 'researcher',
+          description: 'Researches using lookup only.',
+          allowedTools: ['lookup'],
+          model: childModel,
+        },
+      ],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.run({ goal: 'Research and report' });
+    expect(result).toMatchObject({
+      status: 'success',
+      output: 'Parent completed.',
+    });
+
+    const childRequestMessages = childModel.receivedRequests[1]?.messages ?? [];
+    expect(
+      childRequestMessages.some(
+        (message) =>
+          message.role === 'user' &&
+          typeof message.content === 'string' &&
+          message.content === 'Focus more on alliance reactions.',
+      ),
+    ).toBe(true);
+
+    const parentRequestMessages = parentModel.receivedRequests[1]?.messages ?? [];
+    expect(
+      parentRequestMessages.some(
+        (message) =>
+          message.role === 'user' &&
+          typeof message.content === 'string' &&
+          message.content === 'Focus more on alliance reactions.',
+      ),
+    ).toBe(false);
   });
 
   it('rejects steering for a terminal run', async () => {

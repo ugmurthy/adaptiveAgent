@@ -6,6 +6,30 @@ export type CaptureMode = 'full' | 'summary' | 'none';
 export type ToolBudgetExhaustedAction = 'fail' | 'continue_with_warning' | 'ask_model';
 export type ResearchPolicyName = 'none' | 'light' | 'standard' | 'deep';
 
+export type ContinuationStrategy =
+  | 'hybrid_snapshot_then_step'
+  | 'latest_snapshot'
+  | 'last_successful_step'
+  | 'failure_boundary'
+  | 'manual_checkpoint';
+
+export type RecoveryDecision =
+  | 'not_recoverable'
+  | 'retry_same_run'
+  | 'continue_new_run'
+  | 'requires_reconciliation'
+  | 'requires_user_action';
+
+export type FailureClass =
+  | 'provider_transient'
+  | 'provider_terminal'
+  | 'agent_invalid_output'
+  | 'tool_uncertain'
+  | 'tool_failed'
+  | 'user_action_required'
+  | 'policy_blocked'
+  | 'unknown';
+
 interface CoreRuntimeModule {
   createAdaptiveAgent(options: CreateAdaptiveAgentOptions): unknown;
   createAdaptiveAgentLogger(options?: AdaptiveAgentLoggerOptions): AdaptiveAgentLogger;
@@ -147,6 +171,42 @@ export type RunResult<TOutput extends JsonValue = JsonValue> =
 
 export type ChatResult<TOutput extends JsonValue = JsonValue> = RunResult<TOutput>;
 
+export interface RunRecoveryOptions {
+  runId: string;
+  continuable: boolean;
+  decision: RecoveryDecision;
+  failureClass: FailureClass;
+  reason: string;
+  recommendedStrategy?: ContinuationStrategy;
+  recommendedProvider?: string;
+  recommendedModel?: string;
+  sourceSnapshotId?: string;
+  sourceSnapshotSeq?: number;
+  lastSafeEventSeq?: number;
+  lastCompletedStepId?: string;
+  nextStepId?: string;
+  requiresReconciliation?: boolean;
+  unsafeReason?: string;
+}
+
+export interface ContinueRunOptions {
+  fromRunId: string;
+  strategy?: ContinuationStrategy;
+  provider?: string;
+  model?: string;
+  metadata?: Record<string, JsonValue>;
+  requireApproval?: boolean;
+}
+
+export interface ContinueRunResult {
+  sourceRunId: string;
+  continuationRunId: string;
+  strategy: ContinuationStrategy;
+  sourceSnapshotSeq?: number;
+  lastCompletedStepId?: string;
+  nextStepId?: string;
+}
+
 export interface RuntimeRunRecord {
   id: string;
   rootRunId: string;
@@ -194,6 +254,9 @@ export interface AdaptiveAgentHandle {
   resolveClarification?(runId: string, message: string): Promise<RunResult>;
   resume?(runId: string): Promise<RunResult>;
   retry?(runId: string): Promise<RunResult>;
+  getRecoveryOptions?(runId: string): Promise<RunRecoveryOptions>;
+  createContinuationRun?(options: ContinueRunOptions): Promise<ContinueRunResult>;
+  continueRun?(options: ContinueRunOptions): Promise<RunResult>;
   interrupt?(runId: string): Promise<void>;
   steer?(runId: string, input: string | { message: string; role?: 'user' | 'system'; metadata?: JsonObject }): Promise<void>;
 }

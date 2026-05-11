@@ -151,6 +151,10 @@ export async function listSessions(client: PostgresClient): Promise<SessionListI
         jsonb_agg(
           jsonb_build_object(
             'rootRunId', l.root_run_id,
+            'runId', l.run_id,
+            'status', r.status,
+            'startedAt', r.created_at,
+            'completedAt', r.completed_at,
             'goal', r.goal,
             'linkedAt', l.created_at
           )
@@ -213,11 +217,23 @@ function parseSessionGoals(value: unknown): SessionListItem['goals'] {
       return [];
     }
     const record = item as Record<string, unknown>;
-    if (typeof record.rootRunId !== 'string' || (record.goal !== null && typeof record.goal !== 'string') || typeof record.linkedAt !== 'string') {
+    if (
+      typeof record.rootRunId !== 'string'
+      || typeof record.runId !== 'string'
+      || (record.status !== null && typeof record.status !== 'string')
+      || (record.startedAt !== null && typeof record.startedAt !== 'string')
+      || (record.completedAt !== null && typeof record.completedAt !== 'string')
+      || (record.goal !== null && typeof record.goal !== 'string')
+      || typeof record.linkedAt !== 'string'
+    ) {
       return [];
     }
     return [{
       rootRunId: record.rootRunId,
+      runId: record.runId,
+      status: record.status,
+      startedAt: record.startedAt,
+      completedAt: record.completedAt,
       goal: record.goal,
       linkedAt: record.linkedAt,
     }];

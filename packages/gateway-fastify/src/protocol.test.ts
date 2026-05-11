@@ -106,6 +106,58 @@ describe('gateway protocol validation', () => {
     });
   });
 
+  it('parses run.continue frames with model overrides', () => {
+    const frame = parseInboundFrame(
+      JSON.stringify({
+        type: 'run.continue',
+        sessionId: 'session-1',
+        runId: 'run-1',
+        provider: 'openrouter',
+        model: 'anthropic/claude-3.7-sonnet',
+        strategy: 'hybrid_snapshot_then_step',
+        requireApproval: true,
+        metadata: { source: 'test' },
+      }),
+    );
+
+    expect(frame).toEqual({
+      type: 'run.continue',
+      sessionId: 'session-1',
+      runId: 'run-1',
+      provider: 'openrouter',
+      model: 'anthropic/claude-3.7-sonnet',
+      strategy: 'hybrid_snapshot_then_step',
+      requireApproval: true,
+      metadata: { source: 'test' },
+    });
+  });
+
+  it('parses session-only run.continue frames for server-side inference', () => {
+    const frame = parseInboundFrame(
+      JSON.stringify({
+        type: 'run.continue',
+        sessionId: 'session-1',
+      }),
+    );
+
+    expect(frame).toEqual({
+      type: 'run.continue',
+      sessionId: 'session-1',
+      runId: undefined,
+      provider: undefined,
+      model: undefined,
+      strategy: undefined,
+      requireApproval: undefined,
+      metadata: undefined,
+    });
+  });
+
+  it('rejects run.continue without a sessionId or runId', () => {
+    expectInvalidFrameIssue(() => parseInboundFrame(JSON.stringify({
+      type: 'run.continue',
+    })), 'frame.sessionId or frame.runId must be provided.');
+  });
+
   it('maps invalid JSON to a stable protocol error', () => {
     expect(() => parseInboundFrame('{"type":"ping"')).toThrowError(ProtocolValidationError);
 

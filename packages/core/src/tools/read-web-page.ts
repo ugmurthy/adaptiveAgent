@@ -1,4 +1,5 @@
 import type { ToolDefinition } from '../types.js';
+import { extractPdfTextWithPdfJs } from './pdf-text.js';
 
 export interface ReadWebPageToolConfig {
   /** Maximum response body size in bytes. Defaults to 512 KiB. */
@@ -255,46 +256,6 @@ function decodeHtmlEntities(text: string): string {
     .replace(/&nbsp;/g, ' ')
     .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
     .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
-}
-
-async function extractPdfTextWithPdfJs(rawBuffer: ArrayBuffer): Promise<{ title: string; text: string }> {
-  const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
-  const document = await pdfjs.getDocument({
-    data: new Uint8Array(rawBuffer),
-    useWorkerFetch: false,
-    isEvalSupported: false,
-  }).promise;
-
-  try {
-    const metadata = await document.getMetadata().catch(() => null);
-    const title = normalizePdfTitle(metadata?.info?.Title);
-    const pageTexts: string[] = [];
-
-    for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
-      const page = await document.getPage(pageNumber);
-      const content = await page.getTextContent();
-      const lines = content.items
-        .map((item) => ('str' in item ? item.str : ''))
-        .join(' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-
-      if (lines) {
-        pageTexts.push(lines);
-      }
-    }
-
-    return {
-      title,
-      text: pageTexts.join('\n\n').trim(),
-    };
-  } finally {
-    await document.destroy();
-  }
-}
-
-function normalizePdfTitle(value: unknown): string {
-  return typeof value === 'string' ? value.trim() : '';
 }
 
 function normalizeReadWebPageError(error: unknown, url: string): RecoverableReadWebPageError {

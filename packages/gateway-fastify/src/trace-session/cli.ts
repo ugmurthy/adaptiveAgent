@@ -150,8 +150,11 @@ export async function main(): Promise<void> {
     if ((options.listSessions || options.listSessionless || options.deleteEmptyGoalSessions || options.usageOnly) && (options.messages || options.systemOnly)) {
       throw new Error(`--messages and --system-only can only be used when rendering a full trace.\n\n${USAGE}`);
     }
-    if ((options.listSessions || options.listSessionless || options.deleteEmptyGoalSessions || options.usageOnly) && (options.view || options.messagesView || options.focusRunId || options.previewChars)) {
-      throw new Error(`--view, --messages-view, --focus-run, and --preview-chars can only be used when rendering a full trace.\n\n${USAGE}`);
+    if ((options.listSessions || options.listSessionless || options.deleteEmptyGoalSessions || options.usageOnly) && (options.view || options.messagesView || options.focusRunId)) {
+      throw new Error(`--view, --messages-view, and --focus-run can only be used when rendering a full trace.\n\n${USAGE}`);
+    }
+    if ((options.listSessionless || options.deleteEmptyGoalSessions || options.usageOnly) && options.previewChars) {
+      throw new Error(`--preview-chars can only be used with --ls or when rendering a full trace.\n\n${USAGE}`);
     }
     if (options.usageOnly && options.sessionId && options.rootRunId) {
       throw new Error(`--usage prints all linked root runs for a session and does not accept --root-run.\n\n${USAGE}`);

@@ -1,4 +1,4 @@
-import type { ImageDetail, ImageInput, JsonObject, JsonValue } from './core.js';
+import type { ContinuationStrategy, ImageDetail, ImageInput, JsonObject, JsonValue } from './core.js';
 import type { InvocationMode } from './config.js';
 
 export const INBOUND_FRAME_TYPES = [
@@ -6,6 +6,7 @@ export const INBOUND_FRAME_TYPES = [
   'message.send',
   'run.start',
   'run.retry',
+  'run.continue',
   'approval.resolve',
   'clarification.resolve',
   'channel.subscribe',
@@ -89,6 +90,17 @@ export interface RunRetryFrame {
   metadata?: JsonObject;
 }
 
+export interface RunContinueFrame {
+  type: 'run.continue';
+  sessionId?: string;
+  runId?: string;
+  strategy?: ContinuationStrategy;
+  provider?: string;
+  model?: string;
+  requireApproval?: boolean;
+  metadata?: JsonObject;
+}
+
 export interface ApprovalResolveFrame {
   type: 'approval.resolve';
   sessionId: string;
@@ -125,6 +137,7 @@ export type InboundFrame =
   | MessageSendFrame
   | RunStartFrame
   | RunRetryFrame
+  | RunContinueFrame
   | ApprovalResolveFrame
   | ClarificationResolveFrame
   | ChannelSubscribeFrame
@@ -273,6 +286,9 @@ export function validateInboundFrame(value: unknown): InboundFrame {
     case 'run.retry': {
       return validateRunRetryFrame(frame, issues);
     }
+    case 'run.continue': {
+      return validateRunContinueFrame(frame, issues);
+    }
     case 'approval.resolve': {
       return validateApprovalResolveFrame(frame, issues);
     }
@@ -296,6 +312,27 @@ function validateRunRetryFrame(frame: Record<string, unknown>, issues: string[])
     type: 'run.retry',
     sessionId: expectOptionalNonEmptyString(frame.sessionId, 'frame.sessionId', issues),
     runId: expectNonEmptyString(frame.runId, 'frame.runId', issues) ?? 'invalid-run-id',
+    metadata: expectOptionalJsonObject(frame.metadata, 'frame.metadata', issues),
+  };
+
+  return finalizeFrame(validatedFrame, issues);
+}
+
+function validateRunContinueFrame(frame: Record<string, unknown>, issues: string[]): RunContinueFrame {
+  const sessionId = expectOptionalNonEmptyString(frame.sessionId, 'frame.sessionId', issues);
+  const runId = expectOptionalNonEmptyString(frame.runId, 'frame.runId', issues);
+  if (!sessionId && !runId) {
+    issues.push('frame.sessionId or frame.runId must be provided.');
+  }
+
+  const validatedFrame: RunContinueFrame = {
+    type: 'run.continue',
+    sessionId,
+    runId,
+    strategy: expectOptionalContinuationStrategy(frame.strategy, 'frame.strategy', issues),
+    provider: expectOptionalNonEmptyString(frame.provider, 'frame.provider', issues),
+    model: expectOptionalNonEmptyString(frame.model, 'frame.model', issues),
+    requireApproval: expectOptionalBoolean(frame.requireApproval, 'frame.requireApproval', issues),
     metadata: expectOptionalJsonObject(frame.metadata, 'frame.metadata', issues),
   };
 
@@ -486,6 +523,14 @@ function expectBoolean(value: unknown, path: string, issues: string[]): boolean 
   return undefined;
 }
 
+function expectOptionalBoolean(value: unknown, path: string, issues: string[]): boolean | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  return expectBoolean(value, path, issues);
+}
+
 function expectNonEmptyString(value: unknown, path: string, issues: string[]): string | undefined {
   if (typeof value === 'string' && value.trim().length > 0) {
     return value;
@@ -501,6 +546,31 @@ function expectOptionalNonEmptyString(value: unknown, path: string, issues: stri
   }
 
   return expectNonEmptyString(value, path, issues);
+}
+
+const CONTINUATION_STRATEGIES = new Set<ContinuationStrategy>([
+  'hybrid_snapshot_then_step',
+  'latest_snapshot',
+  'last_successful_step',
+  'failure_boundary',
+  'manual_checkpoint',
+]);
+
+function expectOptionalContinuationStrategy(
+  value: unknown,
+  path: string,
+  issues: string[],
+): ContinuationStrategy | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (typeof value === 'string' && CONTINUATION_STRATEGIES.has(value as ContinuationStrategy)) {
+    return value as ContinuationStrategy;
+  }
+
+  issues.push(`${path} must be a supported continuation strategy.`);
+  return undefined;
 }
 
 function expectStringArray(value: unknown, path: string, issues: string[]): string[] | undefined {

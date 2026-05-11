@@ -7,6 +7,7 @@ import {
   getInteractiveSessionMode,
   isTopLevelTerminalRunEvent,
   parseClarifyCommand,
+  parseContinueCommand,
   parseEventsCommand,
   parseInterruptCommand,
   parseRetryCommand,
@@ -197,6 +198,38 @@ describe('recordRootRunRetryTarget', () => {
   });
 });
 
+describe('parseContinueCommand', () => {
+  it('uses the most recent failed run when no runId is supplied', () => {
+    expect(parseContinueCommand('/continue', 'run-failed')).toEqual({
+      runId: 'run-failed',
+    });
+  });
+
+  it('allows session-based inference when no runId is known', () => {
+    expect(parseContinueCommand('/continue')).toEqual({});
+  });
+
+  it('parses provider and model overrides', () => {
+    expect(parseContinueCommand('/continue run-1 --provider openrouter --model anthropic/claude-3.7-sonnet')).toEqual({
+      runId: 'run-1',
+      provider: 'openrouter',
+      model: 'anthropic/claude-3.7-sonnet',
+    });
+  });
+
+  it('accepts the /contine typo alias and continuation options', () => {
+    expect(parseContinueCommand('/contine --strategy latest_snapshot --approve', 'run-1')).toEqual({
+      runId: 'run-1',
+      strategy: 'latest_snapshot',
+      requireApproval: true,
+    });
+  });
+
+  it('rejects extra positional arguments', () => {
+    expect(() => parseContinueCommand('/continue run-1 run-2')).toThrow('Usage: /continue');
+  });
+});
+
 describe('createAutoApprovalResolveFrame', () => {
   it('creates an approval.resolve frame and clears pending approval tracking', () => {
     const state = {
@@ -321,10 +354,21 @@ describe('parseSteerCommand', () => {
     });
   });
 
+  it('parses session-active and exact steering forms', () => {
+    expect(parseSteerCommand('/steer please stop after this step')).toEqual({
+      message: 'please stop after this step',
+    });
+    expect(parseSteerCommand('/steer --exact run-1 steer only this run')).toEqual({
+      runId: 'run-1',
+      message: 'steer only this run',
+      mode: 'exact',
+    });
+  });
+
   it('rejects invalid steering commands', () => {
-    expect(() => parseSteerCommand('/steer')).toThrow('Usage: /steer [--role user|system] <runId> <message>');
+    expect(() => parseSteerCommand('/steer')).toThrow('Usage: /steer [--exact] [--role user|system] [<runId>] <message>');
     expect(() => parseSteerCommand('/steer --role assistant run-1 no')).toThrow(
-      'Usage: /steer [--role user|system] <runId> <message>',
+      'Usage: /steer [--exact] [--role user|system] [<runId>] <message>',
     );
   });
 });

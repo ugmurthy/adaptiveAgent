@@ -8,6 +8,7 @@ import type {
   ApprovalRequestedFrame,
   ApprovalResolveFrame,
   ClarificationResolveFrame,
+  RunContinueFrame,
   RunOutputFrame,
   RunRetryFrame,
   RunStartFrame,
@@ -56,6 +57,17 @@ export interface ExecuteGatewayClarificationResolutionOptions {
 }
 
 export interface ExecuteGatewayRunRetryOptions {
+  gatewayConfig?: GatewayConfig;
+  agentRegistry: AgentRegistry;
+  stores: GatewayStores;
+  authContext?: GatewayAuthContext;
+  hooks?: ResolvedGatewayHooks;
+  now?: () => Date;
+  realtimeEvents?: Omit<RealtimeEventForwardingContext, 'fallbackAgentId' | 'fallbackSessionId' | 'requestId'>;
+  hasRuntimeObserver?: (rootRunId: string) => boolean;
+}
+
+export interface ExecuteGatewayRunContinueOptions {
   gatewayConfig?: GatewayConfig;
   agentRegistry: AgentRegistry;
   stores: GatewayStores;
@@ -728,6 +740,331 @@ export async function executeGatewayRunRetry(
   } finally {
     await admission?.release();
   }
+}
+
+export async function executeGatewayRunContinue(
+  frame: RunContinueFrame,
+  options: ExecuteGatewayRunContinueOptions,
+): Promise<RunOutputFrame | ApprovalRequestedFrame> {
+  const now = (options.now ?? (() => new Date()))();
+  const nowIso = now.toISOString();
+  const initialSessionRunLink = frame.runId
+    ? (await options.stores.sessionRunLinks.getByRunId(frame.runId)) ??
+      (await resolveLatestSessionRunLinkByRootRunId(options.stores, frame.runId))
+    : undefined;
+  const resolvedSessionId = frame.sessionId ?? initialSessionRunLink?.sessionId;
+  if (!resolvedSessionId) {
+    throw new ProtocolValidationError(
+      'invalid_frame',
+      frame.runId
+        ? `Run "${frame.runId}" is not linked to a continuable run session.`
+        : 'run.continue requires a sessionId when runId is omitted.',
+      {
+        requestType: frame.type,
+        details: frame.runId ? { runId: frame.runId } : undefined,
+      },
+    );
+  }
+
+  const session = await getAuthorizedGatewaySession(resolvedSessionId, {
+    authContext: options.authContext,
+    stores: options.stores,
+    requestType: frame.type,
+  });
+  await runBeforeHook(options.hooks, 'onSessionResolve', frame.type, {
+    authContext: options.authContext,
+    session,
+    metadata: frame.metadata,
+  });
+  assertGatewaySessionWriteAllowed(session, frame.type);
+
+  if (session.invocationMode && session.invocationMode !== 'run') {
+    throw new ProtocolValidationError(
+      'invalid_frame',
+      `Session "${session.id}" is not a run session and cannot continue runs.`,
+      {
+        requestType: frame.type,
+        details: {
+          sessionId: session.id,
+          invocationMode: session.invocationMode ?? null,
+        },
+      },
+    );
+  }
+
+  const agentId = session.agentId;
+  if (!agentId) {
+    throw new ProtocolValidationError(
+      'run_failed',
+      `Session "${session.id}" does not have a routed agent for run continuation.`,
+      {
+        requestType: frame.type,
+        details: { sessionId: session.id, runId: frame.runId ?? null },
+      },
+    );
+  }
+
+  const agent = await options.agentRegistry.getAgent(agentId);
+  if (!agent.agent.getRecoveryOptions || !agent.agent.createContinuationRun || !agent.agent.resume) {
+    throw new ProtocolValidationError(
+      'run_failed',
+      `Agent "${agentId}" does not support run continuation.`,
+      {
+        requestType: frame.type,
+        details: { sessionId: session.id, runId: frame.runId ?? null, agentId },
+      },
+    );
+  }
+
+  const sourceRunId = await resolveContinuationSourceRunId(frame, session, agent, options.stores);
+  const sourceRun = await agent.runtime.runStore.getRun(sourceRunId);
+  const sourceRootRunId = sourceRun?.rootRunId ?? sourceRunId;
+  const recovery = await agent.agent.getRecoveryOptions(sourceRunId);
+  if (!recovery.continuable || recovery.requiresReconciliation) {
+    throw new ProtocolValidationError(
+      'invalid_frame',
+      recovery.unsafeReason ?? recovery.reason ?? `Run "${sourceRunId}" is not continuable.`,
+      {
+        requestType: frame.type,
+        details: {
+          sessionId: session.id,
+          runId: sourceRunId,
+          continuable: recovery.continuable,
+          requiresReconciliation: recovery.requiresReconciliation ?? false,
+          decision: recovery.decision,
+          failureClass: recovery.failureClass,
+        },
+      },
+    );
+  }
+
+  const runningSession = await tryAcquireGatewaySessionRun(session, {
+    stores: options.stores,
+    requestType: frame.type,
+    expectedAllowedStatuses: ['idle', 'failed'],
+    patch: {
+      status: 'running',
+      currentRunId: sourceRunId,
+      currentRootRunId: sourceRootRunId,
+      updatedAt: nowIso,
+    },
+  });
+  let admission: AcquiredRunAdmission | undefined;
+
+  try {
+    admission = await acquireRunAdmission({
+      stores: options.stores,
+      concurrency: resolveGatewayConcurrencyConfig(options.gatewayConfig?.concurrency),
+      agentId,
+      tenantId: runningSession.tenantId,
+      sessionId: runningSession.id,
+      requestType: frame.type,
+      now,
+    });
+
+    const continuation = await agent.agent.createContinuationRun({
+      fromRunId: sourceRunId,
+      ...(frame.strategy ? { strategy: frame.strategy } : {}),
+      ...(frame.provider ? { provider: frame.provider } : {}),
+      ...(frame.model ? { model: frame.model } : {}),
+      ...(frame.requireApproval === undefined ? {} : { requireApproval: frame.requireApproval }),
+      metadata: {
+        ...(frame.metadata ?? {}),
+        gateway: {
+          action: 'continue',
+          sessionId: runningSession.id,
+          agentId,
+          sourceRunId,
+          ...(frame.provider ? { requestedProvider: frame.provider } : {}),
+          ...(frame.model ? { requestedModel: frame.model } : {}),
+        },
+      },
+    });
+    const continuationRootRunId =
+      (await resolveRootRunId(agent.runtime.runStore, continuation.continuationRunId)) ?? continuation.continuationRunId;
+
+    await options.stores.sessionRunLinks.append({
+      sessionId: runningSession.id,
+      runId: continuation.continuationRunId,
+      rootRunId: continuationRootRunId,
+      invocationKind: 'run',
+      metadata: frame.metadata,
+      createdAt: nowIso,
+    });
+
+    const continuationSession = await settleSession(options.stores, runningSession, {
+      status: 'running',
+      currentRunId: continuation.continuationRunId,
+      currentRootRunId: continuationRootRunId,
+      updatedAt: nowIso,
+    });
+
+    const continueResult = await withForwardedRealtimeEvents(
+      agent,
+      options.realtimeEvents && !options.hasRuntimeObserver?.(continuationRootRunId)
+        ? {
+            ...options.realtimeEvents,
+            fallbackAgentId: agentId,
+            fallbackSessionId: continuationSession.id,
+            rootRunId: continuationRootRunId,
+          }
+        : undefined,
+      () => agent.agent.resume!(continuation.continuationRunId),
+    );
+    const resultRootRunId =
+      (await resolveRootRunId(agent.runtime.runStore, continueResult.runId)) ?? continuationRootRunId;
+
+    const response = await settleStructuredRunResult(continueResult, resultRootRunId, {
+      agentId,
+      session: continuationSession,
+      authContext: options.authContext,
+      hooks: options.hooks,
+      agentRegistry: options.agentRegistry,
+      stores: options.stores,
+      nowIso,
+    });
+
+    await runAfterHook(options.hooks, frame.type, {
+      authContext: options.authContext,
+      session: continuationSession,
+      agentId,
+      result: response,
+      metadata: frame.metadata,
+    });
+
+    return response;
+  } catch (error) {
+    if (error instanceof ProtocolValidationError) {
+      throw error;
+    }
+
+    await settleSession(options.stores, runningSession, {
+      status: 'failed',
+      currentRunId: undefined,
+      currentRootRunId: undefined,
+      updatedAt: nowIso,
+    });
+
+    throw new ProtocolValidationError(
+      'run_failed',
+      error instanceof Error ? error.message : 'Run continuation failed unexpectedly.',
+      {
+        requestType: frame.type,
+        details: {
+          sessionId: runningSession.id,
+          runId: sourceRunId,
+          agentId,
+          ...(frame.provider ? { provider: frame.provider } : {}),
+          ...(frame.model ? { model: frame.model } : {}),
+        },
+      },
+    );
+  } finally {
+    await admission?.release();
+  }
+}
+
+async function resolveContinuationSourceRunId(
+  frame: RunContinueFrame,
+  session: GatewaySessionRecord,
+  agent: Awaited<ReturnType<AgentRegistry['getAgent']>>,
+  stores: GatewayStores,
+): Promise<string> {
+  if (frame.runId) {
+    const sourceRun = await agent.runtime.runStore.getRun(frame.runId);
+    const sourceRootRunId = sourceRun?.rootRunId ?? frame.runId;
+    const exactLink = await stores.sessionRunLinks.getByRunId(frame.runId);
+    const rootLink = await resolveSessionRunLinkByRootRunId(stores, session.id, sourceRootRunId);
+    if ((exactLink && exactLink.sessionId === session.id && exactLink.invocationKind === 'run') || rootLink) {
+      return frame.runId;
+    }
+
+    throw new ProtocolValidationError(
+      'invalid_frame',
+      `Run "${frame.runId}" is not linked to session "${session.id}" for continuation.`,
+      {
+        requestType: frame.type,
+        details: {
+          sessionId: session.id,
+          runId: frame.runId,
+          rootRunId: sourceRootRunId,
+        },
+      },
+    );
+  }
+
+  const links = (await stores.sessionRunLinks.listBySession(session.id)).filter((link) => link.invocationKind === 'run');
+  const preferredLinks = session.status === 'failed' && session.lastCompletedRootRunId
+    ? links.filter((link) => link.rootRunId === session.lastCompletedRootRunId)
+    : [];
+  const preferredCandidates = await listContinuableCandidateRunIds(preferredLinks, agent);
+  if (preferredCandidates.length === 1) {
+    return preferredCandidates[0];
+  }
+  if (preferredCandidates.length > 1) {
+    throw ambiguousContinuationError(frame, session.id, preferredCandidates);
+  }
+
+  const candidates = await listContinuableCandidateRunIds(links, agent);
+  if (candidates.length === 1) {
+    return candidates[0];
+  }
+  if (candidates.length > 1) {
+    throw ambiguousContinuationError(frame, session.id, candidates);
+  }
+
+  throw new ProtocolValidationError(
+    'invalid_frame',
+    `Session "${session.id}" has no continuable failed run. Pass /continue <runId> after checking recovery options.`,
+    {
+      requestType: frame.type,
+      details: { sessionId: session.id },
+    },
+  );
+}
+
+async function listContinuableCandidateRunIds(
+  links: SessionRunLinkRecord[],
+  agent: Awaited<ReturnType<AgentRegistry['getAgent']>>,
+): Promise<string[]> {
+  const candidateRunIds: string[] = [];
+  const seen = new Set<string>();
+  for (const link of links) {
+    if (seen.has(link.runId)) {
+      continue;
+    }
+    seen.add(link.runId);
+
+    const run = await agent.runtime.runStore.getRun(link.runId);
+    if (run?.status !== 'failed') {
+      continue;
+    }
+
+    try {
+      const recovery = await agent.agent.getRecoveryOptions!(link.runId);
+      if (recovery.continuable && !recovery.requiresReconciliation) {
+        candidateRunIds.push(link.runId);
+      }
+    } catch {
+      // A run that cannot be analyzed for recovery is not a valid inferred continuation target.
+    }
+  }
+
+  return candidateRunIds;
+}
+
+function ambiguousContinuationError(frame: RunContinueFrame, sessionId: string, candidateRunIds: string[]): ProtocolValidationError {
+  return new ProtocolValidationError(
+    'invalid_frame',
+    `Session "${sessionId}" has multiple continuable failed runs. Use /continue <runId>.`,
+    {
+      requestType: frame.type,
+      details: {
+        sessionId,
+        candidateRunIds,
+      },
+    },
+  );
 }
 
 async function resolveSessionRunLinkByRootRunId(

@@ -93,6 +93,19 @@ describe('createReadFileTool', () => {
     );
   });
 
+  it('returns a recoverable output for outside-workspace paths', async () => {
+    const tool = createReadFileTool({ allowedRoot: tempDir });
+    const result = await executeRecoverableTool(tool, { path: '/tweets_tamil_nadu_2026.txt' });
+
+    expect(result).toMatchObject({
+      ok: false,
+      recoveryKind: 'path_outside_workspace',
+      toolName: 'read_file',
+      requestedPath: '/tweets_tamil_nadu_2026.txt',
+      suggestedPath: 'tweets_tamil_nadu_2026.txt',
+    });
+  });
+
   it('rejects files exceeding max size', async () => {
     const tool = createReadFileTool({ allowedRoot: tempDir, maxSizeBytes: 5 });
 
@@ -107,6 +120,23 @@ describe('createReadFileTool', () => {
     await expect(
       tool.execute({ path: 'nope.txt' } as any, stubToolContext()),
     ).rejects.toThrow();
+  });
+
+  it('extracts text from PDFs', async () => {
+    const tool = createReadFileTool({
+      allowedRoot: tempDir,
+      extractPdfText: vi.fn().mockResolvedValue({
+        title: 'Sample PDF',
+        text: 'First page\n\nSecond page',
+      }),
+    });
+    await writeFile(join(tempDir, 'sample.pdf'), new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d]));
+
+    const result = (await tool.execute({ path: 'sample.pdf' } as any, stubToolContext())) as any;
+
+    expect(result.content).toBe('First page\n\nSecond page');
+    expect(result.sizeBytes).toBe(5);
+    expect(result.path).toBe(join(tempDir, 'sample.pdf'));
   });
 
   it('has correct tool metadata', () => {
@@ -169,6 +199,19 @@ describe('createListDirectoryTool', () => {
     await expect(tool.execute({ path: siblingDir } as any, stubToolContext())).rejects.toThrow(
       'outside the allowed root',
     );
+  });
+
+  it('returns a recoverable output for outside-workspace directories', async () => {
+    const tool = createListDirectoryTool({ allowedRoot: tempDir });
+    const result = await executeRecoverableTool(tool, { path: '/reports' });
+
+    expect(result).toMatchObject({
+      ok: false,
+      recoveryKind: 'path_outside_workspace',
+      toolName: 'list_directory',
+      requestedPath: '/reports',
+      suggestedPath: 'reports',
+    });
   });
 
   it('normalizes alternate absolute directory paths that clearly embed the workspace root name', async () => {
@@ -258,6 +301,22 @@ describe('createWriteFileTool', () => {
     await expect(tool.execute({ path: siblingPath, content: 'no' } as any, stubToolContext())).rejects.toThrow(
       'outside the allowed root',
     );
+  });
+
+  it('returns a recoverable output for outside-workspace write paths', async () => {
+    const tool = createWriteFileTool({ allowedRoot: tempDir });
+    const result = await executeRecoverableTool(tool, {
+      path: '/tweets_tamil_nadu_2026.txt',
+      content: 'hello',
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      recoveryKind: 'path_outside_workspace',
+      toolName: 'write_file',
+      requestedPath: '/tweets_tamil_nadu_2026.txt',
+      suggestedPath: 'tweets_tamil_nadu_2026.txt',
+    });
   });
 
   it('reports malformed JSON input clearly', async () => {

@@ -98,8 +98,33 @@ export async function postRunSteer(
   token: string,
   runId: string,
   steer: { message: string; role?: 'user' | 'system' },
+  mode?: 'exact' | 'leaf',
 ): Promise<unknown> {
-  return postRunAction(options, token, runId, 'steer', steer);
+  return postRunAction(options, token, runId, 'steer', steer, mode ? `mode=${encodeURIComponent(mode)}` : undefined);
+}
+
+export async function postSessionSteer(
+  options: ClientOptions,
+  token: string,
+  sessionId: string,
+  steer: { message: string; role?: 'user' | 'system' },
+): Promise<unknown> {
+  const response = await fetch(`${resolveHttpBaseUrl(options)}/api/sessions/${encodeURIComponent(sessionId)}/steer`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${token}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(steer),
+  });
+  const text = await response.text();
+  const responseBody = parseJsonResponse(text);
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status} ${response.statusText}: ${formatHttpResponseBody(responseBody)}`);
+  }
+
+  return responseBody;
 }
 
 async function postRunAction(
@@ -108,8 +133,9 @@ async function postRunAction(
   runId: string,
   action: 'interrupt' | 'steer',
   body?: Record<string, unknown>,
+  query?: string,
 ): Promise<unknown> {
-  const response = await fetch(`${resolveHttpBaseUrl(options)}/api/runs/${encodeURIComponent(runId)}/${action}`, {
+  const response = await fetch(`${resolveHttpBaseUrl(options)}/api/runs/${encodeURIComponent(runId)}/${action}${query ? `?${query}` : ''}`, {
     method: 'POST',
     headers: {
       authorization: `Bearer ${token}`,

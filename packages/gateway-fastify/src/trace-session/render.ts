@@ -103,7 +103,7 @@ export function renderTraceReport(
   return lines.join('\n');
 }
 
-export function renderSessionList(sessions: SessionListItem[], options: Pick<CliOptions, 'json'>): string {
+export function renderSessionList(sessions: SessionListItem[], options: Pick<CliOptions, 'json'> & Partial<Pick<CliOptions, 'previewChars'>>): string {
   if (options.json) {
     return JSON.stringify(sessions, null, 2);
   }
@@ -111,21 +111,39 @@ export function renderSessionList(sessions: SessionListItem[], options: Pick<Cli
     return chalk.gray('No sessions were found.');
   }
 
+  const previewChars = options.previewChars ?? DEFAULT_MESSAGE_PREVIEW_CHARS;
   return sessions
     .map((session) => {
-      const startedAt = session.status === 'succeeded' ? chalk.green(session.startedAt) : chalk.red(session.startedAt);
-      const lines = [`${session.sessionId} : ${startedAt}`];
+      const sessionStatus = session.status ?? 'unknown';
+      const lines = [`---- ${session.sessionId} : ${statusColor(sessionStatus)(sessionStatus)} : ${session.startedAt} ----`];
       const visibleGoals = session.goals.filter((goal) => normalizeGoal(goal.goal) !== null);
       if (visibleGoals.length === 0) {
-        lines.push('Goal : (none)');
+        lines.push('  Goal: (none)');
       } else {
-        for (const goal of visibleGoals) {
-          lines.push(`Goal : ${goal.goal}`);
+        lines.push(`  Goal: ${truncatePlain(oneLine(visibleGoals[0]!.goal!), previewChars)}`);
+      }
+      if (session.goals.length === 0) {
+        lines.push('  Runs: (none)');
+      }
+      for (const run of session.goals) {
+        const runStatus = run.status ?? 'unknown';
+        const details = [run.runId === run.rootRunId ? run.runId : `${run.runId} root=${run.rootRunId}`];
+        details.push(statusColor(runStatus)(runStatus));
+        if (run.startedAt) {
+          details.push(`started=${formatTime(run.startedAt)}`);
         }
+        if (run.runId !== run.rootRunId) {
+          details.push('child');
+        }
+        const elapsed = durationMs(run.startedAt, run.completedAt);
+        if (elapsed !== null) {
+          details.push(`elapsed=${formatDuration(elapsed)}`);
+        }
+        lines.push(`  - ${details.join('  ')}`);
       }
       return lines.join('\n');
     })
-    .join('\n\n-----\n\n');
+    .join('\n\n');
 }
 
 export function renderSessionlessRunList(runs: SessionlessRunListItem[], options: Pick<CliOptions, 'json'>): string {

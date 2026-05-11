@@ -1,7 +1,7 @@
 import { readdir } from 'node:fs/promises';
 
 import type { ToolDefinition } from '../types.js';
-import { resolvePathWithinRoot } from './path-utils.js';
+import { buildWorkspacePathRecovery, PathOutsideRootError, resolvePathWithinRoot } from './path-utils.js';
 
 export interface ListDirectoryToolConfig {
   /** Restrict listing to paths under this root. Defaults to `process.cwd()`. */
@@ -35,6 +35,16 @@ export function createListDirectoryTool(config?: ListDirectoryToolConfig): ToolD
       properties: {
         path: { type: 'string', description: 'Absolute or relative directory path to list.' },
       },
+    },
+    recoverError(error, input) {
+      const dirPath = typeof input === 'object' && input !== null && 'path' in input && typeof input.path === 'string'
+        ? input.path
+        : '';
+      if (error instanceof PathOutsideRootError) {
+        return buildWorkspacePathRecovery('list_directory', dirPath, error);
+      }
+
+      return undefined;
     },
     async execute(rawInput) {
       // Some models send tool input as a JSON string instead of an object — normalise.

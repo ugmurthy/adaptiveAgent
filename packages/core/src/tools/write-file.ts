@@ -2,7 +2,7 @@ import { writeFile, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 import type { ToolDefinition } from '../types.js';
-import { resolvePathWithinRoot } from './path-utils.js';
+import { buildWorkspacePathRecovery, PathOutsideRootError, resolvePathWithinRoot } from './path-utils.js';
 
 export interface WriteFileToolConfig {
   /** Restrict writes to paths under this root. Defaults to `process.cwd()`. */
@@ -39,6 +39,16 @@ export function createWriteFileTool(config?: WriteFileToolConfig): ToolDefinitio
       },
     },
     requiresApproval: true,
+    recoverError(error, input) {
+      const filePath = typeof input === 'object' && input !== null && 'path' in input && typeof input.path === 'string'
+        ? input.path
+        : '';
+      if (error instanceof PathOutsideRootError) {
+        return buildWorkspacePathRecovery('write_file', filePath, error);
+      }
+
+      return undefined;
+    },
     async execute(rawInput) {
       // Some models send tool input as a JSON string instead of an object — normalise.
       let input: unknown;

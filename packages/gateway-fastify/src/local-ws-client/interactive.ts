@@ -1,5 +1,14 @@
 import type { AgentEventFrame, SessionOpenedFrame } from '../protocol.js';
+import type { ContinuationStrategy } from '../core.js';
 import type { EventStreamMode } from './common.js';
+
+export interface ContinueCommandArgs {
+  runId?: string;
+  provider?: string;
+  model?: string;
+  strategy?: ContinuationStrategy;
+  requireApproval?: boolean;
+}
 
 export interface InteractiveSessionSelection {
   sessionId?: string;
@@ -180,6 +189,59 @@ export function parseRetryCommand(command: string, lastFailedRunId?: string): st
   return args[0];
 }
 
+export function parseContinueCommand(command: string, lastFailedRunId?: string): ContinueCommandArgs {
+  const parts = command.split(/\s+/).filter((part) => part.length > 0);
+  const args = parts.slice(1);
+  const parsed: ContinueCommandArgs = {};
+  let explicitRunId: string | undefined;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+
+    if (arg === '--provider') {
+      parsed.provider = requireCommandFlagValue(arg, args[index + 1]);
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--model') {
+      parsed.model = requireCommandFlagValue(arg, args[index + 1]);
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--strategy') {
+      parsed.strategy = parseContinuationStrategy(requireCommandFlagValue(arg, args[index + 1]));
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--approve' || arg === '--require-approval') {
+      parsed.requireApproval = true;
+      continue;
+    }
+
+    if (arg.startsWith('--')) {
+      throw new Error(`Unknown /continue option: ${arg}`);
+    }
+
+    if (explicitRunId) {
+      throw new Error('Usage: /continue [runId] [--provider <provider>] [--model <model>] [--strategy <strategy>] [--approve]');
+    }
+    explicitRunId = arg;
+  }
+
+  const runId = explicitRunId ?? lastFailedRunId;
+  return {
+    ...parsed,
+    ...(runId ? { runId } : {}),
+  };
+}
+
+export function isContinueCommand(command: string): boolean {
+  return command === '/continue' || command.startsWith('/continue ') || command === '/contine' || command.startsWith('/contine ');
+}
+
 export function parseInterruptCommand(command: string): string {
   const parts = command.split(/\s+/).filter((part) => part.length > 0);
   const args = parts.slice(1);
@@ -190,34 +252,76 @@ export function parseInterruptCommand(command: string): string {
   return args[0];
 }
 
-export function parseSteerCommand(command: string): { runId: string; message: string; role?: 'user' | 'system' } {
+export function parseSteerCommand(command: string): { runId?: string; message: string; role?: 'user' | 'system'; mode?: 'exact' | 'leaf' } {
   let remainder = command.slice('/steer'.length).trim();
   let role: 'user' | 'system' | undefined;
+  let mode: 'exact' | 'leaf' | undefined;
+
+  if (remainder.startsWith('--exact ')) {
+    mode = 'exact';
+    remainder = remainder.slice('--exact'.length).trim();
+  }
 
   if (remainder.startsWith('--role ')) {
     const roleMatch = /^--role\s+(user|system)\s+(.+)$/s.exec(remainder);
     if (!roleMatch) {
-      throw new Error('Usage: /steer [--role user|system] <runId> <message>');
+      throw new Error('Usage: /steer [--exact] [--role user|system] [<runId>] <message>');
     }
     role = roleMatch[1] as 'user' | 'system';
     remainder = roleMatch[2].trim();
   }
 
-  const runIdMatch = /^(\S+)\s+(.+)$/s.exec(remainder);
-  if (!runIdMatch) {
-    throw new Error('Usage: /steer [--role user|system] <runId> <message>');
+  if (remainder.startsWith('--exact ')) {
+    mode = 'exact';
+    remainder = remainder.slice('--exact'.length).trim();
   }
 
-  const message = runIdMatch[2].trim();
+  if (!remainder) {
+    throw new Error('Usage: /steer [--exact] [--role user|system] [<runId>] <message>');
+  }
+
+  const runIdMatch = /^(\S+)\s+(.+)$/s.exec(remainder);
+  const firstToken = runIdMatch?.[1];
+  const runId = mode === 'exact' || (firstToken && looksLikeRunId(firstToken)) ? firstToken : undefined;
+  if (mode === 'exact' && !runId) {
+    throw new Error('Usage: /steer [--exact] [--role user|system] [<runId>] <message>');
+  }
+  const message = (runId ? runIdMatch?.[2] : remainder)?.trim() ?? '';
   if (!message) {
     throw new Error('Steer message must not be empty.');
   }
 
   return {
-    runId: runIdMatch[1],
     message,
+    ...(runId ? { runId } : {}),
     ...(role ? { role } : {}),
+    ...(mode ? { mode } : {}),
   };
+}
+
+function looksLikeRunId(value: string): boolean {
+  return value.includes('-') || /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
+function requireCommandFlagValue(flag: string, value: string | undefined): string {
+  if (value && !value.startsWith('--')) {
+    return value;
+  }
+
+  throw new Error(`Missing value for ${flag}.`);
+}
+
+function parseContinuationStrategy(value: string): ContinuationStrategy {
+  switch (value) {
+    case 'hybrid_snapshot_then_step':
+    case 'latest_snapshot':
+    case 'last_successful_step':
+    case 'failure_boundary':
+    case 'manual_checkpoint':
+      return value;
+    default:
+      throw new Error(`Unsupported continuation strategy: ${value}`);
+  }
 }
 
 export function parseApproveCommand(command: string, pendingRunId?: string): { runId: string; approved: boolean } {

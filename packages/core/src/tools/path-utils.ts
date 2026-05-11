@@ -1,5 +1,39 @@
 import { basename, isAbsolute, relative, resolve, sep } from 'node:path';
 
+export class PathOutsideRootError extends Error {
+  constructor(
+    public readonly requestedPath: string,
+    public readonly allowedRoot: string,
+    public readonly suggestedPath?: string,
+  ) {
+    super(
+      `Path ${requestedPath} is outside the allowed root ${allowedRoot}. ` +
+        `Use a workspace-relative path${suggestedPath ? ` such as "${suggestedPath}"` : ''}.`,
+    );
+    this.name = 'PathOutsideRootError';
+  }
+}
+
+export function buildWorkspacePathRecovery(
+  toolName: string,
+  requestedPath: string,
+  error: PathOutsideRootError,
+): Record<string, string | boolean | null> {
+  return {
+    ok: false,
+    recoveryKind: 'path_outside_workspace',
+    toolName,
+    requestedPath,
+    allowedRoot: error.allowedRoot,
+    suggestedPath: error.suggestedPath ?? null,
+    message: error.message,
+    correctiveAction:
+      error.suggestedPath === undefined
+        ? 'Retry with a path relative to the workspace root.'
+        : `Retry with path "${error.suggestedPath}".`,
+  };
+}
+
 export function resolvePathWithinRoot(allowedRoot: string, requestedPath: string): string {
   const resolvedRoot = resolve(allowedRoot);
   const resolvedPath = resolve(resolvedRoot, requestedPath);
@@ -14,10 +48,7 @@ export function resolvePathWithinRoot(allowedRoot: string, requestedPath: string
   }
 
   const suggestedPath = buildSuggestedWorkspacePath(resolvedRoot, requestedPath);
-  throw new Error(
-    `Path ${requestedPath} is outside the allowed root ${allowedRoot}. ` +
-      `Use a workspace-relative path${suggestedPath ? ` such as "${suggestedPath}"` : ''}.`,
-  );
+  throw new PathOutsideRootError(requestedPath, allowedRoot, suggestedPath);
 }
 
 function isPathWithinRoot(resolvedRoot: string, resolvedPath: string): boolean {

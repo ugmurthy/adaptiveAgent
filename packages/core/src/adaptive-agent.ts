@@ -128,6 +128,33 @@ const CHAT_GOAL_MAX_LENGTH = 120;
 
 const STEER_METADATA_KEY = 'pendingSteerMessages';
 const STEER_UPDATE_MAX_ATTEMPTS = 5;
+const STEER_TOOL_HINTS = [
+  {
+    toolName: 'write_file',
+    patterns: [
+      /\b(?:write|save|store|export|persist)\b[\s\S]{0,120}\b(?:to|into|as)\s+[`"']?[^`"'\s]+\.(?:html?|md|markdown|txt|jsonl?|csv|tsv|xml|ya?ml)\b/i,
+      /\b(?:save|store|export|persist)\b[\s\S]{0,80}\b(?:file|document|artifact|output)\b/i,
+    ],
+  },
+  {
+    toolName: 'read_file',
+    patterns: [
+      /\b(?:read|open|load|inspect|view)\b[\s\S]{0,80}\b(?:file|document)\b/i,
+    ],
+  },
+  {
+    toolName: 'list_directory',
+    patterns: [
+      /\b(?:list|show|scan|inspect)\b[\s\S]{0,80}\b(?:directory|folder)\b/i,
+    ],
+  },
+  {
+    toolName: 'shell_exec',
+    patterns: [
+      /\b(?:run|execute|launch)\b[\s\S]{0,80}\b(?:command|script|shell)\b/i,
+    ],
+  },
+] as const;
 
 export interface SteerInput {
   message: string;
@@ -701,20 +728,25 @@ export class AdaptiveAgent {
       throw new Error(`Run ${runId} is ${run.status}; steer() requires an active run`);
     }
 
+    const steerRouting = await this.resolveSteerRouting(run, normalized.message);
+    const targetRun = steerRouting.targetRun;
+    const metadata = mergeSteerMetadata(normalized.metadata, steerRouting.metadata);
     const pendingEntry: PendingSteerMessage = {
       role,
       content: normalized.message,
       enqueuedAt: new Date().toISOString(),
-      ...(normalized.metadata ? { metadata: normalized.metadata } : {}),
+      ...(metadata ? { metadata } : {}),
     };
 
-    const updatedRun = await this.appendPendingSteerMessage(run, pendingEntry);
+    const updatedRun = await this.appendPendingSteerMessage(targetRun, pendingEntry);
 
     this.logLifecycle('info', 'run.steered', {
       ...runLogBindings(updatedRun),
       stepId: updatedRun.currentStepId,
       role,
       messageSummary: summarizeValueForLog(normalized.message),
+      routedFromRunId: updatedRun.id === run.id ? undefined : run.id,
+      missingTools: steerRouting.missingTools.length > 0 ? steerRouting.missingTools : undefined,
     });
 
     const eventPayload: JsonObject = {
@@ -722,8 +754,15 @@ export class AdaptiveAgent {
       message: normalized.message,
       enqueuedAt: pendingEntry.enqueuedAt,
     };
-    if (normalized.metadata) {
-      eventPayload.metadata = normalized.metadata;
+    if (metadata) {
+      eventPayload.metadata = metadata;
+    }
+    if (updatedRun.id !== run.id) {
+      eventPayload.originalRunId = run.id;
+      eventPayload.routing = {
+        kind: 'parent_deferred',
+        missingTools: steerRouting.missingTools,
+      };
     }
 
     await this.emit({
@@ -733,6 +772,43 @@ export class AdaptiveAgent {
       schemaVersion: 1,
       payload: eventPayload,
     });
+  }
+
+  private async resolveSteerRouting(
+    run: AgentRun,
+    message: string,
+  ): Promise<{ targetRun: AgentRun; metadata?: JsonObject; missingTools: string[] }> {
+    if (!run.parentRunId || !run.delegateName) {
+      return { targetRun: run, missingTools: [] };
+    }
+
+    const availableTools = this.resolveAvailableToolNamesForRun(run);
+    if (!availableTools) {
+      return { targetRun: run, missingTools: [] };
+    }
+
+    const missingTools = inferSteerRequiredTools(message).filter((toolName) => !availableTools.has(toolName));
+    if (missingTools.length === 0) {
+      return { targetRun: run, missingTools: [] };
+    }
+
+    const parentRun = await this.options.runStore.getRun(run.parentRunId);
+    if (!parentRun || TERMINAL_RUN_STATUSES.has(parentRun.status)) {
+      return { targetRun: run, missingTools: [] };
+    }
+
+    return {
+      targetRun: parentRun,
+      missingTools,
+      metadata: {
+        steerRouting: {
+          kind: 'parent_deferred',
+          originalRunId: run.id,
+          originalDelegateName: run.delegateName,
+          missingTools,
+        },
+      },
+    };
   }
 
   private async appendPendingSteerMessage(run: AgentRun, message: PendingSteerMessage): Promise<AgentRun> {
@@ -2109,6 +2185,29 @@ export class AdaptiveAgent {
     };
   }
 
+  private resolveAvailableToolNamesForRun(run: AgentRun): Set<string> | undefined {
+    if (!run.delegateName) {
+      return new Set(this.toolRegistry.keys());
+    }
+
+    const delegate = (this.options.delegates ?? []).find((candidate) => candidate.name === run.delegateName);
+    if (!delegate) {
+      return undefined;
+    }
+
+    const toolNames = new Set<string>(delegate.allowedTools);
+    for (const handlerTool of delegate.handlerTools ?? []) {
+      toolNames.add(handlerTool.name);
+    }
+    if (this.options.delegation?.allowRecursiveDelegation) {
+      for (const nestedDelegate of this.options.delegates ?? []) {
+        toolNames.add(`${RESERVED_DELEGATE_PREFIX}${nestedDelegate.name}`);
+      }
+    }
+
+    return toolNames;
+  }
+
   private async buildContinuationBrief(
     sourceRun: AgentRun,
     recovery: RunRecoveryOptions,
@@ -2860,17 +2959,35 @@ export class AdaptiveAgent {
   }
 
   private async applyUsage(run: AgentRun, usageDelta: UsageSummary): Promise<AgentRun> {
-    const nextUsage = mergeUsage(run.usage, usageDelta);
-    const updatedRun = await this.options.runStore.updateRun(
-      run.id,
-      {
-        usage: nextUsage,
-      },
-      run.version,
-    );
+    let currentRun = run;
+    let nextUsage = mergeUsage(currentRun.usage, usageDelta);
+    let updatedRun: AgentRun;
+    try {
+      updatedRun = await this.options.runStore.updateRun(
+        currentRun.id,
+        {
+          usage: nextUsage,
+        },
+        currentRun.version,
+      );
+    } catch (error) {
+      if (!isOptimisticConcurrencyError(error)) {
+        throw error;
+      }
+
+      currentRun = await this.refreshRun(run.id);
+      nextUsage = mergeUsage(currentRun.usage, usageDelta);
+      updatedRun = await this.options.runStore.updateRun(
+        currentRun.id,
+        {
+          usage: nextUsage,
+        },
+        currentRun.version,
+      );
+    }
 
     await this.emit({
-      runId: run.id,
+      runId: updatedRun.id,
       stepId: updatedRun.currentStepId,
       type: 'usage.updated',
       schemaVersion: 1,
@@ -3935,6 +4052,32 @@ function isDelegateToolCall(pendingToolCall: PendingToolCallState | undefined): 
 
 function toolCallIdempotencyKey(runId: UUID, stepId: string, toolCallId: string): string {
   return `${runId}:${stepId}:${toolCallId}`;
+}
+
+function mergeSteerMetadata(
+  baseMetadata: JsonObject | undefined,
+  routingMetadata: JsonObject | undefined,
+): JsonObject | undefined {
+  if (!baseMetadata && !routingMetadata) {
+    return undefined;
+  }
+
+  return {
+    ...(baseMetadata ?? {}),
+    ...(routingMetadata ?? {}),
+  };
+}
+
+function inferSteerRequiredTools(message: string): string[] {
+  const requiredTools = new Set<string>();
+
+  for (const hint of STEER_TOOL_HINTS) {
+    if (hint.patterns.some((pattern) => pattern.test(message))) {
+      requiredTools.add(hint.toolName);
+    }
+  }
+
+  return [...requiredTools];
 }
 
 function validateLinkedChildRun(parentRun: AgentRun, childRun: AgentRun, stepId: string): string | null {

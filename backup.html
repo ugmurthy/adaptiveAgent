@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IPL Team Probabilities - Playoff & Championship</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            padding: 20px;
+            color: #fff;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        
+        h1 {
+            text-align: center;
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            background: linear-gradient(90deg, #FFD700, #FFA500);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .subtitle {
+            text-align: center;
+            color: #aaa;
+            margin-bottom: 30px;
+            font-size: 1.1em;
+        }
+        
+        .chart-container {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 15px;
+            padding: 20px;
+            margin-bottom: 30px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            backdrop-filter: blur(10px);
+        }
+        
+        .chart-title {
+            font-size: 1.5em;
+            margin-bottom: 20px;
+            color: #FFD700;
+            text-align: center;
+        }
+        
+        .chart-wrapper {
+            position: relative;
+            height: 500px;
+        }
+        
+        .controls {
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+            margin-top: 15px;
+            flex-wrap: wrap;
+        }
+        
+        .btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border: none;
+            color: white;
+            padding: 10px 20px;
+            border-radius: 25px;
+            cursor: pointer;
+            font-size: 0.9em;
+            transition: all 0.3s ease;
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
+        }
+        
+        .legend-custom {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 10px;
+            margin-top: 20px;
+            padding: 15px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 10px;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 5px 10px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 5px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .legend-item:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+        
+        .legend-color {
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+        }
+        
+        .legend-name {
+            font-size: 0.85em;
+            max-width: 150px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+        
+        .stat-card {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 10px;
+            padding: 15px;
+            text-align: center;
+        }
+        
+        .stat-value {
+            font-size: 2em;
+            font-weight: bold;
+            color: #FFD700;
+        }
+        
+        .stat-label {
+            color: #aaa;
+            font-size: 0.9em;
+        }
+        
+        @media (max-width: 768px) {
+            h1 { font-size: 1.8em; }
+            .chart-wrapper { height: 400px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🏏 IPL Team Probabilities</h1>
+        <p class="subtitle">Playoff & Championship Probability Trends Over Time</p>
+        
+        <div class="stats">
+            <div class="stat-card">
+                <div class="stat-value">30</div>
+                <div class="stat-label">Days Tracked</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">10</div>
+                <div class="stat-label">Teams</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">Rajasthan Royals</div>
+                <div class="stat-label">Highest Playoff Chance</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">Punjab Kings</div>
+                <div class="stat-label">Highest Championship Chance</div>
+            </div>
+        </div>
+        
+        <div class="chart-container">
+            <h2 class="chart-title">🎯 Playoff Probability (%)</h2>
+            <div class="chart-wrapper">
+                <canvas id="playoffChart"></canvas>
+            </div>
+            <div class="controls">
+                <button class="btn" onclick="zoomIn('playoff')">🔍 Zoom In</button>
+                <button class="btn" onclick="zoomOut('playoff')">🔍 Zoom Out</button>
+                <button class="btn" onclick="resetZoom('playoff')">🔄 Reset</button>
+            </div>
+        </div>
+        
+        <div class="chart-container">
+            <h2 class="chart-title">🏆 Championship Probability (%)</h2>
+            <div class="chart-wrapper">
+                <canvas id="championshipChart"></canvas>
+            </div>
+            <div class="controls">
+                <button class="btn" onclick="zoomIn('championship')">🔍 Zoom In</button>
+                <button class="btn" onclick="zoomOut('championship')">🔍 Zoom Out</button>
+                <button class="btn" onclick="resetZoom('championship')">🔄 Reset</button>
+            </div>
+        </div>
+        
+        <div class="chart-container">
+            <h2 class="chart-title">📋 Team Legend</h2>
+            <div class="legend-custom" id="teamLegend">
+                <div class="legend-item" onclick="toggleDataset('RR')"><div class="legend-color" style="background-color: #EE9900"></div><span class="legend-name">Rajasthan Royals</span></div><div class="legend-item" onclick="toggleDataset('RCB')"><div class="legend-color" style="background-color: #EC1C24"></div><span class="legend-name">Royal Challengers Bangalore</span></div><div class="legend-item" onclick="toggleDataset('PBKS')"><div class="legend-color" style="background-color: #DD004B"></div><span class="legend-name">Punjab Kings</span></div><div class="legend-item" onclick="toggleDataset('SRH')"><div class="legend-color" style="background-color: #F7A721"></div><span class="legend-name">Sunrisers Hyderabad</span></div><div class="legend-item" onclick="toggleDataset('GT')"><div class="legend-color" style="background-color: #1C2833"></div><span class="legend-name">Gujarat Titans</span></div><div class="legend-item" onclick="toggleDataset('CSK')"><div class="legend-color" style="background-color: #FFFF3C"></div><span class="legend-name">Chennai Super Kings</span></div><div class="legend-item" onclick="toggleDataset('MI')"><div class="legend-color" style="background-color: #004BA0"></div><span class="legend-name">Mumbai Indians</span></div><div class="legend-item" onclick="toggleDataset('DC')"><div class="legend-color" style="background-color: #0078BC"></div><span class="legend-name">Delhi Capitals</span></div><div class="legend-item" onclick="toggleDataset('KKR')"><div class="legend-color" style="background-color: #3A225D"></div><span class="legend-name">Kolkata Knight Riders</span></div><div class="legend-item" onclick="toggleDataset('LSG')"><div class="legend-color" style="background-color: #1C3F95"></div><span class="legend-name">Lucknow Super Giants</span></div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // Embedded data from JSONL files
+        const dates = ["2026-04-10", "2026-04-11", "2026-04-12", "2026-04-13", "2026-04-15", "2026-04-16", "2026-04-17", "2026-04-18", "2026-04-19", "2026-04-20", "2026-04-21", "2026-04-22", "2026-04-23", "2026-04-24", "2026-04-25", "2026-04-26", "2026-04-27", "2026-04-28", "2026-04-29", "2026-04-30", "2026-05-01", "2026-05-02", "2026-05-03", "2026-05-04", "2026-05-05", "2026-05-06", "2026-05-07", "2026-05-08", "2026-05-09", "2026-05-10"];
+        const playoffDatasets = [{"label": "Rajasthan Royals", "data": [99.98, 100.0, 100.0, 98.5, 88.18, 88.78, 86.23, 79.4, 82.56, 85.6, 74.92, 88.4, 88.6, 87.64, 88.3, 72.62, 76.3, 95.3, 92.11, 82.3, 80.4, 66.1, 66.1, 56.98, 82.3, 72.22, 70.8, 71.84, 73.17, 51.17], "borderColor": "#EE9900", "backgroundColor": "#EE9900", "borderWidth": 2, "pointRadius": 3, "pointHoverRadius": 6, "fill": false, "tension": 0.3}, {"label": "Royal Challengers Bangalore", "data": [99.96, 92.8, 87.5, 87.6, 75.74, 91.21, 89.67, 87.3, 83.58, 92.1, 85.34, 93.85, 84.1, 79.1, 94.5, 92.29, 91.8, 99.2, 96.99, 91.8, 89.21, 90.5, 90.5, 91.09, 91.8, 90.2, 89.22, 77.86, 75.02, 67.08], "borderColor": "#EC1C24", "backgroundColor": "#EC1C24", "borderWidth": 2, "pointRadius": 3, "pointHoverRadius": 6, "fill": false, "tension": 0.3}, {"label": "Punjab Kings", "data": [99.08, 97.2, 99.8, 92.3, 80.04, 82.15, 93.45, 84.6, 88.67, 98.7, 94.8, 99.73, 96.2, 94.41, 99.2, 99.63, 99.4, 99.6, 98.22, 94.2, 97.38, 97.1, 97.1, 95.59, 94.2, 93.58, 83.69, 86.77, 87.03, 88.94], "borderColor": "#DD004B", "backgroundColor": "#DD004B", "borderWidth": 2, "pointRadius": 3, "pointHoverRadius": 6, "fill": false, "tension": 0.3}, {"label": "Sunrisers Hyderabad", "data": [null, null, 12.4, 12.4, 35.93, 31.33, 35.78, 38.2, 42.28, 56.3, 38.68, 80.02, 45.9, 63.57, 62.7, 82.48, 80.3, 86.4, 78.72, 88.5, 83.4, 83.8, 83.8, 72.82, 87.5, 70.93, 80.97, 83.06, 89.44, 86.95], "borderColor": "#F7A721", "backgroundColor": "#F7A721", "borderWidth": 2, "pointRadius": 3, "pointHoverRadius": 6, "fill": false, "tension": 0.3}, {"label": "Gujarat Titans", "data": [14.41, null, null, 42.8, 32.33, 33.26, 32.15, 52.8, 38.88, 44.8, 28.4, 8.69, 28.9, 18.0, 38.9, 13.93, 22.5, 9.5, 20.51, 38.7, 39.19, 36.7, 36.7, 59.66, 78.6, 47.68, 43.02, 44.88, 44.39, 68.38], "borderColor": "#1C2833", "backgroundColor": "#1C2833", "borderWidth": 2, "pointRadius": 3, "pointHoverRadius": 6, "fill": false, "tension": 0.3}, {"label": "Chennai Super Kings", "data": [null, null, null, 6.3, 14.45, 16.66, 15.34, 8.6, 6.45, 16.2, 11.35, 1.05, 9.6, 25.03, 42.1, 21.65, 11.4, 8.7, 5.95, 12.4, 6.89, 11.5, 15.2, 8.12, 42.1, 20.29, 27.38, 28.78, 20.24, 21.0], "borderColor": "#FFFF3C", "backgroundColor": "#FFFF3C", "borderWidth": 2, "pointRadius": 3, "pointHoverRadius": 6, "fill": false, "tension": 0.3}, {"label": "Mumbai Indians", "data": [7.01, null, null, 8.7, 8.02, 7.45, 5.89, 3.2, 2.6, 2.3, 10.22, 6.18, 5.6, 3.59, 5.2, 1.96, 1.7, 0.3, 1.36, 1.8, 1.75, 0.6, 0.6, 0.03, 15.2, 0.01, 0.15, 0.06, 0.01, 0.1], "borderColor": "#004BA0", "backgroundColor": "#004BA0", "borderWidth": 2, "pointRadius": 3, "pointHoverRadius": 6, "fill": false, "tension": 0.3}, {"label": "Delhi Capitals", "data": [34.66, 78.5, 62.3, 45.2, 37.5, 33.29, 34.92, 24.7, 35.65, 51.2, 45.45, 21.52, 36.7, 23.73, 48.5, 13.73, 14.2, 0.9, 3.52, 9.8, 0.87, 10.3, 10.3, 11.8, 38.4, 1.5, 1.69, 1.76, 0.01, 0.0], "borderColor": "#0078BC", "backgroundColor": "#0078BC", "borderWidth": 2, "pointRadius": 3, "pointHoverRadius": 6, "fill": false, "tension": 0.3}, {"label": "Kolkata Knight Riders", "data": [null, null, null, 4.1, 1.83, 1.47, 1.12, 1.8, 0.43, 4.1, 2.67, 0.05, 1.7, 1.29, 3.1, 0.37, 1.9, 0.1, 2.32, 3.2, 0.61, 3.3, 3.3, 3.82, 28.7, 3.56, 3.0, 4.97, 10.62, 16.36], "borderColor": "#3A225D", "backgroundColor": "#3A225D", "borderWidth": 2, "pointRadius": 3, "pointHoverRadius": 6, "fill": false, "tension": 0.3}, {"label": "Lucknow Super Giants", "data": [44.8, 24.3, 58.7, 38.5, 25.98, 14.4, 18.67, 12.4, 18.9, 11.5, 8.17, 0.51, 2.8, 3.64, 12.8, 1.34, 0.5, 0.0, 0.3, 1.2, 0.3, 0.2, 0.2, 0.08, 4.8, 0.03, 0.07, 0.03, 0.06, 0.01], "borderColor": "#1C3F95", "backgroundColor": "#1C3F95", "borderWidth": 2, "pointRadius": 3, "pointHoverRadius": 6, "fill": false, "tension": 0.3}];
+        const championshipDatasets = [{"label": "Rajasthan Royals", "data": [42.03, 52.8, 48.2, 28.5, 27.14, 24.56, 22.89, 22.1, 23.68, 20.1, 17.25, 9.96, 23.3, 24.83, 21.5, 8.78, 16.2, 18.2, 17.26, 15.7, 14.98, 11.4, 11.4, 8.57, 14.2, 12.59, 15.14, 15.8, 15.96, 8.57], "borderColor": "#EE9900", "backgroundColor": "#EE9900", "borderWidth": 2, "pointRadius": 3, "pointHoverRadius": 6, "fill": false, "tension": 0.3}, {"label": "Royal Challengers Bangalore", "data": [43.08, 31.5, 15.8, 19.8, 18.59, 27.92, 26.34, 34.2, 26.12, 27.3, 26.43, 17.97, 23.8, 20.89, 29.8, 26.06, 25.3, 31.4, 28.3, 26.5, 22.87, 25.6, 25.6, 29.9, 22.1, 28.68, 27.53, 20.47, 18.36, 15.3], "borderColor": "#EC1C24", "backgroundColor": "#EC1C24", "borderWidth": 2, "pointRadius": 3, "pointHoverRadius": 6, "fill": false, "tension": 0.3}, {"label": "Punjab Kings", "data": [14.78, 9.8, 28.5, 22.3, 21.77, 21.63, 31.56, 28.7, 29.62, 32.5, 37.6, 66.04, 36.2, 35.36, 34.2, 48.4, 33.2, 31.1, 40.13, 29.8, 36.36, 34.7, 34.7, 36.88, 24.8, 32.71, 23.21, 26.02, 22.17, 28.14], "borderColor": "#DD004B", "backgroundColor": "#DD004B", "borderWidth": 2, "pointRadius": 3, "pointHoverRadius": 6, "fill": false, "tension": 0.3}, {"label": "Sunrisers Hyderabad", "data": [null, null, 0.0, 0.0, 8.22, 6.47, 7.12, 4.2, 6.71, 7.8, 5.15, 5.49, 6.5, 10.68, 8.4, 13.64, 18.0, 17.3, 10.48, 22.3, 20.36, 21.6, 21.6, 16.48, 18.5, 16.35, 21.92, 24.26, 27.38, 27.88], "borderColor": "#F7A721", "backgroundColor": "#F7A721", "borderWidth": 2, "pointRadius": 3, "pointHoverRadius": 6, "fill": false, "tension": 0.3}, {"label": "Gujarat Titans", "data": [0.0, null, null, 7.5, 6.5, 6.61, 4.56, 8.4, 6.38, 4.1, 3.73, 0.15, 3.2, 1.94, 0.8, 0.85, 3.8, 1.1, 2.39, 3.8, 4.82, 4.9, 4.9, 6.91, 11.8, 7.56, 8.14, 8.61, 9.38, 15.39], "borderColor": "#1C2833", "backgroundColor": "#1C2833", "borderWidth": 2, "pointRadius": 3, "pointHoverRadius": 6, "fill": false, "tension": 0.3}, {"label": "Chennai Super Kings", "data": [null, null, null, 0.0, 2.73, 2.24, 0.34, 0.2, 0.58, 1.2, 1.05, 0.0, 1.1, 2.84, 1.8, 1.52, 0.5, 0.8, 0.67, 1.1, 0.0, 0.8, 1.2, 1.1, 3.8, 1.77, 3.62, 4.25, 4.47, 2.66], "borderColor": "#FFFF3C", "backgroundColor": "#FFFF3C", "borderWidth": 2, "pointRadius": 3, "pointHoverRadius": 6, "fill": false, "tension": 0.3}, {"label": "Mumbai Indians", "data": [0.0, null, null, 0.0, 1.4, 1.23, 0.05, 0.08, 0.16, 0.1, 0.89, 0.07, 0.5, 0.21, 0.1, 0.18, 0.05, 0.0, 0.13, 0.05, 0.0, 0.05, 0.05, 0.0, 0.5, 0.0, 0.07, 0.0, 0.01, 0.0], "borderColor": "#004BA0", "backgroundColor": "#004BA0", "borderWidth": 2, "pointRadius": 3, "pointHoverRadius": 6, "fill": false, "tension": 0.3}, {"label": "Delhi Capitals", "data": [0.0, 4.2, 4.8, 8.2, 7.8, 6.65, 6.23, 1.8, 4.64, 6.2, 6.92, 0.32, 5.1, 2.82, 3.2, 0.48, 1.9, 0.0, 0.35, 0.6, 0.0, 0.9, 0.9, 1.4, 2.9, 0.11, 0.12, 0.0, 0.0, 0.0], "borderColor": "#0078BC", "backgroundColor": "#0078BC", "borderWidth": 2, "pointRadius": 3, "pointHoverRadius": 6, "fill": false, "tension": 0.3}, {"label": "Kolkata Knight Riders", "data": [null, null, null, 0.0, 0.24, 0.19, 0.02, 0.02, 0.0, 0.2, 0.21, 0.0, 0.1, 0.06, 0.0, 0.03, 0.1, 0.0, 0.28, 0.1, 0.0, 0.2, 0.2, 0.3, 1.2, 0.23, 0.3, 0.0, 2.27, 2.04], "borderColor": "#3A225D", "backgroundColor": "#3A225D", "borderWidth": 2, "pointRadius": 3, "pointHoverRadius": 6, "fill": false, "tension": 0.3}, {"label": "Lucknow Super Giants", "data": [0.0, 1.7, 2.1, 6.1, 5.61, 2.5, 0.89, 0.3, 2.11, 0.5, 0.77, 0.0, 0.2, 0.37, 0.2, 0.06, 0.02, 0.0, 0.01, 0.02, 0.0, 0.05, 0.05, 0.0, 0.2, 0.0, 0.07, 0.0, 0.02, 0.0], "borderColor": "#1C3F95", "backgroundColor": "#1C3F95", "borderWidth": 2, "pointRadius": 3, "pointHoverRadius": 6, "fill": false, "tension": 0.3}];
+        
+        const teamColors = {
+            'RR': '#EE9900',
+            'RCB': '#EC1C24',
+            'PBKS': '#DD004B',
+            'SRH': '#F7A721',
+            'GT': '#1C2833',
+            'CSK': '#FFFF3C',
+            'MI': '#004BA0',
+            'DC': '#0078BC',
+            'KKR': '#3A225D',
+            'LSG': '#1C3F95'
+        };
+        
+        const teamNames = {
+            'RR': 'Rajasthan Royals',
+            'RCB': 'Royal Challengers Bangalore',
+            'PBKS': 'Punjab Kings',
+            'SRH': 'Sunrisers Hyderabad',
+            'GT': 'Gujarat Titans',
+            'CSK': 'Chennai Super Kings',
+            'MI': 'Mumbai Indians',
+            'DC': 'Delhi Capitals',
+            'KKR': 'Kolkata Knight Riders',
+            'LSG': 'Lucknow Super Giants'
+        };
+        
+        let playoffChart = null;
+        let championshipChart = null;
+        
+        // Chart options
+        const commonOptions = {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: {
+                mode: 'index',
+                intersect: false,
+            },
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    enabled: true,
+                    intersect: false,
+                    mode: 'index',
+                    backgroundColor: 'rgba(0, 0, 0, 0.8)',
+                    titleColor: '#FFD700',
+                    bodyColor: '#fff',
+                    borderColor: '#FFD700',
+                    borderWidth: 1,
+                    padding: 12,
+                    titleFont: { size: 14, weight: 'bold' },
+                    bodyFont: { size: 12 },
+                    callbacks: {
+                        label: function(context) {
+                            const label = context.dataset.label || '';
+                            const value = context.parsed.y;
+                            return label + ': ' + value.toFixed(2) + '%';
+                        }
+                    }
+                },
+                zoom: {
+                    zoom: {
+                        wheel: { enabled: true },
+                        pinch: { enabled: true },
+                        mode: 'x',
+                    },
+                    pan: {
+                        enabled: true,
+                        mode: 'x',
+                    },
+                },
+            },
+            scales: {
+                x: {
+                    type: 'category',
+                    grid: { color: 'rgba(255, 255, 255, 0.1)' },
+                    ticks: {
+                        color: '#aaa',
+                        maxRotation: 45,
+                        minRotation: 45
+                    },
+                    border: { color: 'rgba(255, 255, 255, 0.2)' }
+                },
+                y: {
+                    beginAtZero: true,
+                    max: 100,
+                    grid: { color: 'rgba(255, 255, 255, 0.1)' },
+                    ticks: {
+                        color: '#aaa',
+                        callback: function(value) { return value + '%'; }
+                    },
+                    border: { color: 'rgba(255, 255, 255, 0.2)' },
+                    title: {
+                        display: true,
+                        text: 'Probability (%)',
+                        color: '#FFD700',
+                        font: { size: 12 }
+                    }
+                }
+            }
+        };
+        
+        // Create playoff chart
+        const playoffCtx = document.getElementById('playoffChart').getContext('2d');
+        playoffChart = new Chart(playoffCtx, {
+            type: 'line',
+            data: {
+                labels: dates,
+                datasets: playoffDatasets
+            },
+            options: commonOptions
+        });
+        
+        // Create championship chart
+        const championshipCtx = document.getElementById('championshipChart').getContext('2d');
+        championshipChart = new Chart(championshipCtx, {
+            type: 'line',
+            data: {
+                labels: dates,
+                datasets: championshipDatasets
+            },
+            options: commonOptions
+        });
+        
+        // Zoom functions
+        function zoomIn(chartName) {
+            const chart = chartName === 'playoff' ? playoffChart : championshipChart;
+            if (chart) chart.zoom({ x: 1.2 });
+        }
+        
+        function zoomOut(chartName) {
+            const chart = chartName === 'playoff' ? playoffChart : championshipChart;
+            if (chart) chart.zoom({ x: 0.8 });
+        }
+        
+        function resetZoom(chartName) {
+            const chart = chartName === 'playoff' ? playoffChart : championshipChart;
+            if (chart) chart.resetZoom();
+        }
+        
+        // Toggle dataset visibility
+        function toggleDataset(abbr) {
+            const datasetIndex = Object.keys(teamNames).indexOf(abbr);
+            if (playoffChart) {
+                playoffChart.isDatasetVisible(datasetIndex) 
+                    ? playoffChart.hide(datasetIndex) 
+                    : playoffChart.show(datasetIndex);
+            }
+            if (championshipChart) {
+                championshipChart.isDatasetVisible(datasetIndex) 
+                    ? championshipChart.hide(datasetIndex) 
+                    : championshipChart.show(datasetIndex);
+            }
+        }
+        
+        // Keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+            if (e.key === '+' || e.key === '=') {
+                zoomIn('playoff');
+                zoomIn('championship');
+            } else if (e.key === '-') {
+                zoomOut('playoff');
+                zoomOut('championship');
+            } else if (e.key === 'r' || e.key === 'R') {
+                resetZoom('playoff');
+                resetZoom('championship');
+            }
+        });
+    </script>
+</body>
+</html>

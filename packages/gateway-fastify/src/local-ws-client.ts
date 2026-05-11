@@ -19,6 +19,7 @@ import {
   parsePort,
   postRunInterrupt,
   postRunSteer,
+  postSessionSteer,
   rejectIfPending,
   requireValue,
   resolveIfPending,
@@ -27,8 +28,10 @@ import {
 } from './local-ws-client/common.js';
 import {
   getInteractiveSessionMode,
+  isContinueCommand,
   isEventsCommand,
   parseClarifyCommand,
+  parseContinueCommand,
   parseEventsCommand,
   parseInterruptCommand,
   parseRetryCommand,
@@ -53,7 +56,9 @@ export { createAutoApprovalResolveFrame } from './local-ws-client/common.js';
 export type { FailedRunTrackingState } from './local-ws-client/interactive.js';
 export {
   getInteractiveSessionMode,
+  isContinueCommand,
   parseClarifyCommand,
+  parseContinueCommand,
   parseEventsCommand,
   parseInterruptCommand,
   parseRetryCommand,
@@ -92,9 +97,15 @@ const HELP_TEXT = `Commands:
   <text>                     send a chat message with message.send
   /run <goal>                send run.start via a dedicated run session
   /retry [runId]             retry a failed run in the current run session
+  /continue [runId] [--provider <provider>] [--model <model>]
+                             continue a failed run; infers from run session when unambiguous
   /interrupt <runId>         interrupt an active run via POST /api/runs/:runId/interrupt
+  /steer [--role user|system] <text>
+                             steer the active run in the current session
   /steer [--role user|system] <runId> <text>
-                             steer an active run via POST /api/runs/:runId/steer
+                             steer the active leaf under a run via POST /api/runs/:runId/steer
+  /steer --exact [--role user|system] <runId> <text>
+                             steer exactly the specified run via mode=exact
   /approve [runId] [yes|no]  resolve the pending approval for the session
   /clarify [runId] <text>    answer a pending clarification for a run
   /event [on [verbose]|off]  stream one-line, detailed, or muted realtime agent.event frames
@@ -484,6 +495,24 @@ async function main(): Promise<void> {
         continue;
       }
 
+      if (isContinueCommand(line)) {
+        const { runId, provider, model, strategy, requireApproval } = parseContinueCommand(line, state.lastFailedRunId);
+        const continueSessionId = runId ? state.failedRunSessionIds.get(runId) ?? state.runSessionId : state.runSessionId;
+        if (!continueSessionId && runId !== options.rootRunId) {
+          throw new Error('No run sessionId is tracked for /continue. Reattach a run session or pass a runId linked to a run session.');
+        }
+        sendFrame(socket, {
+          type: 'run.continue',
+          ...(continueSessionId ? { sessionId: continueSessionId } : {}),
+          ...(runId ? { runId } : {}),
+          ...(provider ? { provider } : {}),
+          ...(model ? { model } : {}),
+          ...(strategy ? { strategy } : {}),
+          ...(requireApproval === undefined ? {} : { requireApproval }),
+        });
+        continue;
+      }
+
       if (line === '/interrupt' || line.startsWith('/interrupt ')) {
         const runId = parseInterruptCommand(line);
         await postRunInterrupt(options, token, runId);
@@ -492,9 +521,18 @@ async function main(): Promise<void> {
       }
 
       if (line === '/steer' || line.startsWith('/steer ')) {
-        const { runId, message, role } = parseSteerCommand(line);
-        await postRunSteer(options, token, runId, { message, ...(role ? { role } : {}) });
-        console.log(`steer sent for run ${runId}`);
+        const { runId, message, role, mode } = parseSteerCommand(line);
+        if (runId) {
+          await postRunSteer(options, token, runId, { message, ...(role ? { role } : {}) }, mode);
+          console.log(`steer sent for run ${runId}`);
+        } else {
+          const sessionId = state.runSessionId ?? state.sessionId;
+          if (!sessionId) {
+            throw new Error('No sessionId is tracked for /steer. Start or attach a session, or pass a runId.');
+          }
+          await postSessionSteer(options, token, sessionId, { message, ...(role ? { role } : {}) });
+          console.log(`steer sent for session ${sessionId}`);
+        }
         continue;
       }
 
