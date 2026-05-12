@@ -14,6 +14,10 @@ import { createModelAdapter } from './create-model-adapter.js';
 
 const STOP_RESPONSE = {
   id: 'chatcmpl-test-1',
+  object: 'chat.completion',
+  created: 1,
+  model: 'test-model',
+  system_fingerprint: null,
   choices: [
     {
       index: 0,
@@ -33,6 +37,10 @@ const STOP_RESPONSE = {
 
 const TOOL_CALL_RESPONSE = {
   id: 'chatcmpl-test-2',
+  object: 'chat.completion',
+  created: 1,
+  model: 'test-model',
+  system_fingerprint: null,
   choices: [
     {
       index: 0,
@@ -62,6 +70,10 @@ const TOOL_CALL_RESPONSE = {
 
 const DELEGATE_TOOL_CALL_RESPONSE = {
   id: 'chatcmpl-test-2-delegate',
+  object: 'chat.completion',
+  created: 1,
+  model: 'test-model',
+  system_fingerprint: null,
   choices: [
     {
       index: 0,
@@ -91,6 +103,10 @@ const DELEGATE_TOOL_CALL_RESPONSE = {
 
 const TOOL_CALL_RESPONSE_WITH_REASONING = {
   id: 'chatcmpl-test-2b',
+  object: 'chat.completion',
+  created: 1,
+  model: 'test-model',
+  system_fingerprint: null,
   choices: [
     {
       index: 0,
@@ -131,6 +147,10 @@ const TOOL_CALL_RESPONSE_WITH_REASONING = {
 
 const JSON_OUTPUT_RESPONSE = {
   id: 'chatcmpl-test-3',
+  object: 'chat.completion',
+  created: 1,
+  model: 'test-model',
+  system_fingerprint: null,
   choices: [
     {
       index: 0,
@@ -145,6 +165,10 @@ const JSON_OUTPUT_RESPONSE = {
 
 const NO_USAGE_RESPONSE = {
   id: 'chatcmpl-test-4',
+  object: 'chat.completion',
+  created: 1,
+  model: 'test-model',
+  system_fingerprint: null,
   choices: [
     {
       index: 0,
@@ -298,6 +322,15 @@ function mockFetchResponse(body: unknown, status = 200) {
       headers: { 'Content-Type': 'application/json' },
     }),
   );
+}
+
+function fetchRequest(): Request {
+  const input = fetchSpy.mock.calls[0]?.[0];
+  if (!(input instanceof Request)) {
+    throw new Error('Expected fetch to be called with a Request');
+  }
+
+  return input;
 }
 
 function deferred<T>() {
@@ -912,10 +945,10 @@ describe('OpenRouterAdapter', () => {
 
     await adapter.generate(simpleRequest());
 
-    const headers = fetchSpy.mock.calls[0][1].headers;
-    expect(headers['Authorization']).toBe('Bearer or-key');
-    expect(headers['HTTP-Referer']).toBe('https://my-app.com');
-    expect(headers['X-Title']).toBe('My App');
+    const request = fetchRequest();
+    expect(request.headers.get('authorization')).toBe('Bearer or-key');
+    expect(request.headers.get('HTTP-Referer')).toBe('https://my-app.com');
+    expect(request.headers.get('X-Title')).toBe('My App');
     expect(adapter.provider).toBe('openrouter');
   });
 
@@ -928,7 +961,7 @@ describe('OpenRouterAdapter', () => {
 
     await adapter.generate(simpleRequest());
 
-    expect(fetchSpy.mock.calls[0][0]).toBe('https://openrouter.ai/api/v1/chat/completions');
+    expect(fetchRequest().url).toBe('https://openrouter.ai/api/v1/chat/completions');
   });
 });
 
@@ -962,10 +995,35 @@ describe('MistralAdapter', () => {
 
     await adapter.generate(simpleRequest());
 
-    expect(fetchSpy.mock.calls[0][0]).toBe('https://api.mistral.ai/v1/chat/completions');
-    expect(fetchSpy.mock.calls[0][1].headers['Authorization']).toBe('Bearer ms-key');
+    const request = fetchRequest();
+    expect(request.url).toBe('https://api.mistral.ai/v1/chat/completions');
+    expect(request.headers.get('authorization')).toBe('Bearer ms-key');
     expect(adapter.provider).toBe('mistral');
     expect(adapter.capabilities.usage).toBe(true);
+  });
+
+  it('replays assistant tool call messages through the Mistral SDK', async () => {
+    const adapter = new MistralAdapter({ model: 'mistral-large-latest', apiKey: 'ms-key' });
+    mockFetchResponse(STOP_RESPONSE);
+
+    await adapter.generate(requestWithAssistantToolCalls());
+
+    const body = await fetchRequest().json() as { messages: Array<{ role: string; content?: unknown; tool_calls?: unknown }> };
+    const assistantMsg = body.messages.find((m) => m.role === 'assistant');
+    expect(assistantMsg).toMatchObject({
+      role: 'assistant',
+      content: null,
+      tool_calls: [
+        {
+          id: 'call-1',
+          type: 'function',
+          function: {
+            name: 'lookup',
+            arguments: '{"topic":"testing"}',
+          },
+        },
+      ],
+    });
   });
 });
 
