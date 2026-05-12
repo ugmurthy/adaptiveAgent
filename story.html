@@ -3,144 +3,335 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Milo the Friendly Dragon</title>
+    <title>Adventures of the Friendly Dragon</title>
     <style>
-        body {
-            font-family: 'Comic Sans MS', 'Arial Rounded MT Bold', sans-serif;
-            background: linear-gradient(135deg, #87CEEB 0%, #90EE90 50%, #FFB6C1 100%);
+        * {
             margin: 0;
-            padding: 20px;
-            line-height: 1.8;
-            color: #333;
+            padding: 0;
+            box-sizing: border-box;
         }
-        .container {
+
+        body {
+            font-family: 'Comic Sans MS', 'Chalkboard', sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .book-container {
+            width: 90vw;
             max-width: 800px;
-            margin: 0 auto;
-            background: rgba(255, 255, 255, 0.95);
+            background: linear-gradient(180deg, #f58226 0%, #e56b06 50%, #d55e04 100%);
             border-radius: 20px;
-            padding: 30px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            box-shadow: 
+                0 10px 40px rgba(0,0,0,0.5),
+                inset 0 -5px 20px rgba(0,0,0,0.3);
+            position: relative;
+            overflow: hidden;
         }
+
+        .book {
+            padding: 40px;
+            min-height: 500px;
+            position: relative;
+        }
+
+        .page {
+            display: none;
+            text-align: center;
+            animation: fadeIn 0.5s ease;
+        }
+
+        .page.active {
+            display: block;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
         h1 {
-            text-align: center;
-            color: #FF6B6B;
-            font-size: 2.5em;
-            text-shadow: 2px 2px 4px rgba(0,0,0,0.1);
-            margin-bottom: 30px;
+            font-size: 3rem;
+            color: #ff6b6b;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+            margin-bottom: 20px;
+            font-weight: bold;
         }
+
         h2 {
-            color: #4ECDC4;
-            font-size: 1.5em;
-            margin-top: 25px;
+            font-size: 2.5rem;
+            color: #ffd93d;
+            margin-bottom: 15px;
         }
+
         p {
-            font-size: 1.2em;
-            text-align: justify;
+            font-size: 1.8rem;
+            line-height: 1.8;
+            color: #fff;
+            text-shadow: 1px 1px 2px rgba(0,0,0,0.3);
+            margin-bottom: 15px;
+            max-width: 700px;
+            margin-left: auto;
+            margin-right: auto;
         }
-        .star {
-            color: #FFD93D;
-            font-size: 1.5em;
+
+        .page-number {
+            position: absolute;
+            bottom: 20px;
+            right: 30px;
+            font-size: 2rem;
+            color: rgba(255,255,255,0.7);
         }
-        .illustration {
-            text-align: center;
-            font-size: 3em;
-            margin: 20px 0;
-            letter-spacing: 10px;
-        }
-        .dialogue {
-            background: #FFF3E0;
-            padding: 15px;
-            border-radius: 15px;
-            margin: 20px 0;
-            border-left: 5px solid #FFB6C1;
-            font-style: italic;
-        }
-        .final-message {
-            background: #E8F5E9;
-            padding: 20px;
-            border-radius: 15px;
-            text-align: center;
+
+        .controls {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
             margin-top: 30px;
-            border: 3px dashed #4CAF50;
+            padding: 20px;
+            background: rgba(0,0,0,0.3);
+            border-radius: 15px;
         }
+
+        button {
+            background: linear-gradient(180deg, #ff6b6b 0%, #ee5a5a 100%);
+            border: none;
+            padding: 15px 40px;
+            font-size: 1.5rem;
+            color: white;
+            border-radius: 50px;
+            cursor: pointer;
+            font-family: inherit;
+            font-weight: bold;
+            box-shadow: 0 5px 15px rgba(255,107,107,0.4);
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        button:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 8px 20px rgba(255,107,107,0.6);
+        }
+
+        button:active {
+            transform: translateY(0);
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .draggable {
+            cursor: pointer;
+            transition: transform 0.2s;
+            margin: 10px;
+        }
+
+        .draggable:hover {
+            transform: scale(1.1) rotate(5deg);
+        }
+
+        .emoji {
+            font-size: 4rem;
+            margin-bottom: 10px;
+        }
+
+        .title-page {
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            min-height: 500px;
+        }
+
+        .title-emoji {
+            font-size: 8rem;
+            margin-bottom: 20px;
+        }
+
+        .title-name {
+            font-size: 4rem;
+            color: #fff;
+            text-shadow: 4px 4px 8px rgba(0,0,0,0.3);
+        }
+
+        .title-subtitle {
+            font-size: 2.5rem;
+            color: rgba(255,255,255,0.8);
+            margin-top: 10px;
+        }
+
+        /* Decorative elements */
+        .decoration {
+            position: absolute;
+            opacity: 0.2;
+            font-size: 10rem;
+            z-index: 0;
+        }
+
+        .decoration-1 { top: -50px; left: -50px; transform: rotate(-20deg); }
+        .decoration-2 { bottom: -30px; right: -30px; transform: rotate(20deg); }
+
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>🐉 Milo the Friendly Dragon 🐉</h1>
-        
-        <p>Once upon a time, in a cozy cave with cozy blankets, lived a little dragon named Milo. Milo was not like the scary dragons you see in stories with big scary fire breathes. Milo was <strong>SO SMALL</strong> that he could fit in a bathtub!</p>
-        
-        <div class="illustration">🏔️ ➡️ 🐉 ➡️ 🏡</div>
-        
-        <h2>Milo's Special Talent</h2>
-        
-        <p>Milo had a very special talent. Instead of breathing hot fire, Milo could do something <strong>WOW</strong>! He could turn ordinary things into sparkles! ✨</p>
-        
-        <div class="dialogue">
-            <strong>Meow:</strong>"Milo, Milo, my favorite toy is lost! Find it, please, Milo!"
-            <br><br>
-            <strong>Milo says:</strong>"Don't worry! Watch this!"
+    <div class="book-container">
+        <div class="book">
+            <div class="decoration decoration-1">🐉</div>
+            <div class="decoration decoration-2">✨</div>
+
+            <!-- Page 1: Title Page -->
+            <div class="page title-page active" id="page-1">
+                <div class="title-emoji">🐉</div>
+                <div class="title-name">The Friendly Dragon</div>
+                <div class="title-subtitle">A Magical Adventure</div>
+                <p style="font-size: 1.5rem; margin-top: 40px;">Click below to start the story adventure!</p>
+            </div>
+
+            <!-- Page 2: Meet Dragon -->
+            <div class="page" id="page-2">
+                <h1>Meet Puff!</h1>
+                <div class="emoji">🦖</div>
+                <p>Once upon a time, in a land with green hills and blue sky, there lived a tiny dragon who didn't breathe fire. He burped bubbles!</p>
+            </div>
+
+            <!-- Page 3: The Problem -->
+            <div class="page" id="page-3">
+                <h2>The Problem</h2>
+                <div class="emoji">☁️</div>
+                <p>Every other dragon breathed hot fire in caves. But Puff wanted to play with clouds like a fluffy bunny!</p>
+            </div>
+
+            <!-- Page 4: The Discovery -->
+            <div class="page" id="page-4">
+                <h2>The Magic Discovery</h2>
+                <div class="emoji">🌈</div>
+                <p>Puff found a glowing blue jewel that hummed with magic. When Puff hugged it, it became his magic hug!</p>
+            </div>
+
+            <!-- Page 5: Adventures -->
+            <div class="page" id="page-5">
+                <h2>Wonderful Adventures</h2>
+                <div class="emoji">⛰️</div>
+                <p>Puff flew higher than eagles! He gave gentle hugs to sheep and taught them to be brave and kind to everyone!</p>
+            </div>
+
+            <!-- Page 6: Friendship -->
+            <div class="page" id="page-6">
+                <h2>Best Friends Forever</h2>
+                <div class="emoji">🐑</div>
+                <p>Little sheep named Barnaby became Puff's best friend. Together they explored shiny caves and found many beautiful treasures!</p>
+            </div>
+
+            <!-- Page 7: The Celebration -->
+            <div class="page" id="page-7">
+                <h2>A Magical Celebration</h2>
+                <div class="emoji">🎉</div>
+                <p>All the villagers came to see Puff's special hug. They celebrated with rainbow confetti and delicious berry pies!</p>
+            </div>
+
+            <!-- Page 8: The Ending -->
+            <div class="page" id="page-8">
+                <h1>The Happy Ending</h1>
+                <div class="emoji">🌟</div>
+                <p>Puff showed everyone that being different is a special gift. Love and kindness are the most powerful magic of all!</p>
+            </div>
         </div>
-        
-        <p>Milo found Meow's toy car. With his dragon wings, he waved it in the air with magic wiggles. POP! ✨ The toy car became SHINY and CLEAN! 🚗✨</p>
-        
-        <p>"Yay!" said Meow the cat. "Thank you, Milo!"</p>
-        
-        <h2>Milo Helps a Bird</h2>
-        
-        <div class="illustration">🐦 ➡️ ❤️ ➡️ 🐦</div>
-        
-        <p>One sunny morning, Milo saw a little bird looking sad on the ground. His wing had a boo-boo! A big hurt!</p>
-        
-        <div class="dialogue">
-            <strong>Little Bird:</strong>"Oh no! I can't fly! My wing hurts!"
-            <br><br>
-            <strong>Milo says:</strong>"Hush now, little bird. Let me help!"
-        </div>
-        
-        <p>Milo gave the bird a little kiss on its wing. 💕 The boo-boo vanished! The bird flew happily away! 🐦💨</p>
-        
-        <h2>Milo's Biggest Adventure</h2>
-        
-        <div class="illustration">🌈 🦄 ✨ 🌸</div>
-        
-        <p>One day, something very special happened! Milo found a sleeping unicorn! 🦄 The unicorn was all sleepy, but it had a beautiful rainbow mane! 🌈</p>
-        
-        <div class="dialogue">
-            <strong>Meow:</strong>"Look! A unicorn! But it's sleeping..."
-            <br><br>
-            <strong>Milo says:</strong>"Shhh! Let's make our wish!"
-        </div>
-        
-        <p>Milo carefully flew around the unicorn with soft wing beats. He breathed out gentle stardust. ✨ Dream bubbles floated everywhere! 💫</p>
-        
-        <p>The next morning, magic butterflies danced in the garden! 🦋 The flowers were the most beautiful pink ever! 🌸✨</p>
-        
-        <h2>The Grand Surprise!</h2>
-        
-        <div class="illustration">🎉 🎁 ✨ 🐼 🐱 🐦 🐉</div>
-        
-        <p>All of their friends came together: Meow the cat, the little bird, the sleeping unicorn, and even sleepy Panda! Everyone wanted to see Milo's magic! 🎊</p>
-        
-        <p>Milo said, "This magic is for sharing! When you share love and kindness, magic happens!" 💖</p>
-        
-        <div class="final-message">
-            <h2>💖 The End 💖</h2>
-            <p style="font-size: 1.1em;">
-            And Milo lived happily ever after! 
-            <br><br>
-            <strong>Remember:</strong> Everyone has magic inside them! 
-            Whether it's being kind to a friend, helping someone, or sharing your toys... 
-            That's your magic! ✨
-            <br><br>
-            Keep your magic sparkly and share it with everyone! 🌟
-            </p>
-        </div>
-        
-        <div style="text-align: center; margin-top: 20px;">
-            <span class="star">⭐🌟✨❤️🦄🐉</span>
+
+        <div class="controls">
+            <button id="prevBtn" onclick="prevPage()">← Previous</button>
+            <button id="nextBtn" onclick="nextPage()">Next Page →</button>
+            <button onclick="toggleNavigation()" id="navBtn" style="font-size: 1rem; padding: 10px 20px;">🖊️</button>
         </div>
     </div>
+
+    <script>
+        let currentPage = 1;
+        let navigationVisible = true;
+        const totalPages = 8;
+
+        function updateButtons() {
+            document.getElementById('prevBtn').disabled = currentPage === 1;
+            document.getElementById('nextBtn').disabled = currentPage === totalPages;
+        }
+
+        function showPage(pageNum) {
+            // Remove active class from all pages
+            document.querySelectorAll('.page').forEach(page => {
+                page.classList.remove('active');
+            });
+            // Add active class to current page
+            document.getElementById(`page-${pageNum}`).classList.add('active');
+            updateButtons();
+            updateNavigation();
+        }
+
+        function nextPage() {
+            if (currentPage < totalPages) {
+                currentPage++;
+                showPage(currentPage);
+            }
+        }
+
+        function prevPage() {
+            if (currentPage > 1) {
+                currentPage--;
+                showPage(currentPage);
+            }
+        }
+
+        function updateNavigation() {
+            const navBtn = document.getElementById('navBtn');
+            if (navigationVisible) {
+                navBtn.textContent = '🖊️';
+                navBtn.onclick = toggleNavigation;
+            } else {
+                navBtn.textContent = '👆';
+                navBtn.onclick = () => {
+                    showPage(currentPage);
+                    navBtn.textContent = '🖊️';
+                };
+            }
+        }
+
+        function toggleNavigation() {
+            navigationVisible = !navigationVisible;
+            updateNavigation();
+        }
+
+        // Initialize
+        updateButtons();
+        updateNavigation();
+
+        // Keyboard navigation
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowRight') {
+                nextPage();
+            } else if (e.key === 'ArrowLeft') {
+                prevPage();
+            }
+        });
+
+        // Drag to navigate
+        document.querySelectorAll('.page').forEach((page, index) => {
+            page.addEventListener('mouseenter', () => {
+                if (navigationVisible) {
+                    currentPage = index + 1;
+                    showPage(currentPage);
+                }
+            });
+        });
+    </script>
 </body>
 </html>

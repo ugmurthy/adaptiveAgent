@@ -11,6 +11,22 @@
         "marked-terminal": "^7.3.0",
       },
     },
+    "packages/agent-sdk": {
+      "name": "@adaptive-agent/agent-sdk",
+      "version": "0.1.0",
+      "dependencies": {
+        "@adaptive-agent/core": "workspace:*",
+        "ajv": "^8.17.1",
+        "pg": "^8.20.0",
+      },
+      "devDependencies": {
+        "@types/node": "^25.5.2",
+        "@types/pg": "^8.20.0",
+        "bun-types": "^1.3.5",
+        "typescript": "^5.8.3",
+        "vitest": "^3.1.1",
+      },
+    },
     "packages/analysis": {
       "name": "@adaptive-agent/analysis",
       "version": "0.1.0",
@@ -109,6 +125,8 @@
     },
   },
   "packages": {
+    "@adaptive-agent/agent-sdk": ["@adaptive-agent/agent-sdk@workspace:packages/agent-sdk"],
+
     "@adaptive-agent/analysis": ["@adaptive-agent/analysis@workspace:packages/analysis"],
 
     "@adaptive-agent/core": ["@adaptive-agent/core@workspace:packages/core"],

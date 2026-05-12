@@ -46,7 +46,6 @@ The SDK should sit conceptually between `@adaptive-agent/core` and application c
 Existing package boundaries should remain:
 
 - `@adaptive-agent/core`: runtime primitives, stores, adapters, tools, skills
-- `@adaptive-agent/store-postgres`: durable store implementation when split out later
 - `@adaptive-agent/agent-sdk`: configuration, bootstrap, ergonomics, host-level defaults
 
 The SDK may initially reuse logic or code patterns from:
@@ -140,8 +139,6 @@ export interface AgentConfigFile {
     apiKeyEnv?: string;
     apiKey?: string;
     baseUrl?: string;
-    siteUrl?: string;
-    siteName?: string;
     maxConcurrentRequests?: number;
   };
 
@@ -398,8 +395,6 @@ The following model fields should support env-driven values:
 - `model`
 - `baseUrl`
 - `apiKeyEnv`
-- `siteUrl`
-- `siteName`
 
 ## Config Lookup
 
@@ -412,6 +407,10 @@ If the caller does not explicitly provide an agent config object or path, the SD
 3. environment variable `ADAPTIVE_AGENT_CONFIG`
 4. `./agent.json`
 5. `~/.adaptiveAgent/agents/default-agent.json`
+
+Note:
+
+- `agent.settings.json.agent.configPath` is a useful place to point at a default shared `agent.json` for a machine, repo family, or host app.
 
 ### `agent.settings.json` Lookup Order
 
@@ -460,8 +459,6 @@ export interface ResolvedAgentSdkConfig {
     model: string;
     apiKey?: string;
     baseUrl?: string;
-    siteUrl?: string;
-    siteName?: string;
     maxConcurrentRequests?: number;
   };
 
@@ -992,8 +989,6 @@ If later desired, the CLI may converge toward the SDK config model, but the SDK 
     "model": "${AA_MODEL_NAME}",
     "apiKeyEnv": "AA_MODEL_API_KEY",
     "baseUrl": "${AA_MODEL_BASE_URL}",
-    "siteUrl": "https://example.com",
-    "siteName": "My Team Agent",
     "maxConcurrentRequests": 4
   },
   "systemInstructions": "Be concise, careful with file edits, and explain tradeoffs clearly.",
