@@ -107,6 +107,16 @@ export interface ModelCapabilities {
   streaming: boolean;
   usage: boolean;
   imageInput?: boolean;
+  input?: Partial<Record<'image' | 'file' | 'audio', InputModalityCapability>>;
+}
+
+export type InputModality = 'text' | 'image' | 'file' | 'audio';
+export type InputSourceKind = 'path' | 'url' | 'data' | 'file_id';
+
+export interface InputModalityCapability {
+  sources: InputSourceKind[];
+  supportedMimeTypes?: string[];
+  maxInlineBytes?: number;
 }
 
 export type ImageDetail = 'auto' | 'low' | 'high';
@@ -115,6 +125,42 @@ export interface ImageInput {
   path: string;
   mimeType?: string;
   detail?: ImageDetail;
+  name?: string;
+}
+
+export interface PathInputSource {
+  kind: 'path';
+  path: string;
+}
+
+export interface UrlInputSource {
+  kind: 'url';
+  url: string;
+}
+
+export interface DataInputSource {
+  kind: 'data';
+  data: string;
+}
+
+export interface FileIdInputSource {
+  kind: 'file_id';
+  fileId: string;
+}
+
+export type FileInputSource = PathInputSource | UrlInputSource | FileIdInputSource;
+export type AudioInputSource = PathInputSource | UrlInputSource | DataInputSource | FileIdInputSource;
+
+export interface FileInput {
+  source: FileInputSource;
+  mimeType?: string;
+  name?: string;
+}
+
+export interface AudioInput {
+  source: AudioInputSource;
+  mimeType?: string;
+  format?: 'wav' | 'mp3' | 'flac' | 'm4a' | 'ogg' | 'aac' | 'aiff' | 'pcm16' | 'pcm24';
   name?: string;
 }
 
@@ -128,7 +174,17 @@ export interface ModelImageContentPart {
   image: ImageInput;
 }
 
-export type ModelContentPart = ModelTextContentPart | ModelImageContentPart;
+export interface ModelFileContentPart {
+  type: 'file';
+  file: FileInput;
+}
+
+export interface ModelAudioContentPart {
+  type: 'audio';
+  audio: AudioInput;
+}
+
+export type ModelContentPart = ModelTextContentPart | ModelImageContentPart | ModelFileContentPart | ModelAudioContentPart;
 export type ModelMessageContent = string | ModelContentPart[];
 
 export interface AgentDefaults {
@@ -188,6 +244,7 @@ export interface RunRequest {
   goal: string;
   input?: JsonValue;
   images?: ImageInput[];
+  contentParts?: ModelContentPart[];
   context?: Record<string, JsonValue>;
   allowedTools?: string[];
   forbiddenTools?: string[];
@@ -197,7 +254,7 @@ export interface RunRequest {
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
-  content: string;
+  content: ModelMessageContent;
   images?: ImageInput[];
 }
 
@@ -262,6 +319,7 @@ export interface DelegateToolInput {
   goal: string;
   input?: JsonValue;
   images?: ImageInput[];
+  contentParts?: ModelContentPart[];
   context?: Record<string, JsonValue>;
   outputSchema?: JsonSchema;
   metadata?: Record<string, JsonValue>;
@@ -353,6 +411,7 @@ export interface ModelRequest {
   tools?: Array<Pick<ToolDefinition, 'name' | 'description' | 'inputSchema'>>;
   outputSchema?: JsonSchema;
   signal?: AbortSignal;
+  modelTimeoutMs?: number;
   metadata?: Record<string, JsonValue>;
   onRetry?: (event: ModelRetryEvent) => Promise<void> | void;
 }

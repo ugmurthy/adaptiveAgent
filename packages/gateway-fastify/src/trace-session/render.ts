@@ -228,7 +228,7 @@ function renderTraceSummary(report: TraceReport): string {
       lines.push(`${chalk.cyan('agent')} ${session.agentId ?? 'unknown'}  ${chalk.cyan('channel')} ${session.channelId ?? 'unknown'}`);
       lines.push(renderModelSummary(report.rootRuns));
       lines.push(`${chalk.cyan('status')} ${statusColor(session.status)(session.status)}  ${chalk.cyan('current')} ${session.currentRunId ?? 'none'}`);
-      lines.push(`${chalk.cyan('session duration')} ${formatDuration(durationMs(session.createdAt, session.updatedAt))}`);
+      lines.push(`${chalk.cyan('session duration')} ${formatDuration(sessionRunDurationMs(report.rootRuns) ?? durationMs(session.createdAt, session.updatedAt))}`);
     }
   } else {
     lines.push(`${chalk.magenta('target')} ${report.target.kind} ${report.target.requestedId}`);
@@ -272,6 +272,23 @@ function formatRunModel(run: RootRun): string | null {
     return null;
   }
   return `${run.modelProvider ?? 'unknown'}/${run.modelName ?? 'unknown'}`;
+}
+
+function sessionRunDurationMs(rootRuns: RootRun[]): number | null {
+  let earliestStart: number | null = null;
+  let latestEnd: number | null = null;
+
+  for (const run of rootRuns) {
+    const start = parseTime(run.startedAt);
+    const end = parseTime(run.completedAt ?? run.updatedAt);
+    if (start === null || end === null || end < start) {
+      continue;
+    }
+    earliestStart = earliestStart === null ? start : Math.min(earliestStart, start);
+    latestEnd = latestEnd === null ? end : Math.max(latestEnd, end);
+  }
+
+  return earliestStart !== null && latestEnd !== null ? latestEnd - earliestStart : null;
 }
 
 function renderUsage(usage: SessionUsageSummary): string {
@@ -758,8 +775,21 @@ function durationMs(startedAt: string | null, completedAt: string | null): numbe
   if (!startedAt || !completedAt) {
     return null;
   }
-  const duration = Date.parse(completedAt) - Date.parse(startedAt);
+  const start = parseTime(startedAt);
+  const end = parseTime(completedAt);
+  if (start === null || end === null) {
+    return null;
+  }
+  const duration = end - start;
   return Number.isFinite(duration) && duration >= 0 ? duration : null;
+}
+
+function parseTime(value: string | null | undefined): number | null {
+  if (!value) {
+    return null;
+  }
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? time : null;
 }
 
 function formatDuration(ms: number | null): string {

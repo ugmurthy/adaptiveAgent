@@ -2,7 +2,10 @@ import { readFile, stat } from 'node:fs/promises';
 import { extname } from 'node:path';
 
 import type {
+  AudioInput,
+  FileInput,
   ImageInput,
+  InputSourceKind,
   JsonSchema,
   JsonValue,
   ModelAdapter,
@@ -86,8 +89,18 @@ interface OpenAIChatCompletionResponse {
     prompt_tokens: number;
     completion_tokens: number;
     total_tokens: number;
+    cost?: number | string;
+    cost_usd?: number | string;
+    estimated_cost_usd?: number | string;
+    total_cost?: number | string;
+    total_cost_usd?: number | string;
     completion_tokens_details?: {
       reasoning_tokens?: number;
+    };
+    cost_details?: {
+      upstream_inference_cost?: number | string;
+      upstream_inference_prompt_cost?: number | string;
+      upstream_inference_completions_cost?: number | string;
     };
   };
 }
@@ -106,6 +119,8 @@ const DEFAULT_MAX_RETRIES = 2;
 const INITIAL_RETRY_DELAY_MS = 500;
 const MAX_RETRY_DELAY_MS = 8_000;
 const MAX_LOCAL_IMAGE_BYTES = 10 * 1024 * 1024;
+export const MAX_LOCAL_FILE_BYTES = 25 * 1024 * 1024;
+export const MAX_LOCAL_AUDIO_BYTES = 25 * 1024 * 1024;
 const SUPPORTED_IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 // Keep the local process from stampeding the same upstream/model when future
 // parallel sub-agents begin issuing requests concurrently without forcing the
@@ -339,9 +354,7 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
   protected async buildRequestBody(
     request: ModelRequest,
   ): Promise<Record<string, unknown>> {
-    if (request.messages.some(messageHasImageInput) && !this.capabilities.imageInput) {
-      throw new Error(`${this.provider} model ${this.model} does not declare image input support`);
-    }
+    validateInputCapabilities(this.provider, this.model, this.capabilities, request.messages);
 
     const body: Record<string, unknown> = {
       model: this.model,
@@ -408,7 +421,7 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
           completionTokens: data.usage.completion_tokens,
           reasoningTokens: data.usage.completion_tokens_details?.reasoning_tokens,
           totalTokens: data.usage.total_tokens,
-          estimatedCostUSD: 0,
+          estimatedCostUSD: estimateUsageCostUSD(data.usage),
           provider: this.provider,
           model: this.model,
         }
@@ -586,6 +599,7 @@ async function toOpenAIMessage(msg: ModelMessage): Promise<OpenAIMessage> {
     return {
       role: 'tool',
       content: contentAsText(msg.content),
+      name: msg.name,
       tool_call_id: msg.toolCallId ?? '',
     };
   }
@@ -618,8 +632,32 @@ async function toOpenAIMessage(msg: ModelMessage): Promise<OpenAIMessage> {
   };
 }
 
-function messageHasImageInput(message: ModelMessage): boolean {
-  return Array.isArray(message.content) && message.content.some((part) => part.type === 'image');
+function validateInputCapabilities(
+  provider: string,
+  model: string,
+  capabilities: ModelCapabilities,
+  messages: ModelMessage[],
+): void {
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (part.type === 'text') continue;
+      if (part.type === 'image') {
+        if (!capabilities.input?.image && !capabilities.imageInput) {
+          throw new Error(`${provider} model ${model} does not declare image input support`);
+        }
+        continue;
+      }
+      const capability = capabilities.input?.[part.type];
+      if (!capability) {
+        throw new Error(`${provider} model ${model} does not declare ${part.type} input support`);
+      }
+      const sourceKind = part.type === 'file' ? part.file.source.kind : part.audio.source.kind;
+      if (!capability.sources.includes(sourceKind as InputSourceKind)) {
+        throw new Error(`${provider} model ${model} does not support ${part.type} input source ${sourceKind}`);
+      }
+    }
+  }
 }
 
 async function toOpenAIContent(content: ModelMessage['content']): Promise<string | OpenAIContentPart[]> {
@@ -633,6 +671,14 @@ async function toOpenAIContent(content: ModelMessage['content']): Promise<string
         return { type: 'text', text: part.text };
       }
 
+      if (part.type === 'file') {
+        return { type: 'file', file: await toOpenAIFile(part.file) } as unknown as OpenAIContentPart;
+      }
+
+      if (part.type === 'audio') {
+        return { type: 'input_audio', input_audio: await toOpenAIAudio(part.audio) } as unknown as OpenAIContentPart;
+      }
+
       const imageUrl: { url: string; detail?: 'auto' | 'low' | 'high' } = {
         url: await localImageToDataUrl(part.image),
       };
@@ -642,6 +688,30 @@ async function toOpenAIContent(content: ModelMessage['content']): Promise<string
       return { type: 'image_url', image_url: imageUrl };
     }),
   );
+}
+
+async function toOpenAIFile(file: FileInput): Promise<Record<string, unknown>> {
+  switch (file.source.kind) {
+    case 'path':
+      return { file_data: await localFileToDataUrl(file), filename: file.name };
+    case 'url':
+      return { file_data: file.source.url, filename: file.name };
+    case 'file_id':
+      return { file_id: file.source.fileId, filename: file.name };
+  }
+}
+
+async function toOpenAIAudio(audio: AudioInput): Promise<Record<string, unknown>> {
+  if (!audio.format) {
+    throw new Error('Audio input requires format');
+  }
+  if (audio.source.kind !== 'path' && audio.source.kind !== 'data') {
+    throw new Error(`Audio input source ${audio.source.kind} is not supported`);
+  }
+  return {
+    data: audio.source.kind === 'data' ? audio.source.data : await localAudioToBase64(audio),
+    format: audio.format,
+  };
 }
 
 function contentAsText(content: ModelMessage['content']): string {
@@ -679,6 +749,34 @@ async function localImageToDataUrl(image: ImageInput): Promise<string> {
   }
 
   return `data:${mimeType};base64,${imageBuffer.toString('base64')}`;
+}
+
+export async function localFileToDataUrl(file: FileInput): Promise<string> {
+  if (file.source.kind !== 'path') throw new Error('File data URL conversion requires a path source');
+  const fileStats = await stat(file.source.path);
+  if (!fileStats.isFile()) throw new Error(`File input path is not a file: ${file.source.path}`);
+  if (fileStats.size > MAX_LOCAL_FILE_BYTES) throw new Error(`File input ${file.source.path} exceeds maximum size of ${MAX_LOCAL_FILE_BYTES} bytes`);
+  const buffer = await readFile(file.source.path);
+  const mimeType = file.mimeType ?? inferFileMimeType(file.source.path) ?? 'application/octet-stream';
+  return `data:${mimeType};base64,${buffer.toString('base64')}`;
+}
+
+export async function localAudioToBase64(audio: AudioInput): Promise<string> {
+  if (audio.source.kind !== 'path') throw new Error('Audio base64 conversion requires a path source');
+  const fileStats = await stat(audio.source.path);
+  if (!fileStats.isFile()) throw new Error(`Audio input path is not a file: ${audio.source.path}`);
+  if (fileStats.size > MAX_LOCAL_AUDIO_BYTES) throw new Error(`Audio input ${audio.source.path} exceeds maximum size of ${MAX_LOCAL_AUDIO_BYTES} bytes`);
+  return (await readFile(audio.source.path)).toString('base64');
+}
+
+function inferFileMimeType(filePath: string): string | undefined {
+  switch (extname(filePath).toLowerCase()) {
+    case '.pdf': return 'application/pdf';
+    case '.txt': return 'text/plain';
+    case '.json': return 'application/json';
+    case '.csv': return 'text/csv';
+    default: return undefined;
+  }
 }
 
 function inferImageMimeType(filePath: string): string | undefined {
@@ -777,6 +875,47 @@ function tryParseJson(text: string): JsonValue | undefined {
     // not JSON — that's fine, return undefined
   }
 
+  return undefined;
+}
+
+function estimateUsageCostUSD(usage: NonNullable<OpenAIChatCompletionResponse['usage']>): number {
+  return readFiniteNumber(
+    usage.estimated_cost_usd,
+    usage.cost_usd,
+    usage.total_cost_usd,
+    usage.cost,
+    usage.total_cost,
+    usage.cost_details?.upstream_inference_cost,
+    sumFiniteNumbers(
+      usage.cost_details?.upstream_inference_prompt_cost,
+      usage.cost_details?.upstream_inference_completions_cost,
+    ),
+  ) ?? 0;
+}
+
+function sumFiniteNumbers(...values: Array<number | string | undefined>): number | undefined {
+  let total = 0;
+  let found = false;
+  for (const value of values) {
+    const parsed = readFiniteNumber(value);
+    if (parsed === undefined) continue;
+    total += parsed;
+    found = true;
+  }
+  return found ? total : undefined;
+}
+
+function readFiniteNumber(...values: Array<number | string | undefined>): number | undefined {
+  for (const value of values) {
+    const parsed = typeof value === 'number'
+      ? value
+      : typeof value === 'string'
+        ? Number(value)
+        : undefined;
+    if (parsed !== undefined && Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
   return undefined;
 }
 

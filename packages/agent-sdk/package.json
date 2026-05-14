@@ -5,14 +5,21 @@
   "private": true,
   "type": "module",
   "main": "src/index.ts",
+  "bin": {
+    "adaptive-agent": "./dist/adaptive-agent.js"
+  },
   "scripts": {
-    "build": "bun build ./src/index.ts --outdir dist --target bun",
+    "build": "bun build ./src/index.ts ./src/adaptive-agent.ts --outdir dist --target bun",
+    "adaptive-agent": "bun run ./dist/adaptive-agent.js",
+    "link:global": "bun run ./scripts/link-global.ts",
     "test": "bunx vitest run",
     "typecheck": "bunx tsc --noEmit"
   },
   "dependencies": {
     "@adaptive-agent/core": "workspace:*",
     "ajv": "^8.17.1",
+    "marked": "^17.0.5",
+    "marked-terminal": "^7.3.0",
     "pg": "^8.20.0"
   },
   "devDependencies": {

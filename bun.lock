@@ -14,9 +14,14 @@
     "packages/agent-sdk": {
       "name": "@adaptive-agent/agent-sdk",
       "version": "0.1.0",
+      "bin": {
+        "adaptive-agent": "./dist/adaptive-agent.js",
+      },
       "dependencies": {
         "@adaptive-agent/core": "workspace:*",
         "ajv": "^8.17.1",
+        "marked": "^17.0.5",
+        "marked-terminal": "^7.3.0",
         "pg": "^8.20.0",
       },
       "devDependencies": {
@@ -48,6 +53,7 @@
       "dependencies": {
         "@mistralai/mistralai": "^2.2.1",
         "@openrouter/sdk": "^0.12.35",
+        "meshapi-node-sdk": "^0.1.0",
         "pdfjs-dist": "^5.4.296",
         "pino": "^10.3.1",
         "pino-pretty": "^13.1.3",
@@ -61,6 +67,7 @@
       "name": "@adaptive-agent/core-cli",
       "version": "0.1.0",
       "bin": {
+        "core:cli": "./src/cli.ts",
         "core-agent": "./src/cli.ts",
         "adaptive-agent-core": "./src/cli.ts",
       },
@@ -125,6 +132,9 @@
         "vite": "^7.1.7",
       },
     },
+  },
+  "patchedDependencies": {
+    "@openrouter/sdk@0.12.35": "patches/@openrouter%2Fsdk@0.12.35.patch",
   },
   "packages": {
     "@adaptive-agent/agent-sdk": ["@adaptive-agent/agent-sdk@workspace:packages/agent-sdk"],
@@ -512,6 +522,8 @@
     "marked": ["marked@17.0.5", "", { "bin": { "marked": "bin/marked.js" } }, "sha512-6hLvc0/JEbRjRgzI6wnT2P1XuM1/RrrDEX0kPt0N7jGm1133g6X7DlxFasUIx+72aKAr904GTxhSLDrd5DIlZg=="],
 
     "marked-terminal": ["marked-terminal@7.3.0", "", { "dependencies": { "ansi-escapes": "^7.0.0", "ansi-regex": "^6.1.0", "chalk": "^5.4.1", "cli-highlight": "^2.1.11", "cli-table3": "^0.6.5", "node-emoji": "^2.2.0", "supports-hyperlinks": "^3.1.0" }, "peerDependencies": { "marked": ">=1 <16" } }, "sha512-t4rBvPsHc57uE/2nJOLmMbZCQ4tgAccAED3ngXQqW6g+TxA488JzJ+FK3lQkzBQOI1mRV/r/Kq+1ZlJ4D0owQw=="],
+
+    "meshapi-node-sdk": ["meshapi-node-sdk@0.1.0", "", {}, "sha512-xaKwOJprwCIwKZpgoaAt/bw+6k/9VUd09+uVQW36/mwhSNhUv5iZNdb/IiLmtREljHV4/5eV13me711yWNTQKA=="],
 
     "mime-db": ["mime-db@1.54.0", "", {}, "sha512-aU5EJuIN2WDemCcAp2vFBfp/m4EAhWJnUNSSw0ixs7/kXbd6Pg64EmwJkNdFhB8aWt1sH2CTXrLxo/iAGV3oPQ=="],
 

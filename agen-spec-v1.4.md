@@ -566,6 +566,17 @@ Minimum capabilities to expose:
 
 The runtime should degrade gracefully when a provider lacks a capability. For example, if a provider has no structured JSON mode, the runtime may fall back to validated text parsing rather than pretending structured output is guaranteed.
 
+The core package may ship concrete provider adapters as long as they remain behind the `ModelAdapter` boundary. Current reference adapters are:
+
+- `OpenRouterAdapter`, backed by `@openrouter/sdk`
+- `MistralAdapter`, backed by `@mistralai/mistralai`
+- `MeshAdapter`, backed by `meshapi-node-sdk`
+- `OllamaAdapter`, backed by the OpenAI-compatible HTTP chat-completions path
+
+Provider SDK adapters must map `ModelRequest` into the SDK's typed request shape rather than assuming the raw REST wire shape. In particular, SDKs may require different field naming from OpenAI-compatible HTTP payloads, such as `toolCalls` versus `tool_calls`, `toolCallId` versus `tool_call_id`, `imageUrl` versus `image_url`, or `responseFormat` versus `response_format`. Each adapter owns this request and response normalization while preserving the shared runtime semantics for tool calling, structured output, usage accounting, abort signals, and resumability.
+
+The OpenAI-compatible base adapter remains a fallback and parser reference for providers or local endpoints that expose `/chat/completions` directly. It should not become the public runtime contract; the public contract remains `ModelAdapter`.
+
 ## 14. Result Envelope
 
 The runtime should always return a small terminal envelope.

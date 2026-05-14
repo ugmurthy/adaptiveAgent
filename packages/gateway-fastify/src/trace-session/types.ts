@@ -42,6 +42,9 @@ export interface RootRun {
   invocationKind: string;
   turnIndex: number | null;
   linkedAt: string;
+  startedAt?: string | null;
+  updatedAt?: string | null;
+  completedAt?: string | null;
   status: string | null;
   goal: string | null;
   result: unknown;

@@ -1,0 +1,39 @@
+{
+  "mode": "chat",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are validating multimodal input handling. Summarize each attachment by modality, call out any parsing issues, and end with a short confidence note."
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Inspect every attached input. For files, mention the file type and the most useful content you can extract."
+        },
+        
+        {
+          "type": "audio",
+          "audio": {
+            "source": {
+              "kind": "path",
+              "path": "./fixtures/sample-audio.wav"
+            },
+            "format": "wav",
+            "mimeType": "audio/wav",
+            "name": "sample-audio.wav"
+          }
+        }
+      ]
+    }
+  ],
+  "context": {
+    "testCase": "multimodal-fixtures",
+    "purpose": "manual agent-sdk validation"
+  },
+  "metadata": {
+    "createdBy": "codex",
+    "specVariant": "all-local-fixtures"
+  }
+}

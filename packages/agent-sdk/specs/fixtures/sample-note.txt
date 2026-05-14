@@ -1,0 +1,7 @@
+Adaptive Agent fixture note
+
+This text file exists to validate plain text file ingestion.
+Expected highlights:
+- the title line
+- the phrase "plain text file ingestion"
+- the short bullet list structure

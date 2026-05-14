@@ -26,5 +26,8 @@
     "@types/marked-terminal": "^6.1.1",
     "marked": "^17.0.5",
     "marked-terminal": "^7.3.0"
+  },
+  "patchedDependencies": {
+    "@openrouter/sdk@0.12.35": "patches/@openrouter%2Fsdk@0.12.35.patch"
   }
 }

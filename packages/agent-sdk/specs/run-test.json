@@ -1,0 +1,14 @@
+{
+  "mode": "run",
+  "goal": "Get a summary of the IPL 2026 points standing by team. Ensure you cross check the data with multiple websites",
+  "input": {
+    "ticketId": "IPL-2026"
+  },
+  "contentParts": [
+    {
+      "type": "text",
+      "text": "If you encounter http status 4xx then try alternate sites "
+    }
+  ]
+}
+

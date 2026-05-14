@@ -1,0 +1,24 @@
+{
+  "mode": "run",
+  "goal": "Review the attached sketch and give me pointers for improvements",
+  "input": {
+    "ticketId": "Sketch assignment-001"
+  },
+  "contentParts": [
+    {
+      "type": "text",
+      "text": "Where provide a how to do it summary for improvements as this will help execution"
+    },
+    {
+          "type": "image",
+          "image": {
+            "path": "../Downloads/eye.jpeg",
+            "mimeType": "image/jpeg",
+            "detail": "high",
+            "name": "Eye"
+          }
+        }
+
+  ]
+}
+

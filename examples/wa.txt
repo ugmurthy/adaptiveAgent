@@ -1,11 +1,8 @@
-As an expert on world politics and more so a West Asian Economic and Political advisor, with access to wider ranging experts in  Defence, International relations, Military Affairs, Political Science, and International Law and Historians. I would like you and your team to carefully assess developments upto 30/April/2026 regarding the conflict in this region.
+As an expert on world politics and more so a West Asian Economic and Political advisor, with access to wider ranging experts in  Defence, International relations, Military Affairs, Political Science, and International Law and Historians. I would like you and your team to carefully assess developments upto 14/May/2026 regarding the conflict in this region.
 
-Use key insights from history:
-- military historians and psychologists specialising in the causes of war, the dynamics of ceasefires, and the realities of negotiations (both public and private/backchannel) to project probable future scenarios
-- how previous ceasefire talks in previous conflicts say isince WW2 have come about, held on , and finally come to some form of lasting agreement or peace but not necessarily resolving all the reasons for the disputes.
+Consider the  negotiations in Pakistan between USA and Iran and the impact of the same on the region, also consider any overtures to restart negotiations. 
 
-Use that data to do monte carlo similation on possible outcomes and the rationale for the same.  Do consider the  negotiations in pakistan between USA and Iran and the impact of the same on the region, also consider any overtures to restart negotiations. 
+Consider the impact of the US visit to China on the region and other overtures to produce a forward looking report.
 
 Ensure that your verify the data to be accurate and write your final report using professional style, similar to New York times and write the full report in html format to west-asian-report-30Apr.html 
-
 

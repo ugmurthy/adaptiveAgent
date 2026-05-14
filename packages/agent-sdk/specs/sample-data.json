@@ -1,0 +1,11 @@
+{
+  "fixture": true,
+  "name": "sample-data",
+  "priority": 2,
+  "tags": [
+    "json",
+    "multimodal",
+    "agent-sdk"
+  ],
+  "summary": "Structured data for file modality testing."
+}

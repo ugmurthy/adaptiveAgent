@@ -703,6 +703,9 @@ describe('trace-session CLI helpers', () => {
           invocationKind: 'run',
           turnIndex: 0,
           linkedAt: now(),
+          startedAt: '2026-04-16T10:00:01.000Z',
+          updatedAt: '2026-04-16T10:00:11.000Z',
+          completedAt: '2026-04-16T10:00:11.000Z',
           status: 'succeeded',
           goal: 'Trace headers',
           result: 'Done',
@@ -735,7 +738,7 @@ describe('trace-session CLI helpers', () => {
     expect(output).toContain('mesh');
     expect(output).toContain('model');
     expect(output).toContain('qwen/qwen3.5-27b');
-    expect(output).toContain('2.50s');
+    expect(output).toContain('10.00s');
     const lines = output.split('\n');
     const goalLine = lines.find((line) => stripAnsi(line) === '# Goal');
     expect(goalLine).toBeDefined();

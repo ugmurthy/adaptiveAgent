@@ -1,0 +1,26 @@
+{
+  "mode": "run",
+  "goal": "Audio Transcription and Translation from English to other languages when requested",
+  "input": {
+    "ticketId": "audio 001"
+  },
+  "contentParts": [
+    {
+      "type": "text",
+      "text": "Transcribe the audio to English and then translate the result to Hindi, French and German. Double the the translation to be complete before output the final result as a markdown table with column heading indicating language. "
+    },
+    {
+          "type": "audio",
+          "audio": {
+            "source": {
+              "kind": "path",
+              "path": "./sample.mp3"
+            },
+            "format": "mp3",
+            "mimeType": "audio/mpeg",
+            "name": "sample mp3"
+          }
+        }
+  ]
+}
+

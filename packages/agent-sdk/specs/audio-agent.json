@@ -1,0 +1,19 @@
+{
+  "id": "mesh-audio-min",
+  "name": "Mesh Audio Minimal",
+  "invocationModes": ["run"],
+  "defaultInvocationMode": "run",
+  "model": {
+    "provider": "mesh",
+    "model": "openai/gpt-4o-audio-preview"
+  },
+"systemInstructions": "For audio inputs, produce the final transcription/translation in the first response. Do not narrate intent or future actions.",
+
+  "tools": [],
+  "delegates": [],
+  "defaults": {
+    "injectToolManifest": false,
+    "maxSteps": 1,
+    "autoApproveAll": true
+  }
+}

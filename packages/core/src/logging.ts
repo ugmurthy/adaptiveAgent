@@ -108,6 +108,29 @@ function summarizeModelContentPartForLog(part: ModelContentPart) {
     };
   }
 
+  if (part.type === 'file') {
+    return {
+      type: part.type,
+      file: {
+        source: summarizeInputSourceForLog(part.file.source),
+        mimeType: part.file.mimeType,
+        name: part.file.name,
+      },
+    };
+  }
+
+  if (part.type === 'audio') {
+    return {
+      type: part.type,
+      audio: {
+        source: summarizeInputSourceForLog(part.audio.source),
+        mimeType: part.audio.mimeType,
+        format: part.audio.format,
+        name: part.audio.name,
+      },
+    };
+  }
+
   return {
     type: part.type,
     image: {
@@ -116,5 +139,14 @@ function summarizeModelContentPartForLog(part: ModelContentPart) {
       detail: part.image.detail,
       name: part.image.name,
     },
+  };
+}
+
+function summarizeInputSourceForLog(source: { kind: string; path?: string; url?: string; fileId?: string }) {
+  return {
+    kind: source.kind,
+    path: source.path,
+    url: source.url,
+    fileId: source.fileId,
   };
 }

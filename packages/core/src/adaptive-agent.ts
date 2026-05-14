@@ -260,13 +260,13 @@ export class AdaptiveAgent {
       context: request.context,
       metadata: request.metadata,
       status: 'queued',
-    }, (run) => this.createInitialExecutionState(run, request.outputSchema, request.images));
+    }, (run) => this.createInitialExecutionState(run, request.outputSchema, request.images, request.contentParts));
 
     this.logLifecycle('info', 'run.created', {
       ...runLogBindings(createdRun),
       goal: summarizeValueForLog(request.goal),
       input: captureValueForLog(request.input, { mode: this.defaultCaptureMode }),
-      images: summarizeImagesForLog(request.images),
+      contentParts: summarizeContentPartsForLog(normalizeContentParts(request.images, request.contentParts)),
       context: captureValueForLog(request.context, { mode: this.defaultCaptureMode }),
       metadata: captureValueForLog(request.metadata, { mode: 'summary' }),
       outputSchema: request.outputSchema ? summarizeValueForLog(request.outputSchema) : undefined,
@@ -2442,9 +2442,14 @@ export class AdaptiveAgent {
     state.toolBudgetUsage[budgetGroup] = usage;
   }
 
-  private createInitialExecutionState(run: AgentRun, outputSchema?: JsonSchema, images?: ImageInput[]): ExecutionState {
+  private createInitialExecutionState(
+    run: AgentRun,
+    outputSchema?: JsonSchema,
+    images?: ImageInput[],
+    contentParts?: ModelContentPart[],
+  ): ExecutionState {
     return this.createExecutionState(
-      buildInitialMessages(run, outputSchema, this.options.systemInstructions, this.buildRuntimeToolManifestMessage(), images),
+      buildInitialMessages(run, outputSchema, this.options.systemInstructions, this.buildRuntimeToolManifestMessage(), images, contentParts),
       outputSchema,
     );
   }
@@ -2852,6 +2857,7 @@ export class AdaptiveAgent {
       response = await this.options.model.generate({
         ...modelRequest,
         signal: timeoutContext.signal,
+        modelTimeoutMs,
         onRetry: async (retry) => {
           const durationMs = Date.now() - startedAt;
           this.logLifecycle('warn', 'model.retry', {
@@ -3500,6 +3506,7 @@ function buildInitialMessages(
   systemInstructions?: string,
   toolManifestMessage?: ModelMessage,
   images?: ImageInput[],
+  contentParts?: ModelContentPart[],
 ): ModelMessage[] {
   const requestPayload: JsonObject = {
     goal: run.goal,
@@ -3516,7 +3523,7 @@ function buildInitialMessages(
     ...(toolManifestMessage ? [toolManifestMessage] : []),
     {
       role: 'user',
-      content: buildUserMessageContent(JSON.stringify(requestPayload, null, 2), images),
+      content: buildUserMessageContent(JSON.stringify(requestPayload, null, 2), images, contentParts),
     },
   ];
 }
@@ -3547,36 +3554,70 @@ function buildInitialChatMessages(
     ...contextMessage,
     ...messages.map((message) => ({
       role: message.role,
-      content: buildUserMessageContent(message.content, message.images),
+      content: buildChatMessageContent(message.content, message.images),
     })),
   ];
 }
 
-function buildUserMessageContent(text: string, images?: ImageInput[]): ModelMessageContent {
-  if (!images || images.length === 0) {
+function buildChatMessageContent(content: ModelMessageContent, images?: ImageInput[]): ModelMessageContent {
+  if (Array.isArray(content)) {
+    if (images && images.length > 0) {
+      throw new Error('ChatMessage.images is valid only when content is a string');
+    }
+    return content;
+  }
+
+  return buildUserMessageContent(content, images);
+}
+
+function buildUserMessageContent(text: string, images?: ImageInput[], contentParts?: ModelContentPart[]): ModelMessageContent {
+  const normalizedParts = normalizeContentParts(images, contentParts);
+  if (normalizedParts.length === 0) {
     return text;
   }
 
   return [
     { type: 'text', text },
-    ...images.map((image): ModelContentPart => ({
-      type: 'image',
-      image,
-    })),
+    ...normalizedParts,
   ];
 }
 
-function summarizeImagesForLog(images: ImageInput[] | undefined): JsonValue | undefined {
-  if (!images || images.length === 0) {
+function normalizeContentParts(images?: ImageInput[], contentParts?: ModelContentPart[]): ModelContentPart[] {
+  const hasLegacyImages = Boolean(images && images.length > 0);
+  const hasStructuredImages = Boolean(contentParts?.some((part) => part.type === 'image'));
+  if (hasLegacyImages && hasStructuredImages) {
+    throw new Error('RunRequest must not include both images and image contentParts');
+  }
+
+  return [
+    ...(contentParts ?? []),
+    ...(images ?? []).map((image): ModelContentPart => ({ type: 'image', image })),
+  ];
+}
+
+function summarizeContentPartsForLog(contentParts: ModelContentPart[]): JsonValue | undefined {
+  if (contentParts.length === 0) {
     return undefined;
   }
 
-  return images.map((image) => ({
-    path: image.path,
-    mimeType: image.mimeType,
-    detail: image.detail,
-    name: image.name,
-  }));
+  return contentParts.map((part) => {
+    if (part.type === 'file') {
+      return { type: 'file', source: summarizeInputSource(part.file.source), mimeType: part.file.mimeType, name: part.file.name };
+    }
+    if (part.type === 'audio') {
+      return { type: 'audio', source: summarizeInputSource(part.audio.source), mimeType: part.audio.mimeType, format: part.audio.format, name: part.audio.name };
+    }
+    return part;
+  }) as unknown as JsonValue;
+}
+
+function summarizeInputSource(source: { kind: string; path?: string; url?: string; fileId?: string }): JsonObject {
+  return {
+    kind: source.kind,
+    ...(source.path ? { path: source.path } : {}),
+    ...(source.url ? { url: source.url } : {}),
+    ...(source.fileId ? { fileId: source.fileId } : {}),
+  };
 }
 
 function countChatImages(messages: ChatMessage[]): number {
@@ -3590,8 +3631,8 @@ function summarizeChatGoal(messages: ChatMessage[]): string {
 
   const latestUserMessage = [...messages]
     .reverse()
-    .find((message) => message.role === 'user' && message.content.trim().length > 0);
-  const basis = latestUserMessage?.content.trim() || messages[messages.length - 1]?.content.trim() || '';
+    .find((message) => message.role === 'user' && contentAsText(message.content).trim().length > 0);
+  const basis = contentAsText(latestUserMessage?.content ?? messages[messages.length - 1]?.content ?? '').trim();
   if (!basis) {
     return 'Continue the conversation.';
   }
@@ -3795,7 +3836,7 @@ function isModelMessageContent(value: unknown): value is ModelMessageContent {
 }
 
 function isModelContentPartArray(value: unknown): value is ModelContentPart[] {
-  return Array.isArray(value) && value.every(isModelContentPart);
+  return Array.isArray(value) && value.length > 0 && value.every(isModelContentPart);
 }
 
 function isModelContentPart(value: unknown): value is ModelContentPart {
@@ -3812,7 +3853,22 @@ function isModelContentPart(value: unknown): value is ModelContentPart {
     return isImageInput(candidate.image);
   }
 
+  if (candidate.type === 'file') {
+    return isFileInput(candidate.file);
+  }
+
+  if (candidate.type === 'audio') {
+    return isAudioInput(candidate.audio);
+  }
+
   return false;
+}
+
+function contentAsText(content: ModelMessageContent): string {
+  if (typeof content === 'string') {
+    return content;
+  }
+  return content.filter((part) => part.type === 'text').map((part) => part.text).join('\n');
 }
 
 function isImageInput(value: unknown): value is ImageInput {
@@ -3827,6 +3883,54 @@ function isImageInput(value: unknown): value is ImageInput {
     (candidate.detail === undefined || ['auto', 'low', 'high'].includes(String(candidate.detail))) &&
     (candidate.name === undefined || typeof candidate.name === 'string')
   );
+}
+
+function isFileInput(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  return isFileInputSource(candidate.source) &&
+    (candidate.mimeType === undefined || typeof candidate.mimeType === 'string') &&
+    (candidate.name === undefined || typeof candidate.name === 'string');
+}
+
+function isAudioInput(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  return isAudioInputSource(candidate.source) &&
+    (candidate.mimeType === undefined || typeof candidate.mimeType === 'string') &&
+    (candidate.format === undefined || ['wav', 'mp3', 'flac', 'm4a', 'ogg', 'aac', 'aiff', 'pcm16', 'pcm24'].includes(String(candidate.format))) &&
+    (candidate.name === undefined || typeof candidate.name === 'string');
+}
+
+function isFileInputSource(value: unknown): boolean {
+  if (!isJsonObject(value)) {
+    return false;
+  }
+  if (value.kind === 'path') return typeof value.path === 'string' && value.path.trim().length > 0;
+  if (value.kind === 'url') return typeof value.url === 'string' && isHttpUrl(value.url);
+  if (value.kind === 'file_id') return typeof value.fileId === 'string' && value.fileId.trim().length > 0;
+  return false;
+}
+
+function isAudioInputSource(value: unknown): boolean {
+  if (!isJsonObject(value)) {
+    return false;
+  }
+  if (value.kind === 'data') return typeof value.data === 'string' && value.data.trim().length > 0 && !value.data.startsWith('data:');
+  return isFileInputSource(value) || value.kind === 'url';
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
 }
 
 function assistantMessageFromResponse(response: ModelResponse): ModelMessage | null {

@@ -17,6 +17,7 @@
   "dependencies": {
     "@mistralai/mistralai": "^2.2.1",
     "@openrouter/sdk": "^0.12.35",
+    "meshapi-node-sdk": "^0.1.0",
     "pdfjs-dist": "^5.4.296",
     "pino": "^10.3.1",
     "pino-pretty": "^13.1.3"

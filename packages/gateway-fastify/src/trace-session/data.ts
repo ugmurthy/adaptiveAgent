@@ -446,6 +446,9 @@ async function loadRootRuns(client: PostgresClient, rootRunIds: string[], sessio
     invocation_kind: string;
     turn_index: number | null;
     linked_at: string;
+    started_at: string | null;
+    updated_at: string | null;
+    completed_at: string | null;
     status: string | null;
     goal: string | null;
     result: unknown;
@@ -465,6 +468,9 @@ async function loadRootRuns(client: PostgresClient, rootRunIds: string[], sessio
         coalesce(link.invocation_kind, 'run') as invocation_kind,
         link.turn_index,
         coalesce(link.created_at, r.created_at) as linked_at,
+        r.created_at as started_at,
+        r.updated_at as updated_at,
+        r.completed_at as completed_at,
         r.status,
         r.goal,
         r.result,
@@ -493,6 +499,9 @@ async function loadRootRuns(client: PostgresClient, rootRunIds: string[], sessio
     invocationKind: row.invocation_kind,
     turnIndex: row.turn_index,
     linkedAt: row.linked_at,
+    startedAt: row.started_at,
+    updatedAt: row.updated_at,
+    completedAt: row.completed_at,
     status: row.status,
     goal: row.goal,
     result: row.result,
@@ -538,10 +547,28 @@ async function loadSessionUsage(client: PostgresClient, rootRunIds: string[]): P
         coalesce(sum(r.total_prompt_tokens), 0)::text as total_prompt_tokens,
         coalesce(sum(r.total_completion_tokens), 0)::text as total_completion_tokens,
         coalesce(sum(r.total_reasoning_tokens), 0)::text as total_reasoning_tokens,
-        coalesce(sum(r.estimated_cost_usd), 0)::text as estimated_cost_usd
+        coalesce(
+          sum(coalesce(nullif(r.estimated_cost_usd, 0), usage_event.estimated_cost_usd, 0)),
+          0
+        )::text as estimated_cost_usd
       from run_tree rt
       join agent_runs r on r.id = rt.id
       join root_runs rr on rr.root_run_id = rt.root_run_id
+      left join lateral (
+        select nullif(event_usage.estimated_cost_usd, '')::numeric as estimated_cost_usd
+        from agent_events e
+        cross join lateral (
+          select coalesce(
+            e.payload #>> '{usage,estimatedCostUSD}',
+            e.payload #>> '{usage,estimated_cost_usd}'
+          ) as estimated_cost_usd
+        ) event_usage
+        where e.run_id = rt.id
+          and e.event_type = 'usage.updated'
+          and nullif(event_usage.estimated_cost_usd, '') is not null
+        order by e.seq desc, e.created_at desc
+        limit 1
+      ) usage_event on true
       group by rt.root_run_id, rr.ordinality
       order by rr.ordinality asc, rt.root_run_id asc
     `,

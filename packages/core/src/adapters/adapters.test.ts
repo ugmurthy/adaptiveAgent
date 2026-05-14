@@ -390,6 +390,39 @@ describe('BaseOpenAIChatAdapter', () => {
     expect(result.providerResponseId).toBe('chatcmpl-test-1');
   });
 
+  it('uses provider-reported usage cost when present', async () => {
+    const adapter = createAdapter();
+    mockFetchResponse({
+      ...STOP_RESPONSE,
+      usage: {
+        ...STOP_RESPONSE.usage,
+        cost: 0.00014,
+      },
+    });
+
+    const result = await adapter.generate(simpleRequest());
+
+    expect(result.usage?.estimatedCostUSD).toBeCloseTo(0.00014);
+  });
+
+  it('uses provider-reported cost detail totals when direct usage cost is absent', async () => {
+    const adapter = createAdapter();
+    mockFetchResponse({
+      ...STOP_RESPONSE,
+      usage: {
+        ...STOP_RESPONSE.usage,
+        cost_details: {
+          upstream_inference_prompt_cost: '0.00004',
+          upstream_inference_completions_cost: '0.00010',
+        },
+      },
+    });
+
+    const result = await adapter.generate(simpleRequest());
+
+    expect(result.usage?.estimatedCostUSD).toBeCloseTo(0.00014);
+  });
+
   it('maps tool definitions and parses tool call responses', async () => {
     const adapter = createAdapter();
     mockFetchResponse(TOOL_CALL_RESPONSE);
@@ -466,7 +499,7 @@ describe('BaseOpenAIChatAdapter', () => {
     });
   });
 
-  it('maps tool result messages with tool_call_id', async () => {
+  it('maps tool result messages with tool_call_id and name', async () => {
     const adapter = createAdapter();
     mockFetchResponse(STOP_RESPONSE);
 
@@ -477,6 +510,7 @@ describe('BaseOpenAIChatAdapter', () => {
     expect(toolMsg).toMatchObject({
       role: 'tool',
       content: '{"result":"found"}',
+      name: 'lookup',
       tool_call_id: 'call-1',
     });
   });
@@ -963,6 +997,130 @@ describe('OpenRouterAdapter', () => {
 
     expect(fetchRequest().url).toBe('https://openrouter.ai/api/v1/chat/completions');
   });
+
+  it('translates structured output into the OpenRouter SDK responseFormat shape', async () => {
+    const adapter = new OpenRouterAdapter({
+      model: 'anthropic/claude-sonnet-4',
+      apiKey: 'or-key',
+    });
+    mockFetchResponse(STOP_RESPONSE);
+
+    const schema = { type: 'object', properties: { answer: { type: 'string' } } };
+    await adapter.generate(simpleRequest({ outputSchema: schema }));
+
+    const body = await fetchRequest().json() as {
+      response_format?: {
+        type?: string;
+        json_schema?: {
+          name?: string;
+          strict?: boolean;
+          schema?: unknown;
+        };
+      };
+    };
+    expect(body.response_format).toMatchObject({
+      type: 'json_schema',
+      json_schema: {
+        name: 'response',
+        strict: true,
+        schema,
+      },
+    });
+  });
+
+  it('rewrites local text file inputs into text content parts for OpenRouter', async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), 'openrouter-text-file-'));
+    try {
+      const filePath = join(tempDir, 'sample-note.txt');
+      await writeFile(filePath, 'Adaptive Agent fixture note\n\nPlain text file body.');
+      const adapter = new OpenRouterAdapter({
+        model: 'qwen/qwen3.5-27b',
+        apiKey: 'or-key',
+      });
+      mockFetchResponse(STOP_RESPONSE);
+
+      await adapter.generate({
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'Inspect the attachment.' },
+              {
+                type: 'file',
+                file: {
+                  source: { kind: 'path', path: filePath },
+                  mimeType: 'text/plain',
+                  name: 'sample-note.txt',
+                },
+              },
+            ],
+          },
+        ],
+      });
+
+      const body = await fetchRequest().json() as {
+        messages: Array<{
+          content: Array<{ type: string; text?: string }>;
+        }>;
+      };
+      expect(body.messages[0]?.content[0]).toEqual({ type: 'text', text: 'Inspect the attachment.' });
+      expect(body.messages[0]?.content[1]).toMatchObject({ type: 'text' });
+      expect(body.messages[0]?.content[1]?.text).toContain('<file name="sample-note.txt" mimeType="text/plain">');
+      expect(body.messages[0]?.content[1]?.text).toContain('Adaptive Agent fixture note');
+      expect(body.messages[0]?.content[1]?.text).toContain('Plain text file body.');
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves non-text file inputs as OpenRouter file content parts', async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), 'openrouter-pdf-file-'));
+    try {
+      const filePath = join(tempDir, 'sample-doc.pdf');
+      await writeFile(filePath, Buffer.from('%PDF-1.4\n'));
+      const adapter = new OpenRouterAdapter({
+        model: 'qwen/qwen3.5-27b',
+        apiKey: 'or-key',
+      });
+      mockFetchResponse(STOP_RESPONSE);
+
+      await adapter.generate({
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'file',
+                file: {
+                  source: { kind: 'path', path: filePath },
+                  mimeType: 'application/pdf',
+                  name: 'sample-doc.pdf',
+                },
+              },
+            ],
+          },
+        ],
+      });
+
+      const body = await fetchRequest().json() as {
+        messages: Array<{
+          content: Array<{
+            type: string;
+            file?: { filename?: string; file_data?: string };
+          }>;
+        }>;
+      };
+      expect(body.messages[0]?.content[0]).toMatchObject({
+        type: 'file',
+        file: {
+          filename: 'sample-doc.pdf',
+        },
+      });
+      expect(body.messages[0]?.content[0]?.file?.file_data).toMatch(/^data:application\/pdf;base64,/);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('OllamaAdapter', () => {
@@ -1025,6 +1183,118 @@ describe('MistralAdapter', () => {
       ],
     });
   });
+
+  it('translates structured output into the Mistral SDK responseFormat shape', async () => {
+    const adapter = new MistralAdapter({ model: 'mistral-large-latest', apiKey: 'ms-key' });
+    mockFetchResponse(STOP_RESPONSE);
+
+    const schema = { type: 'object', properties: { answer: { type: 'string' } } };
+    await adapter.generate(simpleRequest({ outputSchema: schema }));
+
+    const body = await fetchRequest().json() as {
+      response_format?: {
+        type?: string;
+        json_schema?: {
+          name?: string;
+          strict?: boolean;
+          schema?: unknown;
+        };
+      };
+    };
+    expect(body.response_format).toMatchObject({
+      type: 'json_schema',
+      json_schema: {
+        name: 'response',
+        strict: true,
+        schema,
+      },
+    });
+  });
+
+  it('rewrites local text file inputs into text content parts for Mistral', async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), 'mistral-text-file-'));
+    try {
+      const filePath = join(tempDir, 'sample-note.txt');
+      await writeFile(filePath, 'Adaptive Agent fixture note\n\nPlain text file body.');
+      const adapter = new MistralAdapter({ model: 'mistral-large-latest', apiKey: 'ms-key' });
+      mockFetchResponse(STOP_RESPONSE);
+
+      await adapter.generate({
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'Inspect the attachment.' },
+              {
+                type: 'file',
+                file: {
+                  source: { kind: 'path', path: filePath },
+                  mimeType: 'text/plain',
+                  name: 'sample-note.txt',
+                },
+              },
+            ],
+          },
+        ],
+      });
+
+      const body = await fetchRequest().json() as {
+        messages: Array<{
+          content: Array<{ type: string; text?: string }>;
+        }>;
+      };
+      expect(body.messages[0]?.content[0]).toEqual({ type: 'text', text: 'Inspect the attachment.' });
+      expect(body.messages[0]?.content[1]).toMatchObject({ type: 'text' });
+      expect(body.messages[0]?.content[1]?.text).toContain('<file name="sample-note.txt" mimeType="text/plain">');
+      expect(body.messages[0]?.content[1]?.text).toContain('Adaptive Agent fixture note');
+      expect(body.messages[0]?.content[1]?.text).toContain('Plain text file body.');
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves non-text file inputs as Mistral document content parts', async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), 'mistral-pdf-file-'));
+    try {
+      const filePath = join(tempDir, 'sample-doc.pdf');
+      await writeFile(filePath, Buffer.from('%PDF-1.4\n'));
+      const adapter = new MistralAdapter({ model: 'mistral-large-latest', apiKey: 'ms-key' });
+      mockFetchResponse(STOP_RESPONSE);
+
+      await adapter.generate({
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'file',
+                file: {
+                  source: { kind: 'path', path: filePath },
+                  mimeType: 'application/pdf',
+                  name: 'sample-doc.pdf',
+                },
+              },
+            ],
+          },
+        ],
+      });
+
+      const body = await fetchRequest().json() as {
+        messages: Array<{
+          content: Array<{
+            type: string;
+            document_url?: string;
+          }>;
+        }>;
+      };
+      expect(body.messages[0]?.content[0]).toMatchObject({
+        type: 'document_url',
+      });
+      expect(body.messages[0]?.content[0]?.document_url).toMatch(/^data:application\/pdf;base64,/);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('MeshAdapter', () => {
@@ -1038,6 +1308,64 @@ describe('MeshAdapter', () => {
     expect(fetchSpy.mock.calls[0][1].headers['Authorization']).toBe('Bearer mesh-key');
     expect(adapter.provider).toBe('mesh');
     expect(adapter.capabilities.usage).toBe(true);
+  });
+
+  it('passes the runtime model timeout to the Mesh SDK HTTP timeout', async () => {
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout');
+    const adapter = new MeshAdapter({ model: 'auto', apiKey: 'mesh-key' });
+    mockFetchResponse(STOP_RESPONSE);
+
+    await adapter.generate(simpleRequest({ modelTimeoutMs: 900_000 }));
+
+    expect(timeoutSpy).toHaveBeenCalledWith(900_000);
+  });
+
+  it('uses 15 minutes for Mesh SDK HTTP timeout when runtime model timeout is disabled', async () => {
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout');
+    const adapter = new MeshAdapter({ model: 'auto', apiKey: 'mesh-key' });
+    mockFetchResponse(STOP_RESPONSE);
+
+    await adapter.generate(simpleRequest({ modelTimeoutMs: 0 }));
+
+    expect(timeoutSpy).toHaveBeenCalledWith(900_000);
+  });
+
+  it('preserves tool result names when using the Mesh SDK client path', async () => {
+    const adapter = new MeshAdapter({ model: 'auto', apiKey: 'mesh-key' });
+    mockFetchResponse(STOP_RESPONSE);
+
+    await adapter.generate(requestWithToolResult());
+
+    const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    const toolMsg = body.messages.find((m: { role: string }) => m.role === 'tool');
+    expect(toolMsg).toMatchObject({
+      role: 'tool',
+      content: '{"result":"found"}',
+      name: 'lookup',
+      tool_call_id: 'call-1',
+    });
+  });
+
+  it('surfaces upstream provider detail from Mesh SDK errors', async () => {
+    const adapter = new MeshAdapter({ model: 'auto', apiKey: 'mesh-key' });
+    mockFetchResponse(
+      {
+        error: {
+          code: 'upstream_error',
+          message: 'Upstream provider returned an error.',
+          provider_error: {
+            message:
+              'The GenerateContentRequest proto is invalid: contents[2].parts[0].function_response.name: [REQUIRED_FIELD_MISSING]',
+          },
+        },
+        request_id: 'req_mesh_123',
+      },
+      500,
+    );
+
+    await expect(adapter.generate(simpleRequest())).rejects.toThrow(
+      'Upstream provider returned an error.: The GenerateContentRequest proto is invalid: contents[2].parts[0].function_response.name: [REQUIRED_FIELD_MISSING] [requestId=req_mesh_123]',
+    );
   });
 });
 
