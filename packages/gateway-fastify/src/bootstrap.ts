@@ -283,12 +283,26 @@ async function flushAdaptiveAgentLogger(logger: AdaptiveAgentLogger | undefined)
 
     try {
       logger.flush((error?: Error | null) => {
+        if (isIgnorableLoggerFlushError(error)) {
+          finish();
+          return;
+        }
+
         finish(error);
       });
     } catch (error) {
+      if (isIgnorableLoggerFlushError(error)) {
+        resolve();
+        return;
+      }
+
       reject(error);
     }
   });
+}
+
+function isIgnorableLoggerFlushError(error: unknown): boolean {
+  return error instanceof Error && error.message.includes('sonic boom is not ready yet');
 }
 
 async function emitShutdownProgress(

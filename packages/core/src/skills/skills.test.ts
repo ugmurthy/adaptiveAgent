@@ -172,6 +172,19 @@ Analyze logs carefully.
     expect(delegate.model?.model).toBe('google/gemma-4-26b-a4b-it');
   });
 
+  it('loads the bundled file-converter skill with a handler-backed tool', async () => {
+    const skillDir = fileURLToPath(new URL('../../../../examples/skills/file-converter', import.meta.url));
+
+    const skill = await loadSkillFromDirectory(skillDir);
+    const delegate = skillToDelegate(skill);
+
+    expect(delegate.name).toBe('file-converter');
+    expect(delegate.allowedTools).toEqual([]);
+    expect(delegate.handlerTools).toHaveLength(1);
+    expect(delegate.handlerTools?.[0]?.name).toBe('convert_document_with_pandoc');
+    expect(delegate.handlerTools?.[0]?.description).toContain('pandoc');
+  });
+
   it('handles quoted description values', () => {
     const md = `---
 name: prd

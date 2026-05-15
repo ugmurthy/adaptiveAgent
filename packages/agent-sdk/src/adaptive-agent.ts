@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { access, readFile } from 'node:fs/promises';
+import { access, appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 
 import { marked } from 'marked';
@@ -29,12 +29,24 @@ import {
 marked.use(markedTerminal() as never);
 
 export interface ManualTestCliOptions {
-  command: 'run' | 'chat' | 'spec' | 'config';
+  command: 'run' | 'chat' | 'spec' | 'config' | 'eval';
   specPath: string;
   goalArgs: string[];
   promptFilePath?: string;
   inputJson?: JsonValue;
   imagePaths: string[];
+  evalDataset?: 'cases' | 'gaia';
+  evalInputPath?: string;
+  evalFilesDir?: string;
+  evalOutputPath?: string;
+  evalArtifactsDir?: string;
+  evalResume: boolean;
+  evalFailFast: boolean;
+  evalLimit?: number;
+  evalOffset: number;
+  evalIds?: string[];
+  evalLevel?: string;
+  evalSplit?: string;
   mode?: 'chat' | 'run';
   cwd?: string;
   agentConfigPath?: string;
@@ -46,7 +58,7 @@ export interface ManualTestCliOptions {
   clarificationMode?: ClarificationMode;
   events: boolean;
   inspect: boolean;
-  output: 'pretty' | 'json';
+  output: 'pretty' | 'json' | 'jsonl';
   help: boolean;
 }
 
@@ -95,6 +107,39 @@ interface ManualTestJsonOutput {
   inspection?: JsonValue;
 }
 
+export interface BenchmarkCase {
+  id: string;
+  dataset?: string;
+  split?: string;
+  level?: string;
+  question: string;
+  input?: JsonValue;
+  images?: ImageInput[];
+  contentParts?: ModelContentPart[];
+  expectedAnswer?: string;
+  metadata?: Record<string, JsonValue>;
+}
+
+export interface BenchmarkResultRecord {
+  schemaVersion: 1;
+  dataset: string;
+  taskId: string;
+  level?: string;
+  status: 'completed' | 'failed' | 'skipped';
+  runId?: string;
+  question: string;
+  prediction?: JsonValue;
+  predictionText?: string;
+  expectedAnswer?: string;
+  usage?: JsonValue;
+  timings: { startedAt: string; finishedAt: string; durationMs: number };
+  model: { provider: string; model: string };
+  runtime: { mode: RuntimeMode };
+  artifacts?: { eventLog?: string; inspection?: string; input?: string; output?: string; answer?: string };
+  error?: { message: string; code?: string };
+  metadata: Record<string, JsonValue>;
+}
+
 const HELP_TEXT = `adaptive-agent
 
 Agent SDK CLI
@@ -103,6 +148,8 @@ Usage:
   adaptive-agent run [options] <goal...>
   adaptive-agent chat [options] [message...]
   adaptive-agent spec <path> [options]
+  adaptive-agent eval cases --input <path> --out <path> [options]
+  adaptive-agent eval gaia --input <path> --out <path> [options]
   adaptive-agent config [options]
   adaptive-agent --spec <path> [options]
   bun run ./packages/agent-sdk/dist/adaptive-agent.js --spec <path> [options]
@@ -111,6 +158,8 @@ Commands:
   run                   Run a one-shot goal.
   chat                  Send one chat turn. Reads stdin when no message is given.
   spec                  Run the existing JSON spec format.
+  eval cases            Run generic benchmark cases from JSON/JSONL.
+  eval gaia             Run GAIA benchmark rows from JSON/JSONL.
   config                Print resolved SDK configuration.
 
 Options:
@@ -118,6 +167,17 @@ Options:
   --file <path>           Read run/chat prompt from a file.
   --input-json <json>     JSON input passed to run requests.
   --image <path>          Add an image attachment to a run request. Repeatable.
+  --input <path>          Benchmark input JSONL for eval cases.
+  --files-dir <path>      Directory for benchmark attachments.
+  --out <path>            Benchmark result JSONL path.
+  --artifacts <dir>       Benchmark artifact directory.
+  --resume                Skip benchmark cases already present in --out.
+  --fail-fast             Stop eval after the first failed case.
+  --limit <n>             Limit benchmark cases after filtering.
+  --offset <n>            Skip benchmark cases before filtering.
+  --ids <id,id,...>       Run only the listed benchmark case ids.
+  --level <value>         Run only matching benchmark level.
+  --split <value>         Add/filter benchmark split metadata.
   --mode <chat|run>       Override the spec mode.
   --cwd <path>            Working directory used for SDK config lookup.
   --agent <path>          Explicit path to agent.json.
@@ -129,7 +189,7 @@ Options:
   --clarification <mode>  Clarification mode: interactive or fail.
   --events                Print lifecycle events as they arrive.
   --inspect               Print a compact inspection summary after completion.
-  --output <pretty|json>  Output format. Default: pretty.
+  --output <format>       Output format: pretty, json, or jsonl. Default: pretty.
   --help                  Show this help text.
 `;
 
@@ -173,6 +233,10 @@ export async function main(argv = Bun.argv.slice(2)): Promise<number> {
 
   if (cli.command === 'chat') {
     return runInlineCommand(cli, 'chat');
+  }
+
+  if (cli.command === 'eval') {
+    return runEvalCommand(cli);
   }
 
   return runSpecCommand(cli);
@@ -322,12 +386,93 @@ async function runConfigCommand(cli: ManualTestCliOptions): Promise<number> {
   return 0;
 }
 
+async function runEvalCommand(cli: ManualTestCliOptions): Promise<number> {
+  if (!cli.evalInputPath) {
+    throw new Error(`eval ${cli.evalDataset ?? 'benchmark'} requires --input <path>`);
+  }
+  if (!cli.evalOutputPath) {
+    throw new Error(`eval ${cli.evalDataset ?? 'benchmark'} requires --out <path>`);
+  }
+
+  const resolvedCwd = resolve(cli.cwd ?? process.cwd());
+  const outputPath = resolve(cli.evalOutputPath);
+  const artifactsDir = cli.evalArtifactsDir ? resolve(cli.evalArtifactsDir) : undefined;
+  const allCases = cli.evalDataset === 'gaia'
+    ? await loadGaiaBenchmarkCases(cli.evalInputPath, resolvedCwd, cli.evalFilesDir, cli.evalSplit)
+    : await loadBenchmarkCases(cli.evalInputPath, resolvedCwd);
+  const completedIds = cli.evalResume ? await readCompletedBenchmarkIds(outputPath) : new Set<string>();
+  const selectedCases = selectBenchmarkCases(allCases, cli, completedIds);
+  const sdkOptions = buildSdkOptions(cli, resolvedCwd);
+  const resolvedConfig = await loadAgentSdkConfig(sdkOptions);
+  await mkdir(dirname(outputPath), { recursive: true });
+  if (artifactsDir) await mkdir(artifactsDir, { recursive: true });
+
+  if (cli.output === 'pretty') {
+    console.log(`benchmark: ${cli.evalDataset}`);
+    console.log(`input: ${resolve(cli.evalInputPath)}`);
+    if (cli.evalFilesDir) console.log(`files: ${resolve(resolvedCwd, cli.evalFilesDir)}`);
+    console.log(`out: ${outputPath}`);
+    console.log(`selected: ${selectedCases.length}/${allCases.length}`);
+    console.log(`model: ${resolvedConfig.model.provider}/${resolvedConfig.model.model}`);
+    console.log(`runtime: ${resolvedConfig.runtime.mode}`);
+    console.log('');
+  }
+
+  const eventLog: Array<Record<string, JsonValue>> = [];
+  const sdk = await createAgentSdk({
+    ...sdkOptions,
+    eventListener: (event) => {
+      const entry = summarizeEvent(event);
+      eventLog.push(entry);
+      if (cli.events && cli.output === 'pretty') printEvent(entry);
+    },
+  });
+
+  let failed = 0;
+  const removeProcessErrorGuard = installEvalProcessErrorGuard();
+  try {
+    for (const benchmarkCase of selectedCases) {
+      const record = await runBenchmarkCase({
+        sdk,
+        benchmarkCase,
+        resolvedConfig,
+        outputPath,
+        artifactsDir,
+        eventLog,
+      });
+      await appendJsonLine(outputPath, record as unknown as JsonValue);
+      if (cli.output === 'json' || cli.output === 'jsonl') {
+        console.log(JSON.stringify(record));
+      } else {
+        console.log(`${record.status === 'completed' ? '✓' : '✗'} ${record.taskId}${record.runId ? ` run=${record.runId}` : ''}`);
+      }
+      if (record.status !== 'completed') {
+        failed += 1;
+        if (cli.evalFailFast) break;
+      }
+    }
+  } finally {
+    removeProcessErrorGuard();
+    await sdk.close();
+  }
+
+  if (cli.output === 'pretty') {
+    console.log('');
+    console.log(`completed: ${selectedCases.length - failed}`);
+    console.log(`failed: ${failed}`);
+  }
+  return failed === 0 ? 0 : 1;
+}
+
 export function parseCliArgs(argv: string[]): ManualTestCliOptions {
   const options: ManualTestCliOptions = {
     command: 'spec',
     specPath: '',
     goalArgs: [],
     imagePaths: [],
+    evalResume: false,
+    evalFailFast: false,
+    evalOffset: 0,
     events: false,
     inspect: false,
     output: 'pretty',
@@ -338,11 +483,14 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if (!commandSeen && (arg === 'run' || arg === 'chat' || arg === 'spec' || arg === 'config')) {
+    if (!commandSeen && (arg === 'run' || arg === 'chat' || arg === 'spec' || arg === 'config' || arg === 'eval')) {
       options.command = arg;
       commandSeen = true;
       if (arg === 'spec' && argv[index + 1] && !argv[index + 1].startsWith('--')) {
         options.specPath = argv[++index];
+      }
+      if (arg === 'eval' && argv[index + 1] && !argv[index + 1].startsWith('--')) {
+        options.evalDataset = parseEnumOption(arg, argv[++index], ['cases', 'gaia']);
       }
       continue;
     }
@@ -367,6 +515,39 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
         break;
       case '--input-json':
         options.inputJson = parseJsonFlag(requireOptionValue(arg, argv[++index]), arg);
+        break;
+      case '--input':
+        options.evalInputPath = requireOptionValue(arg, argv[++index]);
+        break;
+      case '--files-dir':
+        options.evalFilesDir = requireOptionValue(arg, argv[++index]);
+        break;
+      case '--out':
+        options.evalOutputPath = requireOptionValue(arg, argv[++index]);
+        break;
+      case '--artifacts':
+        options.evalArtifactsDir = requireOptionValue(arg, argv[++index]);
+        break;
+      case '--resume':
+        options.evalResume = true;
+        break;
+      case '--fail-fast':
+        options.evalFailFast = true;
+        break;
+      case '--limit':
+        options.evalLimit = parsePositiveIntegerOption(arg, requireOptionValue(arg, argv[++index]));
+        break;
+      case '--offset':
+        options.evalOffset = parseNonNegativeIntegerOption(arg, requireOptionValue(arg, argv[++index]));
+        break;
+      case '--ids':
+        options.evalIds = requireOptionValue(arg, argv[++index]).split(',').map((id) => id.trim()).filter(Boolean);
+        break;
+      case '--level':
+        options.evalLevel = requireOptionValue(arg, argv[++index]);
+        break;
+      case '--split':
+        options.evalSplit = requireOptionValue(arg, argv[++index]);
         break;
       case '--image':
         options.imagePaths.push(requireOptionValue(arg, argv[++index]));
@@ -399,7 +580,7 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
         options.clarificationMode = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['interactive', 'fail']);
         break;
       case '--output':
-        options.output = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['pretty', 'json']);
+        options.output = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['pretty', 'json', 'jsonl']);
         break;
       default:
         if (options.command === 'run' || options.command === 'chat') {
@@ -412,6 +593,10 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
 
   if (!options.help && options.command === 'spec' && !options.specPath) {
     throw new Error('Missing required --spec <path> argument');
+  }
+
+  if (!options.help && options.command === 'eval' && !options.evalDataset) {
+    throw new Error('Missing eval dataset. Expected `adaptive-agent eval cases` or `adaptive-agent eval gaia`.');
   }
 
   if (!options.help && options.command === 'chat' && options.imagePaths.length > 0) {
@@ -704,6 +889,22 @@ function parseEnumOption<const T extends string>(flag: string, value: string, al
   return value as T;
 }
 
+function parsePositiveIntegerOption(flag: string, value: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${flag} must be a positive integer`);
+  }
+  return parsed;
+}
+
+function parseNonNegativeIntegerOption(flag: string, value: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${flag} must be a non-negative integer`);
+  }
+  return parsed;
+}
+
 function requireOptionValue(flag: string, value: string | undefined): string {
   if (!value || value.startsWith('--')) {
     throw new Error(`Missing value for ${flag}`);
@@ -745,6 +946,304 @@ async function readInlinePrompt(cli: ManualTestCliOptions, label: string): Promi
 
 function resolveAssetPath(inputPath: string, baseDir: string): string {
   return resolve(baseDir, inputPath);
+}
+
+export async function loadBenchmarkCases(inputPath: string, cwd = process.cwd()): Promise<BenchmarkCase[]> {
+  const resolvedInputPath = resolve(cwd, inputPath);
+  const baseDir = dirname(resolvedInputPath);
+  const content = await readFile(resolvedInputPath, 'utf-8');
+  const trimmed = content.trim();
+  if (!trimmed) return [];
+
+  let rawCases: unknown[];
+  if (trimmed.startsWith('[')) {
+    rawCases = JSON.parse(trimmed) as unknown[];
+  } else if (trimmed.startsWith('{')) {
+    try {
+      rawCases = [JSON.parse(trimmed) as unknown];
+    } catch {
+      rawCases = parseBenchmarkJsonLines(trimmed);
+    }
+  } else {
+    rawCases = parseBenchmarkJsonLines(trimmed);
+  }
+
+  if (!Array.isArray(rawCases)) {
+    throw new Error('Benchmark input must be a JSON array, JSON object, or JSONL records');
+  }
+  return rawCases.map((value, index) => parseBenchmarkCase(value, baseDir, `case[${index}]`));
+}
+
+export async function loadGaiaBenchmarkCases(
+  inputPath: string,
+  cwd = process.cwd(),
+  filesDir?: string,
+  split?: string,
+): Promise<BenchmarkCase[]> {
+  const resolvedInputPath = resolve(cwd, inputPath);
+  const baseDir = filesDir ? resolve(cwd, filesDir) : dirname(resolvedInputPath);
+  const rawRows = await loadBenchmarkRawRecords(resolvedInputPath);
+  return rawRows.map((value, index) => parseGaiaBenchmarkCase(value, baseDir, split, `gaia[${index}]`));
+}
+
+async function loadBenchmarkRawRecords(inputPath: string): Promise<unknown[]> {
+  const content = await readFile(inputPath, 'utf-8');
+  const trimmed = content.trim();
+  if (!trimmed) return [];
+  if (trimmed.startsWith('[')) return JSON.parse(trimmed) as unknown[];
+  if (trimmed.startsWith('{')) {
+    try {
+      return [JSON.parse(trimmed) as unknown];
+    } catch {
+      return parseBenchmarkJsonLines(trimmed);
+    }
+  }
+  return parseBenchmarkJsonLines(trimmed);
+}
+
+function parseGaiaBenchmarkCase(value: unknown, baseDir: string, split: string | undefined, label: string): BenchmarkCase {
+  const raw = ensureObject(value, label);
+  const id = requireString(raw.task_id ?? raw.taskId ?? raw.id, `${label}.task_id`);
+  const question = requireString(raw.Question ?? raw.question, `${label}.Question`);
+  const fileName = readOptionalString(raw.file_name ?? raw.fileName ?? raw.file, `${label}.file_name`);
+  const level = readOptionalString(raw.Level ?? raw.level, `${label}.Level`);
+  const expectedAnswer = readOptionalString(raw['Final answer'] ?? raw.final_answer ?? raw.expectedAnswer ?? raw.answer, `${label}.Final answer`);
+  const attachment = fileName ? gaiaAttachmentForFile(resolve(baseDir, fileName), fileName) : undefined;
+  return {
+    id,
+    dataset: 'gaia',
+    ...(split ? { split } : {}),
+    ...(level ? { level } : {}),
+    question,
+    ...(attachment?.kind === 'image' ? { images: [{ path: attachment.path, name: fileName }] } : {}),
+    ...(attachment?.kind === 'file' ? { contentParts: [{ type: 'file', file: { source: { kind: 'path', path: attachment.path }, name: fileName } }] } : {}),
+    ...(expectedAnswer ? { expectedAnswer } : {}),
+    metadata: {
+      source: 'gaia',
+      ...(fileName ? { fileName } : {}),
+      ...(level ? { level } : {}),
+      ...(split ? { split } : {}),
+    },
+  };
+}
+
+function readOptionalString(value: unknown, label: string): string | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (typeof value !== 'string') throw new Error(`${label} must be a string`);
+  return value;
+}
+
+function gaiaAttachmentForFile(path: string, name: string): { kind: 'image' | 'file'; path: string } {
+  return isImageFileName(name) ? { kind: 'image', path } : { kind: 'file', path };
+}
+
+function isImageFileName(name: string): boolean {
+  return /\.(png|jpe?g|gif|webp|bmp|tiff?)$/i.test(name);
+}
+
+function parseBenchmarkJsonLines(content: string): unknown[] {
+  return content.split(/\r?\n/).filter((line) => line.trim().length > 0).map((line, index) => {
+        try {
+          return JSON.parse(line) as unknown;
+        } catch (error) {
+          throw new Error(`Invalid benchmark JSONL at line ${index + 1}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      });
+}
+
+function parseBenchmarkCase(value: unknown, baseDir: string, label: string): BenchmarkCase {
+  const raw = ensureObject(value, label);
+  const id = requireString(raw.id ?? raw.taskId ?? raw.task_id, `${label}.id`);
+  const question = requireString(raw.question, `${label}.question`);
+  const images = parseOptionalImageArray(raw.images, baseDir, `${label}.images`);
+  const contentParts = parseOptionalContentPartArray(raw.contentParts, baseDir, `${label}.contentParts`);
+  if (images && contentParts?.some((part) => part.type === 'image')) {
+    throw new Error(`${label} must not include both images and image content parts`);
+  }
+  return {
+    id,
+    ...(raw.dataset === undefined ? {} : { dataset: requireString(raw.dataset, `${label}.dataset`) }),
+    ...(raw.split === undefined ? {} : { split: requireString(raw.split, `${label}.split`) }),
+    ...(raw.level === undefined ? {} : { level: requireString(raw.level, `${label}.level`) }),
+    question,
+    ...(raw.input === undefined ? {} : { input: raw.input as JsonValue }),
+    ...(images ? { images } : {}),
+    ...(contentParts ? { contentParts } : {}),
+    ...(raw.expectedAnswer === undefined ? {} : { expectedAnswer: requireString(raw.expectedAnswer, `${label}.expectedAnswer`) }),
+    ...(raw.metadata === undefined ? {} : { metadata: parseOptionalRecord(raw.metadata, `${label}.metadata`) }),
+  };
+}
+
+async function readCompletedBenchmarkIds(outputPath: string): Promise<Set<string>> {
+  const completed = new Set<string>();
+  let content = '';
+  try {
+    content = await readFile(outputPath, 'utf-8');
+  } catch {
+    return completed;
+  }
+  for (const [index, line] of content.split(/\r?\n/).entries()) {
+    if (!line.trim()) continue;
+    try {
+      const record = ensureObject(JSON.parse(line) as unknown, `result[${index}]`);
+      if (record.status === 'completed' && typeof record.taskId === 'string') {
+        completed.add(record.taskId);
+      }
+    } catch {
+      // Ignore malformed historical result lines so a partially written file does not block resume.
+    }
+  }
+  return completed;
+}
+
+function selectBenchmarkCases(cases: BenchmarkCase[], cli: ManualTestCliOptions, completedIds: Set<string>): BenchmarkCase[] {
+  const allowedIds = cli.evalIds ? new Set(cli.evalIds) : undefined;
+  let selected = cases.slice(cli.evalOffset).filter((benchmarkCase) => {
+    if (allowedIds && !allowedIds.has(benchmarkCase.id)) return false;
+    if (cli.evalLevel && benchmarkCase.level !== cli.evalLevel) return false;
+    if (cli.evalSplit && benchmarkCase.split && benchmarkCase.split !== cli.evalSplit) return false;
+    if (completedIds.has(benchmarkCase.id)) return false;
+    return true;
+  });
+  if (cli.evalLimit !== undefined) {
+    selected = selected.slice(0, cli.evalLimit);
+  }
+  return selected;
+}
+
+async function runBenchmarkCase(options: {
+  sdk: Awaited<ReturnType<typeof createAgentSdk>>;
+  benchmarkCase: BenchmarkCase;
+  resolvedConfig: Awaited<ReturnType<typeof loadAgentSdkConfig>>;
+  outputPath: string;
+  artifactsDir?: string;
+  eventLog: Array<Record<string, JsonValue>>;
+}): Promise<BenchmarkResultRecord> {
+  const startedAt = new Date();
+  const eventStartIndex = options.eventLog.length;
+  const runOptions = buildRunOptions({
+    mode: 'run',
+    goal: options.benchmarkCase.question,
+    input: options.benchmarkCase.input,
+    images: options.benchmarkCase.images,
+    contentParts: options.benchmarkCase.contentParts,
+    metadata: {
+      dataset: options.benchmarkCase.dataset ?? 'cases',
+      taskId: options.benchmarkCase.id,
+      ...(options.benchmarkCase.metadata ?? {}),
+    },
+  });
+
+  try {
+    const result = await options.sdk.run(options.benchmarkCase.question, runOptions);
+    const finishedAt = new Date();
+    const artifacts = await writeBenchmarkArtifacts(options, result, eventStartIndex);
+    return {
+      schemaVersion: 1,
+      dataset: options.benchmarkCase.dataset ?? 'cases',
+      taskId: options.benchmarkCase.id,
+      ...(options.benchmarkCase.level ? { level: options.benchmarkCase.level } : {}),
+      status: isSuccessfulResult(result) ? 'completed' : 'failed',
+      runId: result.runId,
+      question: options.benchmarkCase.question,
+      ...(isSuccessfulResult(result) ? { prediction: result.output, predictionText: stringifyPrediction(result.output) } : {}),
+      ...(options.benchmarkCase.expectedAnswer ? { expectedAnswer: options.benchmarkCase.expectedAnswer } : {}),
+      ...('usage' in result ? { usage: result.usage as unknown as JsonValue } : {}),
+      timings: { startedAt: startedAt.toISOString(), finishedAt: finishedAt.toISOString(), durationMs: finishedAt.getTime() - startedAt.getTime() },
+      model: { provider: options.resolvedConfig.model.provider, model: options.resolvedConfig.model.model },
+      runtime: { mode: options.resolvedConfig.runtime.mode },
+      ...(artifacts ? { artifacts } : {}),
+      ...(!isSuccessfulResult(result) && result.status === 'failure' ? { error: { message: result.error, code: isModelTimeoutLike(result.error) ? 'model_timeout' : result.code } } : {}),
+      metadata: options.benchmarkCase.metadata ?? {},
+    };
+  } catch (error) {
+    const finishedAt = new Date();
+    const artifacts = await writeBenchmarkArtifacts(options, { error: error instanceof Error ? error.message : String(error) }, eventStartIndex);
+    return {
+      schemaVersion: 1,
+      dataset: options.benchmarkCase.dataset ?? 'cases',
+      taskId: options.benchmarkCase.id,
+      ...(options.benchmarkCase.level ? { level: options.benchmarkCase.level } : {}),
+      status: 'failed',
+      question: options.benchmarkCase.question,
+      ...(options.benchmarkCase.expectedAnswer ? { expectedAnswer: options.benchmarkCase.expectedAnswer } : {}),
+      timings: { startedAt: startedAt.toISOString(), finishedAt: finishedAt.toISOString(), durationMs: finishedAt.getTime() - startedAt.getTime() },
+      model: { provider: options.resolvedConfig.model.provider, model: options.resolvedConfig.model.model },
+      runtime: { mode: options.resolvedConfig.runtime.mode },
+      ...(artifacts ? { artifacts } : {}),
+      error: {
+        message: error instanceof Error ? error.message : String(error),
+        ...(isModelTimeoutLike(error) ? { code: 'model_timeout' } : {}),
+      },
+      metadata: options.benchmarkCase.metadata ?? {},
+    };
+  }
+}
+
+function installEvalProcessErrorGuard(): () => void {
+  const onUncaughtException = (error: Error) => {
+    if (isModelTimeoutLike(error)) {
+      console.error(`warning: captured unhandled model timeout during eval: ${error.message}`);
+      return;
+    }
+    throw error;
+  };
+  const onUnhandledRejection = (reason: unknown) => {
+    if (isModelTimeoutLike(reason)) {
+      console.error(`warning: captured unhandled model timeout during eval: ${reason instanceof Error ? reason.message : String(reason)}`);
+      return;
+    }
+    throw reason;
+  };
+  process.on('uncaughtException', onUncaughtException);
+  process.on('unhandledRejection', onUnhandledRejection);
+  return () => {
+    process.off('uncaughtException', onUncaughtException);
+    process.off('unhandledRejection', onUnhandledRejection);
+  };
+}
+
+function isModelTimeoutLike(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return String(error).toLowerCase().includes('model timed out');
+  }
+  const name = error.name.toLowerCase();
+  const message = error.message.toLowerCase();
+  return name.includes('timeout') || message.includes('model timed out') || message.includes('model timeout');
+}
+
+async function writeBenchmarkArtifacts(
+  options: { sdk: Awaited<ReturnType<typeof createAgentSdk>>; benchmarkCase: BenchmarkCase; artifactsDir?: string; eventLog: Array<Record<string, JsonValue>> },
+  output: unknown,
+  eventStartIndex: number,
+): Promise<BenchmarkResultRecord['artifacts'] | undefined> {
+  if (!options.artifactsDir) return undefined;
+  const taskDir = resolve(options.artifactsDir, safePathSegment(options.benchmarkCase.id));
+  await mkdir(taskDir, { recursive: true });
+  const inputPath = resolve(taskDir, 'input.json');
+  const outputPath = resolve(taskDir, 'output.json');
+  const eventLogPath = resolve(taskDir, 'events.jsonl');
+  const answerPath = resolve(taskDir, 'answer.txt');
+  await writeFile(inputPath, JSON.stringify(options.benchmarkCase, null, 2));
+  await writeFile(outputPath, JSON.stringify(output, null, 2));
+  const events = options.eventLog.slice(eventStartIndex);
+  await writeFile(eventLogPath, events.map((event) => JSON.stringify(event)).join('\n') + (events.length > 0 ? '\n' : ''));
+  if (typeof output === 'object' && output && 'output' in output) {
+    await writeFile(answerPath, stringifyPrediction((output as { output?: unknown }).output));
+  }
+  return { input: inputPath, output: outputPath, eventLog: eventLogPath, answer: answerPath };
+}
+
+function stringifyPrediction(value: unknown): string {
+  return typeof value === 'string' ? value : JSON.stringify(value) ?? String(value);
+}
+
+function safePathSegment(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._-]/g, '_');
+}
+
+async function appendJsonLine(path: string, value: JsonValue): Promise<void> {
+  await appendFile(path, `${JSON.stringify(value)}\n`);
 }
 
 function collectContentParts(spec: ManualTestSpec): ModelContentPart[] {
@@ -813,6 +1312,18 @@ function summarizeCli(cli: ManualTestCliOptions): Record<string, JsonValue> {
     ...(cli.specPath ? { specPath: resolve(cli.specPath) } : {}),
     ...(cli.promptFilePath ? { promptFilePath: resolve(cli.promptFilePath) } : {}),
     ...(cli.imagePaths.length > 0 ? { imagePaths: cli.imagePaths.map((path) => resolve(path)) } : {}),
+    ...(cli.evalDataset ? { evalDataset: cli.evalDataset } : {}),
+    ...(cli.evalInputPath ? { evalInputPath: resolve(cli.evalInputPath) } : {}),
+    ...(cli.evalFilesDir ? { evalFilesDir: resolve(cli.evalFilesDir) } : {}),
+    ...(cli.evalOutputPath ? { evalOutputPath: resolve(cli.evalOutputPath) } : {}),
+    ...(cli.evalArtifactsDir ? { evalArtifactsDir: resolve(cli.evalArtifactsDir) } : {}),
+    ...(cli.evalLimit ? { evalLimit: cli.evalLimit } : {}),
+    ...(cli.evalOffset ? { evalOffset: cli.evalOffset } : {}),
+    ...(cli.evalIds ? { evalIds: cli.evalIds } : {}),
+    ...(cli.evalLevel ? { evalLevel: cli.evalLevel } : {}),
+    ...(cli.evalSplit ? { evalSplit: cli.evalSplit } : {}),
+    evalResume: cli.evalResume,
+    evalFailFast: cli.evalFailFast,
     ...(cli.mode ? { modeOverride: cli.mode } : {}),
     ...(cli.cwd ? { cwd: resolve(cli.cwd) } : {}),
     ...(cli.agentConfigPath ? { agentConfigPath: resolve(cli.agentConfigPath) } : {}),

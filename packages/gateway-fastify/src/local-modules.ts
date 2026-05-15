@@ -1,4 +1,5 @@
 import { access, readdir } from 'node:fs/promises';
+import { delimiter } from 'node:path';
 import { join, resolve } from 'node:path';
 
 import { createJwtAuthProvider } from './auth.js';
@@ -75,7 +76,19 @@ async function loadLocalSkillDelegates(options: {
 }
 
 function defaultSkillDirectories(): string[] {
-  return [GATEWAY_SKILLS_DIR];
+  const configuredDirectories = parseConfiguredSkillDirectories(process.env.ADAPTIVE_AGENT_GATEWAY_SKILL_DIRS);
+  return [GATEWAY_SKILLS_DIR, ...configuredDirectories];
+}
+
+function parseConfiguredSkillDirectories(value: string | undefined): string[] {
+  if (!value) {
+    return [];
+  }
+
+  return value
+    .split(delimiter)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
 }
 
 async function pathExists(path: string): Promise<boolean> {

@@ -6,6 +6,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   collectProviderWarnings,
+  loadBenchmarkCases,
+  loadGaiaBenchmarkCases,
   loadManualTestSpec,
   parseCliArgs,
   renderPrettyString,
@@ -140,6 +142,9 @@ describe('adaptive-agent cli parsing', () => {
       specPath: './tmp/spec.json',
       goalArgs: [],
       imagePaths: [],
+      evalResume: false,
+      evalFailFast: false,
+      evalOffset: 0,
       mode: 'chat',
       runtimeMode: 'memory',
       provider: 'ollama',
@@ -173,6 +178,120 @@ describe('adaptive-agent cli parsing', () => {
       output: 'pretty',
       help: false,
     });
+  });
+
+  it('parses eval cases benchmark flags', () => {
+    const parsed = parseCliArgs([
+      'eval', 'cases',
+      '--input', './cases.jsonl',
+      '--out', './results.jsonl',
+      '--artifacts', './artifacts',
+      '--resume',
+      '--fail-fast',
+      '--limit', '5',
+      '--offset', '2',
+      '--ids', 'a,b',
+      '--output', 'jsonl',
+    ]);
+
+    expect(parsed).toMatchObject({
+      command: 'eval',
+      evalDataset: 'cases',
+      evalInputPath: './cases.jsonl',
+      evalOutputPath: './results.jsonl',
+      evalArtifactsDir: './artifacts',
+      evalResume: true,
+      evalFailFast: true,
+      evalLimit: 5,
+      evalOffset: 2,
+      evalIds: ['a', 'b'],
+      output: 'jsonl',
+    });
+  });
+
+  it('parses eval gaia benchmark flags', () => {
+    const parsed = parseCliArgs([
+      'eval', 'gaia',
+      '--input', './gaia.jsonl',
+      '--files-dir', './files',
+      '--out', './results.jsonl',
+      '--level', '1',
+      '--split', 'validation',
+    ]);
+
+    expect(parsed).toMatchObject({
+      command: 'eval',
+      evalDataset: 'gaia',
+      evalInputPath: './gaia.jsonl',
+      evalFilesDir: './files',
+      evalOutputPath: './results.jsonl',
+      evalLevel: '1',
+      evalSplit: 'validation',
+    });
+  });
+});
+
+describe('adaptive-agent benchmark cases', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'adaptive-agent-bench-'));
+    await mkdir(join(tempDir, 'fixtures'));
+    await writeFile(join(tempDir, 'fixtures', 'image.png'), 'image');
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it('loads generic benchmark cases from jsonl and resolves assets', async () => {
+    const inputPath = join(tempDir, 'cases.jsonl');
+    await writeFile(inputPath, [
+      JSON.stringify({ id: 'case-1', dataset: 'custom', question: 'What is shown?', images: [{ path: './fixtures/image.png' }], expectedAnswer: 'image' }),
+      JSON.stringify({ task_id: 'case-2', question: 'No asset' }),
+    ].join('\n'));
+
+    const cases = await loadBenchmarkCases(inputPath);
+    expect(cases).toHaveLength(2);
+    expect(cases[0]).toMatchObject({
+      id: 'case-1',
+      dataset: 'custom',
+      question: 'What is shown?',
+      expectedAnswer: 'image',
+      images: [{ path: join(tempDir, 'fixtures', 'image.png') }],
+    });
+    expect(cases[1]?.id).toBe('case-2');
+  });
+
+  it('loads a single pretty-printed benchmark case object', async () => {
+    const inputPath = join(tempDir, 'case.json');
+    await writeFile(inputPath, JSON.stringify({ id: 'case-1', question: 'What is 2+2?' }, null, 2));
+
+    const cases = await loadBenchmarkCases(inputPath);
+    expect(cases).toEqual([{ id: 'case-1', question: 'What is 2+2?' }]);
+  });
+
+  it('normalizes GAIA rows and resolves attachments from files dir', async () => {
+    const inputPath = join(tempDir, 'gaia.jsonl');
+    await writeFile(inputPath, JSON.stringify({
+      task_id: 'gaia-1',
+      Question: 'What is in the image?',
+      file_name: 'image.png',
+      Level: '1',
+      'Final answer': 'coin',
+    }));
+
+    const cases = await loadGaiaBenchmarkCases(inputPath, tempDir, 'fixtures', 'validation');
+    expect(cases).toEqual([{
+      id: 'gaia-1',
+      dataset: 'gaia',
+      split: 'validation',
+      level: '1',
+      question: 'What is in the image?',
+      images: [{ path: join(tempDir, 'fixtures', 'image.png'), name: 'image.png' }],
+      expectedAnswer: 'coin',
+      metadata: { source: 'gaia', fileName: 'image.png', level: '1', split: 'validation' },
+    }]);
   });
 });
 

@@ -114,4 +114,6 @@ Skills can also override child-run defaults with dotted frontmatter keys such as
 
 Skills may also declare `handler: handler.ts`. When present, the handler module is loaded as a child-run tool, which makes it a good fit for integrations such as MCP clients. See `examples/skills/mcp-echo/` for a minimal stdio MCP example that spawns a local server, sends `initialize` and `tools/call`, and returns the result to the delegated skill run.
 
+`examples/skills/file-converter/` shows the same handler-backed pattern for local document conversion with `pandoc`, defaulting output to Markdown unless the caller requests a different target format.
+
 Skills whose required tools are unavailable (e.g. `researcher` when `WEB_SEARCH_PROVIDER=brave` and `BRAVE_SEARCH_API_KEY` is missing) are skipped automatically.

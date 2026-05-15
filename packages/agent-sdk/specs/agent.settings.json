@@ -1,8 +1,8 @@
 {
   "logging": {
     "enabled": true,
-    "level": "debug",
-    "destination": "both",
+    "level": "info",
+    "destination": "file",
     "filePath": "./logs/adaptive-agent.log",
     "pretty": true
   }

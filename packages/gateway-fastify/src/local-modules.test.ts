@@ -1,11 +1,22 @@
 import { fileURLToPath } from 'node:url';
 
+import { afterEach } from 'vitest';
 import { describe, expect, it } from 'vitest';
 
 import type { AgentConfig } from './config.js';
 import { createLocalModuleRegistry } from './local-modules.js';
 
 describe('createLocalModuleRegistry', () => {
+  const originalSkillDirs = process.env.ADAPTIVE_AGENT_GATEWAY_SKILL_DIRS;
+
+  afterEach(() => {
+    if (originalSkillDirs === undefined) {
+      delete process.env.ADAPTIVE_AGENT_GATEWAY_SKILL_DIRS;
+    } else {
+      process.env.ADAPTIVE_AGENT_GATEWAY_SKILL_DIRS = originalSkillDirs;
+    }
+  });
+
   it('registers built-in tools and bundled delegates for local startup', async () => {
     const registry = await createLocalModuleRegistry({
       workspaceRoot: process.cwd(),
@@ -53,6 +64,19 @@ describe('createLocalModuleRegistry', () => {
       skillDirectories: [fileURLToPath(new URL('../../../examples/skills', import.meta.url))],
     });
 
+    expect(registry.listDelegateNames()).toContain('mcp-echo');
+  });
+
+  it('loads additional skill directories from ADAPTIVE_AGENT_GATEWAY_SKILL_DIRS', async () => {
+    process.env.ADAPTIVE_AGENT_GATEWAY_SKILL_DIRS = fileURLToPath(
+      new URL('../../../examples/skills', import.meta.url),
+    );
+
+    const registry = await createLocalModuleRegistry({
+      workspaceRoot: process.cwd(),
+    });
+
+    expect(registry.listDelegateNames()).toContain('file-converter');
     expect(registry.listDelegateNames()).toContain('mcp-echo');
   });
 });
