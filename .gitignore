@@ -51,6 +51,7 @@ mdocs/
 
 # this app artifacts
 artifacts/
+packages/agent-sdk/specs/
 
 new.*
 tmp/

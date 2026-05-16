@@ -122,13 +122,10 @@ describe('createReadFileTool', () => {
     ).rejects.toThrow();
   });
 
-  it('extracts text from PDFs', async () => {
+  it('extracts text from PDFs with pandoc', async () => {
     const tool = createReadFileTool({
       allowedRoot: tempDir,
-      extractPdfText: vi.fn().mockResolvedValue({
-        title: 'Sample PDF',
-        text: 'First page\n\nSecond page',
-      }),
+      extractWithPandoc: vi.fn().mockResolvedValue('First page\n\nSecond page'),
     });
     await writeFile(join(tempDir, 'sample.pdf'), new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d]));
 
@@ -137,6 +134,33 @@ describe('createReadFileTool', () => {
     expect(result.content).toBe('First page\n\nSecond page');
     expect(result.sizeBytes).toBe(5);
     expect(result.path).toBe(join(tempDir, 'sample.pdf'));
+  });
+
+  it('extracts spreadsheet content with pandoc', async () => {
+    const extractWithPandoc = vi.fn().mockResolvedValue('| name | value |\n| --- | --- |\n| alpha | 1 |');
+    const tool = createReadFileTool({
+      allowedRoot: tempDir,
+      extractWithPandoc,
+    });
+    await writeFile(join(tempDir, 'sheet.xlsx'), new Uint8Array([0x50, 0x4b, 0x03, 0x04]));
+
+    const result = (await tool.execute({ path: 'sheet.xlsx' } as any, stubToolContext())) as any;
+
+    expect(result.content).toContain('| name | value |');
+    expect(extractWithPandoc).toHaveBeenCalledWith(
+      join(tempDir, 'sheet.xlsx'),
+      'xlsx',
+      expect.any(AbortSignal),
+    );
+  });
+
+  it('rejects unsupported binary formats', async () => {
+    const tool = createReadFileTool({ allowedRoot: tempDir });
+    await writeFile(join(tempDir, 'image.png'), new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x00]));
+
+    await expect(
+      tool.execute({ path: 'image.png' } as any, stubToolContext()),
+    ).rejects.toThrow('Unsupported binary file format for read_file');
   });
 
   it('has correct tool metadata', () => {
@@ -284,6 +308,92 @@ describe('createWriteFileTool', () => {
     expect(result.path).toBe(join(tempDir, 'nested', 'file.txt'));
     const actual = await readFile(join(tempDir, 'nested', 'file.txt'), 'utf-8');
     expect(actual).toBe('normalized');
+  });
+
+  it('converts content with pandoc and keeps the intermediate source file by default', async () => {
+    const convertWithPandoc = vi.fn(async ({ sourcePath, outputPath, inputFormat, outputFormat }) => {
+      const source = await readFile(sourcePath, 'utf-8');
+      await writeFile(outputPath, `${outputFormat}:${inputFormat}:${source}`);
+      return 'warning text';
+    });
+    const tool = createWriteFileTool({ allowedRoot: tempDir, convertWithPandoc });
+
+    const result = (await tool.execute(
+      { path: 'slides.pptx', content: '# Deck', outputFormat: 'pptx' } as any,
+      stubToolContext(),
+    )) as any;
+
+    expect(result.path).toBe(join(tempDir, 'slides.pptx'));
+    expect(result.outputFormat).toBe('pptx');
+    expect(result.inputFormat).toBe('markdown');
+    expect(result.intermediatePath).toMatch(join(tempDir, 'tmp', 'write-file-conversions'));
+    expect(result.intermediatePath).toMatch(/\.md$/);
+    expect(result.stderr).toBe('warning text');
+    expect(result.sizeBytes).toBe(Buffer.byteLength('pptx:markdown:# Deck'));
+
+    await expect(readFile(result.intermediatePath, 'utf-8')).resolves.toBe('# Deck');
+    await expect(readFile(join(tempDir, 'slides.pptx'), 'utf-8')).resolves.toBe('pptx:markdown:# Deck');
+    expect(convertWithPandoc).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sourcePath: result.intermediatePath,
+        outputPath: join(tempDir, 'slides.pptx'),
+        inputFormat: 'markdown',
+        outputFormat: 'pptx',
+      }),
+      expect.any(AbortSignal),
+    );
+  });
+
+  it('removes the intermediate source file when keepIntermediate is false', async () => {
+    let intermediatePath = '';
+    const tool = createWriteFileTool({
+      allowedRoot: tempDir,
+      convertWithPandoc: async ({ sourcePath, outputPath }) => {
+        intermediatePath = sourcePath;
+        await writeFile(outputPath, 'converted');
+        return undefined;
+      },
+    });
+
+    const result = (await tool.execute(
+      { path: 'document.docx', content: '# Doc', outputFormat: 'docx', keepIntermediate: false } as any,
+      stubToolContext(),
+    )) as any;
+
+    expect(result.intermediatePath).toBeUndefined();
+    await expect(readFile(intermediatePath, 'utf-8')).rejects.toThrow();
+    await expect(readFile(join(tempDir, 'document.docx'), 'utf-8')).resolves.toBe('converted');
+  });
+
+  it('supports latex output format with a tex intermediate for latex input', async () => {
+    const tool = createWriteFileTool({
+      allowedRoot: tempDir,
+      convertWithPandoc: async ({ sourcePath, outputPath, inputFormat, outputFormat }) => {
+        await writeFile(outputPath, `${outputFormat}:${inputFormat}:${sourcePath}`);
+        return undefined;
+      },
+    });
+
+    const result = (await tool.execute(
+      { path: 'paper.tex', content: '\\section{Hi}', inputFormat: 'latex', outputFormat: 'latex' } as any,
+      stubToolContext(),
+    )) as any;
+
+    expect(result.outputFormat).toBe('latex');
+    expect(result.inputFormat).toBe('latex');
+    expect(result.intermediatePath).toMatch(/\.tex$/);
+    await expect(readFile(join(tempDir, 'paper.tex'), 'utf-8')).resolves.toContain('latex:latex:');
+  });
+
+  it('rejects deferred pdf and xlsx output formats clearly', async () => {
+    const tool = createWriteFileTool({ allowedRoot: tempDir });
+
+    await expect(
+      tool.execute({ path: 'output.pdf', content: '# Doc', outputFormat: 'pdf' } as any, stubToolContext()),
+    ).rejects.toThrow('outputFormat "pdf" is deferred');
+    await expect(
+      tool.execute({ path: 'output.xlsx', content: '# Doc', outputFormat: 'xlsx' } as any, stubToolContext()),
+    ).rejects.toThrow('outputFormat "xlsx" is deferred');
   });
 
   it('rejects paths outside the allowed root', async () => {
