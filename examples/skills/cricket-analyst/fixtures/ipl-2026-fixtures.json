@@ -1,0 +1,22 @@
+{
+  "tournament": "IPL 2026",
+  "asOf": "2026-04-28",
+  "matches": [
+    { "id": "m041", "date": "2026-04-22", "home": "RR",   "away": "MI",   "venue": "Jaipur",     "status": "played",   "score": { "home": 187, "away": 152, "winner": "RR" } },
+    { "id": "m042", "date": "2026-04-23", "home": "CSK",  "away": "PBKS", "venue": "Chennai",    "status": "played",   "score": { "home": 198, "away": 174, "winner": "CSK" } },
+    { "id": "m043", "date": "2026-04-24", "home": "KKR",  "away": "DC",   "venue": "Kolkata",    "status": "played",   "score": { "home": 165, "away": 168, "winner": "DC" } },
+    { "id": "m044", "date": "2026-04-25", "home": "SRH",  "away": "GT",   "venue": "Hyderabad",  "status": "played",   "score": { "home": 211, "away": 168, "winner": "SRH" } },
+    { "id": "m045", "date": "2026-04-26", "home": "RCB",  "away": "LSG",  "venue": "Bengaluru",  "status": "played",   "score": { "home": 156, "away": 159, "winner": "LSG" } },
+    { "id": "m046", "date": "2026-04-27", "home": "MI",   "away": "KKR",  "venue": "Mumbai",     "status": "played",   "score": { "home": 178, "away": 172, "winner": "MI" } },
+    { "id": "m047", "date": "2026-04-28", "home": "DC",   "away": "RR",   "venue": "Delhi",      "status": "played",   "score": { "home": 145, "away": 149, "winner": "RR" } },
+    { "id": "m048", "date": "2026-04-29", "home": "PBKS", "away": "SRH",  "venue": "Mohali",     "status": "remaining" },
+    { "id": "m049", "date": "2026-04-30", "home": "GT",   "away": "RCB",  "venue": "Ahmedabad",  "status": "remaining" },
+    { "id": "m050", "date": "2026-05-01", "home": "CSK",  "away": "MI",   "venue": "Chennai",    "status": "remaining" },
+    { "id": "m051", "date": "2026-05-02", "home": "LSG",  "away": "RR",   "venue": "Lucknow",    "status": "remaining" },
+    { "id": "m052", "date": "2026-05-03", "home": "KKR",  "away": "SRH",  "venue": "Kolkata",    "status": "remaining" },
+    { "id": "m053", "date": "2026-05-04", "home": "DC",   "away": "PBKS", "venue": "Delhi",      "status": "remaining" },
+    { "id": "m054", "date": "2026-05-05", "home": "RCB",  "away": "CSK",  "venue": "Bengaluru",  "status": "remaining" },
+    { "id": "m055", "date": "2026-05-06", "home": "GT",   "away": "LSG",  "venue": "Ahmedabad",  "status": "remaining" },
+    { "id": "m056", "date": "2026-05-07", "home": "MI",   "away": "RR",   "venue": "Mumbai",     "status": "remaining" }
+  ]
+}

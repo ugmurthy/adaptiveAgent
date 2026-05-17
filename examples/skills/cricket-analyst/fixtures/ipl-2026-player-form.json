@@ -1,0 +1,51 @@
+{
+  "tournament": "IPL 2026",
+  "asOf": "2026-04-28",
+  "teams": {
+    "RR": [
+      { "name": "Yashasvi Jaiswal",   "role": "batter",     "last5": { "runs": 312, "wickets": null, "sr": 168.4, "econ": null } },
+      { "name": "Sanju Samson",       "role": "batter-wk",  "last5": { "runs": 241, "wickets": null, "sr": 152.7, "econ": null } },
+      { "name": "Trent Boult",        "role": "bowler",     "last5": { "runs": null, "wickets": 9,   "sr": null,  "econ": 7.92 } }
+    ],
+    "KKR": [
+      { "name": "Sunil Narine",       "role": "all-rounder","last5": { "runs": 188, "wickets": 6,   "sr": 175.3, "econ": 6.81 } },
+      { "name": "Andre Russell",      "role": "all-rounder","last5": { "runs": 154, "wickets": 5,   "sr": 198.7, "econ": 8.24 } },
+      { "name": "Varun Chakaravarthy","role": "bowler",     "last5": { "runs": null, "wickets": 8,   "sr": null,  "econ": 7.05 } }
+    ],
+    "CSK": [
+      { "name": "Ruturaj Gaikwad",    "role": "batter",     "last5": { "runs": 224, "wickets": null, "sr": 144.1, "econ": null } },
+      { "name": "MS Dhoni",           "role": "batter-wk",  "last5": { "runs": 87,  "wickets": null, "sr": 218.3, "econ": null } },
+      { "name": "Matheesha Pathirana","role": "bowler",     "last5": { "runs": null, "wickets": 7,   "sr": null,  "econ": 8.14 } }
+    ],
+    "SRH": [
+      { "name": "Travis Head",        "role": "batter",     "last5": { "runs": 268, "wickets": null, "sr": 191.2, "econ": null } },
+      { "name": "Pat Cummins",        "role": "all-rounder","last5": { "runs": 71,  "wickets": 6,   "sr": 134.0, "econ": 8.33 } }
+    ],
+    "LSG": [
+      { "name": "KL Rahul",           "role": "batter-wk",  "last5": { "runs": 198, "wickets": null, "sr": 138.5, "econ": null } },
+      { "name": "Mark Wood",          "role": "bowler",     "last5": { "runs": null, "wickets": 5,   "sr": null,  "econ": 9.12 } }
+    ],
+    "DC": [
+      { "name": "Rishabh Pant",       "role": "batter-wk",  "last5": { "runs": 217, "wickets": null, "sr": 155.0, "econ": null } },
+      { "name": "Kuldeep Yadav",      "role": "bowler",     "last5": { "runs": null, "wickets": 8,   "sr": null,  "econ": 7.45 } }
+    ],
+    "MI": [
+      { "name": "Suryakumar Yadav",   "role": "batter",     "last5": { "runs": 251, "wickets": null, "sr": 172.1, "econ": null } },
+      { "name": "Jasprit Bumrah",     "role": "bowler",     "last5": { "runs": null, "wickets": 9,   "sr": null,  "econ": 6.74 } },
+      { "name": "Hardik Pandya",      "role": "all-rounder","last5": { "runs": 134, "wickets": 4,   "sr": 158.2, "econ": 8.97 } }
+    ],
+    "RCB": [
+      { "name": "Virat Kohli",        "role": "batter",     "last5": { "runs": 245, "wickets": null, "sr": 149.6, "econ": null } },
+      { "name": "Faf du Plessis",     "role": "batter",     "last5": { "runs": 178, "wickets": null, "sr": 141.3, "econ": null } },
+      { "name": "Mohammed Siraj",     "role": "bowler",     "last5": { "runs": null, "wickets": null, "sr": null, "econ": null } }
+    ],
+    "PBKS": [
+      { "name": "Shashank Singh",     "role": "batter",     "last5": { "runs": 132, "wickets": null, "sr": 175.4, "econ": null } },
+      { "name": "Arshdeep Singh",     "role": "bowler",     "last5": { "runs": null, "wickets": 7,   "sr": null,  "econ": 8.51 } }
+    ],
+    "GT": [
+      { "name": "Shubman Gill",       "role": "batter",     "last5": { "runs": 167, "wickets": null, "sr": 132.7, "econ": null } },
+      { "name": "Rashid Khan",        "role": "bowler",     "last5": { "runs": null, "wickets": 4,   "sr": null,  "econ": 7.88 } }
+    ]
+  }
+}
