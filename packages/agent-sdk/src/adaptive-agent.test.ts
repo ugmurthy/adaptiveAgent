@@ -132,8 +132,10 @@ describe('adaptive-agent cli parsing', () => {
       '--model', 'qwen3.5',
       '--approval', 'manual',
       '--clarification', 'fail',
+      '--progress',
       '--events',
       '--inspect',
+      '--dry-run',
       '--output', 'json',
     ]);
 
@@ -151,8 +153,10 @@ describe('adaptive-agent cli parsing', () => {
       model: 'qwen3.5',
       approvalMode: 'manual',
       clarificationMode: 'fail',
+      progress: true,
       events: true,
       inspect: true,
+      dryRun: true,
       output: 'json',
       help: false,
     });
@@ -173,8 +177,10 @@ describe('adaptive-agent cli parsing', () => {
       goalArgs: ['answer', 'this'],
       imagePaths: ['./chart.png'],
       inputJson: { level: 2 },
+      progress: false,
       events: false,
       inspect: false,
+      dryRun: false,
       output: 'pretty',
       help: false,
     });

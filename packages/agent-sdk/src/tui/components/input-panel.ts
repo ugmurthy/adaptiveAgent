@@ -47,12 +47,13 @@ export class InputPanel implements Component {
 
   private formatPrimaryStatus(): string {
     const parts = [
-      this.state.connected ? chalk.green('connected') : chalk.red('disconnected'),
-      this.state.sessionId ? `session ${this.state.sessionId.slice(0, 12)}` : 'session pending',
+      this.state.busy ? chalk.yellow('running') : chalk.green('ready'),
+      `agent ${this.state.agentId}`,
+      `mode ${this.state.invocationMode}`,
     ];
 
-    if (this.state.runSessionId) {
-      parts.push(`run ${this.state.runSessionId.slice(0, 12)}`);
+    if (this.state.currentRunId) {
+      parts.push(`run ${this.state.currentRunId.slice(0, 12)}`);
     }
 
     parts.push(`events ${this.state.eventMode}`);
@@ -69,15 +70,10 @@ export class InputPanel implements Component {
   }
 
   private formatConnectionContext(): string {
-    const parts = [`channel ${this.state.channel}`];
-
-    if (this.state.tenantId) {
-      parts.push(`tenant ${this.state.tenantId}`);
-    }
-
-    if (this.state.roles.length > 0) {
-      parts.push(`roles ${this.state.roles.join(',')}`);
-    }
+    const parts = [
+      `runtime ${this.state.runtimeMode}`,
+      `model ${this.state.provider ?? 'provider?'}/${this.state.model ?? 'model?'}`,
+    ];
 
     return parts.join(chalk.dim(' | '));
   }

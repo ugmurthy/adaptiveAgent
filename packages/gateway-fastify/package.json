@@ -6,7 +6,6 @@
   "main": "src/index.ts",
   "bin": {
     "adaptive-agent-ws-client": "./src/local-ws-client.ts",
-    "adaptive-agent-tui": "./src/local-ws-client-tui.ts",
     "adaptive-agent-trace-session": "./src/trace-session.ts",
     "gateway-ws-client": "./src/local-ws-client.ts",
     "gateway-tui": "./src/local-ws-client-tui.ts",
@@ -32,7 +31,7 @@
     "@adaptive-agent/core": "workspace:*",
     "@fastify/multipart": "^10.0.0",
     "@fastify/websocket": "^11.2.0",
-    "@mariozechner/pi-tui": "^0.66.1",
+    "@earendil-works/pi-tui": "^0.75.4",
     "chalk": "^5.5.0",
     "fastify": "^5.6.1",
     "jose": "^6.2.2",

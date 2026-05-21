@@ -18,6 +18,7 @@ import type {
 
 import {
   createAgentSdk,
+  inspectAgentSdkResolution,
   loadAgentSdkConfig,
   type AgentSdkChatOptions,
   type AgentSdkRunOptions,
@@ -56,8 +57,10 @@ export interface ManualTestCliOptions {
   model?: string;
   approvalMode?: ApprovalMode;
   clarificationMode?: ClarificationMode;
+  progress: boolean;
   events: boolean;
   inspect: boolean;
+  dryRun: boolean;
   output: 'pretty' | 'json' | 'jsonl';
   help: boolean;
 }
@@ -180,8 +183,10 @@ Options:
   --model <name>          Override model name.
   --approval <mode>       Approval mode: auto, manual, reject.
   --clarification <mode>  Clarification mode: interactive or fail.
+  --progress              Print assistant progress updates as they arrive.
   --events                Print lifecycle events as they arrive.
   --inspect               Print a compact inspection summary after completion.
+  --dry-run               Resolve config, request, tools, and delegates without running.
   --output <format>       Output format: pretty, json, or jsonl. Default: pretty.
   --help                  Show this help text.
 
@@ -253,9 +258,11 @@ async function runSpecCommand(cli: ManualTestCliOptions): Promise<number> {
   const spec = await parseAndValidateSpec(specPath, cli.mode);
   const resolvedCwd = resolve(cli.cwd ?? process.cwd());
   const sdkOptions = buildSdkOptions(cli, resolvedCwd);
-  const resolvedConfig = await loadAgentSdkConfig(sdkOptions);
+  const inspection = cli.dryRun ? await inspectAgentSdkResolution(sdkOptions) : undefined;
+  const resolvedConfig = inspection?.config ?? await loadAgentSdkConfig(sdkOptions);
   const warnings = collectProviderWarnings(spec, resolvedConfig.model.provider);
   const eventLog: Array<Record<string, JsonValue>> = [];
+  const lastProgressContentByRun = new Map<string, string>();
 
   for (const warning of warnings) {
     if (cli.output === 'pretty') {
@@ -267,13 +274,20 @@ async function runSpecCommand(cli: ManualTestCliOptions): Promise<number> {
     printResolvedConfigSummary(cli, resolvedConfig, spec, warnings);
   }
 
+  if (cli.dryRun) {
+    printDryRun(cli, inspection!, spec, warnings);
+    return 0;
+  }
+
   const sdk = await createAgentSdk({
     ...sdkOptions,
-    eventListener: cli.events ? (event) => {
+    eventListener: shouldListenForCliEvents(cli) ? (event) => {
       const entry = summarizeEvent(event);
       eventLog.push(entry);
-      if (cli.output === 'pretty') {
+      if (cli.events && cli.output === 'pretty') {
         printEvent(entry);
+      } else if (cli.progress && cli.output === 'pretty') {
+        printProgressEvent(event, lastProgressContentByRun);
       }
     } : undefined,
   });
@@ -324,9 +338,11 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
   await validateLocalPaths(spec);
 
   const sdkOptions = buildSdkOptions(cli, resolvedCwd);
-  const resolvedConfig = await loadAgentSdkConfig(sdkOptions);
+  const inspection = cli.dryRun ? await inspectAgentSdkResolution(sdkOptions) : undefined;
+  const resolvedConfig = inspection?.config ?? await loadAgentSdkConfig(sdkOptions);
   const warnings = collectProviderWarnings(spec, resolvedConfig.model.provider);
   const eventLog: Array<Record<string, JsonValue>> = [];
+  const lastProgressContentByRun = new Map<string, string>();
 
   for (const warning of warnings) {
     if (cli.output === 'pretty') console.error(`warning: ${warning}`);
@@ -336,12 +352,21 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
     printInlineConfigSummary(cli, resolvedConfig, spec, warnings);
   }
 
+  if (cli.dryRun) {
+    printDryRun(cli, inspection!, spec, warnings);
+    return 0;
+  }
+
   const sdk = await createAgentSdk({
     ...sdkOptions,
-    eventListener: cli.events ? (event) => {
+    eventListener: shouldListenForCliEvents(cli) ? (event) => {
       const entry = summarizeEvent(event);
       eventLog.push(entry);
-      if (cli.output === 'pretty') printEvent(entry);
+      if (cli.events && cli.output === 'pretty') {
+        printEvent(entry);
+      } else if (cli.progress && cli.output === 'pretty') {
+        printProgressEvent(event, lastProgressContentByRun);
+      }
     } : undefined,
   });
 
@@ -425,12 +450,17 @@ async function runEvalCommand(cli: ManualTestCliOptions): Promise<number> {
   }
 
   const eventLog: Array<Record<string, JsonValue>> = [];
+  const lastProgressContentByRun = new Map<string, string>();
   const sdk = await createAgentSdk({
     ...sdkOptions,
     eventListener: (event) => {
       const entry = summarizeEvent(event);
       eventLog.push(entry);
-      if (cli.events && cli.output === 'pretty') printEvent(entry);
+      if (cli.events && cli.output === 'pretty') {
+        printEvent(entry);
+      } else if (cli.progress && cli.output === 'pretty') {
+        printProgressEvent(event, lastProgressContentByRun);
+      }
     },
   });
 
@@ -479,8 +509,10 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
     evalResume: false,
     evalFailFast: false,
     evalOffset: 0,
+    progress: false,
     events: false,
     inspect: false,
+    dryRun: false,
     output: 'pretty',
     help: false,
   };
@@ -509,8 +541,14 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
       case '--events':
         options.events = true;
         break;
+      case '--progress':
+        options.progress = true;
+        break;
       case '--inspect':
         options.inspect = true;
+        break;
+      case '--dry-run':
+        options.dryRun = true;
         break;
       case '--spec':
         options.specPath = requireOptionValue(arg, argv[++index]);
@@ -603,6 +641,10 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
 
   if (!options.help && options.command === 'eval' && !options.evalDataset) {
     throw new Error('Missing eval dataset. Expected `adaptive-agent eval cases` or `adaptive-agent eval gaia`.');
+  }
+
+  if (!options.help && options.command === 'eval' && options.dryRun) {
+    throw new Error('--dry-run is supported for run, chat, and spec commands, not eval');
   }
 
   if (!options.help && options.command === 'chat' && options.imagePaths.length > 0) {
@@ -1339,8 +1381,10 @@ function summarizeCli(cli: ManualTestCliOptions): Record<string, JsonValue> {
     ...(cli.model ? { model: cli.model } : {}),
     ...(cli.approvalMode ? { approvalMode: cli.approvalMode } : {}),
     ...(cli.clarificationMode ? { clarificationMode: cli.clarificationMode } : {}),
+    progress: cli.progress,
     events: cli.events,
     inspect: cli.inspect,
+    dryRun: cli.dryRun,
     output: cli.output,
   };
 }
@@ -1357,8 +1401,12 @@ function summarizeResolvedConfig(
     model: resolvedConfig.model.model,
     runtimeMode: resolvedConfig.runtime.mode,
     requestedRuntimeMode: resolvedConfig.runtime.requestedMode,
+    autoMigrate: resolvedConfig.runtime.autoMigrate,
     workspaceRoot: resolvedConfig.workspaceRoot,
     shellCwd: resolvedConfig.shellCwd,
+    approvalMode: resolvedConfig.interaction.approvalMode,
+    clarificationMode: resolvedConfig.interaction.clarificationMode,
+    skillSearchDirs: resolvedConfig.skills.dirs,
     mode: spec.mode,
     messageCount: summary.messageCount,
     textParts: summary.textParts,
@@ -1416,6 +1464,10 @@ function isSuccessfulResult(result: RunResult | ChatResult): result is Extract<R
   return result.status === 'success';
 }
 
+function shouldListenForCliEvents(cli: ManualTestCliOptions): boolean {
+  return cli.events || cli.progress;
+}
+
 function summarizeEvent(event: { type: string; runId: string; stepId?: string; toolCallId?: string; payload: JsonValue; createdAt: string }): Record<string, JsonValue> {
   return {
     type: event.type,
@@ -1443,6 +1495,40 @@ function summarizeEventPayload(payload: JsonValue): JsonValue {
   return summary;
 }
 
+const ASSISTANT_CONTENT_PROGRESS_EVENT_TYPES = new Set([
+  'tool.started',
+  'approval.requested',
+  'delegate.spawned',
+]);
+
+function printProgressEvent(event: { type: string; runId: string; payload: JsonValue }, lastContentByRun: Map<string, string>): void {
+  const assistantContent = extractAssistantProgressContent(event);
+  if (!assistantContent) {
+    return;
+  }
+  if (lastContentByRun.get(event.runId) === assistantContent) {
+    return;
+  }
+  lastContentByRun.set(event.runId, assistantContent);
+  console.error('progress>');
+  console.error(assistantContent);
+}
+
+function extractAssistantProgressContent(event: { type: string; payload: JsonValue }): string | undefined {
+  if (!ASSISTANT_CONTENT_PROGRESS_EVENT_TYPES.has(event.type)) {
+    return undefined;
+  }
+  if (typeof event.payload !== 'object' || event.payload === null || Array.isArray(event.payload)) {
+    return undefined;
+  }
+  const assistantContent = (event.payload as JsonObject).assistantContent;
+  if (typeof assistantContent !== 'string') {
+    return undefined;
+  }
+  const trimmed = assistantContent.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
 function printResolvedConfigSummary(
   cli: ManualTestCliOptions,
   resolvedConfig: Awaited<ReturnType<typeof loadAgentSdkConfig>>,
@@ -1462,6 +1548,103 @@ function printResolvedConfigSummary(
     console.log(`warnings: ${warnings.length}`);
   }
   console.log('');
+}
+
+function formatNameList(values: readonly string[]): string {
+  return values.length > 0 ? values.join(', ') : '(none)';
+}
+
+function oneLine(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function printDryRun(
+  cli: ManualTestCliOptions,
+  inspection: Awaited<ReturnType<typeof inspectAgentSdkResolution>>,
+  spec: ManualTestSpec,
+  warnings: string[],
+): void {
+  const output = summarizeDryRun(cli, inspection, spec, warnings);
+  if (cli.output === 'json') {
+    console.log(JSON.stringify(output, null, 2));
+    return;
+  }
+  if (cli.output === 'jsonl') {
+    console.log(JSON.stringify(output));
+    return;
+  }
+
+  console.log(renderPrettyString(formatDryRunMarkdown(inspection, spec, warnings)));
+}
+
+function formatDryRunMarkdown(
+  inspection: Awaited<ReturnType<typeof inspectAgentSdkResolution>>,
+  spec: ManualTestSpec,
+  warnings: string[],
+): string {
+  const config = inspection.config;
+  const summary = summarizeSpec(spec);
+  const lines = [
+    '# Dry run',
+    '',
+    '- `dryRun`: `true`',
+    `- \`approval\`: \`${config.interaction.approvalMode}\``,
+    `- \`clarification\`: \`${config.interaction.clarificationMode}\``,
+    `- \`shellCwd\`: \`${config.shellCwd}\``,
+    `- \`skillSearchDirs\`: ${formatNameList(config.skills.dirs)}`,
+    '',
+    '## Request',
+    '',
+    `- \`mode\`: \`${spec.mode}\``,
+    ...(spec.mode === 'run'
+      ? [
+          `- \`goalLength\`: \`${spec.goal.length}\``,
+          `- \`input\`: \`${spec.input === undefined ? 'absent' : 'present'}\``,
+        ]
+      : []),
+    `- \`messages\`: \`${summary.messageCount}\``,
+    `- \`content\`: text=${summary.textParts} image=${summary.imageParts + summary.legacyImages} file=${summary.fileParts} audio=${summary.audioParts}`,
+    '',
+    '## Tools',
+    '',
+    ...(inspection.tools.length === 0 ? ['- (none)'] : inspection.tools.map((tool) => `- \`${tool.name}\``)),
+    '',
+    '## Delegates',
+    '',
+    ...(inspection.delegates.length === 0
+      ? ['- (none)']
+      : inspection.delegates.flatMap((delegate) => [
+          `- \`${delegate.name}\``,
+          ...(delegate.description ? [`  - description: ${oneLine(delegate.description)}`] : []),
+          `  - allowedTools: ${formatNameList(delegate.allowedTools)}`,
+        ])),
+    '',
+    `- \`registeredTools\`: ${formatNameList(inspection.registeredToolNames)}`,
+  ];
+
+  if (warnings.length > 0) {
+    lines.push('', '## Warnings', '', ...warnings.map((warning) => `- ${warning}`));
+  }
+
+  return `${lines.join('\n')}\n`;
+}
+
+function summarizeDryRun(
+  cli: ManualTestCliOptions,
+  inspection: Awaited<ReturnType<typeof inspectAgentSdkResolution>>,
+  spec: ManualTestSpec,
+  warnings: string[],
+): Record<string, JsonValue> {
+  return {
+    dryRun: true,
+    cli: summarizeCli(cli),
+    resolvedConfig: summarizeResolvedConfig(inspection.config, spec),
+    request: spec as unknown as JsonValue,
+    tools: inspection.tools.map((tool) => tool.name),
+    delegates: inspection.delegates as unknown as JsonValue,
+    registeredToolNames: inspection.registeredToolNames,
+    warnings,
+  };
 }
 
 function printInlineConfigSummary(

@@ -59,6 +59,18 @@ export type ApprovalMode = 'manual' | 'auto' | 'reject';
 export type ClarificationMode = 'interactive' | 'fail';
 export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'silent';
 export type LogDestination = 'console' | 'file' | 'both';
+export type TuiMessageType = 'user' | 'assistant' | 'progress' | 'run' | 'system' | 'event';
+export type TuiTextStyleName = 'default' | 'dim' | 'bold' | 'italic' | 'underline' | 'red' | 'green' | 'yellow' | 'blue' | 'magenta' | 'cyan' | 'white' | 'gray';
+
+export interface TuiMessageStyleConfig {
+  showPrefix?: boolean;
+  prefix?: TuiTextStyleName | TuiTextStyleName[];
+  body?: TuiTextStyleName | TuiTextStyleName[];
+}
+
+export interface TuiSettingsConfig {
+  messages?: Partial<Record<TuiMessageType, TuiMessageStyleConfig>>;
+}
 
 export interface AgentConfigFile {
   $schema?: string;
@@ -94,6 +106,7 @@ export interface AgentSettingsFile {
   model?: { overrideProvider?: string; overrideModel?: string; overrideBaseUrl?: string; overrideApiKeyEnv?: string };
   defaults?: Partial<AgentDefaults>;
   env?: Record<string, string>;
+  tui?: TuiSettingsConfig;
 }
 
 export interface ResolvedAgentSdkConfig {
@@ -107,6 +120,14 @@ export interface ResolvedAgentSdkConfig {
   interaction: { approvalMode: ApprovalMode; clarificationMode: ClarificationMode };
   events: { printLifecycle: boolean; subscribe: boolean; verbose: boolean };
   skills: { dirs: string[]; allowExampleSkills: boolean };
+  tui: TuiSettingsConfig;
+}
+
+export interface ResolvedAgentSdkModuleInspection {
+  config: ResolvedAgentSdkConfig;
+  tools: Array<Pick<ToolDefinition<JsonValue, JsonValue>, 'name' | 'description' | 'inputSchema' | 'requiresApproval'>>;
+  delegates: Array<Pick<DelegateDefinition, 'name' | 'description' | 'allowedTools'>>;
+  registeredToolNames: string[];
 }
 
 export interface AgentSdkOptions {
@@ -194,16 +215,28 @@ export class AgentSdk {
     return this.resolveInteractions(await this.agent.run({ ...options, goal, metadata: mergeMetadata(this.metadata, options.metadata) }));
   }
 
+  async runRaw(goal: string, options: AgentSdkRunOptions = {}): Promise<RunResult> {
+    return this.agent.run({ ...options, goal, metadata: mergeMetadata(this.metadata, options.metadata) });
+  }
+
   async chat(messageOrMessages: string | ChatMessage[], options: AgentSdkChatOptions = {}): Promise<ChatResult> {
     const messages = typeof messageOrMessages === 'string' ? [{ role: 'user' as const, content: messageOrMessages }] : messageOrMessages;
     return this.resolveInteractions(await this.agent.chat({ ...options, messages, metadata: mergeMetadata(this.metadata, options.metadata) }));
   }
 
+  async chatRaw(messageOrMessages: string | ChatMessage[], options: AgentSdkChatOptions = {}): Promise<ChatResult> {
+    const messages = typeof messageOrMessages === 'string' ? [{ role: 'user' as const, content: messageOrMessages }] : messageOrMessages;
+    return this.agent.chat({ ...options, messages, metadata: mergeMetadata(this.metadata, options.metadata) });
+  }
+
   async resume(runId: UUID): Promise<RunResult> { return this.resolveInteractions(await this.agent.resume(runId)); }
+  async resumeRaw(runId: UUID): Promise<RunResult> { return this.agent.resume(runId); }
   async retry(runId: UUID): Promise<RunResult> { return this.resolveInteractions(await this.agent.retry(runId)); }
+  async retryRaw(runId: UUID): Promise<RunResult> { return this.agent.retry(runId); }
   async getRecoveryOptions(runId: UUID): Promise<RunRecoveryOptions> { return this.agent.getRecoveryOptions(runId); }
   async createContinuationRun(options: ContinueRunOptions): Promise<ContinueRunResult> { return this.agent.createContinuationRun(options); }
   async continueRun(options: ContinueRunOptions): Promise<RunResult> { return this.resolveInteractions(await this.agent.continueRun(options)); }
+  async continueRunRaw(options: ContinueRunOptions): Promise<RunResult> { return this.agent.continueRun(options); }
   async interrupt(runId: UUID): Promise<void> { await this.agent.interrupt(runId); }
   async steer(runId: UUID, message: Parameters<AdaptiveAgent['steer']>[1]): Promise<void> { await this.agent.steer(runId, message); }
   async inspect(runId: UUID): Promise<{ run: Awaited<ReturnType<RunStore['getRun']>>; events: AgentEvent[] }> { return { run: await this.created.runtime.runStore.getRun(runId), events: await this.created.runtime.eventStore.listByRun(runId) }; }
@@ -237,6 +270,25 @@ export class AgentSdk {
 
 export async function createAgentSdk(options: AgentSdkOptions = {}): Promise<AgentSdk> { return AgentSdk.create(options); }
 export async function loadAgentSdkConfig(options: AgentSdkOptions = {}): Promise<ResolvedAgentSdkConfig> { return resolveAgentSdkConfig(options); }
+export async function inspectAgentSdkResolution(options: AgentSdkOptions = {}): Promise<ResolvedAgentSdkModuleInspection> {
+  const config = await resolveAgentSdkConfig(options);
+  const modules = await resolveToolsAndDelegates(config, options);
+  return {
+    config,
+    tools: modules.tools.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+      requiresApproval: tool.requiresApproval,
+    })),
+    delegates: modules.delegates.map((delegate) => ({
+      name: delegate.name,
+      description: delegate.description,
+      allowedTools: delegate.allowedTools,
+    })),
+    registeredToolNames: modules.registeredToolNames,
+  };
+}
 
 async function resolveAgentSdkConfig(options: AgentSdkOptions): Promise<ResolvedAgentSdkConfig> {
   const cwd = options.cwd ?? process.cwd();
@@ -270,7 +322,12 @@ async function resolveAgentSdkConfig(options: AgentSdkOptions): Promise<Resolved
     interaction: { approvalMode: settings.interaction?.approvalMode ?? (settings.interaction?.autoApprove === false ? 'manual' : 'auto'), clarificationMode: settings.interaction?.clarificationMode ?? (settings.interaction?.interactive === false ? 'fail' : 'interactive') },
     events: { printLifecycle: settings.events?.printLifecycle ?? false, subscribe: settings.events?.subscribe ?? false, verbose: settings.events?.verbose ?? false },
     skills: { dirs: resolveSkillDirs(cwd, settings.skills?.dirs, settings.skills?.allowExampleSkills, env), allowExampleSkills: settings.skills?.allowExampleSkills ?? false },
+    tui: normalizeTuiSettings(settings.tui),
   };
+}
+
+function normalizeTuiSettings(settings: TuiSettingsConfig | undefined): TuiSettingsConfig {
+  return settings ? { messages: settings.messages ?? {} } : { messages: {} };
 }
 
 async function resolveToolsAndDelegates(config: ResolvedAgentSdkConfig, options: AgentSdkOptions): Promise<{ tools: Array<ToolDefinition<any, any>>; delegates: DelegateDefinition[]; registeredToolNames: string[] }> {

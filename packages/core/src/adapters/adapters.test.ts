@@ -405,6 +405,18 @@ describe('BaseOpenAIChatAdapter', () => {
     expect(result.usage?.estimatedCostUSD).toBeCloseTo(0.00014);
   });
 
+  it('uses provider-reported top-level cost when present', async () => {
+    const adapter = createAdapter();
+    mockFetchResponse({
+      ...STOP_RESPONSE,
+      cost: '$0.00021',
+    });
+
+    const result = await adapter.generate(simpleRequest());
+
+    expect(result.usage?.estimatedCostUSD).toBeCloseTo(0.00021);
+  });
+
   it('uses provider-reported cost detail totals when direct usage cost is absent', async () => {
     const adapter = createAdapter();
     mockFetchResponse({

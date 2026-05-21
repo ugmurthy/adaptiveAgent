@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { AgentSettingsValidationError, loadAgentSdkConfig } from './index.js';
+import { AgentSettingsValidationError, inspectAgentSdkResolution, loadAgentSdkConfig } from './index.js';
 
 describe('agent-sdk config resolution', () => {
   let tempDir: string;
@@ -58,6 +58,17 @@ describe('agent-sdk config resolution', () => {
     await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({ runtime: { mode: 'postgres' } }));
 
     await expect(loadAgentSdkConfig({ cwd: tempDir, env: {} })).rejects.toThrow(AgentSettingsValidationError);
+  });
+
+  it('inspects resolved tools without creating a runtime bundle', async () => {
+    await writeAgentConfig(join(tempDir, 'agent.json'));
+
+    const inspection = await inspectAgentSdkResolution({ cwd: tempDir, env: {} });
+
+    expect(inspection.config.agent.id).toBe('agent');
+    expect(inspection.tools.map((tool) => tool.name)).toEqual(['read_file']);
+    expect(inspection.registeredToolNames).toContain('read_file');
+    expect(inspection.delegates).toEqual([]);
   });
 });
 

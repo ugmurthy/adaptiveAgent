@@ -19,7 +19,8 @@
     "gateway:mint-jwt": "bun run ./packages/gateway-fastify/src/mint-local-jwt.ts",
     "gateway:status": "bun run ./packages/gateway-fastify/src/check-status.ts",
     "gateway:start": "bun run ./packages/gateway-fastify/src/start-local.ts",
-    "gateway:start:fly": "bun run ./packages/gateway-fastify/src/start-fly.ts"
+    "gateway:start:fly": "bun run ./packages/gateway-fastify/src/start-fly.ts",
+    "agent:tui": "bun run ./packages/agent-sdk/src/adaptive-agent-tui.ts"
   },
   "dependencies": {
     "@e2b/code-interpreter": "^2.4.0",

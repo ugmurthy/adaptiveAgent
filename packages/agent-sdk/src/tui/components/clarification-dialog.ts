@@ -39,9 +39,6 @@ export class ClarificationDialog implements Component {
 
     lines.push(renderTopBorder(width, { border: chalk.cyan }, 'Clarification Needed'));
     lines.push(this.frameLine(chalk.dim(`runId: ${this.clarificationInfo.runId}`), innerWidth));
-    if (this.clarificationInfo.sessionId) {
-      lines.push(this.frameLine(chalk.dim(`sessionId: ${this.clarificationInfo.sessionId}`), innerWidth));
-    }
     lines.push(renderSeparator(width, { border: chalk.dim }));
 
     for (const line of wrapTextWithAnsi(this.clarificationInfo.message, innerWidth)) {

@@ -85,22 +85,27 @@ interface OpenAIChatCompletionResponse {
     };
     finish_reason: 'stop' | 'tool_calls' | 'length' | 'content_filter';
   }>;
+  cost?: number | string | null;
+  cost_usd?: number | string | null;
+  estimated_cost_usd?: number | string | null;
+  total_cost?: number | string | null;
+  total_cost_usd?: number | string | null;
   usage?: {
     prompt_tokens: number;
     completion_tokens: number;
     total_tokens: number;
-    cost?: number | string;
-    cost_usd?: number | string;
-    estimated_cost_usd?: number | string;
-    total_cost?: number | string;
-    total_cost_usd?: number | string;
+    cost?: number | string | null;
+    cost_usd?: number | string | null;
+    estimated_cost_usd?: number | string | null;
+    total_cost?: number | string | null;
+    total_cost_usd?: number | string | null;
     completion_tokens_details?: {
       reasoning_tokens?: number;
     };
     cost_details?: {
-      upstream_inference_cost?: number | string;
-      upstream_inference_prompt_cost?: number | string;
-      upstream_inference_completions_cost?: number | string;
+      upstream_inference_cost?: number | string | null;
+      upstream_inference_prompt_cost?: number | string | null;
+      upstream_inference_completions_cost?: number | string | null;
     };
   };
 }
@@ -421,7 +426,7 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
           completionTokens: data.usage.completion_tokens,
           reasoningTokens: data.usage.completion_tokens_details?.reasoning_tokens,
           totalTokens: data.usage.total_tokens,
-          estimatedCostUSD: estimateUsageCostUSD(data.usage),
+          estimatedCostUSD: estimateCompletionCostUSD(data),
           provider: this.provider,
           model: this.model,
         }
@@ -878,7 +883,22 @@ function tryParseJson(text: string): JsonValue | undefined {
   return undefined;
 }
 
-function estimateUsageCostUSD(usage: NonNullable<OpenAIChatCompletionResponse['usage']>): number {
+function estimateCompletionCostUSD(completion: OpenAIChatCompletionResponse): number {
+  return readFiniteNumber(
+    completion.estimated_cost_usd,
+    completion.cost_usd,
+    completion.total_cost_usd,
+    completion.cost,
+    completion.total_cost,
+    estimateUsageCostUSD(completion.usage),
+  ) ?? 0;
+}
+
+function estimateUsageCostUSD(usage: OpenAIChatCompletionResponse['usage']): number | undefined {
+  if (!usage) {
+    return undefined;
+  }
+
   return readFiniteNumber(
     usage.estimated_cost_usd,
     usage.cost_usd,
@@ -890,10 +910,10 @@ function estimateUsageCostUSD(usage: NonNullable<OpenAIChatCompletionResponse['u
       usage.cost_details?.upstream_inference_prompt_cost,
       usage.cost_details?.upstream_inference_completions_cost,
     ),
-  ) ?? 0;
+  );
 }
 
-function sumFiniteNumbers(...values: Array<number | string | undefined>): number | undefined {
+function sumFiniteNumbers(...values: Array<number | string | null | undefined>): number | undefined {
   let total = 0;
   let found = false;
   for (const value of values) {
@@ -905,18 +925,23 @@ function sumFiniteNumbers(...values: Array<number | string | undefined>): number
   return found ? total : undefined;
 }
 
-function readFiniteNumber(...values: Array<number | string | undefined>): number | undefined {
+function readFiniteNumber(...values: Array<number | string | null | undefined>): number | undefined {
   for (const value of values) {
     const parsed = typeof value === 'number'
       ? value
       : typeof value === 'string'
-        ? Number(value)
+        ? Number(normalizeNumericString(value))
         : undefined;
     if (parsed !== undefined && Number.isFinite(parsed)) {
       return parsed;
     }
   }
   return undefined;
+}
+
+function normalizeNumericString(value: string): string {
+  const trimmed = value.trim();
+  return trimmed.startsWith('$') ? trimmed.slice(1) : trimmed;
 }
 
 function normalizeReasoningDetails(value: JsonValue[] | undefined): JsonValue[] | undefined {

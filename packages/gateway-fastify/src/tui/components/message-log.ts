@@ -1,6 +1,6 @@
 import chalk from 'chalk';
-import type { Component } from '@mariozechner/pi-tui';
-import { Markdown, truncateToWidth, visibleWidth, wrapTextWithAnsi } from '@mariozechner/pi-tui';
+import type { Component } from '@earendil-works/pi-tui';
+import { Markdown, truncateToWidth, visibleWidth, wrapTextWithAnsi } from '@earendil-works/pi-tui';
 import type { MessageEntry } from '../types.js';
 import { defaultMarkdownTheme } from '../themes.js';
 

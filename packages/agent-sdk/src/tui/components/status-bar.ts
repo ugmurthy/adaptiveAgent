@@ -19,16 +19,16 @@ export class StatusBar implements Component {
 
     const parts: string[] = [];
 
-    const status = this.state.connected ? chalk.green('[connected]') : chalk.red('[disconnected]');
+    const status = this.state.busy ? chalk.yellow('[running]') : chalk.green('[ready]');
     parts.push(status);
 
-    if (this.state.sessionId && typeof this.state.sessionId === 'string') {
-      const shortId = this.state.sessionId.slice(0, 12);
-      parts.push(`session: ${shortId}`);
-    }
+    parts.push(`${this.state.agentId}`);
+    parts.push(`${this.state.provider ?? 'provider?'}/${this.state.model ?? 'model?'}`);
+    parts.push(`runtime: ${this.state.runtimeMode}`);
+    parts.push(`mode: ${this.state.invocationMode}`);
 
-    if (this.state.runSessionId && typeof this.state.runSessionId === 'string') {
-      const shortId = this.state.runSessionId.slice(0, 12);
+    if (this.state.currentRunId && typeof this.state.currentRunId === 'string') {
+      const shortId = this.state.currentRunId.slice(0, 12);
       parts.push(`run: ${shortId}`);
     }
 

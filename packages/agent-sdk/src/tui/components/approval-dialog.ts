@@ -55,9 +55,6 @@ export class ApprovalDialog implements Component {
 
     lines.push(renderTopBorder(width, { border: chalk.yellow }, `Approval Required${this.approvalInfo.toolName ? `: ${this.approvalInfo.toolName}` : ''}`));
     lines.push(this.frameLine(chalk.dim(`runId: ${this.approvalInfo.runId}`), innerWidth));
-    if (this.approvalInfo.sessionId) {
-      lines.push(this.frameLine(chalk.dim(`sessionId: ${this.approvalInfo.sessionId}`), innerWidth));
-    }
     if (this.approvalInfo.toolName) {
       lines.push(this.frameLine(`tool: ${this.approvalInfo.toolName}`, innerWidth));
     }

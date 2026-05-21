@@ -56,7 +56,7 @@ import {
   ProcessTerminal,
   Editor,
   type OverlayHandle,
-} from '@mariozechner/pi-tui';
+} from '@earendil-works/pi-tui';
 
 const HELP_TEXT = `Commands:
   <text>                     send a chat message with message.send
