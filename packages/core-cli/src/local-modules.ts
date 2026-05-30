@@ -2,6 +2,7 @@ import { access } from 'node:fs/promises';
 import { delimiter } from 'node:path';
 import { homedir } from 'node:os';
 import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   createListDirectoryTool,
@@ -30,6 +31,8 @@ import {
   type ToolDefinition,
 } from '@adaptive-agent/core';
 import { Pool, types } from 'pg';
+
+const DEFAULT_MODULE_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
 
 export const BUILTIN_LOCAL_TOOL_NAMES = [
   'read_file',
@@ -75,6 +78,8 @@ export interface RuntimeBundle {
 }
 
 export async function resolveLocalModules(options: ResolveLocalModulesOptions): Promise<ResolvedLocalModules> {
+  process.env.ADAPTIVE_AGENT_MODULE_ROOT ??= DEFAULT_MODULE_ROOT;
+
   const env = options.env ?? process.env;
   const builtinTools = createBuiltinTools(options.workspaceRoot, env);
   const registeredToolNames = [...builtinTools.keys()].sort();

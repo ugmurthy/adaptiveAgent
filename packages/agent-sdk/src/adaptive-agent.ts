@@ -1,11 +1,12 @@
 #!/usr/bin/env bun
 
 import { access, appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { dirname, extname, resolve } from 'node:path';
 
 import { marked } from 'marked';
 import { markedTerminal } from 'marked-terminal';
 import type {
+  AgentEvent,
   ChatMessage,
   ChatResult,
   ImageInput,
@@ -18,10 +19,14 @@ import type {
 
 import {
   createAgentSdk,
+  createOrchestrationSdk,
   inspectAgentSdkResolution,
   loadAgentSdkConfig,
   type AgentSdkChatOptions,
   type AgentSdkRunOptions,
+  type OrchestratedRunResult,
+  type OrchestrationLifecycleEvent,
+  type OrchestrationSdk,
   type ApprovalMode,
   type ClarificationMode,
   type RuntimeMode,
@@ -36,6 +41,10 @@ export interface ManualTestCliOptions {
   promptFilePath?: string;
   inputJson?: JsonValue;
   imagePaths: string[];
+  audioPaths: string[];
+  fileAttachmentPaths: string[];
+  orchestrate: boolean;
+  agentCatalogPaths: string[];
   evalDataset?: 'cases' | 'gaia';
   evalInputPath?: string;
   evalFilesDir?: string;
@@ -108,6 +117,7 @@ interface ManualTestJsonOutput {
   warnings: string[];
   result: JsonValue;
   inspection?: JsonValue;
+  orchestration?: JsonValue;
 }
 
 export interface BenchmarkCase {
@@ -143,6 +153,11 @@ export interface BenchmarkResultRecord {
   metadata: Record<string, JsonValue>;
 }
 
+type GaiaAttachment =
+  | { kind: 'image'; path: string }
+  | { kind: 'audio'; path: string; format: Extract<ModelContentPart, { type: 'audio' }>['audio']['format'] }
+  | { kind: 'file'; path: string };
+
 const HELP_TEXT = `adaptive-agent
 
 Agent SDK CLI
@@ -174,6 +189,9 @@ Options:
   --file <path>           Read run/chat prompt from a file.
   --input-json <json>     JSON input passed to run requests.
   --image <path>          Add an image attachment to a run request. Repeatable.
+  --audio <path>          Add an audio attachment to a run request. Repeatable.
+  --file-attachment <path>
+                          Add a file attachment to a run request. Repeatable.
   --mode <chat|run>       Override the spec mode.
   --cwd <path>            Working directory used for SDK config lookup.
   --agent <path>          Explicit path to agent.json.
@@ -183,6 +201,8 @@ Options:
   --model <name>          Override model name.
   --approval <mode>       Approval mode: auto, manual, reject.
   --clarification <mode>  Clarification mode: interactive or fail.
+  --orchestrate           Route run requests through the orchestration SDK.
+  --catalog <path>        Agent config path to add to orchestration catalog. Repeatable.
   --progress              Print assistant progress updates as they arrive.
   --events                Print lifecycle events as they arrive.
   --inspect               Print a compact inspection summary after completion.
@@ -263,6 +283,22 @@ async function runSpecCommand(cli: ManualTestCliOptions): Promise<number> {
   const warnings = collectProviderWarnings(spec, resolvedConfig.model.provider);
   const eventLog: Array<Record<string, JsonValue>> = [];
   const lastProgressContentByRun = new Map<string, string>();
+  const eventListener = shouldListenForCliEvents(cli) ? (event: AgentEvent) => {
+    const entry = summarizeEvent(event);
+    eventLog.push(entry);
+    if (cli.events && cli.output === 'pretty') {
+      printEvent(entry);
+    } else if (cli.progress && cli.output === 'pretty') {
+      printProgressEvent(event, lastProgressContentByRun);
+    }
+  } : undefined;
+  const orchestrationListener = shouldListenForCliEvents(cli) ? (event: OrchestrationLifecycleEvent) => {
+    const entry = summarizeOrchestrationLifecycleEvent(event);
+    eventLog.push(entry);
+    if ((cli.events || cli.progress) && cli.output === 'pretty') {
+      printOrchestrationLifecycleEvent(event);
+    }
+  } : undefined;
 
   for (const warning of warnings) {
     if (cli.output === 'pretty') {
@@ -281,21 +317,26 @@ async function runSpecCommand(cli: ManualTestCliOptions): Promise<number> {
 
   const sdk = await createAgentSdk({
     ...sdkOptions,
-    eventListener: shouldListenForCliEvents(cli) ? (event) => {
-      const entry = summarizeEvent(event);
-      eventLog.push(entry);
-      if (cli.events && cli.output === 'pretty') {
-        printEvent(entry);
-      } else if (cli.progress && cli.output === 'pretty') {
-        printProgressEvent(event, lastProgressContentByRun);
-      }
-    } : undefined,
+    eventListener,
   });
+  const orchestrationSdk = cli.orchestrate && spec.mode === 'run'
+    ? await createOrchestrationSdk({
+        ...sdkOptions,
+        requestedAgentConfig: sdk.config.agent,
+        agentCatalogPaths: cli.agentCatalogPaths,
+        runtime: sdk.created.runtime,
+        eventListener,
+        orchestrationListener,
+      })
+    : undefined;
 
   try {
-    const result = spec.mode === 'chat'
+    const orchestrated = orchestrationSdk && spec.mode === 'run'
+      ? await orchestrationSdk.runRaw(spec.goal, buildRunOptions(spec))
+      : undefined;
+    const result = orchestrated?.finalResult ?? (spec.mode === 'chat'
       ? await sdk.chat(spec.messages, buildChatOptions(spec))
-      : await sdk.run(spec.goal, buildRunOptions(spec));
+      : await sdk.run(spec.goal, buildRunOptions(spec)));
 
     const inspection = cli.inspect ? await summarizeInspection(sdk, result.runId) : undefined;
     if (cli.output === 'json') {
@@ -306,11 +347,13 @@ async function runSpecCommand(cli: ManualTestCliOptions): Promise<number> {
         warnings,
         result: summarizeResult(result),
         ...(inspection ? { inspection: inspection as unknown as JsonValue } : {}),
+        ...(orchestrated ? { orchestration: summarizeOrchestration(orchestrated) } : {}),
       };
       console.log(JSON.stringify(jsonOutput, null, 2));
       return isSuccessfulResult(result) ? 0 : 1;
     }
 
+    if (orchestrated) printOrchestration(orchestrated);
     printResult(result);
     if (cli.inspect && inspection) {
       printInspection(inspection);
@@ -320,6 +363,7 @@ async function runSpecCommand(cli: ManualTestCliOptions): Promise<number> {
     }
     return isSuccessfulResult(result) ? 0 : 1;
   } finally {
+    await orchestrationSdk?.close();
     await sdk.close();
   }
 }
@@ -333,6 +377,9 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
         goal,
         ...(cli.inputJson === undefined ? {} : { input: cli.inputJson }),
         ...(cli.imagePaths.length > 0 ? { images: cli.imagePaths.map((path) => ({ path: resolveAssetPath(path, resolvedCwd) })) } : {}),
+        ...(cli.audioPaths.length > 0 || cli.fileAttachmentPaths.length > 0
+          ? { contentParts: buildInlineContentParts(cli, resolvedCwd) }
+          : {}),
       }
     : { mode: 'chat', messages: [{ role: 'user', content: goal }] };
   await validateLocalPaths(spec);
@@ -343,6 +390,22 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
   const warnings = collectProviderWarnings(spec, resolvedConfig.model.provider);
   const eventLog: Array<Record<string, JsonValue>> = [];
   const lastProgressContentByRun = new Map<string, string>();
+  const eventListener = shouldListenForCliEvents(cli) ? (event: AgentEvent) => {
+    const entry = summarizeEvent(event);
+    eventLog.push(entry);
+    if (cli.events && cli.output === 'pretty') {
+      printEvent(entry);
+    } else if (cli.progress && cli.output === 'pretty') {
+      printProgressEvent(event, lastProgressContentByRun);
+    }
+  } : undefined;
+  const orchestrationListener = shouldListenForCliEvents(cli) ? (event: OrchestrationLifecycleEvent) => {
+    const entry = summarizeOrchestrationLifecycleEvent(event);
+    eventLog.push(entry);
+    if ((cli.events || cli.progress) && cli.output === 'pretty') {
+      printOrchestrationLifecycleEvent(event);
+    }
+  } : undefined;
 
   for (const warning of warnings) {
     if (cli.output === 'pretty') console.error(`warning: ${warning}`);
@@ -359,21 +422,26 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
 
   const sdk = await createAgentSdk({
     ...sdkOptions,
-    eventListener: shouldListenForCliEvents(cli) ? (event) => {
-      const entry = summarizeEvent(event);
-      eventLog.push(entry);
-      if (cli.events && cli.output === 'pretty') {
-        printEvent(entry);
-      } else if (cli.progress && cli.output === 'pretty') {
-        printProgressEvent(event, lastProgressContentByRun);
-      }
-    } : undefined,
+    eventListener,
   });
+  const orchestrationSdk = cli.orchestrate && spec.mode === 'run'
+    ? await createOrchestrationSdk({
+        ...sdkOptions,
+        requestedAgentConfig: sdk.config.agent,
+        agentCatalogPaths: cli.agentCatalogPaths,
+        runtime: sdk.created.runtime,
+        eventListener,
+        orchestrationListener,
+      })
+    : undefined;
 
   try {
-    const result = spec.mode === 'chat'
+    const orchestrated = orchestrationSdk && spec.mode === 'run'
+      ? await orchestrationSdk.runRaw(spec.goal, buildRunOptions(spec))
+      : undefined;
+    const result = orchestrated?.finalResult ?? (spec.mode === 'chat'
       ? await sdk.chat(spec.messages, buildChatOptions(spec))
-      : await sdk.run(spec.goal, buildRunOptions(spec));
+      : await sdk.run(spec.goal, buildRunOptions(spec)));
     const inspection = cli.inspect ? await summarizeInspection(sdk, result.runId) : undefined;
 
     if (cli.output === 'json') {
@@ -384,16 +452,19 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
         warnings,
         result: summarizeResult(result),
         ...(inspection ? { inspection: inspection as unknown as JsonValue } : {}),
+        ...(orchestrated ? { orchestration: summarizeOrchestration(orchestrated) } : {}),
       };
       console.log(JSON.stringify(jsonOutput, null, 2));
       return isSuccessfulResult(result) ? 0 : 1;
     }
 
+    if (orchestrated) printOrchestration(orchestrated);
     printResult(result);
     if (cli.inspect && inspection) printInspection(inspection);
     if (cli.events && eventLog.length > 0) console.error(`event log captured: ${eventLog.length}`);
     return isSuccessfulResult(result) ? 0 : 1;
   } finally {
+    await orchestrationSdk?.close();
     await sdk.close();
   }
 }
@@ -451,18 +522,36 @@ async function runEvalCommand(cli: ManualTestCliOptions): Promise<number> {
 
   const eventLog: Array<Record<string, JsonValue>> = [];
   const lastProgressContentByRun = new Map<string, string>();
+  const eventListener = (event: AgentEvent) => {
+    const entry = summarizeEvent(event);
+    eventLog.push(entry);
+    if (cli.events && cli.output === 'pretty') {
+      printEvent(entry);
+    } else if (cli.progress && cli.output === 'pretty') {
+      printProgressEvent(event, lastProgressContentByRun);
+    }
+  };
   const sdk = await createAgentSdk({
     ...sdkOptions,
-    eventListener: (event) => {
-      const entry = summarizeEvent(event);
-      eventLog.push(entry);
-      if (cli.events && cli.output === 'pretty') {
-        printEvent(entry);
-      } else if (cli.progress && cli.output === 'pretty') {
-        printProgressEvent(event, lastProgressContentByRun);
-      }
-    },
+    eventListener,
   });
+  const orchestrationListener = (event: OrchestrationLifecycleEvent) => {
+    const entry = summarizeOrchestrationLifecycleEvent(event);
+    eventLog.push(entry);
+    if ((cli.events || cli.progress) && cli.output === 'pretty') {
+      printOrchestrationLifecycleEvent(event);
+    }
+  };
+  const orchestrationSdk = cli.orchestrate
+    ? await createOrchestrationSdk({
+        ...sdkOptions,
+        requestedAgentConfig: sdk.config.agent,
+        agentCatalogPaths: cli.agentCatalogPaths,
+        runtime: sdk.created.runtime,
+        eventListener,
+        orchestrationListener,
+      })
+    : undefined;
 
   let failed = 0;
   const removeProcessErrorGuard = installEvalProcessErrorGuard();
@@ -475,6 +564,7 @@ async function runEvalCommand(cli: ManualTestCliOptions): Promise<number> {
         outputPath,
         artifactsDir,
         eventLog,
+        orchestrationSdk,
       });
       await appendJsonLine(outputPath, record as unknown as JsonValue);
       if (cli.output === 'json' || cli.output === 'jsonl') {
@@ -489,6 +579,7 @@ async function runEvalCommand(cli: ManualTestCliOptions): Promise<number> {
     }
   } finally {
     removeProcessErrorGuard();
+    await orchestrationSdk?.close();
     await sdk.close();
   }
 
@@ -506,6 +597,10 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
     specPath: '',
     goalArgs: [],
     imagePaths: [],
+    audioPaths: [],
+    fileAttachmentPaths: [],
+    orchestrate: false,
+    agentCatalogPaths: [],
     evalResume: false,
     evalFailFast: false,
     evalOffset: 0,
@@ -596,6 +691,18 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
       case '--image':
         options.imagePaths.push(requireOptionValue(arg, argv[++index]));
         break;
+      case '--audio':
+        options.audioPaths.push(requireOptionValue(arg, argv[++index]));
+        break;
+      case '--file-attachment':
+        options.fileAttachmentPaths.push(requireOptionValue(arg, argv[++index]));
+        break;
+      case '--orchestrate':
+        options.orchestrate = true;
+        break;
+      case '--catalog':
+        options.agentCatalogPaths.push(requireOptionValue(arg, argv[++index]));
+        break;
       case '--mode':
         options.mode = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['chat', 'run']);
         break;
@@ -651,8 +758,20 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
     throw new Error('--image is supported for run requests, not chat requests');
   }
 
+  if (!options.help && options.command === 'chat' && options.audioPaths.length > 0) {
+    throw new Error('--audio is supported for run requests, not chat requests');
+  }
+
+  if (!options.help && options.command === 'chat' && options.fileAttachmentPaths.length > 0) {
+    throw new Error('--file-attachment is supported for run requests, not chat requests');
+  }
+
   if (!options.help && options.command === 'chat' && options.inputJson !== undefined) {
     throw new Error('--input-json is supported for run requests, not chat requests');
+  }
+
+  if (!options.help && options.command === 'chat' && options.orchestrate) {
+    throw new Error('--orchestrate is supported for run requests, not chat requests');
   }
 
   return options;
@@ -728,6 +847,33 @@ function buildRunOptions(spec: ManualRunSpec): AgentSdkRunOptions {
     outputSchema: spec.outputSchema,
     metadata: spec.metadata,
   };
+}
+
+function buildInlineContentParts(cli: ManualTestCliOptions, cwd: string): ModelContentPart[] {
+  return [
+    ...cli.fileAttachmentPaths.map((path) => ({
+      type: 'file' as const,
+      file: { source: { kind: 'path' as const, path: resolveAssetPath(path, cwd) } },
+    })),
+    ...cli.audioPaths.map((path) => ({
+      type: 'audio' as const,
+      audio: { source: { kind: 'path' as const, path: resolveAssetPath(path, cwd) }, format: inferAudioFormat(path) },
+    })),
+  ];
+}
+
+function inferAudioFormat(path: string): Extract<ModelContentPart, { type: 'audio' }>['audio']['format'] {
+  switch (extname(path).toLowerCase()) {
+    case '.wav': return 'wav';
+    case '.mp3': return 'mp3';
+    case '.flac': return 'flac';
+    case '.m4a': return 'm4a';
+    case '.ogg': return 'ogg';
+    case '.aac': return 'aac';
+    case '.aiff':
+    case '.aif': return 'aiff';
+    default: return 'mp3';
+  }
 }
 
 async function readSpecJson(specPath: string): Promise<JsonObject> {
@@ -1064,6 +1210,9 @@ function parseGaiaBenchmarkCase(value: unknown, baseDir: string, split: string |
     ...(level ? { level } : {}),
     question,
     ...(attachment?.kind === 'image' ? { images: [{ path: attachment.path, name: fileName }] } : {}),
+    ...(attachment?.kind === 'audio'
+      ? { contentParts: [{ type: 'audio' as const, audio: { source: { kind: 'path' as const, path: attachment.path }, format: attachment.format, name: fileName } }] }
+      : {}),
     ...(attachment?.kind === 'file' ? { contentParts: [{ type: 'file', file: { source: { kind: 'path', path: attachment.path }, name: fileName } }] } : {}),
     ...(expectedAnswer ? { expectedAnswer } : {}),
     metadata: {
@@ -1081,12 +1230,29 @@ function readOptionalString(value: unknown, label: string): string | undefined {
   return value;
 }
 
-function gaiaAttachmentForFile(path: string, name: string): { kind: 'image' | 'file'; path: string } {
-  return isImageFileName(name) ? { kind: 'image', path } : { kind: 'file', path };
+function gaiaAttachmentForFile(path: string, name: string): GaiaAttachment {
+  if (isImageFileName(name)) return { kind: 'image', path };
+  const audioFormat = inferAudioFormatFromFileName(name);
+  if (audioFormat) return { kind: 'audio', path, format: audioFormat };
+  return { kind: 'file', path };
 }
 
 function isImageFileName(name: string): boolean {
   return /\.(png|jpe?g|gif|webp|bmp|tiff?)$/i.test(name);
+}
+
+function inferAudioFormatFromFileName(name: string): Extract<ModelContentPart, { type: 'audio' }>['audio']['format'] | undefined {
+  switch (extname(name).toLowerCase()) {
+    case '.wav': return 'wav';
+    case '.mp3': return 'mp3';
+    case '.flac': return 'flac';
+    case '.m4a': return 'm4a';
+    case '.ogg': return 'ogg';
+    case '.aac': return 'aac';
+    case '.aiff':
+    case '.aif': return 'aiff';
+    default: return undefined;
+  }
 }
 
 function parseBenchmarkJsonLines(content: string): unknown[] {
@@ -1166,6 +1332,7 @@ async function runBenchmarkCase(options: {
   outputPath: string;
   artifactsDir?: string;
   eventLog: Array<Record<string, JsonValue>>;
+  orchestrationSdk?: OrchestrationSdk;
 }): Promise<BenchmarkResultRecord> {
   const startedAt = new Date();
   const eventStartIndex = options.eventLog.length;
@@ -1183,7 +1350,10 @@ async function runBenchmarkCase(options: {
   });
 
   try {
-    const result = await options.sdk.run(options.benchmarkCase.question, runOptions);
+    const orchestrated = options.orchestrationSdk
+      ? await options.orchestrationSdk.runRaw(options.benchmarkCase.question, runOptions)
+      : undefined;
+    const result = orchestrated?.finalResult ?? await options.sdk.run(options.benchmarkCase.question, runOptions);
     const finishedAt = new Date();
     const artifacts = await writeBenchmarkArtifacts(options, result, eventStartIndex);
     return {
@@ -1360,6 +1530,10 @@ function summarizeCli(cli: ManualTestCliOptions): Record<string, JsonValue> {
     ...(cli.specPath ? { specPath: resolve(cli.specPath) } : {}),
     ...(cli.promptFilePath ? { promptFilePath: resolve(cli.promptFilePath) } : {}),
     ...(cli.imagePaths.length > 0 ? { imagePaths: cli.imagePaths.map((path) => resolve(path)) } : {}),
+    ...(cli.audioPaths.length > 0 ? { audioPaths: cli.audioPaths.map((path) => resolve(path)) } : {}),
+    ...(cli.fileAttachmentPaths.length > 0 ? { fileAttachmentPaths: cli.fileAttachmentPaths.map((path) => resolve(path)) } : {}),
+    orchestrate: cli.orchestrate,
+    ...(cli.agentCatalogPaths.length > 0 ? { agentCatalogPaths: cli.agentCatalogPaths.map((path) => resolve(path)) } : {}),
     ...(cli.evalDataset ? { evalDataset: cli.evalDataset } : {}),
     ...(cli.evalInputPath ? { evalInputPath: resolve(cli.evalInputPath) } : {}),
     ...(cli.evalFilesDir ? { evalFilesDir: resolve(cli.evalFilesDir) } : {}),
@@ -1447,6 +1621,26 @@ function summarizeResult(result: RunResult | ChatResult): JsonValue {
   };
 }
 
+function summarizeOrchestration(result: OrchestratedRunResult): JsonValue {
+  return {
+    sessionId: result.sessionId,
+    requestedAgentId: result.requestedAgentId,
+    detectedModalities: result.detectedModalities,
+    executionShape: result.executionShape,
+    routingReason: result.plan.routingReason,
+    routingDiagnostics: result.plan.routingDiagnostics as unknown as JsonValue,
+    finalNodeId: result.plan.finalNodeId,
+    stages: result.stages.map((stage) => ({
+      nodeId: stage.nodeId,
+      stage: stage.stage,
+      agentId: stage.agentId,
+      runId: stage.runId,
+      rootRunId: stage.rootRunId,
+      status: stage.result.status,
+    })),
+  };
+}
+
 async function summarizeInspection(sdk: Awaited<ReturnType<typeof createAgentSdk>>, runId: string): Promise<InspectionSummary> {
   const inspection = await sdk.inspect(runId);
   const eventTypes = inspection.events.reduce<Record<string, number>>((counts, event) => {
@@ -1476,6 +1670,23 @@ function summarizeEvent(event: { type: string; runId: string; stepId?: string; t
     ...(event.toolCallId ? { toolCallId: event.toolCallId } : {}),
     createdAt: event.createdAt,
     payload: summarizeEventPayload(event.payload),
+  };
+}
+
+function summarizeOrchestrationLifecycleEvent(event: OrchestrationLifecycleEvent): Record<string, JsonValue> {
+  return {
+    type: event.type,
+    sessionId: event.sessionId,
+    requestedAgentId: event.requestedAgentId,
+    createdAt: event.createdAt,
+    ...('executionShape' in event ? { executionShape: event.executionShape } : {}),
+    ...('detectedModalities' in event ? { detectedModalities: event.detectedModalities } : {}),
+    ...('routingReason' in event ? { routingReason: event.routingReason } : {}),
+    ...('nodes' in event ? { nodes: event.nodes as unknown as JsonValue } : {}),
+    ...('nodeId' in event ? { nodeId: event.nodeId, agentId: event.agentId, stage: event.stage } : {}),
+    ...('runId' in event ? { runId: event.runId, rootRunId: event.rootRunId } : {}),
+    ...('finalRunId' in event ? { finalRunId: event.finalRunId } : {}),
+    ...('status' in event ? { status: event.status } : {}),
   };
 }
 
@@ -1678,6 +1889,16 @@ function printEvent(event: Record<string, JsonValue>): void {
   console.error(parts.join(' '));
 }
 
+function printOrchestrationLifecycleEvent(event: OrchestrationLifecycleEvent): void {
+  const parts = [`[event] ${event.type}`, `session=${event.sessionId}`];
+  if ('nodeId' in event) parts.push(`node=${event.nodeId}`, `agent=${event.agentId}`, `stage=${event.stage}`);
+  if ('runId' in event) parts.push(`run=${event.runId}`);
+  if ('finalRunId' in event) parts.push(`run=${event.finalRunId}`);
+  if ('status' in event) parts.push(`status=${event.status}`);
+  if ('executionShape' in event) parts.push(`shape=${event.executionShape}`);
+  console.error(parts.join(' '));
+}
+
 function printResult(result: RunResult | ChatResult): void {
   console.log(`status: ${result.status}`);
   console.log(`runId: ${result.runId}`);
@@ -1701,6 +1922,13 @@ function printResult(result: RunResult | ChatResult): void {
   if ('toolName' in result) {
     console.log(`tool: ${result.toolName}`);
   }
+}
+
+function printOrchestration(result: OrchestratedRunResult): void {
+  console.log(`orchestration: session=${result.sessionId} shape=${result.executionShape}`);
+  console.log(`routing: ${result.plan.routingReason}`);
+  console.log(`stages: ${result.stages.map((stage) => `${stage.nodeId}:${stage.agentId}:${stage.runId}`).join(', ') || '(none)'}`);
+  console.log('');
 }
 
 function printUsage(usage: { promptTokens: number; completionTokens: number; reasoningTokens?: number; totalTokens?: number; estimatedCostUSD: number; provider?: string; model?: string }): void {

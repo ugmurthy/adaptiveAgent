@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, writeFile, mkdir, rm, readFile } from 'node:fs/promises';
+import { mkdtemp, writeFile, mkdir, rm, readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import JSZip from 'jszip';
 
 import type { ToolContext } from '../types.js';
 import { createReadFileTool } from './read-file.js';
@@ -114,6 +115,17 @@ describe('createReadFileTool', () => {
     ).rejects.toThrow('exceeds maximum size');
   });
 
+  it('allows files larger than 1 MiB with the default max size', async () => {
+    const tool = createReadFileTool({ allowedRoot: tempDir });
+    const largeContent = 'a'.repeat(2 * 1_048_576);
+    await writeFile(join(tempDir, 'large.txt'), largeContent);
+
+    const result = (await tool.execute({ path: 'large.txt' } as any, stubToolContext())) as any;
+
+    expect(result.sizeBytes).toBe(2 * 1_048_576);
+    expect(result.content).toHaveLength(2 * 1_048_576);
+  });
+
   it('throws when file does not exist', async () => {
     const tool = createReadFileTool({ allowedRoot: tempDir });
 
@@ -152,6 +164,148 @@ describe('createReadFileTool', () => {
       'xlsx',
       expect.any(AbortSignal),
     );
+  });
+
+  it('extracts bounded Parquet summaries', async () => {
+    const extractParquet = vi.fn().mockResolvedValue('{"format":"parquet","rowCount":2}');
+    const tool = createReadFileTool({
+      allowedRoot: tempDir,
+      parquetMaxRows: 2,
+      parquetMaxCellLength: 10,
+      extractParquet,
+    });
+    await writeFile(join(tempDir, 'sample.parquet'), new Uint8Array([0x50, 0x41, 0x52, 0x31]));
+
+    const result = (await tool.execute({ path: 'sample.parquet' } as any, stubToolContext())) as any;
+
+    expect(result.content).toContain('"format":"parquet"');
+    expect(extractParquet).toHaveBeenCalledWith(
+      join(tempDir, 'sample.parquet'),
+      { maxRows: 2, maxCellLength: 10 },
+      expect.any(AbortSignal),
+    );
+  });
+
+  it('returns a bounded manifest for ZIP archives', async () => {
+    const zip = new JSZip();
+    zip.file('README.md', 'Archive readme');
+    zip.file('images/logo.png', new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x00]));
+    zip.file('src/index.ts', 'export const value = 1;');
+    await writeFile(join(tempDir, 'archive.zip'), Buffer.from(await zip.generateAsync({ type: 'uint8array' })));
+
+    const tool = createReadFileTool({ allowedRoot: tempDir, zipMaxEntries: 2 });
+    const result = (await tool.execute({ path: 'archive.zip' } as any, stubToolContext())) as any;
+    const manifest = JSON.parse(result.content);
+
+    expect(manifest).toMatchObject({
+      format: 'zip',
+      path: join(tempDir, 'archive.zip'),
+      entryCount: 3,
+      truncated: true,
+    });
+    expect(manifest.entries).toHaveLength(2);
+    expect(manifest.entries[0]).toHaveProperty('readHint');
+    expect(manifest.entries.map((entry: any) => entry.path)).toContain('README.md');
+  });
+
+  it('reads a text member from a ZIP archive', async () => {
+    const zip = new JSZip();
+    zip.file('docs/note.txt', 'Text from inside the archive');
+    await writeFile(join(tempDir, 'archive.zip'), Buffer.from(await zip.generateAsync({ type: 'uint8array' })));
+
+    const tool = createReadFileTool({ allowedRoot: tempDir });
+    const result = (await tool.execute({ path: 'archive.zip#docs/note.txt' } as any, stubToolContext())) as any;
+
+    expect(result.path).toBe(`${join(tempDir, 'archive.zip')}#docs/note.txt`);
+    expect(result.content).toBe('Text from inside the archive');
+  });
+
+  it('extracts PDF members from ZIP archives', async () => {
+    const extractPdfText = vi.fn().mockResolvedValue({ title: '', text: 'PDF text from archive' });
+    const zip = new JSZip();
+    zip.file('docs/sample.pdf', new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d]));
+    await writeFile(join(tempDir, 'archive.zip'), Buffer.from(await zip.generateAsync({ type: 'uint8array' })));
+
+    const tool = createReadFileTool({ allowedRoot: tempDir, extractPdfText });
+    const result = (await tool.execute({ path: 'archive.zip#docs/sample.pdf' } as any, stubToolContext())) as any;
+
+    expect(result.content).toBe('PDF text from archive');
+    expect(extractPdfText).toHaveBeenCalled();
+  });
+
+  it('extracts pandoc-supported members from ZIP archives', async () => {
+    const extractWithPandoc = vi.fn().mockResolvedValue('# Converted document');
+    const zip = new JSZip();
+    zip.file('docs/report.docx', new Uint8Array([0x50, 0x4b, 0x03, 0x04]));
+    await writeFile(join(tempDir, 'archive.zip'), Buffer.from(await zip.generateAsync({ type: 'uint8array' })));
+
+    const tool = createReadFileTool({ allowedRoot: tempDir, extractWithPandoc });
+    const result = (await tool.execute({ path: 'archive.zip#docs/report.docx' } as any, stubToolContext())) as any;
+
+    expect(result.content).toBe('# Converted document');
+    expect(extractWithPandoc).toHaveBeenCalledWith(
+      expect.stringMatching(/report\.docx$/),
+      'docx',
+      expect.any(AbortSignal),
+    );
+  });
+
+  it('keeps temporary ZIP document members until pandoc extraction finishes', async () => {
+    const extractWithPandoc = vi.fn(async (filePath: string) => {
+      await stat(filePath);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await stat(filePath);
+      return '| applicant | qualifications |';
+    });
+    const zip = new JSZip();
+    zip.file('Applicants.xlsx', new Uint8Array([0x50, 0x4b, 0x03, 0x04]));
+    await writeFile(join(tempDir, 'archive.zip'), Buffer.from(await zip.generateAsync({ type: 'uint8array' })));
+
+    const tool = createReadFileTool({ allowedRoot: tempDir, extractWithPandoc });
+    const result = (await tool.execute({ path: 'archive.zip#Applicants.xlsx' } as any, stubToolContext())) as any;
+
+    expect(result.content).toBe('| applicant | qualifications |');
+    expect(extractWithPandoc).toHaveBeenCalledWith(
+      expect.stringMatching(/Applicants\.xlsx$/),
+      'xlsx',
+      expect.any(AbortSignal),
+    );
+  });
+
+  it('rejects binary members from ZIP archives', async () => {
+    const zip = new JSZip();
+    zip.file('image.png', new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x00]));
+    await writeFile(join(tempDir, 'archive.zip'), Buffer.from(await zip.generateAsync({ type: 'uint8array' })));
+
+    const tool = createReadFileTool({ allowedRoot: tempDir });
+
+    await expect(
+      tool.execute({ path: 'archive.zip#image.png' } as any, stubToolContext()),
+    ).rejects.toThrow('Unsupported binary file format for read_file');
+  });
+
+  it('rejects unsafe ZIP member paths', async () => {
+    const zip = new JSZip();
+    zip.file('safe.txt', 'safe');
+    await writeFile(join(tempDir, 'archive.zip'), Buffer.from(await zip.generateAsync({ type: 'uint8array' })));
+
+    const tool = createReadFileTool({ allowedRoot: tempDir });
+
+    await expect(
+      tool.execute({ path: 'archive.zip#../escape.txt' } as any, stubToolContext()),
+    ).rejects.toThrow('Unsafe ZIP entry path');
+  });
+
+  it('rejects ZIP members exceeding the entry size limit', async () => {
+    const zip = new JSZip();
+    zip.file('large.txt', 'abcdef');
+    await writeFile(join(tempDir, 'archive.zip'), Buffer.from(await zip.generateAsync({ type: 'uint8array' })));
+
+    const tool = createReadFileTool({ allowedRoot: tempDir, zipMaxEntrySizeBytes: 5 });
+
+    await expect(
+      tool.execute({ path: 'archive.zip#large.txt' } as any, stubToolContext()),
+    ).rejects.toThrow('exceeds maximum size');
   });
 
   it('rejects unsupported binary formats', async () => {
@@ -759,6 +913,44 @@ describe('createWebSearchTool', () => {
     });
   });
 
+  it('applies structured search hints and deduplicates canonical URLs', async () => {
+    const tool = createWebSearchTool({ apiKey: 'key' });
+
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          web: {
+            results: [
+              { title: 'A', url: 'https://Example.com/page?utm_source=x', description: 'a' },
+              { title: 'A copy', url: 'https://example.com/page', description: 'a copy' },
+              { title: 'B', url: 'https://b.com/page', description: 'b' },
+            ],
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    const result = (await tool.execute(
+      {
+        query: 'test',
+        exactPhrases: ['quoted fact'],
+        domainHints: ['https://www.example.org/path'],
+        excludeDomains: ['spam.example'],
+        answerType: 'date',
+      } as any,
+      stubToolContext(),
+    )) as any;
+
+    expect(result.results).toHaveLength(2);
+    expect(result.results[0].url).toBe('https://example.com/page');
+    expect(result.answerType).toBe('date');
+    expect(tool.summarizeResult?.(result)).toMatchObject({ deduplicatedResults: 1 });
+
+    const [url] = fetchSpy.mock.calls[0];
+    expect(url).toContain('q=test+%22quoted+fact%22+site%3Aexample.org+-site%3Aspam.example');
+  });
+
   it('has correct tool metadata', () => {
     const tool = createWebSearchTool({ apiKey: 'key' });
     expect(tool.name).toBe('web_search');
@@ -852,6 +1044,24 @@ describe('createReadWebPageTool', () => {
     )) as any;
 
     expect(result.text).toContain('Tom & Jerry <3>');
+  });
+
+  it('returns objective-relevant excerpts when requested', async () => {
+    const tool = createReadWebPageTool();
+
+    fetchSpy.mockResolvedValueOnce(
+      new Response('<html><body><p>Noise paragraph.</p><p>The Apollo 11 landing date was July 20, 1969.</p></body></html>', {
+        status: 200,
+        headers: { 'Content-Type': 'text/html' },
+      }),
+    );
+
+    const result = (await tool.execute(
+      { url: 'https://example.com', objective: 'Apollo 11 landing date' } as any,
+      stubToolContext(),
+    )) as any;
+
+    expect(result.relevantExcerpts).toEqual(['The Apollo 11 landing date was July 20, 1969.']);
   });
 
   it('extracts text from PDFs', async () => {

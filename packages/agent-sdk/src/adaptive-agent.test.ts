@@ -144,6 +144,10 @@ describe('adaptive-agent cli parsing', () => {
       specPath: './tmp/spec.json',
       goalArgs: [],
       imagePaths: [],
+      audioPaths: [],
+      fileAttachmentPaths: [],
+      orchestrate: false,
+      agentCatalogPaths: [],
       evalResume: false,
       evalFailFast: false,
       evalOffset: 0,
@@ -166,6 +170,10 @@ describe('adaptive-agent cli parsing', () => {
     const parsed = parseCliArgs([
       'run',
       '--image', './chart.png',
+      '--audio', './call.mp3',
+      '--file-attachment', './notes.pdf',
+      '--orchestrate',
+      '--catalog', './vision-agent.json',
       '--input-json', '{"level":2}',
       'answer',
       'this',
@@ -176,6 +184,10 @@ describe('adaptive-agent cli parsing', () => {
       specPath: '',
       goalArgs: ['answer', 'this'],
       imagePaths: ['./chart.png'],
+      audioPaths: ['./call.mp3'],
+      fileAttachmentPaths: ['./notes.pdf'],
+      orchestrate: true,
+      agentCatalogPaths: ['./vision-agent.json'],
       inputJson: { level: 2 },
       progress: false,
       events: false,
@@ -244,6 +256,7 @@ describe('adaptive-agent benchmark cases', () => {
     tempDir = await mkdtemp(join(tmpdir(), 'adaptive-agent-bench-'));
     await mkdir(join(tempDir, 'fixtures'));
     await writeFile(join(tempDir, 'fixtures', 'image.png'), 'image');
+    await writeFile(join(tempDir, 'fixtures', 'audio.mp3'), 'audio');
   });
 
   afterEach(async () => {
@@ -297,6 +310,27 @@ describe('adaptive-agent benchmark cases', () => {
       images: [{ path: join(tempDir, 'fixtures', 'image.png'), name: 'image.png' }],
       expectedAnswer: 'coin',
       metadata: { source: 'gaia', fileName: 'image.png', level: '1', split: 'validation' },
+    }]);
+  });
+
+  it('normalizes GAIA audio attachments as audio content parts', async () => {
+    const inputPath = join(tempDir, 'gaia-audio.jsonl');
+    await writeFile(inputPath, JSON.stringify({
+      task_id: 'gaia-audio-1',
+      Question: 'What is said in the audio?',
+      file_name: 'audio.mp3',
+      'Final answer': 'hello',
+    }));
+
+    const cases = await loadGaiaBenchmarkCases(inputPath, tempDir, 'fixtures', 'validation');
+    expect(cases).toEqual([{
+      id: 'gaia-audio-1',
+      dataset: 'gaia',
+      split: 'validation',
+      question: 'What is said in the audio?',
+      contentParts: [{ type: 'audio', audio: { source: { kind: 'path', path: join(tempDir, 'fixtures', 'audio.mp3') }, format: 'mp3', name: 'audio.mp3' } }],
+      expectedAnswer: 'hello',
+      metadata: { source: 'gaia', fileName: 'audio.mp3', split: 'validation' },
     }]);
   });
 });

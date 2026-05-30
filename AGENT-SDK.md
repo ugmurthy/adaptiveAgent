@@ -161,8 +161,9 @@ export interface AgentConfigFile {
       | 'light'
       | 'standard'
       | 'deep'
+      | 'gaia'
       | {
-          mode: 'none' | 'light' | 'standard' | 'deep';
+          mode: 'none' | 'light' | 'standard' | 'deep' | 'gaia';
           maxSearches?: number;
           maxPagesRead?: number;
           checkpointAfter?: number;

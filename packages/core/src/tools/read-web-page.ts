@@ -14,12 +14,15 @@ export interface ReadWebPageToolConfig {
 
 type ReadWebPageInput = {
   url: string;
+  objective?: string;
+  maxTextLength?: number;
 };
 
 type ReadWebPageOutput = {
   url: string;
   title: string;
   text: string;
+  relevantExcerpts?: string[];
   bytesFetched: number;
   error?: {
     kind: 'http_error' | 'network_error' | 'content_error' | 'timeout';
@@ -61,12 +64,20 @@ export function createReadWebPageTool(config?: ReadWebPageToolConfig): ToolDefin
       additionalProperties: false,
       properties: {
         url: { type: 'string', description: 'The URL of the web page to read.' },
+        objective: {
+          type: 'string',
+          description: 'Specific fact or question to extract relevant excerpts for.',
+        },
+        maxTextLength: {
+          type: 'number',
+          description: 'Optional per-call maximum extracted text length.',
+        },
       },
     },
     async execute(rawInput, context) {
       // Some models send tool input as a JSON string instead of an object — normalise.
       const input = typeof rawInput === 'string' ? JSON.parse(rawInput) : rawInput;
-      const { url } = input as unknown as ReadWebPageInput;
+      const { url, objective, maxTextLength: perCallMaxTextLength } = input as unknown as ReadWebPageInput;
 
       try {
         const response = await fetch(url, {
@@ -106,16 +117,19 @@ export function createReadWebPageTool(config?: ReadWebPageToolConfig): ToolDefin
 
         const rawBuffer = await readResponseBodyWithinLimit(response, maxSizeBytes, url);
         const { title, text } = await extractReadableText(rawBuffer, contentType, extractPdfText);
+        const relevantExcerpts = objective ? extractRelevantExcerpts(text, objective) : undefined;
         let normalizedText = text;
+        const effectiveMaxTextLength = perCallMaxTextLength ?? maxTextLength;
 
-        if (normalizedText.length > maxTextLength) {
-          normalizedText = normalizedText.slice(0, maxTextLength) + '\n[truncated]';
+        if (normalizedText.length > effectiveMaxTextLength) {
+          normalizedText = normalizedText.slice(0, effectiveMaxTextLength) + '\n[truncated]';
         }
 
         return {
           url,
           title,
           text: normalizedText,
+          ...(relevantExcerpts === undefined ? {} : { relevantExcerpts }),
           bytesFetched: rawBuffer.byteLength,
         } satisfies ReadWebPageOutput;
       } catch (error) {
@@ -244,6 +258,40 @@ function stripHtmlToText(html: string): string {
     .join('\n');
 
   return text.trim();
+}
+
+function extractRelevantExcerpts(text: string, objective: string): string[] {
+  const terms = tokenizeObjective(objective);
+  if (terms.length === 0) {
+    return [];
+  }
+
+  return text
+    .split(/\n+/)
+    .map((paragraph) => paragraph.trim())
+    .filter((paragraph) => paragraph.length > 0)
+    .map((paragraph, index) => ({ paragraph, index, score: scoreExcerpt(paragraph, terms) }))
+    .filter((candidate) => candidate.score > 0)
+    .sort((a, b) => b.score - a.score || a.index - b.index)
+    .slice(0, 5)
+    .map((candidate) => candidate.paragraph.length > 1_000 ? `${candidate.paragraph.slice(0, 1_000)}[truncated]` : candidate.paragraph);
+}
+
+function tokenizeObjective(objective: string): string[] {
+  const stopWords = new Set(['the', 'and', 'for', 'with', 'that', 'this', 'from', 'what', 'when', 'where', 'which', 'who', 'how', 'was', 'were', 'are', 'is', 'in', 'on', 'of', 'to', 'a', 'an']);
+  return Array.from(new Set(objective.toLowerCase().match(/[a-z0-9]+/g) ?? []))
+    .filter((term) => term.length > 2 && !stopWords.has(term));
+}
+
+function scoreExcerpt(paragraph: string, terms: string[]): number {
+  const lower = paragraph.toLowerCase();
+  let score = 0;
+  for (const term of terms) {
+    if (lower.includes(term)) {
+      score += term.length > 5 ? 2 : 1;
+    }
+  }
+  return score;
 }
 
 function decodeHtmlEntities(text: string): string {

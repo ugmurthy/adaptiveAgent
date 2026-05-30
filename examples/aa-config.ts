@@ -243,7 +243,7 @@ export async function resolveAaConfig(options: { configPath?: string } = {}): Pr
     readEnum(agent?.capture, CAPTURE_MODES, 'agent.capture', loadedConfig.path) ?? (verbose ? 'full' : 'summary');
   const researchPolicy = readEnum(
     agent?.researchPolicy,
-    ['none', 'light', 'standard', 'deep'] as const,
+    ['none', 'light', 'standard', 'deep', 'gaia'] as const,
     'agent.researchPolicy',
     loadedConfig.path,
   );

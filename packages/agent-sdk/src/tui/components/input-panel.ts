@@ -75,6 +75,17 @@ export class InputPanel implements Component {
       `model ${this.state.provider ?? 'provider?'}/${this.state.model ?? 'model?'}`,
     ];
 
+    if (this.state.currentRunUsage) {
+      parts.push(formatUsage(this.state.currentRunUsage.promptTokens, this.state.currentRunUsage.completionTokens));
+    }
+
+    const durationMs = this.state.currentRunStartedAt
+      ? Date.now() - this.state.currentRunStartedAt.getTime()
+      : this.state.currentRunDurationMs;
+    if (durationMs !== undefined) {
+      parts.push(`duration ${formatElapsed(durationMs)}`);
+    }
+
     return parts.join(chalk.dim(' | '));
   }
 
@@ -95,6 +106,15 @@ export class InputPanel implements Component {
 
     return parts.join(chalk.dim(' | '));
   }
+}
+
+function formatUsage(inputTokens: number, outputTokens: number): string {
+  return `tokens ↑${formatCount(inputTokens)} ↓${formatCount(outputTokens)}`;
+}
+
+function formatCount(value: number): string {
+  if (!Number.isFinite(value)) return '0';
+  return Math.max(0, Math.trunc(value)).toLocaleString('en-US');
 }
 
 function formatElapsed(ms: number): string {

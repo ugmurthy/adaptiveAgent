@@ -7,7 +7,7 @@ import type { AgentDefaults, JsonObject, JsonValue, ModelAdapterConfig } from '@
 export const INVOCATION_MODES = ['chat', 'run'] as const;
 export const MODEL_PROVIDERS = ['openrouter', 'ollama', 'mistral', 'mesh'] as const;
 export const CAPTURE_MODES = ['full', 'summary', 'none'] as const;
-export const RESEARCH_POLICIES = ['none', 'light', 'standard', 'deep'] as const;
+export const RESEARCH_POLICIES = ['none', 'light', 'standard', 'deep', 'gaia'] as const;
 export const TOOL_BUDGET_EXHAUSTED_ACTIONS = ['fail', 'continue_with_warning', 'ask_model'] as const;
 
 export type InvocationMode = (typeof INVOCATION_MODES)[number];

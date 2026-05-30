@@ -11,6 +11,14 @@ describe('tool budget policy', () => {
       checkpointAfter: 3,
       requirePurpose: true,
     });
+
+    expect(resolveResearchPolicy('gaia')).toEqual({
+      mode: 'gaia',
+      maxSearches: 6,
+      maxPagesRead: 12,
+      checkpointAfter: 3,
+      requirePurpose: true,
+    });
   });
 
   it('lets explicit tool budgets override preset-derived budgets', () => {

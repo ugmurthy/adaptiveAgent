@@ -5,7 +5,17 @@
     "destination": "file",
     "filePath": "./logs/adaptive-agent.log",
     "pretty": true
+  },
+{
+  "tui": {
+    "messages": {
+      "orchestration": {
+        "prefix": "magenta",
+        "body": "magenta"
+      }
+    }
   }
+}
 }
 
 

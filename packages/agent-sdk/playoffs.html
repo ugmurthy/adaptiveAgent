@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IPL 2026 Playoffs - Sports Bulletin | May 26, 2026</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Georgia', serif;
+            background-color: #f5f5f5;
+            color: #333;
+            line-height: 1.6;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            box-shadow: 0 0 20px rgba(0,0,0,0.1);
+        }
+        
+        /* Header Styles */
+        header {
+            background: linear-gradient(135deg, #1a237e 0%, #3949ab 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+            border-bottom: 5px solid #ff6f00;
+        }
+        
+        .newspaper-name {
+            font-size: 14px;
+            letter-spacing: 3px;
+            text-transform: uppercase;
+            opacity: 0.9;
+            margin-bottom: 10px;
+        }
+        
+        h1 {
+            font-size: 48px;
+            font-weight: bold;
+            margin: 15px 0;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+        
+        .date-line {
+            font-size: 18px;
+            font-style: italic;
+            opacity: 0.9;
+            margin-top: 10px;
+        }
+        
+        .tagline {
+            font-size: 20px;
+            font-weight: 300;
+            margin-top: 15px;
+            color: #ffcc80;
+        }
+        
+        /* Main Content */
+        .main-content {
+            padding: 40px;
+        }
+        
+        .intro-section {
+            border-left: 4px solid #ff6f00;
+            padding-left: 20px;
+            margin-bottom: 40px;
+            font-size: 18px;
+            line-height: 1.8;
+        }
+        
+        .intro-section p {
+            margin-bottom: 15px;
+        }
+        
+        /* Section Headers */
+        h2 {
+            color: #1a237e;
+            font-size: 32px;
+            margin: 40px 0 20px 0;
+            padding-bottom: 10px;
+            border-bottom: 3px solid #ff6f00;
+        }
+        
+        h3 {
+            color: #3949ab;
+            font-size: 24px;
+            margin: 25px 0 15px 0;
+        }
+        
+        /* Teams Grid */
+        .teams-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+            margin: 30px 0;
+        }
+        
+        .team-card {
+            background: linear-gradient(135deg, #f5f5f5 0%, #e3f2fd 100%);
+            border-radius: 10px;
+            padding: 25px;
+            border-left: 5px solid #1a237e;
+            box-shadow: 0 3px 10px rgba(0,0,0,0.1);
+        }
+        
+        .team-card:nth-child(1) { border-left-color: #d32f2f; }
+        .team-card:nth-child(2) { border-left-color: #fbc02d; }
+        .team-card:nth-child(3) { border-left-color: #0288d1; }
+        .team-card:nth-child(4) { border-left-color: #c2185b; }
+        
+        .team-name {
+            font-size: 22px;
+            font-weight: bold;
+            margin-bottom: 10px;
+            color: #1a237e;
+        }
+        
+        .team-stats {
+            font-size: 14px;
+            color: #666;
+            margin: 5px 0;
+        }
+        
+        .position-badge {
+            display: inline-block;
+            background: #ff6f00;
+            color: white;
+            padding: 3px 12px;
+            border-radius: 15px;
+            font-size: 12px;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+        
+        /* Table Styles */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 25px 0;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        
+        th {
+            background: linear-gradient(135deg, #1a237e 0%, #3949ab 100%);
+            color: white;
+            padding: 15px;
+            text-align: left;
+            font-weight: bold;
+        }
+        
+        td {
+            padding: 12px 15px;
+            border-bottom: 1px solid #ddd;
+        }
+        
+        tr:hover {
+            background-color: #f5f5f5;
+        }
+        
+        tr:nth-child(even) {
+            background-color: #fafafa;
+        }
+        
+        /* Player Stats */
+        .stats-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 30px;
+            margin: 30px 0;
+        }
+        
+        .stats-box {
+            background: #fff;
+            border: 2px solid #e0e0e0;
+            border-radius: 10px;
+            padding: 25px;
+        }
+        
+        .stats-box h4 {
+            color: #1a237e;
+            font-size: 20px;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #ff6f00;
+        }
+        
+        .player-entry {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px dashed #ddd;
+        }
+        
+        .player-entry:last-child {
+            border-bottom: none;
+        }
+        
+        .player-name {
+            font-weight: bold;
+            color: #333;
+        }
+        
+        .player-stat {
+            color: #ff6f00;
+            font-weight: bold;
+        }
+        
+        /* Expert Opinions */
+        .expert-quote {
+            background: linear-gradient(135deg, #e8eaf6 0%, #c5cae9 100%);
+            border-left: 5px solid #3949ab;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 5px;
+        }
+        
+        .expert-quote blockquote {
+            font-style: italic;
+            font-size: 17px;
+            color: #1a237e;
+            margin-bottom: 10px;
+        }
+        
+        .expert-quote cite {
+            font-weight: bold;
+            color: #666;
+            font-style: normal;
+        }
+        
+        /* Key Storylines */
+        .storylines-list {
+            list-style: none;
+            counter-reset: storyline-counter;
+        }
+        
+        .storylines-list li {
+            position: relative;
+            padding-left: 50px;
+            margin-bottom: 20px;
+        }
+        
+        .storylines-list li::before {
+            counter-increment: storyline-counter;
+            content: counter(storyline-counter);
+            position: absolute;
+            left: 0;
+            top: 0;
+            background: #ff6f00;
+            color: white;
+            width: 35px;
+            height: 35px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 16px;
+        }
+        
+        .storyline-title {
+            font-weight: bold;
+            color: #1a237e;
+            font-size: 18px;
+            margin-bottom: 5px;
+        }
+        
+        /* Footer */
+        footer {
+            background: #1a237e;
+            color: white;
+            padding: 30px;
+            text-align: center;
+            margin-top: 40px;
+        }
+        
+        .footer-text {
+            font-size: 14px;
+            opacity: 0.8;
+            margin-bottom: 10px;
+        }
+        
+        .sources {
+            font-size: 12px;
+            opacity: 0.7;
+            margin-top: 15px;
+        }
+        
+        /* Responsive Design */
+        @media (max-width: 768px) {
+            h1 {
+                font-size: 32px;
+            }
+            
+            .main-content {
+                padding: 20px;
+            }
+            
+            .teams-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .stats-container {
+                grid-template-columns: 1fr;
+            }
+            
+            table {
+                font-size: 14px;
+            }
+            
+            th, td {
+                padding: 10px;
+            }
+        }
+        
+        /* Highlight Box */
+        .highlight-box {
+            background: linear-gradient(135deg, #fff3e0 0%, #ffe0b2 100%);
+            border: 2px solid #ff6f00;
+            border-radius: 10px;
+            padding: 25px;
+            margin: 30px 0;
+        }
+        
+        .highlight-box h3 {
+            color: #e65100;
+            margin-top: 0;
+            border-bottom: none;
+        }
+        
+        /* Match Preview Box */
+        .match-preview {
+            background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%);
+            border: 2px solid #1976d2;
+            border-radius: 10px;
+            padding: 25px;
+            margin: 25px 0;
+        }
+        
+        .match-preview h4 {
+            color: #0d47a1;
+            font-size: 22px;
+            margin-bottom: 15px;
+            text-align: center;
+        }
+        
+        .vs-matchup {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 30px;
+            margin: 20px 0;
+            flex-wrap: wrap;
+        }
+        
+        .vs-team {
+            text-align: center;
+            padding: 15px 30px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        
+        .vs-team strong {
+            font-size: 20px;
+            color: #1a237e;
+            display: block;
+        }
+        
+        .vs-divider {
+            font-size: 28px;
+            font-weight: bold;
+            color: #ff6f00;
+        }
+        
+        .match-details {
+            text-align: center;
+            font-size: 16px;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header>
+            <div class="newspaper-name">The Cricket Chronicle</div>
+            <h1>IPL 2026 Playoffs Begin Tonight!</h1>
+            <div class="date-line">Tuesday, May 26, 2026 | Playoff Commencement Special Edition</div>
+            <div class="tagline">Four Teams Remain – One Will Be Crowned Champion</div>
+        </header>
+
+        <!-- Main Content -->
+        <div class="main-content">
+            <!-- Introduction -->
+            <div class="intro-section">
+                <p><strong>The wait is finally over!</strong> After an exhilarating league stage filled with dramatic finishes, record-breaking performances, and nail-biting encounters, the Indian Premier League 2026 playoffs commence this evening. Four teams have fought their way through 70 league matches to secure their spots in the knockout stage, and tonight marks the beginning of the final chapter.</p>
+                
+                <p>From defending champions Royal Challengers Bengaluru to the consistent Gujarat Titans, from the explosive batting of Sunrisers Hyderabad to Rajasthan Royals' resilient campaign – each team brings its own story, strengths, and aspirations. The stage is set for what promises to be one of the most thrilling playoff series in IPL history.</p>
+            </div>
+
+            <!-- Qualified Teams -->
+            <h2>🏆 Playoff Qualified Teams</h2>
+            <div class="teams-grid">
+                <div class="team-card">
+                    <span class="position-badge">1st Position</span>
+                    <div class="team-name">Royal Challengers Bengaluru</div>
+                    <div class="team-stats"><strong>Points:</strong> 18 (W: 9, L: 5)</div>
+                    <div class="team-stats"><strong>NRR:</strong> +0.783</div>
+                    <div class="team-stats"><strong>Captain:</strong> Rajat Patidar</div>
+                    <div class="team-stats"><strong>Status:</strong> Defending Champions</div>
+                </div>
+                
+                <div class="team-card">
+                    <span class="position-badge">2nd Position</span>
+                    <div class="team-name">Gujarat Titans</div>
+                    <div class="team-stats"><strong>Points:</strong> 18 (W: 9, L: 5)</div>
+                    <div class="team-stats"><strong>NRR:</strong> +0.695</div>
+                    <div class="team-stats"><strong>Captain:</strong> Shubman Gill</div>
+                    <div class="team-stats"><strong>Status:</strong> Consistent Performers</div>
+                </div>
+                
+                <div class="team-card">
+                    <span class="position-badge">3rd Position</span>
+                    <div class="team-name">Sunrisers Hyderabad</div>
+                    <div class="team-stats"><strong>Points:</strong> 18 (W: 9, L: 5)</div>
+                    <div class="team-stats"><strong>NRR:</strong> +0.524</div>
+                    <div class="team-stats"><strong>Captain:</strong> Heinrich Klaasen</div>
+                    <div class="team-stats"><strong>Status:</strong> Batting Powerhouse</div>
+                </div>
+                
+                <div class="team-card">
+                    <span class="position-badge">4th Position</span>
+                    <div class="team-name">Rajasthan Royals</div>
+                    <div class="team-stats"><strong>Points:</strong> 16 (W: 8, L: 6)</div>
+                    <div class="team-stats"><strong>NRR:</strong> +0.189</div>
+                    <div class="team-stats"><strong>Captain:</strong> Riyan Parag</div>
+                    <div class="team-stats"><strong>Status:</strong> Dramatic Qualifiers</div>
+                </div>
+            </div>
+
+            <!-- Playoff Schedule -->
+            <h2>📅 Playoff Schedule & Venues</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Match</th>
+                        <th>Teams</th>
+                        <th>Date</th>
+                        <th>Time (IST)</th>
+                        <th>Venue</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>Qualifier 1</strong></td>
+                        <td>RCB vs GT</td>
+                        <td>May 26 (Today)</td>
+                        <td>7:30 PM</td>
+                        <td>HPCA Stadium, Dharamshala</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Eliminator</strong></td>
+                        <td>SRH vs RR</td>
+                        <td>May 27 (Wed)</td>
+                        <td>7:30 PM</td>
+                        <td>Mullanpur Stadium, Chandigarh</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Qualifier 2</strong></td>
+                        <td>Loser Q1 vs Winner Eliminator</td>
+                        <td>May 29 (Fri)</td>
+                        <td>7:30 PM</td>
+                        <td>Mullanpur Stadium, Chandigarh</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Final</strong></td>
+                        <td>Winner Q1 vs Winner Q2</td>
+                        <td>May 31 (Sun)</td>
+                        <td>7:30 PM</td>
+                        <td>Narendra Modi Stadium, Ahmedabad</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <!-- Tonight's Match Preview -->
+            <div class="match-preview">
+                <h4>⚡ TONIGHT'S SHOWDOWN ⚡</h4>
+                <div class="vs-matchup">
+                    <div class="vs-team">
+                        <strong>Royal Challengers Bengaluru</strong>
+                        <span style="color: #666;">Defending Champions</span>
+                    </div>
+                    <div class="vs-divider">VS</div>
+                    <div class="vs-team">
+                        <strong>Gujarat Titans</strong>
+                        <span style="color: #666;">Consistent Contenders</span>
+                    </div>
+                </div>
+                <div class="match-details">
+                    <p><strong>Qualifier 1 | May 26, 2026 | 7:30 PM IST</strong></p>
+                    <p><strong>Venue:</strong> Himachal Pradesh Cricket Association Stadium, Dharamshala</p>
+                    <p><em>Winner advances directly to the Final! Loser drops to Qualifier 2.</em></p>
+                </div>
+            </div>
+
+            <!-- Player Statistics -->
+            <h2>🎯 Top Player Performances</h2>
+            <div class="stats-container">
+                <div class="stats-box">
+                    <h4>🟠 Orange Cap Race - Top Run Scorers</h4>
+                    <div class="player-entry">
+                        <span class="player-name">1. Sai Sudharsan (GT)</span>
+                        <span class="player-stat">638 runs</span>
+                    </div>
+                    <div class="player-entry">
+                        <span class="player-name">2. Shubman Gill (GT)</span>
+                        <span class="player-stat">616 runs</span>
+                    </div>
+                    <div class="player-entry">
+                        <span class="player-name">3. Heinrich Klaasen (SRH)</span>
+                        <span class="player-stat">606 runs</span>
+                    </div>
+                    <div class="player-entry">
+                        <span class="player-name">4. KL Rahul (DC)</span>
+                        <span class="player-stat">593 runs</span>
+                    </div>
+                    <div class="player-entry">
+                        <span class="player-name">5. Vaibhav Sooryavanshi (RR)</span>
+                        <span class="player-stat">583 runs</span>
+                    </div>
+                </div>
+                
+                <div class="stats-box">
+                    <h4>🟣 Purple Cap Race - Top Wicket Takers</h4>
+                    <div class="player-entry">
+                        <span class="player-name">Bhuvneshwar Kumar (RCB)</span>
+                        <span class="player-stat">24 wickets</span>
+                    </div>
+                    <div class="player-entry">
+                        <span class="player-name">Kagiso Rabada (GT)</span>
+                        <span class="player-stat">24 wickets</span>
+                    </div>
+                    <div class="player-entry">
+                        <span class="player-name">Jofra Archer (RR)</span>
+                        <span class="player-stat">21 wickets</span>
+                    </div>
+                    <div class="player-entry">
+                        <span class="player-name">Anshul Kamboj (CSK)</span>
+                        <span class="player-stat">21 wickets</span>
+                    </div>
+                    <div class="player-entry">
+                        <span class="player-name">Rashid Khan (GT)</span>
+                        <span class="player-stat">19 wickets</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="stats-container">
+                <div class="stats-box">
+                    <h4>⭐ Other Key Statistics</h4>
+                    <div class="player-entry">
+                        <span class="player-name">Highest Strike Rate:</span>
+                        <span class="player-stat">Vaibhav Sooryavanshi (RR) - 232.27</span>
+                    </div>
+                    <div class="player-entry">
+                        <span class="player-name">Most Sixes:</span>
+                        <span class="player-stat">Vaibhav Sooryavanshi (RR) - 53 sixes</span>
+                    </div>
+                    <div class="player-entry">
+                        <span class="player-name">Best Economy:</span>
+                        <span class="player-stat">Sunil Narine (KKR) - 6.64</span>
+                    </div>
+                    <div class="player-entry">
+                        <span class="player-name">Highest Average:</span>
+                        <span class="player-stat">Venkatesh Iyer (RCB) - 79</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Expert Opinions -->
+            <h2>💬 Expert Analysis & Predictions</h2>
+            
+            <div class="expert-quote">
+                <blockquote>
+                    "Based on analysis of 1,169 IPL matches from 2008-2025, our model identifies that batting depth is more critical than star power in playoffs. Death bowling quality separates the contenders from the champions – every top-four team had at least two economical death bowlers."
+                </blockquote>
+                <cite>- CricMind AI Analytics Team</cite>
+            </div>
+
+            <div class="expert-quote">
+                <blockquote>
+                    "RCB enters as defending champions with significant momentum. Virat Kohli's experience (8,671 IPL runs) cannot be underestimated in high-pressure situations. However, GT's balanced squad with Sai Sudharsan and Shubman Gill leading the run charts makes them equally dangerous."
+                </blockquote>
+                <cite>- Senior Cricket Analyst, ESPNcricinfo</cite>
+            </div>
+
+            <div class="expert-quote">
+                <blockquote>
+                    "SRH represents the new era of aggressive T20 batting. With Heinrich Klaasen's 606 runs and Abhishek Sharma's 43 sixes, they can dismantle any bowling attack in a single over. Their ability to score quickly will be crucial in the eliminator against RR."
+                </blockquote>
+                <cite>- Former International Cricketer & Commentator</cite>
+            </div>
+
+            <div class="expert-quote">
+                <blockquote>
+                    "Rajasthan Royals' qualification was dramatic – defeating Mumbai Indians by 30 runs to clinch the final spot. Vaibhav Sooryavanshi has been phenomenal with 583 runs at a strike rate of 232.27. This kind of form often translates well into knockout cricket."
+                </blockquote>
+                <cite>- Cricket Correspondent, The Daily Jagran</cite>
+            </div>
+
+            <!-- Key Storylines -->
+            <h2>📰 Key Storylines to Watch</h2>
+            <ul class="storylines-list">
+                <li>
+                    <div class="storyline-title">RCB's Title Defense Mission</div>
+                    <p>As defending champions, RCB aims to become one of the few teams to successfully defend an IPL title. With Virat Kohli's legendary experience and Bhuvneshwar Kumar's 24 wickets, they enter with confidence.</p>
+                </li>
+                
+                <li>
+                    <div class="storyline-title">GT's Balanced Attack</div>
+                    <p>Gujarat Titans boast two players in the top 2 run-scorers (Sai Sudharsan - 638, Shubman Gill - 616), complemented by Kagiso Rabada's 24 wickets and Rashid Khan's crafty spin. A complete package for playoff success.</p>
+                </li>
+                
+                <li>
+                    <div class="storyline-title">SRH's Explosive Batting Revolution</div>
+                    <p>With three players among the top run-scorers and multiple high-strike-rate performers, SRH embodies modern T20 aggression. Can their batting firepower carry them to glory?</p>
+                </li>
+                
+                <li>
+                    <div class="storyline-title">RR's Resilient Journey</div>
+                    <p>Rajasthan Royals' last-ball qualification drama adds spice to their campaign. Vaibhav Sooryavanshi's exceptional form (53 sixes!) and Jofra Archer's 21 wickets make them unpredictable opponents.</p>
+                </li>
+                
+                <li>
+                    <div class="storyline-title">The Venue Factor</div>
+                    <p>From Dharamshala's picturesque HPCA Stadium to the grand Narendra Modi Stadium in Ahmedabad for the Final, different pitch conditions could play a decisive role in team strategies.</p>
+                </li>
+            </ul>
+
+            <!-- Recent Results -->
+            <h2>📊 Recent Match Results (League Stage Finale)</h2>
+            <div class="highlight-box">
+                <h3>Key Deciding Matches</h3>
+                <ul style="list-style-type: disc; margin-left: 20px; margin-top: 15px;">
+                    <li><strong>May 24:</strong> RR defeated MI by 30 runs in Mumbai (clinched 4th playoff spot)</li>
+                    <li><strong>May 24:</strong> DC defeated KKR by 40 runs</li>
+                    <li><strong>May 22:</strong> SRH defeated RCB by 55 runs in Hyderabad</li>
+                    <li><strong>May 21:</strong> GT defeated CSK by 89 runs in Chennai</li>
+                </ul>
+            </div>
+
+            <!-- Team Strengths Analysis -->
+            <h2>🔍 Team Strengths Breakdown</h2>
+            
+            <div class="stats-container">
+                <div class="stats-box">
+                    <h4>🔴 Royal Challengers Bengaluru</h4>
+                    <p><strong>Strengths:</strong> Defending champion momentum, Virat Kohli's experience, Bhuvneshwar Kumar's 24 wickets</p>
+                    <p><strong>Key Players:</strong> Rajat Patidar (captain), Virat Kohli, Bhuvneshwar Kumar, Venkatesh Iyer (highest average: 79)</p>
+                </div>
+                
+                <div class="stats-box">
+                    <h4>🟡 Gujarat Titans</h4>
+                    <p><strong>Strengths:</strong> Two players in top 2 run-scorers, strong bowling attack with Rabada and Rashid Khan</p>
+                    <p><strong>Key Players:</strong> Shubman Gill (captain), Sai Sudharsan, Kagiso Rabada, Rashid Khan</p>
+                </div>
+                
+                <div class="stats-box">
+                    <h4>🔵 Sunrisers Hyderabad</h4>
+                    <p><strong>Strengths:</strong> Explosive batting lineup, multiple high-strike-rate players</p>
+                    <p><strong>Key Players:</strong> Heinrich Klaasen, Abhishek Sharma (43 sixes), Travis Head, Eshan Malinga</p>
+                </div>
+                
+                <div class="stats-box">
+                    <h4>🟣 Rajasthan Royals</h4>
+                    <p><strong>Strengths:</strong> Vaibhav Sooryavanshi's phenomenal form, experienced leadership under Riyan Parag</p>
+                    <p><strong>Key Players:</strong> Vaibhav Sooryavanshi, Jofra Archer (21 wickets), Riyan Parag (captain)</p>
+                </div>
+            </div>
+
+            <!-- Conclusion -->
+            <h2>🎬 What to Expect</h2>
+            <div class="intro-section">
+                <p>The IPL 2026 playoffs promise to deliver everything cricket fans love: high-octane action, clutch performances, and unforgettable moments. Tonight's Qualifier 1 between RCB and GT sets the tone – a clash between the top two teams where only the winner advances directly to the Final.</p>
+                
+                <p>Whether it's RCB's championship experience, GT's consistency, SRH's batting explosion, or RR's resilient spirit, each team has a legitimate claim to the trophy. The journey begins tonight at 7:30 PM IST in Dharamshala. Stay tuned for what could be the most exciting playoff series in IPL history!</p>
+                
+                <p style="text-align: center; margin-top: 30px; font-size: 20px; font-weight: bold; color: #1a237e;">
+                    🏏 THE PLAYOFFS BEGIN NOW! 🏏
+                </p>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <footer>
+            <div class="footer-text">
+                <p><strong>The Cricket Chronicle</strong> | IPL 2026 Playoff Special Edition</p>
+                <p>Published: Tuesday, May 26, 2026</p>
+            </div>
+            <div class="sources">
+                <p><strong>Sources:</strong> Cricket News (cricketnews.com) | The Daily Jagran (thedailyjagran.com) | BBC Sport (bbc.com/sport/cricket) | CricMind AI Analytics (cricmind.ai) | ESPNcricinfo</p>
+                <p style="margin-top: 10px;"><em>This bulletin compiled based on available information up to the commencement of IPL 2026 playoffs. For live updates during playoff matches, please refer to official IPL broadcasting partners.</em></p>
+            </div>
+        </footer>
+    </div>
+</body>
+</html>

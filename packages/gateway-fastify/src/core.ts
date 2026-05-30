@@ -4,7 +4,7 @@ export type JsonObject = { [key: string]: JsonValue };
 export type JsonSchema = Record<string, unknown>;
 export type CaptureMode = 'full' | 'summary' | 'none';
 export type ToolBudgetExhaustedAction = 'fail' | 'continue_with_warning' | 'ask_model';
-export type ResearchPolicyName = 'none' | 'light' | 'standard' | 'deep';
+export type ResearchPolicyName = 'none' | 'light' | 'standard' | 'deep' | 'gaia';
 
 export type ContinuationStrategy =
   | 'hybrid_snapshot_then_step'

@@ -5,10 +5,16 @@
   "defaultInvocationMode": "run",
   "model": {
     "provider": "mesh",
-    "model": "openai/gpt-4o-audio-preview"
+    "model": "openai/gpt-audio-mini"
   },
 "systemInstructions": "For audio inputs, produce the final transcription/translation in the first response. Do not narrate intent or future actions.",
-
+"capabilities": {
+  "modalitiesSupported": ["text", "audio"],
+  "modalitiesPreferred": ["audio"],
+  "modalityRoles": {
+    "audio": "analyze"
+  }
+},
   "tools": [],
   "delegates": [],
   "defaults": {

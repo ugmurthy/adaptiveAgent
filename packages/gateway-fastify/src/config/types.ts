@@ -30,7 +30,7 @@ export const AGENT_RUNTIME_LOG_DESTINATIONS = ['console', 'file', 'both'] as con
 export const AGENT_RUNTIME_LOG_LEVELS = ['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent'] as const satisfies readonly AdaptiveAgentLogLevel[];
 export const MODEL_PROVIDERS: ModelAdapterConfig['provider'][] = ['openrouter', 'ollama', 'mistral', 'mesh'];
 export const GATEWAY_STORE_KINDS = ['memory', 'file', 'postgres'] as const;
-export const RESEARCH_POLICIES = ['none', 'light', 'standard', 'deep'] as const;
+export const RESEARCH_POLICIES = ['none', 'light', 'standard', 'deep', 'gaia'] as const;
 export const TOOL_BUDGET_EXHAUSTED_ACTIONS = ['fail', 'continue_with_warning', 'ask_model'] as const;
 
 export type InvocationMode = (typeof INVOCATION_MODES)[number];

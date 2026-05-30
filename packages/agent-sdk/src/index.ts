@@ -3,6 +3,7 @@ import { createInterface } from 'node:readline/promises';
 import { homedir } from 'node:os';
 import { delimiter, isAbsolute, resolve } from 'node:path';
 import { stdin, stderr } from 'node:process';
+import { fileURLToPath } from 'node:url';
 
 import Ajv, { type ErrorObject } from 'ajv';
 import { Pool, types } from 'pg';
@@ -53,6 +54,8 @@ import {
   type UUID,
 } from '@adaptive-agent/core';
 
+const DEFAULT_MODULE_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
+
 export type InvocationMode = 'run' | 'chat';
 export type RuntimeMode = 'memory' | 'postgres';
 export type ApprovalMode = 'manual' | 'auto' | 'reject';
@@ -61,6 +64,15 @@ export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'silent';
 export type LogDestination = 'console' | 'file' | 'both';
 export type TuiMessageType = 'user' | 'assistant' | 'progress' | 'run' | 'system' | 'event';
 export type TuiTextStyleName = 'default' | 'dim' | 'bold' | 'italic' | 'underline' | 'red' | 'green' | 'yellow' | 'blue' | 'magenta' | 'cyan' | 'white' | 'gray';
+
+export type SupportedModality = 'text' | 'image' | 'file' | 'audio';
+
+export interface AgentCapabilityConfig {
+  modalitiesSupported?: SupportedModality[];
+  modalitiesPreferred?: SupportedModality[];
+  modalityRoles?: Partial<Record<SupportedModality, 'ingest' | 'analyze' | 'summarize' | 'synthesize'>>;
+  subjectsPreferred?: string[];
+}
 
 export interface TuiMessageStyleConfig {
   showPrefix?: boolean;
@@ -91,6 +103,7 @@ export interface AgentConfigFile {
   recovery?: { continuation?: { enabled?: boolean; defaultStrategy?: ContinuationStrategy; requireUserApproval?: boolean }; retryableErrorCodes?: string[]; fallbackModels?: Array<{ provider: string; model: string; whenFailureClass?: FailureClass[]; whenErrorCode?: string[] }> };
   metadata?: JsonObject;
   routing?: JsonObject;
+  capabilities?: AgentCapabilityConfig;
 }
 
 export interface AgentSettingsFile {
@@ -269,6 +282,26 @@ export class AgentSdk {
 }
 
 export async function createAgentSdk(options: AgentSdkOptions = {}): Promise<AgentSdk> { return AgentSdk.create(options); }
+export { createOrchestrationSdk, OrchestrationSdk } from './orchestration.js';
+export type {
+  AgentCatalogEntry,
+  InputClaim,
+  OrchestratedRunOptions,
+  OrchestratedRunResult,
+  OrchestratedRunStageResult,
+  OrchestrationConcurrencyPolicy,
+  OrchestrationExecutionShape,
+  OrchestrationInputSelector,
+  OrchestrationLifecycleEvent,
+  OrchestrationPlan,
+  OrchestrationPlanNode,
+  OrchestrationPlanNodeStatus,
+  OrchestrationSessionInspection,
+  OrchestrationSessionRecord,
+  OrchestrationSessionRunLinkRecord,
+  OrchestrationSessionStatus,
+  OrchestrationStageKind,
+} from './orchestration.js';
 export async function loadAgentSdkConfig(options: AgentSdkOptions = {}): Promise<ResolvedAgentSdkConfig> { return resolveAgentSdkConfig(options); }
 export async function inspectAgentSdkResolution(options: AgentSdkOptions = {}): Promise<ResolvedAgentSdkModuleInspection> {
   const config = await resolveAgentSdkConfig(options);
@@ -331,6 +364,8 @@ function normalizeTuiSettings(settings: TuiSettingsConfig | undefined): TuiSetti
 }
 
 async function resolveToolsAndDelegates(config: ResolvedAgentSdkConfig, options: AgentSdkOptions): Promise<{ tools: Array<ToolDefinition<any, any>>; delegates: DelegateDefinition[]; registeredToolNames: string[] }> {
+  process.env.ADAPTIVE_AGENT_MODULE_ROOT ??= DEFAULT_MODULE_ROOT;
+
   const builtins = createBuiltinTools(config.workspaceRoot, config.shellCwd, options.env ?? process.env);
   const providedTools = new Map((options.tools ?? []).map((tool) => [tool.name, tool]));
   const registry = new Map([...builtins, ...providedTools]);
@@ -396,7 +431,7 @@ async function loadRequiredAgent(cwd: string, explicitPath: string | undefined, 
 }
 
 const ajv = new Ajv({ allErrors: true, allowUnionTypes: true });
-const agentValidator = ajv.compile({ type: 'object', required: ['id', 'name', 'invocationModes', 'defaultInvocationMode', 'model', 'tools'], additionalProperties: true, properties: { id: { type: 'string', minLength: 1 }, name: { type: 'string', minLength: 1 }, invocationModes: { type: 'array', items: { enum: ['run', 'chat'] }, minItems: 1 }, defaultInvocationMode: { enum: ['run', 'chat'] }, model: { type: 'object', additionalProperties: true }, tools: { type: 'array', items: { type: 'string', minLength: 1 } }, delegates: { type: 'array', items: { type: 'string' }, nullable: true }, metadata: { type: 'object', nullable: true }, routing: { type: 'object', nullable: true } } });
+const agentValidator = ajv.compile({ type: 'object', required: ['id', 'name', 'invocationModes', 'defaultInvocationMode', 'model', 'tools'], additionalProperties: true, properties: { id: { type: 'string', minLength: 1 }, name: { type: 'string', minLength: 1 }, invocationModes: { type: 'array', items: { enum: ['run', 'chat'] }, minItems: 1 }, defaultInvocationMode: { enum: ['run', 'chat'] }, model: { type: 'object', additionalProperties: true }, tools: { type: 'array', items: { type: 'string', minLength: 1 } }, delegates: { type: 'array', items: { type: 'string' }, nullable: true }, metadata: { type: 'object', nullable: true }, routing: { type: 'object', additionalProperties: true, nullable: true, properties: { keywords: { type: 'array', nullable: true, items: { type: 'string', minLength: 1 } } } }, capabilities: { type: 'object', additionalProperties: true, nullable: true, properties: { modalitiesSupported: { type: 'array', nullable: true, items: { enum: ['text', 'image', 'file', 'audio'] } }, modalitiesPreferred: { type: 'array', nullable: true, items: { enum: ['text', 'image', 'file', 'audio'] } }, modalityRoles: { type: 'object', additionalProperties: { enum: ['ingest', 'analyze', 'summarize', 'synthesize'] }, nullable: true }, subjectsPreferred: { type: 'array', nullable: true, items: { type: 'string', minLength: 1 } } } } } });
 const settingsValidator = ajv.compile({ type: 'object', additionalProperties: true, properties: { runtime: { type: 'object', additionalProperties: true, nullable: true, properties: { mode: { type: 'string', enum: ['memory', 'postgres'], nullable: true }, autoMigrate: { type: 'boolean', nullable: true } } }, logging: { type: 'object', additionalProperties: true, nullable: true, properties: { destination: { type: 'string', enum: ['console', 'file', 'both'], nullable: true } } } } });
 
 function validateAgent(value: unknown, path: string): AgentConfigFile {

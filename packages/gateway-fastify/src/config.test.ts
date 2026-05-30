@@ -120,7 +120,7 @@ describe('gateway config loading', () => {
           delegates: ['researcher'],
           defaults: {
             injectToolManifest: false,
-            researchPolicy: 'standard',
+            researchPolicy: 'gaia',
             toolBudgets: {
               'web_research.search': {
                 maxCalls: 3,
@@ -193,7 +193,7 @@ describe('gateway config loading', () => {
       delegates: ['researcher'],
       defaults: {
         injectToolManifest: false,
-        researchPolicy: 'standard',
+        researchPolicy: 'gaia',
         toolBudgets: {
           'web_research.search': {
             maxCalls: 3,
@@ -411,7 +411,7 @@ describe('gateway config loading', () => {
     );
 
     await expect(loadAgentConfigFile({ configPath: agentConfigPath })).rejects.toThrowError(
-      /defaults.researchPolicy must be one of: none, light, standard, deep[\s\S]*defaults.toolBudgets.web_research.search.maxCalls must be a non-negative integer[\s\S]*defaults.toolBudgets.web_research.search.onExhausted must be one of: fail, continue_with_warning, ask_model/,
+      /defaults.researchPolicy must be one of: none, light, standard, deep, gaia[\s\S]*defaults.toolBudgets.web_research.search.maxCalls must be a non-negative integer[\s\S]*defaults.toolBudgets.web_research.search.onExhausted must be one of: fail, continue_with_warning, ask_model/,
     );
   });
 });

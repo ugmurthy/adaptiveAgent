@@ -1,11 +1,14 @@
 import { access, readdir } from 'node:fs/promises';
 import { delimiter } from 'node:path';
 import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { createJwtAuthProvider } from './auth.js';
 import { createBuiltinTools, loadSkillDelegateFromDirectory, type DelegateDefinition } from './core.js';
 import { ADAPTIVE_AGENT_ARTIFACTS_DIR, GATEWAY_SKILLS_DIR } from './local-dev.js';
 import { createModuleRegistry, type ModuleRegistry } from './registries.js';
+
+const DEFAULT_MODULE_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
 
 export interface CreateLocalModuleRegistryOptions {
   workspaceRoot?: string;
@@ -16,6 +19,8 @@ export interface CreateLocalModuleRegistryOptions {
 export async function createLocalModuleRegistry(
   options: CreateLocalModuleRegistryOptions = {},
 ): Promise<ModuleRegistry> {
+  process.env.ADAPTIVE_AGENT_MODULE_ROOT ??= DEFAULT_MODULE_ROOT;
+
   const workspaceRoot = resolve(options.workspaceRoot ?? ADAPTIVE_AGENT_ARTIFACTS_DIR);
   const tools = await createBuiltinTools({
     rootDir: workspaceRoot,

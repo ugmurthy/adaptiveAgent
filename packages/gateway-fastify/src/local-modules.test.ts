@@ -8,12 +8,19 @@ import { createLocalModuleRegistry } from './local-modules.js';
 
 describe('createLocalModuleRegistry', () => {
   const originalSkillDirs = process.env.ADAPTIVE_AGENT_GATEWAY_SKILL_DIRS;
+  const originalModuleRoot = process.env.ADAPTIVE_AGENT_MODULE_ROOT;
 
   afterEach(() => {
     if (originalSkillDirs === undefined) {
       delete process.env.ADAPTIVE_AGENT_GATEWAY_SKILL_DIRS;
     } else {
       process.env.ADAPTIVE_AGENT_GATEWAY_SKILL_DIRS = originalSkillDirs;
+    }
+
+    if (originalModuleRoot === undefined) {
+      delete process.env.ADAPTIVE_AGENT_MODULE_ROOT;
+    } else {
+      process.env.ADAPTIVE_AGENT_MODULE_ROOT = originalModuleRoot;
     }
   });
 
@@ -78,5 +85,19 @@ describe('createLocalModuleRegistry', () => {
 
     expect(registry.listDelegateNames()).toContain('file-converter');
     expect(registry.listDelegateNames()).toContain('mcp-echo');
+  });
+
+  it('sets a module root for skill handlers when the gateway starts from another cwd', async () => {
+    delete process.env.ADAPTIVE_AGENT_MODULE_ROOT;
+
+    await createLocalModuleRegistry({
+      workspaceRoot: process.cwd(),
+      requiredDelegateNames: ['mcp-echo'],
+      skillDirectories: [fileURLToPath(new URL('../../../examples/skills', import.meta.url))],
+    });
+
+    expect(process.env.ADAPTIVE_AGENT_MODULE_ROOT).toBe(
+      fileURLToPath(new URL('../../..', import.meta.url)),
+    );
   });
 });

@@ -19,6 +19,10 @@ type WebSearchInput = {
   purpose?: string;
   expectedUse?: 'verify' | 'discover' | 'compare' | 'current_status';
   freshnessRequired?: boolean;
+  domainHints?: string[];
+  excludeDomains?: string[];
+  exactPhrases?: string[];
+  answerType?: 'date' | 'number' | 'name' | 'place' | 'organization' | 'file' | 'other';
 };
 
 type WebSearchResult = {
@@ -33,6 +37,10 @@ type WebSearchOutput = {
   purpose?: string;
   expectedUse?: 'verify' | 'discover' | 'compare' | 'current_status';
   freshnessRequired?: boolean;
+  domainHints?: string[];
+  excludeDomains?: string[];
+  exactPhrases?: string[];
+  answerType?: 'date' | 'number' | 'name' | 'place' | 'organization' | 'file' | 'other';
   researchStatus?: {
     status: 'complete' | 'partial';
     reason?: 'budget_exhausted' | 'timeout' | 'provider_error';
@@ -49,6 +57,7 @@ type WebSearchOutput = {
 interface WebSearchDiagnostics {
   provider: 'brave' | 'duckduckgo';
   providerPath: 'api' | 'deep' | 'html-fallback';
+  deduplicatedResults?: number;
 }
 
 interface WebSearchExecutionResult {
@@ -143,42 +152,78 @@ export function createWebSearchTool(config: WebSearchToolConfig): ToolDefinition
           type: 'boolean',
           description: 'Whether the answer depends on current information.',
         },
+        domainHints: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Preferred domains to search, expressed as hostnames for site: filters.',
+        },
+        excludeDomains: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Domains to exclude from the search results.',
+        },
+        exactPhrases: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Exact phrases to quote in the search query.',
+        },
+        answerType: {
+          type: 'string',
+          enum: ['date', 'number', 'name', 'place', 'organization', 'file', 'other'],
+          description: 'Expected answer type for downstream evidence review.',
+        },
       },
     },
     async execute(rawInput, context) {
       // Some models send tool input as a JSON string instead of an object — normalise.
       const input = typeof rawInput === 'string' ? JSON.parse(rawInput) : rawInput;
-      const { query, maxResults: perCallMax, purpose, expectedUse, freshnessRequired } = input as unknown as WebSearchInput;
+      const {
+        query,
+        maxResults: perCallMax,
+        purpose,
+        expectedUse,
+        freshnessRequired,
+        domainHints,
+        excludeDomains,
+        exactPhrases,
+        answerType,
+      } = input as unknown as WebSearchInput;
       const count = perCallMax ?? maxResults;
+      const effectiveQuery = buildEffectiveSearchQuery(query, { domainHints, excludeDomains, exactPhrases });
       try {
         const execution =
           provider === 'brave'
             ? await searchBrave({
                 apiKey: config.apiKey!,
-                query,
+                query: effectiveQuery,
                 count,
                 baseUrl,
                 signal: context.signal,
               })
             : await searchDuckDuckGo({
-                query,
+                query: effectiveQuery,
                 count,
                 baseUrl,
                 signal: context.signal,
               });
+        const deduplicatedResults = deduplicateSearchResults(execution.results, count);
 
         const output = attachWebSearchDiagnostics(
           {
             query,
-            results: execution.results,
+            results: deduplicatedResults.results,
             ...(purpose === undefined ? {} : { purpose }),
             ...(expectedUse === undefined ? {} : { expectedUse }),
             ...(freshnessRequired === undefined ? {} : { freshnessRequired }),
+            ...(domainHints === undefined ? {} : { domainHints }),
+            ...(excludeDomains === undefined ? {} : { excludeDomains }),
+            ...(exactPhrases === undefined ? {} : { exactPhrases }),
+            ...(answerType === undefined ? {} : { answerType }),
             researchStatus: {
               status: 'complete',
             },
           },
-          execution.diagnostics,
+          { ...execution.diagnostics, deduplicatedResults: deduplicatedResults.removed },
         );
 
         return output;
@@ -192,6 +237,10 @@ export function createWebSearchTool(config: WebSearchToolConfig): ToolDefinition
       recovered.purpose = input.purpose;
       recovered.expectedUse = input.expectedUse;
       recovered.freshnessRequired = input.freshnessRequired;
+      recovered.domainHints = input.domainHints;
+      recovered.excludeDomains = input.excludeDomains;
+      recovered.exactPhrases = input.exactPhrases;
+      recovered.answerType = input.answerType;
       recovered.researchStatus = {
         status: 'partial',
         reason: recovered.error?.kind === 'timeout' ? 'timeout' : 'provider_error',
@@ -203,6 +252,96 @@ export function createWebSearchTool(config: WebSearchToolConfig): ToolDefinition
       return summarizeWebSearchOutput(output);
     },
   };
+}
+
+function buildEffectiveSearchQuery(
+  query: string,
+  hints: Pick<WebSearchInput, 'domainHints' | 'excludeDomains' | 'exactPhrases'>,
+): string {
+  const terms = [query.trim()];
+  for (const phrase of hints.exactPhrases ?? []) {
+    const trimmed = phrase.trim();
+    if (trimmed) {
+      terms.push(`"${trimmed.replace(/"/g, '')}"`);
+    }
+  }
+  for (const domain of hints.domainHints ?? []) {
+    const normalized = normalizeDomainHint(domain);
+    if (normalized) {
+      terms.push(`site:${normalized}`);
+    }
+  }
+  for (const domain of hints.excludeDomains ?? []) {
+    const normalized = normalizeDomainHint(domain);
+    if (normalized) {
+      terms.push(`-site:${normalized}`);
+    }
+  }
+  return terms.filter(Boolean).join(' ');
+}
+
+function normalizeDomainHint(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  try {
+    const url = trimmed.includes('://') ? new URL(trimmed) : new URL(`https://${trimmed}`);
+    return url.hostname.toLowerCase().replace(/^www\./, '');
+  } catch {
+    return trimmed.toLowerCase().replace(/^www\./, '').replace(/[^a-z0-9.-]/g, '') || undefined;
+  }
+}
+
+function deduplicateSearchResults(
+  results: WebSearchResult[],
+  count: number,
+): { results: WebSearchResult[]; removed: number } {
+  const seen = new Set<string>();
+  const deduplicated: WebSearchResult[] = [];
+  for (const result of results) {
+    const key = canonicalSearchResultKey(result.url) ?? `${result.title}\n${result.snippet}`.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduplicated.push({ ...result, url: normalizeResultUrl(result.url) ?? result.url });
+    if (deduplicated.length >= count) {
+      break;
+    }
+  }
+  return { results: deduplicated, removed: results.length - deduplicated.length };
+}
+
+function canonicalSearchResultKey(rawUrl: string): string | undefined {
+  const normalized = normalizeResultUrl(rawUrl);
+  if (!normalized) {
+    return undefined;
+  }
+  try {
+    const url = new URL(normalized);
+    url.hash = '';
+    return `${url.hostname}${url.pathname}${url.search}`.toLowerCase().replace(/\/$/, '');
+  } catch {
+    return normalized.toLowerCase();
+  }
+}
+
+function normalizeResultUrl(rawUrl: string): string | undefined {
+  try {
+    const url = new URL(rawUrl);
+    url.hostname = url.hostname.toLowerCase();
+    url.hash = '';
+    for (const param of Array.from(url.searchParams.keys())) {
+      if (/^(utm_|fbclid$|gclid$|mc_cid$|mc_eid$)/i.test(param)) {
+        url.searchParams.delete(param);
+      }
+    }
+    return url.toString();
+  } catch {
+    return undefined;
+  }
 }
 
 async function searchBrave({
@@ -433,6 +572,7 @@ function summarizeWebSearchOutput(output: WebSearchOutput): JsonValue {
     resultCount: output.results.length,
     provider: diagnostics?.provider ?? 'unknown',
     providerPath: diagnostics?.providerPath ?? 'unknown',
+    deduplicatedResults: diagnostics?.deduplicatedResults ?? 0,
     topResults: output.results.slice(0, 3).map((result) => ({
       title: result.title,
       url: result.url,

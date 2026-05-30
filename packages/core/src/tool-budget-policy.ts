@@ -37,6 +37,13 @@ export const RESEARCH_POLICY_PRESETS: Record<ResearchPolicyName, ResolvedResearc
     checkpointAfter: 5,
     requirePurpose: true,
   },
+  gaia: {
+    mode: 'gaia',
+    maxSearches: 6,
+    maxPagesRead: 12,
+    checkpointAfter: 3,
+    requirePurpose: true,
+  },
 };
 
 export function resolveResearchPolicy(
