@@ -107,6 +107,27 @@ describe('createReadFileTool', () => {
     });
   });
 
+  it('formats generic read_file recovery outputs without requiring content', () => {
+    const tool = createReadFileTool({ allowedRoot: tempDir });
+    const recoveryOutput = {
+      ok: false,
+      recoveryKind: 'path_outside_workspace',
+      toolName: 'read_file',
+      requestedPath: '/outside.txt',
+      suggestedPath: 'outside.txt',
+    };
+
+    expect(tool.formatResultForModel?.(recoveryOutput as any, {
+      toolName: 'read_file',
+      runId: 'run-1',
+      stepId: 'step-1',
+      toolCallId: 'read-1',
+      input: { path: '/outside.txt' },
+      maxBytes: 1024,
+    })).toEqual(recoveryOutput);
+    expect(tool.summarizeResult?.(recoveryOutput as any)).toEqual(recoveryOutput);
+  });
+
   it('rejects files exceeding max size', async () => {
     const tool = createReadFileTool({ allowedRoot: tempDir, maxSizeBytes: 5 });
 
@@ -649,6 +670,25 @@ describe('createShellExecTool', () => {
     expect(tool.name).toBe('shell_exec');
     expect(tool.requiresApproval).toBe(true);
   });
+
+  it('formats generic shell_exec outputs without requiring stdout or stderr', () => {
+    const tool = createShellExecTool();
+    const genericOutput = {
+      status: 'partial',
+      reason: 'budget_exhausted',
+      toolName: 'shell_exec',
+    };
+
+    expect(tool.formatResultForModel?.(genericOutput as any, {
+      toolName: 'shell_exec',
+      runId: 'run-1',
+      stepId: 'step-1',
+      toolCallId: 'shell-1',
+      input: { command: 'echo hi' },
+      maxBytes: 1024,
+    })).toEqual(genericOutput);
+    expect(tool.summarizeResult?.(genericOutput as any)).toEqual(genericOutput);
+  });
 });
 
 // ── web_search ──────────────────────────────────────────────────────────────
@@ -705,6 +745,27 @@ describe('createWebSearchTool', () => {
     expect(url).toContain('web/search');
     expect(url).toContain('q=test+query');
     expect(init.headers['X-Subscription-Token']).toBe('brave-key');
+  });
+
+  it('formats generic budget-exhausted outputs without assuming search results', () => {
+    const tool = createWebSearchTool({ apiKey: 'brave-key' });
+    const budgetOutput = {
+      status: 'partial',
+      reason: 'budget_exhausted',
+      toolName: 'web_search',
+      budgetGroup: 'web_research.search',
+      message: 'The search budget is exhausted.',
+    };
+
+    expect(tool.formatResultForModel?.(budgetOutput as any, {
+      toolName: 'web_search',
+      runId: 'run-1',
+      stepId: 'step-1',
+      toolCallId: 'search-1',
+      input: { query: 'test' },
+      maxBytes: 1024,
+    })).toEqual(budgetOutput);
+    expect(tool.summarizeResult?.(budgetOutput as any)).toEqual(budgetOutput);
   });
 
   it('sends a DuckDuckGo request and parses lite results', async () => {
@@ -1171,6 +1232,25 @@ describe('createReadWebPageTool', () => {
         message: 'Timed out after 30000ms',
       },
     });
+  });
+
+  it('formats generic read_web_page outputs without requiring text', () => {
+    const tool = createReadWebPageTool();
+    const genericOutput = {
+      status: 'partial',
+      reason: 'budget_exhausted',
+      toolName: 'read_web_page',
+    };
+
+    expect(tool.formatResultForModel?.(genericOutput as any, {
+      toolName: 'read_web_page',
+      runId: 'run-1',
+      stepId: 'step-1',
+      toolCallId: 'page-1',
+      input: { url: 'https://example.com' },
+      maxBytes: 1024,
+    })).toEqual(genericOutput);
+    expect(tool.summarizeResult?.(genericOutput as any)).toEqual(genericOutput);
   });
 
   it('has correct tool metadata', () => {

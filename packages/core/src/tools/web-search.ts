@@ -11,6 +11,8 @@ export interface WebSearchToolConfig {
   baseUrl?: string;
   /** Tool timeout in milliseconds. Defaults to `90000`. */
   timeoutMs?: number;
+  /** Maximum provider HTML/error body size in bytes. Defaults to 512 KiB. */
+  maxResponseBodyBytes?: number;
 }
 
 type WebSearchInput = {
@@ -101,6 +103,8 @@ const DUCKDUCKGO_HEADERS = {
 };
 const WEB_SEARCH_DIAGNOSTICS = Symbol('web_search.diagnostics');
 const DEFAULT_WEB_TOOL_TIMEOUT_MS = 90_000;
+const DEFAULT_MAX_RESPONSE_BODY_BYTES = 524_288;
+const DEFAULT_MODEL_RESULT_MAX_BYTES = 32 * 1024;
 
 class RecoverableWebSearchError extends Error {
   constructor(readonly output: WebSearchOutput) {
@@ -118,11 +122,14 @@ export function createWebSearchTool(config: WebSearchToolConfig): ToolDefinition
   const maxResults = config.maxResults ?? 5;
   const baseUrl = config.baseUrl ?? (provider === 'brave' ? BRAVE_BASE_URL : DUCKDUCKGO_BASE_URL);
   const timeoutMs = config.timeoutMs ?? DEFAULT_WEB_TOOL_TIMEOUT_MS;
+  const maxResponseBodyBytes = config.maxResponseBodyBytes ?? DEFAULT_MAX_RESPONSE_BODY_BYTES;
+  const cache = new Map<string, WebSearchOutput>();
 
   return {
     name: 'web_search',
     budgetGroup: 'web_research.search',
     timeoutMs,
+    maxModelResultBytes: DEFAULT_MODEL_RESULT_MAX_BYTES,
     description:
       'Search the web for current or unknown information. Include a short purpose when possible so the search stays goal-directed. Returns results with title, URL, and snippet.',
     retryPolicy: {
@@ -190,6 +197,24 @@ export function createWebSearchTool(config: WebSearchToolConfig): ToolDefinition
       } = input as unknown as WebSearchInput;
       const count = perCallMax ?? maxResults;
       const effectiveQuery = buildEffectiveSearchQuery(query, { domainHints, excludeDomains, exactPhrases });
+      const cacheKey = JSON.stringify({
+        runId: context.runId,
+        provider,
+        effectiveQuery,
+        count,
+        purpose,
+        expectedUse,
+        freshnessRequired,
+        domainHints,
+        excludeDomains,
+        exactPhrases,
+        answerType,
+      });
+      const cached = cache.get(cacheKey);
+      if (cached) {
+        return cached;
+      }
+
       try {
         const execution =
           provider === 'brave'
@@ -198,12 +223,14 @@ export function createWebSearchTool(config: WebSearchToolConfig): ToolDefinition
                 query: effectiveQuery,
                 count,
                 baseUrl,
+                maxResponseBodyBytes,
                 signal: context.signal,
               })
             : await searchDuckDuckGo({
                 query: effectiveQuery,
                 count,
                 baseUrl,
+                maxResponseBodyBytes,
                 signal: context.signal,
               });
         const deduplicatedResults = deduplicateSearchResults(execution.results, count);
@@ -226,6 +253,7 @@ export function createWebSearchTool(config: WebSearchToolConfig): ToolDefinition
           { ...execution.diagnostics, deduplicatedResults: deduplicatedResults.removed },
         );
 
+        cache.set(cacheKey, output);
         return output;
       } catch (error) {
         throw normalizeWebSearchError(error, query, provider);
@@ -250,6 +278,9 @@ export function createWebSearchTool(config: WebSearchToolConfig): ToolDefinition
     },
     summarizeResult(output) {
       return summarizeWebSearchOutput(output);
+    },
+    formatResultForModel(output) {
+      return formatWebSearchOutputForModel(output);
     },
   };
 }
@@ -349,12 +380,14 @@ async function searchBrave({
   query,
   count,
   baseUrl,
+  maxResponseBodyBytes,
   signal,
 }: {
   apiKey: string;
   query: string;
   count: number;
   baseUrl: string;
+  maxResponseBodyBytes: number;
   signal: AbortSignal;
 }): Promise<WebSearchExecutionResult> {
   const url = new URL(`${baseUrl}/web/search`);
@@ -371,7 +404,7 @@ async function searchBrave({
   });
 
   if (!response.ok) {
-    const errorText = await response.text().catch(() => 'unknown error');
+    const errorText = await readResponseTextWithinLimit(response, maxResponseBodyBytes, signal).catch(() => 'unknown error');
     throw createRecoverableWebSearchError({
       query,
       provider: 'brave',
@@ -399,11 +432,13 @@ async function searchDuckDuckGo({
   query,
   count,
   baseUrl,
+  maxResponseBodyBytes,
   signal,
 }: {
   query: string;
   count: number;
   baseUrl: string;
+  maxResponseBodyBytes: number;
   signal: AbortSignal;
 }): Promise<WebSearchExecutionResult> {
   const searchPageUrl = new URL(baseUrl);
@@ -414,7 +449,7 @@ async function searchDuckDuckGo({
     headers: DUCKDUCKGO_HEADERS,
     signal,
   });
-  const searchPageHtml = await searchPageResponse.text();
+  const searchPageHtml = await readResponseTextWithinLimit(searchPageResponse, maxResponseBodyBytes, signal);
 
   if (isDuckDuckGoChallengeResponse(searchPageHtml)) {
     throw createRecoverableWebSearchError({
@@ -446,7 +481,7 @@ async function searchDuckDuckGo({
       },
       signal,
     });
-    const deepResponseText = await deepResponse.text();
+    const deepResponseText = await readResponseTextWithinLimit(deepResponse, maxResponseBodyBytes, signal);
 
     if (isDuckDuckGoChallengeResponse(deepResponseText)) {
       deferredError = createRecoverableWebSearchError({
@@ -488,7 +523,7 @@ async function searchDuckDuckGo({
     },
     signal,
   });
-  const fallbackHtml = await fallbackResponse.text();
+  const fallbackHtml = await readResponseTextWithinLimit(fallbackResponse, maxResponseBodyBytes, signal);
 
   if (isDuckDuckGoChallengeResponse(fallbackHtml)) {
     throw (
@@ -552,6 +587,10 @@ function attachWebSearchDiagnostics(output: WebSearchOutput, diagnostics: WebSea
 }
 
 function summarizeWebSearchOutput(output: WebSearchOutput): JsonValue {
+  if (!Array.isArray(output.results)) {
+    return output as unknown as JsonValue;
+  }
+
   if (output.error) {
     return {
       query: output.query,
@@ -580,10 +619,73 @@ function summarizeWebSearchOutput(output: WebSearchOutput): JsonValue {
   };
 }
 
+function formatWebSearchOutputForModel(output: WebSearchOutput): JsonValue {
+  if (!Array.isArray(output.results)) {
+    return output as unknown as JsonValue;
+  }
+
+  if (output.error) {
+    return summarizeWebSearchOutput(output);
+  }
+
+  return {
+    query: output.query,
+    results: output.results.map((result) => ({
+      title: result.title,
+      url: result.url,
+      snippet: result.snippet,
+    })),
+    ...(output.purpose === undefined ? {} : { purpose: output.purpose }),
+    ...(output.expectedUse === undefined ? {} : { expectedUse: output.expectedUse }),
+    ...(output.freshnessRequired === undefined ? {} : { freshnessRequired: output.freshnessRequired }),
+    ...(output.researchStatus === undefined ? {} : { researchStatus: output.researchStatus }),
+  };
+}
+
 function getWebSearchDiagnostics(output: WebSearchOutput): WebSearchDiagnostics | undefined {
   return (output as WebSearchOutput & { [WEB_SEARCH_DIAGNOSTICS]?: WebSearchDiagnostics })[
     WEB_SEARCH_DIAGNOSTICS
   ];
+}
+
+async function readResponseTextWithinLimit(
+  response: Response,
+  maxBytes: number,
+  signal: AbortSignal,
+): Promise<string> {
+  signal.throwIfAborted();
+  if (!response.body) {
+    const text = await response.text();
+    if (Buffer.byteLength(text, 'utf8') > maxBytes) {
+      throw new Error(`Response body exceeds maximum size of ${maxBytes} bytes`);
+    }
+    return text;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const chunks: string[] = [];
+  let totalBytes = 0;
+
+  while (true) {
+    signal.throwIfAborted();
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    if (!value) {
+      continue;
+    }
+
+    totalBytes += value.byteLength;
+    if (totalBytes > maxBytes) {
+      await reader.cancel();
+      throw new Error(`Response body exceeds maximum size of ${maxBytes} bytes`);
+    }
+    chunks.push(decoder.decode(value, { stream: true }));
+  }
+  chunks.push(decoder.decode());
+  return chunks.join('');
 }
 
 function normalizeWebSearchError(

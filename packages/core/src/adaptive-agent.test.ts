@@ -289,10 +289,44 @@ describe('AdaptiveAgent', () => {
     expect(messages[1]?.content).toContain('"kind": "tool"');
     expect(messages[1]?.content).toContain('"name": "delegate.researcher"');
     expect(messages[1]?.content).toContain('"kind": "delegate"');
+    expect(messages[1]?.content).not.toContain('"inputSchema"');
     expect(messages[2]).toMatchObject({
       role: 'user',
       content: expect.stringContaining('Inspect runtime manifest'),
     });
+  });
+
+  it('filters model-visible tools from RunRequest allowedTools and forbiddenTools', async () => {
+    const runStore = new InMemoryRunStore();
+    const model = new SequenceModel([
+      {
+        finishReason: 'stop',
+        text: 'Done.',
+      },
+    ]);
+    const forbiddenTool: ToolDefinition = {
+      name: 'forbidden_lookup',
+      description: 'Should not be visible.',
+      inputSchema: { type: 'object', additionalProperties: true },
+      execute: async () => ({ ok: true }),
+    };
+
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [createLookupTool(), forbiddenTool],
+      runStore,
+    });
+
+    const result = await agent.run({
+      goal: 'Use only lookup',
+      allowedTools: ['lookup', 'forbidden_lookup'],
+      forbiddenTools: ['forbidden_lookup'],
+    });
+    expect(result.status).toBe('success');
+
+    expect(model.receivedRequests[0].tools?.map((tool) => tool.name)).toEqual(['lookup']);
+    expect(model.receivedRequests[0].messages[1]?.content).toContain('"name": "lookup"');
+    expect(model.receivedRequests[0].messages[1]?.content).not.toContain('forbidden_lookup');
   });
 
   it('continues a failed run from durable partial progress with a linked audit record', async () => {
@@ -386,6 +420,118 @@ describe('AdaptiveAgent', () => {
     expect(continuationRequest?.messages.at(-1)?.content).toContain('Continue the previous failed run');
     expect(continuationRequest?.messages.at(-1)?.content).toContain('"lastCompletedStepId": "step-1"');
     expect(continuationRequest?.messages.at(-1)?.content).toContain('"nextStepId": "step-2"');
+  });
+
+  it('feeds capped model-visible tool output back to the model while preserving raw tool output', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const toolExecutionStore = new InMemoryToolExecutionStore();
+    const rawContent = 'x'.repeat(1_000);
+    const compactTool: ToolDefinition = {
+      name: 'compact_lookup',
+      description: 'Returns a large result.',
+      inputSchema: { type: 'object', additionalProperties: true },
+      maxModelResultBytes: 220,
+      execute: async () => ({
+        content: rawContent,
+        rawOnly: 'keep-this-out-of-model-history',
+      }),
+      formatResultForModel: (output) => ({
+        content: typeof output === 'object' && output !== null && 'content' in output ? output.content : '',
+        modelOnly: true,
+      }),
+    };
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'compact-call-1',
+            name: 'compact_lookup',
+            input: {},
+          },
+        ],
+      },
+      {
+        finishReason: 'stop',
+        text: 'Done with compact output.',
+      },
+    ]);
+
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [compactTool],
+      runStore,
+      eventStore,
+      snapshotStore,
+      toolExecutionStore,
+    });
+
+    const result = await agent.run({ goal: 'Use the compact lookup' });
+    expect(result.status).toBe('success');
+
+    const toolMessage = model.receivedRequests[1].messages.find((message) => message.role === 'tool');
+    expect(toolMessage?.content).not.toContain('keep-this-out-of-model-history');
+    const modelOutput = JSON.parse(toolMessage?.content as string);
+    expect(modelOutput).toMatchObject({
+      modelOnly: true,
+      truncated: true,
+    });
+    expect(Buffer.byteLength(toolMessage?.content as string, 'utf8')).toBeLessThanOrEqual(260);
+
+    const execution = await toolExecutionStore.getByIdempotencyKey(`${result.runId}:step-1:compact-call-1`);
+    expect(execution?.output).toMatchObject({
+      content: rawContent,
+      rawOnly: 'keep-this-out-of-model-history',
+    });
+  });
+
+  it('aborts the tool signal when a tool timeout fires', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    let aborted = false;
+    const hangingTool: ToolDefinition = {
+      name: 'hang',
+      description: 'Waits forever unless aborted.',
+      inputSchema: { type: 'object', additionalProperties: true },
+      timeoutMs: 10,
+      execute: async (_input, context) =>
+        new Promise((resolve) => {
+          context.signal.addEventListener('abort', () => {
+            aborted = true;
+          });
+        }),
+    };
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'hang-call-1',
+            name: 'hang',
+            input: {},
+          },
+        ],
+      },
+    ]);
+
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [hangingTool],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.run({ goal: 'Trigger timeout cancellation' });
+    expect(result).toMatchObject({
+      status: 'failure',
+      code: 'TOOL_ERROR',
+      error: 'Timed out after 10ms',
+    });
+    expect(aborted).toBe(true);
   });
 
   it('blocks continuation when a tool call has no durable completion', async () => {

@@ -73,6 +73,7 @@ interface PendingToolCallState {
 
 interface PendingToolCallExecutionResult {
   output: JsonValue;
+  modelOutput: JsonValue;
   completion?: ToolExecutionCompletionPersistence;
 }
 
@@ -91,12 +92,17 @@ interface ExecutionState {
   waitingOnChildRunId?: UUID;
   toolBudgetUsage: Record<string, ToolBudgetUsage>;
   pendingRuntimeMessages: ModelMessage[];
+  visibleToolNames?: string[];
 }
 
 interface ToolBudgetUsage {
   calls: number;
   consecutiveCalls: number;
   checkpointEmitted: boolean;
+}
+
+interface RuntimeToolContext extends ToolContext {
+  abort(reason?: unknown): void;
 }
 
 interface RunContinuationOptions {
@@ -124,6 +130,7 @@ const DEFAULT_AGENT_DEFAULTS = {
 const OLLAMA_MODEL_TIMEOUT_MULTIPLIER = 4;
 const EXECUTION_STATE_SCHEMA_VERSION = 1;
 const DEFAULT_TOOL_TERMINAL_RETRY_LIMIT = 1;
+const DEFAULT_MODEL_RESULT_MAX_BYTES = 64 * 1024;
 
 const TERMINAL_RUN_STATUSES = new Set<RunStatus>([
   'succeeded',
@@ -264,6 +271,15 @@ export class AdaptiveAgent {
   }
 
   async run(request: RunRequest): Promise<RunResult> {
+    const visibleToolNames = this.resolveRequestedToolNames(request.allowedTools, request.forbiddenTools);
+    if (
+      visibleToolNames &&
+      request.contentParts?.some((part) => part.type === 'file') &&
+      this.resolveFileInputPolicy() === 'read_file' &&
+      !visibleToolNames.includes('read_file')
+    ) {
+      throw new Error('fileInputPolicy=read_file requires read_file to be visible for this run');
+    }
     const normalizedContentParts = await this.normalizeFileInputsForReadFile(request.contentParts);
     const { run: createdRun, state } = await this.createRunWithInitialSnapshot({
       goal: request.goal,
@@ -271,7 +287,15 @@ export class AdaptiveAgent {
       context: request.context,
       metadata: request.metadata,
       status: 'queued',
-    }, (run) => this.createInitialExecutionState(run, request.outputSchema, request.images, normalizedContentParts));
+    }, (run) =>
+      this.createInitialExecutionState(
+        run,
+        request.outputSchema,
+        request.images,
+        normalizedContentParts,
+        visibleToolNames,
+      )
+    );
 
     this.logLifecycle('info', 'run.created', {
       ...runLogBindings(createdRun),
@@ -546,7 +570,7 @@ export class AdaptiveAgent {
         });
 
         try {
-          lastOutput = await runWithTimeout(toolTimeoutMs, toolContext.signal, () =>
+          lastOutput = await runWithTimeout(toolTimeoutMs, toolContext, () =>
             tool.execute(input, toolContext),
           );
         } catch (error) {
@@ -1412,7 +1436,7 @@ export class AdaptiveAgent {
         }
 
         const toolOutput = toolExecutionResult.output;
-        state.messages.push(toolResultMessage(pendingToolCall, toolOutput));
+        state.messages.push(toolResultMessage(pendingToolCall, toolExecutionResult.modelOutput));
         state.pendingToolCalls.shift();
         state.approvedToolCallIds = removeApprovedToolCallId(state.approvedToolCallIds, pendingToolCall.id);
         state.waitingOnChildRunId = undefined;
@@ -1743,6 +1767,9 @@ export class AdaptiveAgent {
     if (!tool) {
       throw new Error(`Unknown tool ${pendingToolCall.name}`);
     }
+    if (state.visibleToolNames && !state.visibleToolNames.includes(tool.name)) {
+      throw new Error(`Tool ${tool.name} is not visible for this run`);
+    }
 
     if (tool.requiresApproval && !this.options.defaults?.autoApproveAll && !state.approvedToolCallIds.includes(pendingToolCall.id)) {
       const awaitingApprovalRun = await this.transitionRun(run, 'awaiting_approval');
@@ -1777,6 +1804,8 @@ export class AdaptiveAgent {
     const budget = budgetGroup ? this.resolvedToolBudgets?.[budgetGroup] : undefined;
     const existingExecution = await this.options.toolExecutionStore?.getByIdempotencyKey(toolContext.idempotencyKey);
     if (existingExecution?.status === 'completed') {
+      const output = existingExecution.output ?? null;
+      const modelOutput = this.formatToolOutputForModel(run, pendingToolCall, tool, output);
       this.onToolExecutionAdmitted(run, state, budgetGroup, budget);
       this.logLifecycle('info', 'tool.execution_reused', {
         ...runLogBindings(run),
@@ -1787,12 +1816,12 @@ export class AdaptiveAgent {
           reused: true,
           rawOutputBytes:
             existingExecution.output === undefined ? undefined : approximateSerializedByteLength(existingExecution.output),
-          modelOutputBytes:
-            existingExecution.output === undefined ? undefined : modelVisibleToolOutputBytes(existingExecution.output),
+          modelOutputBytes: modelVisibleToolOutputBytes(modelOutput),
         }),
       });
       return {
-        output: existingExecution.output ?? null,
+        output,
+        modelOutput,
       };
     }
 
@@ -1810,11 +1839,13 @@ export class AdaptiveAgent {
 
       const eventInput = captureToolInputForLog(tool, pendingToolCall.input, this.defaultCaptureMode);
       const budgetOutput = budgetAdmission.output;
+      const modelOutput = this.formatToolOutputForModel(run, pendingToolCall, tool, budgetOutput);
       const performance = toolCompletionPerformanceMetrics({
         input: pendingToolCall.input,
         eventInput,
         output: budgetOutput,
         eventOutput: budgetOutput,
+        modelOutput,
         durationMs: 0,
         timeoutMs: toolTimeoutMs,
         skipped: true,
@@ -1831,6 +1862,7 @@ export class AdaptiveAgent {
 
       return {
         output: budgetOutput,
+        modelOutput,
         completion: {
           idempotencyKey: toolContext.idempotencyKey,
           output: budgetOutput,
@@ -1895,9 +1927,10 @@ export class AdaptiveAgent {
     try {
       const output = await runWithTimeout(
         toolTimeoutMs,
-        toolContext.signal,
+        toolContext,
         () => tool.execute(pendingToolCall.input, toolContext),
       );
+      const modelOutput = this.formatToolOutputForModel(run, pendingToolCall, tool, output);
 
       const durationMs = Date.now() - toolStartedAt;
       if (!emitsToolLifecycle) {
@@ -1908,6 +1941,7 @@ export class AdaptiveAgent {
           eventInput,
           output,
           eventOutput,
+          modelOutput,
           durationMs,
           timeoutMs: toolTimeoutMs,
         });
@@ -1929,6 +1963,7 @@ export class AdaptiveAgent {
         eventInput,
         output,
         eventOutput,
+        modelOutput,
         durationMs,
         timeoutMs: toolTimeoutMs,
       });
@@ -1942,6 +1977,7 @@ export class AdaptiveAgent {
 
       return {
         output,
+        modelOutput,
         completion: {
           idempotencyKey: toolContext.idempotencyKey,
           output,
@@ -1968,6 +2004,9 @@ export class AdaptiveAgent {
 
       if (!emitsToolLifecycle) {
         const eventInput = captureToolInputForLog(tool, pendingToolCall.input, this.defaultCaptureMode);
+        const recoveredModelOutput = recoveredOutput === undefined
+          ? undefined
+          : this.formatToolOutputForModel(run, pendingToolCall, tool, recoveredOutput);
         const recoveredEventOutput =
           recoveredOutput === undefined
             ? undefined
@@ -1979,6 +2018,7 @@ export class AdaptiveAgent {
           eventInput,
           output: recoveredOutput,
           eventOutput: recoveredEventOutput,
+          modelOutput: recoveredModelOutput,
           durationMs,
           timeoutMs: toolTimeoutMs,
           recovered: recoveredOutput !== undefined,
@@ -2018,8 +2058,10 @@ export class AdaptiveAgent {
       }
 
       if (recoveredOutput !== undefined) {
+        const modelOutput = this.formatToolOutputForModel(run, pendingToolCall, tool, recoveredOutput);
         return {
           output: recoveredOutput,
+          modelOutput,
           completion: {
             idempotencyKey: toolContext.idempotencyKey,
             output: recoveredOutput,
@@ -2173,7 +2215,11 @@ export class AdaptiveAgent {
 
     const pendingToolCall = state.pendingToolCalls[0];
     if (pendingToolCall) {
-      state.messages.push(toolResultMessage(pendingToolCall, resolution.output));
+      const tool = this.resolveToolDefinitionByName(pendingToolCall.name);
+      const modelOutput = tool
+        ? this.formatToolOutputForModel(run, pendingToolCall, tool, resolution.output)
+        : capModelVisibleToolResult(resolution.output, DEFAULT_MODEL_RESULT_MAX_BYTES, pendingToolCall.name);
+      state.messages.push(toolResultMessage(pendingToolCall, modelOutput));
       state.pendingToolCalls.shift();
       state.waitingOnChildRunId = undefined;
       state.stepsUsed += 1;
@@ -2264,7 +2310,28 @@ export class AdaptiveAgent {
     });
   }
 
-  private createToolContext(run: AgentRun, stepId: string, toolCallId: string): ToolContext {
+  private formatToolOutputForModel(
+    run: AgentRun,
+    pendingToolCall: PendingToolCallState,
+    tool: ToolDefinition,
+    output: JsonValue,
+  ): JsonValue {
+    const maxBytes = tool.maxModelResultBytes ?? DEFAULT_MODEL_RESULT_MAX_BYTES;
+    const formatted = tool.formatResultForModel
+      ? tool.formatResultForModel(output, {
+          toolName: tool.name,
+          runId: run.id,
+          stepId: pendingToolCall.stepId,
+          toolCallId: pendingToolCall.id,
+          input: pendingToolCall.input,
+          maxBytes,
+        })
+      : output;
+
+    return capModelVisibleToolResult(formatted, maxBytes, tool.name);
+  }
+
+  private createToolContext(run: AgentRun, stepId: string, toolCallId: string): RuntimeToolContext {
     const controller = new AbortController();
     return {
       runId: run.id,
@@ -2281,6 +2348,7 @@ export class AdaptiveAgent {
       context: run.context,
       idempotencyKey: `${run.id}:${stepId}:${toolCallId}`,
       signal: controller.signal,
+      abort: (reason?: unknown) => controller.abort(reason),
       emit: (event) => Promise.resolve(this.emit(event)),
     };
   }
@@ -2364,7 +2432,7 @@ export class AdaptiveAgent {
   }
 
   private createContinuationExecutionState(sourceState: ExecutionState, continuationBrief: JsonObject): ExecutionState {
-    const toolManifestMessage = this.buildRuntimeToolManifestMessage();
+    const toolManifestMessage = this.buildRuntimeToolManifestMessage(sourceState.visibleToolNames);
     const state = this.createExecutionState(
       [
         buildAgentSystemMessage(this.options.systemInstructions),
@@ -2381,6 +2449,7 @@ export class AdaptiveAgent {
         },
       ],
       sourceState.outputSchema,
+      sourceState.visibleToolNames,
     );
     state.stepsUsed = sourceState.stepsUsed;
     return state;
@@ -2400,7 +2469,11 @@ export class AdaptiveAgent {
     }
   }
 
-  private createExecutionState(messages: ModelMessage[], outputSchema?: JsonSchema): ExecutionState {
+  private createExecutionState(
+    messages: ModelMessage[],
+    outputSchema?: JsonSchema,
+    visibleToolNames?: string[],
+  ): ExecutionState {
     return {
       messages,
       stepsUsed: 0,
@@ -2409,6 +2482,7 @@ export class AdaptiveAgent {
       toolBudgetUsage: {},
       pendingRuntimeMessages: [],
       outputSchema,
+      visibleToolNames,
     };
   }
 
@@ -2547,10 +2621,13 @@ export class AdaptiveAgent {
     outputSchema?: JsonSchema,
     images?: ImageInput[],
     contentParts?: ModelContentPart[],
+    visibleToolNames?: string[],
   ): ExecutionState {
+    const toolManifestMessage = this.buildRuntimeToolManifestMessage(visibleToolNames);
     return this.createExecutionState(
-      buildInitialMessages(run, outputSchema, this.options.systemInstructions, this.buildRuntimeToolManifestMessage(), images, contentParts),
+      buildInitialMessages(run, outputSchema, this.options.systemInstructions, toolManifestMessage, images, contentParts),
       outputSchema,
+      visibleToolNames,
     );
   }
 
@@ -2640,15 +2717,54 @@ export class AdaptiveAgent {
     throw new Error('fileInputPolicy=read_file requires materializeFileInput for file_id sources');
   }
 
-  private buildRuntimeToolManifestMessage(): ModelMessage | undefined {
+  private buildRuntimeToolManifestMessage(visibleToolNames?: string[]): ModelMessage | undefined {
     if (this.options.defaults?.injectToolManifest === false) {
       return undefined;
     }
 
     return buildRuntimeToolManifestMessage(
-      Array.from(this.toolRegistry.values()),
+      this.filterVisibleTools(Array.from(this.toolRegistry.values()), visibleToolNames),
       this.options.model.formatToolName?.bind(this.options.model),
+      this.options.model.capabilities.toolCalling ? 'compact' : 'full',
     );
+  }
+
+  private resolveRequestedToolNames(allowedTools?: string[], forbiddenTools?: string[]): string[] | undefined {
+    if (!allowedTools && !forbiddenTools) {
+      return undefined;
+    }
+
+    const allToolNames = new Set(this.toolRegistry.keys());
+    const requested = allowedTools && allowedTools.length > 0
+      ? new Set(allowedTools)
+      : new Set(allToolNames);
+
+    for (const toolName of requested) {
+      if (!allToolNames.has(toolName)) {
+        throw new Error(`Run requested unknown allowed tool ${toolName}`);
+      }
+    }
+
+    for (const toolName of forbiddenTools ?? []) {
+      if (!allToolNames.has(toolName)) {
+        throw new Error(`Run requested unknown forbidden tool ${toolName}`);
+      }
+      requested.delete(toolName);
+    }
+
+    return Array.from(requested);
+  }
+
+  private filterVisibleTools<T extends Pick<ToolDefinition, 'name'>>(
+    tools: T[],
+    visibleToolNames?: string[],
+  ): T[] {
+    if (!visibleToolNames) {
+      return tools;
+    }
+
+    const visible = new Set(visibleToolNames);
+    return tools.filter((tool) => visible.has(tool.name));
   }
 
   private async createRunWithInitialSnapshot(
@@ -3039,7 +3155,7 @@ export class AdaptiveAgent {
   private async generateModelResponse(run: AgentRun, state: ExecutionState): Promise<ModelResponse> {
     const modelRequest = {
       messages: [...state.messages],
-      tools: this.plannerVisibleTools(),
+      tools: this.plannerVisibleTools(state),
       outputSchema: state.outputSchema,
       metadata: run.metadata,
     };
@@ -3253,8 +3369,8 @@ export class AdaptiveAgent {
     return updatedRun;
   }
 
-  private plannerVisibleTools(): Array<Pick<ToolDefinition, 'name' | 'description' | 'inputSchema'>> {
-    return this.plannerTools;
+  private plannerVisibleTools(state?: ExecutionState): Array<Pick<ToolDefinition, 'name' | 'description' | 'inputSchema'>> {
+    return this.filterVisibleTools(this.plannerTools, state?.visibleToolNames);
   }
 
   private async ensureRunStep(run: AgentRun, stepId: string): Promise<AgentRun> {
@@ -3763,23 +3879,32 @@ function buildAgentSystemMessage(systemInstructions?: string): ModelMessage {
 function buildRuntimeToolManifestMessage(
   tools: ToolDefinition[],
   formatToolName?: (name: string) => string,
+  mode: 'compact' | 'full' = 'full',
 ): ModelMessage {
   const manifest = {
     tools: tools.map((tool) => ({
       name: formatToolName ? formatToolName(tool.name) : tool.name,
       kind: tool.name.startsWith(RESERVED_DELEGATE_PREFIX) ? 'delegate' : 'tool',
       description: tool.description,
-      inputSchema: tool.inputSchema,
-      ...(tool.outputSchema ? { outputSchema: tool.outputSchema } : {}),
+      ...(mode === 'full'
+        ? {
+            inputSchema: tool.inputSchema,
+            ...(tool.outputSchema ? { outputSchema: tool.outputSchema } : {}),
+          }
+        : {}),
     })),
   };
+
+  const guidance = mode === 'full'
+    ? 'The following callable tools are available to this agent through the model tool interface. Use the exact `name` and provide input that satisfies `inputSchema`. Tools whose `kind` is `delegate` start a child run for that delegate profile.'
+    : 'The following callable tools are available through the model tool interface. Use the provider-native tool schema for arguments. Tools whose `kind` is `delegate` start a child run for that delegate profile.';
 
   return {
     role: 'system',
     content: [
       '## Available Tools and Delegates',
       '',
-      'The following callable tools are available to this agent through the model tool interface. Use the exact `name` and provide input that satisfies `inputSchema`. Tools whose `kind` is `delegate` start a child run for that delegate profile.',
+      guidance,
       '',
       '```json',
       JSON.stringify(manifest, null, 2),
@@ -4020,6 +4145,10 @@ function serializeExecutionState(state: ExecutionState): JsonObject {
     serialized.pendingRuntimeMessages = state.pendingRuntimeMessages as unknown as JsonValue;
   }
 
+  if (state.visibleToolNames) {
+    serialized.visibleToolNames = state.visibleToolNames;
+  }
+
   return serialized;
 }
 
@@ -4048,7 +4177,17 @@ function deserializeExecutionState(value: JsonValue): ExecutionState | null {
     waitingOnChildRunId: typeof value.waitingOnChildRunId === 'string' ? value.waitingOnChildRunId : undefined,
     toolBudgetUsage: deserializeToolBudgetUsage(value.toolBudgetUsage),
     pendingRuntimeMessages: deserializeModelMessages(value.pendingRuntimeMessages),
+    visibleToolNames: deserializeStringArray(value.visibleToolNames),
   };
+}
+
+function deserializeStringArray(value: JsonValue | undefined): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const entries = value.filter((entry): entry is string => typeof entry === 'string');
+  return entries.length === value.length ? entries : undefined;
 }
 
 function deserializeToolBudgetUsage(value: JsonValue | undefined): Record<string, ToolBudgetUsage> {
@@ -4922,6 +5061,7 @@ function toolCompletionPerformanceMetrics(params: {
   eventInput?: JsonValue;
   output?: JsonValue;
   eventOutput?: JsonValue;
+  modelOutput?: JsonValue;
   durationMs: number;
   timeoutMs?: number;
   skipped?: boolean;
@@ -4936,12 +5076,86 @@ function toolCompletionPerformanceMetrics(params: {
     eventInputBytes: params.eventInput === undefined ? undefined : approximateSerializedByteLength(params.eventInput),
     rawOutputBytes: params.output === undefined ? undefined : approximateSerializedByteLength(params.output),
     eventOutputBytes: params.eventOutput === undefined ? undefined : approximateSerializedByteLength(params.eventOutput),
-    modelOutputBytes: params.output === undefined ? undefined : modelVisibleToolOutputBytes(params.output),
+    modelOutputBytes:
+      params.modelOutput === undefined
+        ? params.output === undefined ? undefined : modelVisibleToolOutputBytes(params.output)
+        : modelVisibleToolOutputBytes(params.modelOutput),
   });
 }
 
 function modelVisibleToolOutputBytes(output: JsonValue): number {
   return approximateSerializedByteLength(output);
+}
+
+function capModelVisibleToolResult(output: JsonValue, maxBytes: number, toolName: string): JsonValue {
+  if (!maxBytes || maxBytes <= 0 || approximateSerializedByteLength(output) <= maxBytes) {
+    return output;
+  }
+
+  if (isJsonObjectPayload(output)) {
+    const content = output.content;
+    if (typeof content === 'string') {
+      const cappedContent = truncateUtf8String(content, Math.max(0, maxBytes - 512));
+      const capped = {
+        ...output,
+        content: cappedContent.text,
+        truncated: true,
+        bytesReturned: cappedContent.bytes,
+        bytesAvailable: Buffer.byteLength(content, 'utf8'),
+      };
+      if (approximateSerializedByteLength(capped) <= maxBytes) {
+        return capped;
+      }
+    }
+
+    const text = output.text;
+    if (typeof text === 'string') {
+      const cappedText = truncateUtf8String(text, Math.max(0, maxBytes - 512));
+      const capped = {
+        ...output,
+        text: cappedText.text,
+        truncated: true,
+        bytesReturned: cappedText.bytes,
+        bytesAvailable: Buffer.byteLength(text, 'utf8'),
+      };
+      if (approximateSerializedByteLength(capped) <= maxBytes) {
+        return capped;
+      }
+    }
+  }
+
+  const serialized = JSON.stringify(output) ?? 'null';
+  const capped = truncateUtf8String(serialized, Math.max(0, maxBytes - 512));
+  return {
+    toolName,
+    truncated: true,
+    bytesReturned: capped.bytes,
+    bytesAvailable: Buffer.byteLength(serialized, 'utf8'),
+    contentFormat: 'json',
+    content: capped.text,
+    followUp: 'Call the tool again with a narrower range, query, or objective to retrieve more detail.',
+  };
+}
+
+function truncateUtf8String(text: string, maxBytes: number): { text: string; bytes: number } {
+  if (maxBytes <= 0) {
+    return { text: '', bytes: 0 };
+  }
+
+  const buffer = Buffer.from(text, 'utf8');
+  if (buffer.byteLength <= maxBytes) {
+    return { text, bytes: buffer.byteLength };
+  }
+
+  let end = maxBytes;
+  while (end > 0 && (buffer[end] & 0b1100_0000) === 0b1000_0000) {
+    end -= 1;
+  }
+
+  return {
+    text: buffer.subarray(0, end).toString('utf8'),
+    bytes: end,
+  };
 }
 
 function createAbortTimeoutContext(timeoutMs: number): {
@@ -4975,17 +5189,21 @@ function createModelTimeoutError(timeoutMs: number, cause?: unknown): ModelTimeo
   return new ModelTimeoutError(`Model timed out after ${timeoutMs}ms`, cause === undefined ? undefined : { cause });
 }
 
-async function runWithTimeout<T>(timeoutMs: number, _signal: AbortSignal, task: () => Promise<T>): Promise<T> {
+async function runWithTimeout<T>(timeoutMs: number, context: RuntimeToolContext, task: () => Promise<T>): Promise<T> {
   if (!timeoutMs || timeoutMs <= 0) {
     return task();
   }
 
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeoutError = new ToolExecutionError(`Timed out after ${timeoutMs}ms`);
   try {
     return await Promise.race([
       task(),
       new Promise<T>((_, reject) => {
-        timeoutId = setTimeout(() => reject(new ToolExecutionError(`Timed out after ${timeoutMs}ms`)), timeoutMs);
+        timeoutId = setTimeout(() => {
+          context.abort(timeoutError);
+          reject(timeoutError);
+        }, timeoutMs);
       }),
     ]);
   } finally {

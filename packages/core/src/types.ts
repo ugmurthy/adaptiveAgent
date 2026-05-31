@@ -379,6 +379,15 @@ export interface ToolContext {
   emit: (event: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>) => Promise<void>;
 }
 
+export interface ToolResultFormatContext {
+  toolName: string;
+  runId: UUID;
+  stepId: string;
+  toolCallId: string;
+  input: JsonValue;
+  maxBytes: number;
+}
+
 export interface ToolDefinition<I extends JsonValue = JsonValue, O extends JsonValue = JsonValue> {
   name: string;
   description: string;
@@ -391,6 +400,8 @@ export interface ToolDefinition<I extends JsonValue = JsonValue, O extends JsonV
   retryPolicy?: ToolRetryPolicy;
   budgetGroup?: string;
   summarizeResult?: (output: O) => JsonValue;
+  formatResultForModel?: (output: O, context: ToolResultFormatContext) => JsonValue;
+  maxModelResultBytes?: number;
   recoverError?: (error: unknown, input: I) => O | undefined;
   execute(input: I, context: ToolContext): Promise<O>;
 }

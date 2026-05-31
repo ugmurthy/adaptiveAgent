@@ -24,6 +24,13 @@ type ReadWebPageOutput = {
   text: string;
   relevantExcerpts?: string[];
   bytesFetched: number;
+  truncated?: boolean;
+  textLength?: number;
+  maxTextLength?: number;
+  next?: {
+    url: string;
+    maxTextLength: number;
+  };
   error?: {
     kind: 'http_error' | 'network_error' | 'content_error' | 'timeout';
     message: string;
@@ -34,6 +41,7 @@ type ReadWebPageOutput = {
 const DEFAULT_MAX_SIZE = 524_288; // 512 KiB
 const DEFAULT_MAX_TEXT_LENGTH = 50_000;
 const DEFAULT_WEB_TOOL_TIMEOUT_MS = 90_000;
+const DEFAULT_MODEL_RESULT_MAX_BYTES = 32 * 1024;
 
 class RecoverableReadWebPageError extends Error {
   constructor(readonly output: ReadWebPageOutput) {
@@ -47,11 +55,13 @@ export function createReadWebPageTool(config?: ReadWebPageToolConfig): ToolDefin
   const maxTextLength = config?.maxTextLength ?? DEFAULT_MAX_TEXT_LENGTH;
   const timeoutMs = config?.timeoutMs ?? DEFAULT_WEB_TOOL_TIMEOUT_MS;
   const extractPdfText = config?.extractPdfText ?? extractPdfTextWithPdfJs;
+  const cache = new Map<string, ReadWebPageOutput>();
 
   return {
     name: 'read_web_page',
     budgetGroup: 'web_research.read',
     timeoutMs,
+    maxModelResultBytes: DEFAULT_MODEL_RESULT_MAX_BYTES,
     description:
       'Fetch a web page and extract its text content. Returns the URL, page title, and extracted text.',
     retryPolicy: {
@@ -74,10 +84,21 @@ export function createReadWebPageTool(config?: ReadWebPageToolConfig): ToolDefin
         },
       },
     },
+    summarizeResult(output) {
+      return summarizeReadWebPageOutput(output);
+    },
+    formatResultForModel(output, context) {
+      return formatReadWebPageOutputForModel(output, context.maxBytes);
+    },
     async execute(rawInput, context) {
       // Some models send tool input as a JSON string instead of an object — normalise.
       const input = typeof rawInput === 'string' ? JSON.parse(rawInput) : rawInput;
       const { url, objective, maxTextLength: perCallMaxTextLength } = input as unknown as ReadWebPageInput;
+      const cacheKey = `${context.runId}:${url}:${objective ?? ''}:${perCallMaxTextLength ?? ''}`;
+      const cached = cache.get(cacheKey);
+      if (cached) {
+        return cached;
+      }
 
       try {
         const response = await fetch(url, {
@@ -115,23 +136,30 @@ export function createReadWebPageTool(config?: ReadWebPageToolConfig): ToolDefin
           });
         }
 
-        const rawBuffer = await readResponseBodyWithinLimit(response, maxSizeBytes, url);
+        const rawBuffer = await readResponseBodyWithinLimit(response, maxSizeBytes, url, context.signal);
         const { title, text } = await extractReadableText(rawBuffer, contentType, extractPdfText);
         const relevantExcerpts = objective ? extractRelevantExcerpts(text, objective) : undefined;
         let normalizedText = text;
         const effectiveMaxTextLength = perCallMaxTextLength ?? maxTextLength;
+        const wasTruncated = normalizedText.length > effectiveMaxTextLength;
 
-        if (normalizedText.length > effectiveMaxTextLength) {
-          normalizedText = normalizedText.slice(0, effectiveMaxTextLength) + '\n[truncated]';
+        if (wasTruncated) {
+          normalizedText = `${normalizedText.slice(0, effectiveMaxTextLength)}\n[truncated]`;
         }
 
-        return {
+        const output = {
           url,
           title,
           text: normalizedText,
           ...(relevantExcerpts === undefined ? {} : { relevantExcerpts }),
           bytesFetched: rawBuffer.byteLength,
+          textLength: text.length,
+          maxTextLength: effectiveMaxTextLength,
+          truncated: wasTruncated,
+          ...(wasTruncated ? { next: { url, maxTextLength: Math.min(text.length, effectiveMaxTextLength * 2) } } : {}),
         } satisfies ReadWebPageOutput;
+        cache.set(cacheKey, output);
+        return output;
       } catch (error) {
         throw normalizeReadWebPageError(error, url);
       }
@@ -139,6 +167,64 @@ export function createReadWebPageTool(config?: ReadWebPageToolConfig): ToolDefin
     recoverError(error, input) {
       const { url } = input;
       return normalizeReadWebPageError(error, url).output;
+    },
+  };
+}
+
+function summarizeReadWebPageOutput(output: ReadWebPageOutput): unknown {
+  if (typeof output.text !== 'string') {
+    return output;
+  }
+
+  return {
+    url: output.url,
+    title: output.title,
+    bytesFetched: output.bytesFetched,
+    textBytes: Buffer.byteLength(output.text, 'utf8'),
+    textLength: output.textLength ?? output.text.length,
+    truncated: output.truncated ?? false,
+    relevantExcerptCount: output.relevantExcerpts?.length ?? 0,
+    ...(output.error === undefined
+      ? {}
+      : {
+          error: {
+            kind: output.error.kind,
+            message: output.error.message,
+            ...(output.error.status === undefined ? {} : { status: output.error.status }),
+          },
+        }),
+    ...(output.next === undefined ? {} : { next: output.next }),
+  };
+}
+
+function formatReadWebPageOutputForModel(output: ReadWebPageOutput, maxBytes: number): unknown {
+  if (typeof output.text !== 'string') {
+    return output;
+  }
+
+  if (output.relevantExcerpts && output.relevantExcerpts.length > 0) {
+    return {
+      ...output,
+      text: output.relevantExcerpts.join('\n\n'),
+      modelView: 'relevant_excerpts',
+    };
+  }
+
+  const textBytes = Buffer.byteLength(output.text, 'utf8');
+  if (textBytes <= maxBytes) {
+    return output;
+  }
+
+  const capped = truncateUtf8(output.text, Math.max(0, maxBytes - 512));
+  return {
+    ...output,
+    text: capped.text,
+    truncated: true,
+    bytesReturned: capped.bytes,
+    bytesAvailable: textBytes,
+    next: output.next ?? {
+      url: output.url,
+      maxTextLength: Math.min(output.textLength ?? output.text.length, (output.maxTextLength ?? output.text.length) * 2),
     },
   };
 }
@@ -177,7 +263,13 @@ function parseContentLength(value: string | null): number | undefined {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
-async function readResponseBodyWithinLimit(response: Response, maxSizeBytes: number, url: string): Promise<ArrayBuffer> {
+async function readResponseBodyWithinLimit(
+  response: Response,
+  maxSizeBytes: number,
+  url: string,
+  signal?: AbortSignal,
+): Promise<ArrayBuffer> {
+  signal?.throwIfAborted();
   if (!response.body) {
     const rawBuffer = await response.arrayBuffer();
     if (rawBuffer.byteLength > maxSizeBytes) {
@@ -196,6 +288,7 @@ async function readResponseBodyWithinLimit(response: Response, maxSizeBytes: num
   let totalBytes = 0;
 
   while (true) {
+    signal?.throwIfAborted();
     const { done, value } = await reader.read();
     if (done) {
       break;
@@ -226,6 +319,23 @@ async function readResponseBodyWithinLimit(response: Response, maxSizeBytes: num
   }
 
   return merged.buffer;
+}
+
+function truncateUtf8(text: string, maxBytes: number): { text: string; bytes: number } {
+  const source = Buffer.from(text, 'utf8');
+  if (source.byteLength <= maxBytes) {
+    return { text, bytes: source.byteLength };
+  }
+
+  let end = Math.max(0, maxBytes);
+  while (end > 0 && (source[end] & 0b1100_0000) === 0b1000_0000) {
+    end -= 1;
+  }
+
+  return {
+    text: source.subarray(0, end).toString('utf8'),
+    bytes: end,
+  };
 }
 
 function extractTitle(html: string): string {

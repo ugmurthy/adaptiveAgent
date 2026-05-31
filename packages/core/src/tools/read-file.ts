@@ -31,12 +31,23 @@ export interface ReadFileToolConfig {
 
 interface ReadFileInput {
   path: string;
+  lineStart?: number;
+  lineEnd?: number;
+  offsetBytes?: number;
+  maxBytes?: number;
 }
 
 interface ReadFileOutput {
   path: string;
   content: string;
   sizeBytes: number;
+  truncated?: boolean;
+  bytesReturned?: number;
+  bytesAvailable?: number;
+  lineStart?: number;
+  lineEnd?: number;
+  totalLines?: number;
+  next?: Partial<ReadFileInput>;
 }
 
 const DEFAULT_MAX_SIZE = 10 * 1_048_576; // 10 MiB
@@ -44,6 +55,7 @@ const DEFAULT_PARQUET_MAX_ROWS = 50;
 const DEFAULT_PARQUET_MAX_CELL_LENGTH = 500;
 const DEFAULT_ZIP_MAX_ENTRIES = 100;
 const DEFAULT_ZIP_MAX_ENTRY_SIZE = 1_048_576; // 1 MiB
+const DEFAULT_MODEL_RESULT_MAX_BYTES = 32 * 1024;
 const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
 
 export interface ParquetExtractionOptions {
@@ -54,6 +66,172 @@ export interface ParquetExtractionOptions {
 export interface ZipExtractionOptions {
   maxEntries: number;
   maxEntrySizeBytes: number;
+}
+
+function summarizeReadFileOutput(output: ReadFileOutput): unknown {
+  if (typeof output.content !== 'string') {
+    return output;
+  }
+
+  return {
+    path: output.path,
+    sizeBytes: output.sizeBytes,
+    contentBytes: Buffer.byteLength(output.content, 'utf8'),
+    truncated: output.truncated ?? false,
+    ...(output.bytesReturned === undefined ? {} : { bytesReturned: output.bytesReturned }),
+    ...(output.bytesAvailable === undefined ? {} : { bytesAvailable: output.bytesAvailable }),
+    ...(output.lineStart === undefined ? {} : { lineStart: output.lineStart }),
+    ...(output.lineEnd === undefined ? {} : { lineEnd: output.lineEnd }),
+    ...(output.totalLines === undefined ? {} : { totalLines: output.totalLines }),
+    ...(output.next === undefined ? {} : { next: output.next }),
+  };
+}
+
+function formatReadFileOutputForModel(output: ReadFileOutput, maxBytes: number): unknown {
+  if (typeof output.content !== 'string') {
+    return output;
+  }
+
+  const contentBytes = Buffer.byteLength(output.content, 'utf8');
+  if (contentBytes <= maxBytes) {
+    return output;
+  }
+
+  const capped = truncateUtf8(output.content, Math.max(0, maxBytes - 512));
+  return {
+    ...output,
+    content: capped.text,
+    truncated: true,
+    bytesReturned: capped.bytes,
+    bytesAvailable: output.bytesAvailable ?? contentBytes,
+    next: output.next ?? {
+      path: output.path,
+      offsetBytes: capped.bytes,
+      maxBytes,
+    },
+  };
+}
+
+function applyReadRange(content: string, input: ReadFileInput): Omit<ReadFileOutput, 'path' | 'sizeBytes'> {
+  const fullBytes = Buffer.byteLength(content, 'utf8');
+  const hasLineRange = input.lineStart !== undefined || input.lineEnd !== undefined;
+  if (hasLineRange) {
+    const lines = content.split(/\r?\n/);
+    const lineStart = normalizePositiveInteger(input.lineStart, 1);
+    const lineEnd = Math.min(
+      normalizePositiveInteger(input.lineEnd, lines.length),
+      lines.length,
+    );
+    if (lineStart > lineEnd) {
+      return {
+        content: '',
+        truncated: lineEnd < lines.length,
+        bytesReturned: 0,
+        bytesAvailable: fullBytes,
+        lineStart,
+        lineEnd,
+        totalLines: lines.length,
+      };
+    }
+
+    const selected = lines.slice(lineStart - 1, lineEnd).join('\n');
+    return {
+      content: selected,
+      truncated: lineStart > 1 || lineEnd < lines.length,
+      bytesReturned: Buffer.byteLength(selected, 'utf8'),
+      bytesAvailable: fullBytes,
+      lineStart,
+      lineEnd,
+      totalLines: lines.length,
+      ...(lineEnd < lines.length
+        ? {
+            next: {
+              path: input.path,
+              lineStart: lineEnd + 1,
+              lineEnd: Math.min(lines.length, lineEnd + (lineEnd - lineStart + 1)),
+            },
+          }
+        : {}),
+    };
+  }
+
+  const offsetBytes = normalizeNonNegativeInteger(input.offsetBytes, 0);
+  const maxBytes = input.maxBytes === undefined ? undefined : normalizePositiveInteger(input.maxBytes, fullBytes);
+  if (offsetBytes === 0 && maxBytes === undefined) {
+    return {
+      content,
+      bytesReturned: fullBytes,
+      bytesAvailable: fullBytes,
+      truncated: false,
+    };
+  }
+
+  const source = Buffer.from(content, 'utf8');
+  const start = Math.min(offsetBytes, source.byteLength);
+  const end = maxBytes === undefined ? source.byteLength : Math.min(source.byteLength, start + maxBytes);
+  const selected = source.subarray(adjustUtf8Start(source, start), adjustUtf8End(source, end));
+  const selectedText = selected.toString('utf8');
+  const truncated = start > 0 || end < source.byteLength;
+  return {
+    content: selectedText,
+    truncated,
+    bytesReturned: selected.byteLength,
+    bytesAvailable: source.byteLength,
+    ...(truncated && end < source.byteLength
+      ? {
+          next: {
+            path: input.path,
+            offsetBytes: end,
+            ...(maxBytes === undefined ? {} : { maxBytes }),
+          },
+        }
+      : {}),
+  };
+}
+
+function normalizePositiveInteger(value: number | undefined, fallback: number): number {
+  if (value === undefined || !Number.isFinite(value)) {
+    return fallback;
+  }
+
+  return Math.max(1, Math.floor(value));
+}
+
+function normalizeNonNegativeInteger(value: number | undefined, fallback: number): number {
+  if (value === undefined || !Number.isFinite(value)) {
+    return fallback;
+  }
+
+  return Math.max(0, Math.floor(value));
+}
+
+function truncateUtf8(text: string, maxBytes: number): { text: string; bytes: number } {
+  const source = Buffer.from(text, 'utf8');
+  if (source.byteLength <= maxBytes) {
+    return { text, bytes: source.byteLength };
+  }
+
+  const end = adjustUtf8End(source, Math.max(0, maxBytes));
+  return {
+    text: source.subarray(0, end).toString('utf8'),
+    bytes: end,
+  };
+}
+
+function adjustUtf8Start(buffer: Buffer, start: number): number {
+  let index = Math.min(Math.max(0, start), buffer.byteLength);
+  while (index < buffer.byteLength && (buffer[index] & 0b1100_0000) === 0b1000_0000) {
+    index += 1;
+  }
+  return index;
+}
+
+function adjustUtf8End(buffer: Buffer, end: number): number {
+  let index = Math.min(Math.max(0, end), buffer.byteLength);
+  while (index > 0 && (buffer[index] & 0b1100_0000) === 0b1000_0000) {
+    index -= 1;
+  }
+  return index;
 }
 
 const DIRECT_TEXT_EXTENSIONS = new Set([
@@ -129,7 +307,8 @@ export function createReadFileTool(config?: ReadFileToolConfig): ToolDefinition 
   return {
     name: 'read_file',
     description:
-      'Read the textual content of a file at the given path. Uses pandoc for supported document and spreadsheet formats.',
+      'Read the textual content of a file at the given path. Supports optional line or byte ranges. Uses pandoc for supported document and spreadsheet formats.',
+    maxModelResultBytes: DEFAULT_MODEL_RESULT_MAX_BYTES,
     retryPolicy: {
       retryable: true,
       retryOn: ['timeout', 'network', 'not_found', 'unknown'],
@@ -140,7 +319,29 @@ export function createReadFileTool(config?: ReadFileToolConfig): ToolDefinition 
       additionalProperties: false,
       properties: {
         path: { type: 'string', description: 'Absolute or relative file path to read.' },
+        lineStart: {
+          type: 'number',
+          description: 'Optional 1-based first line to return for text content.',
+        },
+        lineEnd: {
+          type: 'number',
+          description: 'Optional 1-based last line to return for text content.',
+        },
+        offsetBytes: {
+          type: 'number',
+          description: 'Optional UTF-8 byte offset to start returning content from.',
+        },
+        maxBytes: {
+          type: 'number',
+          description: 'Optional maximum UTF-8 bytes of text content to return.',
+        },
       },
+    },
+    summarizeResult(output) {
+      return summarizeReadFileOutput(output as ReadFileOutput);
+    },
+    formatResultForModel(output, context) {
+      return formatReadFileOutputForModel(output as ReadFileOutput, context.maxBytes);
     },
     recoverError(error, input) {
       const filePath = typeof input === 'object' && input !== null && 'path' in input && typeof input.path === 'string'
@@ -155,7 +356,8 @@ export function createReadFileTool(config?: ReadFileToolConfig): ToolDefinition 
     async execute(rawInput, context) {
       // Some models send tool input as a JSON string instead of an object — normalise.
       const input = typeof rawInput === 'string' ? JSON.parse(rawInput) : rawInput;
-      const { path: filePath } = input as unknown as ReadFileInput;
+      const readInput = input as unknown as ReadFileInput;
+      const { path: filePath } = readInput;
       const zipPath = parseZipMemberPath(filePath);
       const resolved = resolvePathWithinRoot(allowedRoot, zipPath?.archivePath ?? filePath);
 
@@ -180,10 +382,11 @@ export function createReadFileTool(config?: ReadFileToolConfig): ToolDefinition 
         context?.signal,
         zipPath?.entryPath,
       );
+      const ranged = applyReadRange(content, readInput);
 
       return {
         path: zipPath ? `${resolved}#${zipPath.entryPath}` : resolved,
-        content,
+        ...ranged,
         sizeBytes: contentBuffer.byteLength,
       } satisfies ReadFileOutput as unknown as ReturnType<ToolDefinition['execute']>;
     },
@@ -209,10 +412,12 @@ async function readContentAsText(
   }
 
   if (extension === '.pdf') {
+    signal?.throwIfAborted();
     const extracted = await extractPdfText(contentBuffer.buffer.slice(
       contentBuffer.byteOffset,
       contentBuffer.byteOffset + contentBuffer.byteLength,
     ));
+    signal?.throwIfAborted();
     return extracted.text;
   }
 
@@ -480,6 +685,7 @@ async function defaultExtractWithPandoc(
   inputFormat: string,
   signal?: AbortSignal,
 ): Promise<string> {
+  signal?.throwIfAborted();
   const args = ['--from', inputFormat, '--to', 'markdown', '--wrap=none', filePath];
 
   return new Promise<string>((resolve, reject) => {
@@ -492,6 +698,7 @@ async function defaultExtractWithPandoc(
 
     const abortHandler = () => {
       child.kill('SIGTERM');
+      reject(signal?.reason instanceof Error ? signal.reason : new Error('Operation aborted'));
     };
 
     signal?.addEventListener('abort', abortHandler, { once: true });
