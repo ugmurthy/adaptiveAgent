@@ -1,10 +1,12 @@
 import { readFile, stat } from 'node:fs/promises';
 import { extname } from 'node:path';
 
+import { compactJsonObject, encodedByteLength } from '../logging.js';
 import type {
   AudioInput,
   FileInput,
   ImageInput,
+  JsonObject,
   InputSourceKind,
   JsonSchema,
   JsonValue,
@@ -283,13 +285,21 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
     const body = await this.buildRequestBody(request);
     const headers = this.buildHeaders();
     const url = `${this.baseUrl}/chat/completions`;
+    const bodyJson = JSON.stringify(body);
+    const requestBytes = encodedByteLength(bodyJson);
 
     let attempt = 0;
+    let totalGateWaitMs = 0;
+    let totalRetryDelayMs = 0;
     while (true) {
       let retryDelayMs: number | undefined;
       let release: (() => void) | undefined;
+      const gateWaitStartedAt = Date.now();
+      let responseLatencyMs: number | undefined;
+      let responseStatusCode: number | undefined;
       try {
         release = await this.requestGate.acquire(request.signal);
+        totalGateWaitMs += Date.now() - gateWaitStartedAt;
       } catch (error) {
         throw withModelInvocationDiagnostics(error, {
           modelInvocationPhase: 'gate_wait',
@@ -299,12 +309,15 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
       try {
         let response: Response;
         try {
+          const requestStartedAt = Date.now();
           response = await fetch(url, {
             method: 'POST',
             headers,
-            body: JSON.stringify(body),
+            body: bodyJson,
             signal: request.signal,
           });
+          responseLatencyMs = Date.now() - requestStartedAt;
+          responseStatusCode = response.status;
         } catch (error) {
           throw withModelInvocationDiagnostics(error, {
             modelInvocationPhase: 'http_request',
@@ -321,8 +334,10 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
         }
 
         let data: OpenAIChatCompletionResponse;
+        let responseText = '';
         try {
-          data = (await response.json()) as OpenAIChatCompletionResponse;
+          responseText = await response.text();
+          data = JSON.parse(responseText) as OpenAIChatCompletionResponse;
         } catch (error) {
           throw withModelInvocationDiagnostics(error, {
             modelInvocationPhase: 'response_body',
@@ -330,14 +345,42 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
             modelInvocationStatusCode: response.status,
           });
         }
-        return this.parseResponse(data);
+        const parsed = this.parseResponse(data);
+        return {
+          ...parsed,
+          performance: compactJsonObject({
+            ...(parsed.performance ?? {}),
+            adapterGateWaitMs: totalGateWaitMs,
+            adapterAttemptCount: attempt + 1,
+            adapterRetryDelayMs: totalRetryDelayMs,
+            adapterResponseLatencyMs: responseLatencyMs,
+            adapterStatusCode: response.status,
+            adapterRequestBytes: requestBytes,
+            adapterResponseBytes: encodedByteLength(responseText),
+          }),
+        };
       } catch (error) {
         retryDelayMs = getRetryDelayMs(error, attempt);
         if (retryDelayMs === undefined || isAbortError(error) || request.signal?.aborted) {
           throw error;
         }
 
-        await emitRetryEvent(request, error, attempt, retryDelayMs);
+        await emitRetryEvent(
+          request,
+          error,
+          attempt,
+          retryDelayMs,
+          compactJsonObject({
+            adapterGateWaitMs: totalGateWaitMs,
+            adapterAttemptCount: attempt + 1,
+            adapterRetryDelayMs: retryDelayMs,
+            adapterTotalRetryDelayMs: totalRetryDelayMs + retryDelayMs,
+            adapterResponseLatencyMs: responseLatencyMs,
+            adapterStatusCode: responseStatusCode,
+            adapterRequestBytes: requestBytes,
+          }),
+        );
+        totalRetryDelayMs += retryDelayMs;
         this.requestGate.imposeCooldown(retryDelayMs);
       } finally {
         release?.();
@@ -491,6 +534,7 @@ async function emitRetryEvent(
   error: unknown,
   attempt: number,
   retryDelayMs: number,
+  performance: JsonObject,
 ): Promise<void> {
   if (!(error instanceof ModelRequestError)) {
     return;
@@ -504,6 +548,7 @@ async function emitRetryEvent(
     reason: error.statusCode === 429 ? 'rate_limit' : 'provider_error',
     phase: 'http_status',
     message: error.message,
+    performance,
   });
 }
 

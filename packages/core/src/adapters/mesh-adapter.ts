@@ -1,5 +1,6 @@
 import { MeshAPI, MeshAPIApiError } from 'meshapi-node-sdk';
 
+import { approximateSerializedByteLength, compactJsonObject } from '../logging.js';
 import type { ModelRequest, ModelResponse } from '../types.js';
 import { BaseOpenAIChatAdapter, MAX_LOCAL_AUDIO_BYTES, type BaseOpenAIChatAdapterConfig } from './base-openai-chat-adapter.js';
 
@@ -48,6 +49,7 @@ export class MeshAdapter extends BaseOpenAIChatAdapter {
   override async generate(request: ModelRequest): Promise<ModelResponse> {
     const body = await this.buildRequestBody(request);
     let completion;
+    const startedAt = Date.now();
     try {
       completion = await this.client.chat.completions.create(
         {
@@ -60,7 +62,17 @@ export class MeshAdapter extends BaseOpenAIChatAdapter {
       throw enrichMeshError(error);
     }
 
-    return this.parseResponse(completion as never);
+    const parsed = this.parseResponse(completion as never);
+    return {
+      ...parsed,
+      performance: compactJsonObject({
+        ...(parsed.performance ?? {}),
+        adapterAttemptCount: 1,
+        adapterResponseLatencyMs: Date.now() - startedAt,
+        adapterRequestBytes: approximateSerializedByteLength(body),
+        adapterResponseBytes: approximateSerializedByteLength(completion),
+      }),
+    };
   }
 }
 

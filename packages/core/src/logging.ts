@@ -1,6 +1,17 @@
-import type { AgentRun, ModelContentPart, ModelMessage, ModelRequest, ModelResponse, RunResult, ToolDefinition } from './types.js';
+import type {
+  AgentRun,
+  JsonObject,
+  ModelContentPart,
+  ModelMessage,
+  ModelRequest,
+  ModelResponse,
+  RunResult,
+  ToolDefinition,
+} from './types.js';
 
 import { captureValueForLog, summarizeValueForLog } from './logger.js';
+
+const textEncoder = new TextEncoder();
 
 export function runLogBindings(run: Pick<AgentRun, 'id' | 'rootRunId' | 'parentRunId' | 'delegateName' | 'delegationDepth'>) {
   return {
@@ -19,6 +30,7 @@ export function summarizeModelRequestForLog(request: ModelRequest) {
     toolNames: request.tools?.map((tool) => tool.name) ?? [],
     outputSchema: request.outputSchema ? summarizeValueForLog(request.outputSchema) : undefined,
     metadata: captureValueForLog(request.metadata),
+    performance: modelRequestPerformanceMetrics(request),
   };
 }
 
@@ -37,7 +49,76 @@ export function summarizeModelResponseForLog(response: ModelResponse) {
     structuredOutput:
       response.structuredOutput === undefined ? undefined : summarizeValueForLog(response.structuredOutput),
     usage: response.usage ? captureValueForLog(response.usage, { mode: 'full' }) : undefined,
+    performance: modelResponsePerformanceMetrics(response),
   };
+}
+
+export function modelRequestPerformanceMetrics(request: ModelRequest): JsonObject {
+  const requestPayload = {
+    messages: request.messages,
+    tools: request.tools,
+    outputSchema: request.outputSchema,
+    metadata: request.metadata,
+  };
+
+  return compactJsonObject({
+    messageCount: request.messages.length,
+    toolCount: request.tools?.length ?? 0,
+    requestBytes: approximateSerializedByteLength(requestPayload),
+    messageBytes: approximateSerializedByteLength(request.messages),
+    toolDefinitionBytes: request.tools ? approximateSerializedByteLength(request.tools) : 0,
+    outputSchemaBytes: request.outputSchema ? approximateSerializedByteLength(request.outputSchema) : 0,
+  });
+}
+
+export function modelResponsePerformanceMetrics(response: ModelResponse): JsonObject {
+  const metrics = compactJsonObject({
+    responseBytes: approximateSerializedByteLength({
+      text: response.text,
+      structuredOutput: response.structuredOutput,
+      toolCalls: response.toolCalls,
+      finishReason: response.finishReason,
+      usage: response.usage,
+      providerResponseId: response.providerResponseId,
+      summary: response.summary,
+      reasoning: response.reasoning,
+      reasoningDetails: response.reasoningDetails,
+    }),
+    textBytes: response.text === undefined ? 0 : encodedByteLength(response.text),
+    structuredOutputBytes: response.structuredOutput === undefined ? 0 : approximateSerializedByteLength(response.structuredOutput),
+    toolCallCount: response.toolCalls?.length ?? 0,
+    toolCallInputBytes: response.toolCalls ? approximateSerializedByteLength(response.toolCalls.map((toolCall) => toolCall.input)) : 0,
+    reasoningBytes: response.reasoning === undefined ? 0 : encodedByteLength(response.reasoning),
+  });
+
+  if (isJsonObject(response.performance)) {
+    metrics.adapter = response.performance;
+  }
+
+  return metrics;
+}
+
+export function approximateSerializedByteLength(value: unknown): number {
+  const serialized = safeJsonStringify(value);
+  return serialized === undefined ? 0 : encodedByteLength(serialized);
+}
+
+export function encodedByteLength(value: string): number {
+  return textEncoder.encode(value).byteLength;
+}
+
+export function compactJsonObject(values: Record<string, unknown>): JsonObject {
+  const result: JsonObject = {};
+  for (const [key, value] of Object.entries(values)) {
+    if (value === undefined) {
+      continue;
+    }
+
+    if (isJsonValue(value)) {
+      result[key] = value;
+    }
+  }
+  return result;
 }
 
 export function captureToolInputForLog(tool: ToolDefinition, input: unknown, fallbackMode: 'full' | 'summary' | 'none') {
@@ -149,4 +230,37 @@ function summarizeInputSourceForLog(source: { kind: string; path?: string; url?:
     url: source.url,
     fileId: source.fileId,
   };
+}
+
+function safeJsonStringify(value: unknown): string | undefined {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function isJsonObject(value: unknown): value is JsonObject {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isJsonValue(value: unknown): value is JsonObject[keyof JsonObject] {
+  if (value === null) {
+    return true;
+  }
+
+  switch (typeof value) {
+    case 'string':
+    case 'number':
+    case 'boolean':
+      return Number.isFinite(value) || typeof value !== 'number';
+    case 'object':
+      if (Array.isArray(value)) {
+        return value.every(isJsonValue);
+      }
+
+      return Object.values(value).every(isJsonValue);
+    default:
+      return false;
+  }
 }

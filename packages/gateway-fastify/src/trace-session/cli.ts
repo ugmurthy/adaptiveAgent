@@ -13,20 +13,22 @@ import {
 } from '../postgres.js';
 
 import { DEFAULT_TRACE_CONFIG_PATH, USAGE } from './constants.js';
-import { listSessionlessRuns, listSessions, loadUsageForTraceTarget, traceSession } from './data.js';
+import { listSessionlessRuns, listSessionPerformance, listSessions, loadUsageForTraceTarget, traceSession } from './data.js';
 import {
   renderDeleteEmptyGoalSessionsSql,
+  renderSessionPerformanceList,
   renderSessionList,
   renderSessionlessRunList,
   renderTraceReport,
   renderUsageReport,
 } from './render.js';
-import type { CliOptions, MessageView, ReportView, SessionListItem, SessionUsageSummary, SessionlessRunListItem, TraceReport } from './types.js';
+import type { CliOptions, MessageView, ReportView, SessionListItem, SessionPerformanceListItem, SessionUsageSummary, SessionlessRunListItem, TraceReport } from './types.js';
 
 export function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
     json: false,
     listSessions: false,
+    listPerformance: false,
     listSessionless: false,
     deleteEmptyGoalSessions: false,
     usageOnly: false,
@@ -52,6 +54,9 @@ export function parseArgs(args: string[]): CliOptions {
         break;
       case '--ls':
         options.listSessions = true;
+        break;
+      case '--lsp':
+        options.listPerformance = true;
         break;
       case '--ls-sessionless':
         options.listSessionless = true;
@@ -129,17 +134,17 @@ export async function main(): Promise<void> {
       console.log(USAGE);
       return;
     }
-    if (!options.listSessions && !options.listSessionless && !options.deleteEmptyGoalSessions && !options.sessionId && !options.rootRunId && !options.runId) {
+    if (!options.listSessions && !options.listPerformance && !options.listSessionless && !options.deleteEmptyGoalSessions && !options.sessionId && !options.rootRunId && !options.runId) {
       throw new Error(`Missing session id, --root-run, or --run.\n\n${USAGE}`);
     }
-    if ((options.listSessions || options.listSessionless || options.deleteEmptyGoalSessions) && options.sessionId) {
-      throw new Error(`--ls, --ls-sessionless, and --delete do not accept a session id.\n\n${USAGE}`);
+    if ((options.listSessions || options.listPerformance || options.listSessionless || options.deleteEmptyGoalSessions) && options.sessionId) {
+      throw new Error(`--ls, --lsp, --ls-sessionless, and --delete do not accept a session id.\n\n${USAGE}`);
     }
-    if ((options.listSessions || options.listSessionless || options.deleteEmptyGoalSessions) && (options.rootRunId || options.runId)) {
-      throw new Error(`--ls, --ls-sessionless, and --delete do not accept --root-run or --run.\n\n${USAGE}`);
+    if ((options.listSessions || options.listPerformance || options.listSessionless || options.deleteEmptyGoalSessions) && (options.rootRunId || options.runId)) {
+      throw new Error(`--ls, --lsp, --ls-sessionless, and --delete do not accept --root-run or --run.\n\n${USAGE}`);
     }
-    if ([options.listSessions, options.listSessionless, options.deleteEmptyGoalSessions].filter(Boolean).length > 1) {
-      throw new Error(`Choose only one of --ls, --ls-sessionless, or --delete.\n\n${USAGE}`);
+    if ([options.listSessions, options.listPerformance, options.listSessionless, options.deleteEmptyGoalSessions].filter(Boolean).length > 1) {
+      throw new Error(`Choose only one of --ls, --lsp, --ls-sessionless, or --delete.\n\n${USAGE}`);
     }
     if (options.sessionId && options.runId) {
       throw new Error(`--run cannot be combined with a session id. Use --root-run to restrict a session trace.\n\n${USAGE}`);
@@ -147,14 +152,14 @@ export async function main(): Promise<void> {
     if (options.rootRunId && options.runId) {
       throw new Error(`Choose either --root-run or --run, not both.\n\n${USAGE}`);
     }
-    if ((options.listSessions || options.listSessionless || options.deleteEmptyGoalSessions || options.usageOnly) && (options.messages || options.systemOnly)) {
+    if ((options.listSessions || options.listPerformance || options.listSessionless || options.deleteEmptyGoalSessions || options.usageOnly) && (options.messages || options.systemOnly)) {
       throw new Error(`--messages and --system-only can only be used when rendering a full trace.\n\n${USAGE}`);
     }
-    if ((options.listSessions || options.listSessionless || options.deleteEmptyGoalSessions || options.usageOnly) && (options.view || options.messagesView || options.focusRunId)) {
+    if ((options.listSessions || options.listPerformance || options.listSessionless || options.deleteEmptyGoalSessions || options.usageOnly) && (options.view || options.messagesView || options.focusRunId)) {
       throw new Error(`--view, --messages-view, and --focus-run can only be used when rendering a full trace.\n\n${USAGE}`);
     }
     if ((options.listSessionless || options.deleteEmptyGoalSessions || options.usageOnly) && options.previewChars) {
-      throw new Error(`--preview-chars can only be used with --ls or when rendering a full trace.\n\n${USAGE}`);
+      throw new Error(`--preview-chars can only be used with --ls, --lsp, or when rendering a full trace.\n\n${USAGE}`);
     }
     if (options.usageOnly && options.sessionId && options.rootRunId) {
       throw new Error(`--usage prints all linked root runs for a session and does not accept --root-run.\n\n${USAGE}`);
@@ -166,7 +171,13 @@ export async function main(): Promise<void> {
       throw new Error(`trace-session requires gateway stores.kind = "postgres" in ${loaded.path}.`);
     }
 
-    if (options.listSessions || options.listSessionless || options.deleteEmptyGoalSessions) {
+    if (options.listSessions || options.listPerformance || options.listSessionless || options.deleteEmptyGoalSessions) {
+      if (options.listPerformance) {
+        const items = await runListSessionPerformanceWithPasswordRetry(storeConfig);
+        console.log(renderSessionPerformanceList(items, options));
+        return;
+      }
+
       if (options.listSessionless) {
         const runs = await runListSessionlessRunsWithPasswordRetry(storeConfig);
         console.log(renderSessionlessRunList(runs, options));
@@ -239,6 +250,33 @@ async function runListSessionsWithPasswordRetry(config: Extract<GatewayStoreConf
     pool = createGatewayPostgresPool(config, { password });
     try {
       return await listSessions(pool);
+    } finally {
+      await pool.end();
+    }
+  } finally {
+    if (shouldEndPool) {
+      await pool.end();
+    }
+  }
+}
+
+async function runListSessionPerformanceWithPasswordRetry(config: Extract<GatewayStoreConfig, { kind: 'postgres' }>): Promise<SessionPerformanceListItem[]> {
+  let pool = await createTraceSessionPostgresPool(config);
+  let shouldEndPool = true;
+
+  try {
+    return await listSessionPerformance(pool);
+  } catch (error) {
+    if (!isPostgresPasswordAuthFailure(error)) {
+      throw error;
+    }
+
+    await pool.end();
+    shouldEndPool = false;
+    const password = await promptHidden('Postgres password: ');
+    pool = createGatewayPostgresPool(config, { password });
+    try {
+      return await listSessionPerformance(pool);
     } finally {
       await pool.end();
     }
@@ -410,10 +448,10 @@ function requireValue(option: string, value: string | undefined): string {
 }
 
 function parseReportView(value: string): ReportView {
-  if (value === 'overview' || value === 'milestones' || value === 'timeline' || value === 'delegates' || value === 'messages' || value === 'plans' || value === 'all') {
+  if (value === 'overview' || value === 'performance' || value === 'milestones' || value === 'timeline' || value === 'delegates' || value === 'messages' || value === 'plans' || value === 'all') {
     return value;
   }
-  throw new Error(`Invalid --view value: ${value}. Expected one of overview, milestones, timeline, delegates, messages, plans, or all.`);
+  throw new Error(`Invalid --view value: ${value}. Expected one of overview, performance, milestones, timeline, delegates, messages, plans, or all.`);
 }
 
 function parseMessageView(value: string): MessageView {

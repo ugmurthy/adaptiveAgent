@@ -7,8 +7,12 @@ import { pipeline } from 'node:stream/promises';
 
 import { DelegationError, DelegationExecutor, type ExecuteChildRunRequest, type ParentResumeResult } from './delegation-executor.js';
 import {
+  approximateSerializedByteLength,
   captureToolInputForLog,
   captureToolOutputForLog,
+  compactJsonObject,
+  modelRequestPerformanceMetrics,
+  modelResponsePerformanceMetrics,
   runLogBindings,
   summarizeModelRequestForLog,
   summarizeModelResponseForLog,
@@ -513,13 +517,16 @@ export class AdaptiveAgent {
         const eventInput = captureToolInputForLog(tool, input, this.defaultCaptureMode);
         const toolCallId = `plan:${currentExecution.id}:${step.id}`;
         const toolContext = this.createToolContext(currentRun, step.id, toolCallId);
+        const toolTimeoutMs = tool.timeoutMs ?? this.defaults.toolTimeoutMs;
         const toolStartedAt = Date.now();
         let recoveredToolFailure = false;
+        const startedPerformance = toolStartPerformanceMetrics({ input, eventInput, timeoutMs: toolTimeoutMs });
 
         this.logToolStarted(currentRun, step.id, tool, input, {
           planId: plan.id,
           planExecutionId: currentExecution.id,
           stepIndex: index,
+          performance: startedPerformance,
         });
 
         await this.emit({
@@ -534,17 +541,34 @@ export class AdaptiveAgent {
             planId: plan.id,
             planExecutionId: currentExecution.id,
             ...(eventInput === undefined ? {} : { input: eventInput }),
+            performance: startedPerformance,
           },
         });
 
         try {
-          lastOutput = await runWithTimeout(tool.timeoutMs ?? this.defaults.toolTimeoutMs, toolContext.signal, () =>
+          lastOutput = await runWithTimeout(toolTimeoutMs, toolContext.signal, () =>
             tool.execute(input, toolContext),
           );
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           const recoveredOutput = recoverToolError(tool, error, input);
-          this.logToolFailed(currentRun, step.id, tool, input, error, Date.now() - toolStartedAt, {
+          const durationMs = Date.now() - toolStartedAt;
+          const recoveredEventOutput =
+            recoveredOutput === undefined
+              ? undefined
+              : tool.summarizeResult
+                ? tool.summarizeResult(recoveredOutput)
+                : recoveredOutput;
+          const failurePerformance = toolCompletionPerformanceMetrics({
+            input,
+            eventInput,
+            output: recoveredOutput,
+            eventOutput: recoveredEventOutput,
+            durationMs,
+            timeoutMs: toolTimeoutMs,
+            recovered: recoveredOutput !== undefined,
+          });
+          this.logToolFailed(currentRun, step.id, tool, input, error, durationMs, {
             planId: plan.id,
             planExecutionId: currentExecution.id,
             stepIndex: index,
@@ -553,13 +577,8 @@ export class AdaptiveAgent {
               recoveredOutput === undefined
                 ? undefined
                 : captureToolOutputForLog(tool, recoveredOutput, this.defaultCaptureMode),
+            performance: failurePerformance,
           });
-          const recoveredEventOutput =
-            recoveredOutput === undefined
-              ? undefined
-              : tool.summarizeResult
-                ? tool.summarizeResult(recoveredOutput)
-                : recoveredOutput;
           await this.emit({
             runId: currentRun.id,
             planExecutionId: currentExecution.id,
@@ -573,6 +592,7 @@ export class AdaptiveAgent {
               error: message,
               recoverable: recoveredOutput !== undefined,
               ...(recoveredEventOutput === undefined ? {} : { output: recoveredEventOutput }),
+              performance: failurePerformance,
             },
           });
 
@@ -608,10 +628,21 @@ export class AdaptiveAgent {
         }
 
         if (!recoveredToolFailure) {
-          this.logToolCompleted(currentRun, step.id, tool, input, lastOutput, Date.now() - toolStartedAt, {
+          const durationMs = Date.now() - toolStartedAt;
+          const eventOutput = tool.summarizeResult ? tool.summarizeResult(lastOutput) : lastOutput;
+          const completedPerformance = toolCompletionPerformanceMetrics({
+            input,
+            eventInput,
+            output: lastOutput,
+            eventOutput,
+            durationMs,
+            timeoutMs: toolTimeoutMs,
+          });
+          this.logToolCompleted(currentRun, step.id, tool, input, lastOutput, durationMs, {
             planId: plan.id,
             planExecutionId: currentExecution.id,
             stepIndex: index,
+            performance: completedPerformance,
           });
 
           await this.emit({
@@ -624,7 +655,8 @@ export class AdaptiveAgent {
             payload: {
               toolName: tool.name,
               ...(eventInput === undefined ? {} : { input: eventInput }),
-              output: tool.summarizeResult ? tool.summarizeResult(lastOutput) : lastOutput,
+              output: eventOutput,
+              performance: completedPerformance,
             },
           });
         }
@@ -1740,6 +1772,7 @@ export class AdaptiveAgent {
     state.approvedToolCallIds = removeApprovedToolCallId(state.approvedToolCallIds, pendingToolCall.id);
 
     const toolContext = this.createToolContext(run, pendingToolCall.stepId, pendingToolCall.id);
+    const toolTimeoutMs = tool.timeoutMs ?? this.defaults.toolTimeoutMs;
     const budgetGroup = this.resolveBudgetGroup(tool);
     const budget = budgetGroup ? this.resolvedToolBudgets?.[budgetGroup] : undefined;
     const existingExecution = await this.options.toolExecutionStore?.getByIdempotencyKey(toolContext.idempotencyKey);
@@ -1750,6 +1783,13 @@ export class AdaptiveAgent {
         stepId: pendingToolCall.stepId,
         toolName: tool.name,
         idempotencyKey: toolContext.idempotencyKey,
+        performance: compactJsonObject({
+          reused: true,
+          rawOutputBytes:
+            existingExecution.output === undefined ? undefined : approximateSerializedByteLength(existingExecution.output),
+          modelOutputBytes:
+            existingExecution.output === undefined ? undefined : modelVisibleToolOutputBytes(existingExecution.output),
+        }),
       });
       return {
         output: existingExecution.output ?? null,
@@ -1770,6 +1810,15 @@ export class AdaptiveAgent {
 
       const eventInput = captureToolInputForLog(tool, pendingToolCall.input, this.defaultCaptureMode);
       const budgetOutput = budgetAdmission.output;
+      const performance = toolCompletionPerformanceMetrics({
+        input: pendingToolCall.input,
+        eventInput,
+        output: budgetOutput,
+        eventOutput: budgetOutput,
+        durationMs: 0,
+        timeoutMs: toolTimeoutMs,
+        skipped: true,
+      });
 
       this.logLifecycle('warn', 'tool.budget_exhausted', {
         ...runLogBindings(run),
@@ -1777,6 +1826,7 @@ export class AdaptiveAgent {
         toolName: tool.name,
         budgetGroup,
         output: captureValueForLog(budgetOutput, { mode: 'summary' }),
+        performance,
       });
 
       return {
@@ -1790,13 +1840,14 @@ export class AdaptiveAgent {
             toolCallId: pendingToolCall.id,
             type: 'tool.completed',
             schemaVersion: 1,
-          payload: {
-            toolName: tool.name,
-            ...(pendingToolCall.assistantContent === undefined ? {} : { assistantContent: pendingToolCall.assistantContent }),
-            ...(eventInput === undefined ? {} : { input: eventInput }),
-            output: budgetOutput,
-            ...(budgetGroup === undefined ? {} : { budgetGroup }),
+            payload: {
+              toolName: tool.name,
+              ...(pendingToolCall.assistantContent === undefined ? {} : { assistantContent: pendingToolCall.assistantContent }),
+              ...(eventInput === undefined ? {} : { input: eventInput }),
+              output: budgetOutput,
+              ...(budgetGroup === undefined ? {} : { budgetGroup }),
               skipped: true,
+              performance,
             },
           },
         },
@@ -1820,7 +1871,12 @@ export class AdaptiveAgent {
 
     if (!emitsToolLifecycle) {
       const eventInput = captureToolInputForLog(tool, pendingToolCall.input, this.defaultCaptureMode);
-      this.logToolStarted(run, pendingToolCall.stepId, tool, pendingToolCall.input);
+      const performance = toolStartPerformanceMetrics({
+        input: pendingToolCall.input,
+        eventInput,
+        timeoutMs: toolTimeoutMs,
+      });
+      this.logToolStarted(run, pendingToolCall.stepId, tool, pendingToolCall.input, { performance });
       await this.emit({
         runId: run.id,
         stepId: pendingToolCall.stepId,
@@ -1831,34 +1887,57 @@ export class AdaptiveAgent {
           toolName: tool.name,
           ...(pendingToolCall.assistantContent === undefined ? {} : { assistantContent: pendingToolCall.assistantContent }),
           ...(eventInput === undefined ? {} : { input: eventInput }),
+          performance,
         },
       });
     }
 
     try {
       const output = await runWithTimeout(
-        tool.timeoutMs ?? this.defaults.toolTimeoutMs,
+        toolTimeoutMs,
         toolContext.signal,
         () => tool.execute(pendingToolCall.input, toolContext),
       );
 
+      const durationMs = Date.now() - toolStartedAt;
       if (!emitsToolLifecycle) {
+        const eventInput = captureToolInputForLog(tool, pendingToolCall.input, this.defaultCaptureMode);
+        const eventOutput = tool.summarizeResult ? tool.summarizeResult(output) : output;
+        const performance = toolCompletionPerformanceMetrics({
+          input: pendingToolCall.input,
+          eventInput,
+          output,
+          eventOutput,
+          durationMs,
+          timeoutMs: toolTimeoutMs,
+        });
         this.logToolCompleted(
           run,
           pendingToolCall.stepId,
           tool,
           pendingToolCall.input,
           output,
-          Date.now() - toolStartedAt,
+          durationMs,
+          { performance },
         );
       }
 
       const eventInput = captureToolInputForLog(tool, pendingToolCall.input, this.defaultCaptureMode);
+      const eventOutput = tool.summarizeResult ? tool.summarizeResult(output) : output;
+      const completionPerformance = toolCompletionPerformanceMetrics({
+        input: pendingToolCall.input,
+        eventInput,
+        output,
+        eventOutput,
+        durationMs,
+        timeoutMs: toolTimeoutMs,
+      });
       const completionPayload: JsonObject = {
         toolName: tool.name,
         ...(pendingToolCall.assistantContent === undefined ? {} : { assistantContent: pendingToolCall.assistantContent }),
         ...(eventInput === undefined ? {} : { input: eventInput }),
-        output: tool.summarizeResult ? tool.summarizeResult(output) : output,
+        output: eventOutput,
+        performance: completionPerformance,
       };
 
       return {
@@ -1885,23 +1964,9 @@ export class AdaptiveAgent {
 
       const recoveredOutput = recoverToolError(tool, error, pendingToolCall.input);
       let toolFailedEvent: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'> | undefined;
+      const durationMs = Date.now() - toolStartedAt;
 
       if (!emitsToolLifecycle) {
-        this.logToolFailed(
-          run,
-          pendingToolCall.stepId,
-          tool,
-          pendingToolCall.input,
-          error,
-          Date.now() - toolStartedAt,
-          {
-            recoverable: recoveredOutput !== undefined,
-            recoveredOutput:
-              recoveredOutput === undefined
-                ? undefined
-                : captureToolOutputForLog(tool, recoveredOutput, this.defaultCaptureMode),
-          },
-        );
         const eventInput = captureToolInputForLog(tool, pendingToolCall.input, this.defaultCaptureMode);
         const recoveredEventOutput =
           recoveredOutput === undefined
@@ -1909,6 +1974,31 @@ export class AdaptiveAgent {
             : tool.summarizeResult
               ? tool.summarizeResult(recoveredOutput)
               : recoveredOutput;
+        const performance = toolCompletionPerformanceMetrics({
+          input: pendingToolCall.input,
+          eventInput,
+          output: recoveredOutput,
+          eventOutput: recoveredEventOutput,
+          durationMs,
+          timeoutMs: toolTimeoutMs,
+          recovered: recoveredOutput !== undefined,
+        });
+        this.logToolFailed(
+          run,
+          pendingToolCall.stepId,
+          tool,
+          pendingToolCall.input,
+          error,
+          durationMs,
+          {
+            recoverable: recoveredOutput !== undefined,
+            recoveredOutput:
+              recoveredOutput === undefined
+                ? undefined
+                : captureToolOutputForLog(tool, recoveredOutput, this.defaultCaptureMode),
+            performance,
+          },
+        );
         toolFailedEvent = {
           runId: run.id,
           stepId: pendingToolCall.stepId,
@@ -1922,6 +2012,7 @@ export class AdaptiveAgent {
             error: error instanceof Error ? error.message : String(error),
             recoverable: recoveredOutput !== undefined,
             ...(recoveredEventOutput === undefined ? {} : { output: recoveredEventOutput }),
+            performance,
           },
         };
       }
@@ -2576,9 +2667,11 @@ export class AdaptiveAgent {
         const run = await stores.runStore.createRun(persistedRunInput);
         const state = createState(run);
         this.logInitialInjectedSystemMessages(run, state);
-        const createdEvent = this.runCreatedEvent(run);
+        const createdEvent = this.withEventPayloadPerformance(this.runCreatedEvent(run));
         await stores.eventStore.append(createdEvent);
 
+        const serializedState = serializeExecutionState(state);
+        const snapshotSaveStartedAt = Date.now();
         const snapshot = await stores.snapshotStore.save({
           runId: run.id,
           snapshotSeq: 1,
@@ -2590,13 +2683,20 @@ export class AdaptiveAgent {
             status: run.status,
             stepsUsed: state.stepsUsed,
           },
-          state: serializeExecutionState(state),
+          state: serializedState,
         });
+        const performance = snapshotPerformanceMetrics(
+          state,
+          serializedState,
+          Date.now() - snapshotSaveStartedAt,
+        );
 
-        const snapshotEvent = this.snapshotCreatedEvent(run, snapshot.snapshotSeq, run.status);
+        const snapshotEvent = this.withEventPayloadPerformance(
+          this.snapshotCreatedEvent(run, snapshot.snapshotSeq, run.status, performance),
+        );
         await stores.eventStore.append(snapshotEvent);
         downstreamEvents.push(createdEvent, snapshotEvent);
-        this.logSnapshotCreated(run, state, snapshot.snapshotSeq, run.status);
+        this.logSnapshotCreated(run, state, snapshot.snapshotSeq, run.status, performance);
 
         return { run, state };
       });
@@ -2671,6 +2771,8 @@ export class AdaptiveAgent {
     }
 
     const latestSnapshot = await stores.snapshotStore.getLatest(run.id);
+    const serializedState = serializeExecutionState(state);
+    const snapshotSaveStartedAt = Date.now();
     const snapshot = await stores.snapshotStore.save({
       runId: run.id,
       snapshotSeq: (latestSnapshot?.snapshotSeq ?? 0) + 1,
@@ -2682,12 +2784,19 @@ export class AdaptiveAgent {
         status,
         stepsUsed: state.stepsUsed,
       },
-      state: serializeExecutionState(state),
+      state: serializedState,
     });
+    const performance = snapshotPerformanceMetrics(
+      state,
+      serializedState,
+      Date.now() - snapshotSaveStartedAt,
+    );
 
-    const snapshotEvent = this.snapshotCreatedEvent(run, snapshot.snapshotSeq, status);
+    const snapshotEvent = this.withEventPayloadPerformance(
+      this.snapshotCreatedEvent(run, snapshot.snapshotSeq, status, performance),
+    );
     await stores.eventStore?.append(snapshotEvent);
-    this.logSnapshotCreated(run, state, snapshot.snapshotSeq, status);
+    this.logSnapshotCreated(run, state, snapshot.snapshotSeq, status, performance);
     return snapshotEvent;
   }
 
@@ -2696,30 +2805,31 @@ export class AdaptiveAgent {
     output: JsonValue;
     event?: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>;
   }): Promise<void> {
+    const event = params.event ? this.withEventPayloadPerformance(params.event) : undefined;
     const transactionStore = this.options.transactionStore;
-    if (transactionStore?.toolExecutionStore && (transactionStore.eventStore || !params.event)) {
+    if (transactionStore?.toolExecutionStore && (transactionStore.eventStore || !event)) {
       await transactionStore.runInTransaction(async (stores) => {
         if (!stores.toolExecutionStore) {
           throw new Error('Transactional tool completion requires toolExecutionStore');
         }
 
         await stores.toolExecutionStore.markCompleted(params.idempotencyKey, params.output);
-        if (params.event) {
+        if (event) {
           if (!stores.eventStore) {
             throw new Error('Transactional tool completion event requires eventStore');
           }
 
-          await stores.eventStore.append(params.event);
+          await stores.eventStore.append(event);
         }
       });
 
-      await this.emitDownstreamOnly(params.event ? [params.event] : []);
+      await this.emitDownstreamOnly(event ? [event] : []);
       return;
     }
 
     await this.options.toolExecutionStore?.markCompleted(params.idempotencyKey, params.output);
-    if (params.event) {
-      await this.emit(params.event);
+    if (event) {
+      await this.emit(event);
     }
   }
 
@@ -2729,30 +2839,31 @@ export class AdaptiveAgent {
     errorMessage: string;
     event?: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>;
   }): Promise<void> {
+    const event = params.event ? this.withEventPayloadPerformance(params.event) : undefined;
     const transactionStore = this.options.transactionStore;
-    if (transactionStore?.toolExecutionStore && (transactionStore.eventStore || !params.event)) {
+    if (transactionStore?.toolExecutionStore && (transactionStore.eventStore || !event)) {
       await transactionStore.runInTransaction(async (stores) => {
         if (!stores.toolExecutionStore) {
           throw new Error('Transactional tool failure requires toolExecutionStore');
         }
 
         await stores.toolExecutionStore.markFailed(params.idempotencyKey, params.errorCode, params.errorMessage);
-        if (params.event) {
+        if (event) {
           if (!stores.eventStore) {
             throw new Error('Transactional tool failure event requires eventStore');
           }
 
-          await stores.eventStore.append(params.event);
+          await stores.eventStore.append(event);
         }
       });
 
-      await this.emitDownstreamOnly(params.event ? [params.event] : []);
+      await this.emitDownstreamOnly(event ? [event] : []);
       return;
     }
 
     await this.options.toolExecutionStore?.markFailed(params.idempotencyKey, params.errorCode, params.errorMessage);
-    if (params.event) {
-      await this.emit(params.event);
+    if (event) {
+      await this.emit(event);
     }
   }
 
@@ -2762,6 +2873,10 @@ export class AdaptiveAgent {
     completion?: ToolExecutionCompletionPersistence;
     stepCompletedEvent: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>;
   }): Promise<void> {
+    const completionEvent = params.completion?.event
+      ? this.withEventPayloadPerformance(params.completion.event)
+      : undefined;
+    const stepCompletedEvent = this.withEventPayloadPerformance(params.stepCompletedEvent);
     const transactionStore = this.options.transactionStore;
     if (
       transactionStore?.eventStore &&
@@ -2780,14 +2895,14 @@ export class AdaptiveAgent {
           }
 
           await stores.toolExecutionStore.markCompleted(params.completion.idempotencyKey, params.completion.output);
-          if (params.completion.event) {
-            await stores.eventStore.append(params.completion.event);
-            downstreamEvents.push(params.completion.event);
+          if (completionEvent) {
+            await stores.eventStore.append(completionEvent);
+            downstreamEvents.push(completionEvent);
           }
         }
 
-        await stores.eventStore.append(params.stepCompletedEvent);
-        downstreamEvents.push(params.stepCompletedEvent);
+        await stores.eventStore.append(stepCompletedEvent);
+        downstreamEvents.push(stepCompletedEvent);
         const snapshotEvent = await this.saveExecutionSnapshotWithStores(
           stores,
           params.run,
@@ -2804,10 +2919,13 @@ export class AdaptiveAgent {
     }
 
     if (params.completion) {
-      await this.persistToolExecutionCompletion(params.completion);
+      await this.persistToolExecutionCompletion({
+        ...params.completion,
+        event: completionEvent,
+      });
     }
 
-    await this.emit(params.stepCompletedEvent);
+    await this.emit(stepCompletedEvent);
     await this.saveExecutionSnapshot(params.run, params.state, params.run.status);
   }
 
@@ -2836,7 +2954,7 @@ export class AdaptiveAgent {
           downstreamEvents.push(snapshotEvent);
         }
 
-        const terminalEvent = params.event(updatedRun);
+        const terminalEvent = this.withEventPayloadPerformance(params.event(updatedRun));
         await stores.eventStore.append(terminalEvent);
         downstreamEvents.push(terminalEvent);
         return updatedRun;
@@ -2886,6 +3004,7 @@ export class AdaptiveAgent {
     run: AgentRun,
     snapshotSeq: number,
     status: RunStatus,
+    performance?: JsonObject,
   ): Omit<AgentEvent, 'id' | 'seq' | 'createdAt'> {
     return {
       runId: run.id,
@@ -2895,6 +3014,7 @@ export class AdaptiveAgent {
       payload: {
         snapshotSeq,
         status,
+        ...(performance === undefined ? {} : { performance }),
       },
     };
   }
@@ -2904,6 +3024,7 @@ export class AdaptiveAgent {
     state: ExecutionState,
     snapshotSeq: number,
     status: RunStatus,
+    performance?: JsonObject,
   ): void {
     this.logLifecycle('debug', 'snapshot.created', {
       ...runLogBindings(run),
@@ -2911,6 +3032,7 @@ export class AdaptiveAgent {
       snapshotSeq,
       status,
       stepsUsed: state.stepsUsed,
+      performance,
     });
   }
 
@@ -2926,6 +3048,7 @@ export class AdaptiveAgent {
     const modelTimeoutMs = this.defaults.modelTimeoutMs;
     const modelProvider = this.options.model.provider;
     const modelName = this.options.model.model;
+    const requestPerformance = modelRequestPerformanceMetrics(modelRequest);
 
     this.logLifecycle('debug', 'model.request', {
       ...runLogBindings(run),
@@ -2944,6 +3067,7 @@ export class AdaptiveAgent {
         provider: modelProvider,
         model: modelName,
         startedAt: new Date(startedAt).toISOString(),
+        performance: requestPerformance,
       },
     });
 
@@ -2955,12 +3079,19 @@ export class AdaptiveAgent {
         modelTimeoutMs,
         onRetry: async (retry) => {
           const durationMs = Date.now() - startedAt;
+          const retryPerformance = compactJsonObject({
+            ...requestPerformance,
+            ...(retry.performance ?? {}),
+            durationMs,
+            retryDelayMs: retry.retryDelayMs,
+          });
           this.logLifecycle('warn', 'model.retry', {
             ...runLogBindings(run),
             stepId: run.currentStepId,
             provider: modelProvider,
             model: modelName,
             durationMs,
+            performance: retryPerformance,
             attempt: retry.attempt,
             nextAttempt: retry.nextAttempt,
             statusCode: retry.statusCode,
@@ -2979,6 +3110,7 @@ export class AdaptiveAgent {
               provider: modelProvider,
               model: modelName,
               durationMs,
+              performance: retryPerformance,
               attempt: retry.attempt,
               nextAttempt: retry.nextAttempt,
               statusCode: retry.statusCode,
@@ -2995,10 +3127,17 @@ export class AdaptiveAgent {
         ? createModelTimeoutError(this.defaults.modelTimeoutMs, error)
         : error;
       const durationMs = Date.now() - startedAt;
+      const failurePerformance = compactJsonObject({
+        ...requestPerformance,
+        durationMs,
+        timedOut: timeoutContext.didTimeout(),
+        modelTimeoutMs,
+      });
       this.logLifecycle('error', 'model.failed', {
         ...runLogBindings(run),
         stepId: run.currentStepId,
         durationMs,
+        performance: failurePerformance,
         ...summarizeModelFailureForLog(modelError, {
           modelTimeoutMs,
           timedOut: timeoutContext.didTimeout(),
@@ -3018,6 +3157,7 @@ export class AdaptiveAgent {
             modelTimeoutMs,
             provider: modelProvider,
             model: modelName,
+            performance: failurePerformance,
             error: modelError instanceof Error ? modelError.message : String(modelError),
           },
         });
@@ -3030,11 +3170,17 @@ export class AdaptiveAgent {
     }
 
     const durationMs = Date.now() - startedAt;
+    const responsePerformance = compactJsonObject({
+      ...modelResponsePerformanceMetrics(response),
+      durationMs,
+      pendingToolCallCount: response.toolCalls?.length ?? 0,
+    });
     this.logLifecycle('debug', 'model.response', {
       ...runLogBindings(run),
       stepId: run.currentStepId,
       durationMs,
       ...summarizeModelResponseForLog(response),
+      performance: responsePerformance,
     });
 
     await this.emit({
@@ -3049,6 +3195,7 @@ export class AdaptiveAgent {
         model: modelName,
         finishReason: response.finishReason,
         toolCallCount: response.toolCalls?.length ?? 0,
+        performance: responsePerformance,
       },
     });
 
@@ -3487,7 +3634,17 @@ export class AdaptiveAgent {
   }
 
   private async emit(event: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>): Promise<void> {
-    await this.eventEmitter.emit(event);
+    const measuredEvent = this.withEventPayloadPerformance(event);
+    const emitStartedAt = Date.now();
+    await this.eventEmitter.emit(measuredEvent);
+    this.logLifecycle('debug', 'event.emitted', {
+      runId: measuredEvent.runId,
+      stepId: measuredEvent.stepId,
+      toolCallId: measuredEvent.toolCallId,
+      eventType: measuredEvent.type,
+      payloadBytes: approximateSerializedByteLength(measuredEvent.payload),
+      durationMs: Date.now() - emitStartedAt,
+    });
   }
 
   private async emitDownstreamOnly(events: Array<Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>>): Promise<void> {
@@ -3496,8 +3653,44 @@ export class AdaptiveAgent {
     }
 
     for (const event of events) {
+      const emitStartedAt = Date.now();
       await this.options.eventSink.emit(event);
+      this.logLifecycle('debug', 'event.downstream_emitted', {
+        runId: event.runId,
+        stepId: event.stepId,
+        toolCallId: event.toolCallId,
+        eventType: event.type,
+        payloadBytes: approximateSerializedByteLength(event.payload),
+        durationMs: Date.now() - emitStartedAt,
+      });
     }
+  }
+
+  private withEventPayloadPerformance(
+    event: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>,
+  ): Omit<AgentEvent, 'id' | 'seq' | 'createdAt'> {
+    if (!isJsonObjectPayload(event.payload)) {
+      return event;
+    }
+
+    const currentPerformance = isJsonObjectPayload(event.payload.performance)
+      ? event.payload.performance
+      : {};
+    const { eventPayloadBytes: _eventPayloadBytes, ...performanceWithoutPayloadBytes } = currentPerformance;
+    const payloadWithoutPayloadBytes = {
+      ...event.payload,
+      performance: performanceWithoutPayloadBytes,
+    };
+    return {
+      ...event,
+      payload: {
+        ...event.payload,
+        performance: compactJsonObject({
+          ...performanceWithoutPayloadBytes,
+          eventPayloadBytes: approximateSerializedByteLength(payloadWithoutPayloadBytes),
+        }),
+      },
+    };
   }
 }
 
@@ -4688,6 +4881,67 @@ function mergeDelegateToolBudgets(
   }
 
   return merged;
+}
+
+function isJsonObjectPayload(value: unknown): value is JsonObject {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function snapshotPerformanceMetrics(
+  state: ExecutionState,
+  serializedState: JsonValue,
+  saveDurationMs?: number,
+): JsonObject {
+  return compactJsonObject({
+    saveDurationMs,
+    stateBytes: approximateSerializedByteLength(serializedState),
+    messageCount: state.messages.length,
+    messageBytes: approximateSerializedByteLength(state.messages),
+    pendingToolCallCount: state.pendingToolCalls.length,
+    pendingToolCallBytes: approximateSerializedByteLength(state.pendingToolCalls),
+    pendingRuntimeMessageCount: state.pendingRuntimeMessages.length,
+    approvedToolCallCount: state.approvedToolCallIds.length,
+    toolBudgetGroupCount: Object.keys(state.toolBudgetUsage).length,
+  });
+}
+
+function toolStartPerformanceMetrics(params: {
+  input: JsonValue;
+  eventInput?: JsonValue;
+  timeoutMs?: number;
+}): JsonObject {
+  return compactJsonObject({
+    timeoutMs: params.timeoutMs,
+    inputBytes: approximateSerializedByteLength(params.input),
+    eventInputBytes: params.eventInput === undefined ? undefined : approximateSerializedByteLength(params.eventInput),
+  });
+}
+
+function toolCompletionPerformanceMetrics(params: {
+  input: JsonValue;
+  eventInput?: JsonValue;
+  output?: JsonValue;
+  eventOutput?: JsonValue;
+  durationMs: number;
+  timeoutMs?: number;
+  skipped?: boolean;
+  recovered?: boolean;
+}): JsonObject {
+  return compactJsonObject({
+    durationMs: params.durationMs,
+    timeoutMs: params.timeoutMs,
+    skipped: params.skipped,
+    recovered: params.recovered,
+    inputBytes: approximateSerializedByteLength(params.input),
+    eventInputBytes: params.eventInput === undefined ? undefined : approximateSerializedByteLength(params.eventInput),
+    rawOutputBytes: params.output === undefined ? undefined : approximateSerializedByteLength(params.output),
+    eventOutputBytes: params.eventOutput === undefined ? undefined : approximateSerializedByteLength(params.eventOutput),
+    modelOutputBytes: params.output === undefined ? undefined : modelVisibleToolOutputBytes(params.output),
+  });
+}
+
+function modelVisibleToolOutputBytes(output: JsonValue): number {
+  return approximateSerializedByteLength(output);
 }
 
 function createAbortTimeoutContext(timeoutMs: number): {

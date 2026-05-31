@@ -1,14 +1,16 @@
 #!/usr/bin/env bun
 
 export { main, parseArgs } from './trace-session/cli.js';
-export { listSessionlessRuns, listSessions, loadUsageForTraceTarget, traceSession } from './trace-session/data.js';
+export { listSessionlessRuns, listSessionPerformance, listSessions, loadUsageForTraceTarget, traceSession } from './trace-session/data.js';
 export {
   buildTimeline,
   computeDelegateReason,
+  summarizePerformance,
   summarizeTrace,
 } from './trace-session/report.js';
 export {
   renderDeleteEmptyGoalSessionsSql,
+  renderSessionPerformanceList,
   renderSessionList,
   renderSessionlessRunList,
   renderTraceReport,
@@ -19,6 +21,8 @@ export type {
   DelegateRow,
   MessageView,
   MilestoneEntry,
+  PerformanceBucketSummary,
+  PerformanceSummary,
   PlanRow,
   ReportView,
   RootRun,
@@ -26,6 +30,7 @@ export type {
   RunSnapshotSummary,
   RunTreeEntry,
   SessionListItem,
+  SessionPerformanceListItem,
   SessionOverview,
   SessionUsageSummary,
   SessionlessRunListItem,

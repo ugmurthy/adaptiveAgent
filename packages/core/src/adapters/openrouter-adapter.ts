@@ -3,6 +3,7 @@ import { extname } from 'node:path';
 
 import { OpenRouter } from '@openrouter/sdk';
 
+import { approximateSerializedByteLength, compactJsonObject } from '../logging.js';
 import type { FileInput, ModelContentPart, ModelMessage, ModelRequest, ModelResponse } from '../types.js';
 import { BaseOpenAIChatAdapter, MAX_LOCAL_AUDIO_BYTES, MAX_LOCAL_FILE_BYTES, type BaseOpenAIChatAdapterConfig } from './base-openai-chat-adapter.js';
 import { toProviderSdkResponseFormat } from './provider-sdk-request.js';
@@ -83,6 +84,7 @@ export class OpenRouterAdapter extends BaseOpenAIChatAdapter {
   override async generate(request: ModelRequest): Promise<ModelResponse> {
     const normalizedRequest = await normalizeOpenRouterRequest(request);
     const body = await this.buildRequestBody(normalizedRequest);
+    const startedAt = Date.now();
     const completion = await this.client.chat.send(
       {
         chatRequest: toSdkRequest(body),
@@ -90,7 +92,17 @@ export class OpenRouterAdapter extends BaseOpenAIChatAdapter {
       { signal: request.signal, headers: this.sdkHeaders } as never,
     );
 
-    return this.parseResponse(fromSdkResponse(completion));
+    const parsed = this.parseResponse(fromSdkResponse(completion));
+    return {
+      ...parsed,
+      performance: compactJsonObject({
+        ...(parsed.performance ?? {}),
+        adapterAttemptCount: 1,
+        adapterResponseLatencyMs: Date.now() - startedAt,
+        adapterRequestBytes: approximateSerializedByteLength(body),
+        adapterResponseBytes: approximateSerializedByteLength(completion),
+      }),
+    };
   }
 }
 

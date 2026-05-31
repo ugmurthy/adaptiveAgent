@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildTimeline, computeDelegateReason, parseArgs, renderDeleteEmptyGoalSessionsSql, renderSessionList, renderSessionlessRunList, renderTraceReport, renderUsageReport, summarizeTrace, traceSession } from './trace-session.js';
+import { buildTimeline, computeDelegateReason, parseArgs, renderDeleteEmptyGoalSessionsSql, renderSessionList, renderSessionPerformanceList, renderSessionlessRunList, renderTraceReport, renderUsageReport, summarizePerformance, summarizeTrace, traceSession } from './trace-session.js';
+import type { TraceRow } from './trace-session.js';
 
 describe('trace-session CLI helpers', () => {
   it('parses the primary trace-session command and flags', () => {
@@ -8,6 +9,7 @@ describe('trace-session CLI helpers', () => {
       sessionId: 'sess-1',
       json: true,
       listSessions: false,
+      listPerformance: false,
       listSessionless: false,
       deleteEmptyGoalSessions: false,
       usageOnly: false,
@@ -25,6 +27,7 @@ describe('trace-session CLI helpers', () => {
       sessionId: 'sess-1',
       json: false,
       listSessions: false,
+      listPerformance: false,
       listSessionless: false,
       deleteEmptyGoalSessions: false,
       usageOnly: false,
@@ -41,6 +44,7 @@ describe('trace-session CLI helpers', () => {
       sessionId: 'sess-1',
       json: false,
       listSessions: false,
+      listPerformance: false,
       listSessionless: false,
       deleteEmptyGoalSessions: false,
       usageOnly: false,
@@ -56,10 +60,18 @@ describe('trace-session CLI helpers', () => {
     });
   });
 
+  it('parses the performance report view', () => {
+    expect(parseArgs(['trace-session', 'sess-1', '--view', 'performance'])).toMatchObject({
+      sessionId: 'sess-1',
+      view: 'performance',
+    });
+  });
+
   it('parses direct run tracing flags without a session id', () => {
     expect(parseArgs(['trace-session', '--run', 'run-1', '--messages'])).toEqual({
       json: false,
       listSessions: false,
+      listPerformance: false,
       listSessionless: false,
       deleteEmptyGoalSessions: false,
       usageOnly: false,
@@ -77,6 +89,25 @@ describe('trace-session CLI helpers', () => {
       sessionId: undefined,
       json: true,
       listSessions: true,
+      listPerformance: false,
+      listSessionless: false,
+      deleteEmptyGoalSessions: false,
+      usageOnly: false,
+      includePlans: false,
+      onlyDelegates: false,
+      messages: false,
+      previewChars: 40,
+      systemOnly: false,
+      help: false,
+    });
+  });
+
+  it('parses the session performance list flag without a session id', () => {
+    expect(parseArgs(['trace-session', '--lsp', '--json', '--preview-chars', '40'])).toEqual({
+      sessionId: undefined,
+      json: true,
+      listSessions: false,
+      listPerformance: true,
       listSessionless: false,
       deleteEmptyGoalSessions: false,
       usageOnly: false,
@@ -94,6 +125,7 @@ describe('trace-session CLI helpers', () => {
       sessionId: undefined,
       json: false,
       listSessions: false,
+      listPerformance: false,
       listSessionless: false,
       deleteEmptyGoalSessions: true,
       usageOnly: false,
@@ -110,6 +142,7 @@ describe('trace-session CLI helpers', () => {
       sessionId: 'sess-1',
       json: true,
       listSessions: false,
+      listPerformance: false,
       listSessionless: false,
       deleteEmptyGoalSessions: false,
       usageOnly: true,
@@ -146,6 +179,22 @@ describe('trace-session CLI helpers', () => {
           status: 'unknown',
           goals: [],
         },
+        {
+          sessionId: null,
+          startedAt: '2026-04-16T08:00:00.000Z',
+          status: 'succeeded',
+          goals: [
+            {
+              rootRunId: 'root-sessionless',
+              runId: 'root-sessionless',
+              status: 'succeeded',
+              startedAt: '2026-04-16T08:00:00.000Z',
+              completedAt: '2026-04-16T08:00:05.000Z',
+              goal: 'SDK-only run',
+              linkedAt: '2026-04-16T08:00:00.000Z',
+            },
+          ],
+        },
       ],
       { json: false },
     );
@@ -156,6 +205,8 @@ describe('trace-session CLI helpers', () => {
     expect(output).toContain('---- session-older-full-id : unknown : 2026-04-16T09:00:00.000Z ----');
     expect(output).toContain('  Goal: (none)');
     expect(output).toContain('  Runs: (none)');
+    expect(output).toContain('---- sessionless:root-sessionless : succeeded : 2026-04-16T08:00:00.000Z ----');
+    expect(output).toContain('  - run=root-sessionless  succeeded  started=2026-04-16 08:00:00.000  elapsed=5.00s');
   });
 
   it('renders listed sessions as JSON', () => {
@@ -193,11 +244,59 @@ describe('trace-session CLI helpers', () => {
     ]);
   });
 
+  it('renders listed session performance as one line per run', () => {
+    const performance = summarizePerformance([
+      traceRow({
+        event_id: 'model-done',
+        event_type: 'model.completed',
+        payload: { performance: { durationMs: 1500 } },
+      }),
+      traceRow({
+        event_id: 'tool-done',
+        event_type: 'tool.completed',
+        event_tool_name: 'read_file',
+        payload: { toolName: 'read_file', performance: { durationMs: 250 } },
+      }),
+      traceRow({
+        event_id: 'snapshot',
+        event_type: 'snapshot.created',
+        payload: { performance: { saveDurationMs: 50 } },
+      }),
+    ]);
+
+    const output = renderSessionPerformanceList(
+      [{
+        sessionId: 'session-1',
+        sessionStatus: 'succeeded',
+        rootRunId: 'root-1',
+        runId: 'root-1',
+        runStatus: 'succeeded',
+        startedAt: '2026-04-16T10:00:00.000Z',
+        completedAt: '2026-04-16T10:00:02.000Z',
+        totalDurationMs: 2000,
+        goal: 'Summarize the incident timeline',
+        performance,
+      }],
+      { json: false },
+    );
+
+    expect(output).toContain('session=session-1');
+    expect(output).toContain('run=root-1');
+    expect(output).toContain('total=2.00s');
+    expect(output).toContain('model=1.50s');
+    expect(output).toContain('tools=250ms');
+    expect(output).toContain('snapshot=50ms');
+    expect(output).toContain('other=200ms');
+    expect(output).toContain('\n  goal=Summarize the incident timeline');
+    expect(output.split('\n')).toHaveLength(2);
+  });
+
   it('parses the session-less list flag without a session id', () => {
     expect(parseArgs(['trace-session', '--ls-sessionless', '--json'])).toEqual({
       sessionId: undefined,
       json: true,
       listSessions: false,
+      listPerformance: false,
       listSessionless: true,
       deleteEmptyGoalSessions: false,
       usageOnly: false,
@@ -755,7 +854,19 @@ describe('trace-session CLI helpers', () => {
       {
         target: traceTarget('session', 'sess-1'),
         session: session('succeeded'),
-        rootRuns: [],
+        rootRuns: [{
+          rootRunId: 'root-1',
+          runId: 'root-1',
+          invocationKind: 'run',
+          turnIndex: 0,
+          linkedAt: now(),
+          startedAt: '2026-04-16T10:00:00.000Z',
+          updatedAt: '2026-04-16T10:00:03.000Z',
+          completedAt: '2026-04-16T10:00:03.000Z',
+          status: 'succeeded',
+          goal: 'Measure performance',
+          result: 'Done',
+        }],
         usage: usage(),
         timeline: [],
         llmMessages: [],
@@ -857,6 +968,122 @@ describe('trace-session CLI helpers', () => {
     expect(output).toContain('reasoning=40');
     expect(output).toContain('total=1,540');
     expect(output).toContain('cost=$0.012345');
+  });
+
+  it('summarizes and renders persisted performance metrics', () => {
+    const performance = summarizePerformance([
+      traceRow({
+        event_id: 'model-start',
+        event_seq: 1,
+        event_type: 'model.started',
+        payload: {
+          performance: {
+            requestBytes: 2048,
+            eventPayloadBytes: 100,
+          },
+        },
+      }),
+      traceRow({
+        event_id: 'model-done',
+        event_seq: 2,
+        event_type: 'model.completed',
+        payload: {
+          performance: {
+            responseBytes: 1024,
+            durationMs: 2500,
+            pendingToolCallCount: 1,
+            adapter: {
+              adapterResponseLatencyMs: 2300,
+              adapterRequestBytes: 4096,
+              adapterResponseBytes: 2048,
+              adapterAttemptCount: 2,
+              adapterStatusCode: 200,
+            },
+          },
+        },
+      }),
+      traceRow({
+        event_id: 'tool-done',
+        event_seq: 3,
+        event_type: 'tool.completed',
+        event_tool_name: 'read_file',
+        ledger_tool_name: 'read_file',
+        payload: {
+          toolName: 'read_file',
+          performance: {
+            durationMs: 12,
+            inputBytes: 32,
+            rawOutputBytes: 4096,
+            eventOutputBytes: 128,
+            modelOutputBytes: 4096,
+          },
+        },
+      }),
+      traceRow({
+        event_id: 'snapshot',
+        event_seq: 4,
+        event_type: 'snapshot.created',
+        payload: {
+          performance: {
+            stateBytes: 8192,
+            messageBytes: 4096,
+            messageCount: 8,
+            saveDurationMs: 5,
+          },
+        },
+      }),
+    ]);
+
+    expect(performance.model.requestBytes.total).toBe(2048);
+    expect(performance.model.adapterStatusCodes).toEqual({ '200': 1 });
+    expect(performance.tools.byTool[0]).toMatchObject({
+      toolName: 'read_file',
+      completed: 1,
+    });
+    expect(performance.snapshots.stateBytes.total).toBe(8192);
+
+    const output = renderTraceReport(
+      {
+        target: traceTarget('session', 'sess-1'),
+        session: session('succeeded'),
+        rootRuns: [{
+          rootRunId: 'root-1',
+          runId: 'root-1',
+          invocationKind: 'run',
+          turnIndex: 0,
+          linkedAt: now(),
+          startedAt: '2026-04-16T10:00:00.000Z',
+          updatedAt: '2026-04-16T10:00:03.000Z',
+          completedAt: '2026-04-16T10:00:03.000Z',
+          status: 'succeeded',
+          goal: 'Measure performance',
+          result: 'Done',
+        }],
+        usage: usage(),
+        performance,
+        timeline: [],
+        llmMessages: [],
+        delegates: [],
+        plans: [],
+        warnings: [],
+        summary: { status: 'succeeded', reason: 'ok' },
+      },
+      { json: false, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false, view: 'performance' },
+    );
+
+    expect(output).toContain('Performance');
+    expect(output).toContain('model');
+    expect(output).toContain('adapter status');
+    expect(output).toContain('200:1');
+    expect(output).toContain('read_file');
+    expect(output).toContain('Notes');
+    expect(output).toContain('raw output');
+    expect(output).toContain('Duration split:');
+    expect(output).toContain('total=3.00s');
+    expect(output).toContain('model=2.50s');
+    expect(output).toContain('tools=12ms');
+    expect(output).toContain('snapshot save=5ms');
+    expect(output).toContain('other=483ms');
   });
 
   it('renders the effective LLM message context and classifies system messages', () => {
@@ -1151,6 +1378,7 @@ describe('trace-session CLI helpers', () => {
       sessionId: 'sess-msg',
       json: false,
       listSessions: false,
+      listPerformance: false,
       listSessionless: false,
       deleteEmptyGoalSessions: false,
       usageOnly: false,
@@ -1253,6 +1481,7 @@ describe('trace-session CLI helpers', () => {
       runId: 'child-run-1',
       json: false,
       listSessions: false,
+      listPerformance: false,
       listSessionless: false,
       deleteEmptyGoalSessions: false,
       usageOnly: false,
@@ -1403,6 +1632,7 @@ describe('trace-session CLI helpers', () => {
       sessionId: 'sess-fallback',
       json: false,
       listSessions: false,
+      listPerformance: false,
       listSessionless: false,
       deleteEmptyGoalSessions: false,
       usageOnly: false,
@@ -1506,6 +1736,49 @@ function delegate(overrides: Partial<Parameters<typeof computeDelegateReason>[0]
     child_last_event_type: 'run.status.changed',
     child_last_event_at: now(),
     child_last_event_payload: null,
+    ...overrides,
+  };
+}
+
+function traceRow(overrides: Partial<TraceRow> = {}): TraceRow {
+  return {
+    session_id: 'sess-1',
+    root_run_id: 'root-1',
+    run_id: 'root-1',
+    parent_run_id: null,
+    parent_step_id: null,
+    run_delegate_name: null,
+    delegation_depth: 0,
+    run_status: 'succeeded',
+    current_step_id: 'step-1',
+    current_child_run_id: null,
+    goal: null,
+    run_error_code: null,
+    run_error_message: null,
+    run_created_at: now(),
+    run_updated_at: now(),
+    run_completed_at: now(),
+    event_id: 'event-1',
+    event_seq: 1,
+    event_created_at: now(),
+    event_type: 'run.created',
+    event_step_id: null,
+    tool_call_id: null,
+    payload: {},
+    event_tool_name: null,
+    resolved_input: null,
+    ledger_tool_name: null,
+    tool_execution_status: null,
+    tool_started_at: null,
+    tool_completed_at: null,
+    tool_output: null,
+    tool_error_code: null,
+    tool_error_message: null,
+    child_run_id: null,
+    child_run_status: null,
+    child_error_code: null,
+    child_error_message: null,
+    child_run_result: null,
     ...overrides,
   };
 }

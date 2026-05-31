@@ -3,6 +3,7 @@ import { extname } from 'node:path';
 
 import { Mistral } from '@mistralai/mistralai';
 
+import { approximateSerializedByteLength, compactJsonObject } from '../logging.js';
 import type { FileInput, ModelContentPart, ModelMessage, ModelRequest, ModelResponse } from '../types.js';
 import { BaseOpenAIChatAdapter, MAX_LOCAL_AUDIO_BYTES, MAX_LOCAL_FILE_BYTES, type BaseOpenAIChatAdapterConfig } from './base-openai-chat-adapter.js';
 import { toProviderSdkResponseFormat } from './provider-sdk-request.js';
@@ -67,11 +68,22 @@ export class MistralAdapter extends BaseOpenAIChatAdapter {
   override async generate(request: ModelRequest): Promise<ModelResponse> {
     const normalizedRequest = await normalizeMistralRequest(request);
     const body = await this.buildRequestBody(normalizedRequest);
+    const startedAt = Date.now();
     const completion = await this.client.chat.complete(toSdkRequest(body) as never, {
       signal: request.signal,
     } as never);
 
-    return this.parseResponse(fromSdkResponse(completion));
+    const parsed = this.parseResponse(fromSdkResponse(completion));
+    return {
+      ...parsed,
+      performance: compactJsonObject({
+        ...(parsed.performance ?? {}),
+        adapterAttemptCount: 1,
+        adapterResponseLatencyMs: Date.now() - startedAt,
+        adapterRequestBytes: approximateSerializedByteLength(body),
+        adapterResponseBytes: approximateSerializedByteLength(completion),
+      }),
+    };
   }
 }
 

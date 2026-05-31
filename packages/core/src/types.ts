@@ -429,6 +429,7 @@ export interface ModelRetryEvent {
   reason: 'rate_limit' | 'provider_error';
   phase: 'http_status';
   message: string;
+  performance?: JsonObject;
 }
 
 export interface ModelResponse {
@@ -441,6 +442,7 @@ export interface ModelResponse {
   summary?: string;
   reasoning?: string;
   reasoningDetails?: JsonValue[];
+  performance?: JsonObject;
 }
 
 export interface ModelStreamEvent {

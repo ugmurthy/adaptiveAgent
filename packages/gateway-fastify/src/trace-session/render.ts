@@ -9,11 +9,14 @@ import type {
   DelegateRow,
   MessageView,
   MilestoneEntry,
+  PerformanceBucketSummary,
+  PerformanceSummary,
   PlanRow,
   ReportView,
   RootRun,
   RunMessageTrace,
   SessionListItem,
+  SessionPerformanceListItem,
   SessionOverview,
   SessionUsageSummary,
   SessionlessRunListItem,
@@ -58,6 +61,12 @@ export function renderTraceReport(
     for (const warning of report.warnings) {
       lines.push(`- ${warning}`);
     }
+  }
+
+  if (shouldRenderSection(effectiveView, 'performance')) {
+    lines.push('');
+    lines.push(markdownBlock('# Performance'));
+    lines.push(renderPerformance(report.performance ?? emptyPerformanceSummary(), traceDurationMs(report)));
   }
 
   if (shouldRenderSection(effectiveView, 'milestones')) {
@@ -115,7 +124,8 @@ export function renderSessionList(sessions: SessionListItem[], options: Pick<Cli
   return sessions
     .map((session) => {
       const sessionStatus = session.status ?? 'unknown';
-      const lines = [`---- ${session.sessionId} : ${statusColor(sessionStatus)(sessionStatus)} : ${session.startedAt} ----`];
+      const sessionLabel = session.sessionId ?? `sessionless:${session.goals[0]?.rootRunId ?? 'unknown'}`;
+      const lines = [`---- ${sessionLabel} : ${statusColor(sessionStatus)(sessionStatus)} : ${session.startedAt} ----`];
       const visibleGoals = session.goals.filter((goal) => normalizeGoal(goal.goal) !== null);
       if (visibleGoals.length === 0) {
         lines.push('  Goal: (none)');
@@ -127,7 +137,7 @@ export function renderSessionList(sessions: SessionListItem[], options: Pick<Cli
       }
       for (const run of session.goals) {
         const runStatus = run.status ?? 'unknown';
-        const details = [run.runId === run.rootRunId ? run.runId : `${run.runId} root=${run.rootRunId}`];
+        const details = [session.sessionId === null ? `run=${run.runId}` : run.runId === run.rootRunId ? run.runId : `${run.runId} root=${run.rootRunId}`];
         details.push(statusColor(runStatus)(runStatus));
         if (run.startedAt) {
           details.push(`started=${formatTime(run.startedAt)}`);
@@ -144,6 +154,37 @@ export function renderSessionList(sessions: SessionListItem[], options: Pick<Cli
       return lines.join('\n');
     })
     .join('\n\n');
+}
+
+export function renderSessionPerformanceList(
+  items: SessionPerformanceListItem[],
+  options: Pick<CliOptions, 'json'> & Partial<Pick<CliOptions, 'previewChars'>>,
+): string {
+  if (options.json) {
+    return JSON.stringify(items, null, 2);
+  }
+  if (items.length === 0) {
+    return chalk.gray('No session run performance rows were found.');
+  }
+
+  const previewChars = options.previewChars ?? DEFAULT_MESSAGE_PREVIEW_CHARS;
+  return items.map((item) => {
+    const split = durationSplitParts(item.performance, item.totalDurationMs);
+    const status = statusColor(item.runStatus ?? item.sessionStatus ?? 'unknown')(item.runStatus ?? item.sessionStatus ?? 'unknown');
+    const goal = normalizeGoal(item.goal);
+    const metricsLine = [
+      `session=${item.sessionId}`,
+      `run=${item.runId}`,
+      item.runId === item.rootRunId ? undefined : `root=${item.rootRunId}`,
+      `status=${status}`,
+      `total=${formatDuration(split.totalDurationMs)}`,
+      `model=${formatDuration(split.modelDurationMs)}`,
+      `tools=${formatDuration(split.toolDurationMs)}`,
+      `snapshot=${formatDuration(split.snapshotSaveMs)}`,
+      `other=${formatDuration(split.otherDurationMs)}`,
+    ].filter((part): part is string => part !== undefined).join('  ');
+    return `${metricsLine}\n  goal=${goal ? truncatePlain(oneLine(goal), previewChars) : '(none)'}`;
+  }).join('\n');
 }
 
 export function renderSessionlessRunList(runs: SessionlessRunListItem[], options: Pick<CliOptions, 'json'>): string {
@@ -291,6 +332,14 @@ function sessionRunDurationMs(rootRuns: RootRun[]): number | null {
   return earliestStart !== null && latestEnd !== null ? latestEnd - earliestStart : null;
 }
 
+function traceDurationMs(report: TraceReport): number | null {
+  const runDuration = sessionRunDurationMs(report.rootRuns);
+  if (runDuration !== null) {
+    return runDuration;
+  }
+  return report.session ? durationMs(report.session.createdAt, report.session.updatedAt) : null;
+}
+
 function renderUsage(usage: SessionUsageSummary): string {
   const lines = [`${chalk.cyan('usage')} ${formatUsageSummary(usage.total)}`];
   if (usage.byRootRun.length > 1) {
@@ -299,6 +348,178 @@ function renderUsage(usage: SessionUsageSummary): string {
     }
   }
   return lines.join('\n');
+}
+
+function renderPerformance(performance: PerformanceSummary, totalDurationMs: number | null): string {
+  const lines: string[] = [];
+  const statusCodes = Object.entries(performance.model.adapterStatusCodes)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([status, count]) => `${status}:${count}`)
+    .join(', ') || '-';
+
+  if (performance.events.measuredEvents === 0) {
+    lines.push(chalk.gray('No Phase 0 performance payloads were found for this trace.'));
+  }
+
+  lines.push(markdownBlock('## Overview'));
+  lines.push(renderMetricTable([
+    ['events', `${formatNumber(performance.events.measuredEvents)} measured / ${formatNumber(performance.events.totalEvents)} total`, 'Events carrying `payload.performance`.'],
+    ['event payload bytes', formatBucketBytes(performance.events.payloadBytes), 'Persisted runtime event payload size.'],
+    ['event emit time', formatBucketDuration(performance.events.emitDurationMs), 'Time spent appending or forwarding measured events.'],
+  ]));
+
+  lines.push('');
+  lines.push(markdownBlock('## Model'));
+  lines.push(renderMetricTable([
+    ['calls', `started=${formatNumber(performance.model.started)} completed=${formatNumber(performance.model.completed)} failed=${formatNumber(performance.model.failed)}`, 'Model lifecycle counts.'],
+    ['duration', formatBucketDuration(performance.model.durationMs), 'Wall-clock model call time measured by core.'],
+    ['request bytes', formatBucketBytes(performance.model.requestBytes), 'Serialized model request size before adapter conversion.'],
+    ['response bytes', formatBucketBytes(performance.model.responseBytes), 'Serialized model response size after parsing.'],
+    ['pending tool calls', formatBucketNumber(performance.model.pendingToolCallCount), 'Tool calls returned by model responses.'],
+    ['retries', `${formatNumber(performance.model.retries)} events, delay ${formatBucketDuration(performance.model.retryDelayMs)}`, 'Adapter or provider retry activity.'],
+    ['adapter latency', formatBucketDuration(performance.model.adapterResponseLatencyMs), 'Provider SDK or HTTP response latency.'],
+    ['adapter gate wait', formatBucketDuration(performance.model.adapterGateWaitMs), 'Time waiting for adapter request admission.'],
+    ['adapter attempts', formatBucketNumber(performance.model.adapterAttemptCount), 'Attempts reported by adapters.'],
+    ['adapter bytes', `request ${formatBucketBytes(performance.model.adapterRequestBytes)} / response ${formatBucketBytes(performance.model.adapterResponseBytes)}`, 'Serialized provider-specific request and response sizes.'],
+    ['adapter status', statusCodes, 'HTTP status codes observed by adapters.'],
+  ]));
+
+  lines.push('');
+  lines.push(markdownBlock('## Tools'));
+  lines.push(renderMetricTable([
+    ['calls', `started=${formatNumber(performance.tools.started)} completed=${formatNumber(performance.tools.completed)} failed=${formatNumber(performance.tools.failed)}`, 'Tool lifecycle counts.'],
+    ['duration', formatBucketDuration(performance.tools.durationMs), 'Host tool execution time.'],
+    ['child duration', formatBucketDuration(performance.tools.childRunDurationMs), 'Synthetic delegate child-run wall time; not added to the duration split to avoid double counting child spans.'],
+    ['input bytes', formatBucketBytes(performance.tools.inputBytes), 'Raw tool input size.'],
+    ['event input bytes', formatBucketBytes(performance.tools.eventInputBytes), 'Input size after event capture/redaction.'],
+    ['raw output bytes', formatBucketBytes(performance.tools.rawOutputBytes), 'Raw tool output size.'],
+    ['event output bytes', formatBucketBytes(performance.tools.eventOutputBytes), 'Output size persisted in lifecycle events.'],
+    ['model output bytes', formatBucketBytes(performance.tools.modelOutputBytes), 'Tool output size visible to the model.'],
+  ]));
+
+  const visibleTools = performance.tools.byTool
+    .filter((tool) => tool.durationMs.count > 0 || tool.rawOutputBytes.count > 0 || tool.started > 0)
+    .slice(0, 8);
+  if (visibleTools.length > 0) {
+    lines.push('');
+    lines.push(markdownBlock('### Top Tools'));
+    lines.push(renderTable(
+      ['tool', 'started', 'completed', 'failed', 'duration', 'raw output', 'model output'],
+      visibleTools.map((tool) => [
+        toolColor(tool.toolName)(tool.toolName),
+        formatNumber(tool.started),
+        formatNumber(tool.completed),
+        formatNumber(tool.failed),
+        formatBucketDuration(tool.durationMs),
+        formatBucketBytes(tool.rawOutputBytes),
+        formatBucketBytes(tool.modelOutputBytes),
+      ]),
+    ));
+  }
+
+  lines.push('');
+  lines.push(markdownBlock('## Snapshots'));
+  lines.push(renderDurationSplit(performance, totalDurationMs));
+  lines.push(renderMetricTable([
+    ['created', formatNumber(performance.snapshots.created), 'Snapshot events observed in the trace.'],
+    ['state bytes', formatBucketBytes(performance.snapshots.stateBytes), 'Serialized snapshot state size.'],
+    ['message bytes', formatBucketBytes(performance.snapshots.messageBytes), 'Serialized persisted message context size.'],
+    ['message count', formatBucketNumber(performance.snapshots.messageCount), 'Messages persisted in snapshots.'],
+    ['pending tool bytes', formatBucketBytes(performance.snapshots.pendingToolCallBytes), 'Serialized pending tool call state.'],
+    ['save time', formatBucketDuration(performance.snapshots.saveDurationMs), 'Snapshot store write time when measured.'],
+  ]));
+
+  lines.push('');
+  lines.push(markdownBlock('## Notes'));
+  lines.push('- `total` shows cumulative volume or time across measured events; `max` points to the largest single event.');
+  lines.push('- Request and snapshot bytes usually explain prompt or persistence bloat; adapter latency usually explains provider wait.');
+  lines.push('- `raw output` versus `model output` shows whether tool results are being compressed before returning to the model.');
+
+  return lines.join('\n');
+}
+
+function emptyPerformanceSummary(): PerformanceSummary {
+  const bucket = (): PerformanceBucketSummary => ({ count: 0, total: 0, max: 0, average: 0 });
+  return {
+    events: {
+      totalEvents: 0,
+      measuredEvents: 0,
+      payloadBytes: bucket(),
+      emitDurationMs: bucket(),
+    },
+    model: {
+      started: 0,
+      completed: 0,
+      failed: 0,
+      retries: 0,
+      requestBytes: bucket(),
+      responseBytes: bucket(),
+      durationMs: bucket(),
+      retryDelayMs: bucket(),
+      pendingToolCallCount: bucket(),
+      adapterGateWaitMs: bucket(),
+      adapterResponseLatencyMs: bucket(),
+      adapterRequestBytes: bucket(),
+      adapterResponseBytes: bucket(),
+      adapterAttemptCount: bucket(),
+      adapterRetryDelayMs: bucket(),
+      adapterStatusCodes: {},
+    },
+    tools: {
+      started: 0,
+      completed: 0,
+      failed: 0,
+      inputBytes: bucket(),
+      eventInputBytes: bucket(),
+      rawOutputBytes: bucket(),
+      eventOutputBytes: bucket(),
+      modelOutputBytes: bucket(),
+      durationMs: bucket(),
+      childRunDurationMs: bucket(),
+      byTool: [],
+    },
+    snapshots: {
+      created: 0,
+      stateBytes: bucket(),
+      messageBytes: bucket(),
+      messageCount: bucket(),
+      saveDurationMs: bucket(),
+      pendingToolCallBytes: bucket(),
+    },
+  };
+}
+
+function renderDurationSplit(performance: PerformanceSummary, totalDurationMs: number | null): string {
+  const split = durationSplitParts(performance, totalDurationMs);
+  return [
+    chalk.cyan('Duration split:'),
+    `total=${formatDuration(split.totalDurationMs)}`,
+    `model=${formatDuration(split.modelDurationMs)}`,
+    `tools=${formatDuration(split.toolDurationMs)}`,
+    `snapshot save=${formatDuration(split.snapshotSaveMs)}`,
+    `other=${formatDuration(split.otherDurationMs)}`,
+  ].join('  ');
+}
+
+function durationSplitParts(performance: PerformanceSummary, totalDurationMs: number | null): {
+  totalDurationMs: number | null;
+  modelDurationMs: number;
+  toolDurationMs: number;
+  snapshotSaveMs: number;
+  otherDurationMs: number | null;
+} {
+  const modelDurationMs = performance.model.durationMs.total;
+  const toolDurationMs = performance.tools.durationMs.total;
+  const snapshotSaveMs = performance.snapshots.saveDurationMs.total;
+  const measuredMs = modelDurationMs + toolDurationMs + snapshotSaveMs;
+  const otherDurationMs = totalDurationMs === null ? null : Math.max(0, totalDurationMs - measuredMs);
+  return {
+    totalDurationMs,
+    modelDurationMs,
+    toolDurationMs,
+    snapshotSaveMs,
+    otherDurationMs,
+  };
 }
 
 function renderGoal(rootRuns: RootRun[]): string {
@@ -712,6 +933,14 @@ function renderTable(headers: string[], rows: string[][], options?: { maxWidths?
   return [line(headers.map((header) => chalk.bold(header))), line(widths.map((width) => '-'.repeat(width))), ...rows.map(line)].join('\n');
 }
 
+function renderMetricTable(rows: Array<[metric: string, value: string, explanation: string]>): string {
+  return renderTable(['metric', 'value', 'meaning'], rows.map(([metric, value, explanation]) => [
+    chalk.cyan(metric),
+    value,
+    explanation,
+  ]), { maxWidths: [24, 52, 72] });
+}
+
 function statusColor(status: string): (value: string) => string {
   if (['succeeded', 'returned successfully'].includes(status)) {
     return chalk.green;
@@ -826,6 +1055,37 @@ function formatTimeOfDay(value: string | null): string {
 
 function formatNumber(value: number): string {
   return new Intl.NumberFormat('en-US').format(value);
+}
+
+function formatBucketBytes(bucket: PerformanceBucketSummary): string {
+  if (bucket.count === 0) {
+    return '-';
+  }
+  return `${formatBytes(bucket.total)} total/${formatBytes(bucket.max)} max/${formatBytes(bucket.average)} avg`;
+}
+
+function formatBucketDuration(bucket: PerformanceBucketSummary): string {
+  if (bucket.count === 0) {
+    return '-';
+  }
+  return `${formatDuration(bucket.total)} total/${formatDuration(bucket.max)} max/${formatDuration(bucket.average)} avg`;
+}
+
+function formatBucketNumber(bucket: PerformanceBucketSummary): string {
+  if (bucket.count === 0) {
+    return '-';
+  }
+  return `${formatNumber(bucket.total)} total/${formatNumber(bucket.max)} max/${formatNumber(Number(bucket.average.toFixed(2)))} avg`;
+}
+
+function formatBytes(value: number): string {
+  if (value < 1024) {
+    return `${formatNumber(Math.round(value))}B`;
+  }
+  if (value < 1024 * 1024) {
+    return `${(value / 1024).toFixed(1)}KiB`;
+  }
+  return `${(value / (1024 * 1024)).toFixed(2)}MiB`;
 }
 
 function compactValue(value: unknown): string {

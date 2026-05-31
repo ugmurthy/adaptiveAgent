@@ -1,5 +1,5 @@
 import type { EventType } from '@adaptive-agent/core';
-export type ReportView = 'overview' | 'milestones' | 'timeline' | 'delegates' | 'messages' | 'plans' | 'all';
+export type ReportView = 'overview' | 'performance' | 'milestones' | 'timeline' | 'delegates' | 'messages' | 'plans' | 'all';
 export type MessageView = 'compact' | 'delta' | 'full';
 
 export interface CliOptions {
@@ -8,6 +8,7 @@ export interface CliOptions {
   runId?: string;
   json: boolean;
   listSessions: boolean;
+  listPerformance: boolean;
   listSessionless: boolean;
   deleteEmptyGoalSessions: boolean;
   usageOnly: boolean;
@@ -71,7 +72,7 @@ export interface SessionUsageSummary {
 }
 
 export interface SessionListItem {
-  sessionId: string;
+  sessionId: string | null;
   startedAt: string;
   status?: string;
   goals: Array<{
@@ -88,8 +89,22 @@ export interface SessionListItem {
 export interface SessionlessRunListItem {
   rootRunId: string;
   startedAt: string;
+  completedAt?: string | null;
   status?: string | null;
   goal: string | null;
+}
+
+export interface SessionPerformanceListItem {
+  sessionId: string;
+  sessionStatus?: string;
+  rootRunId: string;
+  runId: string;
+  runStatus: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  totalDurationMs: number | null;
+  goal: string | null;
+  performance: PerformanceSummary;
 }
 
 export interface TraceRow {
@@ -148,6 +163,69 @@ export interface TimelineEntry {
   outcome: string;
   childRunId: string | null;
   eventSeq: number | null;
+}
+
+export interface PerformanceBucketSummary {
+  count: number;
+  total: number;
+  max: number;
+  average: number;
+}
+
+export interface PerformanceSummary {
+  events: {
+    totalEvents: number;
+    measuredEvents: number;
+    payloadBytes: PerformanceBucketSummary;
+    emitDurationMs: PerformanceBucketSummary;
+  };
+  model: {
+    started: number;
+    completed: number;
+    failed: number;
+    retries: number;
+    requestBytes: PerformanceBucketSummary;
+    responseBytes: PerformanceBucketSummary;
+    durationMs: PerformanceBucketSummary;
+    retryDelayMs: PerformanceBucketSummary;
+    pendingToolCallCount: PerformanceBucketSummary;
+    adapterGateWaitMs: PerformanceBucketSummary;
+    adapterResponseLatencyMs: PerformanceBucketSummary;
+    adapterRequestBytes: PerformanceBucketSummary;
+    adapterResponseBytes: PerformanceBucketSummary;
+    adapterAttemptCount: PerformanceBucketSummary;
+    adapterRetryDelayMs: PerformanceBucketSummary;
+    adapterStatusCodes: Record<string, number>;
+  };
+  tools: {
+    started: number;
+    completed: number;
+    failed: number;
+    inputBytes: PerformanceBucketSummary;
+    eventInputBytes: PerformanceBucketSummary;
+    rawOutputBytes: PerformanceBucketSummary;
+    eventOutputBytes: PerformanceBucketSummary;
+    modelOutputBytes: PerformanceBucketSummary;
+    durationMs: PerformanceBucketSummary;
+    childRunDurationMs: PerformanceBucketSummary;
+    byTool: Array<{
+      toolName: string;
+      started: number;
+      completed: number;
+      failed: number;
+      durationMs: PerformanceBucketSummary;
+      rawOutputBytes: PerformanceBucketSummary;
+      modelOutputBytes: PerformanceBucketSummary;
+    }>;
+  };
+  snapshots: {
+    created: number;
+    stateBytes: PerformanceBucketSummary;
+    messageBytes: PerformanceBucketSummary;
+    messageCount: PerformanceBucketSummary;
+    saveDurationMs: PerformanceBucketSummary;
+    pendingToolCallBytes: PerformanceBucketSummary;
+  };
 }
 
 export interface MilestoneEntry {
@@ -285,6 +363,7 @@ export interface TraceReport {
   session: SessionOverview | null;
   rootRuns: RootRun[];
   usage: SessionUsageSummary;
+  performance?: PerformanceSummary;
   timeline: TimelineEntry[];
   milestones?: MilestoneEntry[];
   llmMessages: RunMessageTrace[];
@@ -305,6 +384,3 @@ export interface TraceTarget {
   requestedId: string;
   resolvedRootRunId?: string;
 }
-
-const CORE_EVENT_TYPES: EventType[] = [
-  'run.created',

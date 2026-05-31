@@ -388,6 +388,13 @@ describe('BaseOpenAIChatAdapter', () => {
       model: adapter.model,
     });
     expect(result.providerResponseId).toBe('chatcmpl-test-1');
+    expect(result.performance).toMatchObject({
+      adapterAttemptCount: 1,
+      adapterRequestBytes: expect.any(Number),
+      adapterResponseBytes: expect.any(Number),
+      adapterResponseLatencyMs: expect.any(Number),
+      adapterStatusCode: 200,
+    });
   });
 
   it('uses provider-reported usage cost when present', async () => {
@@ -695,6 +702,11 @@ describe('BaseOpenAIChatAdapter', () => {
         retryDelayMs: 250,
         reason: 'rate_limit',
         phase: 'http_status',
+        performance: expect.objectContaining({
+          adapterRequestBytes: expect.any(Number),
+          adapterRetryDelayMs: 250,
+          adapterStatusCode: 429,
+        }),
       }),
     ]);
   });

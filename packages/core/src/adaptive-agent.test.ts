@@ -1712,6 +1712,10 @@ describe('AdaptiveAgent', () => {
     const modelRequestLog = entries.find((entry) => entry.event === 'model.request');
     expect(modelRequestLog).toBeDefined();
     expect(modelRequestLog?.messageCount).toBeGreaterThan(0);
+    expect(modelRequestLog?.performance).toMatchObject({
+      messageCount: expect.any(Number),
+      requestBytes: expect.any(Number),
+    });
 
     const systemInjectionLog = entries.find(
       (entry) => entry.event === 'system_message.injected' && entry.source === 'initial_prompt',
@@ -1737,6 +1741,10 @@ describe('AdaptiveAgent', () => {
     expect(lookupStartLog?.input).toMatchObject({
       topic: 'delegation',
     });
+    expect(lookupStartLog?.performance).toMatchObject({
+      inputBytes: expect.any(Number),
+      eventInputBytes: expect.any(Number),
+    });
 
     const lookupCompletedLog = entries.find(
       (entry) => entry.event === 'tool.completed' && entry.toolName === 'lookup',
@@ -1744,6 +1752,42 @@ describe('AdaptiveAgent', () => {
     expect(lookupCompletedLog?.output).toMatchObject({
       finding: 'researched:delegation',
     });
+    expect(lookupCompletedLog?.performance).toMatchObject({
+      durationMs: expect.any(Number),
+      rawOutputBytes: expect.any(Number),
+      modelOutputBytes: expect.any(Number),
+    });
+
+    const events = await eventStore.listByRun(result.runId);
+    const modelStartedEvent = events.find((event) => event.type === 'model.started');
+    expect(modelStartedEvent?.payload).toEqual(
+      expect.objectContaining({
+        performance: expect.objectContaining({
+          requestBytes: expect.any(Number),
+          eventPayloadBytes: expect.any(Number),
+        }),
+      }),
+    );
+
+    const childRuns = await runStore.listChildren(result.runId);
+    const childEvents = childRuns[0] ? await eventStore.listByRun(childRuns[0].id) : [];
+    const lookupCompletedEvent = childEvents.find(
+      (event) =>
+        event.type === 'tool.completed' &&
+        event.payload &&
+        typeof event.payload === 'object' &&
+        !Array.isArray(event.payload) &&
+        event.payload.toolName === 'lookup',
+    );
+    expect(lookupCompletedEvent?.payload).toEqual(
+      expect.objectContaining({
+        performance: expect.objectContaining({
+          durationMs: expect.any(Number),
+          rawOutputBytes: expect.any(Number),
+          eventPayloadBytes: expect.any(Number),
+        }),
+      }),
+    );
 
     const latestSnapshot = await snapshotStore.getLatest(result.runId);
     expect(latestSnapshot?.state).toMatchObject({

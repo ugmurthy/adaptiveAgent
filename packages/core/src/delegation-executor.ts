@@ -1,6 +1,11 @@
 import type { Logger } from 'pino';
 
-import { runLogBindings, summarizeRunResultForLog } from './logging.js';
+import {
+  approximateSerializedByteLength,
+  compactJsonObject,
+  runLogBindings,
+  summarizeRunResultForLog,
+} from './logging.js';
 import { captureValueForLog, summarizeValueForLog } from './logger.js';
 import type {
   AgentDefaults,
@@ -177,6 +182,7 @@ export class DelegationExecutor {
     const toolName = this.toDelegateToolName(delegate.name);
     const childRunId = crypto.randomUUID();
     const childDepth = parentContext.delegationDepth + 1;
+    const startPerformance = delegateToolStartPerformance(input);
 
     this.logLifecycle('info', 'tool.started', {
       runId: parentContext.runId,
@@ -189,6 +195,7 @@ export class DelegationExecutor {
       childRunId,
       childDelegateName: delegate.name,
       input: captureValueForLog(input, { mode: this.options.defaults?.capture ?? 'summary' }),
+      performance: startPerformance,
     });
 
     await parentContext.emit({
@@ -201,6 +208,7 @@ export class DelegationExecutor {
         toolName,
         delegateName: delegate.name,
         childRunId,
+        performance: startPerformance,
       },
     });
 
@@ -231,6 +239,12 @@ export class DelegationExecutor {
       context: captureValueForLog(input.context, { mode: this.options.defaults?.capture ?? 'summary' }),
       metadata: captureValueForLog(input.metadata, { mode: 'summary' }),
       outputSchema: input.outputSchema ? summarizeValueForLog(input.outputSchema) : undefined,
+      performance: compactJsonObject({
+        inputBytes: approximateSerializedByteLength(input.input),
+        contextBytes: input.context === undefined ? undefined : approximateSerializedByteLength(input.context),
+        metadataBytes: input.metadata === undefined ? undefined : approximateSerializedByteLength(input.metadata),
+        outputSchemaBytes: input.outputSchema === undefined ? undefined : approximateSerializedByteLength(input.outputSchema),
+      }),
     });
 
     const childResult = await this.options.executeChildRun({
@@ -257,6 +271,9 @@ export class DelegationExecutor {
       delegateName: delegate.name,
       toolName,
       result: summarizeRunResultForLog(childResult),
+      performance: compactJsonObject({
+        resultBytes: approximateSerializedByteLength(childResult),
+      }),
     });
 
     await this.materializeChildTerminalState(childRunId, childResult);
@@ -424,6 +441,7 @@ export class DelegationExecutor {
     const mapped = this.mapChildRun(childRun);
     if (!alreadyResolved) {
       const statusChangedEvent = this.runStatusChangedEvent(parentRun, params.stepId, 'running', null);
+      const performance = delegateToolResolutionPerformance(childRun, mapped);
       const parentToolEvent = this.parentToolResolutionEvent({
         parentRunId: parentRun.id,
         stepId: params.stepId,
@@ -432,6 +450,7 @@ export class DelegationExecutor {
         toolName: params.toolName,
         childRunId: params.childRunId,
         mapped,
+        performance,
       });
       const refreshedParent = await this.persistParentResolutionBoundary({
         parentRun,
@@ -455,6 +474,7 @@ export class DelegationExecutor {
           delegateName: params.delegateName,
           childRunId: params.childRunId,
           output: summarizeValueForLog(mapped.output),
+          performance,
         });
         return {
           kind: 'resolved',
@@ -472,6 +492,7 @@ export class DelegationExecutor {
         childRunId: params.childRunId,
         error: mapped.error,
         code: mapped.code,
+        performance,
       });
 
       return {
@@ -534,11 +555,13 @@ export class DelegationExecutor {
 
         await stores.toolExecutionStore?.markChildRunLinked(params.parentContext.idempotencyKey, params.childRunId);
 
-        const statusChangedEvent = this.runStatusChangedEvent(
-          parentRun,
-          params.parentContext.stepId,
-          'awaiting_subagent',
-          params.childRunId,
+        const statusChangedEvent = this.withEventPayloadPerformance(
+          this.runStatusChangedEvent(
+            parentRun,
+            params.parentContext.stepId,
+            'awaiting_subagent',
+            params.childRunId,
+          ),
         );
         await stores.eventStore.append(statusChangedEvent);
         downstreamEvents.push(statusChangedEvent);
@@ -553,15 +576,17 @@ export class DelegationExecutor {
           downstreamEvents.push(snapshotEvent);
         }
 
-        const delegateSpawnedEvent = this.delegateSpawnedEvent(
-          params.parentContext.runId,
-          params.parentContext.stepId,
-          params.delegatePayload,
+        const delegateSpawnedEvent = this.withEventPayloadPerformance(
+          this.delegateSpawnedEvent(
+            params.parentContext.runId,
+            params.parentContext.stepId,
+            params.delegatePayload,
+          ),
         );
         await stores.eventStore.append(delegateSpawnedEvent);
         downstreamEvents.push(delegateSpawnedEvent);
 
-        const childCreatedEvent = this.childRunCreatedEvent(childRun);
+        const childCreatedEvent = this.withEventPayloadPerformance(this.childRunCreatedEvent(childRun));
         await stores.eventStore.append(childCreatedEvent);
         downstreamEvents.push(childCreatedEvent);
 
@@ -628,6 +653,8 @@ export class DelegationExecutor {
     statusChangedEvent: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>;
     parentToolEvent: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>;
   }): Promise<AgentRun> {
+    const statusChangedEvent = this.withEventPayloadPerformance(params.statusChangedEvent);
+    const parentToolEvent = this.withEventPayloadPerformance(params.parentToolEvent);
     const transactionStore = this.options.transactionStore;
     if (transactionStore?.eventStore) {
       const updatedParent = await transactionStore.runInTransaction(async (stores) => {
@@ -643,12 +670,12 @@ export class DelegationExecutor {
           },
           params.parentRun.version,
         );
-        await stores.eventStore.append(params.statusChangedEvent);
-        await stores.eventStore.append(params.parentToolEvent);
+        await stores.eventStore.append(statusChangedEvent);
+        await stores.eventStore.append(parentToolEvent);
         return nextParent;
       });
 
-      await this.emitDownstreamOnly([params.statusChangedEvent, params.parentToolEvent]);
+      await this.emitDownstreamOnly([statusChangedEvent, parentToolEvent]);
       return updatedParent;
     }
 
@@ -660,8 +687,8 @@ export class DelegationExecutor {
       },
       params.parentRun.version,
     );
-    await this.emitRunEvent(params.statusChangedEvent);
-    await this.emitRunEvent(params.parentToolEvent);
+    await this.emitRunEvent(statusChangedEvent);
+    await this.emitRunEvent(parentToolEvent);
     return updatedParent;
   }
 
@@ -759,6 +786,18 @@ export class DelegationExecutor {
     const latestSnapshot = await stores.snapshotStore.getLatest(parentRun.id);
     const previousState = isJsonObject(latestSnapshot?.state) ? latestSnapshot.state : {};
     const previousSummary = isJsonObject(latestSnapshot?.summary) ? latestSnapshot.summary : {};
+    const summary = {
+      ...previousSummary,
+      state: 'awaiting_subagent',
+      waitingOnDelegateName: delegateName,
+    };
+    const state = {
+      ...previousState,
+      waitingOnChildRunId: childRunId,
+      waitingOnDelegateName: delegateName,
+      parentStepId: parentRun.currentStepId ?? null,
+    };
+    const snapshotSaveStartedAt = Date.now();
     await stores.snapshotStore.save({
       runId: parentRun.id,
       snapshotSeq: (latestSnapshot?.snapshotSeq ?? 0) + 1,
@@ -766,20 +805,16 @@ export class DelegationExecutor {
       currentStepId: parentRun.currentStepId,
       currentPlanId: parentRun.currentPlanId,
       currentPlanExecutionId: parentRun.currentPlanExecutionId,
-      summary: {
-        ...previousSummary,
-        state: 'awaiting_subagent',
-        waitingOnDelegateName: delegateName,
-      },
-      state: {
-        ...previousState,
-        waitingOnChildRunId: childRunId,
-        waitingOnDelegateName: delegateName,
-        parentStepId: parentRun.currentStepId ?? null,
-      },
+      summary,
+      state,
+    });
+    const performance = delegationSnapshotPerformance({
+      state,
+      summary,
+      saveDurationMs: Date.now() - snapshotSaveStartedAt,
     });
 
-    const snapshotEvent = {
+    const snapshotEvent = this.withEventPayloadPerformance({
       runId: parentRun.id,
       type: 'snapshot.created',
       stepId: parentRun.currentStepId,
@@ -788,8 +823,9 @@ export class DelegationExecutor {
         status: 'awaiting_subagent',
         waitingOnChildRunId: childRunId,
         waitingOnDelegateName: delegateName,
+        performance,
       },
-    } satisfies Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>;
+    } satisfies Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>);
 
     await stores.eventStore?.append(snapshotEvent);
 
@@ -799,6 +835,7 @@ export class DelegationExecutor {
       status: 'awaiting_subagent',
       waitingOnChildRunId: childRunId,
       waitingOnDelegateName: delegateName,
+      performance,
     });
 
     return snapshotEvent;
@@ -862,6 +899,7 @@ export class DelegationExecutor {
     mapped:
       | { kind: 'success'; output: JsonValue }
       | { kind: 'failure'; error: string; code: RunFailureCode };
+    performance?: JsonObject;
   }): Omit<AgentEvent, 'id' | 'seq' | 'createdAt'> {
     if (params.mapped.kind === 'success') {
       return {
@@ -875,6 +913,7 @@ export class DelegationExecutor {
           delegateName: params.delegateName,
           childRunId: params.childRunId,
           output: params.mapped.output,
+          ...(params.performance === undefined ? {} : { performance: params.performance }),
         },
       };
     }
@@ -891,6 +930,7 @@ export class DelegationExecutor {
         childRunId: params.childRunId,
         error: params.mapped.error,
         code: params.mapped.code,
+        ...(params.performance === undefined ? {} : { performance: params.performance }),
       },
     };
   }
@@ -901,7 +941,16 @@ export class DelegationExecutor {
     }
 
     for (const event of events) {
+      const emitStartedAt = Date.now();
       await this.options.downstreamEventSink.emit(event);
+      this.logLifecycle('debug', 'event.downstream_emitted', {
+        runId: event.runId,
+        stepId: event.stepId,
+        toolCallId: event.toolCallId,
+        eventType: event.type,
+        payloadBytes: approximateSerializedByteLength(event.payload),
+        durationMs: Date.now() - emitStartedAt,
+      });
     }
   }
 
@@ -1081,7 +1130,47 @@ export class DelegationExecutor {
     payload: JsonValue;
     stepId?: string;
   }): Promise<void> {
-    await this.options.eventSink?.emit(event);
+    if (!this.options.eventSink) {
+      return;
+    }
+
+    const emitStartedAt = Date.now();
+    await this.options.eventSink.emit(event);
+    this.logLifecycle('debug', 'event.emitted', {
+      runId: event.runId,
+      stepId: event.stepId,
+      eventType: event.type,
+      payloadBytes: approximateSerializedByteLength(event.payload),
+      durationMs: Date.now() - emitStartedAt,
+    });
+  }
+
+  private withEventPayloadPerformance(
+    event: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>,
+  ): Omit<AgentEvent, 'id' | 'seq' | 'createdAt'> {
+    if (!isJsonObject(event.payload)) {
+      return event;
+    }
+
+    const currentPerformance = isJsonObject(event.payload.performance)
+      ? event.payload.performance
+      : {};
+    const { eventPayloadBytes: _eventPayloadBytes, ...performanceWithoutPayloadBytes } = currentPerformance;
+    const payloadWithoutPayloadBytes = {
+      ...event.payload,
+      performance: performanceWithoutPayloadBytes,
+    };
+
+    return {
+      ...event,
+      payload: {
+        ...event.payload,
+        performance: compactJsonObject({
+          ...performanceWithoutPayloadBytes,
+          eventPayloadBytes: approximateSerializedByteLength(payloadWithoutPayloadBytes),
+        }),
+      },
+    };
   }
 
   private pendingReason(status: RunStatus): string {
@@ -1190,8 +1279,51 @@ function mergeDelegateToolBudgets(
   return merged;
 }
 
-function isJsonObject(value: JsonValue): value is JsonObject {
+function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function delegateToolStartPerformance(input: DelegateToolInput): JsonObject {
+  return compactJsonObject({
+    inputBytes: approximateSerializedByteLength(input),
+    timeoutMs: 0,
+  });
+}
+
+function delegateToolResolutionPerformance(
+  childRun: AgentRun,
+  mapped: { kind: 'success'; output: JsonValue } | { kind: 'failure'; error: string; code: RunFailureCode },
+): JsonObject {
+  return compactJsonObject({
+    childRunDurationMs: runDurationMs(childRun),
+    childDelegationDepth: childRun.delegationDepth,
+    rawOutputBytes: mapped.kind === 'success' ? approximateSerializedByteLength(mapped.output) : undefined,
+    modelOutputBytes: mapped.kind === 'success' ? approximateSerializedByteLength(mapped.output) : undefined,
+    errorBytes: mapped.kind === 'failure' ? approximateSerializedByteLength(mapped.error) : undefined,
+  });
+}
+
+function delegationSnapshotPerformance(params: {
+  state: JsonObject;
+  summary: JsonObject;
+  saveDurationMs?: number;
+}): JsonObject {
+  return compactJsonObject({
+    saveDurationMs: params.saveDurationMs,
+    stateBytes: approximateSerializedByteLength(params.state),
+    summaryBytes: approximateSerializedByteLength(params.summary),
+    waitingOnChildRun: true,
+  });
+}
+
+function runDurationMs(run: AgentRun): number | undefined {
+  const startedAt = Date.parse(run.createdAt);
+  const endedAt = Date.parse(run.completedAt ?? run.updatedAt);
+  if (Number.isNaN(startedAt) || Number.isNaN(endedAt)) {
+    return undefined;
+  }
+
+  return Math.max(0, endedAt - startedAt);
 }
 
 function toDelegateToolInput(input: JsonValue): DelegateToolInput {

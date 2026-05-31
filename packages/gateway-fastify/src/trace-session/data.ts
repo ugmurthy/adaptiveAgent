@@ -10,6 +10,7 @@ import {
   filterReportForFocusedRun,
   isHistoricalTrace,
   summarizeTrace,
+  summarizePerformance,
   totalStepsFromSnapshotSummaries,
 } from './report.js';
 import type {
@@ -20,6 +21,7 @@ import type {
   RunMessageTrace,
   RunSnapshotSummary,
   SessionListItem,
+  SessionPerformanceListItem,
   SessionOverview,
   SessionUsageSummary,
   SessionlessRunListItem,
@@ -27,6 +29,7 @@ import type {
   TraceMessage,
   TraceMessageRole,
   TraceReport,
+  TraceRow,
   TraceTarget,
   TraceToolCall,
   UsageSummary,
@@ -97,6 +100,7 @@ export async function traceSession(client: PostgresClient, options: CliOptions):
     session,
     rootRuns,
     usage,
+    performance: summarizePerformance(traceRows),
     timeline,
     milestones: buildMilestones(traceRows),
     llmMessages,
@@ -117,6 +121,7 @@ export async function traceSession(client: PostgresClient, options: CliOptions):
       report = filterReportForFocusedRun(report, focusedRunIds);
       report.summary = summarizeTrace(report.session, report.rootRuns, report.timeline, report.delegates);
       report.totalSteps = totalStepsFromSnapshotSummaries(report.snapshotSummaries ?? []);
+      report.performance = summarizePerformance(traceRows.filter((row) => focusedRunIds.has(row.run_id)));
     }
   }
 
@@ -130,7 +135,8 @@ export async function loadUsageForTraceTarget(client: PostgresClient, options: C
 
 
 export async function listSessions(client: PostgresClient): Promise<SessionListItem[]> {
-  const result = await client.query<{
+  const [sessionResult, sessionlessRuns] = await Promise.all([
+    client.query<{
     session_id: string;
     started_at: string;
     status: string;
@@ -169,13 +175,70 @@ export async function listSessions(client: PostgresClient): Promise<SessionListI
     left join agent_runs r on r.id::text = l.root_run_id
     group by s.id, s.created_at
     order by s.created_at desc, s.id desc
-  `);
+  `),
+    listSessionlessRuns(client),
+  ]);
 
-  return result.rows.map((row) => ({
+  const sessions = sessionResult.rows.map((row) => ({
     sessionId: row.session_id,
     startedAt: row.started_at,
     status: row.status,
     goals: parseSessionGoals(row.goals),
+  }));
+
+  const sessionless = sessionlessRuns.map((run): SessionListItem => ({
+    sessionId: null,
+    startedAt: run.startedAt,
+    status: run.status ?? undefined,
+    goals: [{
+      rootRunId: run.rootRunId,
+      runId: run.rootRunId,
+      status: run.status ?? null,
+      startedAt: run.startedAt,
+      completedAt: run.completedAt ?? null,
+      goal: run.goal,
+      linkedAt: run.startedAt,
+    }],
+  }));
+
+  return [...sessions, ...sessionless].sort((left, right) =>
+    Date.parse(right.startedAt) - Date.parse(left.startedAt)
+    || (right.sessionId ?? right.goals[0]?.rootRunId ?? '').localeCompare(left.sessionId ?? left.goals[0]?.rootRunId ?? ''),
+  );
+}
+
+export async function listSessionPerformance(client: PostgresClient): Promise<SessionPerformanceListItem[]> {
+  const sessions = await listSessions(client);
+  const entries = sessions.flatMap((session) =>
+    session.goals.map((goal) => ({
+      session,
+      goal,
+    })),
+  );
+  const rootRunIds = [...new Set(entries.map((entry) => entry.goal.rootRunId))];
+  if (rootRunIds.length === 0) {
+    return [];
+  }
+
+  const traceRows = await loadTraceRows(client, 'performance-list', rootRunIds);
+  const rowsByRootRun = new Map<string, TraceRow[]>();
+  for (const row of traceRows) {
+    const rows = rowsByRootRun.get(row.root_run_id) ?? [];
+    rows.push(row);
+    rowsByRootRun.set(row.root_run_id, rows);
+  }
+
+  return entries.map(({ session, goal }) => ({
+    sessionId: session.sessionId,
+    sessionStatus: session.status,
+    rootRunId: goal.rootRunId,
+    runId: goal.runId,
+    runStatus: goal.status,
+    startedAt: goal.startedAt,
+    completedAt: goal.completedAt,
+    totalDurationMs: durationMs(goal.startedAt, goal.completedAt),
+    goal: goal.goal,
+    performance: summarizePerformance(rowsByRootRun.get(goal.rootRunId) ?? []),
   }));
 }
 
@@ -183,12 +246,14 @@ export async function listSessionlessRuns(client: PostgresClient): Promise<Sessi
   const result = await client.query<{
     root_run_id: string;
     started_at: string;
+    completed_at: string | null;
     status: string | null;
     goal: string | null;
   }>(`
     select
       r.id::text as root_run_id,
       r.created_at as started_at,
+      r.completed_at,
       r.status,
       r.goal
     from agent_runs r
@@ -203,6 +268,7 @@ export async function listSessionlessRuns(client: PostgresClient): Promise<Sessi
   return result.rows.map((row) => ({
     rootRunId: row.root_run_id,
     startedAt: row.started_at,
+    completedAt: row.completed_at,
     status: row.status,
     goal: row.goal,
   }));
@@ -256,6 +322,14 @@ function usageSummaryFromRow(row: {
     totalTokens: promptTokens + completionTokens + reasoningTokens,
     estimatedCostUSD: Number(row.estimated_cost_usd ?? 0),
   };
+}
+
+function durationMs(startedAt: string | null, completedAt: string | null): number | null {
+  if (!startedAt || !completedAt) {
+    return null;
+  }
+  const duration = Date.parse(completedAt) - Date.parse(startedAt);
+  return Number.isFinite(duration) && duration >= 0 ? duration : null;
 }
 
 

@@ -6,6 +6,8 @@ import type { AgentEventFrame } from '../protocol.js';
 import type {
   DelegateRow,
   MilestoneEntry,
+  PerformanceBucketSummary,
+  PerformanceSummary,
   RootRun,
   RunSnapshotSummary,
   RunTreeEntry,
@@ -199,6 +201,227 @@ export function summarizeTrace(
   }
 
   return { status: 'unknown', reason: 'not enough persisted trace data to determine the terminal reason' };
+}
+
+export function summarizePerformance(rows: TraceRow[]): PerformanceSummary {
+  const eventPayloadBytes = createBucket();
+  const eventEmitDurationMs = createBucket();
+  const modelRequestBytes = createBucket();
+  const modelResponseBytes = createBucket();
+  const modelDurationMs = createBucket();
+  const modelRetryDelayMs = createBucket();
+  const modelPendingToolCallCount = createBucket();
+  const adapterGateWaitMs = createBucket();
+  const adapterResponseLatencyMs = createBucket();
+  const adapterRequestBytes = createBucket();
+  const adapterResponseBytes = createBucket();
+  const adapterAttemptCount = createBucket();
+  const adapterRetryDelayMs = createBucket();
+  const adapterStatusCodes: Record<string, number> = {};
+  const toolInputBytes = createBucket();
+  const toolEventInputBytes = createBucket();
+  const toolRawOutputBytes = createBucket();
+  const toolEventOutputBytes = createBucket();
+  const toolModelOutputBytes = createBucket();
+  const toolDurationMs = createBucket();
+  const toolChildRunDurationMs = createBucket();
+  const snapshotStateBytes = createBucket();
+  const snapshotMessageBytes = createBucket();
+  const snapshotMessageCount = createBucket();
+  const snapshotSaveDurationMs = createBucket();
+  const snapshotPendingToolCallBytes = createBucket();
+  const toolsByName = new Map<string, ToolPerformanceAccumulator>();
+  const seenEvents = new Set<string>();
+  let modelStarted = 0;
+  let modelCompleted = 0;
+  let modelFailed = 0;
+  let modelRetries = 0;
+  let toolsStarted = 0;
+  let toolsCompleted = 0;
+  let toolsFailed = 0;
+  let snapshotsCreated = 0;
+  let measuredEvents = 0;
+
+  for (const row of rows) {
+    if (!row.event_type) {
+      continue;
+    }
+
+    const eventKey = row.event_id ?? `${row.run_id}:${row.event_seq ?? row.event_created_at ?? seenEvents.size}`;
+    if (seenEvents.has(eventKey)) {
+      continue;
+    }
+    seenEvents.add(eventKey);
+
+    const performance = payloadPerformance(row.payload);
+    if (!performance) {
+      continue;
+    }
+    measuredEvents += 1;
+
+    addNumber(eventPayloadBytes, readNumber(performance, 'eventPayloadBytes'));
+    addNumber(eventEmitDurationMs, readNumber(performance, 'eventEmitDurationMs'));
+
+    switch (row.event_type) {
+      case 'model.started':
+        modelStarted += 1;
+        addNumber(modelRequestBytes, readNumber(performance, 'requestBytes'));
+        break;
+      case 'model.completed':
+        modelCompleted += 1;
+        addNumber(modelResponseBytes, readNumber(performance, 'responseBytes'));
+        addNumber(modelDurationMs, readNumber(performance, 'durationMs'));
+        addNumber(modelPendingToolCallCount, readNumber(performance, 'pendingToolCallCount'));
+        addAdapterMetrics(performance);
+        break;
+      case 'model.failed':
+        modelFailed += 1;
+        addNumber(modelDurationMs, readNumber(performance, 'durationMs'));
+        break;
+      case 'model.retry':
+        modelRetries += 1;
+        addNumber(modelRetryDelayMs, readNumber(performance, 'retryDelayMs'));
+        addNumber(modelDurationMs, readNumber(performance, 'durationMs'));
+        addAdapterMetrics(performance);
+        break;
+      case 'tool.started':
+        toolsStarted += 1;
+        addToolCounts(row, 'started');
+        addNumber(toolInputBytes, readNumber(performance, 'inputBytes'));
+        addNumber(toolEventInputBytes, readNumber(performance, 'eventInputBytes'));
+        break;
+      case 'tool.completed':
+        toolsCompleted += 1;
+        addToolCounts(row, 'completed');
+        addToolMetrics(row, performance);
+        break;
+      case 'tool.failed':
+        toolsFailed += 1;
+        addToolCounts(row, 'failed');
+        addToolMetrics(row, performance);
+        break;
+      case 'snapshot.created':
+        snapshotsCreated += 1;
+        addNumber(snapshotStateBytes, readNumber(performance, 'stateBytes'));
+        addNumber(snapshotMessageBytes, readNumber(performance, 'messageBytes'));
+        addNumber(snapshotMessageCount, readNumber(performance, 'messageCount'));
+        addNumber(snapshotSaveDurationMs, readNumber(performance, 'saveDurationMs'));
+        addNumber(snapshotPendingToolCallBytes, readNumber(performance, 'pendingToolCallBytes'));
+        break;
+    }
+  }
+
+  return {
+    events: {
+      totalEvents: seenEvents.size,
+      measuredEvents,
+      payloadBytes: finishBucket(eventPayloadBytes),
+      emitDurationMs: finishBucket(eventEmitDurationMs),
+    },
+    model: {
+      started: modelStarted,
+      completed: modelCompleted,
+      failed: modelFailed,
+      retries: modelRetries,
+      requestBytes: finishBucket(modelRequestBytes),
+      responseBytes: finishBucket(modelResponseBytes),
+      durationMs: finishBucket(modelDurationMs),
+      retryDelayMs: finishBucket(modelRetryDelayMs),
+      pendingToolCallCount: finishBucket(modelPendingToolCallCount),
+      adapterGateWaitMs: finishBucket(adapterGateWaitMs),
+      adapterResponseLatencyMs: finishBucket(adapterResponseLatencyMs),
+      adapterRequestBytes: finishBucket(adapterRequestBytes),
+      adapterResponseBytes: finishBucket(adapterResponseBytes),
+      adapterAttemptCount: finishBucket(adapterAttemptCount),
+      adapterRetryDelayMs: finishBucket(adapterRetryDelayMs),
+      adapterStatusCodes,
+    },
+    tools: {
+      started: toolsStarted,
+      completed: toolsCompleted,
+      failed: toolsFailed,
+      inputBytes: finishBucket(toolInputBytes),
+      eventInputBytes: finishBucket(toolEventInputBytes),
+      rawOutputBytes: finishBucket(toolRawOutputBytes),
+      eventOutputBytes: finishBucket(toolEventOutputBytes),
+      modelOutputBytes: finishBucket(toolModelOutputBytes),
+      durationMs: finishBucket(toolDurationMs),
+      childRunDurationMs: finishBucket(toolChildRunDurationMs),
+      byTool: [...toolsByName.values()]
+        .map((tool) => ({
+          toolName: tool.toolName,
+          started: tool.started,
+          completed: tool.completed,
+          failed: tool.failed,
+          durationMs: finishBucket(tool.durationMs),
+          rawOutputBytes: finishBucket(tool.rawOutputBytes),
+          modelOutputBytes: finishBucket(tool.modelOutputBytes),
+        }))
+        .sort((left, right) => right.durationMs.total - left.durationMs.total || left.toolName.localeCompare(right.toolName)),
+    },
+    snapshots: {
+      created: snapshotsCreated,
+      stateBytes: finishBucket(snapshotStateBytes),
+      messageBytes: finishBucket(snapshotMessageBytes),
+      messageCount: finishBucket(snapshotMessageCount),
+      saveDurationMs: finishBucket(snapshotSaveDurationMs),
+      pendingToolCallBytes: finishBucket(snapshotPendingToolCallBytes),
+    },
+  };
+
+  function addAdapterMetrics(performance: Record<string, unknown>): void {
+    const adapter = asRecord(performance.adapter) ?? performance;
+    addNumber(adapterGateWaitMs, readNumber(adapter, 'adapterGateWaitMs'));
+    addNumber(adapterResponseLatencyMs, readNumber(adapter, 'adapterResponseLatencyMs'));
+    addNumber(adapterRequestBytes, readNumber(adapter, 'adapterRequestBytes'));
+    addNumber(adapterResponseBytes, readNumber(adapter, 'adapterResponseBytes'));
+    addNumber(adapterAttemptCount, readNumber(adapter, 'adapterAttemptCount'));
+    addNumber(adapterRetryDelayMs, readNumber(adapter, 'adapterRetryDelayMs') ?? readNumber(adapter, 'adapterTotalRetryDelayMs'));
+    const statusCode = readNumber(adapter, 'adapterStatusCode');
+    if (statusCode !== undefined) {
+      const key = String(statusCode);
+      adapterStatusCodes[key] = (adapterStatusCodes[key] ?? 0) + 1;
+    }
+  }
+
+  function addToolMetrics(row: TraceRow, performance: Record<string, unknown>): void {
+    addNumber(toolInputBytes, readNumber(performance, 'inputBytes'));
+    addNumber(toolEventInputBytes, readNumber(performance, 'eventInputBytes'));
+    addNumber(toolRawOutputBytes, readNumber(performance, 'rawOutputBytes'));
+    addNumber(toolEventOutputBytes, readNumber(performance, 'eventOutputBytes'));
+    addNumber(toolModelOutputBytes, readNumber(performance, 'modelOutputBytes'));
+    addNumber(toolDurationMs, readNumber(performance, 'durationMs'));
+    addNumber(toolChildRunDurationMs, readNumber(performance, 'childRunDurationMs'));
+
+    const tool = toolAccumulator(row);
+    addNumber(tool.durationMs, readNumber(performance, 'durationMs') ?? readNumber(performance, 'childRunDurationMs'));
+    addNumber(tool.rawOutputBytes, readNumber(performance, 'rawOutputBytes'));
+    addNumber(tool.modelOutputBytes, readNumber(performance, 'modelOutputBytes'));
+  }
+
+  function addToolCounts(row: TraceRow, kind: 'started' | 'completed' | 'failed'): void {
+    const tool = toolAccumulator(row);
+    tool[kind] += 1;
+  }
+
+  function toolAccumulator(row: TraceRow): ToolPerformanceAccumulator {
+    const toolName = row.ledger_tool_name ?? row.event_tool_name ?? payloadString(row.payload, 'toolName') ?? 'unknown';
+    const existing = toolsByName.get(toolName);
+    if (existing) {
+      return existing;
+    }
+    const created = {
+      toolName,
+      started: 0,
+      completed: 0,
+      failed: 0,
+      durationMs: createBucket(),
+      rawOutputBytes: createBucket(),
+      modelOutputBytes: createBucket(),
+    };
+    toolsByName.set(toolName, created);
+    return created;
+  }
 }
 
 
@@ -421,6 +644,64 @@ function durationMs(startedAt: string | null, completedAt: string | null): numbe
 function payloadValue(payload: unknown, key: string): unknown {
   if (payload && typeof payload === 'object' && key in payload) {
     return (payload as Record<string, unknown>)[key];
+  }
+  return undefined;
+}
+
+interface PerformanceBucketAccumulator {
+  count: number;
+  total: number;
+  max: number;
+}
+
+interface ToolPerformanceAccumulator {
+  toolName: string;
+  started: number;
+  completed: number;
+  failed: number;
+  durationMs: PerformanceBucketAccumulator;
+  rawOutputBytes: PerformanceBucketAccumulator;
+  modelOutputBytes: PerformanceBucketAccumulator;
+}
+
+function createBucket(): PerformanceBucketAccumulator {
+  return { count: 0, total: 0, max: 0 };
+}
+
+function addNumber(bucket: PerformanceBucketAccumulator, value: number | undefined): void {
+  if (value === undefined || !Number.isFinite(value)) {
+    return;
+  }
+  bucket.count += 1;
+  bucket.total += value;
+  bucket.max = Math.max(bucket.max, value);
+}
+
+function finishBucket(bucket: PerformanceBucketAccumulator): PerformanceBucketSummary {
+  return {
+    count: bucket.count,
+    total: bucket.total,
+    max: bucket.max,
+    average: bucket.count === 0 ? 0 : bucket.total / bucket.count,
+  };
+}
+
+function payloadPerformance(payload: unknown): Record<string, unknown> | null {
+  return asRecord(payloadValue(payload, 'performance'));
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function readNumber(record: Record<string, unknown>, key: string): number | undefined {
+  const value = record[key];
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
   }
   return undefined;
 }

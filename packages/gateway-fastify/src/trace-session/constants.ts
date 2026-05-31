@@ -7,6 +7,7 @@ export const USAGE = `Usage:
   adaptive-agent-trace-session --root-run <rootRunId> [options]
   adaptive-agent-trace-session --run <runId> [options]
   adaptive-agent-trace-session --ls [options]
+  adaptive-agent-trace-session --lsp [options]
   adaptive-agent-trace-session --ls-sessionless [options]
   adaptive-agent-trace-session --delete [options]
   adaptive-agent-trace-session <sessionId> --usage [options]
@@ -15,13 +16,14 @@ export const USAGE = `Usage:
 
 Options:
   --ls                   List sessions and associated goals, newest first.
+  --lsp                  List sessions/runs with one-line duration splits.
   --ls-sessionless       List root runs that are not linked to any gateway session.
   --delete               Print SQL to delete sessions whose goals are empty or null.
   --usage                Print usage totals for the session and all linked root runs.
   --messages             Include the current snapshot-backed LLM message context.
   --messages-view <mode> Message view: compact, delta, or full. Default: compact.
   --system-only          Include only system messages in the LLM message view.
-  --view <name>          Report view: overview, milestones, timeline, delegates, messages, plans, or all.
+  --view <name>          Report view: overview, performance, milestones, timeline, delegates, messages, plans, or all.
   --focus-run <id>       Limit the rendered report to a run subtree within the traced tree.
   --preview-chars <n>    Preview length for --ls goals and compact/delta message views. Default: ${DEFAULT_MESSAGE_PREVIEW_CHARS}
   --json                 Print the trace report as JSON.
