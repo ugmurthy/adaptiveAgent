@@ -51,7 +51,7 @@ describe('MessageLog', () => {
 
     const rendered = log.render(80).map(stripAnsi);
 
-    expect(rendered.some((line) => line.includes('Checking available data'))).toBe(true);
+    expect(rendered.some((line) => line.includes('\u29bf Checking available data'))).toBe(true);
     expect(rendered.some((line) => line.includes('undefined'))).toBe(false);
   });
 
@@ -74,5 +74,27 @@ describe('MessageLog', () => {
 
     expect(rendered.some((line) => line.includes('...'))).toBe(true);
     expect(rendered.some((line) => line.includes('system> /help still works'))).toBe(true);
+  });
+
+  it('does not leave extra blank lines between rendered messages', () => {
+    const log = new MessageLog();
+
+    log.addMessage({
+      type: 'assistant',
+      content: 'First message',
+      timestamp: new Date(),
+    });
+    log.addMessage({
+      type: 'system',
+      content: 'Second message',
+      timestamp: new Date(),
+    });
+
+    const rendered = log.render(80).map(stripAnsi);
+    const assistantIndex = rendered.findIndex((line) => line.includes('assistant> First message'));
+    const systemIndex = rendered.findIndex((line) => line.includes('system> Second message'));
+
+    expect(assistantIndex).toBeGreaterThanOrEqual(0);
+    expect(systemIndex).toBe(assistantIndex + 1);
   });
 });

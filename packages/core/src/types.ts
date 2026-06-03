@@ -375,6 +375,8 @@ export interface ToolContext {
   input?: JsonValue;
   context?: Record<string, JsonValue>;
   idempotencyKey: string;
+  /** Effective runtime timeout for this tool call. A value <= 0 means disabled. */
+  timeoutMs?: number;
   signal: AbortSignal;
   emit: (event: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>) => Promise<void>;
 }

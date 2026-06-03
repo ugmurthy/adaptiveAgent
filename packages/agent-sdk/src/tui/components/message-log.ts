@@ -1,21 +1,13 @@
 import chalk from 'chalk';
 import type { Component } from '@earendil-works/pi-tui';
 import { Markdown, truncateToWidth, visibleWidth, wrapTextWithAnsi } from '@earendil-works/pi-tui';
-import type { TuiMessageStyleConfig, TuiMessageType, TuiSettingsConfig, TuiTextStyleName } from '../../index.js';
+import type { TuiMessageType, TuiSettingsConfig } from '../../index.js';
 import type { MessageEntry } from '../types.js';
+import { applyStyle, resolveMessageStyle, resolvePrefixLabel, trimOuterBlankLines } from '../message-styles.js';
 import { defaultMarkdownTheme } from '../themes.js';
 
 const MAX_MESSAGES = 100;
 const MAX_LINES_PER_MESSAGE = 50;
-
-const DEFAULT_MESSAGE_STYLES: Record<TuiMessageType, Required<Pick<TuiMessageStyleConfig, 'showPrefix'>> & Pick<TuiMessageStyleConfig, 'prefix' | 'body'>> = {
-  user: { showPrefix: true, prefix: 'blue', body: 'default' },
-  assistant: { showPrefix: true, prefix: 'green', body: 'default' },
-  progress: { showPrefix: true, prefix: 'green', body: 'default' },
-  run: { showPrefix: true, prefix: 'cyan', body: 'default' },
-  system: { showPrefix: true, prefix: 'yellow', body: 'default' },
-  event: { showPrefix: true, prefix: 'dim', body: 'default' },
-};
 
 export class MessageLog implements Component {
   private messages: MessageEntry[] = [];
@@ -54,16 +46,16 @@ export class MessageLog implements Component {
     const lines: string[] = [];
 
     for (const entry of this.messages) {
-      const style = this.getStyle(entry.type);
-      const prefix = style.showPrefix ? this.getPrefix(entry.type, style) : '';
+      const style = resolveMessageStyle(this.theme, entry.type);
+      const prefix = this.getPrefix(entry.type, style);
       const prefixWidth = visibleWidth(prefix);
-      const contentWidth = style.showPrefix ? Math.max(1, width - prefixWidth - 1) : width;
-      const continuationPrefix = style.showPrefix ? ' '.repeat(prefixWidth + 1) : '';
+      const contentWidth = Math.max(1, width - prefixWidth - 1);
+      const continuationPrefix = ' '.repeat(prefixWidth + 1);
       const contentLines = this.formatContent(entry, contentWidth);
 
       for (let index = 0; index < contentLines.length && index < MAX_LINES_PER_MESSAGE; index += 1) {
-        const linePrefix = style.showPrefix && index === 0 ? `${prefix} ` : continuationPrefix;
-        lines.push(truncateToWidth(linePrefix + this.applyStyle(contentLines[index], style.body), width));
+        const linePrefix = index === 0 ? `${prefix} ` : continuationPrefix;
+        lines.push(truncateToWidth(linePrefix + applyStyle(contentLines[index], style.body), width));
       }
 
       if (contentLines.length > MAX_LINES_PER_MESSAGE) {
@@ -109,24 +101,8 @@ export class MessageLog implements Component {
     return this.scrollOffset;
   }
 
-  private getStyle(type: TuiMessageType): Required<Pick<TuiMessageStyleConfig, 'showPrefix'>> & Pick<TuiMessageStyleConfig, 'prefix' | 'body'> {
-    const fallback = DEFAULT_MESSAGE_STYLES[type];
-    const override = this.theme.messages?.[type] ?? {};
-    return {
-      showPrefix: override.showPrefix ?? fallback.showPrefix,
-      prefix: override.prefix ?? fallback.prefix,
-      body: override.body ?? fallback.body,
-    };
-  }
-
-  private getPrefix(type: MessageEntry['type'], style: TuiMessageStyleConfig): string {
-    const label = type === 'user' ? 'you>' : `${type}>`;
-    return this.applyStyle(label, style.prefix);
-  }
-
-  private applyStyle(text: string, style: TuiTextStyleName | TuiTextStyleName[] | undefined): string {
-    const styles = Array.isArray(style) ? style : [style ?? 'default'];
-    return styles.reduce((styled, styleName) => applyNamedStyle(styled, styleName), text);
+  private getPrefix(type: TuiMessageType, style: ReturnType<typeof resolveMessageStyle>): string {
+    return applyStyle(resolvePrefixLabel(type, style), style.prefix);
   }
 
   private formatContent(entry: MessageEntry, maxWidth: number): string[] {
@@ -135,34 +111,15 @@ export class MessageLog implements Component {
     if (entry.type === 'assistant' || entry.type === 'progress' || entry.type === 'run') {
       const markdown = new Markdown(content, 0, 0, defaultMarkdownTheme);
       const rendered = markdown.render(maxWidth);
-      return rendered.length > 0 ? rendered : [''];
+      return rendered.length > 0 ? trimOuterBlankLines([...rendered]) : [''];
     }
 
-    const lines = wrapTextWithAnsi(content, maxWidth);
+    const lines = trimOuterBlankLines(wrapTextWithAnsi(content, maxWidth));
     return lines.length > 0 ? lines : [''];
   }
 
   invalidate(): void {
     this.cachedLines = undefined;
     this.cachedWidth = undefined;
-  }
-}
-
-function applyNamedStyle(text: string, style: TuiTextStyleName): string {
-  switch (style) {
-    case 'dim': return chalk.dim(text);
-    case 'bold': return chalk.bold(text);
-    case 'italic': return chalk.italic(text);
-    case 'underline': return chalk.underline(text);
-    case 'red': return chalk.red(text);
-    case 'green': return chalk.green(text);
-    case 'yellow': return chalk.yellow(text);
-    case 'blue': return chalk.blue(text);
-    case 'magenta': return chalk.magenta(text);
-    case 'cyan': return chalk.cyan(text);
-    case 'white': return chalk.white(text);
-    case 'gray': return chalk.gray(text);
-    case 'default': return text;
-    default: return text;
   }
 }

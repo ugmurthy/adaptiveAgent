@@ -2,16 +2,21 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   collectProviderWarnings,
+  selectBenchmarkCases,
   loadBenchmarkCases,
   loadGaiaBenchmarkCases,
   loadManualTestSpec,
+  main,
   parseCliArgs,
+  renderStyledPrettyMessage,
   renderPrettyString,
+  summarizeGaiaDryRunTasks,
 } from './adaptive-agent.js';
+import type { BenchmarkAttachmentType, BenchmarkCase, ManualTestCliOptions } from './adaptive-agent.js';
 
 describe('adaptive-agent spec loading', () => {
   let tempDir: string;
@@ -135,6 +140,7 @@ describe('adaptive-agent cli parsing', () => {
       '--progress',
       '--events',
       '--inspect',
+      '--show-lines', '5',
       '--dry-run',
       '--output', 'json',
     ]);
@@ -150,6 +156,7 @@ describe('adaptive-agent cli parsing', () => {
       agentCatalogPaths: [],
       evalResume: false,
       evalFailFast: false,
+      evalSwarm: 1,
       evalOffset: 0,
       mode: 'chat',
       runtimeMode: 'memory',
@@ -160,6 +167,7 @@ describe('adaptive-agent cli parsing', () => {
       progress: true,
       events: true,
       inspect: true,
+      showLines: 5,
       dryRun: true,
       output: 'json',
       help: false,
@@ -206,9 +214,11 @@ describe('adaptive-agent cli parsing', () => {
       '--artifacts', './artifacts',
       '--resume',
       '--fail-fast',
+      '--swarm', '3',
       '--limit', '5',
       '--offset', '2',
       '--ids', 'a,b',
+      '--type', 'image',
       '--output', 'jsonl',
     ]);
 
@@ -220,9 +230,11 @@ describe('adaptive-agent cli parsing', () => {
       evalArtifactsDir: './artifacts',
       evalResume: true,
       evalFailFast: true,
+      evalSwarm: 3,
       evalLimit: 5,
       evalOffset: 2,
       evalIds: ['a', 'b'],
+      evalType: 'image',
       output: 'jsonl',
     });
   });
@@ -246,6 +258,25 @@ describe('adaptive-agent cli parsing', () => {
       evalLevel: '1',
       evalSplit: 'validation',
     });
+  });
+
+  it('allows eval dry-run without an output path', () => {
+    expect(parseCliArgs(['eval', 'cases', '--input', './cases.jsonl', '--dry-run'])).toMatchObject({
+      command: 'eval',
+      evalDataset: 'cases',
+      evalInputPath: './cases.jsonl',
+      dryRun: true,
+    });
+    expect(parseCliArgs(['eval', 'gaia', '--input', './gaia.jsonl', '--dry-run'])).toMatchObject({
+      command: 'eval',
+      evalDataset: 'gaia',
+      evalInputPath: './gaia.jsonl',
+      dryRun: true,
+    });
+  });
+
+  it('rejects --swarm outside eval', () => {
+    expect(() => parseCliArgs(['run', '--swarm', '2', 'hello'])).toThrow('--swarm is supported for eval requests');
   });
 });
 
@@ -333,7 +364,145 @@ describe('adaptive-agent benchmark cases', () => {
       metadata: { source: 'gaia', fileName: 'audio.mp3', split: 'validation' },
     }]);
   });
+
+  it('filters benchmark cases by attachment type', () => {
+    const cases: BenchmarkCase[] = [
+      { id: 'image', question: 'image?', images: [{ path: '/tmp/image.png' }] },
+      { id: 'audio', question: 'audio?', contentParts: [{ type: 'audio', audio: { source: { kind: 'path', path: '/tmp/audio.mp3' }, format: 'mp3' } }] },
+      { id: 'video', question: 'video?', contentParts: [{ type: 'file', file: { source: { kind: 'path', path: '/tmp/video.mp4' } } }] },
+      { id: 'other', question: 'file?', contentParts: [{ type: 'file', file: { source: { kind: 'path', path: '/tmp/notes.pdf' } } }] },
+      { id: 'mixed', question: 'mixed?', images: [{ path: '/tmp/image.png' }], contentParts: [{ type: 'file', file: { source: { kind: 'path', path: '/tmp/notes.pdf' } } }] },
+      { id: 'none', question: 'no attachment?' },
+    ];
+
+    expect(selectIdsByType(cases, 'image')).toEqual(['image', 'mixed']);
+    expect(selectIdsByType(cases, 'audio')).toEqual(['audio']);
+    expect(selectIdsByType(cases, 'video')).toEqual(['video']);
+    expect(selectIdsByType(cases, 'other')).toEqual(['other', 'mixed']);
+  });
+
+  it('summarizes GAIA dry-run task attachment details', async () => {
+    const inputPath = join(tempDir, 'gaia-dry-run.jsonl');
+    await writeFile(inputPath, [
+      JSON.stringify({ task_id: 'gaia-image', Question: 'What is in the image?', file_name: 'image.png', Level: '1' }),
+      JSON.stringify({ task_id: 'gaia-none', Question: 'No attachment' }),
+    ].join('\n'));
+
+    const cases = await loadGaiaBenchmarkCases(inputPath, tempDir, 'fixtures', 'validation');
+
+    expect(summarizeGaiaDryRunTasks(cases)).toEqual([
+      {
+        taskId: 'gaia-image',
+        attachmentType: 'image',
+        fileName: 'image.png',
+        path: join(tempDir, 'fixtures', 'image.png'),
+        level: '1',
+        split: 'validation',
+      },
+      {
+        taskId: 'gaia-none',
+        attachmentType: 'none',
+        split: 'validation',
+      },
+    ]);
+  });
+
+  it('dry-runs eval cases without requiring an output path', async () => {
+    await writeAgentConfig(join(tempDir, 'agent.json'));
+    const inputPath = join(tempDir, 'cases-dry-run.jsonl');
+    await writeFile(inputPath, JSON.stringify({ id: 'case-1', question: 'What is 2+2?' }));
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      const exitCode = await main(['eval', 'cases', '--input', inputPath, '--cwd', tempDir, '--swarm', '2', '--dry-run', '--output', 'json']);
+      const output = JSON.parse(String(log.mock.calls[0]?.[0])) as Record<string, unknown>;
+
+      expect(exitCode).toBe(0);
+      expect(output.dryRun).toBe(true);
+      expect(output).not.toHaveProperty('gaiaTasks');
+      expect(output.benchmark).toMatchObject({ dataset: 'cases', selectedCases: 1, totalCases: 1, requests: 0, swarm: 2 });
+      expect(output.tools).toEqual(['read_file']);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('dry-runs eval gaia and lists task attachment details', async () => {
+    await writeAgentConfig(join(tempDir, 'agent.json'));
+    const inputPath = join(tempDir, 'gaia-dry-run-main.jsonl');
+    await writeFile(inputPath, JSON.stringify({
+      task_id: 'gaia-1',
+      Question: 'What is in the image?',
+      file_name: 'image.png',
+      Level: '1',
+    }));
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      const exitCode = await main([
+        'eval', 'gaia',
+        '--input', inputPath,
+        '--files-dir', 'fixtures',
+        '--split', 'validation',
+        '--cwd', tempDir,
+        '--dry-run',
+        '--output', 'json',
+      ]);
+      const output = JSON.parse(String(log.mock.calls[0]?.[0])) as Record<string, unknown>;
+
+      expect(exitCode).toBe(0);
+      expect(output.benchmark).toMatchObject({ dataset: 'gaia', selectedCases: 1, totalCases: 1, requests: 0 });
+      expect(output.gaiaTaskCount).toBe(1);
+      expect(output.gaiaTasks).toEqual([{
+        taskId: 'gaia-1',
+        attachmentType: 'image',
+        fileName: 'image.png',
+        path: join(tempDir, 'fixtures', 'image.png'),
+        level: '1',
+        split: 'validation',
+      }]);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('rejects swarm eval runs with interactive settings', async () => {
+    await writeAgentConfig(join(tempDir, 'agent.json'));
+    const inputPath = join(tempDir, 'cases-swarm-interactive.jsonl');
+    await writeFile(inputPath, JSON.stringify({ id: 'case-1', question: 'What is 2+2?' }));
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      await expect(main([
+        'eval', 'cases',
+        '--input', inputPath,
+        '--out', join(tempDir, 'results.jsonl'),
+        '--cwd', tempDir,
+        '--swarm', '2',
+      ])).rejects.toThrow('--swarm > 1 requires non-interactive eval settings');
+    } finally {
+      log.mockRestore();
+    }
+  });
 });
+
+function selectIdsByType(cases: BenchmarkCase[], evalType: BenchmarkAttachmentType): string[] {
+  return selectBenchmarkCases(cases, { evalOffset: 0, evalType } as ManualTestCliOptions, new Set()).map((benchmarkCase) => benchmarkCase.id);
+}
+
+async function writeAgentConfig(path: string): Promise<void> {
+  await writeFile(
+    path,
+    JSON.stringify({
+      id: 'agent',
+      name: 'Agent',
+      invocationModes: ['chat', 'run'],
+      defaultInvocationMode: 'chat',
+      model: { provider: 'ollama', model: 'qwen3.5' },
+      tools: ['read_file'],
+    }),
+  );
+}
 
 describe('adaptive-agent pretty rendering', () => {
   it('renders markdown strings for pretty output', () => {
@@ -342,4 +511,60 @@ describe('adaptive-agent pretty rendering', () => {
     expect(rendered).toContain('one');
     expect(rendered).toContain('two');
   });
+
+  it('styles CLI assistant output using tui message settings', () => {
+    const rendered = stripAnsi(renderStyledPrettyMessage('assistant', '# Heading', {
+      messages: {
+        assistant: {
+          prefix: 'magenta',
+          body: 'cyan',
+        },
+      },
+    }));
+
+    expect(rendered).toContain('assistant>');
+    expect(rendered).toContain('Heading');
+  });
+
+  it('omits the prefix when the configured message style disables it', () => {
+    const rendered = stripAnsi(renderStyledPrettyMessage('progress', 'Checking available data', {
+      messages: {
+        progress: {
+          showPrefix: false,
+          body: 'green',
+        },
+      },
+    }));
+
+    expect(rendered.trim()).toBe('\u29bf Checking available data');
+  });
+
+  it('keeps the prefix and first content line together when the content starts with a newline', () => {
+    const rendered = stripAnsi(renderStyledPrettyMessage('assistant', '\nLeading line', {
+      messages: {
+        assistant: {
+          prefix: 'green',
+        },
+      },
+    }));
+
+    expect(rendered.startsWith('assistant> Leading line')).toBe(true);
+  });
+
+  it('trims trailing blank lines from rendered CLI messages', () => {
+    const rendered = stripAnsi(renderStyledPrettyMessage('progress', 'Checking available data', {
+      messages: {
+        progress: {
+          prefix: 'green',
+        },
+      },
+    }));
+
+    expect(rendered.endsWith('\n')).toBe(false);
+    expect(rendered).toBe('progress> Checking available data');
+  });
 });
+
+function stripAnsi(text: string): string {
+  return text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '');
+}

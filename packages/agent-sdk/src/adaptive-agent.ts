@@ -30,7 +30,11 @@ import {
   type ApprovalMode,
   type ClarificationMode,
   type RuntimeMode,
+  type TuiMessageType,
+  type TuiSettingsConfig,
+  type TuiTextStyleName,
 } from './index.js';
+import { applyNamedStyle, formatStyledMessageBlock } from './tui/message-styles.js';
 
 marked.use(markedTerminal() as never);
 
@@ -52,11 +56,13 @@ export interface ManualTestCliOptions {
   evalArtifactsDir?: string;
   evalResume: boolean;
   evalFailFast: boolean;
+  evalSwarm: number;
   evalLimit?: number;
   evalOffset: number;
   evalIds?: string[];
   evalLevel?: string;
   evalSplit?: string;
+  evalType?: BenchmarkAttachmentType;
   mode?: 'chat' | 'run';
   cwd?: string;
   agentConfigPath?: string;
@@ -69,6 +75,7 @@ export interface ManualTestCliOptions {
   progress: boolean;
   events: boolean;
   inspect: boolean;
+  showLines: number;
   dryRun: boolean;
   output: 'pretty' | 'json' | 'jsonl';
   help: boolean;
@@ -158,6 +165,24 @@ type GaiaAttachment =
   | { kind: 'audio'; path: string; format: Extract<ModelContentPart, { type: 'audio' }>['audio']['format'] }
   | { kind: 'file'; path: string };
 
+export type BenchmarkAttachmentType = 'audio' | 'image' | 'video' | 'other';
+export type BenchmarkDryRunAttachmentType = BenchmarkAttachmentType | 'none';
+
+export interface GaiaDryRunTaskSummary {
+  taskId: string;
+  attachmentType: BenchmarkDryRunAttachmentType;
+  fileName?: string;
+  path?: string;
+  level?: string;
+  split?: string;
+}
+
+const BENCHMARK_ATTACHMENT_TYPES = ['audio', 'image', 'video', 'other'] as const;
+const RUN_COLOR_STYLES = ['cyan', 'magenta', 'yellow', 'blue', 'green'] as const satisfies readonly TuiTextStyleName[];
+const IMAGE_FILE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tif', '.tiff']);
+const AUDIO_FILE_EXTENSIONS = new Set(['.wav', '.mp3', '.flac', '.m4a', '.ogg', '.aac', '.aiff', '.aif', '.opus', '.oga', '.weba']);
+const VIDEO_FILE_EXTENSIONS = new Set(['.mp4', '.m4v', '.mov', '.webm', '.mkv', '.avi', '.mpeg', '.mpg', '.ogv', '.wmv', '.flv', '.3gp', '.ts', '.mts', '.m2ts']);
+
 const HELP_TEXT = `adaptive-agent
 
 Agent SDK CLI
@@ -206,6 +231,7 @@ Options:
   --progress              Print assistant progress updates as they arrive.
   --events                Print lifecycle events as they arrive.
   --inspect               Print a compact inspection summary after completion.
+  --show-lines <n>        Maximum pretty-rendered progress lines to show. Default: 3.
   --dry-run               Resolve config, request, tools, and delegates without running.
   --output <format>       Output format: pretty, json, or jsonl. Default: pretty.
   --help                  Show this help text.
@@ -213,15 +239,19 @@ Options:
 Eval options:
   --input <path>          Benchmark input JSONL for eval cases.
   --files-dir <path>      Directory for benchmark attachments.
-  --out <path>            Benchmark result JSONL path.
+  --out <path>            Benchmark result JSONL path. Required unless --dry-run
+                          is used without --resume.
   --artifacts <dir>       Benchmark artifact directory.
   --resume                Skip benchmark cases already present in --out.
   --fail-fast             Stop eval after the first failed case.
+  --swarm <n>             Run eval cases in batches of up to n concurrent runs.
   --limit <n>             Limit benchmark cases after filtering.
   --offset <n>            Skip benchmark cases before filtering.
   --ids <id,id,...>       Run only the listed benchmark case ids.
   --level <value>         Run only matching benchmark level.
   --split <value>         Add/filter benchmark split metadata.
+  --type <value>          Run only rows with a matching attachment type: audio,
+                          image, video, or other. Rows without attachments do not match.
 `;
 
 const PROVIDER_INPUT_CAPABILITIES: Record<
@@ -283,22 +313,22 @@ async function runSpecCommand(cli: ManualTestCliOptions): Promise<number> {
   const warnings = collectProviderWarnings(spec, resolvedConfig.model.provider);
   const eventLog: Array<Record<string, JsonValue>> = [];
   const lastProgressContentByRun = new Map<string, string>();
-  const eventListener = shouldListenForCliEvents(cli) ? (event: AgentEvent) => {
-    const entry = summarizeEvent(event);
-    eventLog.push(entry);
-    if (cli.events && cli.output === 'pretty') {
-      printEvent(entry);
-    } else if (cli.progress && cli.output === 'pretty') {
-      printProgressEvent(event, lastProgressContentByRun);
-    }
-  } : undefined;
-  const orchestrationListener = shouldListenForCliEvents(cli) ? (event: OrchestrationLifecycleEvent) => {
-    const entry = summarizeOrchestrationLifecycleEvent(event);
-    eventLog.push(entry);
-    if ((cli.events || cli.progress) && cli.output === 'pretty') {
-      printOrchestrationLifecycleEvent(event);
-    }
-  } : undefined;
+    const eventListener = shouldListenForCliEvents(cli) ? (event: AgentEvent) => {
+      const entry = summarizeEvent(event);
+      eventLog.push(entry);
+      if (cli.events && cli.output === 'pretty') {
+        printEvent(entry, resolvedConfig.tui);
+      } else if (cli.progress && cli.output === 'pretty') {
+        printProgressEvent(event, lastProgressContentByRun, resolvedConfig.tui, cli.showLines);
+      }
+    } : undefined;
+    const orchestrationListener = shouldListenForCliEvents(cli) ? (event: OrchestrationLifecycleEvent) => {
+      const entry = summarizeOrchestrationLifecycleEvent(event);
+      eventLog.push(entry);
+      if ((cli.events || cli.progress) && cli.output === 'pretty') {
+        printOrchestrationLifecycleEvent(event, resolvedConfig.tui);
+      }
+    } : undefined;
 
   for (const warning of warnings) {
     if (cli.output === 'pretty') {
@@ -354,7 +384,7 @@ async function runSpecCommand(cli: ManualTestCliOptions): Promise<number> {
     }
 
     if (orchestrated) printOrchestration(orchestrated);
-    printResult(result);
+    printResult(result, spec.mode === 'chat' ? 'assistant' : 'run', resolvedConfig.tui);
     if (cli.inspect && inspection) {
       printInspection(inspection);
     }
@@ -394,16 +424,16 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
     const entry = summarizeEvent(event);
     eventLog.push(entry);
     if (cli.events && cli.output === 'pretty') {
-      printEvent(entry);
+      printEvent(entry, resolvedConfig.tui);
     } else if (cli.progress && cli.output === 'pretty') {
-      printProgressEvent(event, lastProgressContentByRun);
+      printProgressEvent(event, lastProgressContentByRun, resolvedConfig.tui, cli.showLines);
     }
   } : undefined;
   const orchestrationListener = shouldListenForCliEvents(cli) ? (event: OrchestrationLifecycleEvent) => {
     const entry = summarizeOrchestrationLifecycleEvent(event);
     eventLog.push(entry);
     if ((cli.events || cli.progress) && cli.output === 'pretty') {
-      printOrchestrationLifecycleEvent(event);
+      printOrchestrationLifecycleEvent(event, resolvedConfig.tui);
     }
   } : undefined;
 
@@ -459,7 +489,7 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
     }
 
     if (orchestrated) printOrchestration(orchestrated);
-    printResult(result);
+    printResult(result, spec.mode === 'chat' ? 'assistant' : 'run', resolvedConfig.tui);
     if (cli.inspect && inspection) printInspection(inspection);
     if (cli.events && eventLog.length > 0) console.error(`event log captured: ${eventLog.length}`);
     return isSuccessfulResult(result) ? 0 : 1;
@@ -492,43 +522,66 @@ async function runEvalCommand(cli: ManualTestCliOptions): Promise<number> {
   if (!cli.evalInputPath) {
     throw new Error(`eval ${cli.evalDataset ?? 'benchmark'} requires --input <path>`);
   }
-  if (!cli.evalOutputPath) {
+  if (!cli.evalOutputPath && (!cli.dryRun || cli.evalResume)) {
+    if (cli.dryRun && cli.evalResume) {
+      throw new Error(`eval ${cli.evalDataset ?? 'benchmark'} --dry-run --resume requires --out <path>`);
+    }
     throw new Error(`eval ${cli.evalDataset ?? 'benchmark'} requires --out <path>`);
   }
 
   const resolvedCwd = resolve(cli.cwd ?? process.cwd());
-  const outputPath = resolve(cli.evalOutputPath);
+  const outputPath = cli.evalOutputPath ? resolve(cli.evalOutputPath) : undefined;
   const artifactsDir = cli.evalArtifactsDir ? resolve(cli.evalArtifactsDir) : undefined;
   const allCases = cli.evalDataset === 'gaia'
     ? await loadGaiaBenchmarkCases(cli.evalInputPath, resolvedCwd, cli.evalFilesDir, cli.evalSplit)
     : await loadBenchmarkCases(cli.evalInputPath, resolvedCwd);
-  const completedIds = cli.evalResume ? await readCompletedBenchmarkIds(outputPath) : new Set<string>();
+  const completedIds = cli.evalResume && outputPath ? await readCompletedBenchmarkIds(outputPath) : new Set<string>();
   const selectedCases = selectBenchmarkCases(allCases, cli, completedIds);
   const sdkOptions = buildSdkOptions(cli, resolvedCwd);
-  const resolvedConfig = await loadAgentSdkConfig(sdkOptions);
-  await mkdir(dirname(outputPath), { recursive: true });
-  if (artifactsDir) await mkdir(artifactsDir, { recursive: true });
+  const inspection = cli.dryRun ? await inspectAgentSdkResolution(sdkOptions) : undefined;
+  const resolvedConfig = inspection?.config ?? await loadAgentSdkConfig(sdkOptions);
 
   if (cli.output === 'pretty') {
     console.log(`benchmark: ${cli.evalDataset}`);
-    console.log(`input: ${resolve(cli.evalInputPath)}`);
+    console.log(`input: ${resolve(resolvedCwd, cli.evalInputPath)}`);
     if (cli.evalFilesDir) console.log(`files: ${resolve(resolvedCwd, cli.evalFilesDir)}`);
-    console.log(`out: ${outputPath}`);
+    if (cli.evalType) console.log(`type: ${cli.evalType}`);
+    if (outputPath) console.log(`out: ${outputPath}`);
     console.log(`selected: ${selectedCases.length}/${allCases.length}`);
+    console.log(`swarm: ${cli.evalSwarm}`);
     console.log(`model: ${resolvedConfig.model.provider}/${resolvedConfig.model.model}`);
     console.log(`runtime: ${resolvedConfig.runtime.mode}`);
     console.log('');
   }
 
+  if (cli.dryRun) {
+    printEvalDryRun(cli, inspection!, selectedCases, allCases.length);
+    return 0;
+  }
+
+  if (cli.evalSwarm > 1) {
+    validateEvalSwarmRuntime(resolvedConfig);
+  }
+
+  if (!outputPath) {
+    throw new Error(`eval ${cli.evalDataset ?? 'benchmark'} requires --out <path>`);
+  }
+  await mkdir(dirname(outputPath), { recursive: true });
+  if (artifactsDir) await mkdir(artifactsDir, { recursive: true });
+
   const eventLog: Array<Record<string, JsonValue>> = [];
   const lastProgressContentByRun = new Map<string, string>();
+  const swarmColors = cli.evalSwarm > 1 && cli.output === 'pretty' ? new RunColorRegistry() : undefined;
   const eventListener = (event: AgentEvent) => {
     const entry = summarizeEvent(event);
     eventLog.push(entry);
+    if (swarmColors && event.type === 'run.created') {
+      printRunStartedEvent(event, resolvedConfig.tui, swarmColors);
+    }
     if (cli.events && cli.output === 'pretty') {
-      printEvent(entry);
+      printEvent(entry, resolvedConfig.tui, swarmColors);
     } else if (cli.progress && cli.output === 'pretty') {
-      printProgressEvent(event, lastProgressContentByRun);
+      printProgressEvent(event, lastProgressContentByRun, resolvedConfig.tui, cli.showLines, swarmColors);
     }
   };
   const sdk = await createAgentSdk({
@@ -539,7 +592,7 @@ async function runEvalCommand(cli: ManualTestCliOptions): Promise<number> {
     const entry = summarizeOrchestrationLifecycleEvent(event);
     eventLog.push(entry);
     if ((cli.events || cli.progress) && cli.output === 'pretty') {
-      printOrchestrationLifecycleEvent(event);
+      printOrchestrationLifecycleEvent(event, resolvedConfig.tui);
     }
   };
   const orchestrationSdk = cli.orchestrate
@@ -554,10 +607,13 @@ async function runEvalCommand(cli: ManualTestCliOptions): Promise<number> {
     : undefined;
 
   let failed = 0;
+  let completed = 0;
+  let processed = 0;
   const removeProcessErrorGuard = installEvalProcessErrorGuard();
   try {
-    for (const benchmarkCase of selectedCases) {
-      const record = await runBenchmarkCase({
+    for (let batchStart = 0; batchStart < selectedCases.length; batchStart += cli.evalSwarm) {
+      const batch = selectedCases.slice(batchStart, batchStart + cli.evalSwarm);
+      const records = await Promise.all(batch.map((benchmarkCase) => runBenchmarkCase({
         sdk,
         benchmarkCase,
         resolvedConfig,
@@ -565,16 +621,22 @@ async function runEvalCommand(cli: ManualTestCliOptions): Promise<number> {
         artifactsDir,
         eventLog,
         orchestrationSdk,
-      });
-      await appendJsonLine(outputPath, record as unknown as JsonValue);
-      if (cli.output === 'json' || cli.output === 'jsonl') {
-        console.log(JSON.stringify(record));
-      } else {
-        console.log(`${record.status === 'completed' ? '✓' : '✗'} ${record.taskId}${record.runId ? ` run=${record.runId}` : ''}`);
+        includeEventArtifacts: cli.evalSwarm === 1,
+      })));
+
+      for (const [batchIndex, record] of records.entries()) {
+        await appendJsonLine(outputPath, record as unknown as JsonValue);
+        printEvalRecord(record, batchStart + batchIndex, cli, swarmColors);
+        processed += 1;
+        if (record.status === 'completed') {
+          completed += 1;
+        } else {
+          failed += 1;
+        }
       }
-      if (record.status !== 'completed') {
-        failed += 1;
-        if (cli.evalFailFast) break;
+
+      if (cli.evalFailFast && records.some((record) => record.status !== 'completed')) {
+        break;
       }
     }
   } finally {
@@ -585,8 +647,9 @@ async function runEvalCommand(cli: ManualTestCliOptions): Promise<number> {
 
   if (cli.output === 'pretty') {
     console.log('');
-    console.log(`completed: ${selectedCases.length - failed}`);
+    console.log(`completed: ${completed}`);
     console.log(`failed: ${failed}`);
+    if (processed < selectedCases.length) console.log(`skipped: ${selectedCases.length - processed}`);
   }
   return failed === 0 ? 0 : 1;
 }
@@ -603,16 +666,19 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
     agentCatalogPaths: [],
     evalResume: false,
     evalFailFast: false,
+    evalSwarm: 1,
     evalOffset: 0,
     progress: false,
     events: false,
     inspect: false,
+    showLines: 3,
     dryRun: false,
     output: 'pretty',
     help: false,
   };
 
   let commandSeen = false;
+  let swarmSpecified = false;
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -641,6 +707,9 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
         break;
       case '--inspect':
         options.inspect = true;
+        break;
+      case '--show-lines':
+        options.showLines = parsePositiveIntegerOption(arg, requireOptionValue(arg, argv[++index]));
         break;
       case '--dry-run':
         options.dryRun = true;
@@ -673,6 +742,10 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
       case '--fail-fast':
         options.evalFailFast = true;
         break;
+      case '--swarm':
+        options.evalSwarm = parsePositiveIntegerOption(arg, requireOptionValue(arg, argv[++index]));
+        swarmSpecified = true;
+        break;
       case '--limit':
         options.evalLimit = parsePositiveIntegerOption(arg, requireOptionValue(arg, argv[++index]));
         break;
@@ -687,6 +760,9 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
         break;
       case '--split':
         options.evalSplit = requireOptionValue(arg, argv[++index]);
+        break;
+      case '--type':
+        options.evalType = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), BENCHMARK_ATTACHMENT_TYPES);
         break;
       case '--image':
         options.imagePaths.push(requireOptionValue(arg, argv[++index]));
@@ -750,8 +826,8 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
     throw new Error('Missing eval dataset. Expected `adaptive-agent eval cases` or `adaptive-agent eval gaia`.');
   }
 
-  if (!options.help && options.command === 'eval' && options.dryRun) {
-    throw new Error('--dry-run is supported for run, chat, and spec commands, not eval');
+  if (!options.help && swarmSpecified && options.command !== 'eval') {
+    throw new Error('--swarm is supported for eval requests, not run/chat/spec/config requests');
   }
 
   if (!options.help && options.command === 'chat' && options.imagePaths.length > 0) {
@@ -1238,7 +1314,7 @@ function gaiaAttachmentForFile(path: string, name: string): GaiaAttachment {
 }
 
 function isImageFileName(name: string): boolean {
-  return /\.(png|jpe?g|gif|webp|bmp|tiff?)$/i.test(name);
+  return hasFileExtension(name, IMAGE_FILE_EXTENSIONS);
 }
 
 function inferAudioFormatFromFileName(name: string): Extract<ModelContentPart, { type: 'audio' }>['audio']['format'] | undefined {
@@ -1253,6 +1329,126 @@ function inferAudioFormatFromFileName(name: string): Extract<ModelContentPart, {
     case '.aif': return 'aiff';
     default: return undefined;
   }
+}
+
+function benchmarkCaseHasAttachmentType(benchmarkCase: BenchmarkCase, type: BenchmarkAttachmentType): boolean {
+  if (type === 'image' && (benchmarkCase.images?.length ?? 0) > 0) {
+    return true;
+  }
+
+  for (const part of benchmarkCase.contentParts ?? []) {
+    if (part.type === 'image' && type === 'image') return true;
+    if (part.type === 'audio' && type === 'audio') return true;
+    if (part.type === 'file' && inferFileAttachmentType(part.file) === type) return true;
+  }
+
+  return false;
+}
+
+export function summarizeGaiaDryRunTasks(cases: BenchmarkCase[]): GaiaDryRunTaskSummary[] {
+  return cases.map((benchmarkCase) => {
+    const attachment = summarizeBenchmarkCaseAttachment(benchmarkCase);
+    return {
+      taskId: benchmarkCase.id,
+      attachmentType: attachment.type,
+      ...(attachment.fileName ? { fileName: attachment.fileName } : {}),
+      ...(attachment.path ? { path: attachment.path } : {}),
+      ...(benchmarkCase.level ? { level: benchmarkCase.level } : {}),
+      ...(benchmarkCase.split ? { split: benchmarkCase.split } : {}),
+    };
+  });
+}
+
+function summarizeBenchmarkCaseAttachment(
+  benchmarkCase: BenchmarkCase,
+): { type: BenchmarkDryRunAttachmentType; fileName?: string; path?: string } {
+  const image = benchmarkCase.images?.[0];
+  if (image) {
+    return {
+      type: 'image',
+      ...(image.name ? { fileName: image.name } : {}),
+      path: image.path,
+    };
+  }
+
+  for (const part of benchmarkCase.contentParts ?? []) {
+    if (part.type === 'image') {
+      return {
+        type: 'image',
+        ...(part.image.name ? { fileName: part.image.name } : {}),
+        path: part.image.path,
+      };
+    }
+    if (part.type === 'audio') {
+      const path = pathFromAudioInputSource(part.audio.source);
+      return {
+        type: 'audio',
+        ...(part.audio.name ? { fileName: part.audio.name } : {}),
+        ...(path ? { path } : {}),
+      };
+    }
+    if (part.type === 'file') {
+      const path = pathFromFileInputSource(part.file.source);
+      return {
+        type: inferFileAttachmentType(part.file),
+        ...(part.file.name ? { fileName: part.file.name } : {}),
+        ...(path ? { path } : {}),
+      };
+    }
+  }
+
+  return { type: 'none' };
+}
+
+function inferFileAttachmentType(file: Extract<ModelContentPart, { type: 'file' }>['file']): BenchmarkAttachmentType {
+  return inferAttachmentType(file.mimeType, file.name ?? nameFromFileInputSource(file.source));
+}
+
+function inferAttachmentType(mimeType: string | undefined, name: string | undefined): BenchmarkAttachmentType {
+  const normalizedMimeType = mimeType?.split(';', 1)[0]?.trim().toLowerCase();
+  if (normalizedMimeType?.startsWith('image/')) return 'image';
+  if (normalizedMimeType?.startsWith('audio/')) return 'audio';
+  if (normalizedMimeType?.startsWith('video/')) return 'video';
+
+  if (name) {
+    if (hasFileExtension(name, IMAGE_FILE_EXTENSIONS)) return 'image';
+    if (hasFileExtension(name, AUDIO_FILE_EXTENSIONS)) return 'audio';
+    if (hasFileExtension(name, VIDEO_FILE_EXTENSIONS)) return 'video';
+  }
+
+  return 'other';
+}
+
+function nameFromFileInputSource(source: Extract<ModelContentPart, { type: 'file' }>['file']['source']): string | undefined {
+  return pathFromFileInputSource(source);
+}
+
+function pathFromFileInputSource(source: Extract<ModelContentPart, { type: 'file' }>['file']['source']): string | undefined {
+  if (source.kind === 'path') return source.path;
+  if (source.kind === 'url') {
+    try {
+      return new URL(source.url).pathname;
+    } catch {
+      return source.url;
+    }
+  }
+  return undefined;
+}
+
+function pathFromAudioInputSource(source: Extract<ModelContentPart, { type: 'audio' }>['audio']['source']): string | undefined {
+  if (source.kind === 'path') return source.path;
+  if (source.kind === 'url') {
+    try {
+      return new URL(source.url).pathname;
+    } catch {
+      return source.url;
+    }
+  }
+  return undefined;
+}
+
+function hasFileExtension(name: string, extensions: ReadonlySet<string>): boolean {
+  return extensions.has(extname(name).toLowerCase());
 }
 
 function parseBenchmarkJsonLines(content: string): unknown[] {
@@ -1310,12 +1506,13 @@ async function readCompletedBenchmarkIds(outputPath: string): Promise<Set<string
   return completed;
 }
 
-function selectBenchmarkCases(cases: BenchmarkCase[], cli: ManualTestCliOptions, completedIds: Set<string>): BenchmarkCase[] {
+export function selectBenchmarkCases(cases: BenchmarkCase[], cli: ManualTestCliOptions, completedIds: Set<string>): BenchmarkCase[] {
   const allowedIds = cli.evalIds ? new Set(cli.evalIds) : undefined;
   let selected = cases.slice(cli.evalOffset).filter((benchmarkCase) => {
     if (allowedIds && !allowedIds.has(benchmarkCase.id)) return false;
     if (cli.evalLevel && benchmarkCase.level !== cli.evalLevel) return false;
     if (cli.evalSplit && benchmarkCase.split && benchmarkCase.split !== cli.evalSplit) return false;
+    if (cli.evalType && !benchmarkCaseHasAttachmentType(benchmarkCase, cli.evalType)) return false;
     if (completedIds.has(benchmarkCase.id)) return false;
     return true;
   });
@@ -1323,6 +1520,12 @@ function selectBenchmarkCases(cases: BenchmarkCase[], cli: ManualTestCliOptions,
     selected = selected.slice(0, cli.evalLimit);
   }
   return selected;
+}
+
+function validateEvalSwarmRuntime(resolvedConfig: Awaited<ReturnType<typeof loadAgentSdkConfig>>): void {
+  if (resolvedConfig.interaction.approvalMode === 'manual' || resolvedConfig.interaction.clarificationMode === 'interactive') {
+    throw new Error('--swarm > 1 requires non-interactive eval settings; use --approval auto|reject and --clarification fail');
+  }
 }
 
 async function runBenchmarkCase(options: {
@@ -1333,6 +1536,7 @@ async function runBenchmarkCase(options: {
   artifactsDir?: string;
   eventLog: Array<Record<string, JsonValue>>;
   orchestrationSdk?: OrchestrationSdk;
+  includeEventArtifacts?: boolean;
 }): Promise<BenchmarkResultRecord> {
   const startedAt = new Date();
   const eventStartIndex = options.eventLog.length;
@@ -1431,7 +1635,7 @@ function isModelTimeoutLike(error: unknown): boolean {
 }
 
 async function writeBenchmarkArtifacts(
-  options: { sdk: Awaited<ReturnType<typeof createAgentSdk>>; benchmarkCase: BenchmarkCase; artifactsDir?: string; eventLog: Array<Record<string, JsonValue>> },
+  options: { sdk: Awaited<ReturnType<typeof createAgentSdk>>; benchmarkCase: BenchmarkCase; artifactsDir?: string; eventLog: Array<Record<string, JsonValue>>; includeEventArtifacts?: boolean },
   output: unknown,
   eventStartIndex: number,
 ): Promise<BenchmarkResultRecord['artifacts'] | undefined> {
@@ -1440,16 +1644,18 @@ async function writeBenchmarkArtifacts(
   await mkdir(taskDir, { recursive: true });
   const inputPath = resolve(taskDir, 'input.json');
   const outputPath = resolve(taskDir, 'output.json');
-  const eventLogPath = resolve(taskDir, 'events.jsonl');
+  const eventLogPath = options.includeEventArtifacts === false ? undefined : resolve(taskDir, 'events.jsonl');
   const answerPath = resolve(taskDir, 'answer.txt');
   await writeFile(inputPath, JSON.stringify(options.benchmarkCase, null, 2));
   await writeFile(outputPath, JSON.stringify(output, null, 2));
-  const events = options.eventLog.slice(eventStartIndex);
-  await writeFile(eventLogPath, events.map((event) => JSON.stringify(event)).join('\n') + (events.length > 0 ? '\n' : ''));
+  if (eventLogPath) {
+    const events = options.eventLog.slice(eventStartIndex);
+    await writeFile(eventLogPath, events.map((event) => JSON.stringify(event)).join('\n') + (events.length > 0 ? '\n' : ''));
+  }
   if (typeof output === 'object' && output && 'output' in output) {
     await writeFile(answerPath, stringifyPrediction((output as { output?: unknown }).output));
   }
-  return { input: inputPath, output: outputPath, eventLog: eventLogPath, answer: answerPath };
+  return { input: inputPath, output: outputPath, ...(eventLogPath ? { eventLog: eventLogPath } : {}), answer: answerPath };
 }
 
 function stringifyPrediction(value: unknown): string {
@@ -1462,6 +1668,21 @@ function safePathSegment(value: string): string {
 
 async function appendJsonLine(path: string, value: JsonValue): Promise<void> {
   await appendFile(path, `${JSON.stringify(value)}\n`);
+}
+
+function printEvalRecord(
+  record: BenchmarkResultRecord,
+  caseIndex: number,
+  cli: ManualTestCliOptions,
+  colors?: RunColorRegistry,
+): void {
+  if (cli.output === 'json' || cli.output === 'jsonl') {
+    console.log(JSON.stringify(record));
+    return;
+  }
+  const countPrefix = cli.evalDataset === 'gaia' ? `${caseIndex + 1} : ` : '';
+  const line = `${countPrefix}${record.status === 'completed' ? '✓' : '✗'} ${record.taskId}${record.runId ? ` run=${record.runId}` : ''}`;
+  console.log(colors?.colorize(record.runId, line) ?? line);
 }
 
 function collectContentParts(spec: ManualTestSpec): ModelContentPart[] {
@@ -1539,11 +1760,13 @@ function summarizeCli(cli: ManualTestCliOptions): Record<string, JsonValue> {
     ...(cli.evalFilesDir ? { evalFilesDir: resolve(cli.evalFilesDir) } : {}),
     ...(cli.evalOutputPath ? { evalOutputPath: resolve(cli.evalOutputPath) } : {}),
     ...(cli.evalArtifactsDir ? { evalArtifactsDir: resolve(cli.evalArtifactsDir) } : {}),
+    evalSwarm: cli.evalSwarm,
     ...(cli.evalLimit ? { evalLimit: cli.evalLimit } : {}),
     ...(cli.evalOffset ? { evalOffset: cli.evalOffset } : {}),
     ...(cli.evalIds ? { evalIds: cli.evalIds } : {}),
     ...(cli.evalLevel ? { evalLevel: cli.evalLevel } : {}),
     ...(cli.evalSplit ? { evalSplit: cli.evalSplit } : {}),
+    ...(cli.evalType ? { evalType: cli.evalType } : {}),
     evalResume: cli.evalResume,
     evalFailFast: cli.evalFailFast,
     ...(cli.mode ? { modeOverride: cli.mode } : {}),
@@ -1558,6 +1781,7 @@ function summarizeCli(cli: ManualTestCliOptions): Record<string, JsonValue> {
     progress: cli.progress,
     events: cli.events,
     inspect: cli.inspect,
+    showLines: cli.showLines,
     dryRun: cli.dryRun,
     output: cli.output,
   };
@@ -1712,7 +1936,50 @@ const ASSISTANT_CONTENT_PROGRESS_EVENT_TYPES = new Set([
   'delegate.spawned',
 ]);
 
-function printProgressEvent(event: { type: string; runId: string; payload: JsonValue }, lastContentByRun: Map<string, string>): void {
+class RunColorRegistry {
+  private readonly stylesByRunId = new Map<string, TuiTextStyleName>();
+
+  colorize(runId: string | undefined, value: string): string {
+    if (!runId) return value;
+    return applyNamedStyle(value, this.styleForRun(runId));
+  }
+
+  private styleForRun(runId: string): TuiTextStyleName {
+    const cached = this.stylesByRunId.get(runId);
+    if (cached) return cached;
+    const style = RUN_COLOR_STYLES[this.stylesByRunId.size % RUN_COLOR_STYLES.length]!;
+    this.stylesByRunId.set(runId, style);
+    return style;
+  }
+}
+
+function shortRunId(runId: string): string {
+  return runId.length > 8 ? runId.slice(0, 8) : runId;
+}
+
+function oneLinePreview(value: string, maxLength: number): string {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+function printRunStartedEvent(event: AgentEvent, theme: TuiSettingsConfig, colors: RunColorRegistry): void {
+  if (typeof event.payload !== 'object' || event.payload === null || Array.isArray(event.payload)) return;
+  const payload = event.payload as JsonObject;
+  if (typeof payload.rootRunId === 'string' && payload.rootRunId !== event.runId) return;
+  if (typeof payload.delegationDepth === 'number' && payload.delegationDepth > 0) return;
+  const goal = typeof payload.goal === 'string' ? ` goal="${oneLinePreview(payload.goal, 120)}"` : '';
+  const line = colors.colorize(event.runId, `[started] run=${event.runId}${goal}`);
+  console.error(renderStyledPrettyMessage('event', line, theme));
+}
+
+function printProgressEvent(
+  event: { type: string; runId: string; payload: JsonValue },
+  lastContentByRun: Map<string, string>,
+  theme: TuiSettingsConfig,
+  showLines: number,
+  colors?: RunColorRegistry,
+): void {
   const assistantContent = extractAssistantProgressContent(event);
   if (!assistantContent) {
     return;
@@ -1721,8 +1988,30 @@ function printProgressEvent(event: { type: string; runId: string; payload: JsonV
     return;
   }
   lastContentByRun.set(event.runId, assistantContent);
-  console.error('progress>');
-  console.error(assistantContent);
+  const rendered = limitRenderedProgressLines(renderPrettyString(assistantContent), showLines);
+  if (colors) {
+    const prefix = `[run ${shortRunId(event.runId)}]`;
+    console.error(formatStyledMessageBlock('progress', colors.colorize(event.runId, `${prefix} ${rendered}`), swarmProgressTheme(theme)));
+    return;
+  }
+  console.error(formatStyledMessageBlock('progress', rendered, theme));
+}
+
+function limitRenderedProgressLines(rendered: string, showLines: number): string {
+  return rendered.trim().split(/\r?\n/).slice(0, showLines).join('\n');
+}
+
+function swarmProgressTheme(theme: TuiSettingsConfig): TuiSettingsConfig {
+  return {
+    ...theme,
+    messages: {
+      ...(theme.messages ?? {}),
+      progress: {
+        ...(theme.messages?.progress ?? {}),
+        showPrefix: false,
+      },
+    },
+  };
 }
 
 function extractAssistantProgressContent(event: { type: string; payload: JsonValue }): string | undefined {
@@ -1786,6 +2075,83 @@ function printDryRun(
   }
 
   console.log(renderPrettyString(formatDryRunMarkdown(inspection, spec, warnings)));
+}
+
+function printEvalDryRun(
+  cli: ManualTestCliOptions,
+  inspection: Awaited<ReturnType<typeof inspectAgentSdkResolution>>,
+  selectedCases: BenchmarkCase[],
+  totalCases: number,
+): void {
+  const output = summarizeEvalDryRun(cli, inspection, selectedCases, totalCases);
+  if (cli.output === 'json') {
+    console.log(JSON.stringify(output, null, 2));
+    return;
+  }
+  if (cli.output === 'jsonl') {
+    console.log(JSON.stringify(output));
+    return;
+  }
+
+  console.log(renderPrettyString(formatEvalDryRunMarkdown(cli, inspection, selectedCases, totalCases)));
+}
+
+function formatEvalDryRunMarkdown(
+  cli: ManualTestCliOptions,
+  inspection: Awaited<ReturnType<typeof inspectAgentSdkResolution>>,
+  selectedCases: BenchmarkCase[],
+  totalCases: number,
+): string {
+  const config = inspection.config;
+  const lines = [
+    '# Dry run',
+    '',
+    '- `dryRun`: `true`',
+    '- `command`: `eval`',
+    `- \`benchmark\`: \`${cli.evalDataset ?? 'benchmark'}\``,
+    `- \`requests\`: \`0\``,
+    `- \`selected\`: \`${selectedCases.length}/${totalCases}\``,
+    `- \`swarm\`: \`${cli.evalSwarm}\``,
+    `- \`approval\`: \`${config.interaction.approvalMode}\``,
+    `- \`clarification\`: \`${config.interaction.clarificationMode}\``,
+    `- \`shellCwd\`: \`${config.shellCwd}\``,
+    `- \`skillSearchDirs\`: ${formatNameList(config.skills.dirs)}`,
+    '',
+    '## Tools',
+    '',
+    ...(inspection.tools.length === 0 ? ['- (none)'] : inspection.tools.map((tool) => `- \`${tool.name}\``)),
+    '',
+    '## Delegates',
+    '',
+    ...(inspection.delegates.length === 0
+      ? ['- (none)']
+      : inspection.delegates.flatMap((delegate) => [
+          `- \`${delegate.name}\``,
+          ...(delegate.description ? [`  - description: ${oneLine(delegate.description)}`] : []),
+          `  - allowedTools: ${formatNameList(delegate.allowedTools)}`,
+        ])),
+    '',
+    `- \`registeredTools\`: ${formatNameList(inspection.registeredToolNames)}`,
+  ];
+
+  if (cli.evalDataset === 'gaia') {
+    lines.push('', '## GAIA Tasks', '');
+    const tasks = summarizeGaiaDryRunTasks(selectedCases);
+    lines.push(...(tasks.length === 0 ? ['- (none)'] : tasks.map(formatGaiaDryRunTaskLine)));
+    lines.push('', `- \`totalTaskIds\`: \`${tasks.length}\``);
+  }
+
+  return `${lines.join('\n')}\n`;
+}
+
+function formatGaiaDryRunTaskLine(task: GaiaDryRunTaskSummary): string {
+  const details = [
+    `attachment=${task.attachmentType}`,
+    ...(task.fileName ? [`file=${task.fileName}`] : []),
+    ...(task.level ? [`level=${task.level}`] : []),
+    ...(task.split ? [`split=${task.split}`] : []),
+  ];
+  return `- \`${task.taskId}\` ${details.join(' ')}`;
 }
 
 function formatDryRunMarkdown(
@@ -1858,6 +2224,57 @@ function summarizeDryRun(
   };
 }
 
+function summarizeEvalDryRun(
+  cli: ManualTestCliOptions,
+  inspection: Awaited<ReturnType<typeof inspectAgentSdkResolution>>,
+  selectedCases: BenchmarkCase[],
+  totalCases: number,
+): Record<string, JsonValue> {
+  return {
+    dryRun: true,
+    cli: summarizeCli(cli),
+    resolvedConfig: summarizeEvalResolvedConfig(inspection.config),
+    benchmark: {
+      dataset: cli.evalDataset ?? 'benchmark',
+      inputPath: cli.evalInputPath ? resolve(cli.cwd ? resolve(cli.cwd) : process.cwd(), cli.evalInputPath) : undefined,
+      filesDir: cli.evalFilesDir ? resolve(cli.cwd ? resolve(cli.cwd) : process.cwd(), cli.evalFilesDir) : undefined,
+      outputPath: cli.evalOutputPath ? resolve(cli.evalOutputPath) : undefined,
+      selectedCases: selectedCases.length,
+      totalCases,
+      requests: 0,
+      swarm: cli.evalSwarm,
+    } as JsonValue,
+    tools: inspection.tools.map((tool) => tool.name),
+    delegates: inspection.delegates as unknown as JsonValue,
+    registeredToolNames: inspection.registeredToolNames,
+    ...(cli.evalDataset === 'gaia'
+      ? {
+          gaiaTaskCount: selectedCases.length,
+          gaiaTasks: summarizeGaiaDryRunTasks(selectedCases) as unknown as JsonValue,
+        }
+      : {}),
+  };
+}
+
+function summarizeEvalResolvedConfig(
+  resolvedConfig: Awaited<ReturnType<typeof loadAgentSdkConfig>>,
+): Record<string, JsonValue> {
+  return {
+    agentId: resolvedConfig.agent.id,
+    agentName: resolvedConfig.agent.name,
+    provider: resolvedConfig.model.provider,
+    model: resolvedConfig.model.model,
+    runtimeMode: resolvedConfig.runtime.mode,
+    requestedRuntimeMode: resolvedConfig.runtime.requestedMode,
+    autoMigrate: resolvedConfig.runtime.autoMigrate,
+    workspaceRoot: resolvedConfig.workspaceRoot,
+    shellCwd: resolvedConfig.shellCwd,
+    approvalMode: resolvedConfig.interaction.approvalMode,
+    clarificationMode: resolvedConfig.interaction.clarificationMode,
+    skillSearchDirs: resolvedConfig.skills.dirs,
+  };
+}
+
 function printInlineConfigSummary(
   cli: ManualTestCliOptions,
   resolvedConfig: Awaited<ReturnType<typeof loadAgentSdkConfig>>,
@@ -1879,46 +2296,51 @@ function printInlineConfigSummary(
   console.log('');
 }
 
-function printEvent(event: Record<string, JsonValue>): void {
+function printEvent(event: Record<string, JsonValue>, theme: TuiSettingsConfig, colors?: RunColorRegistry): void {
   const parts = [
     `[event] ${String(event.type)}`,
     `run=${String(event.runId)}`,
     ...(event.stepId ? [`step=${String(event.stepId)}`] : []),
     ...(event.toolCallId ? [`toolCall=${String(event.toolCallId)}`] : []),
   ];
-  console.error(parts.join(' '));
+  const runId = typeof event.runId === 'string' ? event.runId : undefined;
+  console.error(renderStyledPrettyMessage('event', colors?.colorize(runId, parts.join(' ')) ?? parts.join(' '), theme));
 }
 
-function printOrchestrationLifecycleEvent(event: OrchestrationLifecycleEvent): void {
+function printOrchestrationLifecycleEvent(event: OrchestrationLifecycleEvent, theme: TuiSettingsConfig): void {
   const parts = [`[event] ${event.type}`, `session=${event.sessionId}`];
   if ('nodeId' in event) parts.push(`node=${event.nodeId}`, `agent=${event.agentId}`, `stage=${event.stage}`);
   if ('runId' in event) parts.push(`run=${event.runId}`);
   if ('finalRunId' in event) parts.push(`run=${event.finalRunId}`);
   if ('status' in event) parts.push(`status=${event.status}`);
   if ('executionShape' in event) parts.push(`shape=${event.executionShape}`);
-  console.error(parts.join(' '));
+  console.error(renderStyledPrettyMessage('event', parts.join(' '), theme));
 }
 
-function printResult(result: RunResult | ChatResult): void {
+function printResult(
+  result: RunResult | ChatResult,
+  successType: Extract<TuiMessageType, 'assistant' | 'run'>,
+  theme: TuiSettingsConfig,
+): void {
   console.log(`status: ${result.status}`);
   console.log(`runId: ${result.runId}`);
   if (result.status === 'success') {
     console.log(`stepsUsed: ${result.stepsUsed}`);
     printUsage(result.usage);
     console.log('output:');
-    console.log(renderPrettyValue(result.output));
+    console.log(renderStyledPrettyValue(successType, result.output, theme));
     return;
   }
   if (result.status === 'failure') {
     console.log(`code: ${result.code}`);
     console.log('error:');
-    console.log(renderPrettyString(result.error));
+    console.log(renderStyledPrettyMessage('system', result.error, theme));
     console.log(`stepsUsed: ${result.stepsUsed}`);
     printUsage(result.usage);
     return;
   }
   console.log('message:');
-  console.log(renderPrettyString(result.message));
+  console.log(renderStyledPrettyMessage('system', result.message, theme));
   if ('toolName' in result) {
     console.log(`tool: ${result.toolName}`);
   }
@@ -1952,8 +2374,27 @@ export function renderPrettyValue(value: unknown): string {
   return JSON.stringify(value, null, 2) ?? String(value);
 }
 
+export function renderStyledPrettyValue(
+  type: TuiMessageType,
+  value: unknown,
+  theme: TuiSettingsConfig = {},
+): string {
+  return renderStyledPrettyMessage(type, renderPrettyValue(value), theme);
+}
+
 export function renderPrettyString(value: string): string {
   return marked.parse(value) as string;
+}
+
+export function renderStyledPrettyMessage(
+  type: TuiMessageType,
+  value: string,
+  theme: TuiSettingsConfig = {},
+): string {
+  const rendered = type === 'assistant' || type === 'progress' || type === 'run'
+    ? renderPrettyString(value)
+    : value;
+  return formatStyledMessageBlock(type, rendered, theme);
 }
 
 async function validateLocalPaths(spec: ManualTestSpec): Promise<void> {

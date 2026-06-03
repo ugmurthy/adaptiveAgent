@@ -116,4 +116,6 @@ Skills may also declare `handler: handler.ts`. When present, the handler module 
 
 `examples/skills/file-converter/` shows the same handler-backed pattern for local document conversion with `pandoc`, defaulting output to Markdown unless the caller requests a different target format.
 
+`examples/skills/persistent-code-executor/` is an enhanced E2B code-execution delegate that keeps one sandbox alive across multiple handler calls in the same child run. It is separate from a one-shot `code-executor`: use it only when repeated cells need shared interpreter state, files, or installed packages. It exposes explicit `run`, `status`, and `close` actions, creates sandboxes with `onTimeout: "kill"`, extends only a bounded idle TTL, and attempts to close on aborts or infrastructure errors so failed runs do not keep spending sandbox time unnecessarily.
+
 Skills whose required tools are unavailable (e.g. `researcher` when `WEB_SEARCH_PROVIDER=brave` and `BRAVE_SEARCH_API_KEY` is missing) are skipped automatically.

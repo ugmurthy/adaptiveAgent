@@ -539,9 +539,9 @@ export class AdaptiveAgent {
 
         const input = resolvePlanTemplate(step.inputTemplate, request.input, request.context, resolvedStepOutputs);
         const eventInput = captureToolInputForLog(tool, input, this.defaultCaptureMode);
-        const toolCallId = `plan:${currentExecution.id}:${step.id}`;
-        const toolContext = this.createToolContext(currentRun, step.id, toolCallId);
         const toolTimeoutMs = tool.timeoutMs ?? this.defaults.toolTimeoutMs;
+        const toolCallId = `plan:${currentExecution.id}:${step.id}`;
+        const toolContext = this.createToolContext(currentRun, step.id, toolCallId, toolTimeoutMs);
         const toolStartedAt = Date.now();
         let recoveredToolFailure = false;
         const startedPerformance = toolStartPerformanceMetrics({ input, eventInput, timeoutMs: toolTimeoutMs });
@@ -1798,8 +1798,8 @@ export class AdaptiveAgent {
 
     state.approvedToolCallIds = removeApprovedToolCallId(state.approvedToolCallIds, pendingToolCall.id);
 
-    const toolContext = this.createToolContext(run, pendingToolCall.stepId, pendingToolCall.id);
     const toolTimeoutMs = tool.timeoutMs ?? this.defaults.toolTimeoutMs;
+    const toolContext = this.createToolContext(run, pendingToolCall.stepId, pendingToolCall.id, toolTimeoutMs);
     const budgetGroup = this.resolveBudgetGroup(tool);
     const budget = budgetGroup ? this.resolvedToolBudgets?.[budgetGroup] : undefined;
     const existingExecution = await this.options.toolExecutionStore?.getByIdempotencyKey(toolContext.idempotencyKey);
@@ -2331,7 +2331,7 @@ export class AdaptiveAgent {
     return capModelVisibleToolResult(formatted, maxBytes, tool.name);
   }
 
-  private createToolContext(run: AgentRun, stepId: string, toolCallId: string): RuntimeToolContext {
+  private createToolContext(run: AgentRun, stepId: string, toolCallId: string, timeoutMs: number): RuntimeToolContext {
     const controller = new AbortController();
     return {
       runId: run.id,
@@ -2347,6 +2347,7 @@ export class AdaptiveAgent {
       input: run.input,
       context: run.context,
       idempotencyKey: `${run.id}:${stepId}:${toolCallId}`,
+      timeoutMs,
       signal: controller.signal,
       abort: (reason?: unknown) => controller.abort(reason),
       emit: (event) => Promise.resolve(this.emit(event)),

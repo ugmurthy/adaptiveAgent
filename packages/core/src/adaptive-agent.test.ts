@@ -492,6 +492,7 @@ describe('AdaptiveAgent', () => {
     const eventStore = new InMemoryEventStore();
     const snapshotStore = new InMemorySnapshotStore();
     let aborted = false;
+    let contextTimeoutMs: number | undefined;
     const hangingTool: ToolDefinition = {
       name: 'hang',
       description: 'Waits forever unless aborted.',
@@ -499,6 +500,7 @@ describe('AdaptiveAgent', () => {
       timeoutMs: 10,
       execute: async (_input, context) =>
         new Promise((resolve) => {
+          contextTimeoutMs = context.timeoutMs;
           context.signal.addEventListener('abort', () => {
             aborted = true;
           });
@@ -531,6 +533,7 @@ describe('AdaptiveAgent', () => {
       code: 'TOOL_ERROR',
       error: 'Timed out after 10ms',
     });
+    expect(contextTimeoutMs).toBe(10);
     expect(aborted).toBe(true);
   });
 

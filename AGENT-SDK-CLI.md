@@ -224,15 +224,19 @@ GAIA loader -> BenchmarkCase[] -> AgentSdk run loop -> result writer
 ```text
 --input <path>              JSONL/JSON/CSV input
 --files-dir <path>          Directory for GAIA attachments
---out <path>                JSONL result file
+--out <path>                JSONL result file; optional for --dry-run unless --resume is set
 --artifacts <dir>           Per-task traces, prompts, outputs
 --limit <n>
 --offset <n>
 --ids <id,id,...>
 --level <1|2|3>
 --split validation|test
+--type audio|image|video|other
+                          Filter rows by attachment type; rows without attachments do not match
 --concurrency <n>           Start with default 1
 --resume                    Skip tasks already present in output
+--dry-run                   Resolve config, tools, delegates, and selected rows without requests;
+                            GAIA also lists task id and attachment details
 --fail-fast
 --max-steps <n>
 --timeout-ms <n>
