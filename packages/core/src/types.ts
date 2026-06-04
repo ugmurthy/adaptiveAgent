@@ -244,6 +244,7 @@ export interface RecoveryPolicy {
 }
 
 export interface RunRequest {
+  sessionId?: string;
   goal: string;
   input?: JsonValue;
   images?: ImageInput[];
@@ -262,6 +263,7 @@ export interface ChatMessage {
 }
 
 export interface ChatRequest {
+  sessionId?: string;
   messages: ChatMessage[];
   context?: Record<string, JsonValue>;
   outputSchema?: JsonSchema;
@@ -363,6 +365,7 @@ export interface AdaptiveAgentOptions {
 
 export interface ToolContext {
   runId: UUID;
+  sessionId?: string;
   rootRunId: UUID;
   parentRunId?: UUID;
   parentStepId?: string;
@@ -520,6 +523,7 @@ export interface PlanArtifact {
 
 export interface AgentRun {
   id: UUID;
+  sessionId?: string;
   rootRunId: UUID;
   parentRunId?: UUID;
   parentStepId?: string;
@@ -689,6 +693,7 @@ export interface ToolExecutionStore {
 export interface RunStore {
   createRun(run: {
     id?: UUID;
+    sessionId?: string;
     rootRunId?: UUID;
     parentRunId?: UUID;
     parentStepId?: string;

@@ -48,6 +48,7 @@ export interface PostgresPoolClient extends PostgresClient {
 
 interface AgentRunRow {
   id: string;
+  session_id: string | null;
   root_run_id: string;
   parent_run_id: string | null;
   parent_step_id: string | null;
@@ -219,19 +220,19 @@ export class PostgresOptimisticConcurrencyError extends Error {
 export const POSTGRES_RUNTIME_RUN_QUERIES = {
   create: `
     INSERT INTO agent_runs (
-      id, root_run_id, parent_run_id, parent_step_id, delegate_name,
+      id, session_id, root_run_id, parent_run_id, parent_step_id, delegate_name,
       delegation_depth, current_child_run_id, goal, input, context,
       model_provider, model_name, model_parameters, metadata,
       status, version, total_prompt_tokens, total_completion_tokens,
       total_reasoning_tokens, estimated_cost_usd, created_at, updated_at,
       completed_at
     ) VALUES (
-      $1, $2, $3, $4, $5,
-      $6, $7, $8, $9, $10,
-      $11, $12, $13, $14,
-      $15, 0, 0, 0,
-      0, 0, $16, $17,
-      $18
+      $1, $2, $3, $4, $5, $6,
+      $7, $8, $9, $10, $11,
+      $12, $13, $14, $15,
+      $16, 0, 0, 0,
+      0, 0, $17, $18,
+      $19
     )
     RETURNING *
   `,
@@ -553,6 +554,7 @@ export class PostgresRunStore implements RunStore {
     const completedAt = isTerminalRunStatus(run.status) ? now : null;
     const result = await this.client.query<AgentRunRow>(POSTGRES_RUNTIME_RUN_QUERIES.create, [
       id,
+      parent?.sessionId ?? run.sessionId ?? null,
       rootRunId,
       run.parentRunId ?? null,
       run.parentStepId ?? null,
@@ -1117,6 +1119,7 @@ export function createPostgresRuntimeStores(options: { client: PostgresClient | 
 function runRowToRecord(row: AgentRunRow): AgentRun {
   return {
     id: row.id,
+    sessionId: row.session_id ?? undefined,
     rootRunId: row.root_run_id,
     parentRunId: row.parent_run_id ?? undefined,
     parentStepId: row.parent_step_id ?? undefined,
@@ -1331,6 +1334,10 @@ function isTerminalRunStatus(status: RunStatus): boolean {
 function assertMutableRunPatch(runId: UUID, current: AgentRun, patch: Partial<AgentRun>): void {
   if (patch.id && patch.id !== runId) {
     throw new Error('Run IDs are immutable');
+  }
+
+  if (patch.sessionId && patch.sessionId !== current.sessionId) {
+    throw new Error('sessionId is immutable');
   }
 
   if (patch.rootRunId && patch.rootRunId !== current.rootRunId) {

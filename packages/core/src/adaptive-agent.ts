@@ -282,6 +282,7 @@ export class AdaptiveAgent {
     }
     const normalizedContentParts = await this.normalizeFileInputsForReadFile(request.contentParts);
     const { run: createdRun, state } = await this.createRunWithInitialSnapshot({
+      sessionId: request.sessionId,
       goal: request.goal,
       input: request.input,
       context: request.context,
@@ -320,6 +321,7 @@ export class AdaptiveAgent {
     );
     const goal = summarizeChatGoal(normalizedMessages);
     const { run: createdRun, state } = await this.createRunWithInitialSnapshot({
+      sessionId: request.sessionId,
       goal,
       context: request.context,
       metadata: request.metadata,
@@ -1221,6 +1223,7 @@ export class AdaptiveAgent {
 
     const { run: continuationRun } = await this.createRunWithInitialSnapshot(
       {
+        sessionId: sourceRun.sessionId,
         goal: sourceRun.goal,
         input: sourceRun.input,
         context: {
@@ -2335,6 +2338,7 @@ export class AdaptiveAgent {
     const controller = new AbortController();
     return {
       runId: run.id,
+      sessionId: run.sessionId,
       rootRunId: run.rootRunId,
       parentRunId: run.parentRunId,
       parentStepId: run.parentStepId,

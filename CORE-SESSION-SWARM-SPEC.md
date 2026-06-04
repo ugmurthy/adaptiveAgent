@@ -203,7 +203,15 @@ export interface SwarmRequest {
   sessionId?: string;
   topLevelObjective: string;
   input?: JsonValue;
+  contentParts?: ModelContentPart[];
   maxWorkers?: number;
+  metadata?: Record<string, JsonValue>;
+}
+
+export interface SwarmAttachment {
+  id: string;
+  contentPart: ModelContentPart;
+  description?: string;
   metadata?: Record<string, JsonValue>;
 }
 
@@ -211,6 +219,7 @@ export interface SwarmSubtask {
   id: string;
   subObjective: string;
   input?: JsonValue;
+  attachmentRefs?: string[];
   targetAgentId?: string;
   metadata?: Record<string, JsonValue>;
 }
@@ -250,22 +259,170 @@ export interface SwarmRunResult {
 
 `targetAgentId` identifies which configured agent should run a subtask. The target agent's definition remains responsible for its model, instructions, and allowed tools.
 
+`contentParts` carries the top-level multimodal input for the swarm request. It should use the same `ModelContentPart` shape as `RunRequest.contentParts`, including text, image, file, and audio parts. Decomposition output should not duplicate raw files or inline blobs into every subtask; it should refer to coordinator-owned attachments by id.
+
+## Multimodal Input Decomposition and Attachment Routing
+
+The coordinator must handle objectives that combine a natural-language description with files or other modalities. Examples include:
+
+- one text objective plus multiple PDFs;
+- one text objective plus screenshots or charts;
+- one text objective plus audio files;
+- mixed image, file, and text parts where only some subtasks need some inputs.
+
+### Attachment inventory
+
+Before decomposition, the coordinator should convert `SwarmRequest.contentParts` into a deterministic attachment inventory:
+
+```ts
+interface SwarmAttachment {
+  id: string;
+  contentPart: ModelContentPart;
+  description?: string;
+  metadata?: Record<string, JsonValue>;
+}
+```
+
+Attachment ids should be stable within the coordinator run, such as `attachment-1`, `attachment-2`, or caller-provided names normalized to unique ids. The inventory should preserve original `ModelContentPart` values and any useful metadata such as `name`, `mimeType`, source kind, and size when available.
+
+### Decomposer input
+
+The decomposer logic inside the coordinator receives:
+
+- `topLevelObjective`;
+- `input`, if supplied;
+- the attachment inventory summary;
+- optionally the actual `contentParts` when the coordinator model supports the relevant input modalities.
+
+The attachment inventory summary should be structured enough for the decomposer to reference files without inventing paths or duplicating payloads. Example:
+
+```json
+{
+  "attachments": [
+    {
+      "id": "attachment-1",
+      "type": "file",
+      "name": "financials.pdf",
+      "mimeType": "application/pdf"
+    },
+    {
+      "id": "attachment-2",
+      "type": "image",
+      "name": "dashboard.png",
+      "mimeType": "image/png"
+    }
+  ]
+}
+```
+
+### Decomposer output
+
+Each `SwarmSubtask` may include `attachmentRefs`:
+
+```ts
+export interface SwarmSubtask {
+  id: string;
+  subObjective: string;
+  input?: JsonValue;
+  attachmentRefs?: string[];
+  targetAgentId?: string;
+  metadata?: Record<string, JsonValue>;
+}
+```
+
+`attachmentRefs` must contain only ids from the coordinator attachment inventory. The coordinator must validate refs before launching workers.
+
+Example decomposition result:
+
+```json
+{
+  "id": "subtask-2",
+  "subObjective": "Extract revenue assumptions from the financial model PDF and summarize risks.",
+  "attachmentRefs": ["attachment-1"],
+  "targetAgentId": "finance-analysis-agent"
+}
+```
+
+### Worker input construction
+
+For each worker run, the coordinator resolves `attachmentRefs` to `contentParts` and passes only the selected attachments to that worker.
+
+Worker request construction:
+
+```ts
+const selectedContentParts = resolveAttachmentRefs(subtask.attachmentRefs, attachmentInventory);
+
+await workerAgent.run({
+  sessionId,
+  goal: subtask.subObjective,
+  input: subtask.input,
+  contentParts: selectedContentParts,
+  context: {
+    topLevelObjective,
+    subtaskId: subtask.id,
+    attachmentRefs: subtask.attachmentRefs ?? [],
+  },
+  metadata: {
+    ...subtask.metadata,
+    orchestration: {
+      kind: 'swarm',
+      coordinatorRunId,
+      role: 'worker',
+      subtaskId: subtask.id,
+    },
+  },
+});
+```
+
+The worker should receive the subtask-specific objective as `goal`. The top-level objective should be included in context for alignment, not substituted for the worker goal.
+
+### Capability and policy checks
+
+Before launching a worker, the coordinator must verify that the selected target agent can accept the selected modalities. If the target model cannot consume a modality natively, the coordinator should follow the existing core file input policy behavior:
+
+- pass provider-native content parts when supported;
+- use `fileInputPolicy=read_file` where appropriate and ensure `read_file` is visible to the worker;
+- materialize URL or file-id inputs through existing `materializeFileInput` behavior when required;
+- fail the subtask with a clear validation error if the selected agent cannot consume or materialize a required attachment.
+
+The coordinator should not silently drop attachments selected by the decomposer.
+
+### Large or partially relevant files
+
+The initial version may route whole attachments by id. A later refinement can add selectors for file ranges, pages, timestamps, or regions:
+
+```ts
+interface SwarmAttachmentRef {
+  attachmentId: string;
+  pages?: number[];
+  lineStart?: number;
+  lineEnd?: number;
+  timeStartSeconds?: number;
+  timeEndSeconds?: number;
+  region?: JsonObject;
+}
+```
+
+Do not require partial attachment selectors in the first implementation unless needed by a concrete tool or provider adapter. The first version should keep `attachmentRefs: string[]` and route complete selected attachments.
+
 ## Coordinator Flow
 
 The coordinator owns decomposition. There is no separate decomposer run in the initial design.
 
 1. Accept `SwarmRequest`.
 2. Generate or reuse `sessionId`.
-3. Create a coordinator run with:
+3. Build an attachment inventory from `SwarmRequest.contentParts`, if present.
+4. Create a coordinator run with:
    - `sessionId`
    - `goal` or equivalent set to `topLevelObjective`
    - `metadata.orchestration.role = 'coordinator'`
-4. Inside the coordinator flow, produce a structured list of `SwarmSubtask` records.
-5. Launch worker runs for subtasks using bounded concurrency.
-6. Collect `SwarmSubtaskResult` records, including failures.
-7. Run the quality agent against the top-level objective, subtasks, and worker results.
-8. Run the synthesizer agent against the top-level objective, worker results, and quality assessments.
-9. Persist the final coordinator result and return `SwarmRunResult`.
+5. Inside the coordinator flow, produce a structured list of `SwarmSubtask` records, including `attachmentRefs` when a subtask needs selected files or other modalities.
+6. Validate each subtask's `attachmentRefs` against the attachment inventory.
+7. Launch worker runs for subtasks using bounded concurrency, passing only the selected `contentParts` to each worker.
+8. Collect `SwarmSubtaskResult` records, including failures.
+9. Run the quality agent against the top-level objective, subtasks, attachment refs, and worker results.
+10. Run the synthesizer agent against the top-level objective, worker results, attachment refs, and quality assessments.
+11. Persist the final coordinator result and return `SwarmRunResult`.
 
 The coordinator may use model instructions, schemas, or existing tools to perform decomposition, but the decomposition remains part of the coordinator's responsibility.
 
@@ -284,13 +441,17 @@ Each worker run must include:
 The worker run goal should be the `subObjective`, not the top-level objective. The top-level objective can be included in context for alignment.
 
 ```ts
+const selectedContentParts = resolveAttachmentRefs(subtask.attachmentRefs, attachmentInventory);
+
 await workerAgent.run({
   sessionId,
   goal: subtask.subObjective,
   input: subtask.input,
+  contentParts: selectedContentParts,
   context: {
     topLevelObjective,
     subtaskId: subtask.id,
+    attachmentRefs: subtask.attachmentRefs ?? [],
   },
   metadata: {
     ...subtask.metadata,
@@ -336,6 +497,7 @@ The quality agent should produce structured assessments rather than free-form pr
 
 - top-level objective;
 - subtask list;
+- subtask attachment refs and attachment summaries, not necessarily full raw attachments;
 - worker run ids, statuses, outputs, and errors;
 - quality assessments;
 - any caller input/context needed for the final response.
@@ -360,11 +522,21 @@ This avoids a multi-child parent model and preserves current resumability assump
 
 ## CLI/Gateway Direction
 
-A future `--swarm` mode can be layered on top of this coordinator API:
+The existing Agent SDK CLI already uses `eval --swarm <n>` to mean "run eval cases with up to `n` concurrent eval runs." That existing flag is a concurrency control for evaluation workloads; it does not decompose one objective into subtasks and should not be treated as this feature.
+
+A future CLI or gateway entrypoint for coordinated decomposition must avoid ambiguity with the existing eval flag. The exact command name is therefore intentionally TBD, but `swarm-run` is the preferred candidate because it preserves the meaningful swarm terminology without overloading `eval --swarm <n>`.
+
+Possible shapes include:
 
 ```sh
-adaptive-agent run --swarm "Analyze this complex objective and produce a final answer"
+adaptive-agent swarm-run "Analyze this complex objective and produce a final answer"
+adaptive-agent run --orchestrate "Analyze this complex objective and produce a final answer"
+adaptive-agent run --decompose "Analyze this complex objective and produce a final answer"
 ```
+
+If implemented, `adaptive-agent run --decompose` must be an alias for the same `SwarmCoordinator` execution path as `adaptive-agent swarm-run`. `adaptive-agent run --orchestrate` is intentionally not the initial alias because it is broader than decomposition and may later cover other orchestration modes.
+
+Avoid reusing `--swarm` for this feature because `eval --swarm <n>` already has a different meaning.
 
 Expected behavior:
 
@@ -374,7 +546,7 @@ Expected behavior:
 - return all relevant run ids and the synthesizer output;
 - preserve normal non-swarm `agent.run()` behavior.
 
-Gateway interactive sessions should remain serialized for chat/write safety unless an explicit swarm mode creates independent runs under the same core `sessionId`.
+Gateway interactive sessions should remain serialized for chat/write safety unless an explicit coordinated decomposition mode creates independent runs under the same core `sessionId`.
 
 ## Non-Goals
 
@@ -382,11 +554,22 @@ Gateway interactive sessions should remain serialized for chat/write safety unle
 - No replacement of existing delegate child runs.
 - No separate `swarmId` in the initial implementation.
 - No duplicated `allowedTools` on `SwarmSubtask`.
+- No raw attachment duplication across all subtasks by default.
+- No required partial file/page/timestamp selectors in the first implementation.
 - No gateway authorization/session ownership migration into core.
 - No DAG scheduler in the initial version.
 - No parallel child-run delegation changes.
 
 ## Implementation Phases
+
+### Phase 0: Contract cleanup and naming lock
+
+- Treat `swarm-run` as the canonical coordinated decomposition command name.
+- If supported, make `run --decompose` an exact alias for the same coordinator flow.
+- Do not introduce `run --orchestrate` in the initial CLI unless a broader orchestration mode is explicitly designed.
+- Keep specialist routing on `SwarmSubtask.targetAgentId`; do not model specialist selection as nested orchestration.
+- Keep nested swarm/coordinator execution out of the initial implementation.
+- Preserve the no-`swarmId`, independent-worker-root-run, and no-multi-child-parent-run constraints.
 
 ### Phase 1: Core persisted `sessionId`
 
@@ -407,14 +590,18 @@ Gateway interactive sessions should remain serialized for chat/write safety unle
 
 - Implement a `SwarmCoordinator` or equivalent orchestration helper.
 - Keep decomposition inside the coordinator flow.
+- Build a deterministic attachment inventory from `SwarmRequest.contentParts`.
+- Require decomposer output to reference attachments through validated `attachmentRefs`.
 - Launch independent worker root runs with bounded concurrency.
+- Pass only selected `contentParts` to each worker run.
 - Collect structured worker results.
 - Invoke quality and synthesis runs.
 - Return `SwarmRunResult`.
 
-### Phase 4: CLI or gateway `--swarm` integration
+### Phase 4: CLI or gateway coordinated decomposition integration
 
 - Add a command or frame option that invokes the coordinator.
+- Avoid overloading or confusing the existing Agent SDK `eval --swarm <n>` concurrency flag.
 - Surface `sessionId`, `coordinatorRunId`, worker run ids, quality run id, and synthesizer run id.
 - Keep non-swarm gateway session write semantics unchanged.
 
@@ -436,11 +623,16 @@ Gateway interactive sessions should remain serialized for chat/write safety unle
 - Quality and synthesizer runs share the same `sessionId` and coordinator metadata.
 - Failed worker runs are represented in `SwarmSubtaskResult` and do not prevent quality/synthesis unless policy says so.
 - `targetAgentId` selects an agent whose own definition controls tools.
+- Coordinator builds stable attachment ids for multimodal `contentParts`.
+- Decomposer output with unknown `attachmentRefs` is rejected before worker launch.
+- Worker runs receive only the attachments selected by their subtask.
+- Worker launch fails clearly when the selected target agent cannot consume or materialize a required modality.
 
 ### Integration tests
 
 - PostgreSQL migration is idempotent.
 - A full swarm run can be queried by `sessionId` and grouped by `coordinatorRunId`.
+- A full swarm run with mixed file/image/audio inputs preserves attachment routing in run context or metadata.
 - Existing delegate child-run tests continue to pass without multi-child behavior.
 
 ## Open Implementation Decisions
@@ -450,3 +642,5 @@ Gateway interactive sessions should remain serialized for chat/write safety unle
 3. Whether failed worker runs should be retried automatically based on quality-agent recommendations in the first version.
 4. Whether `maxWorkers` default should live in `AdaptiveAgentOptions.defaults`, a coordinator option, or CLI/gateway config.
 5. Whether quality and synthesis should be required phases or configurable profiles.
+6. Whether attachment inventory summaries should be persisted in coordinator `metadata`, coordinator `result`, events, or all three.
+7. When to promote `attachmentRefs: string[]` to structured refs with page, range, timestamp, or region selectors.

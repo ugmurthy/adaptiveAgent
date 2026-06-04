@@ -72,6 +72,7 @@ export class InMemoryRunStore implements RunStore {
     const now = new Date();
     const storedRun: AgentRun = {
       id,
+      sessionId: parent?.sessionId ?? run.sessionId,
       rootRunId,
       parentRunId: run.parentRunId,
       parentStepId: run.parentStepId,
@@ -122,6 +123,10 @@ export class InMemoryRunStore implements RunStore {
 
     if (patch.id && patch.id !== runId) {
       throw new Error('Run IDs are immutable');
+    }
+
+    if (patch.sessionId && patch.sessionId !== current.sessionId) {
+      throw new Error('sessionId is immutable');
     }
 
     if (patch.rootRunId && patch.rootRunId !== current.rootRunId) {

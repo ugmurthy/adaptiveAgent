@@ -49,6 +49,7 @@ function createQueuedClient(results: Array<Record<string, unknown>[]>): Postgres
 
 const sampleRunRow = {
   id: 'run-1',
+  session_id: 'session-1',
   root_run_id: 'run-1',
   parent_run_id: null,
   parent_step_id: null,
@@ -204,6 +205,7 @@ describe('PostgresRunStore', () => {
 
     const run = await store.createRun({
       id: 'run-1',
+      sessionId: 'session-1',
       goal: 'Write a report',
       input: { topic: 'resumability' },
       context: { locale: 'en-US' },
@@ -216,6 +218,7 @@ describe('PostgresRunStore', () => {
 
     expect(run).toMatchObject({
       id: 'run-1',
+      sessionId: 'session-1',
       rootRunId: 'run-1',
       goal: 'Write a report',
       status: 'running',
@@ -234,6 +237,7 @@ describe('PostgresRunStore', () => {
       POSTGRES_RUNTIME_RUN_QUERIES.create,
       expect.arrayContaining([
         'run-1',
+        'session-1',
         'run-1',
         null,
         null,

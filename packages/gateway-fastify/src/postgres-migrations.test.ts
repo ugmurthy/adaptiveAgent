@@ -18,6 +18,8 @@ describe('Postgres migration files', () => {
     const deltaSql = await readFile(new URL('../../core/migrations/002_tool_observability.sql', import.meta.url), 'utf-8');
 
     expect(sql).toContain('create table if not exists agent_runs');
+    expect(sql).toContain('session_id text');
+    expect(sql).toContain('agent_runs_session_idx');
     expect(sql).toContain('create table if not exists agent_events');
     expect(sql).toContain('create table if not exists run_snapshots');
     expect(sql).toContain('create table if not exists plans');

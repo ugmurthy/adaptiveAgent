@@ -11,6 +11,7 @@ create extension if not exists pgcrypto;
 
 create table if not exists agent_runs (
   id uuid primary key,
+  session_id text,
   root_run_id uuid not null,
   parent_run_id uuid references agent_runs(id) on delete set null,
   parent_step_id text,
@@ -42,6 +43,7 @@ create table if not exists agent_runs (
 );
 
 create index if not exists agent_runs_root_idx on agent_runs (root_run_id, created_at desc);
+create index if not exists agent_runs_session_idx on agent_runs (session_id, created_at desc, id) where session_id is not null;
 create index if not exists agent_runs_parent_idx on agent_runs (parent_run_id, created_at desc);
 create index if not exists agent_runs_delegate_idx on agent_runs (delegate_name, created_at desc);
 create index if not exists agent_runs_status_idx on agent_runs (status, updated_at asc, id asc);
@@ -232,6 +234,17 @@ create table if not exists run_continuations (
 
 create index if not exists run_continuations_source_idx
   on run_continuations (source_run_id, created_at desc);
+`,
+  },
+  {
+    name: 'core:005_run_session_id',
+    sql: `
+alter table agent_runs
+  add column if not exists session_id text;
+
+create index if not exists agent_runs_session_idx
+  on agent_runs (session_id, created_at desc, id)
+  where session_id is not null;
 `,
   },
 ];

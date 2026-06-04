@@ -90,6 +90,26 @@ function createBudgetedSearchTool(): ToolDefinition {
 }
 
 describe('AdaptiveAgent', () => {
+  it('persists sessionId for run-style root runs', async () => {
+    const runStore = new InMemoryRunStore();
+    const agent = new AdaptiveAgent({
+      model: new SequenceModel([{ finishReason: 'stop', text: 'done' }]),
+      tools: [],
+      runStore,
+      eventStore: new InMemoryEventStore(),
+      snapshotStore: new InMemorySnapshotStore(),
+    });
+
+    const result = await agent.run({ sessionId: 'session-1', goal: 'Remember this session' });
+
+    const storedRun = await runStore.getRun(result.runId);
+    expect(storedRun).toMatchObject({
+      id: result.runId,
+      sessionId: 'session-1',
+      status: 'succeeded',
+    });
+  });
+
   it('rewrites file content parts to read_file instructions when native file input is unavailable', async () => {
     const tempDir = await mkdtemp(join(tmpdir(), 'agent-file-policy-'));
     try {
@@ -163,6 +183,7 @@ describe('AdaptiveAgent', () => {
     });
 
     const result = await agent.chat({
+      sessionId: 'chat-session-1',
       messages: [
         { role: 'system', content: 'Call the user Sam.' },
         { role: 'assistant', content: 'Hi Sam! What would you like to know?' },
@@ -210,7 +231,10 @@ describe('AdaptiveAgent', () => {
     });
 
     const storedRun = await runStore.getRun(result.runId);
-    expect(storedRun?.goal).toBe('What is the capital of France?');
+    expect(storedRun).toMatchObject({
+      goal: 'What is the capital of France?',
+      sessionId: 'chat-session-1',
+    });
   });
 
   it('adds run image inputs to the initial user model message without embedding bytes', async () => {
@@ -367,7 +391,7 @@ describe('AdaptiveAgent', () => {
       },
     });
 
-    const failedResult = await agent.run({ goal: 'Research continuation recovery' });
+    const failedResult = await agent.run({ sessionId: 'session-continuation-1', goal: 'Research continuation recovery' });
     expect(failedResult).toMatchObject({
       status: 'failure',
       code: 'MODEL_ERROR',
@@ -397,8 +421,9 @@ describe('AdaptiveAgent', () => {
     const continuationEvents = await eventStore.listByRun(continuedResult.runId);
     const continuationRequest = model.receivedRequests.at(-1);
 
-    expect(sourceRun).toMatchObject({ status: 'failed' });
+    expect(sourceRun).toMatchObject({ status: 'failed', sessionId: 'session-continuation-1' });
     expect(continuationRun).toMatchObject({
+      sessionId: 'session-continuation-1',
       status: 'succeeded',
       metadata: expect.objectContaining({
         continuationOfRunId: failedResult.runId,
@@ -1847,7 +1872,7 @@ describe('AdaptiveAgent', () => {
       },
     });
 
-    const result = await agent.run({ goal: 'Write a delegation memo' });
+    const result = await agent.run({ sessionId: 'session-delegation-1', goal: 'Write a delegation memo' });
     expect(result.status).toBe('success');
 
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -2438,7 +2463,7 @@ describe('AdaptiveAgent', () => {
       toolExecutionStore,
     });
 
-    const result = await agent.run({ goal: 'Write a delegation memo' });
+    const result = await agent.run({ sessionId: 'session-delegation-1', goal: 'Write a delegation memo' });
     if (result.status !== 'success') {
       throw new Error(`Expected success, received ${result.status}`);
     }
@@ -2448,6 +2473,7 @@ describe('AdaptiveAgent', () => {
     const childRuns = await runStore.listChildren(result.runId);
     expect(childRuns).toHaveLength(1);
     expect(childRuns[0]).toMatchObject({
+      sessionId: 'session-delegation-1',
       parentRunId: result.runId,
       delegateName: 'researcher',
       status: 'succeeded',

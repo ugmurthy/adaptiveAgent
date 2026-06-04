@@ -635,6 +635,7 @@ export class DelegationExecutor {
   }): Parameters<RunStore['createRun']>[0] {
     return {
       id: params.childRunId,
+      sessionId: params.parentContext.sessionId,
       rootRunId: params.parentContext.rootRunId,
       parentRunId: params.parentContext.runId,
       parentStepId: params.parentContext.stepId,
