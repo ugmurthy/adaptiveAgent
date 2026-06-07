@@ -15,13 +15,17 @@ import type {
   JsonValue,
   ModelContentPart,
   RunResult,
+  SwarmRunResult,
+  SwarmSubtask,
 } from '@adaptive-agent/core';
+import { SwarmCoordinator, createSwarmDecompositionOutputSchema } from '@adaptive-agent/core';
 
 import {
   createAgentSdk,
   createOrchestrationSdk,
   inspectAgentSdkResolution,
   loadAgentSdkConfig,
+  type AgentConfigFile,
   type AgentSdkChatOptions,
   type AgentSdkRunOptions,
   type OrchestratedRunResult,
@@ -39,7 +43,7 @@ import { applyNamedStyle, formatStyledMessageBlock } from './tui/message-styles.
 marked.use(markedTerminal() as never);
 
 export interface ManualTestCliOptions {
-  command: 'run' | 'chat' | 'spec' | 'config' | 'eval';
+  command: 'run' | 'chat' | 'spec' | 'config' | 'eval' | 'swarm-run';
   specPath: string;
   goalArgs: string[];
   promptFilePath?: string;
@@ -49,6 +53,11 @@ export interface ManualTestCliOptions {
   fileAttachmentPaths: string[];
   orchestrate: boolean;
   agentCatalogPaths: string[];
+  workerCatalogPaths: string[];
+  qualityAgentPath?: string;
+  synthesizerAgentPath?: string;
+  maxWorkers?: number;
+  sessionId?: string;
   evalDataset?: 'cases' | 'gaia';
   evalInputPath?: string;
   evalFilesDir?: string;
@@ -189,6 +198,7 @@ Agent SDK CLI
 
 Usage:
   adaptive-agent run [options] <goal...>
+  adaptive-agent swarm-run --agent <path-or-name> --worker-catalog <paths-or-names> [options] <task...>
   adaptive-agent chat [options] [message...]
   adaptive-agent spec <path> [options]
   adaptive-agent config [options]
@@ -201,6 +211,7 @@ Eval usage:
 
 Commands:
   run                   Run a one-shot goal.
+  swarm-run             Decompose one task into bounded worker runs and synthesize a final result.
   chat                  Send one chat turn. Reads stdin when no message is given.
   spec                  Run the existing JSON spec format.
   config                Print resolved SDK configuration.
@@ -219,7 +230,7 @@ Options:
                           Add a file attachment to a run request. Repeatable.
   --mode <chat|run>       Override the spec mode.
   --cwd <path>            Working directory used for SDK config lookup.
-  --agent <path>          Explicit path to agent.json.
+  --agent <path-or-name>  Explicit path to agent.json, or filename from agents.dirs.
   --settings <path>       Explicit path to agent.settings.json.
   --runtime <mode>        Runtime mode: memory or postgres.
   --provider <name>       Override provider: openrouter, ollama, mistral, mesh.
@@ -228,6 +239,14 @@ Options:
   --clarification <mode>  Clarification mode: interactive or fail.
   --orchestrate           Route run requests through the orchestration SDK.
   --catalog <path>        Agent config path to add to orchestration catalog. Repeatable.
+  --worker-catalog <paths>
+                          Comma-separated worker agent JSON paths or filenames for swarm-run.
+  --quality-agent <path-or-name>
+                          Optional quality agent JSON path or filename for swarm-run.
+  --synthesizer-agent <path-or-name>
+                          Optional synthesizer agent JSON path or filename for swarm-run.
+  --max-workers <n>       Maximum concurrent swarm workers.
+  --session-id <id>       Session id for run grouping.
   --progress              Print assistant progress updates as they arrive.
   --events                Print lifecycle events as they arrive.
   --inspect               Print a compact inspection summary after completion.
@@ -290,6 +309,10 @@ export async function main(argv = Bun.argv.slice(2)): Promise<number> {
 
   if (cli.command === 'run') {
     return runInlineCommand(cli, 'run');
+  }
+
+  if (cli.command === 'swarm-run') {
+    return runSwarmCommand(cli);
   }
 
   if (cli.command === 'chat') {
@@ -499,6 +522,150 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
   }
 }
 
+async function runSwarmCommand(cli: ManualTestCliOptions): Promise<number> {
+  const resolvedCwd = resolve(cli.cwd ?? process.cwd());
+  const topLevelObjective = await readInlinePrompt(cli, 'swarm task');
+  const sdkOptions = buildSdkOptions(cli, resolvedCwd);
+  const eventLog: Array<Record<string, JsonValue>> = [];
+  const coordinatorConfig = await loadAgentSdkConfig(sdkOptions);
+  const workerConfigs = await Promise.all(cli.workerCatalogPaths.map((agentConfigPath) => loadAgentSdkConfig({ ...sdkOptions, agentConfigPath })));
+  const qualityConfig = await loadAgentSdkConfig({
+    ...sdkOptions,
+    ...(cli.qualityAgentPath
+      ? { agentConfigPath: cli.qualityAgentPath }
+      : { agentConfig: roleAgentConfig(coordinatorConfig.agent, 'quality') }),
+  });
+  const synthesizerConfig = await loadAgentSdkConfig({
+    ...sdkOptions,
+    ...(cli.synthesizerAgentPath
+      ? { agentConfigPath: cli.synthesizerAgentPath }
+      : { agentConfig: roleAgentConfig(coordinatorConfig.agent, 'synthesizer') }),
+  });
+  const workerIds = workerConfigs.map((config) => config.agent.id);
+  const duplicateWorkerId = workerIds.find((id, index) => workerIds.indexOf(id) !== index);
+  if (duplicateWorkerId) throw new Error(`swarm-run worker catalog contains duplicate agent id: ${duplicateWorkerId}`);
+
+  if (cli.dryRun) {
+    printSwarmDryRun(cli, coordinatorConfig, workerConfigs, qualityConfig, synthesizerConfig);
+    return 0;
+  }
+
+  const lastProgressContentByRun = new Map<string, string>();
+  const swarmColors = cli.output === 'pretty' ? new RunColorRegistry() : undefined;
+  const eventListener = shouldListenForCliEvents(cli) ? (event: AgentEvent) => {
+    const entry = summarizeEvent(event);
+    eventLog.push(entry);
+    if (swarmColors && event.type === 'run.created') {
+      printRunStartedEvent(event, coordinatorConfig.tui, swarmColors);
+    }
+    if (cli.events && cli.output === 'pretty') {
+      printEvent(entry, coordinatorConfig.tui, swarmColors);
+    } else if (cli.progress && cli.output === 'pretty') {
+      printProgressEvent(event, lastProgressContentByRun, coordinatorConfig.tui, cli.showLines, swarmColors);
+    }
+  } : undefined;
+
+  const coordinatorSdk = await createAgentSdk({ ...sdkOptions, eventListener });
+  const workerSdks = await Promise.all(cli.workerCatalogPaths.map((agentConfigPath) => createAgentSdk({ ...sdkOptions, agentConfigPath, runtime: coordinatorSdk.created.runtime, eventListener })));
+  const qualitySdk = await createAgentSdk({
+    ...sdkOptions,
+    ...(cli.qualityAgentPath
+      ? { agentConfigPath: cli.qualityAgentPath }
+      : { agentConfig: roleAgentConfig(coordinatorSdk.config.agent, 'quality') }),
+    runtime: coordinatorSdk.created.runtime,
+    eventListener,
+  });
+  const synthesizerSdk = await createAgentSdk({
+    ...sdkOptions,
+    ...(cli.synthesizerAgentPath
+      ? { agentConfigPath: cli.synthesizerAgentPath }
+      : { agentConfig: roleAgentConfig(coordinatorSdk.config.agent, 'synthesizer') }),
+    runtime: coordinatorSdk.created.runtime,
+    eventListener,
+  });
+
+  try {
+    const sessionId = cli.sessionId ?? crypto.randomUUID();
+    const workerCatalog = workerConfigs.map((config) => ({
+      id: config.agent.id,
+      name: config.agent.name,
+      description: config.agent.description ?? '',
+      capabilities: (config.agent.capabilities ?? {}) as JsonValue,
+    }));
+    const contentParts = buildInlineContentParts(cli, resolvedCwd);
+    const decompositionResult = await coordinatorSdk.runRaw(topLevelObjective, {
+      sessionId,
+      input: {
+        originalInput: cli.inputJson ?? null,
+        workerCatalog: workerCatalog as unknown as JsonValue,
+      },
+      contentParts: contentParts.length > 0 ? contentParts : undefined,
+      context: {
+        phase: 'swarm.decompose',
+        topLevelObjective,
+        validWorkerAgentIds: workerIds as unknown as JsonValue,
+        instructions: [
+          'Decompose the top-level objective into independent subtasks.',
+          'Each subtask targetAgentId must exactly match one id from validWorkerAgentIds.',
+          'Return only structured subtasks; do not invent worker ids.',
+        ],
+      },
+      outputSchema: createSwarmDecompositionOutputSchema(workerIds),
+      metadata: { orchestration: { kind: 'swarm', coordinatorRunId: 'pending', role: 'coordinator' } as unknown as JsonValue },
+    });
+
+    if (decompositionResult.status !== 'success') {
+      throw new Error(`Coordinator decomposition failed: ${summarizeResult(decompositionResult)}`);
+    }
+
+    const subtasks = parseSwarmSubtasks(decompositionResult.output);
+    validateSdkDecomposition(subtasks, workerIds);
+    if (cli.output === 'pretty') {
+      printSwarmExecutionPlan(sessionId, decompositionResult.runId, subtasks);
+    }
+    const swarm = new SwarmCoordinator({
+      runStore: coordinatorSdk.created.runtime.runStore,
+      coordinatorAgent: coordinatorSdk.agent,
+      workerAgents: Object.fromEntries(workerSdks.map((sdk) => [sdk.config.agent.id, sdk.agent])),
+      qualityAgent: qualitySdk.agent,
+      synthesizerAgent: synthesizerSdk.agent,
+      defaultMaxWorkers: cli.maxWorkers,
+    });
+    const result = await swarm.execute({
+      sessionId,
+      coordinatorRunId: decompositionResult.runId,
+      topLevelObjective,
+      input: cli.inputJson,
+      contentParts: contentParts.length > 0 ? contentParts : undefined,
+      maxWorkers: cli.maxWorkers,
+      metadata: {
+        defaultsUsed: {
+          qualityAgent: cli.qualityAgentPath ? 'explicit' : 'coordinator_with_quality_instructions',
+          synthesizerAgent: cli.synthesizerAgentPath ? 'explicit' : 'coordinator_with_synthesis_instructions',
+        },
+      },
+      subtasks,
+    });
+
+    if (cli.output === 'json') {
+      console.log(JSON.stringify(summarizeSwarmRun(result, workerIds, cli, subtasks), null, 2));
+    } else if (cli.output === 'jsonl') {
+      console.log(JSON.stringify(summarizeSwarmRun(result, workerIds, cli, subtasks)));
+    } else {
+      printSwarmResult(result, workerIds, cli);
+      if (cli.events && eventLog.length > 0) console.error(`event log captured: ${eventLog.length}`);
+    }
+    return result.status === 'succeeded' ? 0 : 1;
+  } finally {
+    await Promise.allSettled([
+      ...workerSdks.map((sdk) => sdk.close()),
+      qualitySdk.close(),
+      synthesizerSdk.close(),
+      coordinatorSdk.close(),
+    ]);
+  }
+}
+
 async function runConfigCommand(cli: ManualTestCliOptions): Promise<number> {
   const resolvedCwd = resolve(cli.cwd ?? process.cwd());
   const resolvedConfig = await loadAgentSdkConfig(buildSdkOptions(cli, resolvedCwd));
@@ -513,6 +680,7 @@ async function runConfigCommand(cli: ManualTestCliOptions): Promise<number> {
   console.log(`shellCwd: ${resolvedConfig.shellCwd}`);
   console.log(`approval: ${resolvedConfig.interaction.approvalMode}`);
   console.log(`clarification: ${resolvedConfig.interaction.clarificationMode}`);
+  console.log(`agentSearchDirs: ${resolvedConfig.agents.dirs.join(', ')}`);
   console.log(`tools: ${resolvedConfig.agent.tools.join(', ')}`);
   console.log(`delegates: ${(resolvedConfig.agent.delegates ?? []).join(', ') || '(none)'}`);
   return 0;
@@ -664,6 +832,7 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
     fileAttachmentPaths: [],
     orchestrate: false,
     agentCatalogPaths: [],
+    workerCatalogPaths: [],
     evalResume: false,
     evalFailFast: false,
     evalSwarm: 1,
@@ -682,7 +851,7 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if (!commandSeen && (arg === 'run' || arg === 'chat' || arg === 'spec' || arg === 'config' || arg === 'eval')) {
+    if (!commandSeen && (arg === 'run' || arg === 'chat' || arg === 'spec' || arg === 'config' || arg === 'eval' || arg === 'swarm-run')) {
       options.command = arg;
       commandSeen = true;
       if (arg === 'spec' && argv[index + 1] && !argv[index + 1].startsWith('--')) {
@@ -779,6 +948,21 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
       case '--catalog':
         options.agentCatalogPaths.push(requireOptionValue(arg, argv[++index]));
         break;
+      case '--worker-catalog':
+        options.workerCatalogPaths.push(...requireOptionValue(arg, argv[++index]).split(',').map((path) => path.trim()).filter(Boolean));
+        break;
+      case '--quality-agent':
+        options.qualityAgentPath = requireOptionValue(arg, argv[++index]);
+        break;
+      case '--synthesizer-agent':
+        options.synthesizerAgentPath = requireOptionValue(arg, argv[++index]);
+        break;
+      case '--max-workers':
+        options.maxWorkers = parsePositiveIntegerOption(arg, requireOptionValue(arg, argv[++index]));
+        break;
+      case '--session-id':
+        options.sessionId = requireOptionValue(arg, argv[++index]);
+        break;
       case '--mode':
         options.mode = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['chat', 'run']);
         break;
@@ -810,7 +994,7 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
         options.output = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['pretty', 'json', 'jsonl']);
         break;
       default:
-        if (options.command === 'run' || options.command === 'chat') {
+        if (options.command === 'run' || options.command === 'chat' || options.command === 'swarm-run') {
           options.goalArgs.push(arg);
           break;
         }
@@ -827,7 +1011,25 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
   }
 
   if (!options.help && swarmSpecified && options.command !== 'eval') {
-    throw new Error('--swarm is supported for eval requests, not run/chat/spec/config requests');
+    throw new Error('--swarm is supported for eval requests, not run/chat/spec/config/swarm-run requests');
+  }
+
+  if (!options.help && options.command === 'swarm-run') {
+    if (!options.agentConfigPath) {
+      throw new Error('swarm-run requires --agent <path-or-name> for the coordinator agent');
+    }
+    if (options.workerCatalogPaths.length === 0) {
+      throw new Error('swarm-run requires --worker-catalog <path-or-name,...>');
+    }
+    if (options.promptFilePath && options.goalArgs.length > 0) {
+      throw new Error('swarm-run accepts positional task text or --file <path>, but not both');
+    }
+    if (!options.promptFilePath && options.goalArgs.length === 0) {
+      throw new Error('swarm-run requires positional task text or --file <path>');
+    }
+    if (options.orchestrate) {
+      throw new Error('--orchestrate is not used with swarm-run; swarm-run already uses coordinated decomposition');
+    }
   }
 
   if (!options.help && options.command === 'chat' && options.imagePaths.length > 0) {
@@ -1755,6 +1957,11 @@ function summarizeCli(cli: ManualTestCliOptions): Record<string, JsonValue> {
     ...(cli.fileAttachmentPaths.length > 0 ? { fileAttachmentPaths: cli.fileAttachmentPaths.map((path) => resolve(path)) } : {}),
     orchestrate: cli.orchestrate,
     ...(cli.agentCatalogPaths.length > 0 ? { agentCatalogPaths: cli.agentCatalogPaths.map((path) => resolve(path)) } : {}),
+    ...(cli.workerCatalogPaths.length > 0 ? { workerCatalogPaths: cli.workerCatalogPaths.map((path) => resolve(path)) } : {}),
+    ...(cli.qualityAgentPath ? { qualityAgentPath: resolve(cli.qualityAgentPath) } : {}),
+    ...(cli.synthesizerAgentPath ? { synthesizerAgentPath: resolve(cli.synthesizerAgentPath) } : {}),
+    ...(cli.maxWorkers ? { maxWorkers: cli.maxWorkers } : {}),
+    ...(cli.sessionId ? { sessionId: cli.sessionId } : {}),
     ...(cli.evalDataset ? { evalDataset: cli.evalDataset } : {}),
     ...(cli.evalInputPath ? { evalInputPath: resolve(cli.evalInputPath) } : {}),
     ...(cli.evalFilesDir ? { evalFilesDir: resolve(cli.evalFilesDir) } : {}),
@@ -1804,6 +2011,7 @@ function summarizeResolvedConfig(
     shellCwd: resolvedConfig.shellCwd,
     approvalMode: resolvedConfig.interaction.approvalMode,
     clarificationMode: resolvedConfig.interaction.clarificationMode,
+    agentSearchDirs: resolvedConfig.agents.dirs,
     skillSearchDirs: resolvedConfig.skills.dirs,
     mode: spec.mode,
     messageCount: summary.messageCount,
@@ -1843,6 +2051,201 @@ function summarizeResult(result: RunResult | ChatResult): JsonValue {
     ...('toolName' in result ? { toolName: result.toolName } : {}),
     ...('suggestedQuestions' in result && result.suggestedQuestions ? { suggestedQuestions: result.suggestedQuestions as unknown as JsonValue } : {}),
   };
+}
+
+function parseSwarmSubtasks(output: JsonValue): SwarmSubtask[] {
+  const raw = isRecordValue(output) && Array.isArray(output.subtasks)
+    ? output.subtasks
+    : Array.isArray(output) ? output : undefined;
+  if (!raw || raw.length === 0) throw new Error('Coordinator produced no subtasks');
+  return raw.map((item, index) => {
+    if (!isRecordValue(item)) throw new Error(`Coordinator subtask ${index + 1} is not an object`);
+    const id = typeof item.id === 'string' ? item.id.trim() : '';
+    const subObjective = typeof item.subObjective === 'string' ? item.subObjective.trim() : '';
+    if (!id) throw new Error(`Coordinator subtask ${index + 1} is missing id`);
+    if (!subObjective) throw new Error(`Coordinator subtask ${id} is missing subObjective`);
+    return {
+      id,
+      subObjective,
+      ...(isJsonValueLike(item.input) ? { input: item.input } : {}),
+      ...(Array.isArray(item.attachmentRefs) ? { attachmentRefs: item.attachmentRefs.filter((ref): ref is string => typeof ref === 'string' && ref.length > 0) } : {}),
+      ...(typeof item.targetAgentId === 'string' && item.targetAgentId.length > 0 ? { targetAgentId: item.targetAgentId } : {}),
+      ...(isJsonRecordLike(item.metadata) ? { metadata: item.metadata } : {}),
+    };
+  });
+}
+
+function validateSdkDecomposition(subtasks: SwarmSubtask[], validWorkerIds: string[]): void {
+  const ids = new Set<string>();
+  const validWorkers = new Set(validWorkerIds);
+  const issues: string[] = [];
+  for (const subtask of subtasks) {
+    if (ids.has(subtask.id)) issues.push(`duplicate subtask id: ${subtask.id}`);
+    ids.add(subtask.id);
+    if (!subtask.targetAgentId) issues.push(`subtask ${subtask.id} is missing targetAgentId`);
+    else if (!validWorkers.has(subtask.targetAgentId)) issues.push(`subtask ${subtask.id} targets unknown worker agent: ${subtask.targetAgentId}`);
+  }
+  if (issues.length > 0) throw new Error(`Invalid swarm decomposition: ${issues.join('; ')}. Valid worker ids: ${validWorkerIds.join(', ')}`);
+}
+
+function roleAgentConfig(base: AgentConfigFile, role: 'quality' | 'synthesizer'): AgentConfigFile {
+  const roleInstructions = role === 'quality'
+    ? 'Swarm quality role: assess worker outputs against the top-level objective and return structured assessments.'
+    : 'Swarm synthesizer role: synthesize one final answer from worker outputs and quality assessments.';
+  return {
+    ...base,
+    id: `${base.id}-${role}`,
+    name: `${base.name} ${role}`,
+    systemInstructions: [base.systemInstructions, roleInstructions].filter(Boolean).join('\n\n'),
+  };
+}
+
+function summarizeSwarmRun(result: SwarmRunResult, workerIds: string[], cli: ManualTestCliOptions, subtasks: SwarmSubtask[]): JsonValue {
+  return {
+    command: 'swarm-run',
+    sessionId: result.sessionId,
+    coordinatorRunId: result.coordinatorRunId,
+    status: result.status,
+    workerAgentIds: workerIds,
+    maxWorkers: cli.maxWorkers ?? null,
+    subtasks: subtasks as unknown as JsonValue,
+    defaultsUsed: {
+      qualityAgent: cli.qualityAgentPath ? 'explicit' : 'coordinator_with_quality_instructions',
+      synthesizerAgent: cli.synthesizerAgentPath ? 'explicit' : 'coordinator_with_synthesis_instructions',
+    },
+    subtaskResults: result.subtaskResults as unknown as JsonValue,
+    qualityRunId: result.qualityRunId ?? null,
+    synthesizerRunId: result.synthesizerRunId ?? null,
+    qualityAssessments: (result.qualityAssessments ?? []) as unknown as JsonValue,
+    output: result.output,
+    errorCode: result.errorCode ?? null,
+    errorMessage: result.errorMessage ?? null,
+    diagnostics: result.diagnostics ?? null,
+  } as JsonValue;
+}
+
+function printSwarmExecutionPlan(sessionId: string, coordinatorRunId: string, subtasks: SwarmSubtask[]): void {
+  console.log(formatSwarmExecutionPlan(sessionId, coordinatorRunId, subtasks));
+  console.log('');
+}
+
+export function formatSwarmExecutionPlan(sessionId: string, coordinatorRunId: string, subtasks: readonly SwarmSubtask[]): string {
+  return [
+    `orchestration: session=${sessionId} coordinator=${coordinatorRunId}`,
+    formatSwarmSubtasks(subtasks),
+  ].join('\n');
+}
+
+export function formatSwarmSubtasks(subtasks: readonly SwarmSubtask[]): string {
+  const lines = ['subtasks:'];
+  for (const [index, subtask] of subtasks.entries()) {
+    const target = subtask.targetAgentId ? ` -> ${subtask.targetAgentId}` : '';
+    lines.push(`  ${index + 1}. ${subtask.id}${target}: ${subtask.subObjective}`);
+  }
+  return lines.join('\n');
+}
+
+function printSwarmResult(result: SwarmRunResult, workerIds: string[], cli: ManualTestCliOptions): void {
+  console.log(`orchestration: session=${result.sessionId} coordinator=${result.coordinatorRunId}`);
+  console.log(`workers: ${workerIds.join(', ')} (max ${cli.maxWorkers ?? 'default'})`);
+  console.log(`runs: workers=${result.subtaskResults.map((subtask) => `${subtask.subtaskId}:${subtask.runId}:${subtask.status}`).join(', ') || '(none)'}`);
+  if (result.qualityRunId) console.log(`qualityRunId: ${result.qualityRunId}`);
+  if (result.synthesizerRunId) console.log(`synthesizerRunId: ${result.synthesizerRunId}`);
+  if (result.status === 'succeeded') {
+    console.log(renderPrettyString(typeof result.output === 'string' ? result.output : JSON.stringify(result.output, null, 2)));
+  } else {
+    console.error(`swarm-run failed: ${result.errorCode ?? 'UNKNOWN'} ${result.errorMessage ?? ''}`.trim());
+  }
+}
+
+function printSwarmDryRun(
+  cli: ManualTestCliOptions,
+  coordinatorConfig: Awaited<ReturnType<typeof loadAgentSdkConfig>>,
+  workerConfigs: Array<Awaited<ReturnType<typeof loadAgentSdkConfig>>>,
+  qualityConfig: Awaited<ReturnType<typeof loadAgentSdkConfig>>,
+  synthesizerConfig: Awaited<ReturnType<typeof loadAgentSdkConfig>>,
+): void {
+  const output = {
+    dryRun: true,
+    cli: summarizeCli(cli),
+    coordinator: summarizeSwarmAgentConfig(coordinatorConfig, 'coordinator', 'explicit'),
+    workers: workerConfigs.map((config) => summarizeSwarmAgentConfig(config, 'worker', 'explicit')),
+    quality: summarizeSwarmAgentConfig(qualityConfig, 'quality', cli.qualityAgentPath ? 'explicit' : 'derived'),
+    synthesizer: summarizeSwarmAgentConfig(synthesizerConfig, 'synthesizer', cli.synthesizerAgentPath ? 'explicit' : 'derived'),
+    defaultsUsed: {
+      qualityAgent: cli.qualityAgentPath ? 'explicit' : 'coordinator_with_quality_instructions',
+      synthesizerAgent: cli.synthesizerAgentPath ? 'explicit' : 'coordinator_with_synthesis_instructions',
+    },
+    maxWorkers: cli.maxWorkers ?? null,
+  } satisfies JsonValue;
+  if (cli.output === 'json') console.log(JSON.stringify(output, null, 2));
+  else if (cli.output === 'jsonl') console.log(JSON.stringify(output));
+  else {
+    console.log('# Swarm dry run');
+    printSwarmAgentConfigSummary('coordinator', coordinatorConfig, 'explicit');
+    for (const workerConfig of workerConfigs) {
+      printSwarmAgentConfigSummary('worker', workerConfig, 'explicit');
+    }
+    printSwarmAgentConfigSummary('quality', qualityConfig, cli.qualityAgentPath ? 'explicit' : 'derived');
+    printSwarmAgentConfigSummary('synthesizer', synthesizerConfig, cli.synthesizerAgentPath ? 'explicit' : 'derived');
+    console.log(`maxWorkers: ${cli.maxWorkers ?? 'default'}`);
+  }
+}
+
+function summarizeSwarmAgentConfig(
+  resolvedConfig: Awaited<ReturnType<typeof loadAgentSdkConfig>>,
+  role: 'coordinator' | 'worker' | 'quality' | 'synthesizer',
+  source: 'explicit' | 'derived',
+): JsonValue {
+  return {
+    role,
+    source,
+    agentId: resolvedConfig.agent.id,
+    agentName: resolvedConfig.agent.name,
+    description: resolvedConfig.agent.description ?? null,
+    provider: resolvedConfig.model.provider,
+    model: resolvedConfig.model.model,
+    runtimeMode: resolvedConfig.runtime.mode,
+    requestedRuntimeMode: resolvedConfig.runtime.requestedMode,
+    workspaceRoot: resolvedConfig.workspaceRoot,
+    shellCwd: resolvedConfig.shellCwd,
+    approvalMode: resolvedConfig.interaction.approvalMode,
+    clarificationMode: resolvedConfig.interaction.clarificationMode,
+    tools: resolvedConfig.agent.tools,
+    delegates: resolvedConfig.agent.delegates ?? [],
+  } satisfies JsonValue;
+}
+
+function printSwarmAgentConfigSummary(
+  label: string,
+  resolvedConfig: Awaited<ReturnType<typeof loadAgentSdkConfig>>,
+  source: 'explicit' | 'derived',
+): void {
+  console.log(`${label}: ${resolvedConfig.agent.id} (${resolvedConfig.agent.name}) [${source}]`);
+  console.log(`  model: ${resolvedConfig.model.provider}/${resolvedConfig.model.model}`);
+  console.log(`  runtime: ${resolvedConfig.runtime.mode} (requested ${resolvedConfig.runtime.requestedMode})`);
+  console.log(`  workspace: ${resolvedConfig.workspaceRoot}`);
+  console.log(`  shellCwd: ${resolvedConfig.shellCwd}`);
+  console.log(`  approval: ${resolvedConfig.interaction.approvalMode}`);
+  console.log(`  clarification: ${resolvedConfig.interaction.clarificationMode}`);
+  console.log(`  agentSearchDirs: ${formatNameList(resolvedConfig.agents.dirs)}`);
+  console.log(`  tools: ${formatNameList(resolvedConfig.agent.tools)}`);
+  console.log(`  delegates: ${formatNameList(resolvedConfig.agent.delegates ?? [])}`);
+}
+
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isJsonRecordLike(value: unknown): value is Record<string, JsonValue> {
+  return isRecordValue(value) && Object.values(value).every(isJsonValueLike);
+}
+
+function isJsonValueLike(value: unknown): value is JsonValue {
+  if (value === null) return true;
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return true;
+  if (Array.isArray(value)) return value.every(isJsonValueLike);
+  return isJsonRecordLike(value);
 }
 
 function summarizeOrchestration(result: OrchestratedRunResult): JsonValue {
@@ -2115,6 +2518,7 @@ function formatEvalDryRunMarkdown(
     `- \`approval\`: \`${config.interaction.approvalMode}\``,
     `- \`clarification\`: \`${config.interaction.clarificationMode}\``,
     `- \`shellCwd\`: \`${config.shellCwd}\``,
+    `- \`agentSearchDirs\`: ${formatNameList(config.agents.dirs)}`,
     `- \`skillSearchDirs\`: ${formatNameList(config.skills.dirs)}`,
     '',
     '## Tools',
@@ -2168,6 +2572,7 @@ function formatDryRunMarkdown(
     `- \`approval\`: \`${config.interaction.approvalMode}\``,
     `- \`clarification\`: \`${config.interaction.clarificationMode}\``,
     `- \`shellCwd\`: \`${config.shellCwd}\``,
+    `- \`agentSearchDirs\`: ${formatNameList(config.agents.dirs)}`,
     `- \`skillSearchDirs\`: ${formatNameList(config.skills.dirs)}`,
     '',
     '## Request',
@@ -2271,6 +2676,7 @@ function summarizeEvalResolvedConfig(
     shellCwd: resolvedConfig.shellCwd,
     approvalMode: resolvedConfig.interaction.approvalMode,
     clarificationMode: resolvedConfig.interaction.clarificationMode,
+    agentSearchDirs: resolvedConfig.agents.dirs,
     skillSearchDirs: resolvedConfig.skills.dirs,
   };
 }

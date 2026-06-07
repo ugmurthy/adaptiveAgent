@@ -1220,7 +1220,7 @@ describe('AdaptiveAgent', () => {
         toolCalls: [
           {
             id: 'delegate-call-1',
-            name: 'delegate.researccher',
+            name: 'delegate.researecher',
             input: {
               goal: 'Research typo recovery',
               input: { topic: 'delegation typo' },

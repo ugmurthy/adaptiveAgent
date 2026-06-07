@@ -231,14 +231,12 @@ export function summarizePerformance(rows: TraceRow[]): PerformanceSummary {
   const snapshotSaveDurationMs = createBucket();
   const snapshotPendingToolCallBytes = createBucket();
   const toolsByName = new Map<string, ToolPerformanceAccumulator>();
+  const toolCalls = new Map<string, ToolCallCountAccumulator>();
   const seenEvents = new Set<string>();
   let modelStarted = 0;
   let modelCompleted = 0;
   let modelFailed = 0;
   let modelRetries = 0;
-  let toolsStarted = 0;
-  let toolsCompleted = 0;
-  let toolsFailed = 0;
   let snapshotsCreated = 0;
   let measuredEvents = 0;
 
@@ -252,6 +250,7 @@ export function summarizePerformance(rows: TraceRow[]): PerformanceSummary {
       continue;
     }
     seenEvents.add(eventKey);
+    recordToolCall(row, eventKey);
 
     const performance = payloadPerformance(row.payload);
     if (!performance) {
@@ -285,19 +284,13 @@ export function summarizePerformance(rows: TraceRow[]): PerformanceSummary {
         addAdapterMetrics(performance);
         break;
       case 'tool.started':
-        toolsStarted += 1;
-        addToolCounts(row, 'started');
         addNumber(toolInputBytes, readNumber(performance, 'inputBytes'));
         addNumber(toolEventInputBytes, readNumber(performance, 'eventInputBytes'));
         break;
       case 'tool.completed':
-        toolsCompleted += 1;
-        addToolCounts(row, 'completed');
         addToolMetrics(row, performance);
         break;
       case 'tool.failed':
-        toolsFailed += 1;
-        addToolCounts(row, 'failed');
         addToolMetrics(row, performance);
         break;
       case 'snapshot.created':
@@ -310,6 +303,8 @@ export function summarizePerformance(rows: TraceRow[]): PerformanceSummary {
         break;
     }
   }
+
+  const toolCounts = finishToolCallCounts();
 
   return {
     events: {
@@ -337,9 +332,9 @@ export function summarizePerformance(rows: TraceRow[]): PerformanceSummary {
       adapterStatusCodes,
     },
     tools: {
-      started: toolsStarted,
-      completed: toolsCompleted,
-      failed: toolsFailed,
+      started: toolCounts.started,
+      completed: toolCounts.completed,
+      failed: toolCounts.failed,
       inputBytes: finishBucket(toolInputBytes),
       eventInputBytes: finishBucket(toolEventInputBytes),
       rawOutputBytes: finishBucket(toolRawOutputBytes),
@@ -399,13 +394,11 @@ export function summarizePerformance(rows: TraceRow[]): PerformanceSummary {
     addNumber(tool.modelOutputBytes, readNumber(performance, 'modelOutputBytes'));
   }
 
-  function addToolCounts(row: TraceRow, kind: 'started' | 'completed' | 'failed'): void {
-    const tool = toolAccumulator(row);
-    tool[kind] += 1;
+  function toolAccumulator(row: TraceRow): ToolPerformanceAccumulator {
+    return toolAccumulatorForName(traceToolName(row));
   }
 
-  function toolAccumulator(row: TraceRow): ToolPerformanceAccumulator {
-    const toolName = row.ledger_tool_name ?? row.event_tool_name ?? payloadString(row.payload, 'toolName') ?? 'unknown';
+  function toolAccumulatorForName(toolName: string): ToolPerformanceAccumulator {
     const existing = toolsByName.get(toolName);
     if (existing) {
       return existing;
@@ -421,6 +414,60 @@ export function summarizePerformance(rows: TraceRow[]): PerformanceSummary {
     };
     toolsByName.set(toolName, created);
     return created;
+  }
+
+  function recordToolCall(row: TraceRow, eventKey: string): void {
+    if (!row.event_type?.startsWith('tool.')) {
+      return;
+    }
+
+    const terminalStatus = normalizeToolTerminalStatus(row.tool_execution_status)
+      ?? normalizeToolEventTerminalStatus(row.event_type);
+    const key = row.tool_call_id
+      ? `call:${row.run_id}:${row.tool_call_id}`
+      : `event:${eventKey}`;
+    const existing = toolCalls.get(key);
+    const toolName = traceToolName(row);
+    const call = existing ?? {
+      toolName,
+      started: false,
+      terminalStatus: null,
+    };
+
+    if (call.toolName === 'unknown' && toolName !== 'unknown') {
+      call.toolName = toolName;
+    }
+    if (row.event_type === 'tool.started' || row.tool_started_at || row.tool_execution_status || terminalStatus) {
+      call.started = true;
+    }
+    if (terminalStatus) {
+      call.terminalStatus = terminalStatus;
+    }
+
+    toolCalls.set(key, call);
+  }
+
+  function finishToolCallCounts(): { started: number; completed: number; failed: number } {
+    let started = 0;
+    let completed = 0;
+    let failed = 0;
+
+    for (const call of toolCalls.values()) {
+      const tool = toolAccumulatorForName(call.toolName);
+      if (call.started) {
+        started += 1;
+        tool.started += 1;
+      }
+      if (call.terminalStatus === 'completed') {
+        completed += 1;
+        tool.completed += 1;
+      } else if (call.terminalStatus === 'failed') {
+        failed += 1;
+        tool.failed += 1;
+      }
+    }
+
+    return { started, completed, failed };
   }
 }
 
@@ -664,6 +711,12 @@ interface ToolPerformanceAccumulator {
   modelOutputBytes: PerformanceBucketAccumulator;
 }
 
+interface ToolCallCountAccumulator {
+  toolName: string;
+  started: boolean;
+  terminalStatus: 'completed' | 'failed' | null;
+}
+
 function createBucket(): PerformanceBucketAccumulator {
   return { count: 0, total: 0, max: 0 };
 }
@@ -709,6 +762,33 @@ function readNumber(record: Record<string, unknown>, key: string): number | unde
 function payloadString(payload: unknown, key: string): string | null {
   const value = payloadValue(payload, key);
   return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+function traceToolName(row: TraceRow): string {
+  return row.ledger_tool_name ?? row.event_tool_name ?? payloadString(row.payload, 'toolName') ?? 'unknown';
+}
+
+function normalizeToolTerminalStatus(status: string | null): 'completed' | 'failed' | null {
+  switch (status) {
+    case 'completed':
+    case 'succeeded':
+      return 'completed';
+    case 'failed':
+      return 'failed';
+    default:
+      return null;
+  }
+}
+
+function normalizeToolEventTerminalStatus(eventType: string | null): 'completed' | 'failed' | null {
+  switch (eventType) {
+    case 'tool.completed':
+      return 'completed';
+    case 'tool.failed':
+      return 'failed';
+    default:
+      return null;
+  }
 }
 
 function oneLine(value: string): string {

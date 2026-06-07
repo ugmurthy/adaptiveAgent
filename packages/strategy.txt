@@ -1,0 +1,22 @@
+Create an India market entry strategy for a premium electric two-wheeler startup launching in 2027.
+
+Produce a board-ready recommendation that covers:
+
+1. Target customer segments and priority cities.
+2. Competitive landscape across Ola Electric, Ather, TVS, Bajaj, Hero, and imported premium EV brands.
+3. Pricing and positioning strategy for a premium but practical scooter.
+4. Distribution model: direct-to-consumer, dealer network, online sales, service partners, and fleet partnerships.
+5. Battery, charging, warranty, and after-sales service implications.
+6. Regulatory and incentive risks, including FAME-style subsidies, state EV policies, localization requirements, and battery safety compliance.
+7. Go-to-market plan for the first 18 months.
+8. Key operating assumptions, risks, and leading indicators to track.
+9. A final “go / no-go / staged-entry” recommendation with rationale.
+
+Use a structured final answer with:
+- executive summary;
+- decomposition of major findings;
+- assumptions;
+- recommended launch sequence;
+- risks and mitigations;
+- 90-day next steps;
+- final board recommendation.

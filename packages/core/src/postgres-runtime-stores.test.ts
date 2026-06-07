@@ -256,6 +256,21 @@ describe('PostgresRunStore', () => {
     await expect(store.getRun('missing')).resolves.toBeNull();
   });
 
+  it('lists runs by session in deterministic order', async () => {
+    const sessionRows = [
+      { ...sampleRunRow, id: 'run-newer', created_at: '2026-04-13T10:02:00.000Z' },
+      { ...sampleRunRow, id: 'run-older', created_at: '2026-04-13T10:01:00.000Z' },
+    ];
+    const client = createMockClientWithRows(sessionRows);
+    const store = new PostgresRunStore(client);
+
+    const runs = await store.listBySession('session-1', { limit: 2, offset: 1 });
+
+    expect(runs.map((run) => run.id)).toEqual(['run-newer', 'run-older']);
+    expect(runs.every((run) => run.sessionId === 'session-1')).toBe(true);
+    expect(client.query).toHaveBeenCalledWith(POSTGRES_RUNTIME_RUN_QUERIES.listBySession, ['session-1', 2, 1]);
+  });
+
   it('updates a run with optimistic versioning', async () => {
     const client = createQueuedClient([[sampleRunRow], [completedRunRow]]);
     const store = new PostgresRunStore(client);

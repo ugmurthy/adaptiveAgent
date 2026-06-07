@@ -109,6 +109,18 @@ export class InMemoryRunStore implements RunStore {
     return run ? cloneRun(run) : null;
   }
 
+  async listBySession(sessionId: string, options: { limit?: number; offset?: number } = {}): Promise<AgentRun[]> {
+    const offset = Math.max(0, options.offset ?? 0);
+    const limit = options.limit === undefined ? undefined : Math.max(0, options.limit);
+    const runs = Array.from(this.runs.values())
+      .filter((run) => run.sessionId === sessionId)
+      .sort((left, right) => {
+        const createdComparison = right.createdAt.localeCompare(left.createdAt);
+        return createdComparison !== 0 ? createdComparison : right.id.localeCompare(left.id);
+      });
+    return runs.slice(offset, limit === undefined ? undefined : offset + limit).map(cloneRun);
+  }
+
   async updateRun(runId: UUID, patch: Partial<AgentRun>, expectedVersion?: number): Promise<AgentRun> {
     const current = this.runs.get(runId);
     if (!current) {

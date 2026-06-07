@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildTimeline, computeDelegateReason, parseArgs, renderDeleteEmptyGoalSessionsSql, renderSessionList, renderSessionPerformanceList, renderSessionlessRunList, renderTraceReport, renderUsageReport, summarizePerformance, summarizeTrace, traceSession } from './trace-session.js';
+import { buildTimeline, computeDelegateReason, listSessions, parseArgs, renderDeleteEmptyGoalSessionsSql, renderSessionList, renderSessionPerformanceList, renderSessionlessRunList, renderTraceReport, renderUsageReport, summarizePerformance, summarizeTrace, traceSession } from './trace-session.js';
 import type { TraceRow } from './trace-session.js';
 
 describe('trace-session CLI helpers', () => {
@@ -244,6 +244,57 @@ describe('trace-session CLI helpers', () => {
     ]);
   });
 
+  it('falls back to agent_runs.session_id when listing runs without gateway links', async () => {
+    const client = {
+      query: async <TRow extends Record<string, unknown>>(sql: string) => {
+        if (sql.includes('from gateway_sessions s')) {
+          return { rows: [] } as unknown as { rows: TRow[] };
+        }
+
+        if (sql.includes('from agent_runs r') && sql.includes('l.root_run_id is null')) {
+          return {
+            rows: [
+              {
+                session_id: 'swarm-session-1',
+                root_run_id: 'root-from-swarm',
+                started_at: '2026-04-16T11:00:00.000Z',
+                completed_at: '2026-04-16T11:00:05.000Z',
+                status: 'succeeded',
+                goal: 'CLI swarm run',
+              },
+              {
+                session_id: null,
+                root_run_id: 'root-without-session',
+                started_at: '2026-04-16T10:00:00.000Z',
+                completed_at: null,
+                status: 'running',
+                goal: 'Detached SDK run',
+              },
+            ],
+          } as unknown as { rows: TRow[] };
+        }
+
+        throw new Error(`Unexpected SQL in test:\n${sql}`);
+      },
+    };
+
+    const sessions = await listSessions(client as never);
+
+    expect(sessions).toEqual([
+      expect.objectContaining({
+        sessionId: 'swarm-session-1',
+        goals: [expect.objectContaining({ rootRunId: 'root-from-swarm' })],
+      }),
+      expect.objectContaining({
+        sessionId: null,
+        goals: [expect.objectContaining({ rootRunId: 'root-without-session' })],
+      }),
+    ]);
+
+    const deleteSessions = await listSessions(client as never, { recoverAgentRunSessionIds: false });
+    expect(deleteSessions[0]?.sessionId).toBeNull();
+  });
+
   it('renders listed session performance as one line per run', () => {
     const performance = summarizePerformance([
       traceRow({
@@ -289,6 +340,27 @@ describe('trace-session CLI helpers', () => {
     expect(output).toContain('other=200ms');
     expect(output).toContain('\n  goal=Summarize the incident timeline');
     expect(output.split('\n')).toHaveLength(2);
+  });
+
+  it('renders null session ids in listed session performance rows', () => {
+    const output = renderSessionPerformanceList(
+      [{
+        sessionId: null,
+        sessionStatus: 'succeeded',
+        rootRunId: 'root-sessionless',
+        runId: 'root-sessionless',
+        runStatus: 'succeeded',
+        startedAt: '2026-04-16T10:00:00.000Z',
+        completedAt: '2026-04-16T10:00:01.000Z',
+        totalDurationMs: 1000,
+        goal: 'Session id omitted by gateway and runtime',
+        performance: summarizePerformance([]),
+      }],
+      { json: false },
+    );
+
+    expect(output).toContain('session=null');
+    expect(output).toContain('run=root-sessionless');
   });
 
   it('parses the session-less list flag without a session id', () => {
@@ -366,17 +438,17 @@ describe('trace-session CLI helpers', () => {
         {
           sessionId: 'session-null',
           startedAt: now(),
-          goals: [{ rootRunId: 'root-null', goal: null, linkedAt: now() }],
+          goals: [{ rootRunId: 'root-null', runId: 'root-null', status: 'succeeded', startedAt: now(), completedAt: now(), goal: null, linkedAt: now() }],
         },
         {
           sessionId: 'session-blank',
           startedAt: now(),
-          goals: [{ rootRunId: 'root-blank', goal: '   ', linkedAt: now() }],
+          goals: [{ rootRunId: 'root-blank', runId: 'root-blank', status: 'succeeded', startedAt: now(), completedAt: now(), goal: '   ', linkedAt: now() }],
         },
         {
           sessionId: 'session-keep',
           startedAt: now(),
-          goals: [{ rootRunId: 'root-keep', goal: 'Keep me', linkedAt: now() }],
+          goals: [{ rootRunId: 'root-keep', runId: 'root-keep', status: 'succeeded', startedAt: now(), completedAt: now(), goal: 'Keep me', linkedAt: now() }],
         },
       ],
       { json: false },
@@ -1086,6 +1158,96 @@ describe('trace-session CLI helpers', () => {
     expect(output).toContain('other=483ms');
   });
 
+  it('counts tool calls by durable execution status instead of terminal lifecycle events', () => {
+    const performance = summarizePerformance([
+      traceRow({
+        event_id: 'tool-start-1',
+        event_seq: 1,
+        event_type: 'tool.started',
+        tool_call_id: 'call-1',
+        event_tool_name: 'web_search',
+        ledger_tool_name: 'web_search',
+        tool_execution_status: 'completed',
+        tool_started_at: '2026-04-16T10:00:00.000Z',
+        payload: { toolName: 'web_search' },
+      }),
+      traceRow({
+        event_id: 'tool-failed-1',
+        event_seq: 2,
+        event_type: 'tool.failed',
+        tool_call_id: 'call-1',
+        event_tool_name: 'web_search',
+        ledger_tool_name: 'web_search',
+        tool_execution_status: 'completed',
+        tool_started_at: '2026-04-16T10:00:00.000Z',
+        tool_completed_at: '2026-04-16T10:00:01.000Z',
+        payload: {
+          toolName: 'web_search',
+          performance: {
+            durationMs: 1000,
+            rawOutputBytes: 128,
+            modelOutputBytes: 64,
+          },
+        },
+      }),
+      traceRow({
+        event_id: 'tool-completed-1',
+        event_seq: 3,
+        event_type: 'tool.completed',
+        tool_call_id: 'call-1',
+        event_tool_name: 'web_search',
+        ledger_tool_name: 'web_search',
+        tool_execution_status: 'completed',
+        tool_started_at: '2026-04-16T10:00:00.000Z',
+        tool_completed_at: '2026-04-16T10:00:01.000Z',
+        payload: {
+          toolName: 'web_search',
+          performance: {
+            durationMs: 1000,
+            rawOutputBytes: 128,
+            modelOutputBytes: 64,
+          },
+        },
+      }),
+      traceRow({
+        event_id: 'tool-failed-2',
+        event_seq: 4,
+        event_type: 'tool.failed',
+        tool_call_id: 'call-2',
+        event_tool_name: 'read_web_page',
+        ledger_tool_name: 'read_web_page',
+        tool_execution_status: 'failed',
+        tool_started_at: '2026-04-16T10:00:02.000Z',
+        tool_completed_at: '2026-04-16T10:00:03.000Z',
+        payload: { toolName: 'read_web_page', performance: { durationMs: 1000 } },
+      }),
+      traceRow({
+        event_id: 'tool-completed-3',
+        event_seq: 5,
+        event_type: 'tool.completed',
+        tool_call_id: 'call-3',
+        event_tool_name: 'write_file',
+        ledger_tool_name: 'write_file',
+        tool_execution_status: 'completed',
+        tool_started_at: '2026-04-16T10:00:04.000Z',
+        tool_completed_at: '2026-04-16T10:00:05.000Z',
+        payload: { toolName: 'write_file', performance: { durationMs: 1000 } },
+      }),
+    ]);
+
+    expect(performance.tools).toMatchObject({
+      started: 3,
+      completed: 2,
+      failed: 1,
+    });
+    expect(performance.tools.byTool.find((tool) => tool.toolName === 'web_search')).toMatchObject({
+      started: 1,
+      completed: 1,
+      failed: 0,
+    });
+    expect(performance.tools.durationMs.count).toBe(4);
+  });
+
   it('renders the effective LLM message context and classifies system messages', () => {
     const output = renderTraceReport(
       {
@@ -1674,6 +1836,147 @@ describe('trace-session CLI helpers', () => {
       status: 'succeeded',
       reason: 'succeeded because all linked root runs completed successfully',
     });
+  });
+
+  it('traces agent_runs.session_id roots when the gateway session row is missing', async () => {
+    const client = {
+      query: async <TRow extends Record<string, unknown>>(sql: string, params?: unknown[]) => {
+        if (sql.includes('from gateway_sessions') && sql.includes('where id = $1')) {
+          expect(params).toEqual(['swarm-session-1']);
+          return { rows: [] } as unknown as { rows: TRow[] };
+        }
+
+        if (sql.includes('select to_regclass')) {
+          return { rows: [{ exists: false }] } as unknown as { rows: TRow[] };
+        }
+
+        if (sql.includes('from information_schema.columns')) {
+          return { rows: [{ count: '3' }] } as unknown as { rows: TRow[] };
+        }
+
+        if (sql.includes('select l.root_run_id') && sql.includes('from gateway_session_run_links l')) {
+          expect(params).toEqual(['swarm-session-1']);
+          return { rows: [] } as unknown as { rows: TRow[] };
+        }
+
+        if (sql.includes('from agent_runs r') && sql.includes('r.session_id = $1')) {
+          expect(params).toEqual(['swarm-session-1']);
+          expect(sql).toContain('min(r.id::text)');
+          expect(sql).not.toContain('min(r.id) asc');
+          return {
+            rows: [
+              { root_run_id: 'root-swarm-a' },
+              { root_run_id: 'root-swarm-b' },
+            ],
+          } as unknown as { rows: TRow[] };
+        }
+
+        if (sql.includes('with requested_roots as')) {
+          expect(params).toEqual(['swarm-session-1', ['root-swarm-a', 'root-swarm-b']]);
+          return {
+            rows: [
+              {
+                root_run_id: 'root-swarm-a',
+                run_id: 'root-swarm-a',
+                invocation_kind: 'run',
+                turn_index: null,
+                linked_at: '2026-04-16T10:00:00.000Z',
+                started_at: '2026-04-16T10:00:00.000Z',
+                updated_at: '2026-04-16T10:00:02.000Z',
+                completed_at: '2026-04-16T10:00:02.000Z',
+                status: 'succeeded',
+                goal: 'Swarm branch A',
+                result: 'A done',
+              },
+              {
+                root_run_id: 'root-swarm-b',
+                run_id: 'root-swarm-b',
+                invocation_kind: 'run',
+                turn_index: null,
+                linked_at: '2026-04-16T10:00:01.000Z',
+                started_at: '2026-04-16T10:00:01.000Z',
+                updated_at: '2026-04-16T10:00:04.000Z',
+                completed_at: '2026-04-16T10:00:04.000Z',
+                status: 'succeeded',
+                goal: 'Swarm branch B',
+                result: 'B done',
+              },
+            ],
+          } as unknown as { rows: TRow[] };
+        }
+
+        if (sql.includes('coalesce(sum(r.total_prompt_tokens)')) {
+          expect(params).toEqual([['root-swarm-a', 'root-swarm-b']]);
+          return {
+            rows: [
+              {
+                root_run_id: 'root-swarm-a',
+                total_prompt_tokens: '10',
+                total_completion_tokens: '5',
+                total_reasoning_tokens: '0',
+                estimated_cost_usd: '0.001',
+              },
+              {
+                root_run_id: 'root-swarm-b',
+                total_prompt_tokens: '20',
+                total_completion_tokens: '5',
+                total_reasoning_tokens: '0',
+                estimated_cost_usd: '0.002',
+              },
+            ],
+          } as unknown as { rows: TRow[] };
+        }
+
+        if (sql.includes('left join agent_events e on e.run_id = rt.run_id')) {
+          expect(params).toEqual([['root-swarm-a', 'root-swarm-b'], 'swarm-session-1']);
+          return { rows: [] } as unknown as { rows: TRow[] };
+        }
+
+        if (sql.includes('latest_snapshot.snapshot_seq as latest_snapshot_seq') && sql.includes('from run_snapshots rs')) {
+          expect(params).toEqual([['root-swarm-a', 'root-swarm-b']]);
+          return { rows: [] } as unknown as { rows: TRow[] };
+        }
+
+        if (sql.includes('with recursive root_runs as') && sql.includes('from unnest($1::text[]) as roots(root_run_id)')) {
+          expect(params).toEqual([['root-swarm-a', 'root-swarm-b']]);
+          return { rows: [] } as unknown as { rows: TRow[] };
+        }
+
+        throw new Error(`Unexpected SQL in test:\n${sql}`);
+      },
+    };
+
+    const report = await traceSession(client as never, {
+      sessionId: 'swarm-session-1',
+      json: false,
+      listSessions: false,
+      listPerformance: false,
+      listSessionless: false,
+      deleteEmptyGoalSessions: false,
+      usageOnly: false,
+      includePlans: false,
+      onlyDelegates: false,
+      messages: false,
+      systemOnly: false,
+      help: false,
+    });
+
+    expect(report.session).toBeNull();
+    expect(report.rootRuns.map((run) => run.rootRunId)).toEqual(['root-swarm-a', 'root-swarm-b']);
+    expect(report.warnings).toEqual([
+      'Gateway session "swarm-session-1" was not found; tracing matching agent_runs rows instead.',
+    ]);
+
+    const output = renderTraceReport(report, {
+      json: false,
+      includePlans: false,
+      onlyDelegates: false,
+      messages: false,
+      systemOnly: false,
+    });
+    expect(output).toContain('swarm-session-1');
+    expect(output).toContain('(agent_runs.session_id)');
+    expect(output).not.toContain('session not found');
   });
 });
 

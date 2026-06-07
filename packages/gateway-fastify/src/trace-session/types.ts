@@ -87,6 +87,7 @@ export interface SessionListItem {
 }
 
 export interface SessionlessRunListItem {
+  sessionId?: string | null;
   rootRunId: string;
   startedAt: string;
   completedAt?: string | null;
@@ -95,7 +96,7 @@ export interface SessionlessRunListItem {
 }
 
 export interface SessionPerformanceListItem {
-  sessionId: string;
+  sessionId: string | null;
   sessionStatus?: string;
   rootRunId: string;
   runId: string;

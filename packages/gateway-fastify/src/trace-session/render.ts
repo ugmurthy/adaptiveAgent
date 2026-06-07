@@ -204,7 +204,7 @@ export function renderSessionlessRunList(runs: SessionlessRunListItem[], options
 }
 
 export function renderDeleteEmptyGoalSessionsSql(sessions: SessionListItem[], options: Pick<CliOptions, 'json'>): string {
-  const deletableSessions = sessions.filter((session) => session.goals.length === 0 || session.goals.every((goal) => normalizeGoal(goal.goal) === null));
+  const deletableSessions = sessions.filter(isDeletableGatewaySession);
 
   if (options.json) {
     return JSON.stringify({
@@ -225,6 +225,11 @@ export function renderDeleteEmptyGoalSessionsSql(sessions: SessionListItem[], op
     'commit;',
   ];
   return lines.join('\n');
+}
+
+function isDeletableGatewaySession(session: SessionListItem): session is SessionListItem & { sessionId: string } {
+  return session.sessionId !== null
+    && (session.goals.length === 0 || session.goals.every((goal) => normalizeGoal(goal.goal) === null));
 }
 
 export function renderUsageReport(usage: SessionUsageSummary, options: Pick<CliOptions, 'json'>): string {
@@ -263,7 +268,13 @@ function renderTraceSummary(report: TraceReport): string {
   lines.push(`${chalk.cyan('reason')} ${report.summary.reason}`);
   if (report.target.kind === 'session') {
     if (!session) {
-      lines.push(`${chalk.magenta('session')} ${chalk.red('not found')}`);
+      if (report.rootRuns.length > 0) {
+        lines.push(`${chalk.magenta('session')} ${report.target.requestedId} ${chalk.gray('(agent_runs.session_id)')}`);
+        lines.push(renderModelSummary(report.rootRuns));
+        lines.push(`${chalk.cyan('session duration')} ${formatDuration(sessionRunDurationMs(report.rootRuns))}`);
+      } else {
+        lines.push(`${chalk.magenta('session')} ${chalk.red('not found')}`);
+      }
     } else {
       lines.push(`${chalk.magenta('session')} ${session.sessionId}`);
       lines.push(`${chalk.cyan('agent')} ${session.agentId ?? 'unknown'}  ${chalk.cyan('channel')} ${session.channelId ?? 'unknown'}`);
@@ -387,7 +398,7 @@ function renderPerformance(performance: PerformanceSummary, totalDurationMs: num
   lines.push('');
   lines.push(markdownBlock('## Tools'));
   lines.push(renderMetricTable([
-    ['calls', `started=${formatNumber(performance.tools.started)} completed=${formatNumber(performance.tools.completed)} failed=${formatNumber(performance.tools.failed)}`, 'Tool lifecycle counts.'],
+    ['calls', `started=${formatNumber(performance.tools.started)} completed=${formatNumber(performance.tools.completed)} failed=${formatNumber(performance.tools.failed)}`, 'Tool execution call counts.'],
     ['duration', formatBucketDuration(performance.tools.durationMs), 'Host tool execution time.'],
     ['child duration', formatBucketDuration(performance.tools.childRunDurationMs), 'Synthetic delegate child-run wall time; not added to the duration split to avoid double counting child spans.'],
     ['input bytes', formatBucketBytes(performance.tools.inputBytes), 'Raw tool input size.'],

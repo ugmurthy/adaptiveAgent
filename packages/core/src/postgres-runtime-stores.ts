@@ -237,6 +237,12 @@ export const POSTGRES_RUNTIME_RUN_QUERIES = {
     RETURNING *
   `,
   get: `SELECT * FROM agent_runs WHERE id = $1`,
+  listBySession: `
+    SELECT * FROM agent_runs
+    WHERE session_id = $1
+    ORDER BY created_at DESC, id DESC
+    LIMIT $2 OFFSET $3
+  `,
   update: `
     UPDATE agent_runs SET
       current_child_run_id = $2,
@@ -581,6 +587,17 @@ export class PostgresRunStore implements RunStore {
   async getRun(runId: UUID): Promise<AgentRun | null> {
     const result = await this.client.query<AgentRunRow>(POSTGRES_RUNTIME_RUN_QUERIES.get, [runId]);
     return result.rows[0] ? runRowToRecord(result.rows[0]) : null;
+  }
+
+  async listBySession(sessionId: string, options: { limit?: number; offset?: number } = {}): Promise<AgentRun[]> {
+    const limit = Math.max(0, options.limit ?? 100);
+    const offset = Math.max(0, options.offset ?? 0);
+    const result = await this.client.query<AgentRunRow>(POSTGRES_RUNTIME_RUN_QUERIES.listBySession, [
+      sessionId,
+      limit,
+      offset,
+    ]);
+    return result.rows.map(runRowToRecord);
   }
 
   async updateRun(runId: UUID, patch: Partial<AgentRun>, expectedVersion?: number): Promise<AgentRun> {

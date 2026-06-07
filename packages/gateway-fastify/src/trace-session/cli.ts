@@ -184,7 +184,9 @@ export async function main(): Promise<void> {
         return;
       }
 
-      const sessions = await runListSessionsWithPasswordRetry(storeConfig);
+      const sessions = await runListSessionsWithPasswordRetry(storeConfig, {
+        recoverAgentRunSessionIds: !options.deleteEmptyGoalSessions,
+      });
       console.log(options.deleteEmptyGoalSessions ? renderDeleteEmptyGoalSessionsSql(sessions, options) : renderSessionList(sessions, options));
       return;
     }
@@ -233,12 +235,15 @@ async function runTraceSessionWithPasswordRetry(
   }
 }
 
-async function runListSessionsWithPasswordRetry(config: Extract<GatewayStoreConfig, { kind: 'postgres' }>): Promise<SessionListItem[]> {
+async function runListSessionsWithPasswordRetry(
+  config: Extract<GatewayStoreConfig, { kind: 'postgres' }>,
+  options: { recoverAgentRunSessionIds?: boolean } = {},
+): Promise<SessionListItem[]> {
   let pool = await createTraceSessionPostgresPool(config);
   let shouldEndPool = true;
 
   try {
-    return await listSessions(pool);
+    return await listSessions(pool, options);
   } catch (error) {
     if (!isPostgresPasswordAuthFailure(error)) {
       throw error;
@@ -249,7 +254,7 @@ async function runListSessionsWithPasswordRetry(config: Extract<GatewayStoreConf
     const password = await promptHidden('Postgres password: ');
     pool = createGatewayPostgresPool(config, { password });
     try {
-      return await listSessions(pool);
+      return await listSessions(pool, options);
     } finally {
       await pool.end();
     }

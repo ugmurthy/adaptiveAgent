@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -27,7 +27,29 @@ describe('agent-sdk config resolution', () => {
     expect(config.workspaceRoot).toBe(tempDir);
     expect(config.shellCwd).toBe(tempDir);
     expect(config.interaction.approvalMode).toBe('auto');
+    expect(config.agents.dirs).toEqual([join(tempDir, 'agents'), join(process.env.HOME ?? '', '.adaptiveAgent', 'agents')]);
     expect(config.skills.dirs).toEqual([join(tempDir, 'skills'), join(process.env.HOME ?? '', '.adaptiveAgent', 'skills')]);
+  });
+
+  it('resolves an agent filename from settings agents dirs', async () => {
+    await mkdir(join(tempDir, 'catalog'));
+    await writeAgentConfig(join(tempDir, 'catalog', 'researcher.json'), 'researcher');
+    await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({ agents: { dirs: ['./catalog'] } }));
+
+    const config = await loadAgentSdkConfig({ cwd: tempDir, agentConfigPath: 'researcher', env: {} });
+
+    expect(config.agent.id).toBe('researcher');
+    expect(config.agents.dirs).toEqual([join(tempDir, 'catalog')]);
+  });
+
+  it('rejects ambiguous agent filenames from settings agents dirs', async () => {
+    await mkdir(join(tempDir, 'catalog-a'));
+    await mkdir(join(tempDir, 'catalog-b'));
+    await writeAgentConfig(join(tempDir, 'catalog-a', 'worker.json'), 'worker-a');
+    await writeAgentConfig(join(tempDir, 'catalog-b', 'worker.json'), 'worker-b');
+    await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({ agents: { dirs: ['./catalog-a', './catalog-b'] } }));
+
+    await expect(loadAgentSdkConfig({ cwd: tempDir, agentConfigPath: 'worker', env: {} })).rejects.toThrow('Ambiguous agent config "worker"');
   });
 
   it('uses settings provider/model only as fallbacks', async () => {
@@ -72,12 +94,12 @@ describe('agent-sdk config resolution', () => {
   });
 });
 
-async function writeAgentConfig(path: string): Promise<void> {
+async function writeAgentConfig(path: string, id = 'agent'): Promise<void> {
   await writeFile(
     path,
     JSON.stringify({
-      id: 'agent',
-      name: 'Agent',
+      id,
+      name: id,
       invocationModes: ['chat', 'run'],
       defaultInvocationMode: 'chat',
       model: { provider: 'ollama', model: 'qwen3.5' },

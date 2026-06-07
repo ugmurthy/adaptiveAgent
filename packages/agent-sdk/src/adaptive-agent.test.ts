@@ -12,6 +12,8 @@ import {
   loadManualTestSpec,
   main,
   parseCliArgs,
+  formatSwarmExecutionPlan,
+  formatSwarmSubtasks,
   renderStyledPrettyMessage,
   renderPrettyString,
   summarizeGaiaDryRunTasks,
@@ -154,6 +156,7 @@ describe('adaptive-agent cli parsing', () => {
       fileAttachmentPaths: [],
       orchestrate: false,
       agentCatalogPaths: [],
+      workerCatalogPaths: [],
       evalResume: false,
       evalFailFast: false,
       evalSwarm: 1,
@@ -273,6 +276,42 @@ describe('adaptive-agent cli parsing', () => {
       evalInputPath: './gaia.jsonl',
       dryRun: true,
     });
+  });
+
+  it('parses swarm-run flags without overloading eval --swarm', () => {
+    const parsed = parseCliArgs([
+      'swarm-run',
+      '--agent', './coordinator.json',
+      '--worker-catalog', './market.json,./pricing.json',
+      '--quality-agent', './quality.json',
+      '--synthesizer-agent', './synth.json',
+      '--max-workers', '3',
+      '--session-id', 'session-1',
+      'build',
+      'strategy',
+    ]);
+
+    expect(parsed).toMatchObject({
+      command: 'swarm-run',
+      agentConfigPath: './coordinator.json',
+      workerCatalogPaths: ['./market.json', './pricing.json'],
+      qualityAgentPath: './quality.json',
+      synthesizerAgentPath: './synth.json',
+      maxWorkers: 3,
+      sessionId: 'session-1',
+      goalArgs: ['build', 'strategy'],
+    });
+  });
+
+  it('rejects swarm-run without an explicit worker catalog or with ambiguous task input', () => {
+    expect(() => parseCliArgs(['swarm-run', '--agent', './coordinator.json', 'task'])).toThrow('requires --worker-catalog');
+    expect(() => parseCliArgs([
+      'swarm-run',
+      '--agent', './coordinator.json',
+      '--worker-catalog', './worker.json',
+      '--file', './task.txt',
+      'task',
+    ])).toThrow('not both');
   });
 
   it('rejects --swarm outside eval', () => {
@@ -505,6 +544,33 @@ async function writeAgentConfig(path: string): Promise<void> {
 }
 
 describe('adaptive-agent pretty rendering', () => {
+  it('formats decomposed swarm subtasks for CLI output', () => {
+    const rendered = formatSwarmSubtasks([
+      { id: 'subtask-1', subObjective: 'Research the market.', targetAgentId: 'market' },
+      { id: 'subtask-2', subObjective: 'Draft the pricing model.', targetAgentId: 'pricing' },
+    ]);
+
+    expect(rendered).toBe([
+      'subtasks:',
+      '  1. subtask-1 -> market: Research the market.',
+      '  2. subtask-2 -> pricing: Draft the pricing model.',
+    ].join('\n'));
+  });
+
+  it('formats the swarm execution plan with session, coordinator, and subtasks', () => {
+    const rendered = formatSwarmExecutionPlan('session-1', 'coordinator-run-1', [
+      { id: 'subtask-1', subObjective: 'Research the market.', targetAgentId: 'market' },
+      { id: 'subtask-2', subObjective: 'Draft the pricing model.', targetAgentId: 'pricing' },
+    ]);
+
+    expect(rendered).toBe([
+      'orchestration: session=session-1 coordinator=coordinator-run-1',
+      'subtasks:',
+      '  1. subtask-1 -> market: Research the market.',
+      '  2. subtask-2 -> pricing: Draft the pricing model.',
+    ].join('\n'));
+  });
+
   it('renders markdown strings for pretty output', () => {
     const rendered = renderPrettyString('# Heading\n\n- one\n- two');
     expect(rendered).toContain('Heading');

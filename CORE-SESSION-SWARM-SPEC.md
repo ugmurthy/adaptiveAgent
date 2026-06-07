@@ -2,13 +2,18 @@
 
 ## Purpose
 
-Extend `@adaptive-agent/core` so a complex natural-language objective can be decomposed into independent subtasks, executed as a bounded swarm of agents under one persisted `sessionId`, quality-checked, and synthesized into one final result.
+Extend the Adaptive Agent runtime so a complex natural-language objective can be decomposed into independent subtasks, executed as a bounded swarm of agents under one persisted `sessionId`, quality-checked, and synthesized into one final result.
+
+The intended product boundary is now split:
+
+- `@adaptive-agent/core` owns durable run/session semantics, strict subtask validation, bounded worker execution, quality/synthesis run linkage, and persistence of orchestration metadata.
+- `@adaptive-agent/agent-sdk` owns CLI-facing decomposition setup: loading existing agent JSON specs, building the coordinator prompt/catalog, invoking decomposition, and passing validated execution inputs into core.
 
 This spec captures the agreed implementation direction:
 
 - Add first-class persisted `sessionId` support to core runs.
 - Use the coordinator/top-level run id as the orchestration grouping id; do not introduce a separate `swarmId`.
-- Keep the decomposer logic inside the coordinator flow.
+- Treat the currently implemented core `SwarmCoordinator` as a Phase 3 text-only prototype; future CLI decomposition should move to Agent SDK while core remains the strict executor/validator.
 - Preserve existing child-run delegation semantics for delegates-as-tools.
 - Do not introduce multi-child parent runs.
 - Represent swarm workers as independent session-linked runs, not simultaneous children of the coordinator.
@@ -28,7 +33,7 @@ The implementation should therefore add durable session correlation to core and 
 
 - `sessionId`: Durable core-level correlation key shared by all runs for one high-level task or conversation.
 - `coordinatorRunId`: The run id of the top-level coordinator run for a swarm execution. This replaces any separate `swarmId` concept.
-- `coordinator`: The top-level orchestration role. It owns decomposition, worker launch coordination, quality-check invocation, and synthesis invocation.
+- `coordinator`: The top-level orchestration role/run for one swarm execution. In the Phase 3 prototype it also performs decomposition; in the target Agent SDK CLI flow the SDK uses a coordinator agent for decomposition and then hands validated subtasks to core for execution.
 - `subtask`: One decomposed independent natural-language task derived from the top-level objective.
 - `worker run`: An independent root run that executes one subtask under the same `sessionId` and with `coordinatorRunId` in orchestration metadata.
 - `quality run`: A run that assesses worker outputs against the top-level objective and subtask objectives.
@@ -42,8 +47,10 @@ The implementation should therefore add durable session correlation to core and 
 3. Child runs remain the mechanism for delegate-as-tool execution.
 4. Swarm worker runs are independent root runs linked by `sessionId` and orchestration metadata.
 5. No multi-child parent model is introduced.
-6. Agent definitions remain the source of truth for allowed tools; swarm task interfaces should not duplicate `allowedTools`.
-7. Nomenclature must distinguish top-level objectives from subtask objectives.
+6. Agent definitions remain the source of truth for model, instructions, delegates, and allowed tools; swarm task interfaces should not duplicate `allowedTools`.
+7. Agent SDK should reuse the existing agent JSON structure for coordinator, worker, quality, and synthesizer profiles; do not introduce a new catalog JSON format for the initial CLI.
+8. Nomenclature must distinguish top-level objectives from subtask objectives.
+9. Core must not trust model output: `targetAgentId`, subtask ids, attachment refs, and orchestration metadata must be validated before worker launch.
 
 ## Core Data Model Changes
 
@@ -196,7 +203,26 @@ No separate `swarmId` is introduced. The pair of `sessionId` and `coordinatorRun
 
 ## Swarm API Shape
 
-The initial orchestration API should be implemented as a helper/coordinator layer rather than deeply changing `AdaptiveAgent` execution internals.
+The Phase 3 implementation introduced a text-only core `SwarmCoordinator` prototype that performs decomposition and execution in one helper. The target post-Phase-3 shape should split this into:
+
+- an Agent SDK decomposition runner that loads existing agent JSON specs, builds the worker catalog prompt, and asks the coordinator agent for structured subtasks;
+- a core strict execution path that validates already-decomposed subtasks and launches worker, quality, and synthesis runs.
+
+The core execution request should be able to accept SDK-produced subtasks directly:
+
+```ts
+export interface SwarmExecutionRequest {
+  sessionId?: string;
+  topLevelObjective: string;
+  subtasks: SwarmSubtask[];
+  input?: JsonValue;
+  contentParts?: ModelContentPart[];
+  maxWorkers?: number;
+  metadata?: Record<string, JsonValue>;
+}
+```
+
+The existing `SwarmRequest` remains useful for the Phase 3 prototype and for programmatic callers that want core to run a coordinator agent, but SDK CLI decomposition should prefer producing `SwarmExecutionRequest`.
 
 ```ts
 export interface SwarmRequest {
@@ -258,6 +284,17 @@ export interface SwarmRunResult {
 ```
 
 `targetAgentId` identifies which configured agent should run a subtask. The target agent's definition remains responsible for its model, instructions, and allowed tools.
+
+Strict core validation must reject invalid decompositions before worker launch:
+
+- `SwarmSubtask.id` must be present, non-empty, and unique.
+- `SwarmSubtask.subObjective` must be present and non-empty.
+- `targetAgentId` must be present unless a core executor default worker is explicitly configured.
+- `targetAgentId`, when present, must exactly match a configured worker id.
+- Unknown `targetAgentId` values are `INVALID_DECOMPOSITION`, not worker runtime failures.
+- Core must not silently remap unknown ids to a default worker.
+
+The SDK should reduce invalid decompositions by giving the coordinator an exact worker catalog and a decomposition schema whose `targetAgentId` enum is built from the loaded worker agent spec ids. Core must still validate after decomposition because model/provider schema adherence is not guaranteed.
 
 `contentParts` carries the top-level multimodal input for the swarm request. It should use the same `ModelContentPart` shape as `RunRequest.contentParts`, including text, image, file, and audio parts. Decomposition output should not duplicate raw files or inline blobs into every subtask; it should refer to coordinator-owned attachments by id.
 
@@ -405,26 +442,44 @@ interface SwarmAttachmentRef {
 
 Do not require partial attachment selectors in the first implementation unless needed by a concrete tool or provider adapter. The first version should keep `attachmentRefs: string[]` and route complete selected attachments.
 
-## Coordinator Flow
+## Coordinator and Executor Flow
 
-The coordinator owns decomposition. There is no separate decomposer run in the initial design.
+The Phase 3 prototype lets a core `SwarmCoordinator` own decomposition. The target CLI architecture after Phase 3 should move decomposition setup to Agent SDK and keep core responsible for strict execution.
 
-1. Accept `SwarmRequest`.
+### Agent SDK decomposition flow
+
+1. Accept CLI input from positional text or `--file <path>`.
+2. Load the coordinator agent from `--agent <agent-spec-path-or-id>` using the existing Agent SDK agent JSON structure.
+3. Load each worker from `--worker-catalog <agent-spec-path-or-id,...>` using the same existing agent JSON structure.
+4. Resolve worker ids from each worker spec's `id` field. These ids are the only valid `targetAgentId` values.
+5. Load `--quality-agent` and `--synthesizer-agent` if supplied; otherwise use the SDK default agent spec with role-specific quality/synthesis instructions.
+6. Build a coordinator-visible catalog summary containing only safe fields such as worker `id`, `name`, and non-secret role/instruction summaries. Do not expose API keys or raw private config to the coordinator prompt.
+7. Ask the coordinator agent to produce `SwarmSubtask[]`, with a schema whose `targetAgentId` enum is exactly the loaded worker ids.
+8. Validate the decomposition in SDK for friendly CLI errors, then pass it to the core strict executor.
+
+### Core strict execution flow
+
+1. Accept `SwarmExecutionRequest` or an equivalent internal execution request containing already-decomposed `SwarmSubtask[]`.
 2. Generate or reuse `sessionId`.
-3. Build an attachment inventory from `SwarmRequest.contentParts`, if present.
-4. Create a coordinator run with:
+3. Create a coordinator/orchestration run with:
    - `sessionId`
    - `goal` or equivalent set to `topLevelObjective`
    - `metadata.orchestration.role = 'coordinator'`
-5. Inside the coordinator flow, produce a structured list of `SwarmSubtask` records, including `attachmentRefs` when a subtask needs selected files or other modalities.
-6. Validate each subtask's `attachmentRefs` against the attachment inventory.
-7. Launch worker runs for subtasks using bounded concurrency, passing only the selected `contentParts` to each worker.
-8. Collect `SwarmSubtaskResult` records, including failures.
+4. Build an attachment inventory from request `contentParts`, if present.
+5. Validate the full decomposition before worker launch:
+   - unique non-empty subtask ids;
+   - non-empty `subObjective`;
+   - known `targetAgentId` values;
+   - valid `attachmentRefs` against the attachment inventory;
+   - selected target worker can consume or materialize the requested modalities.
+6. If validation fails, persist a failed coordinator result with `errorCode = 'INVALID_DECOMPOSITION'` and do not launch workers, quality, or synthesis.
+7. Launch worker runs for subtasks using bounded concurrency, passing only selected `contentParts` to each worker.
+8. Collect `SwarmSubtaskResult` records, including real worker runtime failures.
 9. Run the quality agent against the top-level objective, subtasks, attachment refs, and worker results.
 10. Run the synthesizer agent against the top-level objective, worker results, attachment refs, and quality assessments.
 11. Persist the final coordinator result and return `SwarmRunResult`.
 
-The coordinator may use model instructions, schemas, or existing tools to perform decomposition, but the decomposition remains part of the coordinator's responsibility.
+The current core `SwarmCoordinator` can remain as a programmatic convenience, but CLI-facing decomposition should be implemented in Agent SDK so it can reuse existing agent spec loading and default agent resolution.
 
 ## Worker Run Semantics
 
@@ -468,6 +523,8 @@ await workerAgent.run({
 ## Quality and Synthesis Semantics
 
 The quality run and synthesizer run are also independent root runs under the same `sessionId`.
+
+Quality and synthesis phases remain required in the initial swarm flow. The Agent SDK CLI may omit `--quality-agent` and `--synthesizer-agent`, but omission means "use the SDK default agent with quality/synthesis role instructions," not "skip the phase."
 
 Quality run metadata:
 
@@ -524,26 +581,48 @@ This avoids a multi-child parent model and preserves current resumability assump
 
 The existing Agent SDK CLI already uses `eval --swarm <n>` to mean "run eval cases with up to `n` concurrent eval runs." That existing flag is a concurrency control for evaluation workloads; it does not decompose one objective into subtasks and should not be treated as this feature.
 
-A future CLI or gateway entrypoint for coordinated decomposition must avoid ambiguity with the existing eval flag. The exact command name is therefore intentionally TBD, but `swarm-run` is the preferred candidate because it preserves the meaningful swarm terminology without overloading `eval --swarm <n>`.
+A future CLI or gateway entrypoint for coordinated decomposition must avoid ambiguity with the existing eval flag. `swarm-run` is the preferred command because it preserves the meaningful swarm terminology without overloading `eval --swarm <n>`.
 
-Possible shapes include:
+The Agent SDK CLI should use the existing agent JSON structure already used under locations such as `~/.adaptiveAgent/agents`. Do not introduce a new worker catalog JSON schema for the initial CLI. Agent spec paths may be absolute, relative, or later resolved by bare id from the SDK's known agent directory.
+
+Primary shape:
 
 ```sh
-adaptive-agent swarm-run "Analyze this complex objective and produce a final answer"
-adaptive-agent run --orchestrate "Analyze this complex objective and produce a final answer"
-adaptive-agent run --decompose "Analyze this complex objective and produce a final answer"
+adaptive-agent swarm-run \
+  --agent ./agents/coordinator.json \
+  --worker-catalog ./agents/market.json,./agents/pricing.json \
+  --quality-agent ./agents/quality.json \
+  --synthesizer-agent ./agents/synthesizer.json \
+  --max-workers 3 \
+  --file ./task.txt
 ```
 
-If implemented, `adaptive-agent run --decompose` must be an alias for the same `SwarmCoordinator` execution path as `adaptive-agent swarm-run`. `adaptive-agent run --orchestrate` is intentionally not the initial alias because it is broader than decomposition and may later cover other orchestration modes.
+Minimal shape with SDK defaults for quality and synthesis:
+
+```sh
+adaptive-agent swarm-run \
+  --agent ./agents/coordinator.json \
+  --worker-catalog ./agents/market.json,./agents/pricing.json \
+  --max-workers 3 \
+  --file ./task.txt
+```
+
+`--agent` selects the coordinator/decomposer agent. `--worker-catalog` supplies the allowed worker agent spec paths and is required for the initial implementation. `--quality-agent` and `--synthesizer-agent` are optional; when omitted, Agent SDK should use its default agent spec with role-specific quality or synthesis instructions and clearly report those defaults in CLI output or structured result metadata.
+
+The task objective may be supplied either as positional text or via `--file <path>`. The initial CLI should reject calls that provide both or neither, with a clear error.
+
+If implemented, `adaptive-agent run --decompose` may be an alias for `swarm-run`, but it should route through the same Agent SDK catalog/decomposition path. `adaptive-agent run --orchestrate` is intentionally not the initial alias because it is broader than decomposition and may later cover other orchestration modes.
 
 Avoid reusing `--swarm` for this feature because `eval --swarm <n>` already has a different meaning.
 
 Expected behavior:
 
 - create or accept a `sessionId`;
-- create one coordinator run;
-- run bounded worker tasks under the same `sessionId`;
-- return all relevant run ids and the synthesizer output;
+- load coordinator, worker, quality, and synthesizer agents from existing Agent SDK agent specs;
+- expose only loaded worker spec ids as valid `targetAgentId` values;
+- create one coordinator/orchestration run;
+- run bounded worker tasks under the same `sessionId` after strict subtask validation;
+- return all relevant run ids, validation status, defaults used, and the synthesizer output;
 - preserve normal non-swarm `agent.run()` behavior.
 
 Gateway interactive sessions should remain serialized for chat/write safety unless an explicit coordinated decomposition mode creates independent runs under the same core `sessionId`.
@@ -554,6 +633,8 @@ Gateway interactive sessions should remain serialized for chat/write safety unle
 - No replacement of existing delegate child runs.
 - No separate `swarmId` in the initial implementation.
 - No duplicated `allowedTools` on `SwarmSubtask`.
+- No new agent-catalog JSON schema for initial CLI; reuse existing Agent SDK agent JSON specs.
+- No implicit "all known agents" worker catalog in the initial CLI; `--worker-catalog` must be explicit.
 - No raw attachment duplication across all subtasks by default.
 - No required partial file/page/timestamp selectors in the first implementation.
 - No gateway authorization/session ownership migration into core.
@@ -562,10 +643,12 @@ Gateway interactive sessions should remain serialized for chat/write safety unle
 
 ## Implementation Phases
 
+Implementation status: Phases 0-3 have been implemented as of this spec update. Phase 3 is a text-only prototype where core still performs decomposition inside `SwarmCoordinator`; the phases below redirect post-Phase-3 work toward the Agent SDK decomposition boundary and a stricter core execution contract.
+
 ### Phase 0: Contract cleanup and naming lock
 
 - Treat `swarm-run` as the canonical coordinated decomposition command name.
-- If supported, make `run --decompose` an exact alias for the same coordinator flow.
+- If supported, make `run --decompose` an exact alias for the same Agent SDK catalog/decomposition/execution path.
 - Do not introduce `run --orchestrate` in the initial CLI unless a broader orchestration mode is explicitly designed.
 - Keep specialist routing on `SwarmSubtask.targetAgentId`; do not model specialist selection as nested orchestration.
 - Keep nested swarm/coordinator execution out of the initial implementation.
@@ -589,21 +672,62 @@ Gateway interactive sessions should remain serialized for chat/write safety unle
 ### Phase 3: Swarm coordinator prototype
 
 - Implement a `SwarmCoordinator` or equivalent orchestration helper.
-- Keep decomposition inside the coordinator flow.
-- Build a deterministic attachment inventory from `SwarmRequest.contentParts`.
-- Require decomposer output to reference attachments through validated `attachmentRefs`.
+- Keep decomposition inside the coordinator flow for the text-only prototype.
 - Launch independent worker root runs with bounded concurrency.
-- Pass only selected `contentParts` to each worker run.
 - Collect structured worker results.
 - Invoke quality and synthesis runs.
 - Return `SwarmRunResult`.
 
-### Phase 4: CLI or gateway coordinated decomposition integration
+### Phase 4: Core strict execution contract
 
-- Add a command or frame option that invokes the coordinator.
+- Add a core `SwarmExecutionRequest` or equivalent path that accepts already-decomposed `SwarmSubtask[]`.
+- Keep the current core `SwarmCoordinator` as a programmatic prototype/convenience, but route SDK CLI execution through the strict execution path.
+- Build the decomposition validation layer in core:
+  - non-empty unique subtask ids;
+  - non-empty `subObjective`;
+  - required `targetAgentId` unless an explicit default worker is configured;
+  - exact match against configured worker ids;
+  - `INVALID_DECOMPOSITION` for unknown ids or malformed subtasks;
+  - no synthetic failed worker results for invalid decomposition;
+  - no quality or synthesis runs after invalid decomposition.
+- Add dynamic decomposition schema helpers that SDK can use, including `targetAgentId.enum` from loaded worker ids.
+- Persist invalid decomposition as a failed coordinator/orchestration result with useful diagnostics and valid worker ids.
+- Add tests for unknown `targetAgentId`, duplicate subtask ids, missing `subObjective`, and all-validation-before-worker-launch behavior.
+
+### Phase 5: Agent SDK `swarm-run` CLI integration
+
+- Add `adaptive-agent swarm-run` in Agent SDK.
 - Avoid overloading or confusing the existing Agent SDK `eval --swarm <n>` concurrency flag.
-- Surface `sessionId`, `coordinatorRunId`, worker run ids, quality run id, and synthesizer run id.
+- Reuse existing Agent SDK agent JSON files for every agent path/id; do not define a new worker catalog file format.
+- Support:
+  - `--agent <path-or-id>` for the coordinator/decomposer agent;
+  - `--worker-catalog <path-or-id,...>` for explicit worker specs;
+  - `--quality-agent <path-or-id>` optional, defaulting to SDK default agent plus quality role instructions;
+  - `--synthesizer-agent <path-or-id>` optional, defaulting to SDK default agent plus synthesis role instructions;
+  - `--max-workers <n>`;
+  - `--session-id <id>`;
+  - positional task text or `--file <path>`, but not both.
+- Resolve valid worker ids from each worker spec's `id` field and expose only those ids in the coordinator catalog and schema enum.
+- Build coordinator-visible catalog summaries without secrets such as API keys.
+- Validate decomposition in SDK for friendly CLI errors before calling core, while relying on core validation as authoritative.
+- Surface `sessionId`, `coordinatorRunId`, worker run ids, quality run id, synthesizer run id, defaults used, validation failures, and final output.
 - Keep non-swarm gateway session write semantics unchanged.
+
+### Phase 6: Multimodal attachment routing
+
+- Add `contentParts?: ModelContentPart[]` to SDK `swarm-run` input handling where supported by existing CLI file/content mechanisms.
+- Build a deterministic attachment inventory from request `contentParts`.
+- Require decomposer output to reference attachments through validated `attachmentRefs`.
+- Pass only selected `contentParts` to each worker run.
+- Validate target worker modality capabilities and existing file input policy behavior before worker launch.
+- Add tests for stable attachment ids, unknown attachment refs, worker-specific routing, and unsupported modality failures.
+
+### Phase 7: Gateway coordinated decomposition integration
+
+- Add an explicit gateway frame or endpoint for coordinated decomposition if needed after CLI behavior stabilizes.
+- Reuse Agent SDK/catalog semantics where possible.
+- Keep normal interactive sessions serialized for chat/write safety unless a caller explicitly enters coordinated decomposition mode.
+- Preserve core `sessionId` grouping and gateway authorization/session ownership boundaries.
 
 ## Verification Plan
 
@@ -621,12 +745,25 @@ Gateway interactive sessions should remain serialized for chat/write safety unle
 - Coordinator creates one coordinator run with role `coordinator`.
 - Worker runs are independent root runs with the same `sessionId` and coordinator metadata.
 - Quality and synthesizer runs share the same `sessionId` and coordinator metadata.
-- Failed worker runs are represented in `SwarmSubtaskResult` and do not prevent quality/synthesis unless policy says so.
+- Failed worker runtime errors are represented in `SwarmSubtaskResult` and do not prevent quality/synthesis unless policy says so.
 - `targetAgentId` selects an agent whose own definition controls tools.
+- Decomposition with unknown `targetAgentId` fails as `INVALID_DECOMPOSITION` before worker launch.
+- Decomposition with duplicate subtask ids or missing `subObjective` fails before worker launch.
+- Invalid decomposition does not invoke quality or synthesis.
 - Coordinator builds stable attachment ids for multimodal `contentParts`.
 - Decomposer output with unknown `attachmentRefs` is rejected before worker launch.
 - Worker runs receive only the attachments selected by their subtask.
 - Worker launch fails clearly when the selected target agent cannot consume or materialize a required modality.
+
+### Agent SDK CLI tests
+
+- `swarm-run --agent <path> --worker-catalog <paths> --file <task>` loads existing agent JSON specs.
+- `--worker-catalog` is required and does not default to all known agents.
+- Missing `--quality-agent` and `--synthesizer-agent` use SDK default agent with role-specific instructions and report defaults used.
+- Worker ids come from worker spec `id` fields and are the only valid `targetAgentId` values in the coordinator schema.
+- CLI rejects both positional task text and `--file` together.
+- CLI rejects neither positional task text nor `--file`.
+- CLI output surfaces `sessionId`, `coordinatorRunId`, worker run ids, quality run id, synthesizer run id, defaults used, and final output.
 
 ### Integration tests
 
@@ -641,6 +778,7 @@ Gateway interactive sessions should remain serialized for chat/write safety unle
 2. Whether the coordinator run should persist intermediate decomposition and final synthesis in `result`, events, or both.
 3. Whether failed worker runs should be retried automatically based on quality-agent recommendations in the first version.
 4. Whether `maxWorkers` default should live in `AdaptiveAgentOptions.defaults`, a coordinator option, or CLI/gateway config.
-5. Whether quality and synthesis should be required phases or configurable profiles.
+5. Whether quality and synthesis default agents should be reported only in CLI output or also persisted in coordinator metadata/result.
 6. Whether attachment inventory summaries should be persisted in coordinator `metadata`, coordinator `result`, events, or all three.
 7. When to promote `attachmentRefs: string[]` to structured refs with page, range, timestamp, or region selectors.
+8. Whether the Phase 3 core `SwarmCoordinator` should remain long-term as a decomposition convenience or be split into a pure SDK decomposer plus core executor API.

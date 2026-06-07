@@ -1,22 +1,100 @@
 # Repository Guidance
-- This repository is currently docs-first; the checked-in workspace today is spec and contract Markdown rather than an app/package tree.
-- For JS/TS implementation work, assume Bun + TypeScript with Vitest; prefer Bun-native scripts and commands over npm/yarn or Jest.
-- When a package or workspace is present, default verification commands are `bun run build`, `bun test`, and `bunx vitest run <path>` or `bunx vitest run -t "<name>"`; if the touched workspace defines different scripts, follow its local `package.json`.
-- Useful repo commands: `rg --files -uu` to inspect files, `rg -n "pattern" *.md` to trace terminology and contracts.
-- Primary artifacts are versioned spec docs: `agen-spec-v1.md` (historical v1.2 baseline), `agen-spec-v1.3.md`, and `agen-spec-v1.4.md`.
-- Primary implementation-facing docs are `agen-contracts-v1.3.md`, `agen-contracts-v1.4.md`, and the transitional `agen-contracts-v1.4-multi-agent.md` delta.
-- Runtime behavior for hierarchical delegation is sketched in `agen-runtime-v1.4-algorithms.md`.
-- Treat `agen-spec-v1.4.md` as the current product source of truth unless a task explicitly targets an older version.
-- Treat `agen-contracts-v1.4.md` as the current contract/schema source of truth; it defines internal APIs such as `AdaptiveAgentOptions`, `RunStore`, `PlanStore`, `ToolDefinition`, `ModelAdapter`, and run hierarchy fields.
-- The documented database is PostgreSQL; the current contract describes `agent_runs`, `agent_events`, `run_snapshots`, `plans`, `plan_steps`, and `plan_executions`.
-- Core architecture in the docs is split into `@adaptive-agent/core`, `@adaptive-agent/store-postgres`, and `@adaptive-agent/dashboard-example`.
-- Preserve the central design boundary: `Tool` is the only first-class executable primitive; plans are separate artifacts; v1.4 delegation is modeled as synthetic `delegate.*` tools plus child runs.
-- Keep terminology precise and consistent: use `run`, `plan`, `plan execution`, `delegate profile`, `child run`, and `replan.required` exactly as defined.
-- Do not reintroduce deferred concepts casually: skills runtime, DAG execution, parallel child runs, child messaging, or chain-of-thought persistence are out of scope unless the task explicitly changes the spec.
-- Prefer additive edits over rewriting history: update the newest v1.4 docs, and only touch v1.3/v1.2 docs when the task is about comparison, migration, or historical context.
-- Keep edits ASCII and Markdown-first; use short sections, flat bullets, fenced `ts`/`sql` blocks, and backticks for identifiers and event names.
+
+## Current repository status
+
+- This repository is an active Bun + TypeScript monorepo with implementation packages and versioned architecture/spec docs.
+- Primary packages currently include:
+  - `@adaptive-agent/core` in `packages/core`
+  - `@adaptive-agent/agent-sdk` in `packages/agent-sdk`
+  - `@adaptive-agent/core-cli` in `packages/core-cli`
+  - `@adaptive-agent/gateway-fastify` in `packages/gateway-fastify`
+  - `@adaptive-agent/gateway-web` in `packages/gateway-web`
+  - `@adaptive-agent/analysis` in `packages/analysis`
+- Versioned specs and contract Markdown remain important architecture references. Preserve terminology and behavioral contracts when changing implementation code.
+- Treat `agen-spec-v1.5.md` and `agen-contracts-v1.5.md` as the newest versioned spec/contract sources unless a task explicitly targets v1.4 or earlier.
+- Treat `CORE-SESSION-SWARM-SPEC.md` as the reference for the core/session/swarm responsibility boundary between `@adaptive-agent/core` and `@adaptive-agent/agent-sdk`.
+
+## Runtime and verification
+
+- Use Bun-native commands by default. Do not introduce npm/yarn/Jest workflows unless a package already requires them.
+- For package work, prefer the touched package's local scripts:
+  - `bun run build`
+  - `bun test`
+  - `bunx vitest run`
+  - `bunx vitest run <path>`
+  - `bunx vitest run -t "<name>"`
+  - `bun run typecheck` when the package defines it
+- Root useful commands:
+  - `rg --files -uu` to inspect files
+  - `rg -n "pattern" *.md` to trace terminology and contracts
+- Keep edits scoped. Do not rewrite historical docs unless the task is about migration, comparison, or historical context.
+
+## Hard rules: core vs Agent SDK responsibility boundary
+
+These rules protect the package boundary established by `CORE-SESSION-SWARM-SPEC.md`. They apply beyond swarm work: when adding new orchestration, CLI, or agent-profile features, choose the package based on responsibility, not convenience.
+
+### `@adaptive-agent/core` owns runtime semantics
+
+- Core owns durable execution semantics: runs, sessions, child runs, retries, continuation, persistence, eventing, snapshots, and runtime metadata.
+- Core owns execution-time validation for data it is asked to run. It must not trust model output, CLI input, or SDK-prevalidated data.
+- Core owns generic orchestration primitives that are independent of a specific CLI UX or agent-spec loading flow.
+- Core may expose strict programmatic APIs for already-prepared execution requests.
+- Core must remain usable without importing `@adaptive-agent/agent-sdk`.
+
+### `@adaptive-agent/agent-sdk` owns agent-profile and CLI setup
+
+- Agent SDK owns CLI-facing workflows and user-facing command behavior.
+- Agent SDK owns loading, resolving, and validating existing agent JSON specs.
+- Agent SDK owns coordinator/decomposer prompt construction, safe catalog summaries, default agent selection, and CLI-friendly error messages.
+- Agent SDK owns translating CLI/user intent into strict core execution requests.
+- Agent SDK may prevalidate inputs for usability, but core must still validate before execution.
+
+### Do not blur this boundary
+
+- Do not move CLI-specific parsing, command naming, or agent-spec discovery into core.
+- Do not make core depend on Agent SDK package types, config paths, default agent specs, or CLI concepts.
+- Do not duplicate agent definition fields such as model, instructions, delegates, or allowed tools into orchestration task objects when the existing agent spec is the source of truth.
+- Do not make Agent SDK own durable runtime behavior that belongs in core.
+- Do not bypass core validation just because Agent SDK already validated something.
+
+## Existing architecture and terminology constraints
+
+- Preserve the central design boundary: `Tool` is the only first-class executable primitive; plans are separate artifacts.
+- Keep terminology precise and consistent:
+  - `run`
+  - `sessionId`
+  - `coordinatorRunId`
+  - `top-level objective`
+  - `subObjective`
+  - `worker run`
+  - `quality run`
+  - `synthesizer run`
+  - `child run`
+  - `plan`
+  - `plan execution`
+  - `delegate profile`
+  - `replan.required`
+- Do not casually reintroduce deferred concepts unless the task explicitly changes the spec:
+  - skills runtime
+  - DAG execution
+  - parallel child runs
+  - child messaging
+  - chain-of-thought persistence
+  - separate `swarmId`
+
+## Code and docs style
+
+- Keep Markdown edits ASCII-first unless existing files require otherwise.
+- Use short sections, flat bullets, fenced `ts`/`sql` blocks, and backticks for identifiers and event names.
 - In TypeScript examples, prefer explicit interfaces/types, Bun + TypeScript assumptions, named concepts, and avoid `any` unless the spec genuinely leaves a type open.
-- In `packages/gateway-fastify`, prefer unit-testing upgrade auth helpers and pure protocol handlers directly; Bun's `@fastify/websocket` `injectWS` harness is unreliable for live-upgrade tests, so keep one HTTP/listen smoke test and cover upgrade policy with focused auth tests.
-- In schema examples, preserve deterministic and resumability semantics: event log + snapshots, leases/heartbeats, optimistic versioning, and explicit compatibility checks.
+- In schema examples, preserve deterministic and resumability semantics:
+  - event log plus snapshots
+  - leases/heartbeats
+  - optimistic versioning
+  - explicit compatibility checks
 - Call out breaking changes clearly when moving between versions, especially around public API, persistence, event types, or replay behavior.
-- No Cursor, Claude, Windsurf, Cline, Goose, or Copilot rule files are present in this repository at the time this file was created.
+
+## Package-specific notes
+
+- In `packages/gateway-fastify`, prefer unit-testing upgrade auth helpers and pure protocol handlers directly.
+- Bun's `@fastify/websocket` `injectWS` harness is unreliable for live-upgrade tests, so keep one HTTP/listen smoke test and cover upgrade policy with focused auth tests.

@@ -712,6 +712,11 @@ export interface RunStore {
 
   getRun(runId: UUID): Promise<AgentRun | null>;
 
+  listBySession?(sessionId: string, options?: {
+    limit?: number;
+    offset?: number;
+  }): Promise<AgentRun[]>;
+
   updateRun(runId: UUID, patch: Partial<AgentRun>, expectedVersion?: number): Promise<AgentRun>;
 
   tryAcquireLease(params: {
@@ -766,6 +771,76 @@ export interface RuntimeStores {
   planStore?: PlanStore;
   continuationStore?: ContinuationStore;
   toolExecutionStore?: ToolExecutionStore;
+}
+
+export interface OrchestrationMetadata {
+  kind: 'swarm';
+  coordinatorRunId: UUID;
+  role: 'coordinator' | 'worker' | 'quality' | 'synthesizer';
+  subtaskId?: string;
+}
+
+export interface SwarmRequest {
+  sessionId?: string;
+  topLevelObjective: string;
+  input?: JsonValue;
+  contentParts?: ModelContentPart[];
+  maxWorkers?: number;
+  metadata?: Record<string, JsonValue>;
+}
+
+export interface SwarmExecutionRequest {
+  sessionId?: string;
+  /** Existing decomposition/coordinator run to finalize. If omitted, core creates a lightweight coordinator run. */
+  coordinatorRunId?: UUID;
+  topLevelObjective: string;
+  subtasks: SwarmSubtask[];
+  input?: JsonValue;
+  contentParts?: ModelContentPart[];
+  maxWorkers?: number;
+  metadata?: Record<string, JsonValue>;
+}
+
+export interface SwarmSubtask {
+  id: string;
+  subObjective: string;
+  input?: JsonValue;
+  attachmentRefs?: string[];
+  targetAgentId?: string;
+  metadata?: Record<string, JsonValue>;
+}
+
+export interface SwarmSubtaskResult {
+  subtaskId: string;
+  runId: UUID;
+  rootRunId: UUID;
+  status: RunStatus;
+  output?: JsonValue;
+  errorCode?: string;
+  errorMessage?: string;
+}
+
+export interface SwarmQualityAssessment {
+  subtaskId: string;
+  runId: UUID;
+  usable: boolean;
+  score?: number;
+  issues?: string[];
+  recommendation: 'use' | 'ignore' | 'retry' | 'needs_human';
+}
+
+export interface SwarmRunResult {
+  sessionId: string;
+  coordinatorRunId: UUID;
+  subtaskResults: SwarmSubtaskResult[];
+  qualityRunId?: UUID;
+  synthesizerRunId?: UUID;
+  qualityAssessments?: SwarmQualityAssessment[];
+  status: RunStatus;
+  output?: JsonValue;
+  errorCode?: string;
+  errorMessage?: string;
+  diagnostics?: JsonValue;
 }
 
 export interface RuntimeTransactionStore extends RuntimeStores {

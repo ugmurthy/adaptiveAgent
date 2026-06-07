@@ -1,7 +1,7 @@
-import { access, readFile } from 'node:fs/promises';
+import { access, readFile, readdir } from 'node:fs/promises';
 import { createInterface } from 'node:readline/promises';
 import { homedir } from 'node:os';
-import { delimiter, isAbsolute, resolve } from 'node:path';
+import { delimiter, extname, isAbsolute, resolve } from 'node:path';
 import { stdin, stderr } from 'node:process';
 import { fileURLToPath } from 'node:url';
 
@@ -110,6 +110,7 @@ export interface AgentSettingsFile {
   $schema?: string;
   version?: 1;
   agent?: { configPath?: string; id?: string };
+  agents?: { dirs?: string[] };
   runtime?: { mode?: RuntimeMode; autoMigrate?: boolean };
   logging?: { enabled?: boolean; level?: LogLevel; destination?: LogDestination; filePath?: string; pretty?: boolean };
   interaction?: { autoApprove?: boolean; interactive?: boolean; approvalMode?: ApprovalMode; clarificationMode?: ClarificationMode };
@@ -132,6 +133,7 @@ export interface ResolvedAgentSdkConfig {
   logging: { enabled: boolean; level: LogLevel; destination: LogDestination; filePath?: string; pretty: boolean };
   interaction: { approvalMode: ApprovalMode; clarificationMode: ClarificationMode };
   events: { printLifecycle: boolean; subscribe: boolean; verbose: boolean };
+  agents: { dirs: string[] };
   skills: { dirs: string[]; allowExampleSkills: boolean };
   tui: TuiSettingsConfig;
 }
@@ -329,7 +331,8 @@ async function resolveAgentSdkConfig(options: AgentSdkOptions): Promise<Resolved
   const settingsLoaded = options.settingsConfig ? { path: '<inline settings>', value: options.settingsConfig } : await loadOptionalSettings(cwd, options.settingsConfigPath, env);
   const settings = validateSettings(expandStrings(settingsLoaded?.value ?? {}), settingsLoaded?.path ?? '<defaults>');
   Object.assign(env, settings.env ?? {});
-  const agentLoaded = options.agentConfig ? { path: '<inline agent>', value: options.agentConfig } : await loadRequiredAgent(cwd, options.agentConfigPath ?? settings.agent?.configPath, env);
+  const agentDirs = resolveAgentDirs(cwd, settings.agents?.dirs, env);
+  const agentLoaded = options.agentConfig ? { path: '<inline agent>', value: options.agentConfig } : await loadRequiredAgent(cwd, options.agentConfigPath ?? settings.agent?.configPath, env, agentDirs);
   const agent = validateAgent(expandStrings(agentLoaded.value), agentLoaded.path);
   if (settings.agent?.id && settings.agent.id !== agent.id) throw new AgentSettingsValidationError(settingsLoaded?.path ?? '<settings>', [`settings.agent.id (${settings.agent.id}) does not match agent.id (${agent.id})`]);
 
@@ -354,6 +357,7 @@ async function resolveAgentSdkConfig(options: AgentSdkOptions): Promise<Resolved
     logging: { enabled: settings.logging?.enabled ?? false, level: settings.logging?.level ?? 'info', destination: settings.logging?.destination ?? 'console', filePath: expandOptional(settings.logging?.filePath, env), pretty: settings.logging?.pretty ?? true },
     interaction: { approvalMode: settings.interaction?.approvalMode ?? (settings.interaction?.autoApprove === false ? 'manual' : 'auto'), clarificationMode: settings.interaction?.clarificationMode ?? (settings.interaction?.interactive === false ? 'fail' : 'interactive') },
     events: { printLifecycle: settings.events?.printLifecycle ?? false, subscribe: settings.events?.subscribe ?? false, verbose: settings.events?.verbose ?? false },
+    agents: { dirs: agentDirs },
     skills: { dirs: resolveSkillDirs(cwd, settings.skills?.dirs, settings.skills?.allowExampleSkills, env), allowExampleSkills: settings.skills?.allowExampleSkills ?? false },
     tui: normalizeTuiSettings(settings.tui),
   };
@@ -420,14 +424,39 @@ async function loadOptionalSettings(cwd: string, explicitPath: string | undefine
   return undefined;
 }
 
-async function loadRequiredAgent(cwd: string, explicitPath: string | undefined, env: NodeJS.ProcessEnv): Promise<{ path: string; value: AgentConfigFile }> {
+async function loadRequiredAgent(cwd: string, explicitPath: string | undefined, env: NodeJS.ProcessEnv, agentDirs: string[]): Promise<{ path: string; value: AgentConfigFile }> {
   const candidates = [explicitPath, env.ADAPTIVE_AGENT_CONFIG, resolve(cwd, 'agent.json'), resolve(homedir(), '.adaptiveAgent', 'agents', 'default-agent.json')].filter(Boolean) as string[];
   for (const candidate of candidates) {
     const path = resolvePath(cwd, candidate);
     if (await pathExists(path)) return { path, value: await readJson(path) as AgentConfigFile };
+    const discovered = await resolveAgentConfigByName(candidate, agentDirs);
+    if (discovered) return { path: discovered, value: await readJson(discovered) as AgentConfigFile };
     if (candidate === explicitPath || candidate === env.ADAPTIVE_AGENT_CONFIG) throw new AgentSdkLookupError('agent.json', candidates.map((entry) => resolvePath(cwd, entry)));
   }
   throw new AgentSdkLookupError('agent.json', candidates.map((entry) => resolvePath(cwd, entry)));
+}
+
+async function resolveAgentConfigByName(name: string, dirs: string[]): Promise<string | undefined> {
+  if (!isAgentName(name)) return undefined;
+  const fileNames = extname(name) ? [name] : [name, `${name}.json`];
+  const matches: string[] = [];
+  for (const dir of dirs) {
+    if (!(await pathExists(dir))) continue;
+    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (!entry.isFile() || !fileNames.includes(entry.name)) continue;
+      matches.push(resolve(dir, entry.name));
+    }
+  }
+  matches.sort();
+  if (matches.length > 1) {
+    throw new Error(`Ambiguous agent config "${name}". Matches:\n${matches.map((match) => `- ${match}`).join('\n')}`);
+  }
+  return matches[0];
+}
+
+function isAgentName(value: string): boolean {
+  return Boolean(value.trim()) && !isAbsolute(value) && !/[\\/]/.test(value);
 }
 
 const ajv = new Ajv({ allErrors: true, allowUnionTypes: true });
@@ -484,6 +513,7 @@ export function expandEnvironmentVariables(value: string, env: NodeJS.ProcessEnv
 function expandOptional(value: string | undefined, env: NodeJS.ProcessEnv): string | undefined { return value ? expandEnvironmentVariables(value, env) : undefined; }
 function optionsString(value: string | undefined): string | undefined { return value && value.trim() ? value : undefined; }
 function defaultApiKeyEnv(provider: string): string | undefined { const normalized = provider.toLowerCase(); if (normalized === 'openrouter') return 'OPENROUTER_API_KEY'; if (normalized === 'mistral') return 'MISTRAL_API_KEY'; if (normalized === 'mesh') return 'MESH_API_KEY'; return undefined; }
+function resolveAgentDirs(cwd: string, dirs: string[] | undefined, env: NodeJS.ProcessEnv): string[] { const selected = dirs?.length ? dirs : env.ADAPTIVE_AGENT_AGENTS_DIR ? env.ADAPTIVE_AGENT_AGENTS_DIR.split(delimiter).filter(Boolean) : ['./agents', '~/.adaptiveAgent/agents']; return selected.map((dir) => resolvePath(cwd, expandEnvironmentVariables(dir, env))); }
 function resolveSkillDirs(cwd: string, dirs: string[] | undefined, allowExamples: boolean | undefined, env: NodeJS.ProcessEnv): string[] { const selected = dirs?.length ? dirs : env.ADAPTIVE_AGENT_SKILLS_DIR ? env.ADAPTIVE_AGENT_SKILLS_DIR.split(delimiter).filter(Boolean) : ['./skills', '~/.adaptiveAgent/skills']; const resolved = selected.map((dir) => resolvePath(cwd, expandEnvironmentVariables(dir, env))); if (allowExamples) resolved.push(resolve(cwd, 'examples', 'skills')); return resolved; }
 function normalizeRecovery(recovery: AgentConfigFile['recovery']) { return recovery ? { ...recovery, continuation: recovery.continuation ? { enabled: recovery.continuation.enabled ?? true, defaultStrategy: recovery.continuation.defaultStrategy, requireUserApproval: recovery.continuation.requireUserApproval } : undefined } : undefined; }
 function mergeMetadata(base: JsonObject, extra: JsonObject | undefined): JsonObject { return { ...base, ...(extra ?? {}) }; }

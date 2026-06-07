@@ -48,7 +48,11 @@ export async function traceSession(client: PostgresClient, options: CliOptions):
 
   const warnings: string[] = [];
   if (target.kind === 'session' && !session) {
-    warnings.push(`Session "${options.sessionId}" was not found.`);
+    if (rootRunIds.length === 0) {
+      warnings.push(`Session "${options.sessionId}" was not found.`);
+    } else {
+      warnings.push(`Gateway session "${options.sessionId}" was not found; tracing matching agent_runs rows instead.`);
+    }
   }
   if (target.kind === 'run' && !target.resolvedRootRunId) {
     warnings.push(`Run "${target.requestedId}" was not found.`);
@@ -134,7 +138,11 @@ export async function loadUsageForTraceTarget(client: PostgresClient, options: C
 }
 
 
-export async function listSessions(client: PostgresClient): Promise<SessionListItem[]> {
+export async function listSessions(
+  client: PostgresClient,
+  options: { recoverAgentRunSessionIds?: boolean } = {},
+): Promise<SessionListItem[]> {
+  const recoverAgentRunSessionIds = options.recoverAgentRunSessionIds ?? true;
   const [sessionResult, sessionlessRuns] = await Promise.all([
     client.query<{
     session_id: string;
@@ -187,7 +195,7 @@ export async function listSessions(client: PostgresClient): Promise<SessionListI
   }));
 
   const sessionless = sessionlessRuns.map((run): SessionListItem => ({
-    sessionId: null,
+    sessionId: recoverAgentRunSessionIds ? run.sessionId ?? null : null,
     startedAt: run.startedAt,
     status: run.status ?? undefined,
     goals: [{
@@ -244,6 +252,7 @@ export async function listSessionPerformance(client: PostgresClient): Promise<Se
 
 export async function listSessionlessRuns(client: PostgresClient): Promise<SessionlessRunListItem[]> {
   const result = await client.query<{
+    session_id: string | null;
     root_run_id: string;
     started_at: string;
     completed_at: string | null;
@@ -251,6 +260,7 @@ export async function listSessionlessRuns(client: PostgresClient): Promise<Sessi
     goal: string | null;
   }>(`
     select
+      r.session_id,
       r.id::text as root_run_id,
       r.created_at as started_at,
       r.completed_at,
@@ -266,6 +276,7 @@ export async function listSessionlessRuns(client: PostgresClient): Promise<Sessi
   `);
 
   return result.rows.map((row) => ({
+    sessionId: row.session_id,
     rootRunId: row.root_run_id,
     startedAt: row.started_at,
     completedAt: row.completed_at,
@@ -428,14 +439,13 @@ async function loadTraceSessionRootRunIds(
     root_run_id: string;
   }>(
     `
-      select r.id::text as root_run_id
+      select r.root_run_id::text as root_run_id
       from agent_runs r
-      where r.id = r.root_run_id
-        and (
-          r.context ->> 'sessionId' = $1
-          or r.metadata -> 'gateway' ->> 'sessionId' = $1
-        )
-      order by r.created_at asc, r.id asc
+      where r.session_id = $1
+         or r.context ->> 'sessionId' = $1
+         or r.metadata -> 'gateway' ->> 'sessionId' = $1
+      group by r.root_run_id
+      order by min(r.created_at) asc, min(r.id::text) asc
     `,
     [sessionId],
   );

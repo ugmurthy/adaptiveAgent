@@ -1,10 +1,13 @@
+import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+
 import { Sandbox } from '@e2b/code-interpreter';
 
 import type { JsonValue, ToolContext } from '../../../packages/core/src/types.js';
 
 export const name = 'persistent_e2b_run_code';
 export const description =
-  'Run Python code in an E2B sandbox that persists across multiple tool calls in the same delegated run. Supports run, status, and close actions.';
+  'Run Python code in an E2B sandbox that persists across multiple tool calls in the same delegated run. Supports run, upload, status, and close actions.';
 
 export const inputSchema = {
   type: 'object',
@@ -13,8 +16,8 @@ export const inputSchema = {
   properties: {
     action: {
       type: 'string',
-      enum: ['run', 'status', 'close'],
-      description: 'run executes code, status reports the current sandbox session, close kills it immediately.',
+      enum: ['run', 'upload', 'status', 'close'],
+      description: 'run uploads optional files then executes code, upload writes files without executing code, status reports the current sandbox session, close kills it immediately.',
     },
     code: {
       type: 'string',
@@ -36,6 +39,33 @@ export const inputSchema = {
       type: 'string',
       description: 'Optional E2B template to use when creating the sandbox.',
     },
+    files: {
+      type: 'array',
+      description: 'Optional files to upload into the sandbox before code execution. Each file can use sourcePath, content, or base64.',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['sandboxPath'],
+        properties: {
+          sandboxPath: {
+            type: 'string',
+            description: 'Absolute destination path inside the E2B sandbox, e.g. /home/user/input.csv.',
+          },
+          sourcePath: {
+            type: 'string',
+            description: 'Local file path to read and upload.',
+          },
+          content: {
+            type: 'string',
+            description: 'Inline text content to write to sandboxPath.',
+          },
+          base64: {
+            type: 'string',
+            description: 'Base64-encoded file bytes to write to sandboxPath.',
+          },
+        },
+      },
+    },
   },
 } as const;
 
@@ -51,6 +81,18 @@ export const outputSchema = {
     reused: { type: 'boolean' },
     closed: { type: 'boolean' },
     idleTtlMs: { type: 'number' },
+    uploadedFiles: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          path: { type: 'string' },
+          sourcePath: { type: 'string' },
+          bytes: { type: 'number' },
+        },
+      },
+    },
     text: { type: 'string' },
     logs: {
       type: 'object',
@@ -74,12 +116,26 @@ export const outputSchema = {
 } as const;
 
 interface PersistentCodeInput {
-  action: 'run' | 'status' | 'close';
+  action: 'run' | 'upload' | 'status' | 'close';
   code?: string;
   timeoutMs?: number;
   idleTtlMs?: number;
   closeOnError?: boolean;
   template?: string;
+  files?: UploadFileInput[];
+}
+
+interface UploadFileInput {
+  sandboxPath: string;
+  sourcePath?: string;
+  content?: string;
+  base64?: string;
+}
+
+interface UploadedFileOutput {
+  path: string;
+  sourcePath?: string;
+  bytes: number;
 }
 
 interface SandboxSession {
@@ -122,8 +178,12 @@ export async function execute(rawInput: JsonValue, context: ToolContext): Promis
     return { action: 'close', sandboxId: session.sandboxId, status: 'closed', closed: true };
   }
 
-  if (!input.code?.trim()) {
-    throw new Error('persistent_e2b_run_code requires code when action is run');
+  if (input.action === 'run' && !input.code?.trim() && (!input.files || input.files.length === 0)) {
+    throw new Error('persistent_e2b_run_code requires code or files when action is run');
+  }
+
+  if (input.action === 'upload' && (!input.files || input.files.length === 0)) {
+    throw new Error('persistent_e2b_run_code requires files when action is upload');
   }
 
   const { session, created } = await getOrCreateSession(context, idleTtlMs, input.template);
@@ -135,7 +195,19 @@ export async function execute(rawInput: JsonValue, context: ToolContext): Promis
     await session.sandbox.setTimeout(idleTtlMs);
     scheduleIdleCleanup(session);
 
-    const execution = await session.sandbox.runCode(input.code, {
+    const uploadedFiles = input.files?.length ? await uploadFiles(session, input.files) : [];
+
+    if (input.action === 'upload') {
+      return sessionOutput('upload', session, {
+        status: 'ok',
+        created,
+        reused: !created,
+        idleTtlMs,
+        uploadedFiles: uploadedFiles.map(toJsonObject),
+      });
+    }
+
+    const execution = await session.sandbox.runCode(input.code ?? '', {
       language: 'python',
       timeoutMs: normalizeDuration(input.timeoutMs, DEFAULT_CELL_TIMEOUT_MS, 1_000, idleTtlMs),
     });
@@ -144,6 +216,7 @@ export async function execute(rawInput: JsonValue, context: ToolContext): Promis
       created,
       reused: !created,
       idleTtlMs,
+      uploadedFiles: uploadedFiles.map(toJsonObject),
       text: execution.text ?? '',
       logs: {
         stdout: execution.logs?.stdout ?? [],
@@ -190,8 +263,13 @@ function normalizeInput(rawInput: JsonValue): PersistentCodeInput {
   }
 
   const candidate = input as Record<string, unknown>;
-  if (candidate.action !== 'run' && candidate.action !== 'status' && candidate.action !== 'close') {
-    throw new Error('persistent_e2b_run_code action must be run, status, or close');
+  if (
+    candidate.action !== 'run' &&
+    candidate.action !== 'upload' &&
+    candidate.action !== 'status' &&
+    candidate.action !== 'close'
+  ) {
+    throw new Error('persistent_e2b_run_code action must be run, upload, status, or close');
   }
 
   return {
@@ -201,7 +279,114 @@ function normalizeInput(rawInput: JsonValue): PersistentCodeInput {
     idleTtlMs: typeof candidate.idleTtlMs === 'number' ? candidate.idleTtlMs : undefined,
     closeOnError: typeof candidate.closeOnError === 'boolean' ? candidate.closeOnError : undefined,
     template: typeof candidate.template === 'string' && candidate.template.trim() ? candidate.template.trim() : undefined,
+    files: parseUploadFiles(candidate.files),
   };
+}
+
+function parseUploadFiles(value: unknown): UploadFileInput[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!Array.isArray(value)) {
+    throw new Error('persistent_e2b_run_code files must be an array');
+  }
+
+  return value.map((entry, index) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error(`persistent_e2b_run_code files[${index}] must be an object`);
+    }
+
+    const candidate = entry as Record<string, unknown>;
+    if (typeof candidate.sandboxPath !== 'string' || !candidate.sandboxPath.trim()) {
+      throw new Error(`persistent_e2b_run_code files[${index}] requires sandboxPath`);
+    }
+
+    const sources = [candidate.sourcePath, candidate.content, candidate.base64].filter(
+      (source) => typeof source === 'string',
+    );
+    if (sources.length !== 1) {
+      throw new Error(`persistent_e2b_run_code files[${index}] requires exactly one of sourcePath, content, or base64`);
+    }
+
+    return {
+      sandboxPath: normalizeSandboxPath(candidate.sandboxPath, index),
+      sourcePath: typeof candidate.sourcePath === 'string' ? candidate.sourcePath : undefined,
+      content: typeof candidate.content === 'string' ? candidate.content : undefined,
+      base64: typeof candidate.base64 === 'string' ? candidate.base64 : undefined,
+    };
+  });
+}
+
+function normalizeSandboxPath(path: string, index: number): string {
+  const trimmed = path.trim();
+  if (!trimmed.startsWith('/')) {
+    throw new Error(`persistent_e2b_run_code files[${index}].sandboxPath must be absolute`);
+  }
+
+  if (trimmed.includes('\0')) {
+    throw new Error(`persistent_e2b_run_code files[${index}].sandboxPath is invalid`);
+  }
+
+  return trimmed;
+}
+
+async function uploadFiles(session: SandboxSession, files: UploadFileInput[]): Promise<UploadedFileOutput[]> {
+  const uploaded: UploadedFileOutput[] = [];
+
+  for (const file of files) {
+    const { data, bytes, sourcePath } = await materializeUploadFile(file);
+    await session.sandbox.files.write(file.sandboxPath, data);
+    uploaded.push({
+      path: file.sandboxPath,
+      ...(sourcePath ? { sourcePath } : {}),
+      bytes,
+    });
+  }
+
+  return uploaded;
+}
+
+async function materializeUploadFile(file: UploadFileInput): Promise<{
+  data: string | ArrayBuffer;
+  bytes: number;
+  sourcePath?: string;
+}> {
+  if (file.sourcePath) {
+    const sourcePath = resolve(file.sourcePath);
+    const bytes = await readFile(sourcePath);
+    return {
+      data: toArrayBuffer(bytes),
+      bytes: bytes.byteLength,
+      sourcePath,
+    };
+  }
+
+  if (file.base64 !== undefined) {
+    const bytes = Buffer.from(file.base64, 'base64');
+    return {
+      data: toArrayBuffer(bytes),
+      bytes: bytes.byteLength,
+    };
+  }
+
+  const content = file.content ?? '';
+  return {
+    data: content,
+    bytes: Buffer.byteLength(content, 'utf8'),
+  };
+}
+
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+function toJsonObject(file: UploadedFileOutput): Record<string, JsonValue> {
+  return compactJsonObject({
+    path: file.path,
+    sourcePath: file.sourcePath,
+    bytes: file.bytes,
+  });
 }
 
 async function getOrCreateSession(
@@ -274,6 +459,13 @@ function scheduleIdleCleanup(session: SandboxSession): void {
   session.cleanupTimer = setTimeout(() => {
     void closeSession(session, 'local idle ttl expired');
   }, session.idleTtlMs + 1_000);
+  unrefTimer(session.cleanupTimer);
+}
+
+function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
+  if (typeof timer === 'object' && timer && 'unref' in timer && typeof timer.unref === 'function') {
+    timer.unref();
+  }
 }
 
 function closeOnAbort(context: ToolContext, session: SandboxSession): () => void {

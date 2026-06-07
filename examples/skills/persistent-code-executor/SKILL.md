@@ -20,10 +20,15 @@ needed.
 
 Guidelines:
 
-- Use the handler tool for all execution.
+- Use the handler tool for all execution and sandbox file uploads.
 - Prefer `action: "run"` for normal Python execution. The first run in a child
   run creates a sandbox; subsequent runs reuse the same sandbox and interpreter
   state.
+- Include `files` on `action: "run"` when code needs local files or generated
+  inline content. Files are uploaded before the code cell executes.
+- Use `action: "upload"` to stage files in the sandbox without executing code.
+  Each file must provide an absolute `sandboxPath` and exactly one of
+  `sourcePath`, `content`, or `base64`.
 - Keep related setup, imports, helper functions, and data files in the sandbox
   instead of recreating them in every tool call.
 - Request `action: "status"` when you need the current sandbox id or lifecycle
