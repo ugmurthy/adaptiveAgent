@@ -5,7 +5,13 @@ import { OpenRouter } from '@openrouter/sdk';
 
 import { approximateSerializedByteLength, compactJsonObject } from '../logging.js';
 import type { FileInput, ModelContentPart, ModelMessage, ModelRequest, ModelResponse } from '../types.js';
-import { BaseOpenAIChatAdapter, MAX_LOCAL_AUDIO_BYTES, MAX_LOCAL_FILE_BYTES, type BaseOpenAIChatAdapterConfig } from './base-openai-chat-adapter.js';
+import {
+  BaseOpenAIChatAdapter,
+  MAX_LOCAL_AUDIO_BYTES,
+  MAX_LOCAL_FILE_BYTES,
+  type BaseOpenAIChatAdapterConfig,
+  withModelInvocationDiagnostics,
+} from './base-openai-chat-adapter.js';
 import { toProviderSdkResponseFormat } from './provider-sdk-request.js';
 
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
@@ -85,12 +91,18 @@ export class OpenRouterAdapter extends BaseOpenAIChatAdapter {
     const normalizedRequest = await normalizeOpenRouterRequest(request);
     const body = await this.buildRequestBody(normalizedRequest);
     const startedAt = Date.now();
-    const completion = await this.client.chat.send(
-      {
-        chatRequest: toSdkRequest(body),
-      } as never,
-      { signal: request.signal, headers: this.sdkHeaders } as never,
-    );
+    let completion: unknown;
+    try {
+      const sdkResult = await this.client.chat.send(
+        {
+          chatRequest: toSdkRequest(body),
+        } as never,
+        { signal: request.signal, headers: this.sdkHeaders, timeoutMs: request.modelTimeoutMs } as never,
+      );
+      completion = unwrapOpenRouterSdkResult(sdkResult);
+    } catch (error) {
+      throw enrichOpenRouterSdkError(error);
+    }
 
     const parsed = this.parseResponse(fromSdkResponse(completion));
     return {
@@ -114,6 +126,115 @@ function toSdkRequest(body: Record<string, unknown>): Record<string, unknown> {
     responseFormat: toProviderSdkResponseFormat(body.response_format),
     parallelToolCalls: false,
   };
+}
+
+function unwrapOpenRouterSdkResult(result: unknown): unknown {
+  if (!isRecord(result) || typeof result.ok !== 'boolean') {
+    return result;
+  }
+
+  if (result.ok) {
+    return 'value' in result ? result.value : result;
+  }
+
+  throw enrichOpenRouterSdkError(result.error);
+}
+
+function enrichOpenRouterSdkError(error: unknown): Error {
+  const normalized = error instanceof Error ? error : new Error(String(error));
+  if (typeof readUnknown(normalized, 'modelInvocationPhase') === 'string') {
+    return normalized;
+  }
+
+  const statusCode = readFiniteNumber(normalized, 'statusCode');
+  const phase = statusCode === undefined ? 'http_request' : 'http_status';
+  const providerDetail = extractOpenRouterErrorDetail(normalized);
+  const baseError = providerDetail ? new Error(`${normalized.message}: ${providerDetail}`, { cause: normalized }) : normalized;
+  baseError.name = normalized.name || baseError.name;
+
+  return withModelInvocationDiagnostics(baseError, {
+    modelInvocationPhase: phase,
+    modelInvocationAttempt: 1,
+    modelInvocationStatusCode: statusCode,
+  });
+}
+
+function extractOpenRouterErrorDetail(error: Error): string | undefined {
+  const body = readString(error, 'body');
+  const bodyDetail = body ? extractOpenRouterBodyDetail(body) : undefined;
+  if (bodyDetail) {
+    return bodyDetail;
+  }
+
+  const cause = readUnknown(error, 'cause');
+  if (cause instanceof Error && cause.message && cause.message !== error.message) {
+    return cause.message;
+  }
+
+  return undefined;
+}
+
+function extractOpenRouterBodyDetail(body: string): string | undefined {
+  const trimmed = body.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    const parsedDetail = readNestedString(parsed, [
+      ['error', 'message'],
+      ['error', 'detail'],
+      ['error', 'code'],
+      ['message'],
+      ['detail'],
+    ]);
+    if (parsedDetail) {
+      return parsedDetail;
+    }
+  } catch {
+    // Fall back to the raw body preview below.
+  }
+
+  return trimmed.length > 500 ? `${trimmed.slice(0, 500)}...` : trimmed;
+}
+
+function readNestedString(value: unknown, paths: string[][]): string | undefined {
+  for (const path of paths) {
+    let current = value;
+    for (const segment of path) {
+      if (!isRecord(current) || !(segment in current)) {
+        current = undefined;
+        break;
+      }
+
+      current = current[segment];
+    }
+
+    if (typeof current === 'string' && current.trim()) {
+      return current.trim();
+    }
+  }
+
+  return undefined;
+}
+
+function readUnknown(value: unknown, key: string): unknown {
+  return isRecord(value) ? value[key] : undefined;
+}
+
+function readString(value: unknown, key: string): string | undefined {
+  const found = readUnknown(value, key);
+  return typeof found === 'string' ? found : undefined;
+}
+
+function readFiniteNumber(value: unknown, key: string): number | undefined {
+  const found = readUnknown(value, key);
+  return typeof found === 'number' && Number.isFinite(found) ? found : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
 }
 
 function toSdkMessage(message: unknown): Record<string, unknown> {

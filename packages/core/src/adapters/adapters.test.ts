@@ -1022,6 +1022,52 @@ describe('OpenRouterAdapter', () => {
     expect(fetchRequest().url).toBe('https://openrouter.ai/api/v1/chat/completions');
   });
 
+  it('annotates OpenRouter SDK transport timeouts with the HTTP request phase', async () => {
+    const adapter = new OpenRouterAdapter({
+      model: 'anthropic/claude-sonnet-4',
+      apiKey: 'or-key',
+    });
+    fetchSpy.mockRejectedValueOnce(new DOMException('The operation timed out.', 'TimeoutError'));
+
+    let error: unknown;
+    try {
+      await adapter.generate(simpleRequest({ modelTimeoutMs: 200000 }));
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toMatchObject({
+      modelInvocationPhase: 'http_request',
+      modelInvocationAttempt: 1,
+    });
+    expect((error as Error).message).toContain('timed out');
+    expect(fetchRequest().signal).toBeDefined();
+  });
+
+  it('annotates OpenRouter SDK HTTP error results with status diagnostics', async () => {
+    const adapter = new OpenRouterAdapter({
+      model: 'anthropic/claude-sonnet-4',
+      apiKey: 'or-key',
+    });
+    mockFetchResponse({ error: { message: 'edge timeout detail' } }, 524);
+
+    let error: unknown;
+    try {
+      await adapter.generate(simpleRequest());
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toMatchObject({
+      modelInvocationPhase: 'http_status',
+      modelInvocationAttempt: 1,
+      modelInvocationStatusCode: 524,
+    });
+    expect((error as Error).message).toContain('edge timeout detail');
+  });
+
   it('translates structured output into the OpenRouter SDK responseFormat shape', async () => {
     const adapter = new OpenRouterAdapter({
       model: 'anthropic/claude-sonnet-4',

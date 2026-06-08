@@ -237,6 +237,35 @@ describe('AdaptiveAgent', () => {
     });
   });
 
+  it('keeps system messages in the provider-compatible prefix for chat-style runs', async () => {
+    const model = new SequenceModel([{ finishReason: 'stop', text: 'done' }]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore: new InMemoryRunStore(),
+      eventStore: new InMemoryEventStore(),
+      snapshotStore: new InMemorySnapshotStore(),
+    });
+
+    const result = await agent.chat({
+      messages: [
+        { role: 'user', content: 'Remember this preference.' },
+        { role: 'system', content: 'Reply tersely.' },
+        { role: 'user', content: 'Say done.' },
+      ],
+    });
+
+    expect(result.status).toBe('success');
+    const requestMessages = model.receivedRequests[0]?.messages ?? [];
+    const firstNonSystemIndex = requestMessages.findIndex((message) => message.role !== 'system');
+    expect(firstNonSystemIndex).toBeGreaterThan(0);
+    expect(requestMessages.slice(firstNonSystemIndex).some((message) => message.role === 'system')).toBe(false);
+    expect(requestMessages[firstNonSystemIndex - 1]).toMatchObject({
+      role: 'system',
+      content: 'Reply tersely.',
+    });
+  });
+
   it('adds run image inputs to the initial user model message without embedding bytes', async () => {
     const runStore = new InMemoryRunStore();
     const eventStore = new InMemoryEventStore();
@@ -3781,7 +3810,8 @@ describe('AdaptiveAgent', () => {
       preview: expect.stringContaining('near the web research budget'),
     });
 
-    expect(model.receivedRequests[1]?.messages).toEqual(
+    const secondRequestMessages = model.receivedRequests[1]?.messages ?? [];
+    expect(secondRequestMessages).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           role: 'system',
@@ -3789,6 +3819,13 @@ describe('AdaptiveAgent', () => {
         }),
       ]),
     );
+    const firstNonSystemIndex = secondRequestMessages.findIndex((message) => message.role !== 'system');
+    const checkpointIndex = secondRequestMessages.findIndex(
+      (message) => message.role === 'system' && typeof message.content === 'string' && message.content.includes('near the web research budget'),
+    );
+    expect(checkpointIndex).toBeGreaterThanOrEqual(0);
+    expect(firstNonSystemIndex).toBeGreaterThan(checkpointIndex);
+    expect(secondRequestMessages.slice(firstNonSystemIndex).some((message) => message.role === 'system')).toBe(false);
   });
 
   it('steers the model to answer from current evidence when the search budget is exhausted', async () => {

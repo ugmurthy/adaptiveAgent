@@ -15,6 +15,7 @@ import type {
   JsonValue,
   ModelContentPart,
   RunResult,
+  SwarmRetryResult,
   SwarmRunResult,
   SwarmSubtask,
 } from '@adaptive-agent/core';
@@ -26,6 +27,7 @@ import {
   inspectAgentSdkResolution,
   loadAgentSdkConfig,
   type AgentConfigFile,
+  type AgentSdkOptions,
   type AgentSdkChatOptions,
   type AgentSdkRunOptions,
   type OrchestratedRunResult,
@@ -43,9 +45,10 @@ import { applyNamedStyle, formatStyledMessageBlock } from './tui/message-styles.
 marked.use(markedTerminal() as never);
 
 export interface ManualTestCliOptions {
-  command: 'run' | 'chat' | 'spec' | 'config' | 'eval' | 'swarm-run';
+  command: 'run' | 'chat' | 'spec' | 'config' | 'eval' | 'swarm-run' | 'retry';
   specPath: string;
   goalArgs: string[];
+  runId?: string;
   promptFilePath?: string;
   inputJson?: JsonValue;
   imagePaths: string[];
@@ -85,6 +88,7 @@ export interface ManualTestCliOptions {
   events: boolean;
   inspect: boolean;
   showLines: number;
+  wrapWidth?: number;
   dryRun: boolean;
   output: 'pretty' | 'json' | 'jsonl';
   help: boolean;
@@ -199,6 +203,8 @@ Agent SDK CLI
 Usage:
   adaptive-agent run [options] <goal...>
   adaptive-agent swarm-run --agent <path-or-name> --worker-catalog <paths-or-names> [options] <task...>
+  adaptive-agent retry --run-id <runId> [options]
+  adaptive-agent retry --agent <path-or-name> --worker-catalog <paths-or-names> [options] <sessionId>
   adaptive-agent chat [options] [message...]
   adaptive-agent spec <path> [options]
   adaptive-agent config [options]
@@ -212,6 +218,7 @@ Eval usage:
 Commands:
   run                   Run a one-shot goal.
   swarm-run             Decompose one task into bounded worker runs and synthesize a final result.
+  retry                 Retry one failed run, or retry a swarm session by session id.
   chat                  Send one chat turn. Reads stdin when no message is given.
   spec                  Run the existing JSON spec format.
   config                Print resolved SDK configuration.
@@ -247,10 +254,12 @@ Options:
                           Optional synthesizer agent JSON path or filename for swarm-run.
   --max-workers <n>       Maximum concurrent swarm workers.
   --session-id <id>       Session id for run grouping.
+  --run-id <id>           Retry this single failed run instead of a session.
   --progress              Print assistant progress updates as they arrive.
   --events                Print lifecycle events as they arrive.
   --inspect               Print a compact inspection summary after completion.
   --show-lines <n>        Maximum pretty-rendered progress lines to show. Default: 3.
+  --wrap-width <n>        Fold progress/event text after this many columns. Default: terminal width or 100.
   --dry-run               Resolve config, request, tools, and delegates without running.
   --output <format>       Output format: pretty, json, or jsonl. Default: pretty.
   --help                  Show this help text.
@@ -315,6 +324,10 @@ export async function main(argv = Bun.argv.slice(2)): Promise<number> {
     return runSwarmCommand(cli);
   }
 
+  if (cli.command === 'retry') {
+    return runRetryCommand(cli);
+  }
+
   if (cli.command === 'chat') {
     return runInlineCommand(cli, 'chat');
   }
@@ -336,22 +349,26 @@ async function runSpecCommand(cli: ManualTestCliOptions): Promise<number> {
   const warnings = collectProviderWarnings(spec, resolvedConfig.model.provider);
   const eventLog: Array<Record<string, JsonValue>> = [];
   const lastProgressContentByRun = new Map<string, string>();
-    const eventListener = shouldListenForCliEvents(cli) ? (event: AgentEvent) => {
-      const entry = summarizeEvent(event);
-      eventLog.push(entry);
-      if (cli.events && cli.output === 'pretty') {
-        printEvent(entry, resolvedConfig.tui);
-      } else if (cli.progress && cli.output === 'pretty') {
-        printProgressEvent(event, lastProgressContentByRun, resolvedConfig.tui, cli.showLines);
-      }
-    } : undefined;
-    const orchestrationListener = shouldListenForCliEvents(cli) ? (event: OrchestrationLifecycleEvent) => {
-      const entry = summarizeOrchestrationLifecycleEvent(event);
-      eventLog.push(entry);
-      if ((cli.events || cli.progress) && cli.output === 'pretty') {
-        printOrchestrationLifecycleEvent(event, resolvedConfig.tui);
-      }
-    } : undefined;
+  const progressRunColors = cli.progress && cli.output === 'pretty' ? new RunColorRegistry() : undefined;
+  const eventListener = shouldListenForCliEvents(cli) ? (event: AgentEvent) => {
+    const entry = summarizeEvent(event);
+    eventLog.push(entry);
+    if (progressRunColors) {
+      printRunBoundaryEvent(event, resolvedConfig.tui, progressRunColors, cli.wrapWidth);
+    }
+    if (cli.events && cli.output === 'pretty') {
+      printEvent(entry, resolvedConfig.tui);
+    } else if (cli.progress && cli.output === 'pretty') {
+      printProgressEvent(event, lastProgressContentByRun, resolvedConfig.tui, cli.showLines, cli.wrapWidth);
+    }
+  } : undefined;
+  const orchestrationListener = shouldListenForCliEvents(cli) ? (event: OrchestrationLifecycleEvent) => {
+    const entry = summarizeOrchestrationLifecycleEvent(event);
+    eventLog.push(entry);
+    if ((cli.events || cli.progress) && cli.output === 'pretty') {
+      printOrchestrationLifecycleEvent(event, resolvedConfig.tui);
+    }
+  } : undefined;
 
   for (const warning of warnings) {
     if (cli.output === 'pretty') {
@@ -443,13 +460,17 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
   const warnings = collectProviderWarnings(spec, resolvedConfig.model.provider);
   const eventLog: Array<Record<string, JsonValue>> = [];
   const lastProgressContentByRun = new Map<string, string>();
+  const progressRunColors = cli.progress && cli.output === 'pretty' ? new RunColorRegistry() : undefined;
   const eventListener = shouldListenForCliEvents(cli) ? (event: AgentEvent) => {
     const entry = summarizeEvent(event);
     eventLog.push(entry);
+    if (progressRunColors) {
+      printRunBoundaryEvent(event, resolvedConfig.tui, progressRunColors, cli.wrapWidth);
+    }
     if (cli.events && cli.output === 'pretty') {
       printEvent(entry, resolvedConfig.tui);
     } else if (cli.progress && cli.output === 'pretty') {
-      printProgressEvent(event, lastProgressContentByRun, resolvedConfig.tui, cli.showLines);
+      printProgressEvent(event, lastProgressContentByRun, resolvedConfig.tui, cli.showLines, cli.wrapWidth);
     }
   } : undefined;
   const orchestrationListener = shouldListenForCliEvents(cli) ? (event: OrchestrationLifecycleEvent) => {
@@ -527,20 +548,14 @@ async function runSwarmCommand(cli: ManualTestCliOptions): Promise<number> {
   const topLevelObjective = await readInlinePrompt(cli, 'swarm task');
   const sdkOptions = buildSdkOptions(cli, resolvedCwd);
   const eventLog: Array<Record<string, JsonValue>> = [];
-  const coordinatorConfig = await loadAgentSdkConfig(sdkOptions);
-  const workerConfigs = await Promise.all(cli.workerCatalogPaths.map((agentConfigPath) => loadAgentSdkConfig({ ...sdkOptions, agentConfigPath })));
-  const qualityConfig = await loadAgentSdkConfig({
-    ...sdkOptions,
-    ...(cli.qualityAgentPath
-      ? { agentConfigPath: cli.qualityAgentPath }
-      : { agentConfig: roleAgentConfig(coordinatorConfig.agent, 'quality') }),
-  });
-  const synthesizerConfig = await loadAgentSdkConfig({
-    ...sdkOptions,
-    ...(cli.synthesizerAgentPath
-      ? { agentConfigPath: cli.synthesizerAgentPath }
-      : { agentConfig: roleAgentConfig(coordinatorConfig.agent, 'synthesizer') }),
-  });
+  const coordinatorConfig = await loadFlaggedAgentSdkConfig(sdkOptions, '--agent', cli.agentConfigPath ?? 'agent.json');
+  const workerConfigs = await Promise.all(cli.workerCatalogPaths.map((agentConfigPath) => loadFlaggedAgentSdkConfig(sdkOptions, '--worker-catalog', agentConfigPath)));
+  const qualityConfig = cli.qualityAgentPath
+    ? await loadFlaggedAgentSdkConfig(sdkOptions, '--quality-agent', cli.qualityAgentPath)
+    : await loadAgentSdkConfig({ ...sdkOptions, agentConfig: roleAgentConfig(coordinatorConfig.agent, 'quality') });
+  const synthesizerConfig = cli.synthesizerAgentPath
+    ? await loadFlaggedAgentSdkConfig(sdkOptions, '--synthesizer-agent', cli.synthesizerAgentPath)
+    : await loadAgentSdkConfig({ ...sdkOptions, agentConfig: roleAgentConfig(coordinatorConfig.agent, 'synthesizer') });
   const workerIds = workerConfigs.map((config) => config.agent.id);
   const duplicateWorkerId = workerIds.find((id, index) => workerIds.indexOf(id) !== index);
   if (duplicateWorkerId) throw new Error(`swarm-run worker catalog contains duplicate agent id: ${duplicateWorkerId}`);
@@ -555,34 +570,24 @@ async function runSwarmCommand(cli: ManualTestCliOptions): Promise<number> {
   const eventListener = shouldListenForCliEvents(cli) ? (event: AgentEvent) => {
     const entry = summarizeEvent(event);
     eventLog.push(entry);
-    if (swarmColors && event.type === 'run.created') {
-      printRunStartedEvent(event, coordinatorConfig.tui, swarmColors);
+    if (swarmColors && cli.progress) {
+      printRunBoundaryEvent(event, coordinatorConfig.tui, swarmColors, cli.wrapWidth);
     }
     if (cli.events && cli.output === 'pretty') {
       printEvent(entry, coordinatorConfig.tui, swarmColors);
     } else if (cli.progress && cli.output === 'pretty') {
-      printProgressEvent(event, lastProgressContentByRun, coordinatorConfig.tui, cli.showLines, swarmColors);
+      printProgressEvent(event, lastProgressContentByRun, coordinatorConfig.tui, cli.showLines, cli.wrapWidth, swarmColors);
     }
   } : undefined;
 
-  const coordinatorSdk = await createAgentSdk({ ...sdkOptions, eventListener });
-  const workerSdks = await Promise.all(cli.workerCatalogPaths.map((agentConfigPath) => createAgentSdk({ ...sdkOptions, agentConfigPath, runtime: coordinatorSdk.created.runtime, eventListener })));
-  const qualitySdk = await createAgentSdk({
-    ...sdkOptions,
-    ...(cli.qualityAgentPath
-      ? { agentConfigPath: cli.qualityAgentPath }
-      : { agentConfig: roleAgentConfig(coordinatorSdk.config.agent, 'quality') }),
-    runtime: coordinatorSdk.created.runtime,
-    eventListener,
-  });
-  const synthesizerSdk = await createAgentSdk({
-    ...sdkOptions,
-    ...(cli.synthesizerAgentPath
-      ? { agentConfigPath: cli.synthesizerAgentPath }
-      : { agentConfig: roleAgentConfig(coordinatorSdk.config.agent, 'synthesizer') }),
-    runtime: coordinatorSdk.created.runtime,
-    eventListener,
-  });
+  const coordinatorSdk = await createFlaggedAgentSdk({ ...sdkOptions, eventListener }, '--agent', cli.agentConfigPath ?? 'agent.json');
+  const workerSdks = await Promise.all(cli.workerCatalogPaths.map((agentConfigPath) => createFlaggedAgentSdk({ ...sdkOptions, agentConfigPath, runtime: coordinatorSdk.created.runtime, eventListener }, '--worker-catalog', agentConfigPath)));
+  const qualitySdk = cli.qualityAgentPath
+    ? await createFlaggedAgentSdk({ ...sdkOptions, agentConfigPath: cli.qualityAgentPath, runtime: coordinatorSdk.created.runtime, eventListener }, '--quality-agent', cli.qualityAgentPath)
+    : await createAgentSdk({ ...sdkOptions, agentConfig: roleAgentConfig(coordinatorSdk.config.agent, 'quality'), runtime: coordinatorSdk.created.runtime, eventListener });
+  const synthesizerSdk = cli.synthesizerAgentPath
+    ? await createFlaggedAgentSdk({ ...sdkOptions, agentConfigPath: cli.synthesizerAgentPath, runtime: coordinatorSdk.created.runtime, eventListener }, '--synthesizer-agent', cli.synthesizerAgentPath)
+    : await createAgentSdk({ ...sdkOptions, agentConfig: roleAgentConfig(coordinatorSdk.config.agent, 'synthesizer'), runtime: coordinatorSdk.created.runtime, eventListener });
 
   try {
     const sessionId = cli.sessionId ?? crypto.randomUUID();
@@ -626,9 +631,12 @@ async function runSwarmCommand(cli: ManualTestCliOptions): Promise<number> {
     const swarm = new SwarmCoordinator({
       runStore: coordinatorSdk.created.runtime.runStore,
       coordinatorAgent: coordinatorSdk.agent,
+      coordinatorAgentId: coordinatorSdk.config.agent.id,
       workerAgents: Object.fromEntries(workerSdks.map((sdk) => [sdk.config.agent.id, sdk.agent])),
       qualityAgent: qualitySdk.agent,
+      qualityAgentId: qualitySdk.config.agent.id,
       synthesizerAgent: synthesizerSdk.agent,
+      synthesizerAgentId: synthesizerSdk.config.agent.id,
       defaultMaxWorkers: cli.maxWorkers,
     });
     const result = await swarm.execute({
@@ -653,6 +661,95 @@ async function runSwarmCommand(cli: ManualTestCliOptions): Promise<number> {
       console.log(JSON.stringify(summarizeSwarmRun(result, workerIds, cli, subtasks)));
     } else {
       printSwarmResult(result, workerIds, cli);
+      if (cli.events && eventLog.length > 0) console.error(`event log captured: ${eventLog.length}`);
+    }
+    return result.status === 'succeeded' ? 0 : 1;
+  } finally {
+    await Promise.allSettled([
+      ...workerSdks.map((sdk) => sdk.close()),
+      qualitySdk.close(),
+      synthesizerSdk.close(),
+      coordinatorSdk.close(),
+    ]);
+  }
+}
+
+async function runRetryCommand(cli: ManualTestCliOptions): Promise<number> {
+  const resolvedCwd = resolve(cli.cwd ?? process.cwd());
+  const sdkOptions = buildSdkOptions(cli, resolvedCwd);
+  const eventLog: Array<Record<string, JsonValue>> = [];
+  const resolvedConfig = await loadAgentSdkConfig(sdkOptions);
+  const lastProgressContentByRun = new Map<string, string>();
+  const retryColors = cli.output === 'pretty' ? new RunColorRegistry() : undefined;
+  const eventListener = shouldListenForCliEvents(cli) ? (event: AgentEvent) => {
+    const entry = summarizeEvent(event);
+    eventLog.push(entry);
+    if (retryColors && cli.progress) {
+      printRunBoundaryEvent(event, resolvedConfig.tui, retryColors, cli.wrapWidth);
+    }
+    if (cli.events && cli.output === 'pretty') {
+      printEvent(entry, resolvedConfig.tui, retryColors);
+    } else if (cli.progress && cli.output === 'pretty') {
+      printProgressEvent(event, lastProgressContentByRun, resolvedConfig.tui, cli.showLines, cli.wrapWidth, retryColors);
+    }
+  } : undefined;
+
+  const coordinatorSdk = await createAgentSdk({ ...sdkOptions, eventListener });
+  if (cli.runId) {
+    try {
+      const inspection = await coordinatorSdk.inspect(cli.runId);
+      const runAgentId = typeof inspection.run?.metadata?.agentId === 'string' ? inspection.run.metadata.agentId : undefined;
+      if (runAgentId && runAgentId !== coordinatorSdk.config.agent.id) {
+        throw new Error(`Run ${cli.runId} belongs to agent ${runAgentId}; loaded agent is ${coordinatorSdk.config.agent.id}`);
+      }
+      const result = await coordinatorSdk.retry(cli.runId);
+      if (cli.output === 'json') {
+        console.log(JSON.stringify({ command: 'retry', runId: cli.runId, result: summarizeResult(result) }, null, 2));
+      } else if (cli.output === 'jsonl') {
+        console.log(JSON.stringify({ command: 'retry', runId: cli.runId, result: summarizeResult(result) }));
+      } else {
+        printResult(result, 'retry', resolvedConfig.tui);
+        if (cli.events && eventLog.length > 0) console.error(`event log captured: ${eventLog.length}`);
+      }
+      return isSuccessfulResult(result) ? 0 : 1;
+    } finally {
+      await coordinatorSdk.close();
+    }
+  }
+
+  const sessionId = cli.goalArgs[0]!;
+  const workerConfigs = await Promise.all(cli.workerCatalogPaths.map((agentConfigPath) => loadFlaggedAgentSdkConfig(sdkOptions, '--worker-catalog', agentConfigPath)));
+  const workerIds = workerConfigs.map((config) => config.agent.id);
+  const duplicateWorkerId = workerIds.find((id, index) => workerIds.indexOf(id) !== index);
+  if (duplicateWorkerId) throw new Error(`retry worker catalog contains duplicate agent id: ${duplicateWorkerId}`);
+
+  const qualitySdk = cli.qualityAgentPath
+    ? await createFlaggedAgentSdk({ ...sdkOptions, agentConfigPath: cli.qualityAgentPath, runtime: coordinatorSdk.created.runtime, eventListener }, '--quality-agent', cli.qualityAgentPath)
+    : await createAgentSdk({ ...sdkOptions, agentConfig: roleAgentConfig(coordinatorSdk.config.agent, 'quality'), runtime: coordinatorSdk.created.runtime, eventListener });
+  const synthesizerSdk = cli.synthesizerAgentPath
+    ? await createFlaggedAgentSdk({ ...sdkOptions, agentConfigPath: cli.synthesizerAgentPath, runtime: coordinatorSdk.created.runtime, eventListener }, '--synthesizer-agent', cli.synthesizerAgentPath)
+    : await createAgentSdk({ ...sdkOptions, agentConfig: roleAgentConfig(coordinatorSdk.config.agent, 'synthesizer'), runtime: coordinatorSdk.created.runtime, eventListener });
+  const workerSdks = await Promise.all(cli.workerCatalogPaths.map((agentConfigPath) => createFlaggedAgentSdk({ ...sdkOptions, agentConfigPath, runtime: coordinatorSdk.created.runtime, eventListener }, '--worker-catalog', agentConfigPath)));
+
+  try {
+    const swarm = new SwarmCoordinator({
+      runStore: coordinatorSdk.created.runtime.runStore,
+      coordinatorAgent: coordinatorSdk.agent,
+      coordinatorAgentId: coordinatorSdk.config.agent.id,
+      workerAgents: Object.fromEntries(workerSdks.map((sdk) => [sdk.config.agent.id, sdk.agent])),
+      qualityAgent: qualitySdk.agent,
+      qualityAgentId: qualitySdk.config.agent.id,
+      synthesizerAgent: synthesizerSdk.agent,
+      synthesizerAgentId: synthesizerSdk.config.agent.id,
+      defaultMaxWorkers: cli.maxWorkers,
+    });
+    const result = await swarm.retrySession({ sessionId, dryRun: cli.dryRun, maxWorkers: cli.maxWorkers });
+    if (cli.output === 'json') {
+      console.log(JSON.stringify(summarizeSwarmRetry(result), null, 2));
+    } else if (cli.output === 'jsonl') {
+      console.log(JSON.stringify(summarizeSwarmRetry(result)));
+    } else {
+      printSwarmRetryResult(result);
       if (cli.events && eventLog.length > 0) console.error(`event log captured: ${eventLog.length}`);
     }
     return result.status === 'succeeded' ? 0 : 1;
@@ -743,13 +840,13 @@ async function runEvalCommand(cli: ManualTestCliOptions): Promise<number> {
   const eventListener = (event: AgentEvent) => {
     const entry = summarizeEvent(event);
     eventLog.push(entry);
-    if (swarmColors && event.type === 'run.created') {
-      printRunStartedEvent(event, resolvedConfig.tui, swarmColors);
+    if (swarmColors && cli.progress) {
+      printRunBoundaryEvent(event, resolvedConfig.tui, swarmColors, cli.wrapWidth);
     }
     if (cli.events && cli.output === 'pretty') {
       printEvent(entry, resolvedConfig.tui, swarmColors);
     } else if (cli.progress && cli.output === 'pretty') {
-      printProgressEvent(event, lastProgressContentByRun, resolvedConfig.tui, cli.showLines, swarmColors);
+      printProgressEvent(event, lastProgressContentByRun, resolvedConfig.tui, cli.showLines, cli.wrapWidth, swarmColors);
     }
   };
   const sdk = await createAgentSdk({
@@ -851,7 +948,7 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if (!commandSeen && (arg === 'run' || arg === 'chat' || arg === 'spec' || arg === 'config' || arg === 'eval' || arg === 'swarm-run')) {
+    if (!commandSeen && (arg === 'run' || arg === 'chat' || arg === 'spec' || arg === 'config' || arg === 'eval' || arg === 'swarm-run' || arg === 'retry')) {
       options.command = arg;
       commandSeen = true;
       if (arg === 'spec' && argv[index + 1] && !argv[index + 1].startsWith('--')) {
@@ -879,6 +976,9 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
         break;
       case '--show-lines':
         options.showLines = parsePositiveIntegerOption(arg, requireOptionValue(arg, argv[++index]));
+        break;
+      case '--wrap-width':
+        options.wrapWidth = parsePositiveIntegerOption(arg, requireOptionValue(arg, argv[++index]));
         break;
       case '--dry-run':
         options.dryRun = true;
@@ -963,6 +1063,9 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
       case '--session-id':
         options.sessionId = requireOptionValue(arg, argv[++index]);
         break;
+      case '--run-id':
+        options.runId = requireOptionValue(arg, argv[++index]);
+        break;
       case '--mode':
         options.mode = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['chat', 'run']);
         break;
@@ -994,7 +1097,7 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
         options.output = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['pretty', 'json', 'jsonl']);
         break;
       default:
-        if (options.command === 'run' || options.command === 'chat' || options.command === 'swarm-run') {
+        if (options.command === 'run' || options.command === 'chat' || options.command === 'swarm-run' || options.command === 'retry') {
           options.goalArgs.push(arg);
           break;
         }
@@ -1029,6 +1132,24 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
     }
     if (options.orchestrate) {
       throw new Error('--orchestrate is not used with swarm-run; swarm-run already uses coordinated decomposition');
+    }
+  }
+
+  if (!options.help && options.command === 'retry') {
+    if (options.runId) {
+      if (options.goalArgs.length > 0) {
+        throw new Error('retry accepts --run-id <runId> or one positional <sessionId>, but not both');
+      }
+    } else {
+      if (options.goalArgs.length !== 1 || !options.goalArgs[0]?.trim()) {
+        throw new Error('retry requires --run-id <runId> or exactly one positional <sessionId>');
+      }
+      if (!options.agentConfigPath) {
+        throw new Error('retry <sessionId> requires --agent <path-or-name> for the coordinator agent');
+      }
+      if (options.workerCatalogPaths.length === 0) {
+        throw new Error('retry <sessionId> requires --worker-catalog <path-or-name,...>');
+      }
     }
   }
 
@@ -1962,6 +2083,7 @@ function summarizeCli(cli: ManualTestCliOptions): Record<string, JsonValue> {
     ...(cli.synthesizerAgentPath ? { synthesizerAgentPath: resolve(cli.synthesizerAgentPath) } : {}),
     ...(cli.maxWorkers ? { maxWorkers: cli.maxWorkers } : {}),
     ...(cli.sessionId ? { sessionId: cli.sessionId } : {}),
+    ...(cli.runId ? { runId: cli.runId } : {}),
     ...(cli.evalDataset ? { evalDataset: cli.evalDataset } : {}),
     ...(cli.evalInputPath ? { evalInputPath: resolve(cli.evalInputPath) } : {}),
     ...(cli.evalFilesDir ? { evalFilesDir: resolve(cli.evalFilesDir) } : {}),
@@ -2100,6 +2222,39 @@ function roleAgentConfig(base: AgentConfigFile, role: 'quality' | 'synthesizer')
   };
 }
 
+async function loadFlaggedAgentSdkConfig(
+  baseOptions: AgentSdkOptions,
+  flagName: '--agent' | '--worker-catalog' | '--quality-agent' | '--synthesizer-agent',
+  agentConfigPath: string,
+): Promise<Awaited<ReturnType<typeof loadAgentSdkConfig>>> {
+  try {
+    return await loadAgentSdkConfig({ ...baseOptions, agentConfigPath });
+  } catch (error) {
+    throw contextualAgentLoadError(flagName, agentConfigPath, error);
+  }
+}
+
+async function createFlaggedAgentSdk(
+  options: AgentSdkOptions,
+  flagName: '--agent' | '--worker-catalog' | '--quality-agent' | '--synthesizer-agent',
+  agentConfigPath: string,
+): Promise<Awaited<ReturnType<typeof createAgentSdk>>> {
+  try {
+    return await createAgentSdk(options);
+  } catch (error) {
+    throw contextualAgentLoadError(flagName, agentConfigPath, error);
+  }
+}
+
+function contextualAgentLoadError(flagName: string, value: string, error: unknown): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  const wrapped = new Error(`Unable to load ${flagName} agent "${value}": ${message}`);
+  if (error instanceof Error) {
+    wrapped.stack = `${wrapped.stack ?? wrapped.message}\nCaused by: ${error.stack ?? error.message}`;
+  }
+  return wrapped;
+}
+
 function summarizeSwarmRun(result: SwarmRunResult, workerIds: string[], cli: ManualTestCliOptions, subtasks: SwarmSubtask[]): JsonValue {
   return {
     command: 'swarm-run',
@@ -2121,6 +2276,25 @@ function summarizeSwarmRun(result: SwarmRunResult, workerIds: string[], cli: Man
     errorCode: result.errorCode ?? null,
     errorMessage: result.errorMessage ?? null,
     diagnostics: result.diagnostics ?? null,
+  } as JsonValue;
+}
+
+function summarizeSwarmRetry(result: SwarmRetryResult): JsonValue {
+  return {
+    command: 'retry',
+    retryTarget: 'swarm-session',
+    sessionId: result.sessionId,
+    coordinatorRunId: result.coordinatorRunId,
+    status: result.status,
+    retriedWorkerRunIds: result.retriedWorkerRunIds,
+    skippedWorkerRunIds: result.skippedWorkerRunIds as unknown as JsonValue,
+    subtaskResults: result.subtaskResults as unknown as JsonValue,
+    qualityRunId: result.qualityRunId ?? null,
+    synthesizerRunId: result.synthesizerRunId ?? null,
+    qualityAssessments: (result.qualityAssessments ?? []) as unknown as JsonValue,
+    output: result.output,
+    errorCode: result.errorCode ?? null,
+    errorMessage: result.errorMessage ?? null,
   } as JsonValue;
 }
 
@@ -2155,6 +2329,22 @@ function printSwarmResult(result: SwarmRunResult, workerIds: string[], cli: Manu
     console.log(renderPrettyString(typeof result.output === 'string' ? result.output : JSON.stringify(result.output, null, 2)));
   } else {
     console.error(`swarm-run failed: ${result.errorCode ?? 'UNKNOWN'} ${result.errorMessage ?? ''}`.trim());
+  }
+}
+
+function printSwarmRetryResult(result: SwarmRetryResult): void {
+  console.log(`retry: session=${result.sessionId} coordinator=${result.coordinatorRunId}`);
+  console.log(`workers retried: ${result.retriedWorkerRunIds.join(', ') || '(none)'}`);
+  if (result.skippedWorkerRunIds.length > 0) {
+    console.log(`workers skipped: ${result.skippedWorkerRunIds.map((entry) => `${entry.runId}:${entry.reason}`).join(', ')}`);
+  }
+  console.log(`runs: workers=${result.subtaskResults.map((subtask) => `${subtask.subtaskId}:${subtask.runId}:${subtask.status}`).join(', ') || '(none)'}`);
+  if (result.qualityRunId) console.log(`qualityRunId: ${result.qualityRunId}`);
+  if (result.synthesizerRunId) console.log(`synthesizerRunId: ${result.synthesizerRunId}`);
+  if (result.status === 'succeeded') {
+    console.log(renderPrettyString(typeof result.output === 'string' ? result.output : JSON.stringify(result.output, null, 2)));
+  } else {
+    console.error(`retry failed: ${result.errorCode ?? 'UNKNOWN'} ${result.errorMessage ?? ''}`.trim());
   }
 }
 
@@ -2360,19 +2550,48 @@ function shortRunId(runId: string): string {
   return runId.length > 8 ? runId.slice(0, 8) : runId;
 }
 
-function oneLinePreview(value: string, maxLength: number): string {
-  const normalized = value.replace(/\s+/g, ' ').trim();
-  if (normalized.length <= maxLength) return normalized;
-  return `${normalized.slice(0, Math.max(0, maxLength - 1))}…`;
+function printRunBoundaryEvent(event: AgentEvent, theme: TuiSettingsConfig, colors: RunColorRegistry, wrapWidth?: number): void {
+  if (event.type === 'run.created') {
+    printRunStartedEvent(event, theme, colors, wrapWidth);
+    return;
+  }
+  if (event.type === 'run.completed' || event.type === 'run.failed' || event.type === 'replan.required') {
+    printRunEndedEvent(event, theme, colors, wrapWidth);
+  }
 }
 
-function printRunStartedEvent(event: AgentEvent, theme: TuiSettingsConfig, colors: RunColorRegistry): void {
+function printRunStartedEvent(event: AgentEvent, theme: TuiSettingsConfig, colors: RunColorRegistry, wrapWidth?: number): void {
   if (typeof event.payload !== 'object' || event.payload === null || Array.isArray(event.payload)) return;
   const payload = event.payload as JsonObject;
   if (typeof payload.rootRunId === 'string' && payload.rootRunId !== event.runId) return;
   if (typeof payload.delegationDepth === 'number' && payload.delegationDepth > 0) return;
-  const goal = typeof payload.goal === 'string' ? ` goal="${oneLinePreview(payload.goal, 120)}"` : '';
-  const line = colors.colorize(event.runId, `[started] run=${event.runId}${goal}`);
+  const lines = [`[started] run: ${event.runId}`];
+  if (typeof payload.goal === 'string') {
+    lines.push(`goal: ${payload.goal.replace(/\s+/g, ' ').trim()}`);
+  }
+  const line = colors.colorize(event.runId, wrapRenderedText(lines.join('\n'), wrapWidth));
+  console.error(renderStyledPrettyMessage('event', line, theme));
+}
+
+function printRunEndedEvent(event: AgentEvent, theme: TuiSettingsConfig, colors: RunColorRegistry, wrapWidth?: number): void {
+  const payload = typeof event.payload === 'object' && event.payload !== null && !Array.isArray(event.payload)
+    ? event.payload as JsonObject
+    : {};
+  const status = event.type === 'run.completed'
+    ? 'completed'
+    : event.type === 'replan.required'
+      ? 'replan required'
+      : 'failed';
+  const lines = [`[${status}] run: ${event.runId}`];
+  const error = typeof payload.error === 'string' ? payload.error.replace(/\s+/g, ' ').trim() : undefined;
+  if (error) {
+    lines.push(`error: ${error}`);
+  }
+  const code = typeof payload.code === 'string' ? payload.code : undefined;
+  if (code) {
+    lines.push(`code: ${code}`);
+  }
+  const line = colors.colorize(event.runId, wrapRenderedText(lines.join('\n'), wrapWidth));
   console.error(renderStyledPrettyMessage('event', line, theme));
 }
 
@@ -2381,6 +2600,7 @@ function printProgressEvent(
   lastContentByRun: Map<string, string>,
   theme: TuiSettingsConfig,
   showLines: number,
+  wrapWidth?: number,
   colors?: RunColorRegistry,
 ): void {
   const assistantContent = extractAssistantProgressContent(event);
@@ -2391,13 +2611,79 @@ function printProgressEvent(
     return;
   }
   lastContentByRun.set(event.runId, assistantContent);
-  const rendered = limitRenderedProgressLines(renderPrettyString(assistantContent), showLines);
+  const rendered = limitRenderedProgressLines(wrapRenderedText(renderPrettyString(assistantContent), wrapWidth), showLines);
   if (colors) {
     const prefix = `[run ${shortRunId(event.runId)}]`;
-    console.error(formatStyledMessageBlock('progress', colors.colorize(event.runId, `${prefix} ${rendered}`), swarmProgressTheme(theme)));
+    console.error(formatStyledMessageBlock('progress', wrapRenderedText(colors.colorize(event.runId, `${prefix} ${rendered}`), wrapWidth), swarmProgressTheme(theme)));
     return;
   }
   console.error(formatStyledMessageBlock('progress', rendered, theme));
+}
+
+const ANSI_PATTERN = /\x1B\[[0-?]*[ -/]*[@-~]/g;
+
+function wrapRenderedText(rendered: string, requestedWidth?: number): string {
+  const width = requestedWidth ?? resolveDefaultWrapWidth();
+  if (!Number.isFinite(width) || width < 20) {
+    return rendered.trim();
+  }
+  return rendered
+    .trim()
+    .split(/\r?\n/)
+    .flatMap((line) => wrapRenderedLine(line, width))
+    .join('\n');
+}
+
+function wrapRenderedLine(line: string, width: number): string[] {
+  if (visibleLength(line) <= width) {
+    return [line];
+  }
+  const strippedLine = stripAnsi(line);
+  const labelMatch = /^(\s*[^:\s]+:\s+)(.+)$/.exec(strippedLine);
+  const leadingWhitespace = /^\s*/.exec(strippedLine)?.[0] ?? '';
+  const continuationIndent = labelMatch ? ' '.repeat(labelMatch[1].length) : leadingWhitespace;
+  const tokens = line.trim().split(/\s+/);
+  const lines: string[] = [];
+  let current = '';
+  let currentWidth = 0;
+
+  for (const token of tokens) {
+    const tokenWidth = visibleLength(token);
+    if (current && currentWidth + 1 + tokenWidth > width) {
+      lines.push(current);
+      current = `${continuationIndent}${token}`;
+      currentWidth = continuationIndent.length + tokenWidth;
+      continue;
+    }
+    if (!current) {
+      current = token;
+      currentWidth = tokenWidth;
+      continue;
+    }
+    current += ` ${token}`;
+    currentWidth += 1 + tokenWidth;
+  }
+
+  if (current) {
+    lines.push(current);
+  }
+  return lines.length > 0 ? lines : [line];
+}
+
+function visibleLength(value: string): number {
+  return stripAnsi(value).length;
+}
+
+function stripAnsi(value: string): string {
+  return value.replace(ANSI_PATTERN, '');
+}
+
+function resolveDefaultWrapWidth(): number {
+  const terminalWidth = process.stderr.columns || process.stdout.columns;
+  if (!terminalWidth || terminalWidth < 20) {
+    return 100;
+  }
+  return Math.max(40, Math.min(terminalWidth, 120));
 }
 
 function limitRenderedProgressLines(rendered: string, showLines: number): string {

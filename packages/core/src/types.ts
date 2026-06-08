@@ -778,6 +778,9 @@ export interface OrchestrationMetadata {
   coordinatorRunId: UUID;
   role: 'coordinator' | 'worker' | 'quality' | 'synthesizer';
   subtaskId?: string;
+  agentId?: string;
+  attempt?: number;
+  supersedesRunId?: UUID;
 }
 
 export interface SwarmRequest {
@@ -799,6 +802,52 @@ export interface SwarmExecutionRequest {
   contentParts?: ModelContentPart[];
   maxWorkers?: number;
   metadata?: Record<string, JsonValue>;
+}
+
+export interface SwarmExecutionDescriptor {
+  schemaVersion: 1;
+  sessionId: string;
+  coordinatorRunId: UUID;
+  topLevelObjective: string;
+  input?: JsonValue;
+  contentParts?: ModelContentPart[];
+  maxWorkers: number;
+  subtasks: SwarmSubtask[];
+  agents: {
+    coordinatorAgentId?: string;
+    workerAgentIds: Record<string, string>;
+    qualityAgentId?: string;
+    synthesizerAgentId?: string;
+  };
+}
+
+export interface RunRetryability {
+  runId: UUID;
+  retryable: boolean;
+  failureKind: FailureKind;
+  reason?: string;
+}
+
+export interface SwarmRetryRequest {
+  sessionId: string;
+  dryRun?: boolean;
+  allowPartial?: boolean;
+  maxWorkers?: number;
+}
+
+export interface SwarmRetryResult {
+  sessionId: string;
+  coordinatorRunId: UUID;
+  retriedWorkerRunIds: UUID[];
+  skippedWorkerRunIds: Array<{ runId: UUID; reason: string }>;
+  qualityRunId?: UUID;
+  synthesizerRunId?: UUID;
+  status: RunStatus;
+  output?: JsonValue;
+  errorCode?: string;
+  errorMessage?: string;
+  subtaskResults: SwarmSubtaskResult[];
+  qualityAssessments?: SwarmQualityAssessment[];
 }
 
 export interface SwarmSubtask {

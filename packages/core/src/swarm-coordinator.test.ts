@@ -19,7 +19,7 @@ class SequenceModel implements ModelAdapter {
 
   readonly receivedRequests: ModelRequest[] = [];
 
-  constructor(model: string, private readonly responses: ModelResponse[]) {
+  constructor(model: string, private readonly responses: Array<ModelResponse | Error>) {
     this.model = model;
   }
 
@@ -29,6 +29,9 @@ class SequenceModel implements ModelAdapter {
     const response = this.responses.shift();
     if (!response) {
       throw new Error(`${this.model} received an unexpected generate() call`);
+    }
+    if (response instanceof Error) {
+      throw response;
     }
     return structuredClone(response);
   }
@@ -167,6 +170,117 @@ describe('SwarmCoordinator', () => {
     });
     expect(researcherModel.receivedRequests[0]?.messages.at(-1)?.content).toContain('Research the market.');
     expect(synthesizerModel.receivedRequests[0]?.messages.at(-1)?.content).toContain('qualityAssessments');
+  });
+
+  it('retries failed swarm workers in place and creates fresh quality and synthesizer runs', async () => {
+    const runStore = new InMemoryRunStore();
+    const researcherModel = new SequenceModel('researcher', [
+      new Error('Model timed out after 90000ms'),
+      { finishReason: 'stop', structuredOutput: { finding: 'market recovered' } },
+    ]);
+    const writerModel = new SequenceModel('writer', [
+      { finishReason: 'stop', structuredOutput: { draft: 'initial draft' } },
+    ]);
+    const qualityModel = new SequenceModel('quality', [
+      {
+        finishReason: 'stop',
+        structuredOutput: {
+          assessments: [
+            { subtaskId: 'subtask-1', usable: false, recommendation: 'retry' },
+            { subtaskId: 'subtask-2', usable: true, recommendation: 'use' },
+          ],
+        },
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: {
+          assessments: [
+            { subtaskId: 'subtask-1', usable: true, recommendation: 'use' },
+            { subtaskId: 'subtask-2', usable: true, recommendation: 'use' },
+          ],
+        },
+      },
+    ]);
+    const synthesizerModel = new SequenceModel('synthesizer', [
+      { finishReason: 'stop', structuredOutput: { answer: 'Initial answer with a gap.' } },
+      { finishReason: 'stop', structuredOutput: { answer: 'Recovered answer.' } },
+    ]);
+
+    const swarm = new SwarmCoordinator({
+      runStore,
+      coordinatorAgent: createAgent(new SequenceModel('coordinator', []), runStore),
+      coordinatorAgentId: 'coordinator',
+      workerAgents: {
+        researcher: createAgent(researcherModel, runStore),
+        writer: createAgent(writerModel, runStore),
+      },
+      qualityAgent: createAgent(qualityModel, runStore),
+      qualityAgentId: 'quality',
+      synthesizerAgent: createAgent(synthesizerModel, runStore),
+      synthesizerAgentId: 'synthesizer',
+    });
+    await runStore.createRun({
+      id: 'coordinator-run-retry',
+      sessionId: 'session-swarm-retry',
+      goal: 'Create a market entry recommendation.',
+      metadata: { orchestration: { kind: 'swarm', coordinatorRunId: 'pending', role: 'coordinator' } },
+      status: 'running',
+    });
+
+    const initial = await swarm.execute({
+      sessionId: 'session-swarm-retry',
+      topLevelObjective: 'Create a market entry recommendation.',
+      coordinatorRunId: 'coordinator-run-retry',
+      maxWorkers: 2,
+      subtasks: [
+        { id: 'subtask-1', subObjective: 'Research the market.', targetAgentId: 'researcher' },
+        { id: 'subtask-2', subObjective: 'Draft the recommendation.', targetAgentId: 'writer' },
+      ],
+    });
+
+    expect(initial).toMatchObject({
+      status: 'succeeded',
+      output: { answer: 'Initial answer with a gap.' },
+      subtaskResults: [
+        { subtaskId: 'subtask-1', status: 'failed', errorCode: 'MODEL_ERROR' },
+        { subtaskId: 'subtask-2', status: 'succeeded' },
+      ],
+    });
+
+    const failedWorkerRunId = initial.subtaskResults[0]!.runId;
+    const firstQualityRunId = initial.qualityRunId;
+    const firstSynthesizerRunId = initial.synthesizerRunId;
+
+    const retried = await swarm.retrySession({ sessionId: 'session-swarm-retry' });
+
+    expect(retried).toMatchObject({
+      sessionId: 'session-swarm-retry',
+      coordinatorRunId: 'coordinator-run-retry',
+      status: 'succeeded',
+      output: { answer: 'Recovered answer.' },
+      retriedWorkerRunIds: [failedWorkerRunId],
+      subtaskResults: [
+        { subtaskId: 'subtask-1', runId: failedWorkerRunId, status: 'succeeded', output: { finding: 'market recovered' } },
+        { subtaskId: 'subtask-2', status: 'succeeded', output: { draft: 'initial draft' } },
+      ],
+    });
+    expect(retried.qualityRunId).toBeDefined();
+    expect(retried.synthesizerRunId).toBeDefined();
+    expect(retried.qualityRunId).not.toBe(firstQualityRunId);
+    expect(retried.synthesizerRunId).not.toBe(firstSynthesizerRunId);
+
+    const failedWorker = await runStore.getRun(failedWorkerRunId);
+    expect(failedWorker).toMatchObject({
+      status: 'succeeded',
+      metadata: { retryAttempts: 1, lastRetryFailureKind: 'timeout' },
+    });
+    const coordinatorRun = await runStore.getRun('coordinator-run-retry');
+    expect(coordinatorRun?.metadata?.swarmExecution).toMatchObject({
+      schemaVersion: 1,
+      sessionId: 'session-swarm-retry',
+      coordinatorRunId: 'coordinator-run-retry',
+    });
+    expect(coordinatorRun?.result).toMatchObject({ output: { answer: 'Recovered answer.' } });
   });
 
   it('rejects unknown targetAgentId before launching workers quality or synthesis', async () => {

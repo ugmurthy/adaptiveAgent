@@ -53,6 +53,7 @@ import type {
   RunFailureCode,
   RunRequest,
   RunResult,
+  RunRetryability,
   RunSnapshot,
   RunStatus,
   ToolBudget,
@@ -1166,6 +1167,27 @@ export class AdaptiveAgent {
     } finally {
       await this.releaseLeaseQuietly(run.id);
     }
+  }
+
+  async getRetryability(runId: UUID): Promise<RunRetryability> {
+    const run = await this.options.runStore.getRun(runId);
+    if (!run) {
+      throw new Error(`Run ${runId} does not exist`);
+    }
+
+    if (run.status !== 'failed') {
+      return {
+        runId,
+        retryable: false,
+        failureKind: classifyFailureKind(run.errorCode as RunFailureCode | undefined, run.errorMessage),
+        reason: `Run ${runId} is ${run.status}; only failed runs can be retried`,
+      };
+    }
+
+    const retryability = await this.checkFailedRunRetryability(run, await this.loadExecutionState(run));
+    return retryability.retryable
+      ? { runId, retryable: true, failureKind: retryability.failureKind }
+      : { runId, retryable: false, failureKind: retryability.failureKind, reason: retryability.reason };
   }
 
   async getRecoveryOptions(runId: UUID): Promise<RunRecoveryOptions> {
@@ -2496,7 +2518,12 @@ export class AdaptiveAgent {
       return;
     }
 
-    state.messages.push(...state.pendingRuntimeMessages);
+    const insertionIndex = state.messages.findIndex((message) => message.role !== 'system');
+    if (insertionIndex === -1) {
+      state.messages.push(...state.pendingRuntimeMessages);
+    } else {
+      state.messages.splice(insertionIndex, 0, ...state.pendingRuntimeMessages);
+    }
     state.pendingRuntimeMessages = [];
   }
 
@@ -3159,7 +3186,7 @@ export class AdaptiveAgent {
 
   private async generateModelResponse(run: AgentRun, state: ExecutionState): Promise<ModelResponse> {
     const modelRequest = {
-      messages: [...state.messages],
+      messages: normalizeSystemMessagesAtStart(state.messages),
       tools: this.plannerVisibleTools(state),
       outputSchema: state.outputSchema,
       metadata: run.metadata,
@@ -3974,6 +4001,31 @@ function buildInitialChatMessages(
       role: message.role,
       content: buildChatMessageContent(message.content, message.images),
     })),
+  ];
+}
+
+function normalizeSystemMessagesAtStart(messages: ModelMessage[]): ModelMessage[] {
+  let hasLateSystemMessage = false;
+  let seenNonSystemMessage = false;
+
+  for (const message of messages) {
+    if (message.role === 'system') {
+      if (seenNonSystemMessage) {
+        hasLateSystemMessage = true;
+        break;
+      }
+    } else {
+      seenNonSystemMessage = true;
+    }
+  }
+
+  if (!hasLateSystemMessage) {
+    return [...messages];
+  }
+
+  return [
+    ...messages.filter((message) => message.role === 'system'),
+    ...messages.filter((message) => message.role !== 'system'),
   ];
 }
 

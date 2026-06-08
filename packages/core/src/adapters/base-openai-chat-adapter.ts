@@ -613,7 +613,7 @@ function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === 'AbortError';
 }
 
-function withModelInvocationDiagnostics(error: unknown, diagnostics: ModelInvocationDiagnostics): Error {
+export function withModelInvocationDiagnostics(error: unknown, diagnostics: ModelInvocationDiagnostics): Error {
   const normalizedError = error instanceof Error ? error : new Error(String(error));
   Object.assign(normalizedError, diagnostics);
   return normalizedError;

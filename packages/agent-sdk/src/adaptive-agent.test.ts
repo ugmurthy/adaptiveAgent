@@ -143,6 +143,7 @@ describe('adaptive-agent cli parsing', () => {
       '--events',
       '--inspect',
       '--show-lines', '5',
+      '--wrap-width', '72',
       '--dry-run',
       '--output', 'json',
     ]);
@@ -171,6 +172,7 @@ describe('adaptive-agent cli parsing', () => {
       events: true,
       inspect: true,
       showLines: 5,
+      wrapWidth: 72,
       dryRun: true,
       output: 'json',
       help: false,
