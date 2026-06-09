@@ -40,12 +40,16 @@ import {
   type TuiSettingsConfig,
   type TuiTextStyleName,
 } from './index.js';
+import { doctorExitCode, renderDoctorReport, runDoctor } from './install/doctor.js';
+import { renderInitReport, runInit, type InitProfile } from './install/init.js';
+import { renderUpdateReport, runUpdate, updateExitCode } from './install/update.js';
+import { getVersionInfo, renderVersion } from './install/version.js';
 import { applyNamedStyle, formatStyledMessageBlock } from './tui/message-styles.js';
 
 marked.use(markedTerminal() as never);
 
 export interface ManualTestCliOptions {
-  command: 'run' | 'chat' | 'spec' | 'config' | 'eval' | 'swarm-run' | 'retry';
+  command: 'run' | 'chat' | 'spec' | 'config' | 'eval' | 'swarm-run' | 'retry' | 'init' | 'doctor' | 'update' | 'version';
   specPath: string;
   goalArgs: string[];
   runId?: string;
@@ -82,8 +86,20 @@ export interface ManualTestCliOptions {
   runtimeMode?: RuntimeMode;
   provider?: 'openrouter' | 'ollama' | 'mistral' | 'mesh';
   model?: string;
+  apiKeyEnv?: string;
+  profile?: InitProfile;
   approvalMode?: ApprovalMode;
   clarificationMode?: ClarificationMode;
+  yes: boolean;
+  force: boolean;
+  network: boolean;
+  providerCheck: boolean;
+  strict: boolean;
+  updateCheck: boolean;
+  updateVersion?: string;
+  updateChannel: 'stable' | 'preview';
+  updateRepo?: string;
+  updateBaseUrl?: string;
   progress: boolean;
   events: boolean;
   inspect: boolean;
@@ -206,8 +222,12 @@ Usage:
   adaptive-agent retry --run-id <runId> [options]
   adaptive-agent retry --agent <path-or-name> --worker-catalog <paths-or-names> [options] <sessionId>
   adaptive-agent chat [options] [message...]
+  adaptive-agent init [options]
+  adaptive-agent doctor [options]
+  adaptive-agent update [options]
   adaptive-agent spec <path> [options]
   adaptive-agent config [options]
+  adaptive-agent --version
   adaptive-agent --spec <path> [options]
   bun run ./packages/agent-sdk/dist/adaptive-agent.js --spec <path> [options]
 
@@ -220,6 +240,9 @@ Commands:
   swarm-run             Decompose one task into bounded worker runs and synthesize a final result.
   retry                 Retry one failed run, or retry a swarm session by session id.
   chat                  Send one chat turn. Reads stdin when no message is given.
+  init                  Create first-run configuration under ~/.adaptiveAgent.
+  doctor                Check CLI installation and local configuration.
+  update                Check for or apply GitHub Release updates.
   spec                  Run the existing JSON spec format.
   config                Print resolved SDK configuration.
 
@@ -227,16 +250,13 @@ Eval commands:
   eval cases            Run generic benchmark cases from JSON/JSONL.
   eval gaia             Run GAIA benchmark rows from JSON/JSONL.
 
-Options:
-  --spec <path>           Path to the JSON spec file.
-  --file <path>           Read run/chat prompt from a file.
-  --input-json <json>     JSON input passed to run requests.
-  --image <path>          Add an image attachment to a run request. Repeatable.
-  --audio <path>          Add an audio attachment to a run request. Repeatable.
-  --file-attachment <path>
-                          Add a file attachment to a run request. Repeatable.
-  --mode <chat|run>       Override the spec mode.
+Global options:
   --cwd <path>            Working directory used for SDK config lookup.
+  --output <format>       Output format: pretty, json, or jsonl. Default: pretty.
+  --version               Print adaptive-agent version.
+  --help                  Show this help text.
+
+Agent/config options (run, chat, spec, config, eval, swarm-run, retry):
   --agent <path-or-name>  Explicit path to agent.json, or filename from agents.dirs.
   --settings <path>       Explicit path to agent.settings.json.
   --runtime <mode>        Runtime mode: memory or postgres.
@@ -244,25 +264,89 @@ Options:
   --model <name>          Override model name.
   --approval <mode>       Approval mode: auto, manual, reject.
   --clarification <mode>  Clarification mode: interactive or fail.
+
+Run options:
+  --file <path>           Read run prompt from a file.
+  --input-json <json>     JSON input passed to run requests.
+  --image <path>          Add an image attachment to a run request. Repeatable.
+  --audio <path>          Add an audio attachment to a run request. Repeatable.
+  --file-attachment <path>
+                          Add a file attachment to a run request. Repeatable.
   --orchestrate           Route run requests through the orchestration SDK.
   --catalog <path>        Agent config path to add to orchestration catalog. Repeatable.
+
+Chat options:
+  --file <path>           Read chat message from a file.
+
+Spec options:
+  --spec <path>           Path to the JSON spec file.
+  --mode <chat|run>       Override the spec mode.
+  --orchestrate           Route run-mode specs through the orchestration SDK.
+  --catalog <path>        Agent config path to add to orchestration catalog. Repeatable.
+
+Swarm-run options:
+  --file <path>           Read swarm task from a file.
+  --input-json <json>     JSON input passed to swarm runs.
+  --image <path>          Add an image attachment to the coordinator request. Repeatable.
+  --audio <path>          Add an audio attachment to the coordinator request. Repeatable.
+  --file-attachment <path>
+                          Add a file attachment to the coordinator request. Repeatable.
   --worker-catalog <paths>
-                          Comma-separated worker agent JSON paths or filenames for swarm-run.
+                          Comma-separated worker agent JSON paths or filenames.
   --quality-agent <path-or-name>
-                          Optional quality agent JSON path or filename for swarm-run.
+                          Optional quality agent JSON path or filename.
   --synthesizer-agent <path-or-name>
-                          Optional synthesizer agent JSON path or filename for swarm-run.
+                          Optional synthesizer agent JSON path or filename.
   --max-workers <n>       Maximum concurrent swarm workers.
   --session-id <id>       Session id for run grouping.
-  --run-id <id>           Retry this single failed run instead of a session.
+
+Retry options:
+  --run-id <id>           Retry this single failed run instead of a swarm session.
+  --worker-catalog <paths>
+                          Comma-separated worker agent JSON paths or filenames for session retry.
+  --quality-agent <path-or-name>
+                          Optional quality agent JSON path or filename for session retry.
+  --synthesizer-agent <path-or-name>
+                          Optional synthesizer agent JSON path or filename for session retry.
+  --max-workers <n>       Maximum concurrent swarm workers for session retry.
+
+Init options:
+  --provider <name>       Provider to write: openrouter, ollama, mistral, mesh.
+  --model <name>          Model name to write.
+  --api-key-env <name>    Environment variable containing provider API key.
+  --profile <name>        Init profile: safe or coding.
+  --yes                   Accept command defaults for non-interactive setup.
+  --force                 Overwrite files when supported.
+  --dry-run               Show what init would create without writing files.
+
+Doctor options:
+  --agent <path-or-name>  Explicit path to agent.json, or filename from agents.dirs.
+  --settings <path>       Explicit path to agent.settings.json.
+  --runtime <mode>        Runtime store mode to validate: memory or postgres.
+  --provider <name>       Provider override to validate: openrouter, ollama, mistral, mesh.
+  --model <name>          Model override to validate.
+  --network               Allow doctor network checks against GitHub.
+  --provider-check        Allow doctor provider reachability checks.
+  --strict                Treat doctor warnings as failures.
+
+Update options:
+  --check                 Check for updates without installing.
+  --version <version>     Install or check a specific release version.
+  --channel <name>        Update channel: stable or preview. Default: stable.
+  --force                 Reinstall even when already up to date.
+  --yes                   Accept update prompts when supported.
+  --repo <owner/repo>     GitHub release repo for update checks.
+  --base-url <url>        Release asset base URL for update downloads.
+
+Run output/debug options (run, chat, spec, eval, swarm-run, retry):
   --progress              Print assistant progress updates as they arrive.
   --events                Print lifecycle events as they arrive.
-  --inspect               Print a compact inspection summary after completion.
   --show-lines <n>        Maximum pretty-rendered progress lines to show. Default: 3.
   --wrap-width <n>        Fold progress/event text after this many columns. Default: terminal width or 100.
   --dry-run               Resolve config, request, tools, and delegates without running.
-  --output <format>       Output format: pretty, json, or jsonl. Default: pretty.
-  --help                  Show this help text.
+
+Inspection options (run, chat, spec):
+  --inspect               Print a compact inspection summary after completion.
 
 Eval options:
   --input <path>          Benchmark input JSONL for eval cases.
@@ -280,6 +364,8 @@ Eval options:
   --split <value>         Add/filter benchmark split metadata.
   --type <value>          Run only rows with a matching attachment type: audio,
                           image, video, or other. Rows without attachments do not match.
+  --orchestrate           Route benchmark cases through the orchestration SDK.
+  --catalog <path>        Agent config path to add to orchestration catalog. Repeatable.
 `;
 
 const PROVIDER_INPUT_CAPABILITIES: Record<
@@ -312,6 +398,23 @@ export async function main(argv = Bun.argv.slice(2)): Promise<number> {
     return 0;
   }
 
+  if (cli.command === 'version') {
+    console.log(renderVersion(getVersionInfo()));
+    return 0;
+  }
+
+  if (cli.command === 'init') {
+    return runInitCommand(cli);
+  }
+
+  if (cli.command === 'doctor') {
+    return runDoctorCommand(cli);
+  }
+
+  if (cli.command === 'update') {
+    return runUpdateCommand(cli);
+  }
+
   if (cli.command === 'config') {
     return runConfigCommand(cli);
   }
@@ -337,6 +440,51 @@ export async function main(argv = Bun.argv.slice(2)): Promise<number> {
   }
 
   return runSpecCommand(cli);
+}
+
+async function runInitCommand(cli: ManualTestCliOptions): Promise<number> {
+  const report = await runInit({
+    cwd: cli.cwd,
+    provider: cli.provider,
+    model: cli.model,
+    apiKeyEnv: cli.apiKeyEnv,
+    profile: cli.profile,
+    yes: cli.yes,
+    force: cli.force,
+    dryRun: cli.dryRun,
+  });
+  console.log(renderInitReport(report, cli.output));
+  return report.actions.some((action) => action.kind === 'file' && action.status === 'exists') ? 1 : 0;
+}
+
+async function runDoctorCommand(cli: ManualTestCliOptions): Promise<number> {
+  const report = await runDoctor({
+    cwd: cli.cwd,
+    agent: cli.agentConfigPath,
+    settings: cli.settingsConfigPath,
+    runtime: cli.runtimeMode,
+    provider: cli.provider,
+    model: cli.model,
+    network: cli.network,
+    providerCheck: cli.providerCheck,
+    strict: cli.strict,
+  });
+  console.log(renderDoctorReport(report, cli.output));
+  return doctorExitCode(report, cli.strict);
+}
+
+async function runUpdateCommand(cli: ManualTestCliOptions): Promise<number> {
+  const report = await runUpdate({
+    check: cli.updateCheck,
+    targetVersion: cli.updateVersion,
+    channel: cli.updateChannel,
+    force: cli.force,
+    yes: cli.yes,
+    repo: cli.updateRepo,
+    baseUrl: cli.updateBaseUrl,
+  });
+  console.log(renderUpdateReport(report, cli.output));
+  return updateExitCode(report, cli.updateCheck);
 }
 
 async function runSpecCommand(cli: ManualTestCliOptions): Promise<number> {
@@ -708,7 +856,7 @@ async function runRetryCommand(cli: ManualTestCliOptions): Promise<number> {
       } else if (cli.output === 'jsonl') {
         console.log(JSON.stringify({ command: 'retry', runId: cli.runId, result: summarizeResult(result) }));
       } else {
-        printResult(result, 'retry', resolvedConfig.tui);
+        printResult(result, 'run', resolvedConfig.tui);
         if (cli.events && eventLog.length > 0) console.error(`event log captured: ${eventLog.length}`);
       }
       return isSuccessfulResult(result) ? 0 : 1;
@@ -934,6 +1082,13 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
     evalFailFast: false,
     evalSwarm: 1,
     evalOffset: 0,
+    yes: false,
+    force: false,
+    network: false,
+    providerCheck: false,
+    strict: false,
+    updateCheck: false,
+    updateChannel: 'stable',
     progress: false,
     events: false,
     inspect: false,
@@ -948,7 +1103,7 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if (!commandSeen && (arg === 'run' || arg === 'chat' || arg === 'spec' || arg === 'config' || arg === 'eval' || arg === 'swarm-run' || arg === 'retry')) {
+    if (!commandSeen && (arg === 'run' || arg === 'chat' || arg === 'spec' || arg === 'config' || arg === 'eval' || arg === 'swarm-run' || arg === 'retry' || arg === 'init' || arg === 'doctor' || arg === 'update')) {
       options.command = arg;
       commandSeen = true;
       if (arg === 'spec' && argv[index + 1] && !argv[index + 1].startsWith('--')) {
@@ -964,6 +1119,16 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
       case '--help':
       case '-h':
         options.help = true;
+        break;
+      case '--version':
+        if (options.command === 'update') {
+          options.updateVersion = requireOptionValue(arg, argv[++index]);
+          break;
+        }
+        options.command = 'version';
+        break;
+      case '--check':
+        options.updateCheck = true;
         break;
       case '--events':
         options.events = true;
@@ -982,6 +1147,31 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
         break;
       case '--dry-run':
         options.dryRun = true;
+        break;
+      case '--yes':
+        options.yes = true;
+        break;
+      case '--force':
+        options.force = true;
+        break;
+      case '--network':
+        options.network = true;
+        break;
+      case '--provider-check':
+        options.providerCheck = true;
+        options.network = true;
+        break;
+      case '--strict':
+        options.strict = true;
+        break;
+      case '--channel':
+        options.updateChannel = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['stable', 'preview']);
+        break;
+      case '--repo':
+        options.updateRepo = requireOptionValue(arg, argv[++index]);
+        break;
+      case '--base-url':
+        options.updateBaseUrl = requireOptionValue(arg, argv[++index]);
         break;
       case '--spec':
         options.specPath = requireOptionValue(arg, argv[++index]);
@@ -1086,6 +1276,12 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
         break;
       case '--model':
         options.model = requireOptionValue(arg, argv[++index]);
+        break;
+      case '--api-key-env':
+        options.apiKeyEnv = requireOptionValue(arg, argv[++index]);
+        break;
+      case '--profile':
+        options.profile = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['safe', 'coding']);
         break;
       case '--approval':
         options.approvalMode = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['auto', 'manual', 'reject']);

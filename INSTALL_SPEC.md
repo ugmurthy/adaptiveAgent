@@ -9,20 +9,26 @@ The goal is to give Linux, macOS, and Windows users a simple install and
 first-run flow:
 
 ```bash
-curl -fsSL https://adaptive-agent.dev/install.sh | sh
+curl -fsSL https://github.com/ugmurthy/adaptiveAgent/releases/latest/download/install.sh | sh
 adaptive-agent init
 adaptive-agent doctor
+adaptive-agent run "Hello, confirm you are working"
 adaptive-agent update
 ```
 
 Windows:
 
 ```powershell
-irm https://adaptive-agent.dev/install.ps1 | iex
+irm https://github.com/ugmurthy/adaptiveAgent/releases/latest/download/install.ps1 | iex
 adaptive-agent init
 adaptive-agent doctor
+adaptive-agent run "Hello, confirm you are working"
 adaptive-agent update
 ```
+
+A successful first-run flow means the user can install the binary, create
+configuration, diagnose missing prerequisites, and run one simple agent request
+without editing JSON by hand.
 
 ## Scope And Package Boundary
 
@@ -46,6 +52,10 @@ v0.2.0-preview.1
 Do not use a short git commit hash as the primary version. A short commit hash
 is useful as build metadata, but it cannot safely drive update ordering.
 
+During release, the git tag is the source of truth for the released version.
+Release automation should derive the CLI version and release asset names from
+the tag being published.
+
 `adaptive-agent --version` must print a stable first line:
 
 ```text
@@ -59,7 +69,13 @@ timestamp, release channel, or source repository when available.
 
 ## Release Assets
 
-GitHub Releases are the binary host. Each release must publish:
+GitHub Releases are the binary host. The source repository may also be the
+release asset repository; a separate distribution repository is not required for
+v0.1. The default base URL for downloads should be the GitHub Releases asset URL
+for `https://github.com/ugmurthy/adaptiveAgent`. `--repo` and `--base-url`
+remain override mechanisms for development, mirrors, and tests.
+
+Each release must publish:
 
 ```text
 adaptive-agent-v0.1.0-darwin-arm64.tar.gz
@@ -67,6 +83,8 @@ adaptive-agent-v0.1.0-darwin-x64.tar.gz
 adaptive-agent-v0.1.0-linux-arm64.tar.gz
 adaptive-agent-v0.1.0-linux-x64.tar.gz
 adaptive-agent-v0.1.0-windows-x64.zip
+install.sh
+install.ps1
 checksums.txt
 ```
 
@@ -86,7 +104,7 @@ version. Remote template packs can be added later as an explicit option.
 Compile `packages/agent-sdk/src/adaptive-agent.ts` into standalone binaries
 using Bun.
 
-Each produced binary must pass these smoke tests:
+For v0.1, macOS release binaries must pass these smoke tests before publishing:
 
 ```bash
 adaptive-agent --version
@@ -94,6 +112,10 @@ adaptive-agent --help
 adaptive-agent init --dry-run
 adaptive-agent doctor --output json
 ```
+
+Linux and Windows binaries may be cross-compiled and published without live OS
+smoke tests in v0.1. This limitation must be visible in release notes or CI
+status.
 
 Do not include `adaptive-agent-gaia-eval` in the default end-user installer.
 Include `adaptive-agent-tui` only if it is separately tested on macOS, Linux,
@@ -131,8 +153,62 @@ Rules:
 - Do not require `sudo` by default.
 - Fail closed on checksum mismatch.
 - Do not mutate user config files.
+- Do not mutate shell profile files or PowerShell PATH automatically. When PATH
+  changes are needed, print exact copy-paste commands for the detected shell or
+  PowerShell user environment.
 - Do not create `agent.settings.json` or agent configs from the installer.
   First-run config is handled by `adaptive-agent init`.
+
+### Manual And Trust-Friendly Install
+
+Document alternatives to piping a remote script directly into a shell:
+
+```bash
+curl -fsSLO https://github.com/ugmurthy/adaptiveAgent/releases/latest/download/install.sh
+less install.sh
+sh install.sh
+```
+
+```powershell
+irm https://github.com/ugmurthy/adaptiveAgent/releases/latest/download/install.ps1 -OutFile install.ps1
+Get-Content .\install.ps1
+.\install.ps1
+```
+
+Also document direct binary installation from GitHub Releases:
+
+1. Download the platform archive and `checksums.txt`.
+2. Verify the archive SHA-256 checksum.
+3. Extract the `adaptive-agent` binary into a user-local bin directory.
+4. Add that directory to PATH if needed.
+5. Run `adaptive-agent --version`.
+
+### User-Facing Quickstart Guide
+
+Ship a short copy-paste guide alongside the release. It should be shorter than
+this implementation spec and include only the happy path plus the most common
+API-key fix:
+
+```bash
+curl -fsSL https://github.com/ugmurthy/adaptiveAgent/releases/latest/download/install.sh | sh
+adaptive-agent init
+export OPENROUTER_API_KEY=<your-key>
+adaptive-agent doctor --provider-check
+adaptive-agent run "Hello, confirm you are working"
+```
+
+Windows:
+
+```powershell
+irm https://github.com/ugmurthy/adaptiveAgent/releases/latest/download/install.ps1 | iex
+adaptive-agent init
+$env:OPENROUTER_API_KEY = "<your-key>"
+adaptive-agent doctor --provider-check
+adaptive-agent run "Hello, confirm you are working"
+```
+
+If the installer reports that PATH is not configured, the guide should tell the
+user to copy and run the exact command printed by the installer.
 
 ## CLI Commands
 
@@ -153,6 +229,32 @@ All three commands support:
 
 Default output is `pretty`.
 
+### Config And Workspace Resolution
+
+Use the existing Agent SDK config resolution semantics. The install commands
+must not introduce a second workspace flag name.
+
+Settings lookup precedence:
+
+```text
+1. --settings when supported by the command
+2. ADAPTIVE_AGENT_SETTINGS
+3. ADAPTIVE_AGENT_HOME/agent.settings.json
+4. ~/.adaptiveAgent/agent.settings.json
+```
+
+Working directory and workspace root behavior:
+
+```text
+1. --cwd sets the command working directory used for config lookup.
+2. Settings `workspace.overrideRoot` overrides the agent workspace root.
+3. Agent `workspace.root` or `workspaceRoot` sets the workspace root.
+4. If no workspace root is configured, default to the resolved command cwd.
+```
+
+Relative workspace paths are resolved from the command cwd. `init` should write
+`workspaceRoot: "."` by default, not `$HOME`.
+
 ## `adaptive-agent init`
 
 ### Purpose
@@ -166,11 +268,22 @@ CLI without hand-authoring JSON.
 --provider openrouter|ollama|mistral|mesh
 --model <name>
 --api-key-env <name>
---workspace <path>
+--profile safe|coding
+--cwd <path>
+--yes
 --force
 --dry-run
 --output pretty|json|jsonl
 ```
+
+`--cwd` matches the existing CLI option and controls the working directory used
+for SDK config lookup and for resolving relative workspace paths. Do not add a
+separate `--workspace` option for `init` unless the main CLI also adopts it.
+
+When `adaptive-agent init` runs in a TTY and required choices are not supplied,
+it may prompt for provider, model, profile, API key environment variable, and
+whether to run `doctor` next. In non-TTY mode it must not prompt. `--yes`
+accepts defaults and is intended for scripts.
 
 ### Default Paths
 
@@ -204,6 +317,34 @@ Use `openrouter` by default unless `--provider` is supplied.
 For API-key providers, use `apiKeyEnv`; never write a raw API key value to disk.
 For `ollama`, omit `apiKeyEnv`.
 
+The default `apiKeyEnv` is derived from the provider name and should be shown to
+the user during `init` output and prompts:
+
+```text
+openrouter -> OPENROUTER_API_KEY
+mistral    -> MISTRAL_API_KEY
+mesh       -> MESH_API_KEY
+ollama     -> none
+```
+
+If a known provider environment variable is already set, `init` should mention
+that it was detected and use it to guide the default provider choice. It must
+not print the secret value.
+
+Default provider/model values:
+
+```text
+openrouter -> qwen/qwen3.5-27b
+mistral    -> mistral-small-2603
+mesh       -> qwen/qwen3.5-27b
+ollama     -> detected local model, otherwise llama3.2 with an `ollama pull`
+              reminder from `doctor`
+```
+
+The default profile is `safe`, which installs read-only tools for first-run.
+`coding` is an opt-in profile that may include mutating tools such as
+`write_file` and `shell_exec`.
+
 Default template:
 
 ```json
@@ -214,16 +355,14 @@ Default template:
   "defaultInvocationMode": "run",
   "model": {
     "provider": "openrouter",
-    "model": "openai/gpt-4.1-mini",
+    "model": "qwen/qwen3.5-27b",
     "apiKeyEnv": "OPENROUTER_API_KEY"
   },
-  "workspaceRoot": "$HOME",
+  "workspaceRoot": ".",
   "systemInstructions": "You are a helpful local agent.",
   "tools": [
     "read_file",
     "list_directory",
-    "write_file",
-    "shell_exec",
     "web_search",
     "read_web_page"
   ],
@@ -261,6 +400,12 @@ Embed these templates into the built CLI so `init` does not need network access.
 - Validate generated settings and agent config before exiting.
 - Keep all default user files under `~/.adaptiveAgent`.
 - Do not make model calls or provider API calls.
+- After successful pretty output, print exact next steps for setting the
+  provider environment variable, running `doctor`, and running a first simple
+  `adaptive-agent run` command.
+- If `--cwd` is omitted, write `workspaceRoot` as `.` so the runtime resolves it
+  relative to the command working directory rather than granting access to all
+  of `$HOME`.
 
 ### Output Model
 
@@ -278,6 +423,7 @@ interface InitReport {
   command: 'init';
   homeDir: string;
   dryRun: boolean;
+  yes: boolean;
   force: boolean;
   actions: InitAction[];
   settingsPath: string;
@@ -346,10 +492,16 @@ provider.reachability
 - `runtime.postgresConnection` is `skip` unless runtime resolves to `postgres`.
 - Missing API key is `fail` only when the resolved provider requires one.
 - For `ollama`, missing API key is not a failure.
+- For `ollama`, no detected local model is a `warn` with an exact
+  `ollama pull <model>` remedy.
 - Config lookup and validation should reuse existing Agent SDK config resolution
   where possible.
 - The command may load and validate `agent.json`, but must not start a run by
   default.
+- Every `warn` and `fail` check should include an actionable remedy in pretty
+  output and in the structured `remedy` field.
+- `doctor --network` should check GitHub reachability only. It should not call
+  provider APIs unless `--provider-check` is supplied.
 
 ### Output Model
 
@@ -361,6 +513,7 @@ interface DoctorCheck {
   label: string;
   status: DoctorStatus;
   message: string;
+  remedy?: string;
   details?: Record<string, unknown>;
 }
 
@@ -420,6 +573,11 @@ Defaults:
 
 `--repo` and `--base-url` are intended for development and testing.
 
+Release downloads should use direct GitHub Release asset URLs by default, not a
+custom update service. GitHub API calls may be used for release discovery, but
+archive and checksum downloads should resolve to the release assets published in
+the configured repository.
+
 ### Release Resolution
 
 Asset names are selected by platform and architecture:
@@ -449,6 +607,10 @@ Unsupported OS/arch combinations must fail with a clear message.
 10. Replace the installed binary.
 11. Run the installed binary with `--version`.
 
+On Windows v0.1, stop after verifying the extracted binary and return
+`manual_required` with exact manual update instructions instead of replacing the
+running executable.
+
 ### Replacement Rules
 
 macOS/Linux:
@@ -461,10 +623,9 @@ macOS/Linux:
 Windows:
 
 - Do not assume the running `.exe` can replace itself.
-- For v0.1, either:
-  - spawn a detached PowerShell helper that waits for the current process to
-    exit and then replaces the binary, or
-  - print a clear installer command and return a controlled failure/status.
+- For v0.1, do not replace the running executable. Download and verify the
+  target release, print the exact PowerShell installer command needed to update,
+  and return `manual_required`.
 
 ### Safety Rules
 
@@ -478,7 +639,7 @@ Windows:
 ### Output Model
 
 ```ts
-type UpdateStatus = 'up_to_date' | 'update_available' | 'updated' | 'failed';
+type UpdateStatus = 'up_to_date' | 'update_available' | 'updated' | 'manual_required' | 'failed';
 
 interface UpdateReport {
   command: 'update';
@@ -503,6 +664,7 @@ interface UpdateReport {
 2 invalid usage
 10 update available with --check
 11 no update available with --check
+12 manual update required
 ```
 
 ## Suggested Implementation Structure
@@ -525,6 +687,10 @@ different layout fits the package better.
 
 ## Testing Requirements
 
+For v0.1, CI must run smoke tests on macOS. Linux and Windows binaries may be
+cross-compiled and published without live OS smoke tests, but release notes and
+CI status should make that limitation visible.
+
 Add focused unit tests for:
 
 ```text
@@ -534,15 +700,25 @@ unsupported OS/arch handling
 checksum verification success/failure
 semver comparison
 init dry-run
+init dry-run does not create files or directories
 init refuses overwrite
 init force overwrite
+init --yes non-TTY defaults
+init safe and coding profile generation
+init provider env var detection without secret logging
+init generated default uses `workspaceRoot: "."`
+init generated default omits mutating tools
 init generated config validation
 doctor JSON shape
 doctor skips network by default
+doctor remedies for warnings and failures
 doctor strict warnings fail
+installer PATH command rendering
 update --check available
 update --check up-to-date
+update Windows manual_required
 update checksum mismatch failure
+first-run fake model adapter integration
 ```
 
 Use mocked GitHub, network, filesystem, and process execution operations for
@@ -556,6 +732,10 @@ adaptive-agent --help
 adaptive-agent init --dry-run
 adaptive-agent doctor --output json
 ```
+
+Add a first-run integration test for `adaptive-agent run "Hello, confirm you are
+working"` using a fake model adapter. Do not require real provider secrets for
+basic binary smoke tests.
 
 ## Non-Goals For First Release
 

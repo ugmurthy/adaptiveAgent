@@ -168,6 +168,13 @@ describe('adaptive-agent cli parsing', () => {
       model: 'qwen3.5',
       approvalMode: 'manual',
       clarificationMode: 'fail',
+      yes: false,
+      force: false,
+      network: false,
+      providerCheck: false,
+      strict: false,
+      updateCheck: false,
+      updateChannel: 'stable',
       progress: true,
       events: true,
       inspect: true,
@@ -318,6 +325,33 @@ describe('adaptive-agent cli parsing', () => {
 
   it('rejects --swarm outside eval', () => {
     expect(() => parseCliArgs(['run', '--swarm', '2', 'hello'])).toThrow('--swarm is supported for eval requests');
+  });
+
+  it('parses install workflow commands', () => {
+    expect(parseCliArgs(['--version'])).toMatchObject({ command: 'version' });
+    expect(parseCliArgs(['init', '--provider', 'mesh', '--model', 'qwen/qwen3.5-27b', '--profile', 'coding', '--api-key-env', 'MESH_API_KEY', '--yes', '--force'])).toMatchObject({
+      command: 'init',
+      provider: 'mesh',
+      model: 'qwen/qwen3.5-27b',
+      profile: 'coding',
+      apiKeyEnv: 'MESH_API_KEY',
+      yes: true,
+      force: true,
+    });
+    expect(parseCliArgs(['doctor', '--network', '--provider-check', '--strict'])).toMatchObject({
+      command: 'doctor',
+      network: true,
+      providerCheck: true,
+      strict: true,
+    });
+    expect(parseCliArgs(['update', '--check', '--version', '0.2.0', '--channel', 'preview', '--repo', 'owner/repo', '--base-url', 'https://example.test/releases/{tag}'])).toMatchObject({
+      command: 'update',
+      updateCheck: true,
+      updateVersion: '0.2.0',
+      updateChannel: 'preview',
+      updateRepo: 'owner/repo',
+      updateBaseUrl: 'https://example.test/releases/{tag}',
+    });
   });
 });
 

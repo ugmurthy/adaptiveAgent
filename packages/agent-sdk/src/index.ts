@@ -415,7 +415,7 @@ async function loadDelegates(names: string[], dirs: string[], availableTools: Se
 }
 
 async function loadOptionalSettings(cwd: string, explicitPath: string | undefined, env: NodeJS.ProcessEnv): Promise<{ path: string; value: AgentSettingsFile } | undefined> {
-  const candidates = [explicitPath, env.ADAPTIVE_AGENT_SETTINGS, resolve(cwd, 'agent.settings.json'), resolve(homedir(), '.adaptiveAgent', 'agent.settings.json')].filter(Boolean) as string[];
+  const candidates = [explicitPath, env.ADAPTIVE_AGENT_SETTINGS, resolve(cwd, 'agent.settings.json'), resolve(adaptiveAgentHome(env), 'agent.settings.json')].filter(Boolean) as string[];
   for (const candidate of candidates) {
     const path = resolvePath(cwd, candidate);
     if (await pathExists(path)) return { path, value: await readJson(path) as AgentSettingsFile };
@@ -425,7 +425,7 @@ async function loadOptionalSettings(cwd: string, explicitPath: string | undefine
 }
 
 async function loadRequiredAgent(cwd: string, explicitPath: string | undefined, env: NodeJS.ProcessEnv, agentDirs: string[]): Promise<{ path: string; value: AgentConfigFile }> {
-  const candidates = [explicitPath, env.ADAPTIVE_AGENT_CONFIG, resolve(cwd, 'agent.json'), resolve(homedir(), '.adaptiveAgent', 'agents', 'default-agent.json')].filter(Boolean) as string[];
+  const candidates = [explicitPath, env.ADAPTIVE_AGENT_CONFIG, resolve(cwd, 'agent.json'), resolve(adaptiveAgentHome(env), 'agents', 'default-agent.json')].filter(Boolean) as string[];
   for (const candidate of candidates) {
     const path = resolvePath(cwd, candidate);
     if (await pathExists(path)) return { path, value: await readJson(path) as AgentConfigFile };
@@ -513,6 +513,7 @@ export function expandEnvironmentVariables(value: string, env: NodeJS.ProcessEnv
 function expandOptional(value: string | undefined, env: NodeJS.ProcessEnv): string | undefined { return value ? expandEnvironmentVariables(value, env) : undefined; }
 function optionsString(value: string | undefined): string | undefined { return value && value.trim() ? value : undefined; }
 function defaultApiKeyEnv(provider: string): string | undefined { const normalized = provider.toLowerCase(); if (normalized === 'openrouter') return 'OPENROUTER_API_KEY'; if (normalized === 'mistral') return 'MISTRAL_API_KEY'; if (normalized === 'mesh') return 'MESH_API_KEY'; return undefined; }
+function adaptiveAgentHome(env: NodeJS.ProcessEnv): string { return env.ADAPTIVE_AGENT_HOME ? resolve(env.ADAPTIVE_AGENT_HOME) : resolve(homedir(), '.adaptiveAgent'); }
 function resolveAgentDirs(cwd: string, dirs: string[] | undefined, env: NodeJS.ProcessEnv): string[] { const selected = dirs?.length ? dirs : env.ADAPTIVE_AGENT_AGENTS_DIR ? env.ADAPTIVE_AGENT_AGENTS_DIR.split(delimiter).filter(Boolean) : ['./agents', '~/.adaptiveAgent/agents']; return selected.map((dir) => resolvePath(cwd, expandEnvironmentVariables(dir, env))); }
 function resolveSkillDirs(cwd: string, dirs: string[] | undefined, allowExamples: boolean | undefined, env: NodeJS.ProcessEnv): string[] { const selected = dirs?.length ? dirs : env.ADAPTIVE_AGENT_SKILLS_DIR ? env.ADAPTIVE_AGENT_SKILLS_DIR.split(delimiter).filter(Boolean) : ['./skills', '~/.adaptiveAgent/skills']; const resolved = selected.map((dir) => resolvePath(cwd, expandEnvironmentVariables(dir, env))); if (allowExamples) resolved.push(resolve(cwd, 'examples', 'skills')); return resolved; }
 function normalizeRecovery(recovery: AgentConfigFile['recovery']) { return recovery ? { ...recovery, continuation: recovery.continuation ? { enabled: recovery.continuation.enabled ?? true, defaultStrategy: recovery.continuation.defaultStrategy, requireUserApproval: recovery.continuation.requireUserApproval } : undefined } : undefined; }
