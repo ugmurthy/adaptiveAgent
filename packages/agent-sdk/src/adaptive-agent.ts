@@ -2779,6 +2779,10 @@ function printRunEndedEvent(event: AgentEvent, theme: TuiSettingsConfig, colors:
       ? 'replan required'
       : 'failed';
   const lines = [`[${status}] run: ${event.runId}`];
+  const lineage = renderRunLineage(event.runId, payload);
+  if (lineage) {
+    lines.push(lineage);
+  }
   const error = typeof payload.error === 'string' ? payload.error.replace(/\s+/g, ' ').trim() : undefined;
   if (error) {
     lines.push(`error: ${error}`);
@@ -2787,8 +2791,28 @@ function printRunEndedEvent(event: AgentEvent, theme: TuiSettingsConfig, colors:
   if (code) {
     lines.push(`code: ${code}`);
   }
-  const line = colors.colorize(event.runId, wrapRenderedText(lines.join('\n'), wrapWidth));
+  const colorRunId = terminalEventColorRunId(event.runId, payload);
+  const line = colors.colorize(colorRunId, wrapRenderedText(lines.join('\n'), wrapWidth));
   console.error(renderStyledPrettyMessage('event', line, theme));
+}
+
+function terminalEventColorRunId(runId: string, payload: JsonObject): string {
+  return typeof payload.parentRunId === 'string' ? payload.parentRunId : runId;
+}
+
+function renderRunLineage(runId: string, payload: JsonObject): string | undefined {
+  const rootRunId = typeof payload.rootRunId === 'string' ? payload.rootRunId : undefined;
+  const parentRunId = typeof payload.parentRunId === 'string' ? payload.parentRunId : undefined;
+  const parentStepId = typeof payload.parentStepId === 'string' ? payload.parentStepId : undefined;
+  const delegateName = typeof payload.delegateName === 'string' ? payload.delegateName : undefined;
+  const delegationDepth = typeof payload.delegationDepth === 'number' ? payload.delegationDepth : undefined;
+  const parts: string[] = [];
+  if (rootRunId && rootRunId !== runId) parts.push(`root=${rootRunId}`);
+  if (parentRunId) parts.push(`parent=${parentRunId}`);
+  if (parentStepId) parts.push(`parentStep=${parentStepId}`);
+  if (delegateName) parts.push(`delegate=${delegateName}`);
+  if (delegationDepth !== undefined && delegationDepth > 0) parts.push(`depth=${delegationDepth}`);
+  return parts.length > 0 ? `context: ${parts.join(' ')}` : undefined;
 }
 
 function printProgressEvent(

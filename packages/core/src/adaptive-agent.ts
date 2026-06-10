@@ -1765,6 +1765,45 @@ export class AdaptiveAgent {
       }
     }
 
+    if (tied) {
+      return undefined;
+    }
+
+    if (!bestName) {
+      return this.resolveRepeatedPrefixDelegateToolName(name, candidateNames);
+    }
+
+    return bestName;
+  }
+
+  private resolveRepeatedPrefixDelegateToolName(name: string, candidateNames: string[]): string | undefined {
+    const localName = name.slice(RESERVED_DELEGATE_PREFIX.length);
+    let bestName: string | undefined;
+    let tied = false;
+
+    for (const candidateName of candidateNames) {
+      const candidateLocalName = candidateName.slice(RESERVED_DELEGATE_PREFIX.length);
+      if (localName.length <= candidateLocalName.length) {
+        continue;
+      }
+
+      if (!localName.endsWith(candidateLocalName)) {
+        continue;
+      }
+
+      const repeatedPrefix = localName.slice(0, localName.length - candidateLocalName.length);
+      if (repeatedPrefix.length <= 2 || !candidateLocalName.startsWith(repeatedPrefix)) {
+        continue;
+      }
+
+      if (bestName) {
+        tied = true;
+        continue;
+      }
+
+      bestName = candidateName;
+    }
+
     if (!bestName || tied) {
       return undefined;
     }
@@ -3436,6 +3475,7 @@ export class AdaptiveAgent {
         payload: {
           output,
           stepsUsed: state.stepsUsed,
+          ...runLineagePayload(completedRun),
         },
       }),
     });
@@ -3482,6 +3522,7 @@ export class AdaptiveAgent {
         payload: {
           error,
           code,
+          ...runLineagePayload(failedRun),
         },
       }),
     });
@@ -3614,12 +3655,13 @@ export class AdaptiveAgent {
       stepId: failedRun.currentStepId,
       type: code === 'REPLAN_REQUIRED' ? 'replan.required' : 'run.failed',
       schemaVersion: 1,
-      payload: {
+      payload: removeUndefinedJsonFields({
         error,
         code,
         planId: failedRun.currentPlanId,
         planExecutionId: planExecution.id,
-      },
+        ...runLineagePayload(failedRun),
+      }),
     });
 
     this.logLifecycle(code === 'REPLAN_REQUIRED' ? 'warn' : 'error', code === 'REPLAN_REQUIRED' ? 'replan.required' : 'run.failed', {
@@ -4763,6 +4805,18 @@ function removeUndefinedJsonFields(value: Record<string, JsonValue | undefined>)
   }
 
   return result;
+}
+
+function runLineagePayload(
+  run: Pick<AgentRun, 'rootRunId' | 'parentRunId' | 'parentStepId' | 'delegateName' | 'delegationDepth'>,
+): JsonObject {
+  return removeUndefinedJsonFields({
+    rootRunId: run.rootRunId,
+    parentRunId: run.parentRunId,
+    parentStepId: run.parentStepId,
+    delegateName: run.delegateName,
+    delegationDepth: run.delegationDepth,
+  });
 }
 
 function readPendingSteerMessagesFromMetadata(

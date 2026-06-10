@@ -1311,12 +1311,95 @@ describe('AdaptiveAgent', () => {
 
     const parentEvents = await eventStore.listByRun(result.runId);
     expect(
-      parentEvents.some(
-        (event) =>
-          event.type === 'delegate.spawned' &&
-          'toolName' in event.payload &&
-          event.payload.toolName === 'delegate.researcher',
-      ),
+      parentEvents.some((event) => {
+        if (event.type !== 'delegate.spawned' || typeof event.payload !== 'object' || event.payload === null) {
+          return false;
+        }
+
+        return (event.payload as { toolName?: unknown }).toolName === 'delegate.researcher';
+      }),
+    ).toBe(true);
+  });
+
+  it('corrects a repeated-prefix delegate tool name returned by the model when there is a unique match', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'delegate-call-1',
+            name: 'delegate.researesearcher',
+            input: {
+              goal: 'Research repeated prefix typo recovery',
+              input: { topic: 'delegation stutter typo' },
+            },
+          },
+        ],
+      },
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'child-call-1',
+            name: 'lookup',
+            input: { topic: 'delegation stutter typo' },
+          },
+        ],
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: {
+          finding: 'child finished',
+        },
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: {
+          report: 'parent finished',
+        },
+      },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [createLookupTool()],
+      delegates: [
+        {
+          name: 'researcher',
+          description: 'Researches a topic using the lookup tool.',
+          allowedTools: ['lookup'],
+        },
+      ],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.run({ goal: 'Recover repeated prefix delegate typo' });
+    const childRuns = await runStore.listChildren(result.runId);
+
+    expect(result).toMatchObject({
+      status: 'success',
+      output: { report: 'parent finished' },
+    });
+    expect(childRuns).toHaveLength(1);
+    expect(childRuns[0]).toMatchObject({
+      delegateName: 'researcher',
+      status: 'succeeded',
+      result: { finding: 'child finished' },
+    });
+
+    const parentEvents = await eventStore.listByRun(result.runId);
+    expect(
+      parentEvents.some((event) => {
+        if (event.type !== 'delegate.spawned' || typeof event.payload !== 'object' || event.payload === null) {
+          return false;
+        }
+
+        return (event.payload as { toolName?: unknown }).toolName === 'delegate.researcher';
+      }),
     ).toBe(true);
   });
 

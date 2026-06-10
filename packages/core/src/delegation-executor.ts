@@ -717,10 +717,11 @@ export class DelegationExecutor {
         runId: childRunId,
         type: 'run.completed',
         schemaVersion: 1,
-        payload: {
+        payload: compactJsonObject({
           output: result.output,
           stepsUsed: result.stepsUsed,
-        },
+          ...runLineagePayload(childRun),
+        }),
       });
 
       this.logLifecycle('info', 'run.completed', {
@@ -747,10 +748,11 @@ export class DelegationExecutor {
       runId: childRunId,
       type: 'run.failed',
       schemaVersion: 1,
-      payload: {
+      payload: compactJsonObject({
         error: failure.error,
         code: failure.code,
-      },
+        ...runLineagePayload(childRun),
+      }),
     });
 
     this.logLifecycle('error', 'run.failed', {
@@ -1325,6 +1327,18 @@ function runDurationMs(run: AgentRun): number | undefined {
   }
 
   return Math.max(0, endedAt - startedAt);
+}
+
+function runLineagePayload(
+  run: Pick<AgentRun, 'rootRunId' | 'parentRunId' | 'parentStepId' | 'delegateName' | 'delegationDepth'>,
+): JsonObject {
+  return compactJsonObject({
+    rootRunId: run.rootRunId,
+    parentRunId: run.parentRunId,
+    parentStepId: run.parentStepId,
+    delegateName: run.delegateName,
+    delegationDepth: run.delegationDepth,
+  });
 }
 
 function toDelegateToolInput(input: JsonValue): DelegateToolInput {
