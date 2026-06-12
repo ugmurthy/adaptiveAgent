@@ -2,13 +2,15 @@ import { access, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { isAbsolute, resolve } from 'node:path';
 
-import type { AgentDefaults, JsonObject, JsonValue, ModelAdapterConfig } from '@adaptive-agent/core';
+import type { AgentDefaults, FailureKind, JsonObject, JsonValue, ModelAdapterConfig, StructuredOutputMode } from '@adaptive-agent/core';
 
 export const INVOCATION_MODES = ['chat', 'run'] as const;
 export const MODEL_PROVIDERS = ['openrouter', 'ollama', 'mistral', 'mesh'] as const;
 export const CAPTURE_MODES = ['full', 'summary', 'none'] as const;
 export const RESEARCH_POLICIES = ['none', 'light', 'standard', 'deep', 'gaia'] as const;
 export const TOOL_BUDGET_EXHAUSTED_ACTIONS = ['fail', 'continue_with_warning', 'ask_model'] as const;
+export const STRUCTURED_OUTPUT_MODES = ['prompted', 'strict'] as const satisfies readonly StructuredOutputMode[];
+const MODEL_RETRY_FAILURE_KINDS = ['timeout', 'network', 'rate_limit', 'provider_error'] as const satisfies readonly FailureKind[];
 
 export type InvocationMode = (typeof INVOCATION_MODES)[number];
 
@@ -150,6 +152,7 @@ export function resolveModelConfig(model: LocalModelAdapterConfig, env: NodeJS.P
     siteUrl: model.siteUrl,
     siteName: model.siteName,
     maxConcurrentRequests: model.maxConcurrentRequests,
+    structuredOutputMode: model.structuredOutputMode ?? 'prompted',
   };
 
   if (apiKey) {
@@ -274,6 +277,9 @@ function parseModelConfig(value: unknown, path: string, issues: string[]): Local
     siteUrl: expectOptionalNonEmptyString(model?.siteUrl, `${path}.siteUrl`, issues),
     siteName: expectOptionalNonEmptyString(model?.siteName, `${path}.siteName`, issues),
     maxConcurrentRequests: expectOptionalPositiveInteger(model?.maxConcurrentRequests, `${path}.maxConcurrentRequests`, issues),
+    structuredOutputMode: model?.structuredOutputMode === undefined
+      ? 'prompted'
+      : expectEnum(model.structuredOutputMode, STRUCTURED_OUTPUT_MODES, `${path}.structuredOutputMode`, issues),
   };
 }
 
@@ -287,6 +293,7 @@ function parseAgentDefaults(value: unknown, path: string, issues: string[]): Par
   assignIfDefined(parsed, 'maxSteps', expectOptionalPositiveInteger(defaults?.maxSteps, `${path}.maxSteps`, issues));
   assignIfDefined(parsed, 'toolTimeoutMs', expectOptionalPositiveInteger(defaults?.toolTimeoutMs, `${path}.toolTimeoutMs`, issues));
   assignIfDefined(parsed, 'modelTimeoutMs', expectOptionalPositiveInteger(defaults?.modelTimeoutMs, `${path}.modelTimeoutMs`, issues));
+  assignIfDefined(parsed, 'modelRetryPolicy', parseModelRetryPolicy(defaults?.modelRetryPolicy, `${path}.modelRetryPolicy`, issues));
   assignIfDefined(parsed, 'maxRetriesPerStep', expectOptionalPositiveInteger(defaults?.maxRetriesPerStep, `${path}.maxRetriesPerStep`, issues));
   assignIfDefined(parsed, 'requireApprovalForWriteTools', expectOptionalBoolean(defaults?.requireApprovalForWriteTools, `${path}.requireApprovalForWriteTools`, issues));
   assignIfDefined(parsed, 'autoApproveAll', expectOptionalBoolean(defaults?.autoApproveAll, `${path}.autoApproveAll`, issues));
@@ -303,6 +310,47 @@ function parseAgentDefaults(value: unknown, path: string, issues: string[]): Par
 
   if (defaults?.toolBudgets !== undefined) {
     parsed.toolBudgets = parseToolBudgets(defaults.toolBudgets, `${path}.toolBudgets`, issues);
+  }
+
+  return parsed;
+}
+
+function parseModelRetryPolicy(value: unknown, path: string, issues: string[]): AgentDefaults['modelRetryPolicy'] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const policy = expectObject(value, path, issues);
+  if (!policy) {
+    return undefined;
+  }
+
+  const parsed: NonNullable<AgentDefaults['modelRetryPolicy']> = {};
+  const maxRetries = expectOptionalNonNegativeInteger(policy.maxRetries, `${path}.maxRetries`, issues);
+  if (maxRetries !== undefined) parsed.maxRetries = maxRetries;
+  const baseDelayMs = expectOptionalNonNegativeInteger(policy.baseDelayMs, `${path}.baseDelayMs`, issues);
+  if (baseDelayMs !== undefined) parsed.baseDelayMs = baseDelayMs;
+  const maxDelayMs = expectOptionalNonNegativeInteger(policy.maxDelayMs, `${path}.maxDelayMs`, issues);
+  if (maxDelayMs !== undefined) parsed.maxDelayMs = maxDelayMs;
+  const jitter = expectOptionalBoolean(policy.jitter, `${path}.jitter`, issues);
+  if (jitter !== undefined) parsed.jitter = jitter;
+
+  if (policy.retryOn !== undefined) {
+    const retryOn = expectArray(policy.retryOn, `${path}.retryOn`, issues) ?? [];
+    const parsedRetryOn: FailureKind[] = [];
+    const seen = new Set<FailureKind>();
+
+    for (const [index, rawFailureKind] of retryOn.entries()) {
+      const failureKind = expectEnum(rawFailureKind, MODEL_RETRY_FAILURE_KINDS, `${path}.retryOn[${index}]`, issues);
+      if (!failureKind || seen.has(failureKind)) {
+        continue;
+      }
+
+      seen.add(failureKind);
+      parsedRetryOn.push(failureKind);
+    }
+
+    parsed.retryOn = parsedRetryOn;
   }
 
   return parsed;

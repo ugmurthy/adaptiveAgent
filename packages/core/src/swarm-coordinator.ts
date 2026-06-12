@@ -46,7 +46,8 @@ export class SwarmCoordinator {
         phase: 'swarm.decompose',
         instructions: [
           'Decompose the top-level objective into independent text-only subtasks.',
-          'Return structured subtasks with id, subObjective, optional input, and optional targetAgentId.',
+          'Each subtask must include id, subObjective, input, attachmentRefs, and targetAgentId.',
+          'Use input as a compact string or null, and use attachmentRefs [] when there is no attachment reference.',
         ],
       },
       outputSchema: createSwarmDecompositionOutputSchema(Object.keys(this.options.workerAgents)),
@@ -656,6 +657,8 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
 }
 
+const STRICT_SWARM_SUBTASK_OUTPUT_KEYS = new Set(['id', 'subObjective', 'input', 'attachmentRefs', 'targetAgentId']);
+
 function normalizeSubtasks(output: JsonValue): SwarmSubtask[] {
   const raw = readArray(output, 'subtasks') ?? (Array.isArray(output) ? output : undefined);
   if (!raw || raw.length === 0) {
@@ -665,18 +668,38 @@ function normalizeSubtasks(output: JsonValue): SwarmSubtask[] {
     if (!isRecord(item)) {
       throw new Error(`Swarm subtask ${index + 1} is not an object`);
     }
-    const id = readString(item.id) ?? `subtask-${index + 1}`;
-    const subObjective = readString(item.subObjective) ?? readString(item.goal) ?? readString(item.objective);
+    const unsupportedKeys = Object.keys(item).filter((key) => !STRICT_SWARM_SUBTASK_OUTPUT_KEYS.has(key));
+    if (unsupportedKeys.length > 0) {
+      throw new Error(`Swarm subtask ${index + 1} includes unsupported keys: ${unsupportedKeys.join(', ')}`);
+    }
+    const id = readString(item.id);
+    if (!id) {
+      throw new Error(`Swarm subtask ${index + 1} is missing id`);
+    }
+    const subObjective = readString(item.subObjective);
     if (!subObjective) {
       throw new Error(`Swarm subtask ${id} is missing subObjective`);
+    }
+    if (!Object.hasOwn(item, 'input')) {
+      throw new Error(`Swarm subtask ${id} is missing input`);
+    }
+    if (item.input !== null && typeof item.input !== 'string') {
+      throw new Error(`Swarm subtask ${id} input must be a string or null`);
+    }
+    if (!Array.isArray(item.attachmentRefs) || !item.attachmentRefs.every(isNonEmptyString)) {
+      throw new Error(`Swarm subtask ${id} attachmentRefs must be an array of strings`);
+    }
+    const attachmentRefs = item.attachmentRefs.filter(isNonEmptyString);
+    const targetAgentId = readString(item.targetAgentId);
+    if (!targetAgentId) {
+      throw new Error(`Swarm subtask ${id} is missing targetAgentId`);
     }
     return {
       id,
       subObjective,
-      input: isJsonValue(item.input) ? item.input : undefined,
-      attachmentRefs: Array.isArray(item.attachmentRefs) ? item.attachmentRefs.filter((ref): ref is string => typeof ref === 'string' && ref.length > 0) : undefined,
-      targetAgentId: readString(item.targetAgentId),
-      metadata: isJsonRecord(item.metadata) ? item.metadata : undefined,
+      input: item.input,
+      attachmentRefs,
+      targetAgentId,
     };
   });
 }
@@ -841,18 +864,16 @@ export function createSwarmDecompositionOutputSchema(workerAgentIds: string[] = 
     properties: {
       subtasks: {
         type: 'array',
-        minItems: 1,
         items: {
           type: 'object',
-          required: ['id', 'subObjective'],
-          additionalProperties: true,
+          required: ['id', 'subObjective', 'input', 'attachmentRefs', 'targetAgentId'],
+          additionalProperties: false,
           properties: {
             id: { type: 'string' },
             subObjective: { type: 'string' },
-            input: {},
+            input: { type: ['string', 'null'] },
             attachmentRefs: { type: 'array', items: { type: 'string' } },
             targetAgentId,
-            metadata: { type: 'object', additionalProperties: true },
           },
         },
       },
@@ -869,13 +890,13 @@ const qualityOutputSchema = {
       type: 'array',
       items: {
         type: 'object',
-        required: ['subtaskId', 'usable', 'recommendation'],
-        additionalProperties: true,
+        required: ['subtaskId', 'runId', 'usable', 'score', 'issues', 'recommendation'],
+        additionalProperties: false,
         properties: {
           subtaskId: { type: 'string' },
-          runId: { type: 'string' },
+          runId: { type: ['string', 'null'] },
           usable: { type: 'boolean' },
-          score: { type: 'number' },
+          score: { type: ['number', 'null'] },
           issues: { type: 'array', items: { type: 'string' } },
           recommendation: { type: 'string', enum: ['use', 'ignore', 'retry', 'needs_human'] },
         },

@@ -2,6 +2,7 @@ import type {
   AdaptiveAgentLogDestination,
   AdaptiveAgentLogLevel,
   AgentDefaults,
+  FailureKind,
   JsonObject,
   JsonValue,
   ModelAdapterConfig,
@@ -16,6 +17,7 @@ import {
   MODEL_PROVIDERS,
   RESEARCH_POLICIES,
   REQUEST_LOG_LEVELS,
+  STRUCTURED_OUTPUT_MODES,
   TOOL_BUDGET_EXHAUSTED_ACTIONS,
   type AgentRoutingConfig,
   type GatewayAgentRuntimeLoggingConfig,
@@ -24,6 +26,8 @@ import {
   type HookFailurePolicy,
   type InvocationMode,
 } from './types.js';
+
+const MODEL_RETRY_FAILURE_KINDS = ['timeout', 'network', 'rate_limit', 'provider_error'] as const satisfies readonly FailureKind[];
 
 export function parseGatewayRequestLoggingValue(
   value: unknown,
@@ -151,6 +155,9 @@ export function parseModelConfig(value: unknown, path: string, issues: string[])
   const baseUrl = expectOptionalNonEmptyString(model?.baseUrl, `${path}.baseUrl`, issues);
   const siteUrl = expectOptionalNonEmptyString(model?.siteUrl, `${path}.siteUrl`, issues);
   const siteName = expectOptionalNonEmptyString(model?.siteName, `${path}.siteName`, issues);
+  const structuredOutputMode = model?.structuredOutputMode === undefined
+    ? 'prompted'
+    : expectEnum(model.structuredOutputMode, STRUCTURED_OUTPUT_MODES, `${path}.structuredOutputMode`, issues);
 
   return {
     provider,
@@ -159,6 +166,7 @@ export function parseModelConfig(value: unknown, path: string, issues: string[])
     baseUrl,
     siteUrl,
     siteName,
+    structuredOutputMode,
   };
 }
 
@@ -180,6 +188,11 @@ export function parseAgentDefaults(value: unknown, path: string, issues: string[
     parsedDefaults,
     'modelTimeoutMs',
     expectOptionalPositiveInteger(defaults?.modelTimeoutMs, `${path}.modelTimeoutMs`, issues),
+  );
+  assignIfDefined(
+    parsedDefaults,
+    'modelRetryPolicy',
+    parseModelRetryPolicy(defaults?.modelRetryPolicy, `${path}.modelRetryPolicy`, issues),
   );
   assignIfDefined(
     parsedDefaults,
@@ -220,6 +233,47 @@ export function parseAgentDefaults(value: unknown, path: string, issues: string[
   }
 
   return Object.keys(parsedDefaults).length > 0 ? parsedDefaults : {};
+}
+
+function parseModelRetryPolicy(value: unknown, path: string, issues: string[]): AgentDefaults['modelRetryPolicy'] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const policy = expectObject(value, path, issues);
+  if (!policy) {
+    return undefined;
+  }
+
+  const parsedPolicy: NonNullable<AgentDefaults['modelRetryPolicy']> = {};
+  const maxRetries = expectOptionalNonNegativeInteger(policy.maxRetries, `${path}.maxRetries`, issues);
+  if (maxRetries !== undefined) parsedPolicy.maxRetries = maxRetries;
+  const baseDelayMs = expectOptionalNonNegativeInteger(policy.baseDelayMs, `${path}.baseDelayMs`, issues);
+  if (baseDelayMs !== undefined) parsedPolicy.baseDelayMs = baseDelayMs;
+  const maxDelayMs = expectOptionalNonNegativeInteger(policy.maxDelayMs, `${path}.maxDelayMs`, issues);
+  if (maxDelayMs !== undefined) parsedPolicy.maxDelayMs = maxDelayMs;
+  const jitter = expectOptionalBoolean(policy.jitter, `${path}.jitter`, issues);
+  if (jitter !== undefined) parsedPolicy.jitter = jitter;
+
+  if (policy.retryOn !== undefined) {
+    const retryOn = expectArray(policy.retryOn, `${path}.retryOn`, issues) ?? [];
+    const parsedRetryOn: FailureKind[] = [];
+    const seen = new Set<FailureKind>();
+
+    for (const [index, rawFailureKind] of retryOn.entries()) {
+      const failureKind = expectEnum(rawFailureKind, MODEL_RETRY_FAILURE_KINDS, `${path}.retryOn[${index}]`, issues);
+      if (!failureKind || seen.has(failureKind)) {
+        continue;
+      }
+
+      seen.add(failureKind);
+      parsedRetryOn.push(failureKind);
+    }
+
+    parsedPolicy.retryOn = parsedRetryOn;
+  }
+
+  return parsedPolicy;
 }
 
 export function parseResearchPolicy(value: unknown, path: string, issues: string[]): AgentDefaults['researchPolicy'] | undefined {

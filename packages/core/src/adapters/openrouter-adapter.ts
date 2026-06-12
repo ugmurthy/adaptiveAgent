@@ -4,7 +4,7 @@ import { extname } from 'node:path';
 import { OpenRouter } from '@openrouter/sdk';
 
 import { approximateSerializedByteLength, compactJsonObject } from '../logging.js';
-import type { FileInput, ModelContentPart, ModelMessage, ModelRequest, ModelResponse } from '../types.js';
+import type { FileInput, ModelContentPart, ModelMessage, ModelRequest, ModelResponse, StructuredOutputMode } from '../types.js';
 import {
   BaseOpenAIChatAdapter,
   MAX_LOCAL_AUDIO_BYTES,
@@ -37,6 +37,7 @@ export interface OpenRouterAdapterConfig {
   siteUrl?: string;
   siteName?: string;
   maxConcurrentRequests?: number;
+  structuredOutputMode?: StructuredOutputMode;
 }
 
 export class OpenRouterAdapter extends BaseOpenAIChatAdapter {
@@ -61,6 +62,7 @@ export class OpenRouterAdapter extends BaseOpenAIChatAdapter {
       apiKey: config.apiKey,
       defaultHeaders: headers,
       maxConcurrentRequests: config.maxConcurrentRequests,
+      structuredOutputMode: config.structuredOutputMode,
       capabilities: {
         toolCalling: true,
         jsonOutput: true,

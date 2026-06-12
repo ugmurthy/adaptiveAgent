@@ -795,6 +795,8 @@ function humanMessageCategory(category: TraceMessage['category']): string {
       return chalk.cyan('gateway/chat system context');
     case 'runtime-injected-system':
       return chalk.yellow('runtime-injected system prompt');
+    case 'runtime-injected-user':
+      return chalk.yellow('runtime-injected user message');
     case 'user':
       return chalk.white('user message');
     case 'assistant':
@@ -812,6 +814,8 @@ function humanMessageCategoryPlain(category: TraceMessage['category']): string {
       return 'gateway-chat-system-context';
     case 'runtime-injected-system':
       return 'runtime-injected-system';
+    case 'runtime-injected-user':
+      return 'runtime-injected-user';
     case 'user':
       return 'user';
     case 'assistant':
@@ -840,7 +844,7 @@ function summarizeMessages(messages: TraceMessage[]): {
       if (message.role === 'system') {
         counts.system += 1;
       }
-      if (message.category === 'runtime-injected-system') {
+      if (message.category === 'runtime-injected-system' || message.category === 'runtime-injected-user') {
         counts.runtimeInjected += 1;
       }
       if (message.role === 'user') {

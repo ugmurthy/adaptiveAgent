@@ -2,6 +2,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { extname } from 'node:path';
 
 import { compactJsonObject, encodedByteLength } from '../logging.js';
+import { assertValidOutputSchema, normalizeToolResultContentForModel } from '../model-payloads.js';
 import type {
   AudioInput,
   FileInput,
@@ -17,6 +18,7 @@ import type {
   ModelResponse,
   ModelStreamEvent,
   ModelToolCall,
+  StructuredOutputMode,
   ToolDefinition,
   UsageSummary,
 } from '../types.js';
@@ -29,6 +31,7 @@ export interface BaseOpenAIChatAdapterConfig {
   defaultHeaders?: Record<string, string>;
   capabilities?: Partial<ModelCapabilities>;
   maxConcurrentRequests?: number;
+  structuredOutputMode?: StructuredOutputMode;
 }
 
 export type ModelInvocationPhase = 'gate_wait' | 'http_request' | 'http_status' | 'response_body' | 'retry_backoff';
@@ -257,6 +260,7 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
   readonly provider: string;
   readonly model: string;
   readonly capabilities: ModelCapabilities;
+  readonly structuredOutputMode: StructuredOutputMode;
 
   private readonly baseUrl: string;
   private readonly apiKey: string | undefined;
@@ -270,6 +274,7 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
     this.apiKey = config.apiKey;
     this.defaultHeaders = config.defaultHeaders ?? {};
     this.capabilities = { ...DEFAULT_CAPABILITIES, ...config.capabilities };
+    this.structuredOutputMode = config.structuredOutputMode ?? 'prompted';
     this.requestGate = getOrCreateModelRequestGate(
       this.provider,
       this.model,
@@ -413,15 +418,18 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
       body.tools = request.tools.map((tool) => toOpenAITool(tool));
     }
 
-    if (request.outputSchema && this.capabilities.jsonOutput) {
-      body.response_format = {
-        type: 'json_schema',
-        json_schema: {
-          name: 'response',
-          strict: true,
-          schema: request.outputSchema,
-        },
-      };
+    if (request.outputSchema) {
+      assertValidOutputSchema(request.outputSchema);
+      if (this.structuredOutputMode === 'strict' && this.capabilities.jsonOutput) {
+        body.response_format = {
+          type: 'json_schema',
+          json_schema: {
+            name: 'response',
+            strict: true,
+            schema: request.outputSchema,
+          },
+        };
+      }
     }
 
     return body;
@@ -648,7 +656,7 @@ async function toOpenAIMessage(msg: ModelMessage): Promise<OpenAIMessage> {
   if (msg.role === 'tool') {
     return {
       role: 'tool',
-      content: contentAsText(msg.content),
+      content: normalizeToolResultContentForModel(msg.content),
       name: msg.name,
       tool_call_id: msg.toolCallId ?? '',
     };

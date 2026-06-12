@@ -55,6 +55,7 @@ export interface AgentDefaults {
   maxSteps?: number;
   toolTimeoutMs?: number;
   modelTimeoutMs?: number;
+  modelRetryPolicy?: ModelRetryPolicy;
   maxRetriesPerStep?: number;
   requireApprovalForWriteTools?: boolean;
   autoApproveAll?: boolean;
@@ -62,6 +63,14 @@ export interface AgentDefaults {
   toolBudgets?: Record<string, ToolBudget>;
   researchPolicy?: ResearchPolicyName | ResearchPolicy;
   injectToolManifest?: boolean;
+}
+
+export interface ModelRetryPolicy {
+  maxRetries?: number;
+  retryOn?: FailureKind[];
+  baseDelayMs?: number;
+  maxDelayMs?: number;
+  jitter?: boolean;
 }
 
 export interface ToolBudget {
@@ -86,6 +95,7 @@ export interface ModelAdapterConfig {
   baseUrl?: string;
   siteUrl?: string;
   siteName?: string;
+  structuredOutputMode?: 'prompted' | 'strict';
 }
 
 export type ImageDetail = 'auto' | 'low' | 'high';
@@ -120,6 +130,7 @@ export type FailureKind =
   | 'network'
   | 'rate_limit'
   | 'provider_error'
+  | 'invalid_tool_call'
   | 'not_found'
   | 'tool_error'
   | 'approval_rejected'

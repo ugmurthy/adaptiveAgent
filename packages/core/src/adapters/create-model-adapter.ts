@@ -1,4 +1,4 @@
-import type { ModelAdapter } from '../types.js';
+import type { ModelAdapter, StructuredOutputMode } from '../types.js';
 import { MeshAdapter } from './mesh-adapter.js';
 import { MistralAdapter } from './mistral-adapter.js';
 import { OllamaAdapter } from './ollama-adapter.js';
@@ -12,6 +12,7 @@ export interface ModelAdapterConfig {
   siteUrl?: string;
   siteName?: string;
   maxConcurrentRequests?: number;
+  structuredOutputMode?: StructuredOutputMode;
 }
 
 export function createModelAdapter(config: ModelAdapterConfig): ModelAdapter {
@@ -28,6 +29,7 @@ export function createModelAdapter(config: ModelAdapterConfig): ModelAdapter {
         siteUrl: config.siteUrl,
         siteName: config.siteName,
         maxConcurrentRequests: config.maxConcurrentRequests,
+        structuredOutputMode: config.structuredOutputMode,
       });
     }
 
@@ -36,6 +38,7 @@ export function createModelAdapter(config: ModelAdapterConfig): ModelAdapter {
         model: config.model,
         baseUrl: config.baseUrl,
         maxConcurrentRequests: config.maxConcurrentRequests,
+        structuredOutputMode: config.structuredOutputMode,
       });
 
     case 'mistral': {
@@ -48,6 +51,7 @@ export function createModelAdapter(config: ModelAdapterConfig): ModelAdapter {
         apiKey: config.apiKey,
         baseUrl: config.baseUrl,
         maxConcurrentRequests: config.maxConcurrentRequests,
+        structuredOutputMode: config.structuredOutputMode,
       });
     }
 
@@ -61,6 +65,7 @@ export function createModelAdapter(config: ModelAdapterConfig): ModelAdapter {
         apiKey: config.apiKey,
         baseUrl: config.baseUrl,
         maxConcurrentRequests: config.maxConcurrentRequests,
+        structuredOutputMode: config.structuredOutputMode,
       });
     }
 

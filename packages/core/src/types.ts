@@ -78,6 +78,7 @@ export type EventType =
   | 'step.completed'
   | 'model.started'
   | 'model.retry'
+  | 'model.tool_call_rejected'
   | 'model.completed'
   | 'model.failed'
   | 'tool.started'
@@ -109,6 +110,8 @@ export interface ModelCapabilities {
   imageInput?: boolean;
   input?: Partial<Record<'image' | 'file' | 'audio', InputModalityCapability>>;
 }
+
+export type StructuredOutputMode = 'prompted' | 'strict';
 
 export type InputModality = 'text' | 'image' | 'file' | 'audio';
 export type InputSourceKind = 'path' | 'url' | 'data' | 'file_id';
@@ -191,6 +194,7 @@ export interface AgentDefaults {
   maxSteps?: number;
   toolTimeoutMs?: number;
   modelTimeoutMs?: number;
+  modelRetryPolicy?: ModelRetryPolicy;
   maxRetriesPerStep?: number;
   fileInputPolicy?: FileInputPolicy;
   requireApprovalForWriteTools?: boolean;
@@ -218,6 +222,14 @@ export interface ResearchPolicy {
   maxPagesRead?: number;
   checkpointAfter?: number;
   requirePurpose?: boolean;
+}
+
+export interface ModelRetryPolicy {
+  maxRetries?: number;
+  retryOn?: FailureKind[];
+  baseDelayMs?: number;
+  maxDelayMs?: number;
+  jitter?: boolean;
 }
 
 export interface DelegationPolicy {
@@ -298,6 +310,7 @@ export type FailureKind =
   | 'network'
   | 'rate_limit'
   | 'provider_error'
+  | 'invalid_tool_call'
   | 'not_found'
   | 'tool_error'
   | 'approval_rejected'

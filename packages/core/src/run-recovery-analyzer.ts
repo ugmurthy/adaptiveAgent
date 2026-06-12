@@ -150,6 +150,17 @@ function classifyFailure(run: AgentRun, events: AgentEvent[]): FailureClassifica
   }
 
   if (
+    combined.includes('unknown tool') ||
+    combined.includes('not visible for this run') ||
+    combined.includes('invalid tool-call')
+  ) {
+    return {
+      failureClass: 'agent_invalid_output',
+      reason: 'Run failed because the model requested an unavailable tool',
+    };
+  }
+
+  if (
     combined.includes('timeout') ||
     combined.includes('timed out') ||
     combined.includes('524') ||

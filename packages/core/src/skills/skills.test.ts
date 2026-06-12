@@ -313,6 +313,7 @@ defaults.modelTimeoutMs: 0
 defaults.maxSteps: 12
 defaults.autoApproveAll: true
 defaults.capture: full
+defaults.researchPolicy: deep
 ---
 
 Execute code carefully.
@@ -326,7 +327,22 @@ Execute code carefully.
       maxSteps: 12,
       autoApproveAll: true,
       capture: 'full',
+      researchPolicy: 'deep',
     });
+  });
+
+  it('throws for invalid dotted research policy defaults', () => {
+    const md = `---
+name: researcher
+description: Research things
+defaults.researchPolicy: extra-deep
+---
+
+Research carefully.
+`;
+
+    expect(() => parseSkillMarkdown(md, 'test')).toThrow(SkillLoadError);
+    expect(() => parseSkillMarkdown(md, 'test')).toThrow("invalid research policy for 'defaults.researchPolicy'");
   });
 
   it('throws for invalid dotted default values', () => {

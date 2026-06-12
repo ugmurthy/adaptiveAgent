@@ -89,6 +89,24 @@ function createBudgetedSearchTool(): ToolDefinition {
   };
 }
 
+function createBudgetedReadWebPageTool(onExecute?: () => void): ToolDefinition {
+  return {
+    name: 'read_web_page',
+    description: 'Read a web page.',
+    inputSchema: { type: 'object', additionalProperties: true },
+    budgetGroup: 'web_research.read',
+    execute: async (input) => {
+      onExecute?.();
+      return {
+        url: typeof input === 'object' && input && 'url' in input ? input.url : 'https://example.com',
+        title: 'stub',
+        text: 'stub',
+        bytesFetched: 4,
+      };
+    },
+  };
+}
+
 describe('AdaptiveAgent', () => {
   it('persists sessionId for run-style root runs', async () => {
     const runStore = new InMemoryRunStore();
@@ -1239,6 +1257,404 @@ describe('AdaptiveAgent', () => {
     });
   });
 
+  it('envelopes string-valued delegate results for parent model messages', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'parent-call-1',
+            name: 'delegate.researcher',
+            input: { goal: 'Research plain text output' },
+          },
+        ],
+      },
+      {
+        finishReason: 'stop',
+        text: 'plain child report',
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: { report: 'done' },
+      },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      delegates: [
+        {
+          name: 'researcher',
+          description: 'Researches a topic.',
+          allowedTools: [],
+        },
+      ],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.run({ goal: 'Delegate and continue' });
+
+    expect(result).toMatchObject({ status: 'success', output: { report: 'done' } });
+    const childRuns = await runStore.listChildren(result.runId);
+    expect(childRuns[0]?.result).toBe('plain child report');
+
+    const toolMessage = model.receivedRequests[2]?.messages.find((message) => message.role === 'tool');
+    expect(JSON.parse(toolMessage?.content as string)).toEqual({
+      result: 'plain child report',
+      resultType: 'text',
+    });
+  });
+
+  it('preserves object-shaped delegate results for parent model messages', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'parent-call-1',
+            name: 'delegate.researcher',
+            input: { goal: 'Research object output' },
+          },
+        ],
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: { finding: 'child-done' },
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: { report: 'done' },
+      },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      delegates: [
+        {
+          name: 'researcher',
+          description: 'Researches a topic.',
+          allowedTools: [],
+        },
+      ],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.run({ goal: 'Delegate and continue' });
+
+    expect(result).toMatchObject({ status: 'success', output: { report: 'done' } });
+    const toolMessage = model.receivedRequests[2]?.messages.find((message) => message.role === 'tool');
+    expect(JSON.parse(toolMessage?.content as string)).toEqual({ finding: 'child-done' });
+  });
+
+  it('rejects delegate input with string outputSchema before spawning a child run', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'bad-delegate-call',
+            name: 'delegate.researcher',
+            input: {
+              goal: 'Research malformed schema',
+              outputSchema: '{"type":"object"}',
+            },
+          },
+        ],
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: { report: 'repaired without delegation' },
+      },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      delegates: [
+        {
+          name: 'researcher',
+          description: 'Researches a topic.',
+          allowedTools: [],
+        },
+      ],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.run({ goal: 'Reject malformed delegate schema' });
+
+    expect(result).toMatchObject({ status: 'success', output: { report: 'repaired without delegation' } });
+    expect(await runStore.listChildren(result.runId)).toHaveLength(0);
+
+    const events = await eventStore.listByRun(result.runId);
+    expect(events.find((event) => event.type === 'model.tool_call_rejected')?.payload).toMatchObject({
+      requestedToolName: 'delegate.researcher',
+      reason: 'invalid_tool_input',
+      willRetry: true,
+      error: expect.stringContaining('input.outputSchema must be a JSON object'),
+    });
+    expect(events.some((event) => event.type === 'delegate.spawned')).toBe(false);
+  });
+
+  it.each([
+    ['context', { context: '{"topic":"delegation"}' }, 'input.context'],
+    ['metadata', { metadata: '{"source":"model"}' }, 'input.metadata'],
+  ] as const)('rejects delegate input with string %s before spawning a child run', async (_field, malformedFields, expectedPath) => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'bad-delegate-call',
+            name: 'delegate.researcher',
+            input: {
+              goal: 'Research malformed delegate object',
+              ...malformedFields,
+            },
+          },
+        ],
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: { report: 'repaired without delegation' },
+      },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      delegates: [
+        {
+          name: 'researcher',
+          description: 'Researches a topic.',
+          allowedTools: [],
+        },
+      ],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.run({ goal: 'Reject malformed delegate objects' });
+
+    expect(result.status).toBe('success');
+    expect(await runStore.listChildren(result.runId)).toHaveLength(0);
+    const rejection = (await eventStore.listByRun(result.runId)).find(
+      (event) => event.type === 'model.tool_call_rejected',
+    );
+    expect(rejection?.payload).toMatchObject({
+      requestedToolName: 'delegate.researcher',
+      reason: 'invalid_tool_input',
+      error: expect.stringContaining(`${expectedPath} must be a JSON object`),
+    });
+  });
+
+  it('normalizes fenced JSON text for outputSchema before repair', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const outputSchema = {
+      type: 'object',
+      properties: { answer: { type: 'string' } },
+      required: ['answer'],
+    };
+    const model = new SequenceModel([
+      {
+        finishReason: 'stop',
+        text: '```json\n{"answer":"done"}\n```',
+      },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.run({ goal: 'Return fenced structured output', outputSchema });
+
+    expect(result).toMatchObject({ status: 'success', output: { answer: 'done' } });
+    expect(model.receivedRequests).toHaveLength(1);
+  });
+
+  it('normalizes provider structuredOutput strings for outputSchema before repair', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const outputSchema = {
+      type: 'object',
+      properties: { answer: { type: 'string' } },
+      required: ['answer'],
+    };
+    const model = new SequenceModel([
+      {
+        finishReason: 'stop',
+        structuredOutput: '```json\n{"answer":"done"}\n```',
+      },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.run({ goal: 'Return string structured output', outputSchema });
+
+    expect(result).toMatchObject({ status: 'success', output: { answer: 'done' } });
+    expect(model.receivedRequests).toHaveLength(1);
+  });
+
+  it('repairs a child run with outputSchema when the child model returns only text', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const outputSchema = {
+      type: 'object',
+      properties: { finding: { type: 'string' } },
+      required: ['finding'],
+    };
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'parent-call-1',
+            name: 'delegate.researcher',
+            input: {
+              goal: 'Research with required structure',
+              outputSchema,
+            },
+          },
+        ],
+      },
+      {
+        finishReason: 'stop',
+        text: 'plain child report',
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: { finding: 'repaired from plain child report' },
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: { report: 'parent completed' },
+      },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      delegates: [
+        {
+          name: 'researcher',
+          description: 'Researches a topic.',
+          allowedTools: [],
+        },
+      ],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.run({ goal: 'Delegate with structured result' });
+
+    expect(result).toMatchObject({ status: 'success', output: { report: 'parent completed' } });
+    expect(model.receivedRequests[1]?.outputSchema).toMatchObject({ type: 'object' });
+    expect(model.receivedRequests[2]).toMatchObject({
+      tools: [],
+      outputSchema,
+    });
+    expect(model.receivedRequests[2]?.messages.at(-1)?.content).toContain('plain child report');
+    const parentToolMessage = model.receivedRequests[3]?.messages.find((message) => message.role === 'tool');
+    expect(JSON.parse(parentToolMessage?.content as string)).toEqual({ finding: 'repaired from plain child report' });
+
+    const childRuns = await runStore.listChildren(result.runId);
+    expect(childRuns[0]).toMatchObject({
+      status: 'succeeded',
+      result: { finding: 'repaired from plain child report' },
+    });
+  });
+
+  it('fails a child run with outputSchema when text repair does not return an object', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const outputSchema = {
+      type: 'object',
+      properties: { finding: { type: 'string' } },
+      required: ['finding'],
+    };
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'parent-call-1',
+            name: 'delegate.researcher',
+            input: {
+              goal: 'Research with required structure',
+              outputSchema,
+            },
+          },
+        ],
+      },
+      {
+        finishReason: 'stop',
+        text: 'plain child report',
+      },
+      {
+        finishReason: 'stop',
+        text: 'still not JSON',
+      },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      delegates: [
+        {
+          name: 'researcher',
+          description: 'Researches a topic.',
+          allowedTools: [],
+        },
+      ],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.run({ goal: 'Delegate with unrepaired structured result' });
+
+    expect(result).toMatchObject({
+      status: 'failure',
+      code: 'MODEL_ERROR',
+      error: expect.stringContaining('outputSchema'),
+    });
+    expect(model.receivedRequests[2]).toMatchObject({ tools: [], outputSchema });
+
+    const childRuns = await runStore.listChildren(result.runId);
+    expect(childRuns[0]).toMatchObject({
+      status: 'failed',
+      errorCode: 'MODEL_ERROR',
+      errorMessage: expect.stringContaining('outputSchema'),
+    });
+  });
+
   it('corrects a misspelled delegate tool name returned by the model when there is a unique close delegate match', async () => {
     const runStore = new InMemoryRunStore();
     const eventStore = new InMemoryEventStore();
@@ -1401,6 +1817,316 @@ describe('AdaptiveAgent', () => {
         return (event.payload as { toolName?: unknown }).toolName === 'delegate.researcher';
       }),
     ).toBe(true);
+  });
+
+  it('reprompts once when the model requests an unknown tool before execution', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'bad-delegate-call',
+            name: 'delegate.resistelher',
+            input: {
+              goal: 'Research with typo',
+            },
+          },
+        ],
+      },
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'delegate-call-1',
+            name: 'delegate.researcher',
+            input: {
+              goal: 'Research after repair',
+            },
+          },
+        ],
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: {
+          finding: 'child recovered',
+        },
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: {
+          report: 'parent recovered',
+        },
+      },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      delegates: [
+        {
+          name: 'researcher',
+          description: 'Researches a topic.',
+          allowedTools: [],
+        },
+      ],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.run({ goal: 'Recover unknown delegate name' });
+
+    expect(result).toMatchObject({
+      status: 'success',
+      output: { report: 'parent recovered' },
+    });
+    expect(model.receivedRequests).toHaveLength(4);
+    expect(
+      model.receivedRequests[1]?.messages.some(
+        (message) =>
+          message.role === 'system' &&
+          typeof message.content === 'string' &&
+          message.content.includes('previous model response requested unavailable tool "delegate.resistelher"'),
+      ),
+    ).toBe(true);
+
+    const events = await eventStore.listByRun(result.runId);
+    const rejectionEvent = events.find((event) => event.type === 'model.tool_call_rejected');
+    expect(rejectionEvent).toMatchObject({
+      toolCallId: 'bad-delegate-call',
+      payload: expect.objectContaining({
+        requestedToolName: 'delegate.resistelher',
+        reason: 'unknown_tool',
+        repairAttempt: 1,
+        retryLimit: 1,
+        willRetry: true,
+      }),
+    });
+    expect(
+      events.some((event) => event.type === 'tool.started' && event.toolCallId === 'bad-delegate-call'),
+    ).toBe(false);
+  });
+
+  it('fails with TOOL_ERROR after the invalid tool-call repair attempt is exhausted', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'bad-delegate-call-1',
+            name: 'delegate.resistelher',
+            input: {
+              goal: 'Research with typo',
+            },
+          },
+        ],
+      },
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'bad-delegate-call-2',
+            name: 'delegate.resistelher',
+            input: {
+              goal: 'Research with typo again',
+            },
+          },
+        ],
+      },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      delegates: [
+        {
+          name: 'researcher',
+          description: 'Researches a topic.',
+          allowedTools: [],
+        },
+      ],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.run({ goal: 'Fail after invalid tool repair is exhausted' });
+
+    expect(result).toMatchObject({
+      status: 'failure',
+      code: 'TOOL_ERROR',
+      error: 'Unknown tool delegate.resistelher after 1 invalid tool-call repair attempt',
+      stepsUsed: 0,
+    });
+
+    const events = (await eventStore.listByRun(result.runId)).filter((event) => event.type === 'model.tool_call_rejected');
+    expect(events).toHaveLength(2);
+    expect(events[0].payload).toMatchObject({ requestedToolName: 'delegate.resistelher', willRetry: true });
+    expect(events[1].payload).toMatchObject({ requestedToolName: 'delegate.resistelher', willRetry: false });
+
+    const latestSnapshot = await snapshotStore.getLatest(result.runId);
+    expect(latestSnapshot?.state).toMatchObject({
+      pendingToolCall: {
+        name: 'delegate.resistelher',
+      },
+      invalidToolCallRepairAttempts: {
+        'step-1': 1,
+      },
+    });
+  });
+
+  it('retries an existing pre-tool unknown-tool failure by clearing the invalid tool call and reprompting', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const createdRun = await runStore.createRun({
+      goal: 'Historical failed run',
+      modelProvider: 'test',
+      modelName: 'sequence',
+      status: 'running',
+    });
+    const failedRun = await runStore.updateRun(
+      createdRun.id,
+      {
+        status: 'failed',
+        currentStepId: 'step-1',
+        errorCode: 'TOOL_ERROR',
+        errorMessage: 'Unknown tool delegate.resistelher',
+      },
+      createdRun.version,
+    );
+    await eventStore.append({
+      runId: failedRun.id,
+      stepId: 'step-1',
+      type: 'run.failed',
+      schemaVersion: 1,
+      payload: {
+        error: 'Unknown tool delegate.resistelher',
+        code: 'TOOL_ERROR',
+      },
+    });
+    await snapshotStore.save({
+      runId: failedRun.id,
+      snapshotSeq: 1,
+      status: 'failed',
+      currentStepId: 'step-1',
+      summary: null,
+      state: {
+        schemaVersion: 1,
+        messages: [
+          { role: 'system', content: 'You are AdaptiveAgent.' },
+          { role: 'user', content: 'Do the task.' },
+          {
+            role: 'assistant',
+            content: '',
+            toolCalls: [
+              {
+                id: 'bad-delegate-call',
+                name: 'delegate.resistelher',
+                input: { goal: 'Research with typo' },
+              },
+            ],
+          },
+        ],
+        stepsUsed: 0,
+        pendingToolCalls: [
+          {
+            id: 'bad-delegate-call',
+            name: 'delegate.resistelher',
+            input: { goal: 'Research with typo' },
+            stepId: 'step-1',
+            needsStepStarted: false,
+          },
+        ],
+        pendingToolCall: {
+          id: 'bad-delegate-call',
+          name: 'delegate.resistelher',
+          input: { goal: 'Research with typo' },
+          stepId: 'step-1',
+          needsStepStarted: false,
+        },
+      },
+    });
+    const model = new SequenceModel([
+      {
+        finishReason: 'stop',
+        structuredOutput: {
+          report: 'retried from historical unknown tool',
+        },
+      },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      delegates: [
+        {
+          name: 'researcher',
+          description: 'Researches a topic.',
+          allowedTools: [],
+        },
+      ],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const retried = await agent.retry(failedRun.id);
+
+    expect(retried).toMatchObject({
+      status: 'success',
+      runId: failedRun.id,
+      output: { report: 'retried from historical unknown tool' },
+    });
+    expect(model.receivedRequests[0]?.messages).not.toContainEqual(
+      expect.objectContaining({
+        role: 'assistant',
+        toolCalls: expect.arrayContaining([
+          expect.objectContaining({
+            name: 'delegate.resistelher',
+          }),
+        ]),
+      }),
+    );
+    expect(
+      model.receivedRequests[0]?.messages.some(
+        (message) =>
+          message.role === 'system' &&
+          typeof message.content === 'string' &&
+          message.content.includes('previous model response requested unavailable tool "delegate.resistelher"'),
+      ),
+    ).toBe(true);
+
+    const storedRun = await runStore.getRun(failedRun.id);
+    expect(storedRun?.metadata).toMatchObject({
+      retryAttempts: 1,
+      lastRetryFailureKind: 'invalid_tool_call',
+    });
+
+    const events = await eventStore.listByRun(failedRun.id);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: 'run.retry_started',
+        payload: expect.objectContaining({
+          failureKind: 'invalid_tool_call',
+          retryAttempts: 1,
+        }),
+      }),
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: 'model.tool_call_rejected',
+        toolCallId: 'bad-delegate-call',
+        payload: expect.objectContaining({
+          requestedToolName: 'delegate.resistelher',
+          trigger: 'terminal_retry',
+          willRetry: true,
+        }),
+      }),
+    );
   });
 
   it('retries a failed delegated child in place for retryable model timeouts', async () => {
@@ -2458,6 +3184,204 @@ describe('AdaptiveAgent', () => {
 
     const storedRun = await runStore.getRun(result.runId);
     expect(storedRun?.status).toBe('failed');
+  });
+
+  it('retries a model timeout when modelRetryPolicy allows it', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    let attempts = 0;
+    const model: ModelAdapter = {
+      provider: 'test',
+      model: 'timeout-once',
+      capabilities: {
+        toolCalling: true,
+        jsonOutput: true,
+        streaming: false,
+        usage: false,
+      },
+      async generate(request) {
+        attempts += 1;
+        if (attempts === 1) {
+          return new Promise((_, reject) => {
+            request.signal?.addEventListener(
+              'abort',
+              () => reject(request.signal?.reason ?? new Error('aborted')),
+              { once: true },
+            );
+          });
+        }
+
+        return {
+          finishReason: 'stop',
+          text: 'Recovered after timeout.',
+        };
+      },
+    };
+
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore,
+      defaults: {
+        modelTimeoutMs: 5,
+        modelRetryPolicy: {
+          maxRetries: 1,
+          baseDelayMs: 0,
+          maxDelayMs: 0,
+          jitter: false,
+        },
+      },
+    });
+
+    const result = await agent.run({ goal: 'Recover from a timeout once' });
+    expect(result).toMatchObject({ status: 'success', output: 'Recovered after timeout.' });
+    expect(attempts).toBe(2);
+
+    const events = await eventStore.listByRun(result.runId);
+    const retryEvent = events.find((event) => event.type === 'model.retry' && event.payload.phase === 'runtime');
+    expect(retryEvent).toMatchObject({
+      stepId: 'step-1',
+      payload: expect.objectContaining({
+        attempt: 1,
+        nextAttempt: 2,
+        reason: 'timeout',
+        retryDelayMs: 0,
+      }),
+    });
+    const failedEvent = events.find((event) => event.type === 'model.failed');
+    expect(failedEvent).toMatchObject({
+      payload: expect.objectContaining({
+        attempt: 1,
+        maxAttempts: 2,
+        failureKind: 'timeout',
+        retryable: true,
+      }),
+    });
+    const completedEvent = events.find((event) => event.type === 'model.completed');
+    expect(completedEvent).toMatchObject({
+      payload: expect.objectContaining({
+        attempt: 2,
+        maxAttempts: 2,
+      }),
+    });
+  });
+
+  it('retries a transient provider model error when modelRetryPolicy allows it', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const model = new SequenceModel([
+      new Error('Upstream provider returned an error.'),
+      { finishReason: 'stop', text: 'Recovered after provider error.' },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore,
+      defaults: {
+        modelRetryPolicy: {
+          maxRetries: 1,
+          baseDelayMs: 0,
+          maxDelayMs: 0,
+          jitter: false,
+        },
+      },
+    });
+
+    const result = await agent.run({ goal: 'Recover from provider error once' });
+    expect(result).toMatchObject({ status: 'success', output: 'Recovered after provider error.' });
+    expect(model.receivedRequests).toHaveLength(2);
+
+    const events = await eventStore.listByRun(result.runId);
+    expect(events.find((event) => event.type === 'model.retry' && event.payload.phase === 'runtime')).toMatchObject({
+      payload: expect.objectContaining({
+        reason: 'provider_error',
+        attempt: 1,
+        nextAttempt: 2,
+      }),
+    });
+  });
+
+  it('fails after the configured model retry budget is exhausted', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const model = new SequenceModel([
+      new Error('Upstream provider returned an error.'),
+      new Error('Upstream provider returned an error.'),
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore,
+      defaults: {
+        modelRetryPolicy: {
+          maxRetries: 1,
+          baseDelayMs: 0,
+          maxDelayMs: 0,
+          jitter: false,
+        },
+      },
+    });
+
+    const result = await agent.run({ goal: 'Provider stays down' });
+    expect(result).toMatchObject({
+      status: 'failure',
+      code: 'MODEL_ERROR',
+      error: 'Upstream provider returned an error.',
+    });
+    expect(model.receivedRequests).toHaveLength(2);
+
+    const events = await eventStore.listByRun(result.runId);
+    expect(events.filter((event) => event.type === 'model.retry' && event.payload.phase === 'runtime')).toHaveLength(1);
+    expect(events.filter((event) => event.type === 'model.failed')).toHaveLength(2);
+    expect(events.filter((event) => event.type === 'model.failed')[1]).toMatchObject({
+      payload: expect.objectContaining({
+        attempt: 2,
+        maxAttempts: 2,
+        retryable: false,
+      }),
+    });
+  });
+
+  it('does not retry non-retryable model errors', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const model = new SequenceModel([new Error('Invalid API key')]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore,
+      defaults: {
+        modelRetryPolicy: {
+          maxRetries: 1,
+          baseDelayMs: 0,
+          maxDelayMs: 0,
+          jitter: false,
+        },
+      },
+    });
+
+    const result = await agent.run({ goal: 'Do not retry auth-ish error' });
+    expect(result).toMatchObject({
+      status: 'failure',
+      code: 'MODEL_ERROR',
+      error: 'Invalid API key',
+    });
+    expect(model.receivedRequests).toHaveLength(1);
+
+    const events = await eventStore.listByRun(result.runId);
+    expect(events.find((event) => event.type === 'model.retry' && event.payload.phase === 'runtime')).toBeUndefined();
   });
 
   it('emits model.retry when the adapter reports an internal retry', async () => {
@@ -3839,7 +4763,77 @@ describe('AdaptiveAgent', () => {
     expect(systemMessage!.content).toContain('Always cite your sources');
   });
 
-  it('injects the budget checkpoint message before the next model call', async () => {
+  it('lets a delegate research policy override the parent default', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const toolExecutionStore = new InMemoryToolExecutionStore();
+    let executedReads = 0;
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'parent-call-1',
+            name: 'delegate.researcher',
+            input: {
+              goal: 'Read enough pages to need the delegate policy',
+            },
+          },
+        ],
+      },
+      {
+        finishReason: 'tool_calls',
+        toolCalls: Array.from({ length: 5 }, (_, index) => ({
+          id: `child-read-${index + 1}`,
+          name: 'read_web_page',
+          input: { url: `https://example.com/child/${index + 1}` },
+        })),
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: { finding: 'child-done' },
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: { report: 'done' },
+      },
+    ]);
+
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [createBudgetedReadWebPageTool(() => { executedReads += 1; })],
+      delegates: [
+        {
+          name: 'researcher',
+          description: 'Researches a topic.',
+          allowedTools: ['read_web_page'],
+          defaults: {
+            researchPolicy: 'deep',
+          },
+        },
+      ],
+      runStore,
+      eventStore,
+      snapshotStore,
+      toolExecutionStore,
+      defaults: {
+        researchPolicy: 'light',
+      },
+    });
+
+    const result = await agent.run({ goal: 'Delegate this research task' });
+    expect(result).toMatchObject({
+      status: 'success',
+      output: { report: 'done' },
+    });
+    expect(executedReads).toBe(5);
+    expect(model.receivedRequests[2]?.messages.some(
+      (message) => message.role === 'tool' && typeof message.content === 'string' && message.content.includes('budget_exhausted'),
+    )).toBe(false);
+  });
+
+  it('injects the budget checkpoint as an appended user message before the next model call', async () => {
     const runStore = new InMemoryRunStore();
     const eventStore = new InMemoryEventStore();
     const snapshotStore = new InMemorySnapshotStore();
@@ -3885,6 +4879,7 @@ describe('AdaptiveAgent', () => {
       (entry) => entry.event === 'system_message.injected' && entry.source === 'tool_budget.checkpoint',
     );
     expect(checkpointLog).toMatchObject({
+      role: 'user',
       snapshotField: 'pendingRuntimeMessages',
       snapshotStoreConfigured: true,
     });
@@ -3897,18 +4892,17 @@ describe('AdaptiveAgent', () => {
     expect(secondRequestMessages).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          role: 'system',
+          role: 'user',
           content: expect.stringContaining('near the web research budget'),
         }),
       ]),
     );
-    const firstNonSystemIndex = secondRequestMessages.findIndex((message) => message.role !== 'system');
     const checkpointIndex = secondRequestMessages.findIndex(
-      (message) => message.role === 'system' && typeof message.content === 'string' && message.content.includes('near the web research budget'),
+      (message) => message.role === 'user' && typeof message.content === 'string' && message.content.includes('near the web research budget'),
     );
     expect(checkpointIndex).toBeGreaterThanOrEqual(0);
-    expect(firstNonSystemIndex).toBeGreaterThan(checkpointIndex);
-    expect(secondRequestMessages.slice(firstNonSystemIndex).some((message) => message.role === 'system')).toBe(false);
+    expect(secondRequestMessages[checkpointIndex - 1]).toMatchObject({ role: 'tool' });
+    expect(checkpointIndex).toBe(secondRequestMessages.length - 1);
   });
 
   it('steers the model to answer from current evidence when the search budget is exhausted', async () => {
@@ -3954,6 +4948,174 @@ describe('AdaptiveAgent', () => {
       name: 'web_search',
       content: expect.stringContaining('budget_exhausted'),
     });
+    expect(model.receivedRequests[3]?.tools?.map((tool) => tool.name)).not.toContain('web_search');
+  });
+
+  it('returns skipped partial results when the model repeats an exhausted-budget tool call', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const toolExecutionStore = new InMemoryToolExecutionStore();
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [{ id: 'search-1', name: 'web_search', input: { query: 'first', purpose: 'find starting evidence' } }],
+      },
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [{ id: 'search-2', name: 'web_search', input: { query: 'second', purpose: 'double check' } }],
+      },
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [{ id: 'search-3', name: 'web_search', input: { query: 'third', purpose: 'keep searching' } }],
+      },
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [{ id: 'search-4', name: 'web_search', input: { query: 'fourth', purpose: 'ignore the budget' } }],
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: { done: true },
+      },
+    ]);
+
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [createBudgetedSearchTool()],
+      runStore,
+      eventStore,
+      snapshotStore,
+      toolExecutionStore,
+      defaults: {
+        researchPolicy: 'light',
+      },
+    });
+
+    const result = await agent.run({ goal: 'Research something current' });
+    expect(result).toMatchObject({
+      status: 'success',
+      output: { done: true },
+    });
+    expect(model.receivedRequests[4]?.messages.at(-1)).toMatchObject({
+      role: 'tool',
+      name: 'web_search',
+      content: expect.stringContaining('budget_exhausted'),
+    });
+    expect(model.receivedRequests[4]?.tools?.map((tool) => tool.name)).not.toContain('web_search');
+  });
+
+  it('drains same-batch pending calls for exhausted research budgets as skipped tool results', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const toolExecutionStore = new InMemoryToolExecutionStore();
+    let executedSearches = 0;
+    const searchTool: ToolDefinition = {
+      ...createBudgetedSearchTool(),
+      execute: async (input) => {
+        executedSearches += 1;
+        return {
+          query: typeof input === 'object' && input && 'query' in input ? input.query : 'unknown',
+          results: [{ title: 'stub', url: 'https://example.com', snippet: 'stub' }],
+        };
+      },
+    };
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          { id: 'search-1', name: 'web_search', input: { query: 'first', purpose: 'find starting evidence' } },
+          { id: 'search-2', name: 'web_search', input: { query: 'second', purpose: 'double check' } },
+          { id: 'search-3', name: 'web_search', input: { query: 'third', purpose: 'keep searching' } },
+          { id: 'search-4', name: 'web_search', input: { query: 'fourth', purpose: 'same batch overflow' } },
+        ],
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: { done: true },
+      },
+    ]);
+
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [searchTool],
+      runStore,
+      eventStore,
+      snapshotStore,
+      toolExecutionStore,
+      defaults: {
+        researchPolicy: 'light',
+      },
+    });
+
+    const result = await agent.run({ goal: 'Research something current' });
+    expect(result).toMatchObject({
+      status: 'success',
+      output: { done: true },
+    });
+    expect(executedSearches).toBe(2);
+    const finalMessages = model.receivedRequests[1]?.messages ?? [];
+    const budgetMessages = finalMessages.filter(
+      (message) => message.role === 'tool' && typeof message.content === 'string' && message.content.includes('budget_exhausted'),
+    );
+    expect(budgetMessages).toEqual([
+      expect.objectContaining({
+        role: 'tool',
+        name: 'web_search',
+        toolCallId: 'search-3',
+        content: expect.stringContaining('budget_exhausted'),
+      }),
+      expect.objectContaining({
+        role: 'tool',
+        name: 'web_search',
+        toolCallId: 'search-4',
+        content: expect.stringContaining('budget_exhausted'),
+      }),
+    ]);
+  });
+
+  it('does not derive hidden consecutive read limits from deep research policy', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const toolExecutionStore = new InMemoryToolExecutionStore();
+    let executedReads = 0;
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: Array.from({ length: 5 }, (_, index) => ({
+          id: `read-${index + 1}`,
+          name: 'read_web_page',
+          input: { url: `https://example.com/${index + 1}` },
+        })),
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: { done: true },
+      },
+    ]);
+
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [createBudgetedReadWebPageTool(() => { executedReads += 1; })],
+      runStore,
+      eventStore,
+      snapshotStore,
+      toolExecutionStore,
+      defaults: {
+        researchPolicy: 'deep',
+      },
+    });
+
+    const result = await agent.run({ goal: 'Read several pages' });
+    expect(result).toMatchObject({
+      status: 'success',
+      output: { done: true },
+    });
+    expect(executedReads).toBe(5);
+    expect(model.receivedRequests[1]?.messages.some(
+      (message) => message.role === 'tool' && typeof message.content === 'string' && message.content.includes('budget_exhausted'),
+    )).toBe(false);
   });
 
   it('logs model failure diagnostics for underlying transport timeouts', async () => {

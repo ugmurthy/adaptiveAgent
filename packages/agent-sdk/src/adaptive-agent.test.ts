@@ -12,6 +12,7 @@ import {
   loadManualTestSpec,
   main,
   parseCliArgs,
+  formatCoordinatorDecompositionFailure,
   formatSwarmExecutionPlan,
   formatSwarmSubtasks,
   renderStyledPrettyMessage,
@@ -605,6 +606,29 @@ describe('adaptive-agent pretty rendering', () => {
       '  1. subtask-1 -> market: Research the market.',
       '  2. subtask-2 -> pricing: Draft the pricing model.',
     ].join('\n'));
+  });
+
+  it('renders object summaries for coordinator decomposition failures', () => {
+    const rendered = formatCoordinatorDecompositionFailure({
+      status: 'failure',
+      runId: 'coordinator-run-1',
+      code: 'MODEL_ERROR',
+      error: 'Upstream provider returned an error.',
+      stepsUsed: 1,
+      usage: {
+        promptTokens: 10,
+        completionTokens: 0,
+        estimatedCostUSD: 0,
+        provider: 'mesh',
+        model: 'qwen/qwen3.5',
+      },
+    });
+
+    expect(rendered).toContain('Coordinator decomposition failed:');
+    expect(rendered).toContain('"status": "failure"');
+    expect(rendered).toContain('"code": "MODEL_ERROR"');
+    expect(rendered).toContain('"error": "Upstream provider returned an error."');
+    expect(rendered).not.toContain('[object Object]');
   });
 
   it('renders markdown strings for pretty output', () => {

@@ -112,6 +112,7 @@ describe('gateway config loading', () => {
           model: {
             provider: 'ollama',
             model: 'qwen3.5',
+            structuredOutputMode: 'strict',
           },
           workspaceRoot: '$HOME/.adaptiveAgent',
           systemInstructions:
@@ -120,6 +121,13 @@ describe('gateway config loading', () => {
           delegates: ['researcher'],
           defaults: {
             injectToolManifest: false,
+            modelRetryPolicy: {
+              maxRetries: 1,
+              retryOn: ['timeout', 'provider_error'],
+              baseDelayMs: 0,
+              maxDelayMs: 500,
+              jitter: false,
+            },
             researchPolicy: 'gaia',
             toolBudgets: {
               'web_research.search': {
@@ -187,12 +195,22 @@ describe('gateway config loading', () => {
       id: 'support-agent',
       invocationModes: ['chat', 'run'],
       defaultInvocationMode: 'chat',
+      model: {
+        structuredOutputMode: 'strict',
+      },
       workspaceRoot: '$HOME/.adaptiveAgent',
       systemInstructions:
         'You are the support manager. Delegate focused research to delegate.researcher and synthesize the final answer yourself.',
       delegates: ['researcher'],
       defaults: {
         injectToolManifest: false,
+        modelRetryPolicy: {
+          maxRetries: 1,
+          retryOn: ['timeout', 'provider_error'],
+          baseDelayMs: 0,
+          maxDelayMs: 500,
+          jitter: false,
+        },
         researchPolicy: 'gaia',
         toolBudgets: {
           'web_research.search': {
@@ -396,6 +414,11 @@ describe('gateway config loading', () => {
           tools: [],
           delegates: [],
           defaults: {
+            modelRetryPolicy: {
+              maxRetries: -1,
+              retryOn: ['tool_error'],
+              jitter: 'yes',
+            },
             researchPolicy: 'wild',
             toolBudgets: {
               'web_research.search': {
@@ -411,7 +434,7 @@ describe('gateway config loading', () => {
     );
 
     await expect(loadAgentConfigFile({ configPath: agentConfigPath })).rejects.toThrowError(
-      /defaults.researchPolicy must be one of: none, light, standard, deep, gaia[\s\S]*defaults.toolBudgets.web_research.search.maxCalls must be a non-negative integer[\s\S]*defaults.toolBudgets.web_research.search.onExhausted must be one of: fail, continue_with_warning, ask_model/,
+      /defaults.modelRetryPolicy.maxRetries must be a non-negative integer[\s\S]*defaults.modelRetryPolicy.jitter must be a boolean[\s\S]*defaults.modelRetryPolicy.retryOn\[0\] must be one of: timeout, network, rate_limit, provider_error[\s\S]*defaults.researchPolicy must be one of: none, light, standard, deep, gaia[\s\S]*defaults.toolBudgets.web_research.search.maxCalls must be a non-negative integer[\s\S]*defaults.toolBudgets.web_research.search.onExhausted must be one of: fail, continue_with_warning, ask_model/,
     );
   });
 });

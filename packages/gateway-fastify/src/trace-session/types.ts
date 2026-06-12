@@ -327,6 +327,7 @@ export interface TraceMessage {
     | 'initial-runtime-system'
     | 'gateway-chat-system-context'
     | 'runtime-injected-system'
+    | 'runtime-injected-user'
     | 'user'
     | 'assistant'
     | 'tool';

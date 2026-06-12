@@ -760,6 +760,8 @@ async function runSwarmCommand(cli: ManualTestCliOptions): Promise<number> {
         instructions: [
           'Decompose the top-level objective into independent subtasks.',
           'Each subtask targetAgentId must exactly match one id from validWorkerAgentIds.',
+          'Each subtask must include id, subObjective, input, attachmentRefs, and targetAgentId.',
+          'Use input as a compact string or null, and use attachmentRefs [] when there is no attachment reference.',
           'Return only structured subtasks; do not invent worker ids.',
         ],
       },
@@ -768,7 +770,7 @@ async function runSwarmCommand(cli: ManualTestCliOptions): Promise<number> {
     });
 
     if (decompositionResult.status !== 'success') {
-      throw new Error(`Coordinator decomposition failed: ${summarizeResult(decompositionResult)}`);
+      throw new Error(formatCoordinatorDecompositionFailure(decompositionResult));
     }
 
     const subtasks = parseSwarmSubtasks(decompositionResult.output);
@@ -2371,6 +2373,12 @@ function summarizeResult(result: RunResult | ChatResult): JsonValue {
   };
 }
 
+export function formatCoordinatorDecompositionFailure(result: RunResult | ChatResult): string {
+  return `Coordinator decomposition failed:\n${renderPrettyValue(summarizeResult(result))}`;
+}
+
+const STRICT_SWARM_SUBTASK_OUTPUT_KEYS = new Set(['id', 'subObjective', 'input', 'attachmentRefs', 'targetAgentId']);
+
 function parseSwarmSubtasks(output: JsonValue): SwarmSubtask[] {
   const raw = isRecordValue(output) && Array.isArray(output.subtasks)
     ? output.subtasks
@@ -2378,17 +2386,25 @@ function parseSwarmSubtasks(output: JsonValue): SwarmSubtask[] {
   if (!raw || raw.length === 0) throw new Error('Coordinator produced no subtasks');
   return raw.map((item, index) => {
     if (!isRecordValue(item)) throw new Error(`Coordinator subtask ${index + 1} is not an object`);
+    const unsupportedKeys = Object.keys(item).filter((key) => !STRICT_SWARM_SUBTASK_OUTPUT_KEYS.has(key));
+    if (unsupportedKeys.length > 0) throw new Error(`Coordinator subtask ${index + 1} includes unsupported keys: ${unsupportedKeys.join(', ')}`);
     const id = typeof item.id === 'string' ? item.id.trim() : '';
     const subObjective = typeof item.subObjective === 'string' ? item.subObjective.trim() : '';
     if (!id) throw new Error(`Coordinator subtask ${index + 1} is missing id`);
     if (!subObjective) throw new Error(`Coordinator subtask ${id} is missing subObjective`);
+    if (!Object.hasOwn(item, 'input')) throw new Error(`Coordinator subtask ${id} is missing input`);
+    if (item.input !== null && typeof item.input !== 'string') throw new Error(`Coordinator subtask ${id} input must be a string or null`);
+    if (!Array.isArray(item.attachmentRefs) || !item.attachmentRefs.every((ref) => typeof ref === 'string' && ref.length > 0)) {
+      throw new Error(`Coordinator subtask ${id} attachmentRefs must be an array of strings`);
+    }
+    const attachmentRefs = item.attachmentRefs.filter((ref): ref is string => typeof ref === 'string' && ref.length > 0);
+    if (typeof item.targetAgentId !== 'string' || item.targetAgentId.length === 0) throw new Error(`Coordinator subtask ${id} is missing targetAgentId`);
     return {
       id,
       subObjective,
-      ...(isJsonValueLike(item.input) ? { input: item.input } : {}),
-      ...(Array.isArray(item.attachmentRefs) ? { attachmentRefs: item.attachmentRefs.filter((ref): ref is string => typeof ref === 'string' && ref.length > 0) } : {}),
-      ...(typeof item.targetAgentId === 'string' && item.targetAgentId.length > 0 ? { targetAgentId: item.targetAgentId } : {}),
-      ...(isJsonRecordLike(item.metadata) ? { metadata: item.metadata } : {}),
+      input: item.input,
+      attachmentRefs,
+      targetAgentId: item.targetAgentId,
     };
   });
 }

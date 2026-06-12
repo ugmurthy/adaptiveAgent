@@ -1,338 +1,385 @@
-# Opt-In Agent Streaming Implementation Plan
+# Streaming-Backed `generate()` Implementation Plan
 
 ## Goal
 
-Add opt-in model streaming at the agent level while preserving the existing
-non-streaming `generate()` path as the default behavior.
+Switch provider inference to streaming transport without changing the model
+generation contract used by the rest of core.
 
-The first implementation should make streaming a drop-in runtime choice that
-still returns the same final `ModelResponse` shape used today. Live token
-delivery through the gateway can be layered on after the runtime path is stable.
+The public and internal runtime boundary remains:
 
-## Current State
+```ts
+generate(request: ModelRequest): Promise<ModelResponse>;
+```
 
-- `AdaptiveAgent.generateModelResponse()` always calls `model.generate()`.
-- `ModelAdapter` already defines an optional `stream()` method.
-- OpenRouter, Mistral, Mesh, and Ollama adapters declare
-  `capabilities.streaming: true`.
-- `BaseOpenAIChatAdapter` does not currently implement `stream()`.
-- `modelTimeoutMs` is a hard wall-clock timeout for a model turn.
-- Gateway agent config already supports `defaults.modelTimeoutMs`.
-- Gateway agent config currently requires positive integers for timeout fields,
-  so `modelTimeoutMs: 0` is not accepted through gateway config.
+Adapters may use provider streaming internally, consume the stream to completion,
+aggregate chunks, and return the same final `ModelResponse` shape that callers
+receive today.
+
+This is not a UX streaming feature. The purpose is to avoid provider, gateway,
+or HTTP client timeouts on long-running model inference that can exceed five
+minutes.
 
 ## Non-Goals
 
-- Do not replace the existing `generate()` path.
-- Do not require every adapter to implement streaming immediately.
-- Do not change tool execution, plan execution, delegation semantics, snapshots,
-  or replay behavior.
+- Do not change `ModelRequest`.
+- Do not change `ModelResponse`.
+- Do not require `AdaptiveAgent` to call `model.stream()`.
+- Do not add `modelStreaming`, `modelIdleTimeoutMs`, or gateway config fields in
+  this phase.
+- Do not stream token deltas to gateway or TUI clients.
+- Do not persist partial token/chunk events as durable execution state.
+- Do not change tool execution, delegation, sessions, snapshots, replay, or plan
+  execution semantics.
 - Do not stream chain-of-thought or provider-private reasoning.
-- Do not make streaming mandatory for gateway clients in the first phase.
 
-## Public Configuration
+## Current State
 
-Extend agent defaults with streaming controls:
+- `AdaptiveAgent.generateModelResponse()` calls `this.options.model.generate()`.
+- `ModelAdapter` already exposes a stable required `generate()` method and an
+  optional `stream()` method.
+- OpenRouter, Mistral, Mesh, and Ollama declare streaming capability.
+- Current adapter implementations still use non-streaming generation paths:
+  - OpenRouter: SDK `client.chat.send(...)` without `stream: true`.
+  - Mistral: SDK `client.chat.complete(...)`.
+  - Mesh: SDK `client.chat.completions.create({ stream: false })`.
+  - Ollama: `BaseOpenAIChatAdapter.generate()` posts to `/chat/completions` and
+    waits for a full JSON body.
+- `modelTimeoutMs` remains a core wall-clock timeout around the whole model turn.
+  Streaming will not bypass this timeout.
 
-```ts
-interface AgentDefaults {
-  maxSteps?: number;
-  toolTimeoutMs?: number;
-  modelTimeoutMs?: number;
-  modelStreaming?: boolean;
-  modelIdleTimeoutMs?: number;
-  maxRetriesPerStep?: number;
-  requireApprovalForWriteTools?: boolean;
-  autoApproveAll?: boolean;
-  capture?: CaptureMode;
-}
+## Recommended Implementation Shape
+
+Keep core unchanged and make streaming a provider-adapter implementation detail:
+
+```text
+AdaptiveAgent core
+  -> model.generate(ModelRequest)
+      -> adapter starts provider stream internally
+      -> adapter aggregates chunks
+      -> adapter returns final ModelResponse
+  -> core continues exactly as today
 ```
 
-Recommended defaults:
+The adapter `generate()` implementation should behave conceptually like this:
 
-- `modelStreaming`: `false`
-- `modelIdleTimeoutMs`: unset, meaning no separate idle timeout
-- `modelTimeoutMs`: keep current behavior
+```ts
+async generate(request: ModelRequest): Promise<ModelResponse> {
+  const stream = await startProviderStream(request);
+  const aggregate = new ProviderStreamAccumulator(this.provider, this.model);
 
-Gateway agent config example:
-
-```json
-{
-  "defaults": {
-    "modelTimeoutMs": 600000,
-    "modelStreaming": true,
-    "modelIdleTimeoutMs": 120000
+  for await (const chunk of stream) {
+    aggregate.add(chunk);
   }
+
+  return aggregate.toModelResponse();
 }
 ```
 
-## Runtime Behavior
+No caller should need to know whether the adapter used a non-streaming request
+or a streaming request internally.
 
-Update `AdaptiveAgent.generateModelResponse()` to choose the model call path:
+## Contract Parity Requirements
 
-```ts
-const canStream =
-  this.defaults.modelStreaming === true &&
-  this.options.model.capabilities.streaming &&
-  typeof this.options.model.stream === 'function';
+For a given provider response, streaming-backed `generate()` must preserve the
+current final response semantics:
 
-response = canStream
-  ? await this.options.model.stream(modelRequest, onStreamEvent)
-  : await this.options.model.generate(modelRequest);
-```
+- `text`: concatenate content deltas in order.
+- `structuredOutput`: parse final text as JSON using the same behavior as the
+  existing parser.
+- `toolCalls`: reconstruct the same `ModelToolCall[]` shape as non-streaming.
+- `finishReason`: map provider finish reasons to the existing union.
+- `usage`: preserve usage when the provider supplies it in stream output.
+- `providerResponseId`: preserve the provider response id when available.
+- `reasoning` and `reasoningDetails`: preserve only provider-returned reasoning
+  fields that are already part of the current `ModelResponse` contract.
+- `performance`: continue recording adapter latency, request bytes, response
+  bytes when practical, attempt count, retry delay, and provider status details.
 
-The streaming path must return a complete `ModelResponse` compatible with the
-current execution loop:
-
-```ts
-interface ModelResponse {
-  text?: string;
-  structuredOutput?: JsonValue;
-  toolCalls?: ModelToolCall[];
-  finishReason: 'stop' | 'tool_calls' | 'length' | 'content_filter' | 'error';
-  usage?: UsageSummary;
-  providerResponseId?: string;
-  summary?: string;
-}
-```
-
-If streaming is enabled but the adapter does not support it, fall back to
-`generate()` and emit a debug log such as `model.streaming_unavailable`.
+If a provider cannot supply usage in streaming mode, document that provider as a
+parity exception and keep the non-streaming path available until the tradeoff is
+accepted.
 
 ## Timeout Semantics
 
-Keep `modelTimeoutMs` as the total wall-clock timeout for a model turn.
+Keep `modelTimeoutMs` as the total wall-clock timeout for the model turn.
 
-Add `modelIdleTimeoutMs` for the streaming path:
+Important consequence:
 
-- If no stream event is received within `modelIdleTimeoutMs`, abort the model
-  turn with a timeout failure.
-- Reset the idle timer after every accepted stream event.
-- If both total and idle timeouts are configured, either can abort the turn.
-- If `modelIdleTimeoutMs` is unset, only the total timeout applies.
+- Streaming can avoid transport/body-response timeouts after the first chunk.
+- Streaming cannot help if the model emits no chunk or heartbeat before the
+  configured `modelTimeoutMs` expires.
+- Long-running inference still requires a larger `defaults.modelTimeoutMs` or a
+  disabled core model timeout (`0`) where the host configuration path supports
+  it.
 
-Do not remove the existing `modelTimeoutMs` guard. Long-running streaming calls
-should set a larger `modelTimeoutMs` plus a smaller `modelIdleTimeoutMs`.
+Do not add a separate idle timeout in this drop-in phase. If needed later, add it
+as a follow-up with explicit runtime and gateway configuration.
 
-Example:
+## Provider Implementation Plan
 
-```json
-{
-  "defaults": {
-    "modelTimeoutMs": 900000,
-    "modelStreaming": true,
-    "modelIdleTimeoutMs": 120000
-  }
-}
-```
+### Phase 1: Mesh first
 
-## Stream Events
-
-Use the existing `ModelStreamEvent` interface initially:
+Mesh is the best first target because its installed SDK exposes explicit chat
+completion streaming:
 
 ```ts
-interface ModelStreamEvent {
-  type: 'status' | 'summary' | 'usage';
-  payload: JsonValue;
-}
+const stream = client.chat.completions.create(
+  {
+    ...body,
+    stream: true,
+  },
+  { signal: request.signal },
+);
 ```
 
-For the first phase, stream events should be consumed internally for logging,
-idle timeout refresh, and optional downstream event emission. The final response
-remains the canonical value used by the agent loop.
+Notes:
 
-Recommended lifecycle logs:
+- Mesh SDK `timeoutMs` is ignored for streaming and applies only to initial
+  connection behavior, so keep using `request.signal` for core cancellation.
+- Preserve `enrichMeshError()` for SDK and mid-stream errors.
+- Aggregate OpenAI-compatible stream chunks into the existing parser shape.
+- Verify whether final chunks include `usage`; if not, record this as a parity
+  risk before making Mesh streaming the default.
 
-- `model.stream.started`
-- `model.stream.event`
-- `model.stream.completed`
-- `model.stream.failed`
-- `model.streaming_unavailable`
+### Phase 2: OpenAI-compatible base path
 
-Avoid logging raw token deltas by default. If raw chunks are needed later, gate
-them behind `capture: 'full'` or a separate debug option.
-
-## Adapter Implementation
-
-Implement `stream()` in `BaseOpenAIChatAdapter`.
+Add streaming-backed generation support to `BaseOpenAIChatAdapter` for Ollama
+and compatible endpoints.
 
 Request behavior:
 
 - Reuse `buildRequestBody(request)`.
 - Add `stream: true`.
-- For providers that support it, request usage in the final stream event.
-- Reuse existing headers, request gate, retry, cooldown, and abort signal
-  behavior where practical.
+- Add provider-supported usage options when known, such as
+  `stream_options: { include_usage: true }` for OpenAI-compatible providers that
+  support it.
+- Reuse existing headers, request gate, abort signal, retry, and cooldown
+  behavior before stream consumption begins.
 
 Parsing behavior:
 
 - Parse server-sent events from `response.body`.
-- Ignore empty lines and comments.
-- Stop on `[DONE]`.
-- Accumulate `content` deltas into final `text`.
-- Accumulate tool call deltas by index and id.
-- Reconstruct tool call function names and argument strings.
-- Parse accumulated tool arguments using the existing argument parser.
-- Map final provider finish reason using the existing finish reason mapper.
-- Return the same `ModelResponse` shape as `generate()`.
+- Ignore empty lines and SSE comments.
+- Stop on `data: [DONE]`.
+- Parse JSON `data:` frames.
+- Accumulate content deltas.
+- Accumulate tool-call deltas by `index`, `id`, and function fields.
+- Concatenate fragmented tool-call argument strings.
+- Parse accumulated tool arguments using the same argument parsing behavior as
+  non-streaming responses.
+- Map final finish reason using the same mapper as non-streaming responses.
 
-Provider notes:
+### Phase 3: OpenRouter SDK
 
-- OpenRouter, Mesh, Mistral, and Ollama are OpenAI-compatible enough to share the
-  initial `BaseOpenAIChatAdapter.stream()` path.
-- Some providers may emit usage only in the final chunk or not at all.
-- Some providers may stream tool call arguments in fragmented JSON strings.
-- Some providers may return provider-specific event shapes; keep parsing
-  tolerant and preserve fallback to `generate()`.
+Use the SDK streaming overload:
 
-## Gateway Wiring
+```ts
+const stream = await client.chat.send(
+  {
+    chatRequest: {
+      ...toSdkRequest(body),
+      stream: true,
+    },
+  } as never,
+  { signal: request.signal, headers: sdkHeaders } as never,
+);
+```
 
-Update gateway-facing types and config parsing:
+Notes:
 
-- Add `modelStreaming?: boolean` to `AgentDefaults` in
-  `packages/gateway-fastify/src/core.ts`.
-- Add `modelIdleTimeoutMs?: number` to the same type.
-- Parse `defaults.modelStreaming` as an optional boolean in
-  `packages/gateway-fastify/src/config.ts`.
-- Parse `defaults.modelIdleTimeoutMs` as an optional positive integer.
-- Update config tests to cover both fields.
-- Update gateway README agent config docs with the new fields.
+- Keep the existing SDK request normalization. Do not leak REST-only field names
+  into SDK input.
+- Convert SDK stream chunks into the same accumulator used for OpenAI-compatible
+  chunks where possible.
+- Preserve reasoning and `reasoningDetails` when the SDK returns them.
+- Verify tool-call streaming with delegate tool-name aliases.
 
-The agent registry should not need structural changes because it already passes
-`entry.definition.config.defaults` into `createAdaptiveAgent()`.
+### Phase 4: Mistral SDK
 
-## Core Type Changes
+Use the SDK streaming method:
 
-Update core runtime types:
+```ts
+const stream = await client.chat.stream(toSdkRequest(body) as never, {
+  signal: request.signal,
+} as never);
+```
 
-- Add `modelStreaming?: boolean` to core agent defaults/options.
-- Add `modelIdleTimeoutMs?: number`.
-- Add defaults to `DEFAULT_AGENT_DEFAULTS` or resolve them explicitly in the
-  constructor.
-- Keep the default streaming value false.
+Notes:
 
-Avoid changing `ModelAdapter.generate()` or the required adapter surface.
-`stream()` remains optional.
+- Mistral event names and chunk shapes may differ from OpenAI-compatible chunks.
+- Map Mistral-specific stream events into the same final accumulator model.
+- Verify structured output, tool calls, and usage separately; do not assume
+  non-streaming and streaming response fields match exactly.
+
+## Retry Policy
+
+Preserve current retry behavior for failures before stream consumption starts:
+
+- request gate wait failures;
+- request construction failures;
+- HTTP status failures before a stream body is consumed;
+- connection failures before the first stream chunk.
+
+Be conservative after stream consumption starts:
+
+- Do not automatically retry after partial chunks have been received.
+- Treat mid-stream provider errors as model failures.
+- Preserve provider-specific error enrichment where it already exists.
+
+This avoids duplicating partial inference work and avoids changing deterministic
+execution behavior.
+
+## Stream Accumulator Requirements
+
+The accumulator can start provider-local. Create a shared helper only after at
+least two providers need materially identical logic.
+
+Minimum behavior:
+
+```ts
+interface AccumulatedToolCall {
+  index: number;
+  id?: string;
+  name?: string;
+  argumentsText: string;
+}
+```
+
+Rules:
+
+- Content deltas append to a text buffer.
+- Tool calls are keyed primarily by provider `index`; fall back to insertion
+  order when index is missing.
+- Tool-call `id` and function `name` can arrive before, after, or between
+  argument fragments.
+- Argument fragments concatenate exactly as received before JSON parsing.
+- Empty final text should remain `undefined`, matching current behavior.
+- `finishReason: 'tool_calls'` should be returned when final chunks indicate
+  tool calls, even if text is empty.
+- `structuredOutput` is derived from final text only after stream completion.
 
 ## Event Store and Replay
 
-Do not persist token deltas as durable execution state in the first phase.
+Do not persist partial stream chunks in this phase.
 
-Persist the same final model output artifacts as today:
+Core should continue persisting only the same durable artifacts as today:
 
-- final assistant text
-- final tool calls
-- usage, if available
-- snapshots after model response/tool-call queueing as currently implemented
+- final assistant text;
+- final tool calls;
+- final usage, if available;
+- existing events such as `model.started`, `model.completed`, and
+  `model.failed`;
+- snapshots after model response/tool-call queueing as currently implemented.
 
-This avoids introducing replay instability from partial streamed content.
+This keeps replay and resumability behavior unchanged.
 
-## Testing Plan
+## Tests
 
-Core tests:
+### Adapter tests
 
-- Default behavior still calls `generate()`.
-- `modelStreaming: true` calls `stream()` when capability and method exist.
-- `modelStreaming: true` falls back to `generate()` when `stream()` is missing.
-- Streamed text returns the same final result shape as generated text.
-- Streamed tool call chunks reconstruct a valid `ModelToolCall`.
-- `modelIdleTimeoutMs` aborts when no stream events arrive.
-- Stream events reset the idle timeout.
-- `modelTimeoutMs` still aborts total long-running stream turns.
-- Streaming model failure maps to the same run failure path as generate failure.
+Add focused tests under `packages/core/src/adapters/adapters.test.ts`.
 
-Adapter tests:
+Required cases:
 
-- Parses SSE text deltas.
-- Parses fragmented tool call arguments.
-- Handles `[DONE]`.
-- Handles final usage chunks when present.
-- Aborts cleanly when `AbortSignal` is triggered.
-- Keeps request gate release behavior correct on success, failure, and abort.
-- Preserves existing retry behavior for retryable HTTP responses before stream
-  body consumption begins.
+- Streaming-backed `generate()` returns final text equal to non-streaming parser
+  expectations.
+- Multiple text deltas concatenate in order.
+- `[DONE]` terminates SSE parsing.
+- Empty and comment SSE lines are ignored.
+- Fragmented tool-call arguments reconstruct a valid `ModelToolCall`.
+- Multiple tool calls are reconstructed by index.
+- Final usage chunk maps to `UsageSummary` when present.
+- Missing usage is handled without throwing.
+- Abort signal cancels stream consumption.
+- Request gate release happens on success, provider failure, parse failure, and
+  abort.
+- Retryable HTTP statuses before stream consumption preserve current retry
+  behavior.
+- Mid-stream errors fail the request without automatic retry.
 
-Gateway tests:
+Provider-specific cases:
 
-- Agent config accepts `defaults.modelStreaming`.
-- Agent config accepts `defaults.modelIdleTimeoutMs`.
-- Invalid non-boolean `modelStreaming` is rejected.
-- Invalid non-positive `modelIdleTimeoutMs` is rejected.
-- Registry passes parsed defaults through unchanged.
+- Mesh streaming response chunks map to `ModelResponse`.
+- Mesh mid-stream `MeshAPIApiError` preserves enriched provider detail.
+- OpenRouter SDK stream chunks preserve SDK field-name normalization.
+- Mistral stream events map content, tool calls, finish reason, and usage when
+  available.
+- Ollama/OpenAI-compatible SSE works through `BaseOpenAIChatAdapter`.
 
-Manual verification:
+### Core regression tests
+
+Because core should remain unchanged, run existing core agent tests to ensure the
+adapter behavior is still transparent:
 
 ```bash
 bunx vitest run packages/core/src/adaptive-agent.test.ts
+bunx vitest run packages/core/src/create-adaptive-agent.test.ts
+```
+
+### Verification commands
+
+Use Bun-native checks:
+
+```bash
 bunx vitest run packages/core/src/adapters/adapters.test.ts
-bun --cwd packages/gateway-fastify test
+bunx vitest run packages/core/src/adaptive-agent.test.ts
+bun run --cwd packages/core build
 ```
 
-Then run a gateway agent with:
+If provider config or SDK imports change, also run:
 
-```json
-{
-  "agentRuntimeLogging": {
-    "enabled": true,
-    "level": "debug",
-    "destination": "file"
-  }
-}
+```bash
+bunx vitest run packages/agent-sdk/src/index.test.ts
+bun run --cwd packages/agent-sdk typecheck
 ```
-
-and an agent config containing:
-
-```json
-{
-  "defaults": {
-    "modelTimeoutMs": 600000,
-    "modelStreaming": true,
-    "modelIdleTimeoutMs": 120000
-  }
-}
-```
-
-Confirm logs include `model.stream.started` and `model.stream.completed`.
 
 ## Rollout Plan
 
-1. Add config and type fields with defaults off.
-2. Add runtime branch with fallback to `generate()`.
-3. Add stream idle timeout helper.
-4. Implement `BaseOpenAIChatAdapter.stream()`.
-5. Add unit tests for runtime selection and adapter parsing.
-6. Add gateway config tests and README docs.
-7. Test with Ollama locally.
-8. Test with one hosted OpenAI-compatible provider.
-9. Keep `modelStreaming` off in examples until manual provider testing is
-   complete.
-10. Add live gateway token forwarding in a later phase if needed.
+1. Implement Mesh streaming-backed `generate()` behind the existing
+   `MeshAdapter.generate()` method.
+2. Add Mesh stream aggregation tests for text, tool calls, usage, abort, and
+   mid-stream errors.
+3. Manually validate one long-running Mesh inference with a large enough
+   `modelTimeoutMs`.
+4. If Mesh parity is acceptable, decide whether Mesh should always use
+   streaming internally or keep a private adapter fallback during burn-in.
+5. Implement OpenAI-compatible SSE support in `BaseOpenAIChatAdapter.generate()`
+   or in a private helper called by `generate()`.
+6. Validate Ollama locally.
+7. Implement OpenRouter SDK streaming-backed `generate()`.
+8. Implement Mistral SDK streaming-backed `generate()`.
+9. Keep `ModelAdapter.stream()` optional and unused by core until a separate UX
+   streaming feature is explicitly required.
 
-## Risks and Edge Cases
+## Risks and Mitigations
 
-- Tool call streaming is provider-fragmented and can arrive as partial JSON.
-- Some providers advertise streaming but omit final usage data.
-- Some providers may not support streaming with structured output or tools in
-  every model.
-- Streaming can keep a request alive but does not remove total runtime limits.
-- Request queue wait time can still consume `modelTimeoutMs` before streaming
-  begins.
-- Gateway clients may confuse runtime streaming with websocket live token
-  delivery; document that these are separate phases.
-- Persisting partial stream events too early could complicate replay semantics.
+- **No early chunks:** streaming does not help if the provider emits nothing
+  before core or upstream initial-response timeout. Mitigate with larger
+  `modelTimeoutMs` and provider-specific testing.
+- **Missing usage:** some providers omit stream usage. Mitigate by testing usage
+  first and keeping a non-streaming fallback for providers where accounting is
+  required.
+- **Fragmented tool calls:** tool calls can arrive as partial JSON strings.
+  Mitigate with accumulator tests for fragmented and multiple tool calls.
+- **Provider-specific chunk shapes:** SDK stream events differ. Mitigate by
+  implementing provider-local mapping first.
+- **Mid-stream failures:** automatic retry after partial output is unsafe.
+  Mitigate by retrying only before stream consumption starts.
+- **Structured output differences:** some providers may not support structured
+  output with streaming. Mitigate by testing `outputSchema` per provider before
+  making streaming the default.
+- **Response byte metrics:** streaming does not naturally expose one response
+  body string. Mitigate by approximating serialized chunk bytes or recording the
+  final accumulated response bytes.
 
-## Future Phase: Gateway Live Streaming
+## Future Phase: UX Streaming
 
-After the runtime streaming path is stable, add optional forwarding from model
-stream events to gateway websocket clients.
+If user-facing live token updates are needed later, add that separately:
 
-Potential protocol events:
+- make core choose `model.stream()` explicitly;
+- define durable vs ephemeral model stream events;
+- negotiate gateway/websocket client capability;
+- keep existing final-result frames unchanged for old clients.
 
-- `run.model_stream.started`
-- `run.model_stream.delta`
-- `run.model_stream.usage`
-- `run.model_stream.completed`
-- `run.model_stream.failed`
-
-This should be negotiated by client capability or channel policy so existing
-clients continue to receive the current final-result frames unchanged.
+That future work should not be mixed with this timeout-focused drop-in transport
+change.

@@ -11,6 +11,7 @@ export type KnownNormalizedEventName =
   | 'plan.execution_started'
   | 'step.started'
   | 'step.completed'
+  | 'model.tool_call_rejected'
   | 'tool.started'
   | 'tool.completed'
   | 'tool.failed'
@@ -74,6 +75,7 @@ const KNOWN_EVENT_NAMES = new Set<KnownNormalizedEventName>([
   'plan.execution_started',
   'step.started',
   'step.completed',
+  'model.tool_call_rejected',
   'tool.started',
   'tool.completed',
   'tool.failed',

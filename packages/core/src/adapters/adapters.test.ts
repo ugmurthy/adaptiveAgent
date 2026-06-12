@@ -534,6 +534,25 @@ describe('BaseOpenAIChatAdapter', () => {
     });
   });
 
+  it('wraps scalar tool result messages as JSON objects', async () => {
+    const adapter = createAdapter();
+    mockFetchResponse(STOP_RESPONSE);
+
+    await adapter.generate({
+      messages: [
+        { role: 'user', content: 'Look up testing' },
+        { role: 'tool', content: '"found"', toolCallId: 'call-1', name: 'lookup' },
+      ],
+    });
+
+    const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    const toolMsg = body.messages.find((m: { role: string }) => m.role === 'tool');
+    expect(JSON.parse(toolMsg.content)).toEqual({
+      result: 'found',
+      resultType: 'text',
+    });
+  });
+
   it('replays assistant tool call messages in OpenAI format', async () => {
     const adapter = createAdapter();
     mockFetchResponse(STOP_RESPONSE);
@@ -633,8 +652,19 @@ describe('BaseOpenAIChatAdapter', () => {
     expect(result.structuredOutput).toEqual({ result: 'structured' });
   });
 
-  it('sends response_format when outputSchema is provided', async () => {
+  it('defaults outputSchema requests to prompted JSON without provider response_format', async () => {
     const adapter = createAdapter();
+    mockFetchResponse(STOP_RESPONSE);
+
+    const schema = { type: 'object', properties: { answer: { type: 'string' } } };
+    await adapter.generate(simpleRequest({ outputSchema: schema }));
+
+    const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    expect(body.response_format).toBeUndefined();
+  });
+
+  it('sends response_format when strict structured output is configured', async () => {
+    const adapter = createAdapter({ structuredOutputMode: 'strict' });
     mockFetchResponse(STOP_RESPONSE);
 
     const schema = { type: 'object', properties: { answer: { type: 'string' } } };
@@ -649,6 +679,15 @@ describe('BaseOpenAIChatAdapter', () => {
         schema,
       },
     });
+  });
+
+  it('rejects string outputSchema before sending a request', async () => {
+    const adapter = createAdapter();
+
+    await expect(
+      adapter.generate(simpleRequest({ outputSchema: '{"type":"object"}' as never })),
+    ).rejects.toThrow('outputSchema must be a JSON object');
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 
   it('returns undefined usage when provider omits it', async () => {
@@ -1072,6 +1111,7 @@ describe('OpenRouterAdapter', () => {
     const adapter = new OpenRouterAdapter({
       model: 'anthropic/claude-sonnet-4',
       apiKey: 'or-key',
+      structuredOutputMode: 'strict',
     });
     mockFetchResponse(STOP_RESPONSE);
 
@@ -1255,7 +1295,7 @@ describe('MistralAdapter', () => {
   });
 
   it('translates structured output into the Mistral SDK responseFormat shape', async () => {
-    const adapter = new MistralAdapter({ model: 'mistral-large-latest', apiKey: 'ms-key' });
+    const adapter = new MistralAdapter({ model: 'mistral-large-latest', apiKey: 'ms-key', structuredOutputMode: 'strict' });
     mockFetchResponse(STOP_RESPONSE);
 
     const schema = { type: 'object', properties: { answer: { type: 'string' } } };

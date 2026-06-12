@@ -22,25 +22,48 @@ describe('tool budget policy', () => {
   });
 
   it('lets explicit tool budgets override preset-derived budgets', () => {
+    const budgets = resolveToolBudgets({
+      researchPolicy: 'light',
+      toolBudgets: {
+        'web_research.search': {
+          maxCalls: 3,
+          checkpointAfter: 2,
+        },
+      },
+    });
+
+    expect(budgets).toMatchObject({
+      'web_research.search': {
+        maxCalls: 3,
+        checkpointAfter: 2,
+        onExhausted: 'ask_model',
+      },
+      'web_research.read': {
+        maxCalls: 4,
+      },
+    });
+    expect(budgets?.['web_research.search']).not.toHaveProperty('maxConsecutiveCalls');
+    expect(budgets?.['web_research.read']).not.toHaveProperty('maxConsecutiveCalls');
+  });
+
+  it('preserves explicit consecutive caps without deriving hidden ones from policy presets', () => {
     expect(
       resolveToolBudgets({
-        researchPolicy: 'light',
+        researchPolicy: 'deep',
         toolBudgets: {
           'web_research.search': {
-            maxCalls: 3,
-            checkpointAfter: 2,
+            maxConsecutiveCalls: 2,
           },
         },
       }),
     ).toMatchObject({
       'web_research.search': {
-        maxCalls: 3,
-        checkpointAfter: 2,
+        maxCalls: 8,
         maxConsecutiveCalls: 2,
         onExhausted: 'ask_model',
       },
       'web_research.read': {
-        maxCalls: 4,
+        maxCalls: 20,
       },
     });
   });

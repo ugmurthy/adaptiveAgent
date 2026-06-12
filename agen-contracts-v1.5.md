@@ -91,6 +91,7 @@ export type FailureKind =
   | 'network'
   | 'rate_limit'
   | 'provider_error'
+  | 'invalid_tool_call'
   | 'not_found'
   | 'tool_error'
   | 'approval_rejected'

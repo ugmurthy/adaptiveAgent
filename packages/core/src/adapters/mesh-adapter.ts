@@ -1,7 +1,7 @@
 import { MeshAPI, MeshAPIApiError } from 'meshapi-node-sdk';
 
 import { approximateSerializedByteLength, compactJsonObject } from '../logging.js';
-import type { ModelRequest, ModelResponse } from '../types.js';
+import type { ModelRequest, ModelResponse, StructuredOutputMode } from '../types.js';
 import { BaseOpenAIChatAdapter, MAX_LOCAL_AUDIO_BYTES, type BaseOpenAIChatAdapterConfig } from './base-openai-chat-adapter.js';
 
 const MESH_BASE_URL = 'https://api.meshapi.ai/v1';
@@ -12,6 +12,7 @@ export interface MeshAdapterConfig {
   apiKey: string;
   baseUrl?: string;
   maxConcurrentRequests?: number;
+  structuredOutputMode?: StructuredOutputMode;
 }
 
 export class MeshAdapter extends BaseOpenAIChatAdapter {
@@ -24,6 +25,7 @@ export class MeshAdapter extends BaseOpenAIChatAdapter {
       baseUrl: config.baseUrl ?? MESH_BASE_URL,
       apiKey: config.apiKey,
       maxConcurrentRequests: config.maxConcurrentRequests,
+      structuredOutputMode: config.structuredOutputMode,
       capabilities: {
         toolCalling: true,
         jsonOutput: true,

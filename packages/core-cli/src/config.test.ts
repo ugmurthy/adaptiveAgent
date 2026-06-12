@@ -32,12 +32,22 @@ describe('core-cli config', () => {
         name: 'Local Agent',
         invocationModes: ['chat', 'run'],
         defaultInvocationMode: 'run',
-        model: { provider: 'ollama', model: 'qwen3.5' },
+        model: { provider: 'ollama', model: 'qwen3.5', structuredOutputMode: 'strict' },
         workspaceRoot: '$HOME/project',
         systemInstructions: 'You are local.',
         tools: ['read_file', 'list_directory'],
         delegates: ['researcher'],
-        defaults: { maxSteps: 12, capture: 'summary' },
+        defaults: {
+          maxSteps: 12,
+          capture: 'summary',
+          modelRetryPolicy: {
+            maxRetries: 1,
+            retryOn: ['timeout', 'provider_error'],
+            baseDelayMs: 0,
+            maxDelayMs: 500,
+            jitter: false,
+          },
+        },
         metadata: { team: 'local' },
         routing: { ignored: true },
       },
@@ -46,13 +56,63 @@ describe('core-cli config', () => {
 
     expect(config.id).toBe('local-agent');
     expect(config.invocationModes).toEqual(['chat', 'run']);
+    expect(config.model.structuredOutputMode).toBe('strict');
     expect(config.defaults?.maxSteps).toBe(12);
+    expect(config.defaults?.modelRetryPolicy).toEqual({
+      maxRetries: 1,
+      retryOn: ['timeout', 'provider_error'],
+      baseDelayMs: 0,
+      maxDelayMs: 500,
+      jitter: false,
+    });
     expect(config.routing).toEqual({ ignored: true });
   });
 
   it('reports validation issues with field paths', () => {
     expect(() => validateAgentConfig({ id: '', tools: 'read_file' }, 'bad.json')).toThrow(ConfigValidationError);
     expect(() => validateAgentConfig({ id: '', tools: 'read_file' }, 'bad.json')).toThrow('model.provider');
+  });
+
+  it('defaults structured output mode to prompted when omitted', () => {
+    const config = validateAgentConfig(
+      {
+        id: 'default-structured-output',
+        name: 'Default Structured Output',
+        invocationModes: ['run'],
+        defaultInvocationMode: 'run',
+        model: { provider: 'ollama', model: 'qwen3.5' },
+        tools: [],
+        delegates: [],
+      },
+      'default-structured-output.json',
+    );
+
+    expect(config.model.structuredOutputMode).toBe('prompted');
+    expect(resolveModelConfig(config.model)).toMatchObject({ structuredOutputMode: 'prompted' });
+  });
+
+  it('reports invalid model retry policy defaults', () => {
+    expect(() =>
+      validateAgentConfig(
+        {
+          id: 'bad-retry-policy',
+          name: 'Bad Retry Policy',
+          model: { provider: 'ollama', model: 'qwen3.5' },
+          tools: [],
+          delegates: [],
+          defaults: {
+            modelRetryPolicy: {
+              maxRetries: -1,
+              retryOn: ['tool_error'],
+              jitter: 'yes',
+            },
+          },
+        },
+        'bad-retry-policy.json',
+      ),
+    ).toThrow(
+      /defaults.modelRetryPolicy.maxRetries must be a non-negative integer[\s\S]*defaults.modelRetryPolicy.jitter must be a boolean[\s\S]*defaults.modelRetryPolicy.retryOn\[0\] must be one of: timeout, network, rate_limit, provider_error/,
+    );
   });
 
   it('selects explicit config paths before defaults', async () => {
@@ -81,8 +141,11 @@ describe('core-cli config', () => {
   it('resolves workspace roots and environment-backed model API keys', () => {
     expect(resolveWorkspaceRoot('$HOME/project')).toContain('/project');
     expect(
-      resolveModelConfig({ provider: 'mesh', model: 'openai/gpt-4o', apiKeyEnv: 'MESH_API_KEY' }, { MESH_API_KEY: 'mesh-key' }),
-    ).toMatchObject({ provider: 'mesh', apiKey: 'mesh-key' });
+      resolveModelConfig(
+        { provider: 'mesh', model: 'openai/gpt-4o', apiKeyEnv: 'MESH_API_KEY', structuredOutputMode: 'strict' },
+        { MESH_API_KEY: 'mesh-key' },
+      ),
+    ).toMatchObject({ provider: 'mesh', apiKey: 'mesh-key', structuredOutputMode: 'strict' });
   });
 });
 

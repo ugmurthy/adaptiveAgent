@@ -1,3 +1,4 @@
+import type { StructuredOutputMode } from '../types.js';
 import { BaseOpenAIChatAdapter, type BaseOpenAIChatAdapterConfig } from './base-openai-chat-adapter.js';
 
 const OLLAMA_BASE_URL = 'http://localhost:11434/v1';
@@ -6,6 +7,7 @@ export interface OllamaAdapterConfig {
   model: string;
   baseUrl?: string;
   maxConcurrentRequests?: number;
+  structuredOutputMode?: StructuredOutputMode;
 }
 
 export class OllamaAdapter extends BaseOpenAIChatAdapter {
@@ -15,6 +17,7 @@ export class OllamaAdapter extends BaseOpenAIChatAdapter {
       model: config.model,
       baseUrl: config.baseUrl ?? OLLAMA_BASE_URL,
       maxConcurrentRequests: config.maxConcurrentRequests,
+      structuredOutputMode: config.structuredOutputMode,
       capabilities: {
         toolCalling: true,
         jsonOutput: true,

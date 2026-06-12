@@ -86,13 +86,11 @@ export function budgetsFromResearchPolicy(policy: ResolvedResearchPolicy): Recor
     'web_research.search': {
       maxCalls: policy.maxSearches,
       checkpointAfter: policy.checkpointAfter,
-      maxConsecutiveCalls: 2,
       onExhausted: 'ask_model',
     },
     'web_research.read': {
       maxCalls: policy.maxPagesRead,
       checkpointAfter: Math.max(1, Math.floor(policy.maxPagesRead * 0.75)),
-      maxConsecutiveCalls: 4,
       onExhausted: 'ask_model',
     },
   };

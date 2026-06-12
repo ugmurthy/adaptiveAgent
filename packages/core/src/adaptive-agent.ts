@@ -5,7 +5,13 @@ import { basename, extname, join } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 
-import { DelegationError, DelegationExecutor, type ExecuteChildRunRequest, type ParentResumeResult } from './delegation-executor.js';
+import {
+  DelegationError,
+  DelegationExecutor,
+  validateDelegateToolInput,
+  type ExecuteChildRunRequest,
+  type ParentResumeResult,
+} from './delegation-executor.js';
 import {
   approximateSerializedByteLength,
   captureToolInputForLog,
@@ -18,6 +24,11 @@ import {
   summarizeModelResponseForLog,
 } from './logging.js';
 import { captureValueForLog, errorForLog, summarizeValueForLog } from './logger.js';
+import {
+  assertValidOutputSchema,
+  normalizeToolResultContentForModel,
+  toModelVisibleToolResultObject,
+} from './model-payloads.js';
 import { RunRecoveryAnalyzer } from './run-recovery-analyzer.js';
 import { resolveResearchPolicy, resolveToolBudgets, type ResolvedResearchPolicy } from './tool-budget-policy.js';
 import type {
@@ -42,6 +53,8 @@ import type {
   ModelContentPart,
   ModelMessage,
   ModelMessageContent,
+  ModelRequest,
+  ModelRetryPolicy,
   ModelToolCall,
   ModelResponse,
   PlanCondition,
@@ -74,7 +87,7 @@ interface PendingToolCallState {
 
 interface PendingToolCallExecutionResult {
   output: JsonValue;
-  modelOutput: JsonValue;
+  modelOutput: JsonObject;
   completion?: ToolExecutionCompletionPersistence;
 }
 
@@ -92,8 +105,10 @@ interface ExecutionState {
   approvedToolCallIds: string[];
   waitingOnChildRunId?: UUID;
   toolBudgetUsage: Record<string, ToolBudgetUsage>;
+  exhaustedToolBudgetGroups: Record<string, true>;
   pendingRuntimeMessages: ModelMessage[];
   visibleToolNames?: string[];
+  invalidToolCallRepairAttempts: Record<string, number>;
 }
 
 interface ToolBudgetUsage {
@@ -106,6 +121,14 @@ interface RuntimeToolContext extends ToolContext {
   abort(reason?: unknown): void;
 }
 
+interface ResolvedModelRetryPolicy {
+  maxRetries: number;
+  retryOn: FailureKind[];
+  baseDelayMs: number;
+  maxDelayMs: number;
+  jitter: boolean;
+}
+
 interface RunContinuationOptions {
   outputSchema?: JsonSchema;
   retryFailedChild?: boolean;
@@ -113,7 +136,7 @@ interface RunContinuationOptions {
 }
 
 type FailedRunRetryability =
-  | { retryable: true; failureKind: FailureKind }
+  | { retryable: true; failureKind: FailureKind; retryAction?: 'repair_invalid_tool_call' }
   | { retryable: false; reason: string; failureKind: FailureKind };
 
 type LinkedDelegateChildRun =
@@ -125,12 +148,20 @@ const DEFAULT_AGENT_DEFAULTS = {
   maxSteps: 30,
   toolTimeoutMs: 60_000,
   modelTimeoutMs: 90_000,
+  modelRetryPolicy: {
+    maxRetries: 0,
+    retryOn: ['timeout', 'network', 'rate_limit', 'provider_error'] as FailureKind[],
+    baseDelayMs: 500,
+    maxDelayMs: 8_000,
+    jitter: true,
+  },
   maxRetriesPerStep: 0,
 } as const;
 
 const OLLAMA_MODEL_TIMEOUT_MULTIPLIER = 4;
 const EXECUTION_STATE_SCHEMA_VERSION = 1;
 const DEFAULT_TOOL_TERMINAL_RETRY_LIMIT = 1;
+const DEFAULT_INVALID_TOOL_CALL_REPAIR_LIMIT = 1;
 const DEFAULT_MODEL_RESULT_MAX_BYTES = 64 * 1024;
 
 const TERMINAL_RUN_STATUSES = new Set<RunStatus>([
@@ -143,6 +174,7 @@ const TERMINAL_RUN_STATUSES = new Set<RunStatus>([
 
 const RESERVED_DELEGATE_PREFIX = 'delegate.';
 const CHAT_GOAL_MAX_LENGTH = 120;
+const INVALID_TOOL_CALL_VALID_NAME_LIMIT = 40;
 
 const STEER_METADATA_KEY = 'pendingSteerMessages';
 const STEER_UPDATE_MAX_ATTEMPTS = 5;
@@ -187,6 +219,14 @@ interface PendingSteerMessage {
   metadata?: JsonObject;
 }
 
+interface InvalidToolCallRejection {
+  pendingToolCall: PendingToolCallState;
+  reason: 'unknown_tool' | 'tool_not_visible' | 'invalid_tool_input';
+  validToolNames: string[];
+  resolvedToolName?: string;
+  details?: string;
+}
+
 export class AdaptiveAgent {
   private readonly toolRegistry = new Map<string, ToolDefinition>();
   private readonly plannerTools: Array<Pick<ToolDefinition, 'name' | 'description' | 'inputSchema'>>;
@@ -196,6 +236,7 @@ export class AdaptiveAgent {
     maxSteps: number;
     toolTimeoutMs: number;
     modelTimeoutMs: number;
+    modelRetryPolicy: ResolvedModelRetryPolicy;
     maxRetriesPerStep: number;
   };
   private readonly defaultCaptureMode: CaptureMode;
@@ -210,6 +251,7 @@ export class AdaptiveAgent {
       maxSteps: options.defaults?.maxSteps ?? DEFAULT_AGENT_DEFAULTS.maxSteps,
       toolTimeoutMs: options.defaults?.toolTimeoutMs ?? DEFAULT_AGENT_DEFAULTS.toolTimeoutMs,
       modelTimeoutMs: options.defaults?.modelTimeoutMs ?? resolveDefaultModelTimeoutMs(options.model.provider),
+      modelRetryPolicy: resolveModelRetryPolicy(options.defaults?.modelRetryPolicy),
       maxRetriesPerStep: options.defaults?.maxRetriesPerStep ?? DEFAULT_AGENT_DEFAULTS.maxRetriesPerStep,
     };
     this.defaultCaptureMode = options.defaults?.capture ?? 'summary';
@@ -272,6 +314,10 @@ export class AdaptiveAgent {
   }
 
   async run(request: RunRequest): Promise<RunResult> {
+    if (request.outputSchema !== undefined) {
+      assertValidOutputSchema(request.outputSchema);
+    }
+
     const visibleToolNames = this.resolveRequestedToolNames(request.allowedTools, request.forbiddenTools);
     if (
       visibleToolNames &&
@@ -313,10 +359,15 @@ export class AdaptiveAgent {
   }
 
   async chat(request: ChatRequest): Promise<ChatResult> {
+    if (request.outputSchema !== undefined) {
+      assertValidOutputSchema(request.outputSchema);
+    }
+
     const normalizedMessages = await this.normalizeChatFileInputsForReadFile(request.messages);
     const initialMessages = buildInitialChatMessages(
       normalizedMessages,
       request.context,
+      request.outputSchema,
       this.options.systemInstructions,
       this.buildRuntimeToolManifestMessage(),
     );
@@ -1161,6 +1212,11 @@ export class AdaptiveAgent {
           retryAttempts,
         },
       });
+
+      if (retryability.retryAction === 'repair_invalid_tool_call') {
+        await this.prepareInvalidToolCallRepairRetry(retryingRun, state);
+      }
+
       await this.saveExecutionSnapshot(retryingRun, state, retryingRun.status);
 
       return await this.continueRunFromState(await this.refreshRun(runId), state, { retryFailedChild: true });
@@ -1188,6 +1244,35 @@ export class AdaptiveAgent {
     return retryability.retryable
       ? { runId, retryable: true, failureKind: retryability.failureKind }
       : { runId, retryable: false, failureKind: retryability.failureKind, reason: retryability.reason };
+  }
+
+  private async prepareInvalidToolCallRepairRetry(run: AgentRun, state: ExecutionState): Promise<void> {
+    const pendingToolCall = state.pendingToolCalls[0];
+    if (!pendingToolCall) {
+      throw new Error(`Run ${run.id} has no pending invalid tool call to repair`);
+    }
+
+    const rejection = this.findInvalidPendingToolCall(state, [pendingToolCall]);
+    if (!rejection) {
+      throw new Error(`Run ${run.id} no longer has an invalid pending tool call to repair`);
+    }
+
+    state.messages = removeAssistantToolCallMessage(state.messages, pendingToolCall.id);
+    state.pendingToolCalls = [];
+    state.approvedToolCallIds = removeApprovedToolCallId(state.approvedToolCallIds, pendingToolCall.id);
+    state.waitingOnChildRunId = undefined;
+
+    const repairQueued = await this.rejectInvalidToolCallAndMaybeRepair(
+      run,
+      state,
+      pendingToolCall.stepId,
+      rejection,
+      'terminal_retry',
+      { saveSnapshot: false },
+    );
+    if (!repairQueued) {
+      throw new Error(formatInvalidToolCallError(rejection, readInvalidToolCallRepairAttempts(state, pendingToolCall.stepId)));
+    }
   }
 
   async getRecoveryOptions(runId: UUID): Promise<RunRecoveryOptions> {
@@ -1314,6 +1399,10 @@ export class AdaptiveAgent {
   }
 
   private async runWithExistingRun(runId: UUID, options: RunContinuationOptions): Promise<RunResult> {
+    if (options.outputSchema !== undefined) {
+      assertValidOutputSchema(options.outputSchema);
+    }
+
     const run = await this.options.runStore.getRun(runId);
     if (!run) {
       throw new Error(`Run ${runId} does not exist`);
@@ -1510,33 +1599,72 @@ export class AdaptiveAgent {
       });
 
       let response: ModelResponse;
-      try {
-        this.flushPendingRuntimeMessages(state);
-        response = await this.generateModelResponse(currentRun, state);
-      } catch (error) {
+      while (true) {
+        try {
+          this.flushPendingRuntimeMessages(state);
+          response = await this.generateModelResponse(currentRun, state);
+        } catch (error) {
+          currentRun = await this.refreshRun(currentRun.id);
+          return this.failRun(
+            currentRun,
+            state,
+            error instanceof Error ? error.message : String(error),
+            'MODEL_ERROR',
+          );
+        }
+
         currentRun = await this.refreshRun(currentRun.id);
-        return this.failRun(
-          currentRun,
-          state,
-          error instanceof Error ? error.message : String(error),
-          'MODEL_ERROR',
-        );
-      }
 
-      currentRun = await this.refreshRun(currentRun.id);
+        if (response.finishReason === 'error') {
+          return this.failRun(currentRun, state, 'Model returned finishReason=error', 'MODEL_ERROR');
+        }
 
-      if (response.finishReason === 'error') {
-        return this.failRun(currentRun, state, 'Model returned finishReason=error', 'MODEL_ERROR');
+        if (response.toolCalls && response.toolCalls.length > 0) {
+          const pendingToolCalls = createPendingToolCalls(response.toolCalls, state.stepsUsed + 1);
+          const rejection = this.findInvalidPendingToolCall(state, pendingToolCalls);
+          if (rejection) {
+            const repairQueued = await this.rejectInvalidToolCallAndMaybeRepair(
+              currentRun,
+              state,
+              stepId,
+              rejection,
+              'model_response',
+            );
+            if (repairQueued) {
+              currentRun = await this.refreshRun(currentRun.id);
+              continue;
+            }
+
+            const assistantMessage = assistantMessageFromResponse(response);
+            if (assistantMessage) {
+              state.messages.push(assistantMessage);
+            }
+            const assistantContent = typeof assistantMessage?.content === 'string' ? assistantMessage.content : undefined;
+            state.pendingToolCalls.push(
+              ...createPendingToolCalls(response.toolCalls, state.stepsUsed + 1, assistantContent),
+            );
+
+            return this.failRun(
+              currentRun,
+              state,
+              formatInvalidToolCallError(rejection, readInvalidToolCallRepairAttempts(state, stepId)),
+              'TOOL_ERROR',
+            );
+          }
+        }
+
+        break;
       }
 
       const assistantMessage = assistantMessageFromResponse(response);
       if (assistantMessage) {
         state.messages.push(assistantMessage);
       }
+      const assistantContent = typeof assistantMessage?.content === 'string' ? assistantMessage.content : undefined;
 
       if (response.toolCalls && response.toolCalls.length > 0) {
         state.pendingToolCalls.push(
-          ...createPendingToolCalls(response.toolCalls, state.stepsUsed + 1, assistantMessage?.content),
+          ...createPendingToolCalls(response.toolCalls, state.stepsUsed + 1, assistantContent),
         );
 
         this.logLifecycle('debug', 'model.tool_calls_queued', {
@@ -1553,7 +1681,44 @@ export class AdaptiveAgent {
         continue;
       }
 
-      const output = response.structuredOutput ?? response.text ?? null;
+      let output: JsonValue;
+      if (state.outputSchema) {
+        let structuredOutput = readStructuredOutputCandidate(response);
+        const repairText = readStructuredOutputRepairText(response);
+        if (structuredOutput === undefined && repairText) {
+          const repairResult = await this.repairStructuredOutputFromText(
+            currentRun,
+            repairText,
+            state.outputSchema,
+          );
+          if (repairResult.usage) {
+            currentRun = await this.applyUsage(currentRun, repairResult.usage);
+          }
+          structuredOutput = repairResult.output;
+        }
+
+        if (structuredOutput === undefined) {
+          return this.failRun(
+            currentRun,
+            state,
+            'Model response did not satisfy outputSchema: expected structured JSON object but received text output',
+            'MODEL_ERROR',
+          );
+        }
+
+        if (!isJsonObject(structuredOutput)) {
+          return this.failRun(
+            currentRun,
+            state,
+            'Model response did not satisfy outputSchema: structured output must be a JSON object',
+            'MODEL_ERROR',
+          );
+        }
+
+        output = structuredOutput;
+      } else {
+        output = response.structuredOutput ?? response.text ?? null;
+      }
       resetBudgetConsecutiveCalls(state.toolBudgetUsage);
       state.stepsUsed += 1;
 
@@ -1587,7 +1752,21 @@ export class AdaptiveAgent {
     const failureKind = classifyFailureKind(run.errorCode as RunFailureCode | undefined, run.errorMessage);
     const pendingToolCall = state.pendingToolCalls[0];
     if (isDelegateToolCall(pendingToolCall)) {
-      return this.checkDelegateChildRetryability(run, state, failureKind);
+      const delegateTool = this.resolveToolDefinitionByName(pendingToolCall.name);
+      if (delegateTool) {
+        const inputError = validateDelegateToolInput(pendingToolCall.input, delegateTool.name);
+        if (inputError) {
+          return this.checkInvalidToolCallRepairRetryability(run, state, pendingToolCall, failureKind, {
+            pendingToolCall,
+            reason: 'invalid_tool_input',
+            resolvedToolName: delegateTool.name === pendingToolCall.name ? undefined : delegateTool.name,
+            validToolNames: this.plannerVisibleTools(state).map((visibleTool) => visibleTool.name),
+            details: inputError,
+          });
+        }
+
+        return this.checkDelegateChildRetryability(run, state, failureKind);
+      }
     }
 
     if (run.errorCode === 'MAX_STEPS') {
@@ -1634,11 +1813,20 @@ export class AdaptiveAgent {
 
       const tool = this.resolveToolDefinitionByName(pendingToolCall.name);
       if (!tool) {
-        return {
-          retryable: false,
-          failureKind,
-          reason: `Run ${run.id} failed on unavailable tool "${pendingToolCall.name}"`,
-        };
+        return this.checkInvalidToolCallRepairRetryability(run, state, pendingToolCall, failureKind, {
+          pendingToolCall,
+          reason: 'unknown_tool',
+          validToolNames: this.plannerVisibleTools(state).map((visibleTool) => visibleTool.name),
+        });
+      }
+
+      if (state.visibleToolNames && !state.visibleToolNames.includes(tool.name)) {
+        return this.checkInvalidToolCallRepairRetryability(run, state, pendingToolCall, failureKind, {
+          pendingToolCall,
+          reason: 'tool_not_visible',
+          resolvedToolName: tool.name,
+          validToolNames: this.plannerVisibleTools(state).map((visibleTool) => visibleTool.name),
+        });
       }
 
       if (!tool.retryPolicy?.retryable) {
@@ -1718,6 +1906,200 @@ export class AdaptiveAgent {
       failureKind,
       reason: `Linked child run ${childRun.id} is ${childRun.status} and cannot be retried`,
     };
+  }
+
+  private async checkInvalidToolCallRepairRetryability(
+    run: AgentRun,
+    state: ExecutionState,
+    pendingToolCall: PendingToolCallState,
+    failureKind: FailureKind,
+    rejection: InvalidToolCallRejection,
+  ): Promise<FailedRunRetryability> {
+    if (readInvalidToolCallRepairAttempts(state, pendingToolCall.stepId) >= DEFAULT_INVALID_TOOL_CALL_REPAIR_LIMIT) {
+      return {
+        retryable: false,
+        failureKind,
+        reason: `Run ${run.id} has already used its invalid tool-call repair attempt for ${pendingToolCall.stepId}`,
+      };
+    }
+
+    const proof = await this.checkNoToolSideEffectStarted(run, state, pendingToolCall);
+    if (!proof.safe) {
+      return {
+        retryable: false,
+        failureKind,
+        reason: proof.reason,
+      };
+    }
+
+    if (!isInvalidToolCallFailure(run, rejection)) {
+      return {
+        retryable: false,
+        failureKind,
+        reason: `Run ${run.id} failed on unavailable tool "${pendingToolCall.name}" without an invalid tool-call failure boundary`,
+      };
+    }
+
+    return {
+      retryable: true,
+      failureKind,
+      retryAction: 'repair_invalid_tool_call',
+    };
+  }
+
+  private async checkNoToolSideEffectStarted(
+    run: AgentRun,
+    state: ExecutionState,
+    pendingToolCall: PendingToolCallState,
+  ): Promise<{ safe: true } | { safe: false; reason: string }> {
+    if (run.currentChildRunId || state.waitingOnChildRunId) {
+      return {
+        safe: false,
+        reason: `Run ${run.id} has delegate child linkage and cannot repair invalid tool call "${pendingToolCall.name}"`,
+      };
+    }
+
+    if (!this.options.eventStore) {
+      return {
+        safe: false,
+        reason: `Run ${run.id} has no event store history to prove tool call "${pendingToolCall.name}" never started`,
+      };
+    }
+
+    const events = await this.options.eventStore.listByRun(run.id, 0);
+    const sideEffectEvent = events.find((event) =>
+      event.toolCallId === pendingToolCall.id &&
+      (event.type === 'tool.started' || event.type === 'tool.completed' || event.type === 'tool.failed')
+    );
+    if (sideEffectEvent) {
+      return {
+        safe: false,
+        reason: `Run ${run.id} recorded ${sideEffectEvent.type} for tool call ${pendingToolCall.id}`,
+      };
+    }
+
+    const idempotencyKey = toolCallIdempotencyKey(run.id, pendingToolCall.stepId, pendingToolCall.id);
+    const record = await this.options.toolExecutionStore?.getByIdempotencyKey(idempotencyKey);
+    if (record) {
+      return {
+        safe: false,
+        reason: `Run ${run.id} has a durable tool execution record for tool call ${pendingToolCall.id}`,
+      };
+    }
+
+    return { safe: true };
+  }
+
+  private findInvalidPendingToolCall(
+    state: ExecutionState,
+    pendingToolCalls: PendingToolCallState[],
+  ): InvalidToolCallRejection | undefined {
+    const validToolNames = this.plannerVisibleTools(state).map((tool) => tool.name);
+    const validToolNameSet = new Set(validToolNames);
+
+    for (const pendingToolCall of pendingToolCalls) {
+      const resolvedTool = this.resolveToolDefinitionByName(pendingToolCall.name);
+      if (!resolvedTool) {
+        return {
+          pendingToolCall,
+          reason: 'unknown_tool',
+          validToolNames,
+        };
+      }
+
+      if (!validToolNameSet.has(resolvedTool.name)) {
+        return {
+          pendingToolCall,
+          reason: 'tool_not_visible',
+          resolvedToolName: resolvedTool.name,
+          validToolNames,
+        };
+      }
+
+      if (resolvedTool.name.startsWith(RESERVED_DELEGATE_PREFIX)) {
+        const inputError = validateDelegateToolInput(pendingToolCall.input, resolvedTool.name);
+        if (inputError) {
+          return {
+            pendingToolCall,
+            reason: 'invalid_tool_input',
+            resolvedToolName: resolvedTool.name === pendingToolCall.name ? undefined : resolvedTool.name,
+            validToolNames,
+            details: inputError,
+          };
+        }
+      }
+    }
+
+    return undefined;
+  }
+
+  private async rejectInvalidToolCallAndMaybeRepair(
+    run: AgentRun,
+    state: ExecutionState,
+    stepId: string,
+    rejection: InvalidToolCallRejection,
+    trigger: 'model_response' | 'terminal_retry',
+    options: { saveSnapshot?: boolean } = {},
+  ): Promise<boolean> {
+    const attemptsUsed = readInvalidToolCallRepairAttempts(state, stepId);
+    const willRetry = attemptsUsed < DEFAULT_INVALID_TOOL_CALL_REPAIR_LIMIT;
+    const repairAttempt = willRetry ? attemptsUsed + 1 : attemptsUsed;
+    const error = formatInvalidToolCallError(rejection, attemptsUsed);
+    const eventValidToolNames = rejection.validToolNames.slice(0, INVALID_TOOL_CALL_VALID_NAME_LIMIT);
+    const validToolNamesTruncated = rejection.validToolNames.length > eventValidToolNames.length;
+
+    this.logLifecycle('warn', 'model.tool_call_rejected', {
+      ...runLogBindings(run),
+      stepId,
+      toolCallId: rejection.pendingToolCall.id,
+      requestedToolName: rejection.pendingToolCall.name,
+      resolvedToolName: rejection.resolvedToolName,
+      reason: rejection.reason,
+      validToolNames: eventValidToolNames,
+      validToolNamesTruncated,
+      repairAttempt,
+      retryLimit: DEFAULT_INVALID_TOOL_CALL_REPAIR_LIMIT,
+      willRetry,
+      trigger,
+      error,
+    });
+
+    await this.emit({
+      runId: run.id,
+      stepId,
+      toolCallId: rejection.pendingToolCall.id,
+      type: 'model.tool_call_rejected',
+      schemaVersion: 1,
+      payload: {
+        stepId,
+        requestedToolName: rejection.pendingToolCall.name,
+        ...(rejection.resolvedToolName === undefined ? {} : { resolvedToolName: rejection.resolvedToolName }),
+        reason: rejection.reason,
+        validToolNames: eventValidToolNames,
+        ...(validToolNamesTruncated ? { validToolNamesTruncated: true } : {}),
+        repairAttempt,
+        retryLimit: DEFAULT_INVALID_TOOL_CALL_REPAIR_LIMIT,
+        willRetry,
+        trigger,
+        error,
+      },
+    });
+
+    if (!willRetry) {
+      return false;
+    }
+
+    state.invalidToolCallRepairAttempts[stepId] = repairAttempt;
+    const repairMessage = buildInvalidToolCallRepairMessage(rejection, repairAttempt, DEFAULT_INVALID_TOOL_CALL_REPAIR_LIMIT);
+    state.pendingRuntimeMessages.push({
+      role: 'system',
+      content: repairMessage,
+    });
+    this.logInjectedSystemMessage(run, 'model.tool_call_repair', repairMessage, 'pendingRuntimeMessages', stepId);
+    if (options.saveSnapshot !== false) {
+      await this.saveExecutionSnapshot(run, state, run.status);
+    }
+    return true;
   }
 
   private resolveToolDefinitionByName(name: string): ToolDefinition | undefined {
@@ -1870,7 +2252,11 @@ export class AdaptiveAgent {
     if (existingExecution?.status === 'completed') {
       const output = existingExecution.output ?? null;
       const modelOutput = this.formatToolOutputForModel(run, pendingToolCall, tool, output);
-      this.onToolExecutionAdmitted(run, state, budgetGroup, budget);
+      if (isBudgetExhaustedToolOutput(output)) {
+        this.markToolBudgetExhausted(state, budgetGroup);
+      } else {
+        this.onToolExecutionAdmitted(run, state, budgetGroup, budget);
+      }
       this.logLifecycle('info', 'tool.execution_reused', {
         ...runLogBindings(run),
         stepId: pendingToolCall.stepId,
@@ -1889,8 +2275,14 @@ export class AdaptiveAgent {
       };
     }
 
-    const budgetAdmission = this.admitBudgetedToolCall(run, state, tool, pendingToolCall.input, budgetGroup, budget);
+    const budgetAdmission = this.isToolBudgetGroupExhausted(state, budgetGroup)
+      ? {
+          admitted: false as const,
+          output: createBudgetExhaustedToolOutput(tool.name, budgetGroup!, budget?.onExhausted),
+        }
+      : this.admitBudgetedToolCall(run, state, tool, pendingToolCall.input, budgetGroup, budget);
     if (!budgetAdmission.admitted) {
+      this.markToolBudgetExhausted(state, budgetGroup);
       await this.options.toolExecutionStore?.markStarted({
         runId: run.id,
         stepId: pendingToolCall.stepId,
@@ -2282,7 +2674,11 @@ export class AdaptiveAgent {
       const tool = this.resolveToolDefinitionByName(pendingToolCall.name);
       const modelOutput = tool
         ? this.formatToolOutputForModel(run, pendingToolCall, tool, resolution.output)
-        : capModelVisibleToolResult(resolution.output, DEFAULT_MODEL_RESULT_MAX_BYTES, pendingToolCall.name);
+        : capModelVisibleToolResult(
+            toModelVisibleToolResultObject(resolution.output),
+            DEFAULT_MODEL_RESULT_MAX_BYTES,
+            pendingToolCall.name,
+          );
       state.messages.push(toolResultMessage(pendingToolCall, modelOutput));
       state.pendingToolCalls.shift();
       state.waitingOnChildRunId = undefined;
@@ -2379,7 +2775,7 @@ export class AdaptiveAgent {
     pendingToolCall: PendingToolCallState,
     tool: ToolDefinition,
     output: JsonValue,
-  ): JsonValue {
+  ): JsonObject {
     const maxBytes = tool.maxModelResultBytes ?? DEFAULT_MODEL_RESULT_MAX_BYTES;
     const formatted = tool.formatResultForModel
       ? tool.formatResultForModel(output, {
@@ -2392,7 +2788,7 @@ export class AdaptiveAgent {
         })
       : output;
 
-    return capModelVisibleToolResult(formatted, maxBytes, tool.name);
+    return capModelVisibleToolResult(toModelVisibleToolResultObject(formatted), maxBytes, tool.name);
   }
 
   private createToolContext(run: AgentRun, stepId: string, toolCallId: string, timeoutMs: number): RuntimeToolContext {
@@ -2546,7 +2942,9 @@ export class AdaptiveAgent {
       pendingToolCalls: [],
       approvedToolCallIds: [],
       toolBudgetUsage: {},
+      exhaustedToolBudgetGroups: {},
       pendingRuntimeMessages: [],
+      invalidToolCallRepairAttempts: {},
       outputSchema,
       visibleToolNames,
     };
@@ -2557,26 +2955,21 @@ export class AdaptiveAgent {
       return;
     }
 
-    const insertionIndex = state.messages.findIndex((message) => message.role !== 'system');
-    if (insertionIndex === -1) {
-      state.messages.push(...state.pendingRuntimeMessages);
-    } else {
-      state.messages.splice(insertionIndex, 0, ...state.pendingRuntimeMessages);
-    }
+    state.messages.push(...state.pendingRuntimeMessages);
     state.pendingRuntimeMessages = [];
   }
 
-  private enqueueRuntimeSystemMessage(
+  private enqueueRuntimeUserMessage(
     run: AgentRun,
     state: ExecutionState,
     source: 'research_policy.require_purpose' | 'tool_budget.checkpoint',
     content: string,
   ): void {
     state.pendingRuntimeMessages.push({
-      role: 'system',
+      role: 'user',
       content,
     });
-    this.logInjectedSystemMessage(run, source, content, 'pendingRuntimeMessages', run.currentStepId);
+    this.logInjectedSystemMessage(run, source, content, 'pendingRuntimeMessages', run.currentStepId, 'user');
   }
 
   private logInitialInjectedSystemMessages(run: AgentRun, state: ExecutionState): void {
@@ -2610,6 +3003,18 @@ export class AdaptiveAgent {
     }
 
     return tool.budgetGroup;
+  }
+
+  private isToolBudgetGroupExhausted(state: ExecutionState, budgetGroup: string | undefined): boolean {
+    return Boolean(budgetGroup && state.exhaustedToolBudgetGroups[budgetGroup]);
+  }
+
+  private markToolBudgetExhausted(state: ExecutionState, budgetGroup: string | undefined): void {
+    if (!budgetGroup) {
+      return;
+    }
+
+    state.exhaustedToolBudgetGroups[budgetGroup] = true;
   }
 
   private admitBudgetedToolCall(
@@ -2646,7 +3051,7 @@ export class AdaptiveAgent {
       tool.name === 'web_search' &&
       isMissingWebSearchPurpose(input)
     ) {
-      this.enqueueRuntimeSystemMessage(
+      this.enqueueRuntimeUserMessage(
         run,
         state,
         'research_policy.require_purpose',
@@ -2676,7 +3081,7 @@ export class AdaptiveAgent {
     const checkpointAfter = normalizeBudgetLimit(budget.checkpointAfter);
     if (checkpointAfter !== undefined && !usage.checkpointEmitted && usage.calls >= checkpointAfter) {
       usage.checkpointEmitted = true;
-      this.enqueueRuntimeSystemMessage(
+      this.enqueueRuntimeUserMessage(
         run,
         state,
         'tool_budget.checkpoint',
@@ -2829,13 +3234,25 @@ export class AdaptiveAgent {
   private filterVisibleTools<T extends Pick<ToolDefinition, 'name'>>(
     tools: T[],
     visibleToolNames?: string[],
+    state?: ExecutionState,
   ): T[] {
-    if (!visibleToolNames) {
-      return tools;
-    }
+    const visible = visibleToolNames ? new Set(visibleToolNames) : undefined;
+    return tools.filter((tool) => {
+      if (visible && !visible.has(tool.name)) {
+        return false;
+      }
 
-    const visible = new Set(visibleToolNames);
-    return tools.filter((tool) => visible.has(tool.name));
+      if (!state) {
+        return true;
+      }
+
+      const definition = this.toolRegistry.get(tool.name);
+      if (!definition) {
+        return true;
+      }
+
+      return !this.isToolBudgetGroupExhausted(state, this.resolveBudgetGroup(definition));
+    });
   }
 
   private async createRunWithInitialSnapshot(
@@ -3224,18 +3641,22 @@ export class AdaptiveAgent {
   }
 
   private async generateModelResponse(run: AgentRun, state: ExecutionState): Promise<ModelResponse> {
+    if (state.outputSchema !== undefined) {
+      assertValidOutputSchema(state.outputSchema);
+    }
+
     const modelRequest = {
-      messages: normalizeSystemMessagesAtStart(state.messages),
+      messages: normalizeSystemMessagesAtStart(normalizeToolResultMessagesForModel(state.messages)),
       tools: this.plannerVisibleTools(state),
       outputSchema: state.outputSchema,
       metadata: run.metadata,
     };
-    const startedAt = Date.now();
-    const timeoutContext = createAbortTimeoutContext(this.defaults.modelTimeoutMs);
     const modelTimeoutMs = this.defaults.modelTimeoutMs;
     const modelProvider = this.options.model.provider;
     const modelName = this.options.model.model;
     const requestPerformance = modelRequestPerformanceMetrics(modelRequest);
+    const retryPolicy = this.defaults.modelRetryPolicy;
+    const maxAttempts = retryPolicy.maxRetries + 1;
 
     this.logLifecycle('debug', 'model.request', {
       ...runLogBindings(run),
@@ -3243,56 +3664,46 @@ export class AdaptiveAgent {
       ...summarizeModelRequestForLog(modelRequest),
     });
 
-    await this.emit({
-      runId: run.id,
-      stepId: run.currentStepId,
-      type: 'model.started',
-      schemaVersion: 1,
-      payload: {
-        stepId: run.currentStepId,
-        modelTimeoutMs,
-        provider: modelProvider,
-        model: modelName,
-        startedAt: new Date(startedAt).toISOString(),
-        performance: requestPerformance,
-      },
-    });
+    for (let attempt = 1; ; attempt += 1) {
+      const startedAt = Date.now();
+      const timeoutContext = createAbortTimeoutContext(modelTimeoutMs);
 
-    let response: ModelResponse;
-    try {
-      response = await this.options.model.generate({
-        ...modelRequest,
-        signal: timeoutContext.signal,
-        modelTimeoutMs,
-        onRetry: async (retry) => {
-          const durationMs = Date.now() - startedAt;
-          const retryPerformance = compactJsonObject({
-            ...requestPerformance,
-            ...(retry.performance ?? {}),
-            durationMs,
-            retryDelayMs: retry.retryDelayMs,
-          });
-          this.logLifecycle('warn', 'model.retry', {
-            ...runLogBindings(run),
-            stepId: run.currentStepId,
-            provider: modelProvider,
-            model: modelName,
-            durationMs,
-            performance: retryPerformance,
-            attempt: retry.attempt,
-            nextAttempt: retry.nextAttempt,
-            statusCode: retry.statusCode,
-            retryDelayMs: retry.retryDelayMs,
-            reason: retry.reason,
-            phase: retry.phase,
-            message: retry.message,
-          });
-          await this.emit({
-            runId: run.id,
-            stepId: run.currentStepId,
-            type: 'model.retry',
-            schemaVersion: 1,
-            payload: {
+      await this.emit({
+        runId: run.id,
+        stepId: run.currentStepId,
+        type: 'model.started',
+        schemaVersion: 1,
+        payload: compactJsonObject({
+          stepId: run.currentStepId,
+          modelTimeoutMs,
+          provider: modelProvider,
+          model: modelName,
+          startedAt: new Date(startedAt).toISOString(),
+          attempt,
+          maxAttempts,
+          performance: requestPerformance,
+        }),
+      });
+
+      let response: ModelResponse | undefined;
+      let caughtError: unknown;
+      let didCatch = false;
+      try {
+        response = await this.options.model.generate({
+          ...modelRequest,
+          signal: timeoutContext.signal,
+          modelTimeoutMs,
+          onRetry: async (retry) => {
+            const durationMs = Date.now() - startedAt;
+            const retryPerformance = compactJsonObject({
+              ...requestPerformance,
+              ...(retry.performance ?? {}),
+              durationMs,
+              retryDelayMs: retry.retryDelayMs,
+              modelAttempt: attempt,
+            });
+            this.logLifecycle('warn', 'model.retry', {
+              ...runLogBindings(run),
               stepId: run.currentStepId,
               provider: modelProvider,
               model: modelName,
@@ -3305,92 +3716,270 @@ export class AdaptiveAgent {
               reason: retry.reason,
               phase: retry.phase,
               message: retry.message,
-            },
-          });
-        },
-      });
-    } catch (error) {
-      const modelError = timeoutContext.didTimeout()
-        ? createModelTimeoutError(this.defaults.modelTimeoutMs, error)
-        : error;
-      const durationMs = Date.now() - startedAt;
-      const failurePerformance = compactJsonObject({
-        ...requestPerformance,
-        durationMs,
-        timedOut: timeoutContext.didTimeout(),
-        modelTimeoutMs,
-      });
-      this.logLifecycle('error', 'model.failed', {
-        ...runLogBindings(run),
-        stepId: run.currentStepId,
-        durationMs,
-        performance: failurePerformance,
-        ...summarizeModelFailureForLog(modelError, {
+              modelAttempt: attempt,
+            });
+            await this.emit({
+              runId: run.id,
+              stepId: run.currentStepId,
+              type: 'model.retry',
+              schemaVersion: 1,
+              payload: compactJsonObject({
+                stepId: run.currentStepId,
+                provider: modelProvider,
+                model: modelName,
+                durationMs,
+                performance: retryPerformance,
+                attempt: retry.attempt,
+                nextAttempt: retry.nextAttempt,
+                statusCode: retry.statusCode,
+                retryDelayMs: retry.retryDelayMs,
+                reason: retry.reason,
+                phase: retry.phase,
+                message: retry.message,
+                modelAttempt: attempt,
+              }),
+            });
+          },
+        });
+      } catch (error) {
+        didCatch = true;
+        caughtError = error;
+      } finally {
+        timeoutContext.dispose();
+      }
+
+      if (didCatch) {
+        const timedOut = timeoutContext.didTimeout();
+        const modelError = timedOut
+          ? createModelTimeoutError(modelTimeoutMs, caughtError)
+          : caughtError;
+        const failureKind = classifyModelErrorKind(modelError, timedOut);
+        const retryDelayMs = resolveModelRetryDelayMs(retryPolicy, attempt, failureKind);
+        const willRetry = retryDelayMs !== undefined;
+        const durationMs = Date.now() - startedAt;
+        const failurePerformance = compactJsonObject({
+          ...requestPerformance,
+          durationMs,
+          timedOut,
           modelTimeoutMs,
-          timedOut: timeoutContext.didTimeout(),
-        }),
-        error: errorForLog(modelError),
-      });
-      try {
+          attempt,
+          maxAttempts,
+          failureKind,
+          retryDelayMs,
+          willRetry,
+        });
+        this.logLifecycle('error', 'model.failed', {
+          ...runLogBindings(run),
+          stepId: run.currentStepId,
+          durationMs,
+          performance: failurePerformance,
+          ...summarizeModelFailureForLog(modelError, {
+            modelTimeoutMs,
+            timedOut,
+          }),
+          attempt,
+          maxAttempts,
+          failureKind,
+          willRetry,
+          error: errorForLog(modelError),
+        });
+        try {
+          await this.emit({
+            runId: run.id,
+            stepId: run.currentStepId,
+            type: 'model.failed',
+            schemaVersion: 1,
+            payload: compactJsonObject({
+              stepId: run.currentStepId,
+              durationMs,
+              timedOut,
+              modelTimeoutMs,
+              provider: modelProvider,
+              model: modelName,
+              attempt,
+              maxAttempts,
+              failureKind,
+              retryable: willRetry,
+              performance: failurePerformance,
+              error: errorToMessage(modelError),
+            }),
+          });
+        } catch {
+          // best-effort emit; failure here must not mask the original model error
+        }
+
+        if (!willRetry) {
+          throw modelError;
+        }
+
+        const retryPerformance = compactJsonObject({
+          ...requestPerformance,
+          durationMs,
+          retryDelayMs,
+          attempt,
+          nextAttempt: attempt + 1,
+          maxAttempts,
+          failureKind,
+        });
+        this.logLifecycle('warn', 'model.retry', {
+          ...runLogBindings(run),
+          stepId: run.currentStepId,
+          provider: modelProvider,
+          model: modelName,
+          durationMs,
+          performance: retryPerformance,
+          attempt,
+          nextAttempt: attempt + 1,
+          retryDelayMs,
+          reason: failureKind,
+          phase: 'runtime',
+          message: errorToMessage(modelError),
+        });
         await this.emit({
           runId: run.id,
           stepId: run.currentStepId,
-          type: 'model.failed',
+          type: 'model.retry',
           schemaVersion: 1,
-          payload: {
+          payload: compactJsonObject({
             stepId: run.currentStepId,
-            durationMs,
-            timedOut: timeoutContext.didTimeout(),
-            modelTimeoutMs,
             provider: modelProvider,
             model: modelName,
-            performance: failurePerformance,
-            error: modelError instanceof Error ? modelError.message : String(modelError),
-          },
+            durationMs,
+            performance: retryPerformance,
+            attempt,
+            nextAttempt: attempt + 1,
+            retryDelayMs,
+            reason: failureKind,
+            phase: 'runtime',
+            message: errorToMessage(modelError),
+          }),
         });
-      } catch {
-        // best-effort emit; failure here must not mask the original model error
+        await sleep(retryDelayMs);
+        continue;
       }
-      throw modelError;
+
+      if (!response) {
+        throw new Error('Model did not return a response');
+      }
+
+      const durationMs = Date.now() - startedAt;
+      const responsePerformance = compactJsonObject({
+        ...modelResponsePerformanceMetrics(response),
+        durationMs,
+        pendingToolCallCount: response.toolCalls?.length ?? 0,
+        attempt,
+        maxAttempts,
+      });
+      this.logLifecycle('debug', 'model.response', {
+        ...runLogBindings(run),
+        stepId: run.currentStepId,
+        durationMs,
+        ...summarizeModelResponseForLog(response),
+        performance: responsePerformance,
+        attempt,
+        maxAttempts,
+      });
+
+      await this.emit({
+        runId: run.id,
+        stepId: run.currentStepId,
+        type: 'model.completed',
+        schemaVersion: 1,
+        payload: compactJsonObject({
+          stepId: run.currentStepId,
+          durationMs,
+          provider: modelProvider,
+          model: modelName,
+          finishReason: response.finishReason,
+          toolCallCount: response.toolCalls?.length ?? 0,
+          attempt,
+          maxAttempts,
+          performance: responsePerformance,
+        }),
+      });
+
+      if (response.usage) {
+        await this.applyUsage(run, response.usage);
+      }
+
+      return response;
+    }
+  }
+
+  private async repairStructuredOutputFromText(
+    run: AgentRun,
+    text: string,
+    outputSchema: JsonSchema,
+  ): Promise<{ output?: JsonObject; usage?: UsageSummary }> {
+    const repairRequest: ModelRequest = {
+      messages: buildOutputSchemaRepairMessages(text, outputSchema),
+      tools: [],
+      outputSchema,
+      metadata: mergeMetadata(
+        run.metadata,
+        {
+          outputRepair: compactJsonObject({
+            kind: 'output_schema_repair',
+            stepId: run.currentStepId,
+          }),
+        },
+      ),
+    };
+    const requestPerformance = modelRequestPerformanceMetrics(repairRequest);
+    const startedAt = Date.now();
+    const timeoutContext = createAbortTimeoutContext(this.defaults.modelTimeoutMs);
+
+    this.logLifecycle('debug', 'model.output_schema_repair.request', {
+      ...runLogBindings(run),
+      stepId: run.currentStepId,
+      ...summarizeModelRequestForLog(repairRequest),
+    });
+
+    let response: ModelResponse;
+    try {
+      response = await this.options.model.generate({
+        ...repairRequest,
+        signal: timeoutContext.signal,
+        modelTimeoutMs: this.defaults.modelTimeoutMs,
+      });
+    } catch (error) {
+      const durationMs = Date.now() - startedAt;
+      this.logLifecycle('warn', 'model.output_schema_repair.failed', {
+        ...runLogBindings(run),
+        stepId: run.currentStepId,
+        durationMs,
+        performance: compactJsonObject({
+          ...requestPerformance,
+          durationMs,
+          timedOut: timeoutContext.didTimeout(),
+          modelTimeoutMs: this.defaults.modelTimeoutMs,
+        }),
+        error: errorForLog(error),
+      });
+      return {};
     } finally {
       timeoutContext.dispose();
     }
 
     const durationMs = Date.now() - startedAt;
-    const responsePerformance = compactJsonObject({
-      ...modelResponsePerformanceMetrics(response),
-      durationMs,
-      pendingToolCallCount: response.toolCalls?.length ?? 0,
-    });
-    this.logLifecycle('debug', 'model.response', {
+    const structuredOutput = readStructuredOutputCandidate(response);
+    const output = isJsonObject(structuredOutput) ? structuredOutput : undefined;
+    this.logLifecycle(output ? 'debug' : 'warn', 'model.output_schema_repair.response', {
       ...runLogBindings(run),
       stepId: run.currentStepId,
       durationMs,
       ...summarizeModelResponseForLog(response),
-      performance: responsePerformance,
-    });
-
-    await this.emit({
-      runId: run.id,
-      stepId: run.currentStepId,
-      type: 'model.completed',
-      schemaVersion: 1,
-      payload: {
-        stepId: run.currentStepId,
+      repaired: Boolean(output),
+      performance: compactJsonObject({
+        ...modelResponsePerformanceMetrics(response),
         durationMs,
-        provider: modelProvider,
-        model: modelName,
-        finishReason: response.finishReason,
-        toolCallCount: response.toolCalls?.length ?? 0,
-        performance: responsePerformance,
-      },
+      }),
     });
 
-    if (response.usage) {
-      await this.applyUsage(run, response.usage);
-    }
-
-    return response;
+    return {
+      ...(output ? { output } : {}),
+      ...(response.usage ? { usage: response.usage } : {}),
+    };
   }
 
   private async applyUsage(run: AgentRun, usageDelta: UsageSummary): Promise<AgentRun> {
@@ -3441,7 +4030,7 @@ export class AdaptiveAgent {
   }
 
   private plannerVisibleTools(state?: ExecutionState): Array<Pick<ToolDefinition, 'name' | 'description' | 'inputSchema'>> {
-    return this.filterVisibleTools(this.plannerTools, state?.visibleToolNames);
+    return this.filterVisibleTools(this.plannerTools, state?.visibleToolNames, state);
   }
 
   private async ensureRunStep(run: AgentRun, stepId: string): Promise<AgentRun> {
@@ -3778,15 +4367,23 @@ export class AdaptiveAgent {
 
   private logInjectedSystemMessage(
     run: AgentRun,
-    source: 'initial_prompt' | 'tool_manifest' | 'chat_context' | 'research_policy.require_purpose' | 'tool_budget.checkpoint',
+    source:
+      | 'initial_prompt'
+      | 'tool_manifest'
+      | 'chat_context'
+      | 'research_policy.require_purpose'
+      | 'tool_budget.checkpoint'
+      | 'model.tool_call_repair',
     content: string,
     snapshotField: 'messages' | 'pendingRuntimeMessages',
     stepId?: string,
+    role: ModelMessage['role'] = 'system',
   ): void {
     this.logLifecycle('info', 'system_message.injected', {
       ...runLogBindings(run),
       stepId,
       source,
+      role,
       snapshotField,
       snapshotStoreConfigured: Boolean(this.options.snapshotStore),
       content: summarizeValueForLog(content),
@@ -3930,6 +4527,25 @@ function resolveDefaultModelTimeoutMs(provider: string): number {
   return DEFAULT_AGENT_DEFAULTS.modelTimeoutMs;
 }
 
+function resolveModelRetryPolicy(policy: ModelRetryPolicy | undefined): ResolvedModelRetryPolicy {
+  return {
+    maxRetries: normalizeNonNegativeInteger(policy?.maxRetries, DEFAULT_AGENT_DEFAULTS.modelRetryPolicy.maxRetries),
+    retryOn: normalizeModelRetryFailureKinds(policy?.retryOn),
+    baseDelayMs: normalizeNonNegativeInteger(policy?.baseDelayMs, DEFAULT_AGENT_DEFAULTS.modelRetryPolicy.baseDelayMs),
+    maxDelayMs: normalizeNonNegativeInteger(policy?.maxDelayMs, DEFAULT_AGENT_DEFAULTS.modelRetryPolicy.maxDelayMs),
+    jitter: policy?.jitter ?? DEFAULT_AGENT_DEFAULTS.modelRetryPolicy.jitter,
+  };
+}
+
+function normalizeModelRetryFailureKinds(retryOn: FailureKind[] | undefined): FailureKind[] {
+  const values = retryOn && retryOn.length > 0 ? retryOn : DEFAULT_AGENT_DEFAULTS.modelRetryPolicy.retryOn;
+  return [...new Set(values)];
+}
+
+function normalizeNonNegativeInteger(value: number | undefined, fallback: number): number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : fallback;
+}
+
 function assertSupportedMvpContinuationStrategy(strategy: ContinuationStrategy): void {
   if (strategy !== 'hybrid_snapshot_then_step') {
     throw new Error(`Continuation strategy ${strategy} is not implemented in the MVP`);
@@ -4007,6 +4623,7 @@ function buildInitialMessages(
 
   return [
     buildAgentSystemMessage(systemInstructions),
+    ...buildOutputSchemaGuidanceMessages(outputSchema),
     ...(toolManifestMessage ? [toolManifestMessage] : []),
     {
       role: 'user',
@@ -4015,9 +4632,35 @@ function buildInitialMessages(
   ];
 }
 
+function buildOutputSchemaRepairMessages(text: string, outputSchema: JsonSchema): ModelMessage[] {
+  return [
+    {
+      role: 'system',
+      content: [
+        'You repair schema-constrained model output.',
+        'Convert the provided text into one valid JSON object that satisfies the requested outputSchema.',
+        'Return only the JSON object. Do not include Markdown, code fences, comments, or explanatory prose.',
+        'Preserve facts, caveats, and source URLs from the text. If a requested field is not supported by the text, use a conservative empty value that still fits the schema.',
+      ].join('\n'),
+    },
+    {
+      role: 'user',
+      content: JSON.stringify(
+        {
+          outputSchema: outputSchema as unknown as JsonValue,
+          text,
+        },
+        null,
+        2,
+      ),
+    },
+  ];
+}
+
 function buildInitialChatMessages(
   messages: ChatMessage[],
   context?: Record<string, JsonValue>,
+  outputSchema?: JsonSchema,
   systemInstructions?: string,
   toolManifestMessage?: ModelMessage,
 ): ModelMessage[] {
@@ -4037,6 +4680,7 @@ function buildInitialChatMessages(
 
   return [
     buildAgentSystemMessage(systemInstructions),
+    ...buildOutputSchemaGuidanceMessages(outputSchema),
     ...(toolManifestMessage ? [toolManifestMessage] : []),
     ...contextMessage,
     ...messages.map((message) => ({
@@ -4044,6 +4688,111 @@ function buildInitialChatMessages(
       content: buildChatMessageContent(message.content, message.images),
     })),
   ];
+}
+
+function buildOutputSchemaGuidanceMessages(outputSchema?: JsonSchema): ModelMessage[] {
+  if (!outputSchema) {
+    return [];
+  }
+
+  return [
+    {
+      role: 'system',
+      content: [
+        '## Structured Output',
+        '',
+        'Return exactly one JSON object that satisfies the outputSchema below.',
+        'Do not include Markdown, code fences, comments, or explanatory prose.',
+        '',
+        '```json',
+        JSON.stringify(outputSchema, null, 2),
+        '```',
+      ].join('\n'),
+    },
+  ];
+}
+
+function normalizeToolResultMessagesForModel(messages: ModelMessage[]): ModelMessage[] {
+  let changed = false;
+  const normalized = messages.map((message) => {
+    if (message.role !== 'tool') {
+      return message;
+    }
+
+    const content = normalizeToolResultContentForModel(message.content);
+    if (content === message.content) {
+      return message;
+    }
+
+    changed = true;
+    return { ...message, content };
+  });
+
+  return changed ? normalized : [...messages];
+}
+
+function readStructuredOutputCandidate(response: Pick<ModelResponse, 'structuredOutput' | 'text'>): JsonValue | undefined {
+  if (response.structuredOutput === undefined) {
+    return parseStructuredOutputText(response.text);
+  }
+
+  if (typeof response.structuredOutput === 'string') {
+    return parseStructuredOutputText(response.structuredOutput) ?? parseStructuredOutputText(response.text);
+  }
+
+  return response.structuredOutput;
+}
+
+function readStructuredOutputRepairText(response: Pick<ModelResponse, 'structuredOutput' | 'text'>): string | undefined {
+  return response.text ?? (typeof response.structuredOutput === 'string' ? response.structuredOutput : undefined);
+}
+
+function parseStructuredOutputText(text: string | undefined): JsonValue | undefined {
+  const trimmed = text?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  const direct = parseJsonObjectText(trimmed);
+  if (direct) {
+    return direct;
+  }
+
+  return parseSingleFencedJsonObject(trimmed);
+}
+
+function parseJsonObjectText(text: string | undefined): JsonValue | undefined {
+  if (!text) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    return isJsonObjectPayload(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseSingleFencedJsonObject(text: string): JsonValue | undefined {
+  const fencedBlockPattern = /```[ \t]*(?:json)?[ \t]*\r?\n?([\s\S]*?)```/gi;
+  let parsed: JsonValue | undefined;
+  let match: RegExpExecArray | null;
+
+  while ((match = fencedBlockPattern.exec(text)) !== null) {
+    const candidate = parseJsonObjectText(match[1]?.trim());
+    if (!candidate) {
+      continue;
+    }
+
+    if (parsed) {
+      return undefined;
+    }
+
+    parsed = candidate;
+  }
+
+  return parsed;
 }
 
 function normalizeSystemMessagesAtStart(messages: ModelMessage[]): ModelMessage[] {
@@ -4240,8 +4989,16 @@ function serializeExecutionState(state: ExecutionState): JsonObject {
     serialized.toolBudgetUsage = state.toolBudgetUsage as unknown as JsonValue;
   }
 
+  if (Object.keys(state.exhaustedToolBudgetGroups).length > 0) {
+    serialized.exhaustedToolBudgetGroups = state.exhaustedToolBudgetGroups as unknown as JsonValue;
+  }
+
   if (state.pendingRuntimeMessages.length > 0) {
     serialized.pendingRuntimeMessages = state.pendingRuntimeMessages as unknown as JsonValue;
+  }
+
+  if (Object.keys(state.invalidToolCallRepairAttempts).length > 0) {
+    serialized.invalidToolCallRepairAttempts = state.invalidToolCallRepairAttempts as unknown as JsonValue;
   }
 
   if (state.visibleToolNames) {
@@ -4275,7 +5032,9 @@ function deserializeExecutionState(value: JsonValue): ExecutionState | null {
     approvedToolCallIds: deserializeApprovedToolCallIds(value.approvedToolCallIds),
     waitingOnChildRunId: typeof value.waitingOnChildRunId === 'string' ? value.waitingOnChildRunId : undefined,
     toolBudgetUsage: deserializeToolBudgetUsage(value.toolBudgetUsage),
+    exhaustedToolBudgetGroups: deserializeExhaustedToolBudgetGroups(value.exhaustedToolBudgetGroups),
     pendingRuntimeMessages: deserializeModelMessages(value.pendingRuntimeMessages),
+    invalidToolCallRepairAttempts: deserializeInvalidToolCallRepairAttempts(value.invalidToolCallRepairAttempts),
     visibleToolNames: deserializeStringArray(value.visibleToolNames),
   };
 }
@@ -4311,6 +5070,36 @@ function deserializeToolBudgetUsage(value: JsonValue | undefined): Record<string
   }
 
   return usage;
+}
+
+function deserializeInvalidToolCallRepairAttempts(value: JsonValue | undefined): Record<string, number> {
+  if (!isJsonObject(value)) {
+    return {};
+  }
+
+  const attempts: Record<string, number> = {};
+  for (const [stepId, entry] of Object.entries(value)) {
+    if (typeof entry === 'number' && Number.isInteger(entry) && entry > 0) {
+      attempts[stepId] = entry;
+    }
+  }
+
+  return attempts;
+}
+
+function deserializeExhaustedToolBudgetGroups(value: JsonValue | undefined): Record<string, true> {
+  if (!isJsonObject(value)) {
+    return {};
+  }
+
+  const exhausted: Record<string, true> = {};
+  for (const [groupName, entry] of Object.entries(value)) {
+    if (entry === true) {
+      exhausted[groupName] = true;
+    }
+  }
+
+  return exhausted;
 }
 
 function deserializeModelMessages(value: JsonValue | undefined): ModelMessage[] {
@@ -4569,8 +5358,20 @@ function toolResultMessage(pendingToolCall: PendingToolCallState, output: JsonVa
     role: 'tool',
     name: pendingToolCall.name,
     toolCallId: pendingToolCall.id,
-    content: JSON.stringify(output),
+    content: JSON.stringify(toModelVisibleToolResultObject(output)),
   };
+}
+
+function removeAssistantToolCallMessage(messages: ModelMessage[], toolCallId: string): ModelMessage[] {
+  const nextMessages = [...messages];
+  const index = nextMessages.findLastIndex((message) =>
+    message.role === 'assistant' && Boolean(message.toolCalls?.some((toolCall) => toolCall.id === toolCallId))
+  );
+  if (index >= 0) {
+    nextMessages.splice(index, 1);
+  }
+
+  return nextMessages;
 }
 
 function boundedLevenshteinDistance(left: string, right: string, maxDistance: number): number | undefined {
@@ -4676,6 +5477,10 @@ function createBudgetExhaustedToolOutput(
     budgetGroup,
     message,
   };
+}
+
+function isBudgetExhaustedToolOutput(value: JsonValue): boolean {
+  return isJsonObject(value) && value.reason === 'budget_exhausted';
 }
 
 function isMissingWebSearchPurpose(input: JsonValue): boolean {
@@ -5029,6 +5834,62 @@ function readRetryAttempts(metadata?: Record<string, JsonValue>): number {
   return typeof attempts === 'number' && Number.isFinite(attempts) && attempts > 0 ? attempts : 0;
 }
 
+function readInvalidToolCallRepairAttempts(state: ExecutionState, stepId: string): number {
+  const attempts = state.invalidToolCallRepairAttempts[stepId];
+  return typeof attempts === 'number' && Number.isFinite(attempts) && attempts > 0 ? attempts : 0;
+}
+
+function formatInvalidToolCallError(rejection: InvalidToolCallRejection, attemptsUsed: number): string {
+  const base = rejection.reason === 'invalid_tool_input'
+    ? rejection.details ?? `Tool ${rejection.resolvedToolName ?? rejection.pendingToolCall.name} input is invalid`
+    : rejection.reason === 'tool_not_visible'
+      ? `Tool ${rejection.resolvedToolName ?? rejection.pendingToolCall.name} is not visible for this run`
+      : `Unknown tool ${rejection.pendingToolCall.name}`;
+  if (attemptsUsed <= 0) {
+    return base;
+  }
+
+  const attemptWord = attemptsUsed === 1 ? 'attempt' : 'attempts';
+  return `${base} after ${attemptsUsed} invalid tool-call repair ${attemptWord}`;
+}
+
+function buildInvalidToolCallRepairMessage(
+  rejection: InvalidToolCallRejection,
+  repairAttempt: number,
+  retryLimit: number,
+): string {
+  const reason = rejection.reason === 'invalid_tool_input'
+    ? `tool input is invalid: ${rejection.details ?? 'input does not satisfy the tool schema'}`
+    : rejection.reason === 'tool_not_visible'
+      ? `tool "${rejection.resolvedToolName ?? rejection.pendingToolCall.name}" is not visible for this run`
+      : `tool "${rejection.pendingToolCall.name}" is unknown`;
+
+  return [
+    rejection.reason === 'invalid_tool_input'
+      ? `The previous model response called tool "${rejection.pendingToolCall.name}" with invalid input.`
+      : `The previous model response requested unavailable tool "${rejection.pendingToolCall.name}".`,
+    'No tool was executed and no child run was started.',
+    `Reason: ${reason}.`,
+    `Repair attempt ${repairAttempt}/${retryLimit}: retry the same step using only an exact valid tool name from this JSON array and input that satisfies that tool's inputSchema, or answer directly without a tool call if no tool is needed.`,
+    '```json',
+    JSON.stringify(rejection.validToolNames, null, 2),
+    '```',
+  ].join('\n');
+}
+
+function isInvalidToolCallFailure(run: AgentRun, rejection: InvalidToolCallRejection): boolean {
+  const normalized = (run.errorMessage ?? '').toLowerCase();
+  if (rejection.reason === 'invalid_tool_input') {
+    return normalized.includes('invalid tool-call') || normalized.includes('input.') || normalized.includes('input is invalid');
+  }
+
+  if (rejection.reason === 'tool_not_visible') {
+    return normalized.includes('not visible for this run');
+  }
+
+  return normalized.includes('unknown tool') || normalized.includes('invalid tool-call');
+}
+
 function classifyFailureKind(code?: RunFailureCode, message?: string): FailureKind {
   if (code === 'MAX_STEPS') {
     return 'max_steps';
@@ -5039,6 +5900,19 @@ function classifyFailureKind(code?: RunFailureCode, message?: string): FailureKi
   }
 
   const normalized = (message ?? '').toLowerCase();
+  if (
+    normalized.includes('unknown tool') ||
+    normalized.includes('not visible for this run') ||
+    normalized.includes('invalid tool-call') ||
+    normalized.includes('input is invalid') ||
+    normalized.includes('input.goal') ||
+    normalized.includes('input.context') ||
+    normalized.includes('input.metadata') ||
+    normalized.includes('input.outputschema')
+  ) {
+    return 'invalid_tool_call';
+  }
+
   if (normalized.includes('timed out') || normalized.includes('timeout') || /\b524\b/.test(normalized)) {
     return 'timeout';
   }
@@ -5086,6 +5960,38 @@ function classifyFailureKind(code?: RunFailureCode, message?: string): FailureKi
   return 'unknown';
 }
 
+function classifyModelErrorKind(error: unknown, timedOut: boolean): FailureKind {
+  if (timedOut) {
+    return 'timeout';
+  }
+
+  const statusCode = extractNumericErrorField(error, 'modelInvocationStatusCode');
+  if (statusCode === 429) {
+    return 'rate_limit';
+  }
+  if (statusCode === 524) {
+    return 'timeout';
+  }
+  if (statusCode !== undefined && statusCode >= 500 && statusCode < 600) {
+    return 'provider_error';
+  }
+
+  return classifyFailureKind('MODEL_ERROR', errorToMessage(error));
+}
+
+function resolveModelRetryDelayMs(
+  policy: ResolvedModelRetryPolicy,
+  attempt: number,
+  failureKind: FailureKind,
+): number | undefined {
+  if (policy.maxRetries <= 0 || attempt > policy.maxRetries || !policy.retryOn.includes(failureKind)) {
+    return undefined;
+  }
+
+  const retryWindowMs = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** Math.max(0, attempt - 1));
+  return policy.jitter ? Math.random() * retryWindowMs : retryWindowMs;
+}
+
 function isRetryableModelFailureKind(failureKind: FailureKind): boolean {
   return failureKind === 'timeout' || failureKind === 'network' || failureKind === 'rate_limit' || failureKind === 'provider_error';
 }
@@ -5107,7 +6013,7 @@ function mergeDelegateDefaults(
   if (parentDefaults?.maxSteps !== undefined) {
     defaults.maxSteps = Math.max(parentDefaults.maxSteps, delegateDefaults?.maxSteps ?? parentDefaults.maxSteps);
   }
-  defaults.researchPolicy = parentDefaults?.researchPolicy ?? delegateDefaults?.researchPolicy;
+  defaults.researchPolicy = delegateDefaults?.researchPolicy ?? parentDefaults?.researchPolicy;
   defaults.toolBudgets = mergeDelegateToolBudgets(parentDefaults?.toolBudgets, delegateDefaults?.toolBudgets);
   return defaults;
 }
@@ -5198,40 +6104,53 @@ function modelVisibleToolOutputBytes(output: JsonValue): number {
   return approximateSerializedByteLength(output);
 }
 
-function capModelVisibleToolResult(output: JsonValue, maxBytes: number, toolName: string): JsonValue {
+function capModelVisibleToolResult(output: JsonObject, maxBytes: number, toolName: string): JsonObject {
   if (!maxBytes || maxBytes <= 0 || approximateSerializedByteLength(output) <= maxBytes) {
     return output;
   }
 
-  if (isJsonObjectPayload(output)) {
-    const content = output.content;
-    if (typeof content === 'string') {
-      const cappedContent = truncateUtf8String(content, Math.max(0, maxBytes - 512));
-      const capped = {
-        ...output,
-        content: cappedContent.text,
-        truncated: true,
-        bytesReturned: cappedContent.bytes,
-        bytesAvailable: Buffer.byteLength(content, 'utf8'),
-      };
-      if (approximateSerializedByteLength(capped) <= maxBytes) {
-        return capped;
-      }
+  const result = output.result;
+  if (typeof result === 'string') {
+    const cappedResult = truncateUtf8String(result, Math.max(0, maxBytes - 512));
+    const capped = {
+      ...output,
+      result: cappedResult.text,
+      truncated: true,
+      bytesReturned: cappedResult.bytes,
+      bytesAvailable: Buffer.byteLength(result, 'utf8'),
+    };
+    if (approximateSerializedByteLength(capped) <= maxBytes) {
+      return capped;
     }
+  }
 
-    const text = output.text;
-    if (typeof text === 'string') {
-      const cappedText = truncateUtf8String(text, Math.max(0, maxBytes - 512));
-      const capped = {
-        ...output,
-        text: cappedText.text,
-        truncated: true,
-        bytesReturned: cappedText.bytes,
-        bytesAvailable: Buffer.byteLength(text, 'utf8'),
-      };
-      if (approximateSerializedByteLength(capped) <= maxBytes) {
-        return capped;
-      }
+  const content = output.content;
+  if (typeof content === 'string') {
+    const cappedContent = truncateUtf8String(content, Math.max(0, maxBytes - 512));
+    const capped = {
+      ...output,
+      content: cappedContent.text,
+      truncated: true,
+      bytesReturned: cappedContent.bytes,
+      bytesAvailable: Buffer.byteLength(content, 'utf8'),
+    };
+    if (approximateSerializedByteLength(capped) <= maxBytes) {
+      return capped;
+    }
+  }
+
+  const text = output.text;
+  if (typeof text === 'string') {
+    const cappedText = truncateUtf8String(text, Math.max(0, maxBytes - 512));
+    const capped = {
+      ...output,
+      text: cappedText.text,
+      truncated: true,
+      bytesReturned: cappedText.bytes,
+      bytesAvailable: Buffer.byteLength(text, 'utf8'),
+    };
+    if (approximateSerializedByteLength(capped) <= maxBytes) {
+      return capped;
     }
   }
 
@@ -5300,6 +6219,16 @@ function createModelTimeoutError(timeoutMs: number, cause?: unknown): ModelTimeo
   return new ModelTimeoutError(`Model timed out after ${timeoutMs}ms`, cause === undefined ? undefined : { cause });
 }
 
+function sleep(delayMs: number): Promise<void> {
+  if (delayMs <= 0) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    setTimeout(resolve, delayMs);
+  });
+}
+
 async function runWithTimeout<T>(timeoutMs: number, context: RuntimeToolContext, task: () => Promise<T>): Promise<T> {
   if (!timeoutMs || timeoutMs <= 0) {
     return task();
@@ -5347,7 +6276,7 @@ function extractErrorField(error: unknown, key: string): unknown {
   let current: unknown = error;
 
   while (current instanceof Error) {
-    const value = (current as Record<string, unknown>)[key];
+    const value = (current as unknown as Record<string, unknown>)[key];
     if (value !== undefined) {
       return value;
     }
@@ -5356,4 +6285,8 @@ function extractErrorField(error: unknown, key: string): unknown {
   }
 
   return undefined;
+}
+
+function errorToMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

@@ -66,6 +66,7 @@ export type TuiMessageType = 'user' | 'assistant' | 'progress' | 'run' | 'system
 export type TuiTextStyleName = 'default' | 'dim' | 'bold' | 'italic' | 'underline' | 'red' | 'green' | 'yellow' | 'blue' | 'magenta' | 'cyan' | 'white' | 'gray';
 
 export type SupportedModality = 'text' | 'image' | 'file' | 'audio';
+const STRUCTURED_OUTPUT_MODES = ['prompted', 'strict'] as const;
 
 export interface AgentCapabilityConfig {
   modalitiesSupported?: SupportedModality[];
@@ -94,7 +95,7 @@ export interface AgentConfigFile {
   defaultInvocationMode: InvocationMode;
   workspace?: { root?: string; shellCwd?: string };
   workspaceRoot?: string;
-  model: { provider?: string; model?: string; apiKeyEnv?: string; apiKey?: string; baseUrl?: string; maxConcurrentRequests?: number };
+  model: { provider?: string; model?: string; apiKeyEnv?: string; apiKey?: string; baseUrl?: string; maxConcurrentRequests?: number; structuredOutputMode?: ModelAdapterConfig['structuredOutputMode'] };
   systemInstructions?: string;
   tools: string[];
   delegates?: string[];
@@ -117,7 +118,7 @@ export interface AgentSettingsFile {
   events?: { printLifecycle?: boolean; subscribe?: boolean; verbose?: boolean };
   skills?: { dirs?: string[]; allowExampleSkills?: boolean };
   workspace?: { overrideRoot?: string; overrideShellCwd?: string };
-  model?: { overrideProvider?: string; overrideModel?: string; overrideBaseUrl?: string; overrideApiKeyEnv?: string };
+  model?: { overrideProvider?: string; overrideModel?: string; overrideBaseUrl?: string; overrideApiKeyEnv?: string; overrideStructuredOutputMode?: ModelAdapterConfig['structuredOutputMode'] };
   defaults?: Partial<AgentDefaults>;
   env?: Record<string, string>;
   tui?: TuiSettingsConfig;
@@ -352,7 +353,14 @@ async function resolveAgentSdkConfig(options: AgentSdkOptions): Promise<Resolved
     settings,
     workspaceRoot,
     shellCwd,
-    model: { provider: provider as ModelAdapterConfig['provider'], model: modelName, baseUrl: expandOptional(options.model?.baseUrl ?? settings.model?.overrideBaseUrl ?? agent.model.baseUrl, env), maxConcurrentRequests: options.model?.maxConcurrentRequests ?? agent.model.maxConcurrentRequests, ...(apiKey ? { apiKey } : {}) },
+    model: {
+      provider: provider as ModelAdapterConfig['provider'],
+      model: modelName,
+      baseUrl: expandOptional(options.model?.baseUrl ?? settings.model?.overrideBaseUrl ?? agent.model.baseUrl, env),
+      maxConcurrentRequests: options.model?.maxConcurrentRequests ?? agent.model.maxConcurrentRequests,
+      structuredOutputMode: options.model?.structuredOutputMode ?? settings.model?.overrideStructuredOutputMode ?? agent.model.structuredOutputMode ?? 'prompted',
+      ...(apiKey ? { apiKey } : {}),
+    },
     runtime: { requestedMode, mode, autoMigrate: settings.runtime?.autoMigrate ?? true },
     logging: { enabled: settings.logging?.enabled ?? false, level: settings.logging?.level ?? 'info', destination: settings.logging?.destination ?? 'console', filePath: expandOptional(settings.logging?.filePath, env), pretty: settings.logging?.pretty ?? true },
     interaction: { approvalMode: settings.interaction?.approvalMode ?? (settings.interaction?.autoApprove === false ? 'manual' : 'auto'), clarificationMode: settings.interaction?.clarificationMode ?? (settings.interaction?.interactive === false ? 'fail' : 'interactive') },
@@ -467,6 +475,7 @@ function validateAgent(value: unknown, path: string): AgentConfigFile {
   if (!agentValidator(value)) throw new AgentConfigValidationError(path, formatAjvErrors('agent', agentValidator.errors));
   const config = value as AgentConfigFile;
   if (!config.invocationModes.includes(config.defaultInvocationMode)) throw new AgentConfigValidationError(path, ['agent.defaultInvocationMode must be included in agent.invocationModes']);
+  validateStructuredOutputMode(config.model.structuredOutputMode, path, 'agent.model.structuredOutputMode', AgentConfigValidationError);
   return { ...config, delegates: config.delegates ?? [] };
 }
 
@@ -474,7 +483,21 @@ function validateSettings(value: unknown, path: string): AgentSettingsFile {
   if (!settingsValidator(value)) throw new AgentSettingsValidationError(path, formatAjvErrors('settings', settingsValidator.errors));
   const settings = value as AgentSettingsFile;
   if ((settings.logging?.destination === 'file' || settings.logging?.destination === 'both') && !settings.logging.filePath) throw new AgentSettingsValidationError(path, ['settings.logging.filePath is required when logging.destination is "file" or "both"']);
+  validateStructuredOutputMode(settings.model?.overrideStructuredOutputMode, path, 'settings.model.overrideStructuredOutputMode', AgentSettingsValidationError);
   return settings;
+}
+
+function validateStructuredOutputMode(
+  value: unknown,
+  path: string,
+  propertyPath: string,
+  ErrorClass: typeof AgentConfigValidationError | typeof AgentSettingsValidationError,
+): void {
+  if (value === undefined || STRUCTURED_OUTPUT_MODES.includes(value as (typeof STRUCTURED_OUTPUT_MODES)[number])) {
+    return;
+  }
+
+  throw new ErrorClass(path, [`${propertyPath} must be one of: ${STRUCTURED_OUTPUT_MODES.join(', ')}`]);
 }
 
 function formatAjvErrors(prefix: string, errors: ErrorObject[] | null | undefined): string[] {

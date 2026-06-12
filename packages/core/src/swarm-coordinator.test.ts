@@ -75,11 +75,15 @@ describe('SwarmCoordinator', () => {
             {
               id: 'subtask-1',
               subObjective: 'Research the market.',
+              input: null,
+              attachmentRefs: [],
               targetAgentId: 'researcher',
             },
             {
               id: 'subtask-2',
               subObjective: 'Draft the recommendation.',
+              input: null,
+              attachmentRefs: [],
               targetAgentId: 'writer',
             },
           ],
@@ -170,6 +174,46 @@ describe('SwarmCoordinator', () => {
     });
     expect(researcherModel.receivedRequests[0]?.messages.at(-1)?.content).toContain('Research the market.');
     expect(synthesizerModel.receivedRequests[0]?.messages.at(-1)?.content).toContain('qualityAssessments');
+    expect(coordinatorModel.receivedRequests[0]?.outputSchema).toMatchObject({
+      type: 'object',
+      required: ['subtasks'],
+      additionalProperties: false,
+      properties: {
+        subtasks: {
+          type: 'array',
+          items: {
+            type: 'object',
+            required: ['id', 'subObjective', 'input', 'attachmentRefs', 'targetAgentId'],
+            additionalProperties: false,
+            properties: {
+              input: { type: ['string', 'null'] },
+              attachmentRefs: { type: 'array', items: { type: 'string' } },
+              targetAgentId: { type: 'string', enum: ['researcher', 'writer'] },
+            },
+          },
+        },
+      },
+    });
+    expect(qualityModel.receivedRequests[0]?.outputSchema).toMatchObject({
+      type: 'object',
+      required: ['assessments'],
+      additionalProperties: false,
+      properties: {
+        assessments: {
+          type: 'array',
+          items: {
+            type: 'object',
+            required: ['subtaskId', 'runId', 'usable', 'score', 'issues', 'recommendation'],
+            additionalProperties: false,
+            properties: {
+              runId: { type: ['string', 'null'] },
+              score: { type: ['number', 'null'] },
+              issues: { type: 'array', items: { type: 'string' } },
+            },
+          },
+        },
+      },
+    });
   });
 
   it('retries failed swarm workers in place and creates fresh quality and synthesizer runs', async () => {
@@ -293,7 +337,7 @@ describe('SwarmCoordinator', () => {
         {
           finishReason: 'stop',
           structuredOutput: {
-            subtasks: [{ id: 'subtask-1', subObjective: 'Use missing specialist.', targetAgentId: 'missing' }],
+            subtasks: [{ id: 'subtask-1', subObjective: 'Use missing specialist.', input: null, attachmentRefs: [], targetAgentId: 'missing' }],
           },
         },
       ]), runStore),
@@ -313,6 +357,48 @@ describe('SwarmCoordinator', () => {
     expect(qualityModel.receivedRequests).toHaveLength(0);
     expect(synthesizerModel.receivedRequests).toHaveLength(0);
     expect(await runStore.listBySession('session-swarm-failure')).toHaveLength(1);
+  });
+
+  it('rejects extra model-generated subtask fields before launching workers quality or synthesis', async () => {
+    const runStore = new InMemoryRunStore();
+    const workerModel = new SequenceModel('researcher', []);
+    const qualityModel = new SequenceModel('quality', []);
+    const synthesizerModel = new SequenceModel('synthesizer', []);
+    const swarm = new SwarmCoordinator({
+      runStore,
+      coordinatorAgent: createAgent(new SequenceModel('coordinator', [
+        {
+          finishReason: 'stop',
+          structuredOutput: {
+            subtasks: [
+              {
+                id: 'subtask-1',
+                subObjective: 'Research the market.',
+                input: null,
+                attachmentRefs: [],
+                targetAgentId: 'researcher',
+                metadata: { priority: 'high' },
+              },
+            ],
+          },
+        },
+      ]), runStore),
+      workerAgents: { researcher: createAgent(workerModel, runStore) },
+      qualityAgent: createAgent(qualityModel, runStore),
+      synthesizerAgent: createAgent(synthesizerModel, runStore),
+    });
+
+    const result = await swarm.run({ sessionId: 'session-swarm-extra-fields', topLevelObjective: 'Needs strict subtasks' });
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      errorCode: 'INVALID_DECOMPOSITION',
+      subtaskResults: [],
+    });
+    expect(result.errorMessage).toContain('unsupported keys: metadata');
+    expect(workerModel.receivedRequests).toHaveLength(0);
+    expect(qualityModel.receivedRequests).toHaveLength(0);
+    expect(synthesizerModel.receivedRequests).toHaveLength(0);
   });
 
   it('validates all decomposed subtasks before launching any worker', async () => {

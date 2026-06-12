@@ -4,7 +4,7 @@ import { extname } from 'node:path';
 import { Mistral } from '@mistralai/mistralai';
 
 import { approximateSerializedByteLength, compactJsonObject } from '../logging.js';
-import type { FileInput, ModelContentPart, ModelMessage, ModelRequest, ModelResponse } from '../types.js';
+import type { FileInput, ModelContentPart, ModelMessage, ModelRequest, ModelResponse, StructuredOutputMode } from '../types.js';
 import { BaseOpenAIChatAdapter, MAX_LOCAL_AUDIO_BYTES, MAX_LOCAL_FILE_BYTES, type BaseOpenAIChatAdapterConfig } from './base-openai-chat-adapter.js';
 import { toProviderSdkResponseFormat } from './provider-sdk-request.js';
 
@@ -30,6 +30,7 @@ export interface MistralAdapterConfig {
   apiKey: string;
   baseUrl?: string;
   maxConcurrentRequests?: number;
+  structuredOutputMode?: StructuredOutputMode;
 }
 
 export class MistralAdapter extends BaseOpenAIChatAdapter {
@@ -42,6 +43,7 @@ export class MistralAdapter extends BaseOpenAIChatAdapter {
       baseUrl: config.baseUrl ?? MISTRAL_BASE_URL,
       apiKey: config.apiKey,
       maxConcurrentRequests: config.maxConcurrentRequests,
+      structuredOutputMode: config.structuredOutputMode,
       capabilities: {
         toolCalling: true,
         jsonOutput: true,

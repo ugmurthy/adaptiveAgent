@@ -31,6 +31,7 @@ const CORE_EVENT_TYPES: EventType[] = [
   'step.completed',
   'model.started',
   'model.retry',
+  'model.tool_call_rejected',
   'model.completed',
   'model.failed',
   'tool.started',

@@ -352,6 +352,11 @@ function parseSkillDefaults(
     defaults.capture = capture;
   }
 
+  const researchPolicy = parseOptionalResearchPolicy(meta, 'defaults.researchPolicy', source);
+  if (researchPolicy !== undefined) {
+    defaults.researchPolicy = researchPolicy;
+  }
+
   return Object.keys(defaults).length > 0 ? defaults : undefined;
 }
 
@@ -414,6 +419,29 @@ function parseOptionalCaptureMode(
   }
 
   throw new SkillLoadError(`SKILL.md at ${source} has invalid capture mode for '${key}'`);
+}
+
+function parseOptionalResearchPolicy(
+  meta: Record<string, string | string[]>,
+  key: string,
+  source: string,
+): AgentDefaults['researchPolicy'] | undefined {
+  const value = meta[key];
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (
+    value === 'none' ||
+    value === 'light' ||
+    value === 'standard' ||
+    value === 'deep' ||
+    value === 'gaia'
+  ) {
+    return value;
+  }
+
+  throw new SkillLoadError(`SKILL.md at ${source} has invalid research policy for '${key}'`);
 }
 
 // ── handler loading ─────────────────────────────────────────────────────────

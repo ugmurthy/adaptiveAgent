@@ -505,4 +505,23 @@ describe('formatCompactAgentEventFrame', () => {
       }),
     ).toBe('[12:35:01] run:12345678 #2 status queued -> running');
   });
+
+  it('formats invalid tool-call repair events', () => {
+    expect(
+      formatCompactAgentEventFrame({
+        type: 'agent.event',
+        eventType: 'model.tool_call_rejected',
+        data: {
+          requestedToolName: 'delegate.resistelher',
+          reason: 'unknown_tool',
+          repairAttempt: 1,
+          retryLimit: 1,
+          willRetry: true,
+        },
+        runId: '12345678-aaaa-bbbb-cccc-1234567890ab',
+        seq: 11,
+        createdAt: '2026-04-10T12:35:02.000Z',
+      }),
+    ).toBe('[12:35:02] run:12345678 #11 model rejected tool delegate.resistelher (reason=unknown_tool, repair=1/1, retrying)');
+  });
 });

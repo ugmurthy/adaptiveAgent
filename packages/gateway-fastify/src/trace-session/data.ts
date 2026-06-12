@@ -1257,6 +1257,9 @@ function classifyPersistedMessage(
 ): TraceMessage['category'] {
   switch (message.role) {
     case 'user':
+      if (index >= initialMessageCount) {
+        return 'runtime-injected-user';
+      }
       return 'user';
     case 'assistant':
       return 'assistant';
@@ -1273,7 +1276,7 @@ function classifyPersistedMessage(
 function classifyPendingMessage(message: ParsedTraceMessage): TraceMessage['category'] {
   switch (message.role) {
     case 'user':
-      return 'user';
+      return 'runtime-injected-user';
     case 'assistant':
       return 'assistant';
     case 'tool':

@@ -103,6 +103,18 @@ export function formatCompactAgentEventFrame(
       if (reason) parts.push(`reason=${reason}`);
       return `${prefix} model retry${parts.length > 0 ? ` (${parts.join(', ')})` : ''}`;
     }
+    case 'model.tool_call_rejected': {
+      const requestedToolName = readString(payload, 'requestedToolName') ?? 'unknown';
+      const reason = readString(payload, 'reason');
+      const repairAttempt = readNumber(payload, 'repairAttempt');
+      const retryLimit = readNumber(payload, 'retryLimit');
+      const willRetry = payload.willRetry === true;
+      const parts: string[] = [];
+      if (reason) parts.push(`reason=${reason}`);
+      if (repairAttempt !== undefined && retryLimit !== undefined) parts.push(`repair=${repairAttempt}/${retryLimit}`);
+      parts.push(willRetry ? 'retrying' : 'not retrying');
+      return `${prefix} model rejected tool ${requestedToolName}${parts.length > 0 ? ` (${parts.join(', ')})` : ''}`;
+    }
     case 'model.failed': {
       const durationMs = readNumber(payload, 'durationMs');
       const timedOut = payload.timedOut === true;

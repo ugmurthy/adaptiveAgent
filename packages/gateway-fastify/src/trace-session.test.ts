@@ -1299,8 +1299,8 @@ describe('trace-session CLI helpers', () => {
             {
               position: 3,
               persistence: 'pending',
-              role: 'system',
-              category: 'runtime-injected-system',
+              role: 'user',
+              category: 'runtime-injected-user',
               content: 'You are near the web research budget.',
             },
           ],
@@ -1317,7 +1317,7 @@ describe('trace-session CLI helpers', () => {
     expect(output).toContain('LLM Message Context');
     expect(output).toContain('initial-runtime-system');
     expect(output).toContain('gateway-chat-system-context');
-    expect(output).toContain('runtime-injected-system');
+    expect(output).toContain('runtime-injected-user');
     expect(output).toContain('Show me the prompt.');
   });
 
@@ -1356,8 +1356,8 @@ describe('trace-session CLI helpers', () => {
             {
               position: 1,
               persistence: 'persisted',
-              role: 'system',
-              category: 'runtime-injected-system',
+              role: 'user',
+              category: 'runtime-injected-user',
               content: 'Use a short purpose before each web search.',
             },
             {
@@ -1378,7 +1378,7 @@ describe('trace-session CLI helpers', () => {
     );
 
     expect(output).toContain('delta: added=1 changed=0 pending=1');
-    expect(output).toContain('runtime-injected-system');
+    expect(output).toContain('runtime-injected-user');
     expect(output).toContain('Preparing a clarification.');
   });
 
@@ -1517,7 +1517,7 @@ describe('trace-session CLI helpers', () => {
                   { role: 'assistant', content: 'Working...' },
                 ],
                 pendingRuntimeMessages: [
-                  { role: 'system', content: 'Future web_search calls should include a short purpose.' },
+                  { role: 'user', content: 'Future web_search calls should include a short purpose.' },
                 ],
               },
             }],
@@ -1561,7 +1561,7 @@ describe('trace-session CLI helpers', () => {
           expect.objectContaining({ category: 'initial-runtime-system', content: 'You are AdaptiveAgent.' }),
           expect.objectContaining({ category: 'gateway-chat-system-context', content: 'Conversation summary:\nEarlier turn.' }),
           expect.objectContaining({
-            category: 'runtime-injected-system',
+            category: 'runtime-injected-user',
             persistence: 'pending',
             content: 'Future web_search calls should include a short purpose.',
           }),

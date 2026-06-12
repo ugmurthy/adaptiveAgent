@@ -7,6 +7,7 @@ import {
   summarizeRunResultForLog,
 } from './logging.js';
 import { captureValueForLog, summarizeValueForLog } from './logger.js';
+import { validateOutputSchema } from './model-payloads.js';
 import type {
   AgentDefaults,
   AgentEvent,
@@ -1256,7 +1257,7 @@ function mergeDelegateAgentDefaults(
     defaults.maxSteps = Math.max(parentDefaults.maxSteps, delegateDefaults?.maxSteps ?? parentDefaults.maxSteps);
   }
 
-  defaults.researchPolicy = parentDefaults?.researchPolicy ?? delegateDefaults?.researchPolicy;
+  defaults.researchPolicy = delegateDefaults?.researchPolicy ?? parentDefaults?.researchPolicy;
   defaults.toolBudgets = mergeDelegateToolBudgets(parentDefaults?.toolBudgets, delegateDefaults?.toolBudgets);
   return defaults;
 }
@@ -1284,6 +1285,37 @@ function mergeDelegateToolBudgets(
 
 function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+export function validateDelegateToolInput(input: JsonValue, toolName = 'delegate.*'): string | undefined {
+  if (typeof input === 'string') {
+    return undefined;
+  }
+
+  if (!isJsonObject(input)) {
+    return `${toolName} input must be a JSON object with a string goal, not ${describeJsonType(input)}`;
+  }
+
+  if (typeof input.goal !== 'string') {
+    return `${toolName} input.goal must be a string, not ${describeJsonType(input.goal)}`;
+  }
+
+  if (input.context !== undefined && !isJsonObject(input.context)) {
+    return `${toolName} input.context must be a JSON object, not ${describeJsonType(input.context)}`;
+  }
+
+  if (input.metadata !== undefined && !isJsonObject(input.metadata)) {
+    return `${toolName} input.metadata must be a JSON object, not ${describeJsonType(input.metadata)}`;
+  }
+
+  if (input.outputSchema !== undefined) {
+    const schemaError = validateOutputSchema(input.outputSchema, `${toolName} input.outputSchema`);
+    if (schemaError) {
+      return schemaError;
+    }
+  }
+
+  return undefined;
 }
 
 function delegateToolStartPerformance(input: DelegateToolInput): JsonObject {
@@ -1342,13 +1374,41 @@ function runLineagePayload(
 }
 
 function toDelegateToolInput(input: JsonValue): DelegateToolInput {
+  const validationError = validateDelegateToolInput(input);
+  if (validationError) {
+    throw new DelegationError(validationError);
+  }
+
   if (typeof input === 'string') {
     return { goal: input };
   }
 
-  if (!isJsonObject(input) || typeof input.goal !== 'string') {
-    throw new DelegationError('delegate.* tools require a JSON object input with a string goal');
+  const objectInput = input as JsonObject & { goal: string };
+  return {
+    goal: objectInput.goal,
+    ...(objectInput.input === undefined ? {} : { input: objectInput.input }),
+    ...(objectInput.context === undefined ? {} : { context: objectInput.context as Record<string, JsonValue> }),
+    ...(objectInput.outputSchema === undefined ? {} : { outputSchema: objectInput.outputSchema as unknown as JsonSchema }),
+    ...(objectInput.metadata === undefined ? {} : { metadata: objectInput.metadata as Record<string, JsonValue> }),
+  };
+}
+
+function describeJsonType(value: unknown): string {
+  if (value === null) {
+    return 'null';
   }
 
-  return input as unknown as DelegateToolInput;
+  if (Array.isArray(value)) {
+    return 'an array';
+  }
+
+  if (typeof value === 'object') {
+    return 'an object';
+  }
+
+  if (typeof value === 'undefined') {
+    return 'undefined';
+  }
+
+  return `a ${typeof value}`;
 }
