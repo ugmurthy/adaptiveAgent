@@ -26,7 +26,6 @@ import {
   createOrchestrationSdk,
   inspectAgentSdkResolution,
   loadAgentSdkConfig,
-  type AgentConfigFile,
   type AgentSdkOptions,
   type AgentSdkChatOptions,
   type AgentSdkRunOptions,
@@ -44,9 +43,22 @@ import { doctorExitCode, renderDoctorReport, runDoctor } from './install/doctor.
 import { renderInitReport, runInit, type InitProfile } from './install/init.js';
 import { renderUpdateReport, runUpdate, updateExitCode } from './install/update.js';
 import { getVersionInfo, renderVersion } from './install/version.js';
+import { agentEventColorKey, agentEventProgressPrefix, formatAgentEventSummary, summarizeAgentEvent } from './agent-event-rendering.js';
+import { formatSwarmExecutionPlan, formatSwarmRunStatuses, formatSwarmSubtasks } from './swarm-format.js';
+import { createSwarmRoleAgentConfig } from './swarm-role-config.js';
 import { applyNamedStyle, formatStyledMessageBlock } from './tui/message-styles.js';
 
-marked.use(markedTerminal() as never);
+export { formatSwarmExecutionPlan, formatSwarmRunStatuses, formatSwarmSubtasks } from './swarm-format.js';
+
+const passthroughMarkdownStyle = (value: string): string => value;
+
+marked.use(markedTerminal({
+  // The marked-terminal defaults wrap ordinary paragraphs and list items in
+  // chalk.reset. In terminals that sanitize control characters, those reset
+  // sequences can leak as visible "0m" text inside rendered reports.
+  listitem: passthroughMarkdownStyle,
+  paragraph: passthroughMarkdownStyle,
+} as never) as never);
 
 export interface ManualTestCliOptions {
   command: 'run' | 'chat' | 'spec' | 'config' | 'eval' | 'swarm-run' | 'retry' | 'init' | 'doctor' | 'update' | 'version';
@@ -700,10 +712,10 @@ async function runSwarmCommand(cli: ManualTestCliOptions): Promise<number> {
   const workerConfigs = await Promise.all(cli.workerCatalogPaths.map((agentConfigPath) => loadFlaggedAgentSdkConfig(sdkOptions, '--worker-catalog', agentConfigPath)));
   const qualityConfig = cli.qualityAgentPath
     ? await loadFlaggedAgentSdkConfig(sdkOptions, '--quality-agent', cli.qualityAgentPath)
-    : await loadAgentSdkConfig({ ...sdkOptions, agentConfig: roleAgentConfig(coordinatorConfig.agent, 'quality') });
+    : await loadAgentSdkConfig({ ...sdkOptions, agentConfig: createSwarmRoleAgentConfig(coordinatorConfig.agent, 'quality') });
   const synthesizerConfig = cli.synthesizerAgentPath
     ? await loadFlaggedAgentSdkConfig(sdkOptions, '--synthesizer-agent', cli.synthesizerAgentPath)
-    : await loadAgentSdkConfig({ ...sdkOptions, agentConfig: roleAgentConfig(coordinatorConfig.agent, 'synthesizer') });
+    : await loadAgentSdkConfig({ ...sdkOptions, agentConfig: createSwarmRoleAgentConfig(coordinatorConfig.agent, 'synthesizer') });
   const workerIds = workerConfigs.map((config) => config.agent.id);
   const duplicateWorkerId = workerIds.find((id, index) => workerIds.indexOf(id) !== index);
   if (duplicateWorkerId) throw new Error(`swarm-run worker catalog contains duplicate agent id: ${duplicateWorkerId}`);
@@ -732,10 +744,10 @@ async function runSwarmCommand(cli: ManualTestCliOptions): Promise<number> {
   const workerSdks = await Promise.all(cli.workerCatalogPaths.map((agentConfigPath) => createFlaggedAgentSdk({ ...sdkOptions, agentConfigPath, runtime: coordinatorSdk.created.runtime, eventListener }, '--worker-catalog', agentConfigPath)));
   const qualitySdk = cli.qualityAgentPath
     ? await createFlaggedAgentSdk({ ...sdkOptions, agentConfigPath: cli.qualityAgentPath, runtime: coordinatorSdk.created.runtime, eventListener }, '--quality-agent', cli.qualityAgentPath)
-    : await createAgentSdk({ ...sdkOptions, agentConfig: roleAgentConfig(coordinatorSdk.config.agent, 'quality'), runtime: coordinatorSdk.created.runtime, eventListener });
+    : await createAgentSdk({ ...sdkOptions, agentConfig: createSwarmRoleAgentConfig(coordinatorSdk.config.agent, 'quality'), runtime: coordinatorSdk.created.runtime, eventListener });
   const synthesizerSdk = cli.synthesizerAgentPath
     ? await createFlaggedAgentSdk({ ...sdkOptions, agentConfigPath: cli.synthesizerAgentPath, runtime: coordinatorSdk.created.runtime, eventListener }, '--synthesizer-agent', cli.synthesizerAgentPath)
-    : await createAgentSdk({ ...sdkOptions, agentConfig: roleAgentConfig(coordinatorSdk.config.agent, 'synthesizer'), runtime: coordinatorSdk.created.runtime, eventListener });
+    : await createAgentSdk({ ...sdkOptions, agentConfig: createSwarmRoleAgentConfig(coordinatorSdk.config.agent, 'synthesizer'), runtime: coordinatorSdk.created.runtime, eventListener });
 
   try {
     const sessionId = cli.sessionId ?? crypto.randomUUID();
@@ -776,7 +788,7 @@ async function runSwarmCommand(cli: ManualTestCliOptions): Promise<number> {
     const subtasks = parseSwarmSubtasks(decompositionResult.output);
     validateSdkDecomposition(subtasks, workerIds);
     if (cli.output === 'pretty') {
-      printSwarmExecutionPlan(sessionId, decompositionResult.runId, subtasks);
+      printSwarmExecutionPlan(sessionId, decompositionResult.runId, subtasks, cli.wrapWidth);
     }
     const swarm = new SwarmCoordinator({
       runStore: coordinatorSdk.created.runtime.runStore,
@@ -875,10 +887,10 @@ async function runRetryCommand(cli: ManualTestCliOptions): Promise<number> {
 
   const qualitySdk = cli.qualityAgentPath
     ? await createFlaggedAgentSdk({ ...sdkOptions, agentConfigPath: cli.qualityAgentPath, runtime: coordinatorSdk.created.runtime, eventListener }, '--quality-agent', cli.qualityAgentPath)
-    : await createAgentSdk({ ...sdkOptions, agentConfig: roleAgentConfig(coordinatorSdk.config.agent, 'quality'), runtime: coordinatorSdk.created.runtime, eventListener });
+    : await createAgentSdk({ ...sdkOptions, agentConfig: createSwarmRoleAgentConfig(coordinatorSdk.config.agent, 'quality'), runtime: coordinatorSdk.created.runtime, eventListener });
   const synthesizerSdk = cli.synthesizerAgentPath
     ? await createFlaggedAgentSdk({ ...sdkOptions, agentConfigPath: cli.synthesizerAgentPath, runtime: coordinatorSdk.created.runtime, eventListener }, '--synthesizer-agent', cli.synthesizerAgentPath)
-    : await createAgentSdk({ ...sdkOptions, agentConfig: roleAgentConfig(coordinatorSdk.config.agent, 'synthesizer'), runtime: coordinatorSdk.created.runtime, eventListener });
+    : await createAgentSdk({ ...sdkOptions, agentConfig: createSwarmRoleAgentConfig(coordinatorSdk.config.agent, 'synthesizer'), runtime: coordinatorSdk.created.runtime, eventListener });
   const workerSdks = await Promise.all(cli.workerCatalogPaths.map((agentConfigPath) => createFlaggedAgentSdk({ ...sdkOptions, agentConfigPath, runtime: coordinatorSdk.created.runtime, eventListener }, '--worker-catalog', agentConfigPath)));
 
   try {
@@ -2422,18 +2434,6 @@ function validateSdkDecomposition(subtasks: SwarmSubtask[], validWorkerIds: stri
   if (issues.length > 0) throw new Error(`Invalid swarm decomposition: ${issues.join('; ')}. Valid worker ids: ${validWorkerIds.join(', ')}`);
 }
 
-function roleAgentConfig(base: AgentConfigFile, role: 'quality' | 'synthesizer'): AgentConfigFile {
-  const roleInstructions = role === 'quality'
-    ? 'Swarm quality role: assess worker outputs against the top-level objective and return structured assessments.'
-    : 'Swarm synthesizer role: synthesize one final answer from worker outputs and quality assessments.';
-  return {
-    ...base,
-    id: `${base.id}-${role}`,
-    name: `${base.name} ${role}`,
-    systemInstructions: [base.systemInstructions, roleInstructions].filter(Boolean).join('\n\n'),
-  };
-}
-
 async function loadFlaggedAgentSdkConfig(
   baseOptions: AgentSdkOptions,
   flagName: '--agent' | '--worker-catalog' | '--quality-agent' | '--synthesizer-agent',
@@ -2510,33 +2510,15 @@ function summarizeSwarmRetry(result: SwarmRetryResult): JsonValue {
   } as JsonValue;
 }
 
-function printSwarmExecutionPlan(sessionId: string, coordinatorRunId: string, subtasks: SwarmSubtask[]): void {
-  console.log(formatSwarmExecutionPlan(sessionId, coordinatorRunId, subtasks));
+function printSwarmExecutionPlan(sessionId: string, coordinatorRunId: string, subtasks: SwarmSubtask[], wrapWidth?: number): void {
+  console.log(formatSwarmExecutionPlan(sessionId, coordinatorRunId, subtasks, wrapWidth));
   console.log('');
-}
-
-export function formatSwarmExecutionPlan(sessionId: string, coordinatorRunId: string, subtasks: readonly SwarmSubtask[]): string {
-  return [
-    `orchestration: session=${sessionId} coordinator=${coordinatorRunId}`,
-    formatSwarmSubtasks(subtasks),
-  ].join('\n');
-}
-
-export function formatSwarmSubtasks(subtasks: readonly SwarmSubtask[]): string {
-  const lines = ['subtasks:'];
-  for (const [index, subtask] of subtasks.entries()) {
-    const target = subtask.targetAgentId ? ` -> ${subtask.targetAgentId}` : '';
-    lines.push(`  ${index + 1}. ${subtask.id}${target}: ${subtask.subObjective}`);
-  }
-  return lines.join('\n');
 }
 
 function printSwarmResult(result: SwarmRunResult, workerIds: string[], cli: ManualTestCliOptions): void {
   console.log(`orchestration: session=${result.sessionId} coordinator=${result.coordinatorRunId}`);
   console.log(`workers: ${workerIds.join(', ')} (max ${cli.maxWorkers ?? 'default'})`);
-  console.log(`runs: workers=${result.subtaskResults.map((subtask) => `${subtask.subtaskId}:${subtask.runId}:${subtask.status}`).join(', ') || '(none)'}`);
-  if (result.qualityRunId) console.log(`qualityRunId: ${result.qualityRunId}`);
-  if (result.synthesizerRunId) console.log(`synthesizerRunId: ${result.synthesizerRunId}`);
+  console.log(formatSwarmRunStatuses(result));
   if (result.status === 'succeeded') {
     console.log(renderPrettyString(typeof result.output === 'string' ? result.output : JSON.stringify(result.output, null, 2)));
   } else {
@@ -2550,9 +2532,7 @@ function printSwarmRetryResult(result: SwarmRetryResult): void {
   if (result.skippedWorkerRunIds.length > 0) {
     console.log(`workers skipped: ${result.skippedWorkerRunIds.map((entry) => `${entry.runId}:${entry.reason}`).join(', ')}`);
   }
-  console.log(`runs: workers=${result.subtaskResults.map((subtask) => `${subtask.subtaskId}:${subtask.runId}:${subtask.status}`).join(', ') || '(none)'}`);
-  if (result.qualityRunId) console.log(`qualityRunId: ${result.qualityRunId}`);
-  if (result.synthesizerRunId) console.log(`synthesizerRunId: ${result.synthesizerRunId}`);
+  console.log(formatSwarmRunStatuses(result));
   if (result.status === 'succeeded') {
     console.log(renderPrettyString(typeof result.output === 'string' ? result.output : JSON.stringify(result.output, null, 2)));
   } else {
@@ -2692,9 +2672,11 @@ function shouldListenForCliEvents(cli: ManualTestCliOptions): boolean {
 }
 
 function summarizeEvent(event: { type: string; runId: string; stepId?: string; toolCallId?: string; payload: JsonValue; createdAt: string }): Record<string, JsonValue> {
+  const summary = summarizeAgentEvent(event);
   return {
     type: event.type,
     runId: event.runId,
+    ...(summary.roleLabel ? { roleLabel: summary.roleLabel } : {}),
     ...(event.stepId ? { stepId: event.stepId } : {}),
     ...(event.toolCallId ? { toolCallId: event.toolCallId } : {}),
     createdAt: event.createdAt,
@@ -2777,11 +2759,12 @@ function printRunStartedEvent(event: AgentEvent, theme: TuiSettingsConfig, color
   const payload = event.payload as JsonObject;
   if (typeof payload.rootRunId === 'string' && payload.rootRunId !== event.runId) return;
   if (typeof payload.delegationDepth === 'number' && payload.delegationDepth > 0) return;
-  const lines = [`[started] run: ${event.runId}`];
+  const label = agentEventProgressPrefix(event);
+  const lines = [`[started] ${label} run: ${event.runId}`];
   if (typeof payload.goal === 'string') {
     lines.push(`goal: ${payload.goal.replace(/\s+/g, ' ').trim()}`);
   }
-  const line = colors.colorize(event.runId, wrapRenderedText(lines.join('\n'), wrapWidth));
+  const line = colors.colorize(agentEventColorKey(event), wrapRenderedText(lines.join('\n'), wrapWidth));
   console.error(renderStyledPrettyMessage('event', line, theme));
 }
 
@@ -2794,7 +2777,8 @@ function printRunEndedEvent(event: AgentEvent, theme: TuiSettingsConfig, colors:
     : event.type === 'replan.required'
       ? 'replan required'
       : 'failed';
-  const lines = [`[${status}] run: ${event.runId}`];
+  const label = agentEventProgressPrefix(event);
+  const lines = [`[${status}] ${label} run: ${event.runId}`];
   const lineage = renderRunLineage(event.runId, payload);
   if (lineage) {
     lines.push(lineage);
@@ -2808,7 +2792,7 @@ function printRunEndedEvent(event: AgentEvent, theme: TuiSettingsConfig, colors:
     lines.push(`code: ${code}`);
   }
   const colorRunId = terminalEventColorRunId(event.runId, payload);
-  const line = colors.colorize(colorRunId, wrapRenderedText(lines.join('\n'), wrapWidth));
+  const line = colors.colorize(agentEventColorKey({ runId: colorRunId, payload }), wrapRenderedText(lines.join('\n'), wrapWidth));
   console.error(renderStyledPrettyMessage('event', line, theme));
 }
 
@@ -2849,8 +2833,8 @@ function printProgressEvent(
   lastContentByRun.set(event.runId, assistantContent);
   const rendered = limitRenderedProgressLines(wrapRenderedText(renderPrettyString(assistantContent), wrapWidth), showLines);
   if (colors) {
-    const prefix = `[run ${shortRunId(event.runId)}]`;
-    console.error(formatStyledMessageBlock('progress', wrapRenderedText(colors.colorize(event.runId, `${prefix} ${rendered}`), wrapWidth), swarmProgressTheme(theme)));
+    const prefix = agentEventProgressPrefix(event);
+    console.error(formatStyledMessageBlock('progress', wrapRenderedText(colors.colorize(agentEventColorKey(event), `${prefix} ${rendered}`), wrapWidth), swarmProgressTheme(theme)));
     return;
   }
   console.error(formatStyledMessageBlock('progress', rendered, theme));
@@ -3225,14 +3209,18 @@ function printInlineConfigSummary(
 }
 
 function printEvent(event: Record<string, JsonValue>, theme: TuiSettingsConfig, colors?: RunColorRegistry): void {
-  const parts = [
-    `[event] ${String(event.type)}`,
-    `run=${String(event.runId)}`,
-    ...(event.stepId ? [`step=${String(event.stepId)}`] : []),
-    ...(event.toolCallId ? [`toolCall=${String(event.toolCallId)}`] : []),
-  ];
   const runId = typeof event.runId === 'string' ? event.runId : undefined;
-  console.error(renderStyledPrettyMessage('event', colors?.colorize(runId, parts.join(' ')) ?? parts.join(' '), theme));
+  const rendered = runId
+    ? `[event] ${formatAgentEventSummary({
+        type: String(event.type),
+        runId,
+        ...(typeof event.roleLabel === 'string' ? { roleLabel: event.roleLabel } : {}),
+        ...(typeof event.stepId === 'string' ? { stepId: event.stepId } : {}),
+        ...(typeof event.toolCallId === 'string' ? { toolCallId: event.toolCallId } : {}),
+        timestamp: new Date(),
+      })}`
+    : `[event] ${String(event.type)}`;
+  console.error(renderStyledPrettyMessage('event', colors?.colorize(runId, rendered) ?? rendered, theme));
 }
 
 function printOrchestrationLifecycleEvent(event: OrchestrationLifecycleEvent, theme: TuiSettingsConfig): void {

@@ -13,6 +13,7 @@ import {
   main,
   parseCliArgs,
   formatCoordinatorDecompositionFailure,
+  formatSwarmRunStatuses,
   formatSwarmExecutionPlan,
   formatSwarmSubtasks,
   renderStyledPrettyMessage,
@@ -594,6 +595,23 @@ describe('adaptive-agent pretty rendering', () => {
     ].join('\n'));
   });
 
+  it('wraps long swarm subtasks under the objective column', () => {
+    const rendered = formatSwarmSubtasks([
+      {
+        id: 'subtask-1',
+        subObjective: 'Step 1 - Core Architectural Paradigms: Conduct a comprehensive survey of agent systems and compare patterns.',
+        targetAgentId: 'default-agent',
+      },
+    ], 72);
+
+    expect(rendered).toBe([
+      'subtasks:',
+      '  1. subtask-1 -> default-agent: Step 1 - Core Architectural Paradigms:',
+      '                                 Conduct a comprehensive survey of agent',
+      '                                 systems and compare patterns.',
+    ].join('\n'));
+  });
+
   it('formats the swarm execution plan with session, coordinator, and subtasks', () => {
     const rendered = formatSwarmExecutionPlan('session-1', 'coordinator-run-1', [
       { id: 'subtask-1', subObjective: 'Research the market.', targetAgentId: 'market' },
@@ -605,6 +623,26 @@ describe('adaptive-agent pretty rendering', () => {
       'subtasks:',
       '  1. subtask-1 -> market: Research the market.',
       '  2. subtask-2 -> pricing: Draft the pricing model.',
+    ].join('\n'));
+  });
+
+  it('formats swarm run statuses with one worker per line', () => {
+    const rendered = formatSwarmRunStatuses({
+      subtaskResults: [
+        { subtaskId: 'subtask-1', runId: 'run-1', status: 'succeeded' },
+        { subtaskId: 'subtask-2', runId: 'run-2', status: 'failed', errorCode: 'MODEL_ERROR' },
+      ],
+      qualityRunId: 'quality-run-1',
+      synthesizerRunId: 'synth-run-1',
+    });
+
+    expect(rendered).toBe([
+      'runs:',
+      '  workers:',
+      '    - subtask-1: run=run-1 status=succeeded',
+      '    - subtask-2: run=run-2 status=failed error=MODEL_ERROR',
+      '  quality: run=quality-run-1',
+      '  synthesizer: run=synth-run-1',
     ].join('\n'));
   });
 
@@ -636,6 +674,19 @@ describe('adaptive-agent pretty rendering', () => {
     expect(rendered).toContain('Heading');
     expect(rendered).toContain('one');
     expect(rendered).toContain('two');
+  });
+
+  it('does not wrap markdown list items in reset-only ANSI sequences', () => {
+    const rendered = renderPrettyString([
+      '### Important Notes',
+      '',
+      '* Simon Willison has **967 repositories** on GitHub',
+      '* He has published **354 projects** on PyPI',
+    ].join('\n'));
+
+    expect(rendered).not.toContain('\x1B[0m');
+    expect(stripAnsi(rendered)).not.toContain('0mSimon Willison');
+    expect(stripAnsi(rendered)).not.toContain('GitHub0m');
   });
 
   it('styles CLI assistant output using tui message settings', () => {

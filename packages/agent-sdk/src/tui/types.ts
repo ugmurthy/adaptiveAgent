@@ -7,11 +7,13 @@ export type EventStreamMode = 'progress' | 'compact' | 'verbose' | 'off';
 export interface TuiClientState {
   agentId: string;
   agentName: string;
+  sessionId: string;
   provider?: string;
   model?: string;
   runtimeMode: RuntimeMode;
   invocationMode: 'run' | 'chat';
   currentRunId?: string;
+  currentCoordinatorRunId?: string;
   currentRunStartedAt?: Date;
   currentRunDurationMs?: number;
   currentRunUsage?: UsageSummary;

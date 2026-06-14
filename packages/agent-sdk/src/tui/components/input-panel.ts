@@ -49,6 +49,7 @@ export class InputPanel implements Component {
     const parts = [
       this.state.busy ? chalk.yellow('running') : chalk.green('ready'),
       `agent ${this.state.agentId}`,
+      `session ${this.state.sessionId}`,
       `mode ${this.state.invocationMode}`,
     ];
 

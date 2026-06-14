@@ -23,6 +23,7 @@ export class StatusBar implements Component {
     parts.push(status);
 
     parts.push(`${this.state.agentId}`);
+    parts.push(`session: ${this.state.sessionId}`);
     parts.push(`${this.state.provider ?? 'provider?'}/${this.state.model ?? 'model?'}`);
     parts.push(`runtime: ${this.state.runtimeMode}`);
     parts.push(`mode: ${this.state.invocationMode}`);
