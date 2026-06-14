@@ -460,6 +460,7 @@ export class AdaptiveAgent {
         delegationDepth: currentRun.delegationDepth,
         planId: plan.id,
         planExecutionId: planExecution.id,
+        ...runMetadataEventPayload(currentRun.metadata),
       },
     });
 
@@ -3600,6 +3601,7 @@ export class AdaptiveAgent {
         goal: run.goal,
         rootRunId: run.rootRunId,
         delegationDepth: run.delegationDepth,
+        ...runMetadataEventPayload(run.metadata),
       },
     };
   }
@@ -5621,6 +5623,14 @@ function runLineagePayload(
     parentStepId: run.parentStepId,
     delegateName: run.delegateName,
     delegationDepth: run.delegationDepth,
+  });
+}
+
+function runMetadataEventPayload(metadata: Record<string, JsonValue> | undefined): JsonObject {
+  if (!metadata) return {};
+  return removeUndefinedJsonFields({
+    agentId: typeof metadata.agentId === 'string' ? metadata.agentId : undefined,
+    orchestration: isJsonObject(metadata.orchestration) ? metadata.orchestration : undefined,
   });
 }
 
