@@ -5,6 +5,7 @@ export type JsonSchema = Record<string, unknown>;
 export type CaptureMode = 'full' | 'summary' | 'none';
 export type ToolBudgetExhaustedAction = 'fail' | 'continue_with_warning' | 'ask_model';
 export type ResearchPolicyName = 'none' | 'light' | 'standard' | 'deep' | 'gaia';
+export type WebSearchProvider = 'brave' | 'duckduckgo' | 'serper';
 
 export type ContinuationStrategy =
   | 'hybrid_snapshot_then_step'
@@ -38,7 +39,7 @@ interface CoreRuntimeModule {
   createWriteFileTool(config?: { allowedRoot?: string; createDirectories?: boolean }): ToolDefinition;
   createShellExecTool(config?: { cwd?: string; maxOutputBytes?: number; shell?: string }): ToolDefinition;
   createWebSearchTool(config: {
-    provider?: 'brave' | 'duckduckgo';
+    provider?: WebSearchProvider;
     apiKey?: string;
     maxResults?: number;
     baseUrl?: string;
@@ -368,8 +369,9 @@ export interface LoadedSkillDefinition {
 
 export interface CreateBuiltinToolsOptions {
   rootDir?: string;
-  webSearchProvider?: 'brave' | 'duckduckgo';
+  webSearchProvider?: WebSearchProvider;
   braveSearchApiKey?: string;
+  serperApiKey?: string;
   webToolTimeoutMs?: number;
 }
 
@@ -404,24 +406,40 @@ export async function createBuiltinTools(options: CreateBuiltinToolsOptions = {}
   const coreRuntime = await loadCoreRuntime();
   const rootDir = options.rootDir ?? process.cwd();
   const preferredWebSearchProvider = options.webSearchProvider ?? 'duckduckgo';
-  const webSearchProvider =
-    preferredWebSearchProvider === 'brave' && !options.braveSearchApiKey ? 'duckduckgo' : preferredWebSearchProvider;
+  let webSearchProvider = preferredWebSearchProvider;
+  if (
+    (preferredWebSearchProvider === 'brave' && !options.braveSearchApiKey) ||
+    (preferredWebSearchProvider === 'serper' && !options.serperApiKey)
+  ) {
+    webSearchProvider = 'duckduckgo';
+  }
+
+  let webSearchTool: ToolDefinition;
+  if (webSearchProvider === 'brave') {
+    webSearchTool = coreRuntime.createWebSearchTool({
+      provider: 'brave',
+      apiKey: options.braveSearchApiKey,
+      timeoutMs: options.webToolTimeoutMs,
+    });
+  } else if (webSearchProvider === 'serper') {
+    webSearchTool = coreRuntime.createWebSearchTool({
+      provider: 'serper',
+      apiKey: options.serperApiKey,
+      timeoutMs: options.webToolTimeoutMs,
+    });
+  } else {
+    webSearchTool = coreRuntime.createWebSearchTool({
+      provider: 'duckduckgo',
+      timeoutMs: options.webToolTimeoutMs,
+    });
+  }
 
   return [
     coreRuntime.createReadFileTool({ allowedRoot: rootDir }),
     coreRuntime.createListDirectoryTool({ allowedRoot: rootDir }),
     coreRuntime.createWriteFileTool({ allowedRoot: rootDir }),
     coreRuntime.createShellExecTool({ cwd: rootDir }),
-    webSearchProvider === 'brave'
-      ? coreRuntime.createWebSearchTool({
-          provider: 'brave',
-          apiKey: options.braveSearchApiKey,
-          timeoutMs: options.webToolTimeoutMs,
-        })
-      : coreRuntime.createWebSearchTool({
-          provider: 'duckduckgo',
-          timeoutMs: options.webToolTimeoutMs,
-        }),
+    webSearchTool,
     coreRuntime.createReadWebPageTool({ timeoutMs: options.webToolTimeoutMs }),
   ];
 }

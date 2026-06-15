@@ -95,7 +95,7 @@ const positionalArgs = cliArgs.filter((arg) => !['--verbose', '-v', '--auto-appr
 const webSearchProviderEnv = process.env.WEB_SEARCH_PROVIDER;
 const logDestinationEnv = process.env.LOG_DEST;
 const webSearchProvider =
-  webSearchProviderEnv === 'duckduckgo' || webSearchProviderEnv === 'brave'
+  webSearchProviderEnv === 'duckduckgo' || webSearchProviderEnv === 'brave' || webSearchProviderEnv === 'serper'
     ? webSearchProviderEnv
     : 'brave';
 const logDestination = parseLogDestination(logDestinationEnv);
@@ -153,6 +153,17 @@ if (webSearchProvider === 'duckduckgo') {
   console.log(
     `🔍 Web search tools enabled (WEB_SEARCH_PROVIDER=duckduckgo${webToolTimeoutMs ? `, WEB_TOOL_TIMEOUT_MS=${webToolTimeoutMs}` : ''})`,
   );
+} else if (webSearchProvider === 'serper') {
+  const serperKey = process.env.SERPER_API_KEY;
+  if (serperKey) {
+    tools.push(createWebSearchTool({ provider: 'serper', apiKey: serperKey, timeoutMs: webToolTimeoutMs }));
+    tools.push(createReadWebPageTool({ timeoutMs: webToolTimeoutMs }));
+    console.log(
+      `🔍 Web search tools enabled (WEB_SEARCH_PROVIDER=serper, SERPER_API_KEY found${webToolTimeoutMs ? `, WEB_TOOL_TIMEOUT_MS=${webToolTimeoutMs}` : ''})`,
+    );
+  } else {
+    console.log('⚠️  Web search tools disabled (set WEB_SEARCH_PROVIDER=duckduckgo or provide SERPER_API_KEY)');
+  }
 } else {
   const braveKey = process.env.BRAVE_SEARCH_API_KEY;
   if (braveKey) {
@@ -162,7 +173,7 @@ if (webSearchProvider === 'duckduckgo') {
       `🔍 Web search tools enabled (WEB_SEARCH_PROVIDER=brave, BRAVE_SEARCH_API_KEY found${webToolTimeoutMs ? `, WEB_TOOL_TIMEOUT_MS=${webToolTimeoutMs}` : ''})`,
     );
   } else {
-    console.log('⚠️  Web search tools disabled (set WEB_SEARCH_PROVIDER=duckduckgo or provide BRAVE_SEARCH_API_KEY)');
+    console.log('⚠️  Web search tools disabled (set WEB_SEARCH_PROVIDER=duckduckgo, provide BRAVE_SEARCH_API_KEY, or set WEB_SEARCH_PROVIDER to serper with SERPER_API_KEY)');
   }
 }
 

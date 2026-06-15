@@ -1,9 +1,11 @@
 import type { JsonValue, ToolDefinition } from '../types.js';
 
+export type WebSearchProvider = 'brave' | 'duckduckgo' | 'serper';
+
 export interface WebSearchToolConfig {
   /** Search provider. Defaults to `'brave'`. */
-  provider?: 'brave' | 'duckduckgo';
-  /** API key for Brave Search. Required when `provider` is `'brave'`. */
+  provider?: WebSearchProvider;
+  /** API key for API-backed search providers. Required for Brave and Serper. */
   apiKey?: string;
   /** Maximum results to return. Defaults to `5`. */
   maxResults?: number;
@@ -52,12 +54,12 @@ type WebSearchOutput = {
     kind: 'http_error' | 'network_error' | 'challenge' | 'timeout';
     message: string;
     status?: number;
-    provider: 'brave' | 'duckduckgo';
+    provider: WebSearchProvider;
   };
 };
 
 interface WebSearchDiagnostics {
-  provider: 'brave' | 'duckduckgo';
+  provider: WebSearchProvider;
   providerPath: 'api' | 'deep' | 'html-fallback';
   deduplicatedResults?: number;
 }
@@ -83,7 +85,16 @@ interface DuckDuckGoDeepResult {
   u?: string;
 }
 
+interface SerperSearchResponse {
+  organic?: Array<{
+    title?: string;
+    link?: string;
+    snippet?: string;
+  }>;
+}
+
 const BRAVE_BASE_URL = 'https://api.search.brave.com/res/v1';
+const SERPER_BASE_URL = 'https://google.serper.dev';
 const DUCKDUCKGO_BASE_URL = 'https://duckduckgo.com/';
 const DUCKDUCKGO_HTML_BASE_URL = 'https://html.duckduckgo.com/html/';
 const DUCKDUCKGO_ORIGIN = 'https://duckduckgo.com';
@@ -115,12 +126,12 @@ class RecoverableWebSearchError extends Error {
 
 export function createWebSearchTool(config: WebSearchToolConfig): ToolDefinition<WebSearchInput, WebSearchOutput> {
   const provider = config.provider ?? 'brave';
-  if (provider === 'brave' && !config.apiKey) {
-    throw new Error('createWebSearchTool requires apiKey when provider is brave');
+  if ((provider === 'brave' || provider === 'serper') && !config.apiKey) {
+    throw new Error(`createWebSearchTool requires apiKey when provider is ${provider}`);
   }
 
   const maxResults = config.maxResults ?? 5;
-  const baseUrl = config.baseUrl ?? (provider === 'brave' ? BRAVE_BASE_URL : DUCKDUCKGO_BASE_URL);
+  const baseUrl = config.baseUrl ?? getDefaultWebSearchBaseUrl(provider);
   const timeoutMs = config.timeoutMs ?? DEFAULT_WEB_TOOL_TIMEOUT_MS;
   const maxResponseBodyBytes = config.maxResponseBodyBytes ?? DEFAULT_MAX_RESPONSE_BODY_BYTES;
   const cache = new Map<string, WebSearchOutput>();
@@ -216,23 +227,34 @@ export function createWebSearchTool(config: WebSearchToolConfig): ToolDefinition
       }
 
       try {
-        const execution =
-          provider === 'brave'
-            ? await searchBrave({
-                apiKey: config.apiKey!,
-                query: effectiveQuery,
-                count,
-                baseUrl,
-                maxResponseBodyBytes,
-                signal: context.signal,
-              })
-            : await searchDuckDuckGo({
-                query: effectiveQuery,
-                count,
-                baseUrl,
-                maxResponseBodyBytes,
-                signal: context.signal,
-              });
+        let execution: WebSearchExecutionResult;
+        if (provider === 'brave') {
+          execution = await searchBrave({
+            apiKey: config.apiKey!,
+            query: effectiveQuery,
+            count,
+            baseUrl,
+            maxResponseBodyBytes,
+            signal: context.signal,
+          });
+        } else if (provider === 'serper') {
+          execution = await searchSerper({
+            apiKey: config.apiKey!,
+            query: effectiveQuery,
+            count,
+            baseUrl,
+            maxResponseBodyBytes,
+            signal: context.signal,
+          });
+        } else {
+          execution = await searchDuckDuckGo({
+            query: effectiveQuery,
+            count,
+            baseUrl,
+            maxResponseBodyBytes,
+            signal: context.signal,
+          });
+        }
         const deduplicatedResults = deduplicateSearchResults(execution.results, count);
 
         const output = attachWebSearchDiagnostics(
@@ -283,6 +305,18 @@ export function createWebSearchTool(config: WebSearchToolConfig): ToolDefinition
       return formatWebSearchOutputForModel(output);
     },
   };
+}
+
+function getDefaultWebSearchBaseUrl(provider: WebSearchProvider): string {
+  if (provider === 'brave') {
+    return BRAVE_BASE_URL;
+  }
+
+  if (provider === 'serper') {
+    return SERPER_BASE_URL;
+  }
+
+  return DUCKDUCKGO_BASE_URL;
 }
 
 function buildEffectiveSearchQuery(
@@ -423,6 +457,65 @@ async function searchBrave({
     })),
     diagnostics: {
       provider: 'brave',
+      providerPath: 'api',
+    },
+  };
+}
+
+async function searchSerper({
+  apiKey,
+  query,
+  count,
+  baseUrl,
+  maxResponseBodyBytes,
+  signal,
+}: {
+  apiKey: string;
+  query: string;
+  count: number;
+  baseUrl: string;
+  maxResponseBodyBytes: number;
+  signal: AbortSignal;
+}): Promise<WebSearchExecutionResult> {
+  const url = new URL(`${baseUrl.replace(/\/$/, '')}/search`);
+
+  const response = await fetch(url.toString(), {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      'X-API-KEY': apiKey,
+    },
+    body: JSON.stringify({ q: query, num: count }),
+    signal,
+  });
+
+  if (!response.ok) {
+    const errorText = await readResponseTextWithinLimit(response, maxResponseBodyBytes, signal).catch(() => 'unknown error');
+    throw createRecoverableWebSearchError({
+      query,
+      provider: 'serper',
+      kind: 'http_error',
+      message: `Serper Search API returned ${response.status}: ${errorText}`,
+      status: response.status,
+    });
+  }
+
+  const data = (await response.json()) as SerperSearchResponse;
+  return {
+    results: (data.organic ?? [])
+      .flatMap((result) => {
+        const title = result.title?.trim();
+        const resultUrl = result.link?.trim();
+        if (!title || !resultUrl) {
+          return [];
+        }
+
+        return [{ title, url: resultUrl, snippet: result.snippet?.trim() ?? '' }];
+      })
+      .slice(0, count),
+    diagnostics: {
+      provider: 'serper',
       providerPath: 'api',
     },
   };
@@ -691,7 +784,7 @@ async function readResponseTextWithinLimit(
 function normalizeWebSearchError(
   error: unknown,
   query: string,
-  provider: 'brave' | 'duckduckgo',
+  provider: WebSearchProvider,
 ): RecoverableWebSearchError {
   if (error instanceof RecoverableWebSearchError) {
     return error;
@@ -714,7 +807,7 @@ function createRecoverableWebSearchError({
   status,
 }: {
   query: string;
-  provider: 'brave' | 'duckduckgo';
+  provider: WebSearchProvider;
   kind: 'http_error' | 'network_error' | 'challenge' | 'timeout';
   message: string;
   status?: number;

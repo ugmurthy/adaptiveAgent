@@ -61,6 +61,14 @@ const tools: ToolDefinition[] = [
 if (config.webSearch.enabled) {
   if (config.webSearch.provider === 'duckduckgo') {
     tools.push(createWebSearchTool({ provider: 'duckduckgo', timeoutMs: config.webSearch.timeoutMs }));
+  } else if (config.webSearch.provider === 'serper') {
+    tools.push(
+      createWebSearchTool({
+        provider: 'serper',
+        apiKey: config.webSearch.serperApiKey!,
+        timeoutMs: config.webSearch.timeoutMs,
+      }),
+    );
   } else {
     tools.push(
       createWebSearchTool({

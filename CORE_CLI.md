@@ -143,7 +143,7 @@ Resolution rules:
 - Create file tools with `workspaceRoot` as `allowedRoot`.
 - Create `shell_exec` with `workspaceRoot` as `cwd` unless a later config field explicitly overrides shell cwd.
 - Enable `web_search` only when the requested provider can be configured locally.
-- Use `WEB_SEARCH_PROVIDER=duckduckgo` by default for local use unless `BRAVE_SEARCH_API_KEY` is present and `WEB_SEARCH_PROVIDER=brave` is requested.
+- Use `WEB_SEARCH_PROVIDER=duckduckgo` by default for local use unless `WEB_SEARCH_PROVIDER=brave` with `BRAVE_SEARCH_API_KEY` or `WEB_SEARCH_PROVIDER=serper` with `SERPER_API_KEY` is requested.
 - If the agent JSON references an unavailable tool, fail during startup with the missing tool name and the registered tool names.
 
 Delegates should be loaded from local skills and converted through core skill-to-delegate support. Suggested delegate lookup order:

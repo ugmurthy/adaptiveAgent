@@ -12,7 +12,7 @@ import {
 import type { CaptureMode, ResearchPolicyName, ToolBudget } from '../packages/core/src/types.js';
 
 type ModelProvider = ModelAdapterConfig['provider'];
-type WebSearchProvider = 'brave' | 'duckduckgo';
+type WebSearchProvider = 'brave' | 'duckduckgo' | 'serper';
 
 export interface AaProviderConfig {
   model?: string;
@@ -37,6 +37,7 @@ export interface AaConfigFile {
       enabled?: boolean;
       provider?: WebSearchProvider;
       braveApiKey?: string;
+      serperApiKey?: string;
       timeoutMs?: number;
     };
   };
@@ -78,6 +79,7 @@ export interface ResolvedAaConfig {
     enabled: boolean;
     provider: WebSearchProvider;
     braveApiKey?: string;
+    serperApiKey?: string;
     timeoutMs?: number;
   };
   logging: {
@@ -103,7 +105,7 @@ export interface ResolvedAaConfig {
 }
 
 const MODEL_PROVIDERS = ['ollama', 'openrouter', 'mistral', 'mesh'] as const satisfies readonly ModelProvider[];
-const WEB_SEARCH_PROVIDERS = ['brave', 'duckduckgo'] as const satisfies readonly WebSearchProvider[];
+const WEB_SEARCH_PROVIDERS = ['brave', 'duckduckgo', 'serper'] as const satisfies readonly WebSearchProvider[];
 const LOG_DESTINATIONS = ['console', 'file', 'both'] as const satisfies readonly AdaptiveAgentLogDestination[];
 const LOG_LEVELS = ['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent'] as const;
 const CAPTURE_MODES = ['full', 'summary', 'none'] as const satisfies readonly CaptureMode[];
@@ -208,16 +210,24 @@ export async function resolveAaConfig(options: { configPath?: string } = {}): Pr
   const tools = readRecord(config.tools, 'tools', loadedConfig.path);
   const webSearch = readRecord(tools?.webSearch, 'tools.webSearch', loadedConfig.path);
   const braveApiKey = readNonEmptyString(webSearch?.braveApiKey, 'tools.webSearch.braveApiKey', loadedConfig.path);
+  const serperApiKey = readNonEmptyString(
+    webSearch?.serperApiKey,
+    'tools.webSearch.serperApiKey',
+    loadedConfig.path,
+  );
   const configuredWebSearchProvider = readEnum(
     webSearch?.provider,
     WEB_SEARCH_PROVIDERS,
     'tools.webSearch.provider',
     loadedConfig.path,
   );
-  const webSearchProvider = configuredWebSearchProvider ?? (braveApiKey ? 'brave' : 'duckduckgo');
+  const webSearchProvider =
+    configuredWebSearchProvider ?? (braveApiKey ? 'brave' : serperApiKey ? 'serper' : 'duckduckgo');
   const webSearchEnabled =
     readBoolean(webSearch?.enabled, 'tools.webSearch.enabled', loadedConfig.path) ??
-    (configuredWebSearchProvider === 'duckduckgo' || Boolean(braveApiKey));
+    (configuredWebSearchProvider === 'duckduckgo' ||
+      Boolean(braveApiKey) ||
+      Boolean(serperApiKey));
   const webSearchTimeoutMs = readInteger(
     webSearch?.timeoutMs,
     'tools.webSearch.timeoutMs',
@@ -228,6 +238,12 @@ export async function resolveAaConfig(options: { configPath?: string } = {}): Pr
   if (webSearchEnabled && webSearchProvider === 'brave' && !braveApiKey) {
     throw new Error(
       `tools.webSearch.braveApiKey is required in ${loadedConfig.path} when tools.webSearch.provider='brave'.`,
+    );
+  }
+
+  if (webSearchEnabled && webSearchProvider === 'serper' && !serperApiKey) {
+    throw new Error(
+      `tools.webSearch.serperApiKey is required in ${loadedConfig.path} when tools.webSearch.provider='serper'.`,
     );
   }
 
@@ -287,6 +303,7 @@ export async function resolveAaConfig(options: { configPath?: string } = {}): Pr
       enabled: webSearchEnabled,
       provider: webSearchProvider,
       braveApiKey,
+      serperApiKey,
       timeoutMs: webSearchTimeoutMs,
     },
     logging: {

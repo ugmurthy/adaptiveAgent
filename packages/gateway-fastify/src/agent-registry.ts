@@ -9,6 +9,7 @@ import {
   type CreateAdaptiveAgentOptions,
   type CreatedAdaptiveAgent,
   type ToolDefinition,
+  type WebSearchProvider,
 } from './core.js';
 
 import type { AgentConfig, InvocationMode, LoadedConfig } from './config.js';
@@ -167,6 +168,7 @@ async function resolveAgentTools(entry: AgentRegistryEntry): Promise<ToolDefinit
     rootDir: resolveWorkspaceRoot(workspaceRoot),
     webSearchProvider: readWebSearchProvider(process.env.WEB_SEARCH_PROVIDER),
     braveSearchApiKey: process.env.BRAVE_SEARCH_API_KEY,
+    serperApiKey: process.env.SERPER_API_KEY,
     webToolTimeoutMs: parseOptionalPositiveInteger(process.env.WEB_TOOL_TIMEOUT_MS),
   });
   const workspaceToolByName = new Map(workspaceTools.map((tool) => [tool.name, tool]));
@@ -199,8 +201,8 @@ function expandEnvironmentVariables(value: string): string {
   });
 }
 
-function readWebSearchProvider(value: string | undefined): 'brave' | 'duckduckgo' {
-  return value === 'brave' ? 'brave' : 'duckduckgo';
+function readWebSearchProvider(value: string | undefined): WebSearchProvider {
+  return value === 'brave' || value === 'serper' ? value : 'duckduckgo';
 }
 
 function parseOptionalPositiveInteger(value: string | undefined): number | undefined {

@@ -11,7 +11,7 @@ export { createShellExecTool } from './shell-exec.js';
 export type { ShellExecToolConfig } from './shell-exec.js';
 
 export { createWebSearchTool } from './web-search.js';
-export type { WebSearchToolConfig } from './web-search.js';
+export type { WebSearchProvider, WebSearchToolConfig } from './web-search.js';
 
 export { createReadWebPageTool } from './read-web-page.js';
 export type { ReadWebPageToolConfig } from './read-web-page.js';

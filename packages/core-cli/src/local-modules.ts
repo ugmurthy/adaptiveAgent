@@ -175,6 +175,13 @@ function createBuiltinTools(workspaceRoot: string, env: NodeJS.ProcessEnv): Map<
         createWebSearchTool({ provider: 'brave', apiKey: env.BRAVE_SEARCH_API_KEY, timeoutMs: webToolTimeoutMs }),
       );
     }
+  } else if (env.WEB_SEARCH_PROVIDER === 'serper') {
+    if (env.SERPER_API_KEY) {
+      tools.set(
+        'web_search',
+        createWebSearchTool({ provider: 'serper', apiKey: env.SERPER_API_KEY, timeoutMs: webToolTimeoutMs }),
+      );
+    }
   } else {
     tools.set('web_search', createWebSearchTool({ provider: 'duckduckgo', timeoutMs: webToolTimeoutMs }));
   }

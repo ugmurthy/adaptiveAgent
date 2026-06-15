@@ -4,7 +4,12 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createJwtAuthProvider } from './auth.js';
-import { createBuiltinTools, loadSkillDelegateFromDirectory, type DelegateDefinition } from './core.js';
+import {
+  createBuiltinTools,
+  loadSkillDelegateFromDirectory,
+  type DelegateDefinition,
+  type WebSearchProvider,
+} from './core.js';
 import { ADAPTIVE_AGENT_ARTIFACTS_DIR, GATEWAY_SKILLS_DIR } from './local-dev.js';
 import { createModuleRegistry, type ModuleRegistry } from './registries.js';
 
@@ -26,6 +31,7 @@ export async function createLocalModuleRegistry(
     rootDir: workspaceRoot,
     webSearchProvider: readWebSearchProvider(process.env.WEB_SEARCH_PROVIDER),
     braveSearchApiKey: process.env.BRAVE_SEARCH_API_KEY,
+    serperApiKey: process.env.SERPER_API_KEY,
     webToolTimeoutMs: parseOptionalPositiveInteger(process.env.WEB_TOOL_TIMEOUT_MS),
   });
   const delegates = await loadLocalSkillDelegates({
@@ -105,8 +111,8 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-function readWebSearchProvider(value: string | undefined): 'brave' | 'duckduckgo' {
-  return value === 'brave' ? 'brave' : 'duckduckgo';
+function readWebSearchProvider(value: string | undefined): WebSearchProvider {
+  return value === 'brave' || value === 'serper' ? value : 'duckduckgo';
 }
 
 function parseOptionalPositiveInteger(value: string | undefined): number | undefined {

@@ -378,7 +378,8 @@ function normalizeTuiSettings(settings: TuiSettingsConfig | undefined): TuiSetti
 async function resolveToolsAndDelegates(config: ResolvedAgentSdkConfig, options: AgentSdkOptions): Promise<{ tools: Array<ToolDefinition<any, any>>; delegates: DelegateDefinition[]; registeredToolNames: string[] }> {
   process.env.ADAPTIVE_AGENT_MODULE_ROOT ??= DEFAULT_MODULE_ROOT;
 
-  const builtins = createBuiltinTools(config.workspaceRoot, config.shellCwd, options.env ?? process.env);
+  const env = { ...(options.env ?? process.env), ...(config.settings.env ?? {}) };
+  const builtins = createBuiltinTools(config.workspaceRoot, config.shellCwd, env);
   const providedTools = new Map((options.tools ?? []).map((tool) => [tool.name, tool]));
   const registry = new Map([...builtins, ...providedTools]);
   const registeredToolNames = [...registry.keys()].sort();
@@ -397,6 +398,7 @@ function createBuiltinTools(workspaceRoot: string, shellCwd: string, env: NodeJS
   tools.set('shell_exec', createShellExecTool({ cwd: shellCwd }));
   const timeoutMs = parsePositiveInteger(env.WEB_TOOL_TIMEOUT_MS);
   if (env.WEB_SEARCH_PROVIDER === 'brave' && env.BRAVE_SEARCH_API_KEY) tools.set('web_search', createWebSearchTool({ provider: 'brave', apiKey: env.BRAVE_SEARCH_API_KEY, timeoutMs }));
+  else if (env.WEB_SEARCH_PROVIDER === 'serper' && env.SERPER_API_KEY) tools.set('web_search', createWebSearchTool({ provider: 'serper', apiKey: env.SERPER_API_KEY, timeoutMs }));
   else tools.set('web_search', createWebSearchTool({ provider: 'duckduckgo', timeoutMs }));
   tools.set('read_web_page', createReadWebPageTool({ timeoutMs }));
   return tools;

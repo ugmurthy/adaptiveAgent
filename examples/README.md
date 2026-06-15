@@ -15,8 +15,9 @@ Edit `.env` and fill in the keys you need:
 | `OPENROUTER_API_KEY` | If using OpenRouter | [Get key →](https://openrouter.ai/keys) |
 | `MISTRAL_API_KEY` | If using Mistral | [Get key →](https://console.mistral.ai/api-keys) |
 | `MESH_API_KEY` | If using Mesh | [Docs →](https://docs.meshapi.ai/) |
-| `WEB_SEARCH_PROVIDER` | Optional | Set to `brave` or `duckduckgo` for `web_search` |
+| `WEB_SEARCH_PROVIDER` | Optional | Set to `brave`, `duckduckgo`, or `serper` for `web_search` |
 | `BRAVE_SEARCH_API_KEY` | If `WEB_SEARCH_PROVIDER=brave` | [Get key →](https://api.search.brave.com/app/keys) |
+| `SERPER_API_KEY` | If `WEB_SEARCH_PROVIDER=serper` | [Get key →](https://serper.dev/) |
 | `AGENT_MAX_STEPS` | Optional | Override the sample agent's max steps; when unset it uses the core default of 30 |
 | `TOOL_TIMEOUT_MS` | Optional | Override the sample agent's default timeout for all tool calls in milliseconds; set to `0` to disable |
 | `WEB_TOOL_TIMEOUT_MS` | Optional | Override the timeout for `web_search` and `read_web_page` in milliseconds |
@@ -118,4 +119,4 @@ Skills may also declare `handler: handler.ts`. When present, the handler module 
 
 `examples/skills/persistent-code-executor/` is an enhanced E2B code-execution delegate that keeps one sandbox alive across multiple handler calls in the same child run. It is separate from a one-shot `code-executor`: use it only when repeated cells need shared interpreter state, files, or installed packages. It exposes explicit `run`, `status`, and `close` actions, creates sandboxes with `onTimeout: "kill"`, extends only a bounded idle TTL, and attempts to close on aborts or infrastructure errors so failed runs do not keep spending sandbox time unnecessarily.
 
-Skills whose required tools are unavailable (e.g. `researcher` when `WEB_SEARCH_PROVIDER=brave` and `BRAVE_SEARCH_API_KEY` is missing) are skipped automatically.
+Skills whose required tools are unavailable (e.g. `researcher` when an API-backed `WEB_SEARCH_PROVIDER` is selected and its API key is missing) are skipped automatically.

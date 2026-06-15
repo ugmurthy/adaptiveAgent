@@ -747,6 +747,87 @@ describe('createWebSearchTool', () => {
     expect(init.headers['X-Subscription-Token']).toBe('brave-key');
   });
 
+  it('sends a Serper request and parses organic results', async () => {
+    const tool = createWebSearchTool({ provider: 'serper', apiKey: 'serper-key' });
+
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          organic: [
+            { title: 'Result 1', link: 'https://example.com/1', snippet: 'First result', position: 1 },
+            { title: 'Result 2', link: 'https://example.com/2', snippet: 'Second result', position: 2 },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    const result = (await tool.execute(
+      { query: 'test query' } as any,
+      stubToolContext(),
+    )) as any;
+
+    expect(result.query).toBe('test query');
+    expect(result.results).toEqual([
+      {
+        title: 'Result 1',
+        url: 'https://example.com/1',
+        snippet: 'First result',
+      },
+      {
+        title: 'Result 2',
+        url: 'https://example.com/2',
+        snippet: 'Second result',
+      },
+    ]);
+    expect(tool.summarizeResult?.(result)).toMatchObject({
+      provider: 'serper',
+      providerPath: 'api',
+      resultCount: 2,
+    });
+
+    const [url, init] = fetchSpy.mock.calls[0];
+    expect(url).toBe('https://google.serper.dev/search');
+    expect(init.method).toBe('POST');
+    expect(init.headers['X-API-KEY']).toBe('serper-key');
+    expect(init.headers['Content-Type']).toBe('application/json');
+    expect(JSON.parse(init.body as string)).toEqual({ q: 'test query', num: 5 });
+  });
+
+  it('passes Serper maxResults as num and applies structured search hints', async () => {
+    const tool = createWebSearchTool({ provider: 'serper', apiKey: 'serper-key', maxResults: 1 });
+
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          organic: [
+            { title: 'A', link: 'https://a.com', snippet: 'a' },
+            { title: 'B', link: 'https://b.com', snippet: 'b' },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    const result = (await tool.execute(
+      {
+        query: 'test',
+        exactPhrases: ['quoted fact'],
+        domainHints: ['https://www.example.org/path'],
+        excludeDomains: ['spam.example'],
+      } as any,
+      stubToolContext(),
+    )) as any;
+
+    expect(result.results).toHaveLength(1);
+
+    const [, init] = fetchSpy.mock.calls[0];
+    expect(JSON.parse(init.body as string)).toEqual({
+      q: 'test "quoted fact" site:example.org -site:spam.example',
+      num: 1,
+    });
+  });
+
   it('formats generic budget-exhausted outputs without assuming search results', () => {
     const tool = createWebSearchTool({ apiKey: 'brave-key' });
     const budgetOutput = {
@@ -931,6 +1012,32 @@ describe('createWebSearchTool', () => {
     });
     expect(tool.summarizeResult?.(result)).toMatchObject({
       provider: 'brave',
+      resultCount: 0,
+      error: {
+        kind: 'http_error',
+        status: 403,
+      },
+    });
+  });
+
+  it('returns a recoverable error on Serper non-OK response', async () => {
+    const tool = createWebSearchTool({ provider: 'serper', apiKey: 'key' });
+
+    fetchSpy.mockResolvedValueOnce(new Response('forbidden', { status: 403 }));
+
+    const result = (await executeRecoverableTool(tool, { query: 'test' })) as any;
+
+    expect(result).toMatchObject({
+      query: 'test',
+      results: [],
+      error: {
+        kind: 'http_error',
+        status: 403,
+        provider: 'serper',
+      },
+    });
+    expect(tool.summarizeResult?.(result)).toMatchObject({
+      provider: 'serper',
       resultCount: 0,
       error: {
         kind: 'http_error',
