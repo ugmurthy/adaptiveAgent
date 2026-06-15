@@ -1,12 +1,21 @@
 import { access } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
+import { Pool, type PoolConfig } from 'pg';
+
 import { inspectAgentSdkResolution, type RuntimeMode } from '../index.js';
 import { getVersionInfo } from './version.js';
 
 export type DoctorStatus = 'pass' | 'warn' | 'fail' | 'skip';
 export type DoctorOutputFormat = 'pretty' | 'json' | 'jsonl';
 export type DoctorProvider = 'openrouter' | 'ollama' | 'mistral' | 'mesh';
+
+export interface DoctorPostgresClient {
+  query(sql: string): Promise<unknown>;
+  end(): Promise<void>;
+}
+
+export type DoctorPostgresClientFactory = (env: NodeJS.ProcessEnv) => DoctorPostgresClient | Promise<DoctorPostgresClient>;
 
 export interface DoctorOptions {
   cwd?: string;
@@ -21,6 +30,7 @@ export interface DoctorOptions {
   output?: DoctorOutputFormat;
   env?: NodeJS.ProcessEnv;
   fetch?: typeof fetch;
+  postgresClientFactory?: DoctorPostgresClientFactory;
 }
 
 export interface DoctorCheck {
@@ -48,6 +58,17 @@ const API_KEY_ENV: Partial<Record<DoctorProvider, string>> = {
   mistral: 'MISTRAL_API_KEY',
   mesh: 'MESH_API_KEY',
 };
+
+const PROVIDER_BASE_URL: Record<DoctorProvider, string> = {
+  openrouter: 'https://openrouter.ai/api/v1',
+  ollama: 'http://localhost:11434/v1',
+  mistral: 'https://api.mistral.ai/v1',
+  mesh: 'https://api.meshapi.ai/v1',
+};
+
+const DEFAULT_REACHABILITY_TIMEOUT_MS = 5_000;
+
+type DoctorModelConfig = Awaited<ReturnType<typeof inspectAgentSdkResolution>>['config']['model'];
 
 export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorReport> {
   const env = options.env ?? process.env;
@@ -78,7 +99,7 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
     checks.push(providerApiKeyCheck(inspection.config.model.provider as DoctorProvider, env));
     checks.push({ id: 'runtime.mode', label: 'Runtime mode', status: 'pass', message: `${inspection.config.runtime.mode}`, details: inspection.config.runtime });
     checks.push(postgresEnvCheck(inspection.config.runtime.requestedMode, env));
-    checks.push(postgresConnectionCheck(inspection.config.runtime.mode));
+    checks.push(await postgresConnectionCheck(inspection.config.runtime.mode, env, options.postgresClientFactory));
   } catch (error) {
     checks.push({
       id: 'config.agentValidation',
@@ -90,7 +111,7 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
   }
 
   checks.push(await githubCheck(options));
-  checks.push(providerReachabilityCheck(options.providerCheck ?? false, inspection?.config.model.provider as DoctorProvider | undefined));
+  checks.push(await providerReachabilityCheck(options.providerCheck ?? false, inspection?.config.model, options));
 
   const summary = summarizeChecks(checks);
   return {
@@ -153,9 +174,38 @@ function postgresEnvCheck(runtime: RuntimeMode, env: NodeJS.ProcessEnv): DoctorC
   return { id: 'runtime.postgresEnv', label: 'Postgres env', status: 'fail', message: 'DATABASE_URL is not set.', remedy: 'Set DATABASE_URL or use --runtime memory.' };
 }
 
-function postgresConnectionCheck(runtime: RuntimeMode): DoctorCheck {
+async function postgresConnectionCheck(runtime: RuntimeMode, env: NodeJS.ProcessEnv, clientFactory: DoctorPostgresClientFactory = createPostgresDoctorClient): Promise<DoctorCheck> {
   if (runtime !== 'postgres') return { id: 'runtime.postgresConnection', label: 'Postgres connection', status: 'skip', message: 'Runtime is not postgres.' };
-  return { id: 'runtime.postgresConnection', label: 'Postgres connection', status: 'skip', message: 'Connection check is not implemented in v0.1 doctor.' };
+  let client: DoctorPostgresClient | undefined;
+  try {
+    client = await clientFactory(env);
+    await client.query('select 1');
+    return { id: 'runtime.postgresConnection', label: 'Postgres connection', status: 'pass', message: 'Postgres accepted a select 1 probe.' };
+  } catch (error) {
+    return {
+      id: 'runtime.postgresConnection',
+      label: 'Postgres connection',
+      status: 'fail',
+      message: error instanceof Error ? error.message : String(error),
+      remedy: 'Check DATABASE_URL, database availability, and PGSSL if TLS is required.',
+    };
+  } finally {
+    await client?.end().catch(() => undefined);
+  }
+}
+
+function createPostgresDoctorClient(env: NodeJS.ProcessEnv): DoctorPostgresClient {
+  if (!env.DATABASE_URL) throw new Error('DATABASE_URL is not set.');
+  const config: PoolConfig = {
+    connectionString: env.DATABASE_URL,
+    max: 1,
+    connectionTimeoutMillis: DEFAULT_REACHABILITY_TIMEOUT_MS,
+    idleTimeoutMillis: DEFAULT_REACHABILITY_TIMEOUT_MS,
+    query_timeout: DEFAULT_REACHABILITY_TIMEOUT_MS,
+    statement_timeout: DEFAULT_REACHABILITY_TIMEOUT_MS,
+    ssl: readBooleanEnv(env.PGSSL) ? { rejectUnauthorized: false } : undefined,
+  };
+  return new Pool(config) as unknown as DoctorPostgresClient;
 }
 
 async function githubCheck(options: DoctorOptions): Promise<DoctorCheck> {
@@ -170,9 +220,107 @@ async function githubCheck(options: DoctorOptions): Promise<DoctorCheck> {
   }
 }
 
-function providerReachabilityCheck(enabled: boolean, provider?: DoctorProvider): DoctorCheck {
+async function providerReachabilityCheck(enabled: boolean, modelConfig: DoctorModelConfig | undefined, options: DoctorOptions): Promise<DoctorCheck> {
   if (!enabled) return { id: 'provider.reachability', label: 'Provider reachability', status: 'skip', message: 'Use --provider-check to check provider reachability.' };
-  return { id: 'provider.reachability', label: 'Provider reachability', status: 'skip', message: provider ? `${provider} reachability is not called by v0.1 doctor.` : 'Provider config was not resolved.' };
+  if (!modelConfig) return { id: 'provider.reachability', label: 'Provider reachability', status: 'skip', message: 'Provider config was not resolved.' };
+  const provider = modelConfig.provider as DoctorProvider;
+  const keyEnv = API_KEY_ENV[provider];
+  if (keyEnv && !modelConfig.apiKey) {
+    return { id: 'provider.reachability', label: 'Provider reachability', status: 'skip', message: `${keyEnv} is not set; provider reachability was not attempted.` };
+  }
+
+  const baseUrl = (modelConfig.baseUrl ?? PROVIDER_BASE_URL[provider]).replace(/\/+$/, '');
+  const url = `${baseUrl}/models`;
+  const headers: Record<string, string> = {};
+  if (modelConfig.apiKey) headers.Authorization = `Bearer ${modelConfig.apiKey}`;
+
+  try {
+    const response = await fetchWithTimeout(options.fetch ?? fetch, url, { method: 'GET', headers });
+    if (response.ok) {
+      if (provider === 'ollama') return ollamaModelAvailabilityCheck(response, modelConfig.model);
+      await discardResponseBody(response);
+      return { id: 'provider.reachability', label: 'Provider reachability', status: 'pass', message: `${provider} API is reachable.`, details: { url, status: response.status } };
+    }
+    await discardResponseBody(response);
+    const authFailed = response.status === 401 || response.status === 403;
+    return {
+      id: 'provider.reachability',
+      label: 'Provider reachability',
+      status: authFailed ? 'fail' : 'warn',
+      message: `${provider} returned HTTP ${response.status}.`,
+      remedy: authFailed ? `Check ${keyEnv ?? 'provider credentials'}.` : `Check network access to ${new URL(url).host} and provider status.`,
+      details: { url, status: response.status },
+    };
+  } catch (error) {
+    return {
+      id: 'provider.reachability',
+      label: 'Provider reachability',
+      status: 'warn',
+      message: error instanceof Error ? error.message : String(error),
+      remedy: provider === 'ollama' ? `Start Ollama and run: ollama pull ${modelConfig.model}` : `Check network access to ${new URL(url).host} and provider status.`,
+      details: { url },
+    };
+  }
+}
+
+async function discardResponseBody(response: Response): Promise<void> {
+  await response.body?.cancel().catch(() => undefined);
+}
+
+async function ollamaModelAvailabilityCheck(response: Response, model: string): Promise<DoctorCheck> {
+  let availableModels: string[] = [];
+  try {
+    availableModels = extractModelNames(await response.json());
+  } catch {
+    return { id: 'provider.reachability', label: 'Provider reachability', status: 'pass', message: 'Ollama is reachable.' };
+  }
+
+  if (!availableModels.length || availableModels.some((candidate) => modelNamesMatch(candidate, model))) {
+    return { id: 'provider.reachability', label: 'Provider reachability', status: 'pass', message: availableModels.length ? `Ollama is reachable and model ${model} is available.` : 'Ollama is reachable.' };
+  }
+
+  return {
+    id: 'provider.reachability',
+    label: 'Provider reachability',
+    status: 'warn',
+    message: `Ollama is reachable, but model ${model} was not found.`,
+    remedy: `ollama pull ${model}`,
+    details: { availableModels },
+  };
+}
+
+function extractModelNames(value: unknown): string[] {
+  if (!value || typeof value !== 'object') return [];
+  const record = value as Record<string, unknown>;
+  const entries = Array.isArray(record.data) ? record.data : Array.isArray(record.models) ? record.models : [];
+  return entries.flatMap((entry) => {
+    if (!entry || typeof entry !== 'object') return [];
+    const model = entry as Record<string, unknown>;
+    return [model.id, model.name, model.model].filter((name): name is string => typeof name === 'string' && Boolean(name.trim()));
+  });
+}
+
+function modelNamesMatch(candidate: string, expected: string): boolean {
+  if (candidate === expected) return true;
+  return stripLatestTag(candidate) === stripLatestTag(expected);
+}
+
+function stripLatestTag(value: string): string {
+  return value.endsWith(':latest') ? value.slice(0, -':latest'.length) : value;
+}
+
+async function fetchWithTimeout(fetchImpl: typeof fetch, input: string, init: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), DEFAULT_REACHABILITY_TIMEOUT_MS);
+  try {
+    return await fetchImpl(input, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function readBooleanEnv(value: string | undefined): boolean {
+  return value === '1' || value === 'true' || value === 'yes';
 }
 
 function summarizeChecks(checks: DoctorCheck[]): Record<DoctorStatus, number> {

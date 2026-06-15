@@ -104,6 +104,57 @@ describe('install workflow helpers', () => {
     expect(report.checks.find((check) => check.id === 'network.github')).toMatchObject({ status: 'pass' });
   });
 
+  it('doctor checks Postgres connection when runtime resolves to postgres', async () => {
+    const init = await runInit({ homeDir: join(tempDir, 'home'), cwd: tempDir, provider: 'ollama', yes: true, env: {} });
+    await writeFile(init.settingsPath, JSON.stringify({ runtime: { mode: 'postgres' } }));
+    const query = vi.fn(async () => ({ rows: [{ value: 1 }] }));
+    const end = vi.fn(async () => undefined);
+    const postgresClientFactory = vi.fn(() => ({ query, end }));
+
+    const report = await runDoctor({
+      cwd: tempDir,
+      settings: init.settingsPath,
+      agent: init.defaultAgentPath,
+      env: { DATABASE_URL: 'postgres://user:pass@localhost:5432/adaptive_agent' },
+      postgresClientFactory,
+    });
+
+    expect(postgresClientFactory).toHaveBeenCalledWith(expect.objectContaining({ DATABASE_URL: 'postgres://user:pass@localhost:5432/adaptive_agent' }));
+    expect(query).toHaveBeenCalledWith('select 1');
+    expect(end).toHaveBeenCalled();
+    expect(report.checks.find((check) => check.id === 'runtime.postgresConnection')).toMatchObject({ status: 'pass' });
+  });
+
+  it('doctor checks provider reachability when provider-check is enabled', async () => {
+    const init = await runInit({ homeDir: join(tempDir, 'home'), cwd: tempDir, provider: 'mesh', yes: true, env: { MESH_API_KEY: 'mesh-key' } });
+    const fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('github.com')) return new Response('', { status: 200 });
+      return Response.json({ data: [] });
+    }) as unknown as typeof globalThis.fetch;
+
+    const report = await runDoctor({ cwd: tempDir, settings: init.settingsPath, agent: init.defaultAgentPath, providerCheck: true, env: { MESH_API_KEY: 'mesh-key' }, fetch });
+
+    expect(fetch).toHaveBeenCalledWith('https://api.meshapi.ai/v1/models', expect.objectContaining({ method: 'GET', headers: { Authorization: 'Bearer mesh-key' } }));
+    expect(report.checks.find((check) => check.id === 'provider.reachability')).toMatchObject({ status: 'pass', message: 'mesh API is reachable.' });
+  });
+
+  it('doctor warns when Ollama is reachable but the configured model is missing', async () => {
+    const init = await runInit({ homeDir: join(tempDir, 'home'), cwd: tempDir, provider: 'ollama', yes: true, env: {} });
+    const fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('github.com')) return new Response('', { status: 200 });
+      return Response.json({ data: [{ id: 'mistral:latest' }] });
+    }) as unknown as typeof globalThis.fetch;
+
+    const report = await runDoctor({ cwd: tempDir, settings: init.settingsPath, agent: init.defaultAgentPath, providerCheck: true, env: {}, fetch });
+
+    expect(report.checks.find((check) => check.id === 'provider.reachability')).toMatchObject({
+      status: 'warn',
+      remedy: 'ollama pull llama3.2',
+    });
+  });
+
   it('reports update availability with --check exit code', async () => {
     const fetch = vi.fn(async () => Response.json([{ tag_name: 'v0.2.0', draft: false, prerelease: false }])) as unknown as typeof globalThis.fetch;
 
