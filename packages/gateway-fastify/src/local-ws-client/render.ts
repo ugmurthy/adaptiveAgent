@@ -3,7 +3,34 @@ import { markedTerminal } from 'marked-terminal';
 
 import type { AgentEventFrame } from '../protocol.js';
 
-marked.use(markedTerminal() as never);
+interface TerminalMarkdownExtension {
+  renderer: Record<string, unknown>;
+}
+
+interface MarkdownInlineToken {
+  tokens?: unknown[];
+}
+
+interface MarkdownRendererThis {
+  parser: { parseInline: (tokens: unknown[]) => string };
+}
+
+const terminalMarkdownExtension = markedTerminal() as unknown as TerminalMarkdownExtension;
+
+// marked-terminal's `text` renderer (used for tight list items) returns the raw
+// token text instead of parsing the inline tokens, unlike its `paragraph`
+// renderer. This leaks literal `**bold**` and `` `code` `` markers inside list
+// items. Parse the inline tokens ourselves so list-item markdown renders.
+const baseTextRenderer = terminalMarkdownExtension.renderer.text as (token: unknown) => string;
+terminalMarkdownExtension.renderer.text = function (this: MarkdownRendererThis, token: unknown): string {
+  const tokens = (token as MarkdownInlineToken | null)?.tokens;
+  if (Array.isArray(tokens) && tokens.length > 0) {
+    return this.parser.parseInline(tokens);
+  }
+  return baseTextRenderer.call(this, token);
+};
+
+marked.use(terminalMarkdownExtension as never);
 
 export function formatValue(value: unknown): string {
   if (typeof value === 'string') {

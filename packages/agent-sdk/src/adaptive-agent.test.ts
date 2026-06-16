@@ -407,7 +407,7 @@ describe('adaptive-agent catalog command', () => {
     await rm(tempDir, { recursive: true, force: true });
   });
 
-  it('lists agents, registered tools, and delegate skills as json', async () => {
+  async function writeCatalogFixtures(): Promise<void> {
     await writeFile(
       join(tempDir, 'agent.json'),
       JSON.stringify({
@@ -455,6 +455,10 @@ describe('adaptive-agent catalog command', () => {
         'Use local files to research focused questions.',
       ].join('\n'),
     );
+  }
+
+  it('lists agents, registered tools, and delegate skills as json', async () => {
+    await writeCatalogFixtures();
     const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
 
     try {
@@ -477,6 +481,33 @@ describe('adaptive-agent catalog command', () => {
       expect(output.delegates).toEqual([
         expect.objectContaining({ name: 'researcher', configured: true, allowedTools: ['read_file'], triggers: ['research'] }),
       ]);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('renders agents, tools, and delegate skills with markdown for pretty output', async () => {
+    await writeCatalogFixtures();
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      const exitCode = await main(['catalog', '--cwd', tempDir]);
+      const rendered = stripAnsi(String(log.mock.calls[0]?.[0]));
+
+      expect(exitCode).toBe(0);
+      expect(rendered).toContain('Agent Catalog');
+      expect(rendered).toContain('Active Agent');
+      expect(rendered).toContain('Agents (2)');
+      expect(rendered).toContain('agent');
+      expect(rendered).toContain('active');
+      expect(rendered).toContain('Tools');
+      expect(rendered).toContain('read_file');
+      expect(rendered).toContain('configured');
+      expect(rendered).toContain('approval: not required');
+      expect(rendered).toContain('Delegate Skills (1)');
+      expect(rendered).toContain('researcher');
+      expect(rendered).toContain('allowedTools:');
+      expect(rendered).not.toContain('catalog:\n');
     } finally {
       log.mockRestore();
     }

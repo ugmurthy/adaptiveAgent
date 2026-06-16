@@ -23,7 +23,7 @@
     "@earendil-works/pi-tui": "^0.75.4",
     "ajv": "^8.17.1",
     "chalk": "^5.5.0",
-    "marked": "^17.0.5",
+    "marked": "^15.0.12",
     "marked-terminal": "^7.3.0",
     "pg": "^8.20.0"
   },

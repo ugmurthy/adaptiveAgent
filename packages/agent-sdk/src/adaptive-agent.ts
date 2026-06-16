@@ -54,13 +54,40 @@ export { formatSwarmExecutionPlan, formatSwarmRunStatuses, formatSwarmSubtasks }
 
 const passthroughMarkdownStyle = (value: string): string => value;
 
-marked.use(markedTerminal({
+interface TerminalMarkdownExtension {
+  renderer: Record<string, unknown>;
+}
+
+interface MarkdownInlineToken {
+  tokens?: unknown[];
+}
+
+interface MarkdownRendererThis {
+  parser: { parseInline: (tokens: unknown[]) => string };
+}
+
+const terminalMarkdownExtension = markedTerminal({
   // The marked-terminal defaults wrap ordinary paragraphs and list items in
   // chalk.reset. In terminals that sanitize control characters, those reset
   // sequences can leak as visible "0m" text inside rendered reports.
   listitem: passthroughMarkdownStyle,
   paragraph: passthroughMarkdownStyle,
-} as never) as never);
+} as never) as unknown as TerminalMarkdownExtension;
+
+// marked-terminal's `text` renderer (used for tight list items) returns the raw
+// token text instead of parsing the inline tokens, unlike its `paragraph`
+// renderer. This leaks literal `**bold**` and `` `code` `` markers inside list
+// items. Parse the inline tokens ourselves so list-item markdown renders.
+const baseTextRenderer = terminalMarkdownExtension.renderer.text as (token: unknown) => string;
+terminalMarkdownExtension.renderer.text = function (this: MarkdownRendererThis, token: unknown): string {
+  const tokens = (token as MarkdownInlineToken | null)?.tokens;
+  if (Array.isArray(tokens) && tokens.length > 0) {
+    return this.parser.parseInline(tokens);
+  }
+  return baseTextRenderer.call(this, token);
+};
+
+marked.use(terminalMarkdownExtension as never);
 
 export interface ManualTestCliOptions {
   command: 'run' | 'chat' | 'spec' | 'config' | 'catalog' | 'eval' | 'swarm-run' | 'retry' | 'init' | 'doctor' | 'update' | 'agent-create' | 'version';
@@ -1004,7 +1031,7 @@ async function runCatalogCommand(cli: ManualTestCliOptions): Promise<number> {
     return 0;
   }
 
-  console.log(formatCatalog(catalog));
+  console.log(renderPrettyString(formatCatalogMarkdown(catalog)));
   return 0;
 }
 
@@ -2506,44 +2533,50 @@ function summarizeCatalogAgent(agent: CatalogInspection['agents'][number]): Reco
   };
 }
 
-function formatCatalog(catalog: CatalogInspection): string {
+function formatCatalogMarkdown(catalog: CatalogInspection): string {
   const lines = [
-    'catalog:',
-    `  activeAgent: ${catalog.config.agent.id} (${catalog.config.agent.name})`,
-    `  agentPath: ${catalog.agentPath}`,
-    ...(catalog.settingsPath ? [`  settingsPath: ${catalog.settingsPath}`] : []),
-    `  resolvedModel: ${catalog.config.model.provider}/${catalog.config.model.model}`,
-    `  runtime: ${catalog.config.runtime.mode} (requested ${catalog.config.runtime.requestedMode})`,
-    `  workspace: ${catalog.config.workspaceRoot}`,
-    `  shellCwd: ${catalog.config.shellCwd}`,
-    `  agentSearchDirs: ${formatNameList(catalog.config.agents.dirs)}`,
-    `  skillSearchDirs: ${formatNameList(catalog.config.skills.dirs)}`,
+    '# Agent Catalog',
     '',
-    `Agents (${catalog.agents.length}):`,
-    ...catalog.agents.flatMap(formatCatalogAgent),
+    '## Active Agent',
     '',
-    `Tools (${catalog.tools.length}):`,
-    ...(catalog.tools.length === 0 ? ['  (none)'] : catalog.tools.flatMap(formatCatalogTool)),
+    `- **Agent:** ${formatMarkdownInlineCode(catalog.config.agent.id)} (${catalog.config.agent.name})`,
+    `- **Path:** ${formatMarkdownInlineCode(catalog.agentPath)}`,
+    ...(catalog.settingsPath ? [`- **Settings:** ${formatMarkdownInlineCode(catalog.settingsPath)}`] : []),
+    `- **Model:** ${formatMarkdownInlineCode(`${catalog.config.model.provider}/${catalog.config.model.model}`)}`,
+    `- **Runtime:** ${formatMarkdownInlineCode(catalog.config.runtime.mode)} (requested ${formatMarkdownInlineCode(catalog.config.runtime.requestedMode)})`,
+    `- **Workspace:** ${formatMarkdownInlineCode(catalog.config.workspaceRoot)}`,
+    `- **Shell cwd:** ${formatMarkdownInlineCode(catalog.config.shellCwd)}`,
+    `- **Agent search dirs:** ${formatMarkdownNameList(catalog.config.agents.dirs)}`,
+    `- **Skill search dirs:** ${formatMarkdownNameList(catalog.config.skills.dirs)}`,
     '',
-    `Delegates (${catalog.delegates.length}):`,
-    ...(catalog.delegates.length === 0 ? ['  (none)'] : catalog.delegates.flatMap(formatCatalogDelegate)),
+    `## Agents (${catalog.agents.length})`,
+    '',
+    ...catalog.agents.flatMap(formatCatalogAgentMarkdown),
+    '',
+    `## Tools (${catalog.tools.length})`,
+    '',
+    ...(catalog.tools.length === 0 ? ['- (none)'] : catalog.tools.flatMap(formatCatalogToolMarkdown)),
+    '',
+    `## Delegate Skills (${catalog.delegates.length})`,
+    '',
+    ...(catalog.delegates.length === 0 ? ['- (none)'] : catalog.delegates.flatMap(formatCatalogDelegateMarkdown)),
   ];
 
-  return lines.join('\n');
+  return `${lines.join('\n')}\n`;
 }
 
-function formatCatalogAgent(agent: CatalogInspection['agents'][number]): string[] {
+function formatCatalogAgentMarkdown(agent: CatalogInspection['agents'][number]): string[] {
   const lines = [
-    `  - ${agent.id} (${agent.name})${agent.active ? ' [active]' : ''}`,
-    `    path: ${agent.path}`,
-    ...(agent.description ? [`    description: ${oneLine(agent.description)}`] : []),
-    `    model: ${formatCatalogAgentModel(agent)}`,
-    `    modes: ${agent.invocationModes.join(', ')} (default ${agent.defaultInvocationMode})`,
-    `    tools: ${formatNameList(agent.tools)}`,
-    `    delegates: ${formatNameList(agent.delegates)}`,
+    `- **${formatMarkdownInlineCode(agent.id)}** (${agent.name})${agent.active ? ' - **active**' : ''}`,
+    `  - path: ${formatMarkdownInlineCode(agent.path)}`,
+    ...(agent.description ? [`  - description: ${oneLine(agent.description)}`] : []),
+    `  - model: ${formatMarkdownInlineCode(formatCatalogAgentModel(agent))}`,
+    `  - modes: ${formatMarkdownNameList(agent.invocationModes)} (default ${formatMarkdownInlineCode(agent.defaultInvocationMode)})`,
+    `  - tools: ${formatMarkdownNameList(agent.tools)}`,
+    `  - delegates: ${formatMarkdownNameList(agent.delegates)}`,
   ];
   const capabilities = formatCatalogCapabilities(agent.capabilities);
-  if (capabilities) lines.push(`    capabilities: ${capabilities}`);
+  if (capabilities) lines.push(`  - capabilities: ${capabilities}`);
   return lines;
 }
 
@@ -2554,24 +2587,35 @@ function formatCatalogAgentModel(agent: CatalogInspection['agents'][number]): st
   return '(from settings or override)';
 }
 
-function formatCatalogTool(tool: CatalogInspection['tools'][number]): string[] {
+function formatCatalogToolMarkdown(tool: CatalogInspection['tools'][number]): string[] {
   return [
-    `  - ${tool.name}${tool.configured ? ' [configured]' : ''}`,
-    `    description: ${oneLine(tool.description)}`,
-    `    approval: ${tool.requiresApproval === true ? 'required' : 'not required'}`,
-    `    input: ${formatNameList(catalogInputFieldNames(tool.inputSchema))}`,
+    `- **${formatMarkdownInlineCode(tool.name)}**${tool.configured ? ' - **configured**' : ''}`,
+    `  - description: ${oneLine(tool.description)}`,
+    `  - approval: ${tool.requiresApproval === true ? '**required**' : 'not required'}`,
+    `  - input: ${formatMarkdownNameList(catalogInputFieldNames(tool.inputSchema))}`,
   ];
 }
 
-function formatCatalogDelegate(delegate: CatalogInspection['delegates'][number]): string[] {
+function formatCatalogDelegateMarkdown(delegate: CatalogInspection['delegates'][number]): string[] {
   return [
-    `  - ${delegate.name}${delegate.configured ? ' [configured]' : ''}`,
-    `    path: ${delegate.path}`,
-    `    description: ${oneLine(delegate.description)}`,
-    `    allowedTools: ${formatNameList(delegate.allowedTools)}`,
-    ...(delegate.triggers?.length ? [`    triggers: ${formatNameList(delegate.triggers)}`] : []),
-    ...(delegate.handler ? [`    handler: ${delegate.handler}`] : []),
+    `- **${formatMarkdownInlineCode(delegate.name)}**${delegate.configured ? ' - **configured**' : ''}`,
+    `  - path: ${formatMarkdownInlineCode(delegate.path)}`,
+    `  - description: ${oneLine(delegate.description)}`,
+    `  - allowedTools: ${formatMarkdownNameList(delegate.allowedTools)}`,
+    ...(delegate.triggers?.length ? [`  - triggers: ${formatMarkdownNameList(delegate.triggers)}`] : []),
+    ...(delegate.handler ? [`  - handler: ${formatMarkdownInlineCode(delegate.handler)}`] : []),
   ];
+}
+
+function formatMarkdownNameList(values: readonly string[]): string {
+  return values.length > 0 ? values.map(formatMarkdownInlineCode).join(', ') : '(none)';
+}
+
+function formatMarkdownInlineCode(value: string): string {
+  const tickRuns = value.match(/`+/g)?.map((run) => run.length) ?? [0];
+  const delimiter = '`'.repeat(Math.max(...tickRuns) + 1);
+  const padding = value.startsWith('`') || value.endsWith('`') ? ' ' : '';
+  return `${delimiter}${padding}${value}${padding}${delimiter}`;
 }
 
 function catalogInputFieldNames(schema: JsonSchema): string[] {
@@ -3552,7 +3596,12 @@ export function renderStyledPrettyValue(
   value: unknown,
   theme: TuiSettingsConfig = {},
 ): string {
-  return renderStyledPrettyMessage(type, renderPrettyValue(value), theme);
+  // renderPrettyValue already renders markdown to terminal ANSI. Wrap the
+  // result in the styled block directly instead of routing back through
+  // renderStyledPrettyMessage, which would re-run marked.parse on the
+  // already-rendered ANSI and corrupt the escape sequences (e.g. the `1` in
+  // `\x1b[1m` getting syntax-highlighted, leaking visible `1m`/`22m`).
+  return formatStyledMessageBlock(type, renderPrettyValue(value), theme);
 }
 
 export function renderPrettyString(value: string): string {
