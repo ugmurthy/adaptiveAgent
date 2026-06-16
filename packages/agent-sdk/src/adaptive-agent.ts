@@ -24,6 +24,7 @@ import { SwarmCoordinator, createSwarmDecompositionOutputSchema } from '@adaptiv
 import {
   createAgentSdk,
   createOrchestrationSdk,
+  inspectAgentSdkCatalog,
   inspectAgentSdkResolution,
   loadAgentSdkConfig,
   type AgentSdkOptions,
@@ -43,6 +44,7 @@ import { doctorExitCode, renderDoctorReport, runDoctor } from './install/doctor.
 import { renderInitReport, runInit, type InitProfile } from './install/init.js';
 import { renderUpdateReport, runUpdate, updateExitCode } from './install/update.js';
 import { getVersionInfo, renderVersion } from './install/version.js';
+import { renderAgentCreateReport, runAgentCreate } from './agent-create.js';
 import { agentEventColorKey, agentEventProgressPrefix, formatAgentEventSummary, summarizeAgentEvent } from './agent-event-rendering.js';
 import { formatSwarmExecutionPlan, formatSwarmRunStatuses, formatSwarmSubtasks } from './swarm-format.js';
 import { createSwarmRoleAgentConfig } from './swarm-role-config.js';
@@ -61,7 +63,7 @@ marked.use(markedTerminal({
 } as never) as never);
 
 export interface ManualTestCliOptions {
-  command: 'run' | 'chat' | 'spec' | 'config' | 'eval' | 'swarm-run' | 'retry' | 'init' | 'doctor' | 'update' | 'version';
+  command: 'run' | 'chat' | 'spec' | 'config' | 'catalog' | 'eval' | 'swarm-run' | 'retry' | 'init' | 'doctor' | 'update' | 'agent-create' | 'version';
   specPath: string;
   goalArgs: string[];
   runId?: string;
@@ -94,6 +96,8 @@ export interface ManualTestCliOptions {
   mode?: 'chat' | 'run';
   cwd?: string;
   agentConfigPath?: string;
+  generatorAgentPath?: string;
+  agentCreateId?: string;
   settingsConfigPath?: string;
   runtimeMode?: RuntimeMode;
   provider?: 'openrouter' | 'ollama' | 'mistral' | 'mesh';
@@ -237,8 +241,10 @@ Usage:
   adaptive-agent init [options]
   adaptive-agent doctor [options]
   adaptive-agent update [options]
+  adaptive-agent agent-create [options] <agent-description...>
   adaptive-agent spec <path> [options]
   adaptive-agent config [options]
+  adaptive-agent catalog [options]
   adaptive-agent --version
   adaptive-agent --spec <path> [options]
   bun run ./packages/agent-sdk/dist/adaptive-agent.js --spec <path> [options]
@@ -255,8 +261,10 @@ Commands:
   init                  Create first-run configuration under ~/.adaptiveAgent.
   doctor                Check CLI installation and local configuration.
   update                Check for or apply GitHub Release updates.
+  agent-create          Generate and write a new agent config JSON file.
   spec                  Run the existing JSON spec format.
   config                Print resolved SDK configuration.
+  catalog               List available agents, tools, and delegate skills.
 
 Eval commands:
   eval cases            Run generic benchmark cases from JSON/JSONL.
@@ -268,7 +276,7 @@ Global options:
   --version               Print adaptive-agent version.
   --help                  Show this help text.
 
-Agent/config options (run, chat, spec, config, eval, swarm-run, retry):
+Agent/config options (run, chat, spec, config, catalog, eval, swarm-run, retry):
   --agent <path-or-name>  Explicit path to agent.json, or filename from agents.dirs.
   --settings <path>       Explicit path to agent.settings.json.
   --runtime <mode>        Runtime mode: memory or postgres.
@@ -350,6 +358,17 @@ Update options:
   --repo <owner/repo>     GitHub release repo for update checks.
   --base-url <url>        Release asset base URL for update downloads.
 
+Agent-create options:
+  --file <path>           Read the new agent description from a text file.
+  --generator-agent <path-or-name>
+                          Existing agent used to generate the new config. Default: default-agent.
+  --id <id>               Override the generated agent id.
+  --provider <name>       Override generated config provider: openrouter, ollama, mistral, mesh.
+  --model <name>          Override generated config model name.
+  --yes                   Write without an interactive confirmation prompt.
+  --force                 Overwrite an existing generated config path.
+  --dry-run               Preview the config and ask before writing; Enter means no.
+
 Run output/debug options (run, chat, spec, eval, swarm-run, retry):
   --progress              Print assistant progress updates as they arrive.
   --events                Print lifecycle events as they arrive.
@@ -427,8 +446,16 @@ export async function main(argv = Bun.argv.slice(2)): Promise<number> {
     return runUpdateCommand(cli);
   }
 
+  if (cli.command === 'agent-create') {
+    return runAgentCreateCommand(cli);
+  }
+
   if (cli.command === 'config') {
     return runConfigCommand(cli);
+  }
+
+  if (cli.command === 'catalog') {
+    return runCatalogCommand(cli);
   }
 
   if (cli.command === 'run') {
@@ -497,6 +524,25 @@ async function runUpdateCommand(cli: ManualTestCliOptions): Promise<number> {
   });
   console.log(renderUpdateReport(report, cli.output));
   return updateExitCode(report, cli.updateCheck);
+}
+
+async function runAgentCreateCommand(cli: ManualTestCliOptions): Promise<number> {
+  const brief = await readInlinePrompt(cli, 'agent description');
+  const report = await runAgentCreate({
+    brief,
+    cwd: cli.cwd,
+    settingsConfigPath: cli.settingsConfigPath,
+    generatorAgent: cli.generatorAgentPath,
+    id: cli.agentCreateId,
+    provider: cli.provider,
+    model: cli.model,
+    runtimeMode: cli.runtimeMode,
+    yes: cli.yes,
+    force: cli.force,
+    dryRun: cli.dryRun,
+  });
+  console.log(renderAgentCreateReport(report, cli.output));
+  return report.status === 'created' || report.status === 'overwritten' ? 0 : 1;
 }
 
 async function runSpecCommand(cli: ManualTestCliOptions): Promise<number> {
@@ -945,6 +991,23 @@ async function runConfigCommand(cli: ManualTestCliOptions): Promise<number> {
   return 0;
 }
 
+async function runCatalogCommand(cli: ManualTestCliOptions): Promise<number> {
+  const resolvedCwd = resolve(cli.cwd ?? process.cwd());
+  const catalog = await inspectAgentSdkCatalog(buildSdkOptions(cli, resolvedCwd));
+  const output = summarizeCatalog(catalog);
+  if (cli.output === 'json') {
+    console.log(JSON.stringify(output, null, 2));
+    return 0;
+  }
+  if (cli.output === 'jsonl') {
+    console.log(JSON.stringify(output));
+    return 0;
+  }
+
+  console.log(formatCatalog(catalog));
+  return 0;
+}
+
 async function runEvalCommand(cli: ManualTestCliOptions): Promise<number> {
   if (!cli.evalInputPath) {
     throw new Error(`eval ${cli.evalDataset ?? 'benchmark'} requires --input <path>`);
@@ -1117,7 +1180,7 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if (!commandSeen && (arg === 'run' || arg === 'chat' || arg === 'spec' || arg === 'config' || arg === 'eval' || arg === 'swarm-run' || arg === 'retry' || arg === 'init' || arg === 'doctor' || arg === 'update')) {
+    if (!commandSeen && (arg === 'run' || arg === 'chat' || arg === 'spec' || arg === 'config' || arg === 'catalog' || arg === 'eval' || arg === 'swarm-run' || arg === 'retry' || arg === 'init' || arg === 'doctor' || arg === 'update' || arg === 'agent-create')) {
       options.command = arg;
       commandSeen = true;
       if (arg === 'spec' && argv[index + 1] && !argv[index + 1].startsWith('--')) {
@@ -1279,6 +1342,12 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
       case '--agent':
         options.agentConfigPath = requireOptionValue(arg, argv[++index]);
         break;
+      case '--generator-agent':
+        options.generatorAgentPath = requireOptionValue(arg, argv[++index]);
+        break;
+      case '--id':
+        options.agentCreateId = requireOptionValue(arg, argv[++index]);
+        break;
       case '--settings':
         options.settingsConfigPath = requireOptionValue(arg, argv[++index]);
         break;
@@ -1307,7 +1376,7 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
         options.output = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['pretty', 'json', 'jsonl']);
         break;
       default:
-        if (options.command === 'run' || options.command === 'chat' || options.command === 'swarm-run' || options.command === 'retry') {
+        if (options.command === 'run' || options.command === 'chat' || options.command === 'swarm-run' || options.command === 'retry' || options.command === 'agent-create') {
           options.goalArgs.push(arg);
           break;
         }
@@ -1323,8 +1392,34 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
     throw new Error('Missing eval dataset. Expected `adaptive-agent eval cases` or `adaptive-agent eval gaia`.');
   }
 
+  if (!options.help && options.command !== 'agent-create' && options.generatorAgentPath) {
+    throw new Error('--generator-agent is supported for agent-create requests');
+  }
+
+  if (!options.help && options.command !== 'agent-create' && options.agentCreateId) {
+    throw new Error('--id is supported for agent-create requests');
+  }
+
+  if (!options.help && options.command === 'agent-create') {
+    if (options.agentConfigPath) {
+      throw new Error('agent-create uses --generator-agent <path-or-name>; --agent is not supported for this command');
+    }
+    if (options.promptFilePath && options.goalArgs.length > 0) {
+      throw new Error('agent-create accepts positional description text or --file <path>, but not both');
+    }
+    if (options.orchestrate) {
+      throw new Error('--orchestrate is not supported for agent-create requests');
+    }
+    if (options.imagePaths.length > 0 || options.audioPaths.length > 0 || options.fileAttachmentPaths.length > 0) {
+      throw new Error('--image, --audio, and --file-attachment are not supported for agent-create requests');
+    }
+    if (options.inputJson !== undefined) {
+      throw new Error('--input-json is not supported for agent-create requests');
+    }
+  }
+
   if (!options.help && swarmSpecified && options.command !== 'eval') {
-    throw new Error('--swarm is supported for eval requests, not run/chat/spec/config/swarm-run requests');
+    throw new Error('--swarm is supported for eval requests, not other command requests');
   }
 
   if (!options.help && options.command === 'swarm-run') {
@@ -2353,6 +2448,168 @@ function summarizeResolvedConfig(
     audioParts: summary.audioParts,
     legacyImages: summary.legacyImages,
   };
+}
+
+type CatalogInspection = Awaited<ReturnType<typeof inspectAgentSdkCatalog>>;
+
+function summarizeCatalog(catalog: CatalogInspection): Record<string, JsonValue> {
+  return {
+    command: 'catalog',
+    activeAgent: {
+      id: catalog.config.agent.id,
+      name: catalog.config.agent.name,
+      path: catalog.agentPath,
+      provider: catalog.config.model.provider,
+      model: catalog.config.model.model,
+    },
+    ...(catalog.settingsPath ? { settingsPath: catalog.settingsPath } : {}),
+    workspaceRoot: catalog.config.workspaceRoot,
+    shellCwd: catalog.config.shellCwd,
+    runtimeMode: catalog.config.runtime.mode,
+    requestedRuntimeMode: catalog.config.runtime.requestedMode,
+    agentSearchDirs: catalog.config.agents.dirs,
+    skillSearchDirs: catalog.config.skills.dirs,
+    agents: catalog.agents.map(summarizeCatalogAgent) as unknown as JsonValue,
+    tools: catalog.tools.map((tool) => ({
+      name: tool.name,
+      description: oneLine(tool.description),
+      configured: tool.configured,
+      requiresApproval: tool.requiresApproval === true,
+      inputFields: catalogInputFieldNames(tool.inputSchema),
+    })) as unknown as JsonValue,
+    delegates: catalog.delegates.map((delegate) => ({
+      name: delegate.name,
+      description: oneLine(delegate.description),
+      configured: delegate.configured,
+      path: delegate.path,
+      allowedTools: delegate.allowedTools,
+      ...(delegate.triggers?.length ? { triggers: delegate.triggers } : {}),
+      ...(delegate.handler ? { handler: delegate.handler } : {}),
+    })) as unknown as JsonValue,
+  };
+}
+
+function summarizeCatalogAgent(agent: CatalogInspection['agents'][number]): Record<string, JsonValue> {
+  return {
+    id: agent.id,
+    name: agent.name,
+    ...(agent.description ? { description: oneLine(agent.description) } : {}),
+    path: agent.path,
+    active: agent.active,
+    invocationModes: agent.invocationModes,
+    defaultInvocationMode: agent.defaultInvocationMode,
+    ...(agent.provider ? { provider: agent.provider } : {}),
+    ...(agent.model ? { model: agent.model } : {}),
+    tools: agent.tools,
+    delegates: agent.delegates,
+    ...(agent.capabilities && isJsonValueLike(agent.capabilities) ? { capabilities: agent.capabilities } : {}),
+  };
+}
+
+function formatCatalog(catalog: CatalogInspection): string {
+  const lines = [
+    'catalog:',
+    `  activeAgent: ${catalog.config.agent.id} (${catalog.config.agent.name})`,
+    `  agentPath: ${catalog.agentPath}`,
+    ...(catalog.settingsPath ? [`  settingsPath: ${catalog.settingsPath}`] : []),
+    `  resolvedModel: ${catalog.config.model.provider}/${catalog.config.model.model}`,
+    `  runtime: ${catalog.config.runtime.mode} (requested ${catalog.config.runtime.requestedMode})`,
+    `  workspace: ${catalog.config.workspaceRoot}`,
+    `  shellCwd: ${catalog.config.shellCwd}`,
+    `  agentSearchDirs: ${formatNameList(catalog.config.agents.dirs)}`,
+    `  skillSearchDirs: ${formatNameList(catalog.config.skills.dirs)}`,
+    '',
+    `Agents (${catalog.agents.length}):`,
+    ...catalog.agents.flatMap(formatCatalogAgent),
+    '',
+    `Tools (${catalog.tools.length}):`,
+    ...(catalog.tools.length === 0 ? ['  (none)'] : catalog.tools.flatMap(formatCatalogTool)),
+    '',
+    `Delegates (${catalog.delegates.length}):`,
+    ...(catalog.delegates.length === 0 ? ['  (none)'] : catalog.delegates.flatMap(formatCatalogDelegate)),
+  ];
+
+  return lines.join('\n');
+}
+
+function formatCatalogAgent(agent: CatalogInspection['agents'][number]): string[] {
+  const lines = [
+    `  - ${agent.id} (${agent.name})${agent.active ? ' [active]' : ''}`,
+    `    path: ${agent.path}`,
+    ...(agent.description ? [`    description: ${oneLine(agent.description)}`] : []),
+    `    model: ${formatCatalogAgentModel(agent)}`,
+    `    modes: ${agent.invocationModes.join(', ')} (default ${agent.defaultInvocationMode})`,
+    `    tools: ${formatNameList(agent.tools)}`,
+    `    delegates: ${formatNameList(agent.delegates)}`,
+  ];
+  const capabilities = formatCatalogCapabilities(agent.capabilities);
+  if (capabilities) lines.push(`    capabilities: ${capabilities}`);
+  return lines;
+}
+
+function formatCatalogAgentModel(agent: CatalogInspection['agents'][number]): string {
+  if (agent.provider && agent.model) return `${agent.provider}/${agent.model}`;
+  if (agent.provider) return `${agent.provider}/(from settings or override)`;
+  if (agent.model) return `(from settings or override)/${agent.model}`;
+  return '(from settings or override)';
+}
+
+function formatCatalogTool(tool: CatalogInspection['tools'][number]): string[] {
+  return [
+    `  - ${tool.name}${tool.configured ? ' [configured]' : ''}`,
+    `    description: ${oneLine(tool.description)}`,
+    `    approval: ${tool.requiresApproval === true ? 'required' : 'not required'}`,
+    `    input: ${formatNameList(catalogInputFieldNames(tool.inputSchema))}`,
+  ];
+}
+
+function formatCatalogDelegate(delegate: CatalogInspection['delegates'][number]): string[] {
+  return [
+    `  - ${delegate.name}${delegate.configured ? ' [configured]' : ''}`,
+    `    path: ${delegate.path}`,
+    `    description: ${oneLine(delegate.description)}`,
+    `    allowedTools: ${formatNameList(delegate.allowedTools)}`,
+    ...(delegate.triggers?.length ? [`    triggers: ${formatNameList(delegate.triggers)}`] : []),
+    ...(delegate.handler ? [`    handler: ${delegate.handler}`] : []),
+  ];
+}
+
+function catalogInputFieldNames(schema: JsonSchema): string[] {
+  const schemaRecord = isRecordValue(schema) ? schema : undefined;
+  const properties = isRecordValue(schemaRecord?.properties) ? schemaRecord.properties : undefined;
+  if (!properties) return [];
+  const required = new Set(
+    Array.isArray(schemaRecord?.required)
+      ? schemaRecord.required.filter((field): field is string => typeof field === 'string')
+      : [],
+  );
+  return Object.keys(properties).map((field) => required.has(field) ? field : `${field}?`);
+}
+
+function formatCatalogCapabilities(capabilities: unknown): string | undefined {
+  if (!isRecordValue(capabilities)) return undefined;
+  const parts = [
+    formatCatalogStringArrayCapability(capabilities, 'modalitiesSupported', 'supports'),
+    formatCatalogStringArrayCapability(capabilities, 'modalitiesPreferred', 'prefers'),
+    formatCatalogStringArrayCapability(capabilities, 'subjectsPreferred', 'subjects'),
+    formatCatalogRolesCapability(capabilities.modalityRoles),
+  ].filter((part): part is string => Boolean(part));
+  return parts.length > 0 ? parts.join('; ') : undefined;
+}
+
+function formatCatalogStringArrayCapability(capabilities: Record<string, unknown>, key: string, label: string): string | undefined {
+  const values = capabilities[key];
+  return Array.isArray(values) && values.every((value) => typeof value === 'string') && values.length > 0
+    ? `${label}=${values.join(',')}`
+    : undefined;
+}
+
+function formatCatalogRolesCapability(value: unknown): string | undefined {
+  if (!isRecordValue(value)) return undefined;
+  const roles = Object.entries(value)
+    .filter((entry): entry is [string, string] => typeof entry[1] === 'string')
+    .map(([modality, role]) => `${modality}:${role}`);
+  return roles.length > 0 ? `roles=${roles.join(',')}` : undefined;
 }
 
 function summarizeResult(result: RunResult | ChatResult): JsonValue {

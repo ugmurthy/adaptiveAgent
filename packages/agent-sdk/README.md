@@ -13,6 +13,7 @@ adaptive-agent config [options]
 adaptive-agent run [options] <goal...>
 adaptive-agent chat [options] [message...]
 adaptive-agent spec <path> [options]
+adaptive-agent catalog [options]
 adaptive-agent swarm-run --agent <agent> --worker-catalog <agents> [options] <task...>
 adaptive-agent retry --run-id <runId> [options]
 adaptive-agent retry --agent <agent> --worker-catalog <agents> [options] <sessionId>
@@ -39,6 +40,8 @@ Common options:
 | `--events` | Print lifecycle events while the run executes. |
 | `--inspect` | Print a compact run/event summary after completion. |
 | `--dry-run` | Resolve config, request, tools, and delegates without executing. |
+
+Use `adaptive-agent catalog` to print a human-readable inventory of the active agent, every agent found in `settings.agents.dirs`, every registered tool, and delegate skills found in `settings.skills.dirs`. Add `--output json` or `--output jsonl` for scripts.
 
 ## Configuration API
 

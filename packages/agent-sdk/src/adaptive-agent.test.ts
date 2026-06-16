@@ -220,6 +220,14 @@ describe('adaptive-agent cli parsing', () => {
     });
   });
 
+  it('parses catalog command flags', () => {
+    expect(parseCliArgs(['catalog', '--agent', 'reviewer', '--output', 'json'])).toMatchObject({
+      command: 'catalog',
+      agentConfigPath: 'reviewer',
+      output: 'json',
+    });
+  });
+
   it('parses eval cases benchmark flags', () => {
     const parsed = parseCliArgs([
       'eval', 'cases',
@@ -354,6 +362,124 @@ describe('adaptive-agent cli parsing', () => {
       updateRepo: 'owner/repo',
       updateBaseUrl: 'https://example.test/releases/{tag}',
     });
+  });
+
+  it('parses agent-create flags and description text', () => {
+    expect(parseCliArgs([
+      'agent-create',
+      '--generator-agent', 'default-agent',
+      '--id', 'api-reviewer',
+      '--provider', 'openrouter',
+      '--model', 'openai/gpt-5-mini',
+      '--yes',
+      'Create',
+      'an',
+      'API',
+      'reviewer',
+    ])).toMatchObject({
+      command: 'agent-create',
+      generatorAgentPath: 'default-agent',
+      agentCreateId: 'api-reviewer',
+      provider: 'openrouter',
+      model: 'openai/gpt-5-mini',
+      yes: true,
+      goalArgs: ['Create', 'an', 'API', 'reviewer'],
+    });
+  });
+
+  it('rejects ambiguous agent-create inputs and --agent alias', () => {
+    expect(() => parseCliArgs(['agent-create', '--file', './brief.md', 'description'])).toThrow('not both');
+    expect(() => parseCliArgs(['agent-create', '--agent', 'default-agent', 'description'])).toThrow('uses --generator-agent');
+    expect(() => parseCliArgs(['run', '--generator-agent', 'default-agent', 'hello'])).toThrow('--generator-agent is supported for agent-create');
+  });
+});
+
+describe('adaptive-agent catalog command', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'adaptive-agent-catalog-'));
+    await mkdir(join(tempDir, 'agents'), { recursive: true });
+    await mkdir(join(tempDir, 'skills', 'researcher'), { recursive: true });
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it('lists agents, registered tools, and delegate skills as json', async () => {
+    await writeFile(
+      join(tempDir, 'agent.json'),
+      JSON.stringify({
+        id: 'agent',
+        name: 'Agent',
+        invocationModes: ['chat', 'run'],
+        defaultInvocationMode: 'run',
+        model: { provider: 'ollama', model: 'qwen3.5' },
+        tools: ['read_file'],
+        delegates: ['researcher'],
+      }),
+    );
+    await writeFile(
+      join(tempDir, 'agents', 'reviewer.json'),
+      JSON.stringify({
+        id: 'reviewer',
+        name: 'Reviewer',
+        description: 'Reviews source changes.',
+        invocationModes: ['run'],
+        defaultInvocationMode: 'run',
+        model: { provider: 'ollama', model: 'qwen3.5' },
+        tools: ['read_file', 'web_search'],
+        capabilities: { modalitiesSupported: ['text'], subjectsPreferred: ['code review'] },
+      }),
+    );
+    await writeFile(
+      join(tempDir, 'agent.settings.json'),
+      JSON.stringify({
+        agents: { dirs: ['./agents'] },
+        skills: { dirs: ['./skills'] },
+        runtime: { mode: 'memory' },
+      }),
+    );
+    await writeFile(
+      join(tempDir, 'skills', 'researcher', 'SKILL.md'),
+      [
+        '---',
+        'name: researcher',
+        'description: Research facts from local files.',
+        'allowedTools:',
+        '  - read_file',
+        'triggers:',
+        '  - research',
+        '---',
+        'Use local files to research focused questions.',
+      ].join('\n'),
+    );
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      const exitCode = await main(['catalog', '--cwd', tempDir, '--output', 'json']);
+      const output = JSON.parse(String(log.mock.calls[0]?.[0])) as {
+        agents: Array<{ id: string; active: boolean }>;
+        tools: Array<{ name: string; configured: boolean; requiresApproval: boolean; inputFields: string[] }>;
+        delegates: Array<{ name: string; configured: boolean; allowedTools: string[]; triggers?: string[] }>;
+      };
+
+      expect(exitCode).toBe(0);
+      expect(output.agents).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: 'agent', active: true }),
+        expect.objectContaining({ id: 'reviewer', active: false }),
+      ]));
+      expect(output.tools).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: 'read_file', configured: true, requiresApproval: false, inputFields: expect.arrayContaining(['path']) }),
+        expect.objectContaining({ name: 'write_file', configured: false, requiresApproval: true }),
+      ]));
+      expect(output.delegates).toEqual([
+        expect.objectContaining({ name: 'researcher', configured: true, allowedTools: ['read_file'], triggers: ['research'] }),
+      ]);
+    } finally {
+      log.mockRestore();
+    }
   });
 });
 
