@@ -415,7 +415,11 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
     };
 
     if (request.tools && request.tools.length > 0 && this.capabilities.toolCalling) {
-      body.tools = request.tools.map((tool) => toOpenAITool(tool));
+      body.tools = request.tools.map((tool) => {
+        const openAiTool = toOpenAITool(tool);
+        openAiTool.function.parameters = this.normalizeToolParameters(openAiTool.function.parameters);
+        return openAiTool;
+      });
     }
 
     if (request.outputSchema) {
@@ -433,6 +437,14 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
     }
 
     return body;
+  }
+
+  /**
+   * Hook for provider-specific normalization of a tool's JSON Schema parameters.
+   * The default implementation returns the schema unchanged.
+   */
+  protected normalizeToolParameters(parameters: JsonSchema): JsonSchema {
+    return parameters;
   }
 
   protected buildHeaders(): Record<string, string> {

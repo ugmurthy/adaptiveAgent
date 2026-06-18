@@ -164,6 +164,11 @@ describe('adaptive-agent cli parsing', () => {
       evalFailFast: false,
       evalSwarm: 1,
       evalOffset: 0,
+      minimal: false,
+      bundles: [],
+      installAgents: [],
+      installSkills: [],
+      installManifests: [],
       mode: 'chat',
       runtimeMode: 'memory',
       provider: 'ollama',
@@ -339,15 +344,33 @@ describe('adaptive-agent cli parsing', () => {
 
   it('parses install workflow commands', () => {
     expect(parseCliArgs(['--version'])).toMatchObject({ command: 'version' });
-    expect(parseCliArgs(['init', '--provider', 'mesh', '--model', 'qwen/qwen3.5-27b', '--profile', 'coding', '--api-key-env', 'MESH_API_KEY', '--yes', '--force'])).toMatchObject({
+    expect(parseCliArgs([
+      'init',
+      '--provider', 'mesh',
+      '--model', 'qwen/qwen3.5-27b',
+      '--profile', 'coding',
+      '--api-key-env', 'MESH_API_KEY',
+      '--bundle', 'coding',
+      '--install-agent', './agents/reviewer.json',
+      '--install-skill', './skills/researcher',
+      '--install-manifest', './adaptive-agent.install.json',
+      '--yes',
+      '--force',
+    ])).toMatchObject({
       command: 'init',
       provider: 'mesh',
       model: 'qwen/qwen3.5-27b',
       profile: 'coding',
       apiKeyEnv: 'MESH_API_KEY',
+      bundles: ['coding'],
+      installAgents: ['./agents/reviewer.json'],
+      installSkills: ['./skills/researcher'],
+      installManifests: ['./adaptive-agent.install.json'],
       yes: true,
       force: true,
     });
+    expect(parseCliArgs(['init', '--minimal'])).toMatchObject({ command: 'init', minimal: true });
+    expect(() => parseCliArgs(['init', '--minimal', '--bundle', 'coding'])).toThrow('not both');
     expect(parseCliArgs(['doctor', '--network', '--provider-check', '--strict'])).toMatchObject({
       command: 'doctor',
       network: true,

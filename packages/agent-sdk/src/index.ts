@@ -1,52 +1,19 @@
-import { access, readFile, readdir } from 'node:fs/promises';
-import { createInterface } from 'node:readline/promises';
-import { homedir } from 'node:os';
-import { delimiter, dirname, extname, isAbsolute, resolve } from 'node:path';
-import { stdin, stderr } from 'node:process';
-import { fileURLToPath } from 'node:url';
-
-import Ajv, { type ErrorObject } from 'ajv';
-import { Pool, types } from 'pg';
 import {
   createAdaptiveAgent,
   createAdaptiveAgentLogger,
-  createAdaptiveAgentRuntime,
-  createListDirectoryTool,
-  createPostgresRuntimeStores,
-  createReadFileTool,
-  createReadWebPageTool,
-  createShellExecTool,
-  createWebSearchTool,
-  createWriteFileTool,
-  loadSkillFromDirectory,
-  POSTGRES_RUNTIME_MIGRATIONS,
-  skillToDelegate,
   type AdaptiveAgent,
-  type AdaptiveAgentRuntimeOptions,
-  type AgentDefaults,
   type AgentEvent,
   type ChatMessage,
-  type ChatRequest,
   type ChatResult,
   type ContinueRunOptions,
   type ContinueRunResult,
   type ContinuationStore,
-  type ContinuationStrategy,
   type CreatedAdaptiveAgent,
-  type DelegateDefinition,
   type EventStore,
-  type FailureClass,
   type JsonObject,
   type JsonValue,
-  type ModelAdapterConfig,
   type PlanStore,
-  type PostgresClient,
-  type PostgresMigrationDefinition,
-  type PostgresPoolClient,
-  type PostgresRuntimeStoreBundle,
-  type PostgresTransactionClient,
   type RunRecoveryOptions,
-  type RunRequest,
   type RunResult,
   type RunStore,
   type SnapshotStore,
@@ -54,176 +21,42 @@ import {
   type UUID,
 } from '@adaptive-agent/core';
 
-const DEFAULT_MODULE_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
+import type {
+  AgentSdkCatalogInspection,
+  AgentSdkChatOptions,
+  AgentSdkOptions,
+  AgentSdkRunOptions,
+  ResolvedAgentSdkConfig,
+  ResolvedAgentSdkModuleInspection,
+} from './config-types.js';
+import { resolveAgentSdkConfig, resolveAgentSdkConfigWithSources } from './config-resolve.js';
+import { resolveRuntimeBundle } from './postgres-runtime.js';
+import { discoverCatalogAgents, discoverCatalogDelegates, resolveToolsAndDelegates } from './tool-registry.js';
+import { mergeMetadata, normalizeRecovery, promptText, promptYesNo } from './sdk-utils.js';
 
-export type InvocationMode = 'run' | 'chat';
-export type RuntimeMode = 'memory' | 'postgres';
-export type ApprovalMode = 'manual' | 'auto' | 'reject';
-export type ClarificationMode = 'interactive' | 'fail';
-export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'silent';
-export type LogDestination = 'console' | 'file' | 'both';
-export type TuiMessageType = 'user' | 'assistant' | 'progress' | 'run' | 'system' | 'event';
-export type TuiTextStyleName = 'default' | 'dim' | 'bold' | 'italic' | 'underline' | 'red' | 'green' | 'yellow' | 'blue' | 'magenta' | 'cyan' | 'white' | 'gray';
-
-export type SupportedModality = 'text' | 'image' | 'file' | 'audio';
-const STRUCTURED_OUTPUT_MODES = ['prompted', 'strict'] as const;
-
-export interface AgentCapabilityConfig {
-  modalitiesSupported?: SupportedModality[];
-  modalitiesPreferred?: SupportedModality[];
-  modalityRoles?: Partial<Record<SupportedModality, 'ingest' | 'analyze' | 'summarize' | 'synthesize'>>;
-  subjectsPreferred?: string[];
-}
-
-export interface TuiMessageStyleConfig {
-  showPrefix?: boolean;
-  prefix?: TuiTextStyleName | TuiTextStyleName[];
-  body?: TuiTextStyleName | TuiTextStyleName[];
-}
-
-export interface TuiSettingsConfig {
-  messages?: Partial<Record<TuiMessageType, TuiMessageStyleConfig>>;
-}
-
-export interface AgentConfigFile {
-  $schema?: string;
-  version?: 1;
-  id: string;
-  name: string;
-  description?: string;
-  invocationModes: InvocationMode[];
-  defaultInvocationMode: InvocationMode;
-  workspace?: { root?: string; shellCwd?: string };
-  workspaceRoot?: string;
-  model: { provider?: string; model?: string; apiKeyEnv?: string; apiKey?: string; baseUrl?: string; maxConcurrentRequests?: number; structuredOutputMode?: ModelAdapterConfig['structuredOutputMode'] };
-  systemInstructions?: string;
-  tools: string[];
-  delegates?: string[];
-  defaults?: Partial<AgentDefaults>;
-  delegation?: { maxDepth?: number; maxChildrenPerRun?: number; allowRecursiveDelegation?: boolean; childRunsMayRequestApproval?: boolean; childRunsMayRequestClarification?: boolean };
-  recovery?: { continuation?: { enabled?: boolean; defaultStrategy?: ContinuationStrategy; requireUserApproval?: boolean }; retryableErrorCodes?: string[]; fallbackModels?: Array<{ provider: string; model: string; whenFailureClass?: FailureClass[]; whenErrorCode?: string[] }> };
-  metadata?: JsonObject;
-  routing?: JsonObject;
-  capabilities?: AgentCapabilityConfig;
-}
-
-export interface AgentSettingsFile {
-  $schema?: string;
-  version?: 1;
-  agent?: { configPath?: string; id?: string };
-  agents?: { dirs?: string[] };
-  runtime?: { mode?: RuntimeMode; autoMigrate?: boolean };
-  logging?: { enabled?: boolean; level?: LogLevel; destination?: LogDestination; filePath?: string; pretty?: boolean };
-  interaction?: { autoApprove?: boolean; interactive?: boolean; approvalMode?: ApprovalMode; clarificationMode?: ClarificationMode };
-  events?: { printLifecycle?: boolean; subscribe?: boolean; verbose?: boolean };
-  skills?: { dirs?: string[]; allowExampleSkills?: boolean };
-  workspace?: { overrideRoot?: string; overrideShellCwd?: string };
-  model?: { overrideProvider?: string; overrideModel?: string; overrideBaseUrl?: string; overrideApiKeyEnv?: string; overrideStructuredOutputMode?: ModelAdapterConfig['structuredOutputMode'] };
-  defaults?: Partial<AgentDefaults>;
-  env?: Record<string, string>;
-  tui?: TuiSettingsConfig;
-}
-
-export interface ResolvedAgentSdkConfig {
-  agent: AgentConfigFile;
-  settings: AgentSettingsFile;
-  workspaceRoot: string;
-  shellCwd: string;
-  model: ModelAdapterConfig;
-  runtime: { requestedMode: RuntimeMode; mode: RuntimeMode; autoMigrate: boolean };
-  logging: { enabled: boolean; level: LogLevel; destination: LogDestination; filePath?: string; pretty: boolean };
-  interaction: { approvalMode: ApprovalMode; clarificationMode: ClarificationMode };
-  events: { printLifecycle: boolean; subscribe: boolean; verbose: boolean };
-  agents: { dirs: string[] };
-  skills: { dirs: string[]; allowExampleSkills: boolean };
-  tui: TuiSettingsConfig;
-}
-
-export interface ResolvedAgentSdkModuleInspection {
-  config: ResolvedAgentSdkConfig;
-  tools: Array<Pick<ToolDefinition<JsonValue, JsonValue>, 'name' | 'description' | 'inputSchema' | 'requiresApproval'>>;
-  delegates: Array<Pick<DelegateDefinition, 'name' | 'description' | 'allowedTools'>>;
-  registeredTools: Array<Pick<ToolDefinition<JsonValue, JsonValue>, 'name' | 'description' | 'inputSchema' | 'requiresApproval'>>;
-  registeredToolNames: string[];
-}
-
-export interface AgentSdkCatalogAgent {
-  id: string;
-  name: string;
-  description?: string;
-  path: string;
-  active: boolean;
-  invocationModes: InvocationMode[];
-  defaultInvocationMode: InvocationMode;
-  provider?: string;
-  model?: string;
-  tools: string[];
-  delegates: string[];
-  capabilities?: AgentCapabilityConfig;
-}
-
-export interface AgentSdkCatalogTool extends Pick<ToolDefinition<JsonValue, JsonValue>, 'name' | 'description' | 'inputSchema' | 'requiresApproval'> {
-  configured: boolean;
-}
-
-export interface AgentSdkCatalogDelegate {
-  name: string;
-  description: string;
-  path: string;
-  configured: boolean;
-  allowedTools: string[];
-  triggers?: string[];
-  handler?: string;
-}
-
-export interface AgentSdkCatalogInspection {
-  config: ResolvedAgentSdkConfig;
-  agentPath: string;
-  settingsPath?: string;
-  agents: AgentSdkCatalogAgent[];
-  tools: AgentSdkCatalogTool[];
-  delegates: AgentSdkCatalogDelegate[];
-}
-
-export interface AgentSdkOptions {
-  cwd?: string;
-  env?: NodeJS.ProcessEnv;
-  agentConfig?: AgentConfigFile;
-  agentConfigPath?: string;
-  settingsConfig?: AgentSettingsFile;
-  settingsConfigPath?: string;
-  model?: Partial<ModelAdapterConfig> & { apiKeyEnv?: string };
-  runtimeMode?: RuntimeMode;
-  runtime?: AdaptiveAgentRuntimeOptions<RunStore, EventStore, SnapshotStore, PlanStore | undefined, ContinuationStore>;
-  tools?: Array<ToolDefinition<any, any>>;
-  delegates?: DelegateDefinition[];
-  logger?: ReturnType<typeof createAdaptiveAgentLogger>;
-  eventListener?: (event: AgentEvent) => void;
-}
-
-export class AgentConfigValidationError extends Error {
-  constructor(readonly sourcePath: string, readonly issues: string[]) {
-    super(`Invalid agent config at ${sourcePath}:\n${issues.map((issue) => `- ${issue}`).join('\n')}`);
-    this.name = 'AgentConfigValidationError';
-  }
-}
-
-export class AgentSettingsValidationError extends Error {
-  constructor(readonly sourcePath: string, readonly issues: string[]) {
-    super(`Invalid agent settings at ${sourcePath}:\n${issues.map((issue) => `- ${issue}`).join('\n')}`);
-    this.name = 'AgentSettingsValidationError';
-  }
-}
-
-export class AgentSdkLookupError extends Error {
-  constructor(kind: string, readonly candidates: string[]) {
-    super(`No ${kind} file found. Lookup order:\n${candidates.map((candidate, index) => `${index + 1}. ${candidate}`).join('\n')}`);
-    this.name = 'AgentSdkLookupError';
-  }
-}
-
-export interface AgentSdkRunOptions extends Omit<RunRequest, 'goal' | 'metadata'> { metadata?: JsonObject }
-export interface AgentSdkChatOptions extends Omit<ChatRequest, 'messages' | 'metadata'> { metadata?: JsonObject }
+export * from './config-types.js';
+export * from './errors.js';
+export { expandEnvironmentVariables } from './sdk-utils.js';
+export { createOrchestrationSdk, OrchestrationSdk } from './orchestration.js';
+export type {
+  AgentCatalogEntry,
+  InputClaim,
+  OrchestratedRunOptions,
+  OrchestratedRunResult,
+  OrchestratedRunStageResult,
+  OrchestrationConcurrencyPolicy,
+  OrchestrationExecutionShape,
+  OrchestrationInputSelector,
+  OrchestrationLifecycleEvent,
+  OrchestrationPlan,
+  OrchestrationPlanNode,
+  OrchestrationPlanNodeStatus,
+  OrchestrationSessionInspection,
+  OrchestrationSessionRecord,
+  OrchestrationSessionRunLinkRecord,
+  OrchestrationSessionStatus,
+  OrchestrationStageKind,
+} from './orchestration.js';
 
 export class AgentSdk {
   readonly agent: AdaptiveAgent;
@@ -324,27 +157,9 @@ export class AgentSdk {
 }
 
 export async function createAgentSdk(options: AgentSdkOptions = {}): Promise<AgentSdk> { return AgentSdk.create(options); }
-export { createOrchestrationSdk, OrchestrationSdk } from './orchestration.js';
-export type {
-  AgentCatalogEntry,
-  InputClaim,
-  OrchestratedRunOptions,
-  OrchestratedRunResult,
-  OrchestratedRunStageResult,
-  OrchestrationConcurrencyPolicy,
-  OrchestrationExecutionShape,
-  OrchestrationInputSelector,
-  OrchestrationLifecycleEvent,
-  OrchestrationPlan,
-  OrchestrationPlanNode,
-  OrchestrationPlanNodeStatus,
-  OrchestrationSessionInspection,
-  OrchestrationSessionRecord,
-  OrchestrationSessionRunLinkRecord,
-  OrchestrationSessionStatus,
-  OrchestrationStageKind,
-} from './orchestration.js';
+
 export async function loadAgentSdkConfig(options: AgentSdkOptions = {}): Promise<ResolvedAgentSdkConfig> { return resolveAgentSdkConfig(options); }
+
 export async function inspectAgentSdkResolution(options: AgentSdkOptions = {}): Promise<ResolvedAgentSdkModuleInspection> {
   const config = await resolveAgentSdkConfig(options);
   const modules = await resolveToolsAndDelegates(config, options);
@@ -389,399 +204,3 @@ function pickToolInspectionFields(tool: ToolDefinition<any, any>): Pick<ToolDefi
     requiresApproval: tool.requiresApproval,
   };
 }
-
-interface ResolvedAgentSdkConfigWithSources {
-  config: ResolvedAgentSdkConfig;
-  agentPath: string;
-  settingsPath?: string;
-}
-
-async function resolveAgentSdkConfig(options: AgentSdkOptions): Promise<ResolvedAgentSdkConfig> {
-  return (await resolveAgentSdkConfigWithSources(options)).config;
-}
-
-async function resolveAgentSdkConfigWithSources(options: AgentSdkOptions): Promise<ResolvedAgentSdkConfigWithSources> {
-  const cwd = options.cwd ?? process.cwd();
-  const env = { ...(options.env ?? process.env) };
-  const settingsLoaded = options.settingsConfig ? { path: '<inline settings>', value: options.settingsConfig } : await loadOptionalSettings(cwd, options.settingsConfigPath, env);
-  const settings = validateSettings(expandStrings(settingsLoaded?.value ?? {}), settingsLoaded?.path ?? '<defaults>');
-  Object.assign(env, settings.env ?? {});
-  const agentDirs = resolveAgentDirs(cwd, settings.agents?.dirs, env);
-  const agentLoaded = options.agentConfig ? { path: '<inline agent>', value: options.agentConfig } : await loadRequiredAgent(cwd, options.agentConfigPath ?? settings.agent?.configPath, env, agentDirs);
-  const agent = validateAgent(expandStrings(agentLoaded.value), agentLoaded.path);
-  if (settings.agent?.id && settings.agent.id !== agent.id) throw new AgentSettingsValidationError(settingsLoaded?.path ?? '<settings>', [`settings.agent.id (${settings.agent.id}) does not match agent.id (${agent.id})`]);
-
-  const workspaceRoot = resolvePath(cwd, optionsString(settings.workspace?.overrideRoot) ?? optionsString(agent.workspace?.root) ?? optionsString(agent.workspaceRoot) ?? cwd);
-  const shellCwd = resolvePath(workspaceRoot, optionsString(settings.workspace?.overrideShellCwd) ?? optionsString(agent.workspace?.shellCwd) ?? workspaceRoot);
-  const provider = expandEnvironmentVariables(options.model?.provider ?? agent.model.provider ?? settings.model?.overrideProvider ?? '', env);
-  const modelName = expandEnvironmentVariables(options.model?.model ?? agent.model.model ?? settings.model?.overrideModel ?? '', env);
-  if (!provider || !modelName) throw new AgentConfigValidationError(agentLoaded.path, ['resolved model.provider and model.model are required']);
-  const apiKeyEnv = expandEnvironmentVariables(options.model?.apiKeyEnv ?? settings.model?.overrideApiKeyEnv ?? agent.model.apiKeyEnv ?? defaultApiKeyEnv(provider) ?? '', env);
-  const apiKey = apiKeyEnv ? env[apiKeyEnv] : agent.model.apiKey;
-  const requestedMode = options.runtimeMode ?? settings.runtime?.mode ?? 'postgres';
-  const postgresExplicit = Boolean(options.runtimeMode === 'postgres' || settings.runtime?.mode === 'postgres');
-  const mode = requestedMode === 'postgres' && !env.DATABASE_URL && !postgresExplicit ? 'memory' : requestedMode;
-  if (requestedMode === 'postgres' && !env.DATABASE_URL && postgresExplicit && !options.runtime) throw new AgentSettingsValidationError(settingsLoaded?.path ?? '<settings>', ['runtime.mode is postgres but DATABASE_URL is not set']);
-  const config: ResolvedAgentSdkConfig = {
-    agent,
-    settings,
-    workspaceRoot,
-    shellCwd,
-    model: {
-      provider: provider as ModelAdapterConfig['provider'],
-      model: modelName,
-      baseUrl: expandOptional(options.model?.baseUrl ?? settings.model?.overrideBaseUrl ?? agent.model.baseUrl, env),
-      maxConcurrentRequests: options.model?.maxConcurrentRequests ?? agent.model.maxConcurrentRequests,
-      structuredOutputMode: options.model?.structuredOutputMode ?? settings.model?.overrideStructuredOutputMode ?? agent.model.structuredOutputMode ?? 'prompted',
-      ...(apiKey ? { apiKey } : {}),
-    },
-    runtime: { requestedMode, mode, autoMigrate: settings.runtime?.autoMigrate ?? true },
-    logging: { enabled: settings.logging?.enabled ?? false, level: settings.logging?.level ?? 'info', destination: settings.logging?.destination ?? 'console', filePath: expandOptional(settings.logging?.filePath, env), pretty: settings.logging?.pretty ?? true },
-    interaction: { approvalMode: settings.interaction?.approvalMode ?? (settings.interaction?.autoApprove === false ? 'manual' : 'auto'), clarificationMode: settings.interaction?.clarificationMode ?? (settings.interaction?.interactive === false ? 'fail' : 'interactive') },
-    events: { printLifecycle: settings.events?.printLifecycle ?? false, subscribe: settings.events?.subscribe ?? false, verbose: settings.events?.verbose ?? false },
-    agents: { dirs: agentDirs },
-    skills: { dirs: resolveSkillDirs(cwd, settings.skills?.dirs, settings.skills?.allowExampleSkills, env), allowExampleSkills: settings.skills?.allowExampleSkills ?? false },
-    tui: normalizeTuiSettings(settings.tui),
-  };
-
-  return {
-    config,
-    agentPath: agentLoaded.path,
-    ...(settingsLoaded?.path ? { settingsPath: settingsLoaded.path } : {}),
-  };
-}
-
-function normalizeTuiSettings(settings: TuiSettingsConfig | undefined): TuiSettingsConfig {
-  return settings ? { messages: settings.messages ?? {} } : { messages: {} };
-}
-
-async function resolveToolsAndDelegates(config: ResolvedAgentSdkConfig, options: AgentSdkOptions): Promise<{ tools: Array<ToolDefinition<any, any>>; delegates: DelegateDefinition[]; registeredTools: Array<ToolDefinition<any, any>>; registeredToolNames: string[] }> {
-  process.env.ADAPTIVE_AGENT_MODULE_ROOT ??= DEFAULT_MODULE_ROOT;
-
-  const env = { ...(options.env ?? process.env), ...(config.settings.env ?? {}) };
-  const builtins = createBuiltinTools(config.workspaceRoot, config.shellCwd, env);
-  const providedTools = new Map((options.tools ?? []).map((tool) => [tool.name, tool]));
-  const registry = new Map([...builtins, ...providedTools]);
-  const registeredToolNames = [...registry.keys()].sort();
-  const registeredTools = registeredToolNames.map((toolName) => registry.get(toolName)!);
-  const missing = config.agent.tools.filter((name) => !registry.has(name));
-  if (missing.length) throw new Error(`Unknown tool reference(s): ${missing.join(', ')}. Registered tools: ${registeredToolNames.join(', ') || '(none)'}.`);
-  const tools = config.agent.tools.map((name) => registry.get(name)!);
-  const delegates = [...(options.delegates ?? []), ...(await loadDelegates(config.agent.delegates ?? [], config.skills.dirs, new Set(tools.map((tool) => tool.name))))];
-  return { tools, delegates, registeredTools, registeredToolNames };
-}
-
-function createBuiltinTools(workspaceRoot: string, shellCwd: string, env: NodeJS.ProcessEnv): Map<string, ToolDefinition<any, any>> {
-  const tools = new Map<string, ToolDefinition<any, any>>();
-  tools.set('read_file', createReadFileTool({ allowedRoot: workspaceRoot }));
-  tools.set('list_directory', createListDirectoryTool({ allowedRoot: workspaceRoot }));
-  tools.set('write_file', createWriteFileTool({ allowedRoot: workspaceRoot }));
-  tools.set('shell_exec', createShellExecTool({ cwd: shellCwd }));
-  const timeoutMs = parsePositiveInteger(env.WEB_TOOL_TIMEOUT_MS);
-  if (env.WEB_SEARCH_PROVIDER === 'brave' && env.BRAVE_SEARCH_API_KEY) tools.set('web_search', createWebSearchTool({ provider: 'brave', apiKey: env.BRAVE_SEARCH_API_KEY, timeoutMs }));
-  else if (env.WEB_SEARCH_PROVIDER === 'serper' && env.SERPER_API_KEY) tools.set('web_search', createWebSearchTool({ provider: 'serper', apiKey: env.SERPER_API_KEY, timeoutMs }));
-  else tools.set('web_search', createWebSearchTool({ provider: 'duckduckgo', timeoutMs }));
-  tools.set('read_web_page', createReadWebPageTool({ timeoutMs }));
-  return tools;
-}
-
-async function loadDelegates(names: string[], dirs: string[], availableTools: Set<string>): Promise<DelegateDefinition[]> {
-  const delegates = new Map<string, DelegateDefinition>();
-  for (const dir of dirs) {
-    if (!(await pathExists(dir))) continue;
-    for (const name of names) {
-      if (delegates.has(name)) continue;
-      const skillDir = resolve(dir, name);
-      if (!(await pathExists(skillDir))) continue;
-      const delegate = skillToDelegate(await loadSkillFromDirectory(skillDir));
-      if (delegate.name !== name) throw new Error(`Delegate "${name}" loaded from ${skillDir} declared skill name "${delegate.name}".`);
-      const missing = delegate.allowedTools.filter((tool) => !availableTools.has(tool));
-      if (missing.length) throw new Error(`Delegate "${name}" requires unavailable tool(s): ${missing.join(', ')}.`);
-      delegates.set(name, delegate);
-    }
-  }
-  const missing = names.filter((name) => !delegates.has(name));
-  if (missing.length) throw new Error(`Unable to load delegate(s): ${missing.join(', ')}. Skill search dirs: ${dirs.join(', ') || '(none)'}.`);
-  return names.map((name) => delegates.get(name)!);
-}
-
-async function discoverCatalogAgents(config: ResolvedAgentSdkConfig, activeAgentPath: string): Promise<AgentSdkCatalogAgent[]> {
-  const agents: AgentSdkCatalogAgent[] = [agentConfigToCatalogAgent(config.agent, activeAgentPath, true)];
-  const seenPaths = new Set([activeAgentPath]);
-  const env = { ...process.env, ...(config.settings.env ?? {}) };
-
-  for (const dir of config.agents.dirs) {
-    if (!(await pathExists(dir))) continue;
-    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
-    for (const entry of entries) {
-      if (!entry.isFile() || extname(entry.name).toLowerCase() !== '.json') continue;
-      const path = resolve(dir, entry.name);
-      if (seenPaths.has(path)) continue;
-      const agent = await readCatalogAgent(path, env);
-      if (!agent) continue;
-      agents.push(agentConfigToCatalogAgent(agent, path, path === activeAgentPath));
-      seenPaths.add(path);
-    }
-  }
-
-  return agents.sort((left, right) => Number(right.active) - Number(left.active) || left.id.localeCompare(right.id) || left.path.localeCompare(right.path));
-}
-
-async function readCatalogAgent(path: string, env: NodeJS.ProcessEnv): Promise<AgentConfigFile | undefined> {
-  try {
-    return validateAgent(expandStrings(await readJson(path), env), path);
-  } catch {
-    return undefined;
-  }
-}
-
-function agentConfigToCatalogAgent(agent: AgentConfigFile, path: string, active: boolean): AgentSdkCatalogAgent {
-  return {
-    id: agent.id,
-    name: agent.name,
-    ...(agent.description ? { description: agent.description } : {}),
-    path,
-    active,
-    invocationModes: agent.invocationModes,
-    defaultInvocationMode: agent.defaultInvocationMode,
-    ...(agent.model.provider ? { provider: agent.model.provider } : {}),
-    ...(agent.model.model ? { model: agent.model.model } : {}),
-    tools: agent.tools,
-    delegates: agent.delegates ?? [],
-    ...(agent.capabilities ? { capabilities: agent.capabilities } : {}),
-  };
-}
-
-async function discoverCatalogDelegates(config: ResolvedAgentSdkConfig, configuredDelegateNames: Set<string>): Promise<AgentSdkCatalogDelegate[]> {
-  const delegates = new Map<string, AgentSdkCatalogDelegate>();
-
-  for (const dir of config.skills.dirs) {
-    if (!(await pathExists(dir))) continue;
-    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      const skillPath = resolve(dir, entry.name, 'SKILL.md');
-      if (!(await pathExists(skillPath))) continue;
-      const delegate = await readCatalogDelegate(skillPath, configuredDelegateNames);
-      if (!delegate || delegates.has(delegate.name)) continue;
-      delegates.set(delegate.name, delegate);
-    }
-  }
-
-  return [...delegates.values()].sort((left, right) => Number(right.configured) - Number(left.configured) || left.name.localeCompare(right.name) || left.path.localeCompare(right.path));
-}
-
-async function readCatalogDelegate(skillPath: string, configuredDelegateNames: Set<string>): Promise<AgentSdkCatalogDelegate | undefined> {
-  let raw: string;
-  try {
-    raw = await readFile(skillPath, 'utf-8');
-  } catch {
-    return undefined;
-  }
-
-  // Metadata-only scan: listing the catalog must not import handler modules.
-  const metadata = parseCatalogFrontmatter(raw);
-  const name = readCatalogString(metadata, 'name');
-  const description = readCatalogString(metadata, 'description');
-  if (!name || !description) return undefined;
-  const triggers = readCatalogStringArray(metadata, 'triggers');
-  const handler = readCatalogString(metadata, 'handler');
-
-  return {
-    name,
-    description,
-    path: dirname(skillPath),
-    configured: configuredDelegateNames.has(name),
-    allowedTools: readCatalogStringArray(metadata, 'allowedTools') ?? [],
-    ...(triggers?.length ? { triggers } : {}),
-    ...(handler ? { handler } : {}),
-  };
-}
-
-function parseCatalogFrontmatter(content: string): Record<string, string | string[]> {
-  const trimmed = content.trimStart();
-  if (!trimmed.startsWith('---')) return {};
-  const endIndex = trimmed.indexOf('---', 3);
-  if (endIndex === -1) return {};
-
-  const result: Record<string, string | string[]> = {};
-  const lines = trimmed.slice(3, endIndex).trim().split('\n');
-  let currentKey: string | undefined;
-  let currentList: string[] | undefined;
-
-  for (const line of lines) {
-    const value = line.trim();
-    if (!value || value.startsWith('#')) continue;
-    if (value.startsWith('- ') && currentKey && currentList) {
-      currentList.push(unquoteCatalogValue(value.slice(2).trim()));
-      continue;
-    }
-    if (currentKey && currentList) {
-      result[currentKey] = currentList;
-      currentKey = undefined;
-      currentList = undefined;
-    }
-
-    const colonIndex = value.indexOf(':');
-    if (colonIndex === -1) continue;
-    const key = value.slice(0, colonIndex).trim();
-    const rawValue = value.slice(colonIndex + 1).trim();
-    if (!rawValue) {
-      currentKey = key;
-      currentList = [];
-      continue;
-    }
-    result[key] = parseInlineCatalogArray(rawValue) ?? unquoteCatalogValue(rawValue);
-  }
-
-  if (currentKey && currentList) {
-    result[currentKey] = currentList;
-  }
-  return result;
-}
-
-function parseInlineCatalogArray(value: string): string[] | undefined {
-  if (!value.startsWith('[') || !value.endsWith(']')) return undefined;
-  return value.slice(1, -1).split(',').map((entry) => unquoteCatalogValue(entry.trim())).filter(Boolean);
-}
-
-function unquoteCatalogValue(value: string): string {
-  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-    return value.slice(1, -1);
-  }
-  return value;
-}
-
-function readCatalogString(metadata: Record<string, string | string[]>, key: string): string | undefined {
-  const value = metadata[key];
-  return typeof value === 'string' && value.trim() ? value : undefined;
-}
-
-function readCatalogStringArray(metadata: Record<string, string | string[]>, key: string): string[] | undefined {
-  const value = metadata[key];
-  return Array.isArray(value) ? value.filter((entry) => entry.trim()) : undefined;
-}
-
-async function loadOptionalSettings(cwd: string, explicitPath: string | undefined, env: NodeJS.ProcessEnv): Promise<{ path: string; value: AgentSettingsFile } | undefined> {
-  const candidates = [explicitPath, env.ADAPTIVE_AGENT_SETTINGS, resolve(cwd, 'agent.settings.json'), resolve(adaptiveAgentHome(env), 'agent.settings.json')].filter(Boolean) as string[];
-  for (const candidate of candidates) {
-    const path = resolvePath(cwd, candidate);
-    if (await pathExists(path)) return { path, value: await readJson(path) as AgentSettingsFile };
-    if (candidate === explicitPath || candidate === env.ADAPTIVE_AGENT_SETTINGS) throw new AgentSdkLookupError('agent.settings.json', candidates.map((entry) => resolvePath(cwd, entry)));
-  }
-  return undefined;
-}
-
-async function loadRequiredAgent(cwd: string, explicitPath: string | undefined, env: NodeJS.ProcessEnv, agentDirs: string[]): Promise<{ path: string; value: AgentConfigFile }> {
-  const candidates = [explicitPath, env.ADAPTIVE_AGENT_CONFIG, resolve(cwd, 'agent.json'), resolve(adaptiveAgentHome(env), 'agents', 'default-agent.json')].filter(Boolean) as string[];
-  for (const candidate of candidates) {
-    const path = resolvePath(cwd, candidate);
-    if (await pathExists(path)) return { path, value: await readJson(path) as AgentConfigFile };
-    const discovered = await resolveAgentConfigByName(candidate, agentDirs);
-    if (discovered) return { path: discovered, value: await readJson(discovered) as AgentConfigFile };
-    if (candidate === explicitPath || candidate === env.ADAPTIVE_AGENT_CONFIG) throw new AgentSdkLookupError('agent.json', candidates.map((entry) => resolvePath(cwd, entry)));
-  }
-  throw new AgentSdkLookupError('agent.json', candidates.map((entry) => resolvePath(cwd, entry)));
-}
-
-async function resolveAgentConfigByName(name: string, dirs: string[]): Promise<string | undefined> {
-  if (!isAgentName(name)) return undefined;
-  const fileNames = extname(name) ? [name] : [name, `${name}.json`];
-  const matches: string[] = [];
-  for (const dir of dirs) {
-    if (!(await pathExists(dir))) continue;
-    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
-    for (const entry of entries) {
-      if (!entry.isFile() || !fileNames.includes(entry.name)) continue;
-      matches.push(resolve(dir, entry.name));
-    }
-  }
-  matches.sort();
-  if (matches.length > 1) {
-    throw new Error(`Ambiguous agent config "${name}". Matches:\n${matches.map((match) => `- ${match}`).join('\n')}`);
-  }
-  return matches[0];
-}
-
-function isAgentName(value: string): boolean {
-  return Boolean(value.trim()) && !isAbsolute(value) && !/[\\/]/.test(value);
-}
-
-const ajv = new Ajv({ allErrors: true, allowUnionTypes: true });
-const agentValidator = ajv.compile({ type: 'object', required: ['id', 'name', 'invocationModes', 'defaultInvocationMode', 'model', 'tools'], additionalProperties: true, properties: { id: { type: 'string', minLength: 1 }, name: { type: 'string', minLength: 1 }, invocationModes: { type: 'array', items: { enum: ['run', 'chat'] }, minItems: 1 }, defaultInvocationMode: { enum: ['run', 'chat'] }, model: { type: 'object', additionalProperties: true }, tools: { type: 'array', items: { type: 'string', minLength: 1 } }, delegates: { type: 'array', items: { type: 'string' }, nullable: true }, metadata: { type: 'object', nullable: true }, routing: { type: 'object', additionalProperties: true, nullable: true, properties: { keywords: { type: 'array', nullable: true, items: { type: 'string', minLength: 1 } } } }, capabilities: { type: 'object', additionalProperties: true, nullable: true, properties: { modalitiesSupported: { type: 'array', nullable: true, items: { enum: ['text', 'image', 'file', 'audio'] } }, modalitiesPreferred: { type: 'array', nullable: true, items: { enum: ['text', 'image', 'file', 'audio'] } }, modalityRoles: { type: 'object', additionalProperties: { enum: ['ingest', 'analyze', 'summarize', 'synthesize'] }, nullable: true }, subjectsPreferred: { type: 'array', nullable: true, items: { type: 'string', minLength: 1 } } } } } });
-const settingsValidator = ajv.compile({ type: 'object', additionalProperties: true, properties: { runtime: { type: 'object', additionalProperties: true, nullable: true, properties: { mode: { type: 'string', enum: ['memory', 'postgres'], nullable: true }, autoMigrate: { type: 'boolean', nullable: true } } }, logging: { type: 'object', additionalProperties: true, nullable: true, properties: { destination: { type: 'string', enum: ['console', 'file', 'both'], nullable: true } } } } });
-
-function validateAgent(value: unknown, path: string): AgentConfigFile {
-  if (!agentValidator(value)) throw new AgentConfigValidationError(path, formatAjvErrors('agent', agentValidator.errors));
-  const config = value as AgentConfigFile;
-  if (!config.invocationModes.includes(config.defaultInvocationMode)) throw new AgentConfigValidationError(path, ['agent.defaultInvocationMode must be included in agent.invocationModes']);
-  validateStructuredOutputMode(config.model.structuredOutputMode, path, 'agent.model.structuredOutputMode', AgentConfigValidationError);
-  return { ...config, delegates: config.delegates ?? [] };
-}
-
-function validateSettings(value: unknown, path: string): AgentSettingsFile {
-  if (!settingsValidator(value)) throw new AgentSettingsValidationError(path, formatAjvErrors('settings', settingsValidator.errors));
-  const settings = value as AgentSettingsFile;
-  if ((settings.logging?.destination === 'file' || settings.logging?.destination === 'both') && !settings.logging.filePath) throw new AgentSettingsValidationError(path, ['settings.logging.filePath is required when logging.destination is "file" or "both"']);
-  validateStructuredOutputMode(settings.model?.overrideStructuredOutputMode, path, 'settings.model.overrideStructuredOutputMode', AgentSettingsValidationError);
-  return settings;
-}
-
-function validateStructuredOutputMode(
-  value: unknown,
-  path: string,
-  propertyPath: string,
-  ErrorClass: typeof AgentConfigValidationError | typeof AgentSettingsValidationError,
-): void {
-  if (value === undefined || STRUCTURED_OUTPUT_MODES.includes(value as (typeof STRUCTURED_OUTPUT_MODES)[number])) {
-    return;
-  }
-
-  throw new ErrorClass(path, [`${propertyPath} must be one of: ${STRUCTURED_OUTPUT_MODES.join(', ')}`]);
-}
-
-function formatAjvErrors(prefix: string, errors: ErrorObject[] | null | undefined): string[] {
-  return (errors ?? []).map((error) => `${prefix}${error.instancePath.replaceAll('/', '.')} ${error.message ?? 'is invalid'}`);
-}
-
-async function resolveRuntimeBundle(mode: RuntimeMode, autoMigrate: boolean, env: NodeJS.ProcessEnv = process.env): Promise<{ mode: RuntimeMode; runtime?: AdaptiveAgentRuntimeOptions<RunStore, EventStore, SnapshotStore, PlanStore | undefined, ContinuationStore>; close?: () => Promise<void> }> {
-  if (mode === 'memory') return { mode, runtime: createAdaptiveAgentRuntime<RunStore, EventStore, SnapshotStore, PlanStore | undefined>() };
-  const pool = createPostgresPool(env);
-  if (autoMigrate) await runPostgresRuntimeMigrations(pool);
-  const stores = createPostgresRuntimeStores({ client: pool });
-  return { mode, runtime: postgresStoresToRuntime(stores), close: () => pool.end() };
-}
-
-type CorePool = PostgresPoolClient & { end(): Promise<void> };
-const TIMESTAMP_OIDS = [1082, 1114, 1184] as const;
-let pgTypesConfigured = false;
-function createPostgresPool(env: NodeJS.ProcessEnv): CorePool {
-  if (!env.DATABASE_URL) throw new Error('Postgres runtime requires DATABASE_URL.');
-  if (!pgTypesConfigured) { for (const oid of TIMESTAMP_OIDS) types.setTypeParser(oid, (value) => value); pgTypesConfigured = true; }
-  return new Pool({ connectionString: env.DATABASE_URL, ssl: readBooleanEnv(env.PGSSL) ? { rejectUnauthorized: false } : undefined }) as unknown as CorePool;
-}
-function postgresStoresToRuntime(stores: PostgresRuntimeStoreBundle): AdaptiveAgentRuntimeOptions<RunStore, EventStore, SnapshotStore, PlanStore | undefined, ContinuationStore> { return { runStore: stores.runStore, eventStore: stores.eventStore, snapshotStore: stores.snapshotStore, planStore: stores.planStore, continuationStore: stores.continuationStore, toolExecutionStore: stores.toolExecutionStore, transactionStore: stores }; }
-const CREATE_MIGRATION_TABLE_SQL = `create table if not exists adaptive_agent_migrations (name text primary key, applied_at timestamptz not null default now())`;
-async function runPostgresRuntimeMigrations(client: PostgresClient | PostgresPoolClient): Promise<void> { await runWithPostgresTransaction(client, async (tx) => { await tx.query(CREATE_MIGRATION_TABLE_SQL); for (const migration of POSTGRES_RUNTIME_MIGRATIONS) await runMigrationIfNeeded(tx, migration); }); }
-async function runMigrationIfNeeded(client: PostgresClient, migration: PostgresMigrationDefinition): Promise<void> { const existing = await client.query<{ name: string }>('SELECT name FROM adaptive_agent_migrations WHERE name = $1', [migration.name]); if (existing.rowCount) return; await client.query(migration.sql); await client.query('INSERT INTO adaptive_agent_migrations (name) VALUES ($1)', [migration.name]); }
-async function runWithPostgresTransaction<T>(client: PostgresClient | PostgresPoolClient, operation: (client: PostgresClient) => Promise<T>): Promise<T> { const tx = isPool(client) ? await client.connect() : client; const release = isTx(tx); try { await tx.query('BEGIN'); const result = await operation(tx); await tx.query('COMMIT'); return result; } catch (error) { await tx.query('ROLLBACK'); throw error; } finally { if (release) tx.release(); } }
-function isPool(client: PostgresClient | PostgresPoolClient): client is PostgresPoolClient { return typeof (client as PostgresPoolClient).connect === 'function'; }
-function isTx(client: PostgresClient): client is PostgresTransactionClient { return typeof (client as PostgresTransactionClient).release === 'function'; }
-
-async function readJson(path: string): Promise<unknown> { try { return JSON.parse(await readFile(path, 'utf-8')) as unknown; } catch (error) { throw new AgentConfigValidationError(path, [`Unable to read or parse JSON: ${error instanceof Error ? error.message : String(error)}`]); } }
-async function pathExists(path: string): Promise<boolean> { try { await access(path); return true; } catch { return false; } }
-function resolvePath(cwd: string, value: string): string { const expanded = expandEnvironmentVariables(value, process.env); return isAbsolute(expanded) ? resolve(expanded) : resolve(cwd, expanded); }
-function expandStrings<T>(value: T, env: NodeJS.ProcessEnv = process.env): T { if (typeof value === 'string') return expandEnvironmentVariables(value, env) as T; if (Array.isArray(value)) return value.map((entry) => expandStrings(entry, env)) as T; if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, expandStrings(entry, env)])) as T; return value; }
-export function expandEnvironmentVariables(value: string, env: NodeJS.ProcessEnv = process.env): string { return value.replace(/\$(\w+)|\$\{([^}]+)\}|^~(?=\/|$)/g, (match, bare: string | undefined, braced: string | undefined) => { if (match === '~') return env.HOME ?? homedir(); const name = bare ?? braced; return name === 'HOME' ? env.HOME ?? homedir() : name ? env[name] ?? match : match; }); }
-function expandOptional(value: string | undefined, env: NodeJS.ProcessEnv): string | undefined { return value ? expandEnvironmentVariables(value, env) : undefined; }
-function optionsString(value: string | undefined): string | undefined { return value && value.trim() ? value : undefined; }
-function defaultApiKeyEnv(provider: string): string | undefined { const normalized = provider.toLowerCase(); if (normalized === 'openrouter') return 'OPENROUTER_API_KEY'; if (normalized === 'mistral') return 'MISTRAL_API_KEY'; if (normalized === 'mesh') return 'MESH_API_KEY'; return undefined; }
-function adaptiveAgentHome(env: NodeJS.ProcessEnv): string { return env.ADAPTIVE_AGENT_HOME ? resolve(env.ADAPTIVE_AGENT_HOME) : resolve(homedir(), '.adaptiveAgent'); }
-function resolveAgentDirs(cwd: string, dirs: string[] | undefined, env: NodeJS.ProcessEnv): string[] { const selected = dirs?.length ? dirs : env.ADAPTIVE_AGENT_AGENTS_DIR ? env.ADAPTIVE_AGENT_AGENTS_DIR.split(delimiter).filter(Boolean) : ['./agents', '~/.adaptiveAgent/agents']; return selected.map((dir) => resolvePath(cwd, expandEnvironmentVariables(dir, env))); }
-function resolveSkillDirs(cwd: string, dirs: string[] | undefined, allowExamples: boolean | undefined, env: NodeJS.ProcessEnv): string[] { const selected = dirs?.length ? dirs : env.ADAPTIVE_AGENT_SKILLS_DIR ? env.ADAPTIVE_AGENT_SKILLS_DIR.split(delimiter).filter(Boolean) : ['./skills', '~/.adaptiveAgent/skills']; const resolved = selected.map((dir) => resolvePath(cwd, expandEnvironmentVariables(dir, env))); if (allowExamples) resolved.push(resolve(cwd, 'examples', 'skills')); return resolved; }
-function normalizeRecovery(recovery: AgentConfigFile['recovery']) { return recovery ? { ...recovery, continuation: recovery.continuation ? { enabled: recovery.continuation.enabled ?? true, defaultStrategy: recovery.continuation.defaultStrategy, requireUserApproval: recovery.continuation.requireUserApproval } : undefined } : undefined; }
-function mergeMetadata(base: JsonObject, extra: JsonObject | undefined): JsonObject { return { ...base, ...(extra ?? {}) }; }
-function parsePositiveInteger(value: string | undefined): number | undefined { const parsed = value ? Number.parseInt(value, 10) : NaN; return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined; }
-function readBooleanEnv(value: string | undefined): boolean { return value === '1' || value === 'true' || value === 'yes'; }
-async function promptYesNo(question: string): Promise<boolean> { return ['y', 'yes'].includes((await promptText(question)).trim().toLowerCase()); }
-async function promptText(question: string): Promise<string> { const rl = createInterface({ input: stdin, output: stderr }); try { return await rl.question(question); } finally { rl.close(); } }

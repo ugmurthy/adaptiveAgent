@@ -74,6 +74,58 @@ describe('install workflow helpers', () => {
     expect(renderInitReport(report)).toContain('adaptive-agent run "Hello, confirm you are working"');
   });
 
+  it('installs bundled agents and skills by default', async () => {
+    const homeDir = join(tempDir, 'home');
+    const report = await runInit({ homeDir, cwd: tempDir, provider: 'mesh', yes: true, env: {} });
+    const planner = JSON.parse(await readFile(join(homeDir, 'agents', 'planner.json'), 'utf8'));
+    const researchSkill = await readFile(join(homeDir, 'skills', 'research', 'SKILL.md'), 'utf8');
+
+    expect(report.bundles).toEqual(['core']);
+    expect(planner.model).toEqual({ provider: 'mesh', model: 'qwen/qwen3.5-27b', apiKeyEnv: 'MESH_API_KEY' });
+    expect(researchSkill).toContain('name: research');
+    expect(renderInitReport(report)).toContain('Installed bundled assets: core');
+  });
+
+  it('supports minimal init without bundled assets', async () => {
+    const homeDir = join(tempDir, 'home');
+    const report = await runInit({ homeDir, cwd: tempDir, minimal: true, yes: true, env: {} });
+
+    expect(report.bundles).toEqual([]);
+    await expect(readFile(join(homeDir, 'agents', 'planner.json'), 'utf8')).rejects.toThrow();
+    await expect(readFile(join(homeDir, 'skills', 'research', 'SKILL.md'), 'utf8')).rejects.toThrow();
+  });
+
+  it('installs local agents and skills from a manifest', async () => {
+    const homeDir = join(tempDir, 'home');
+    const sourceDir = join(tempDir, 'source');
+    await mkdir(join(sourceDir, 'skills', 'custom-skill'), { recursive: true });
+    await writeFile(join(sourceDir, 'custom-agent.json'), JSON.stringify({
+      version: 1,
+      id: 'custom-agent',
+      name: 'Custom Agent',
+      invocationModes: ['run'],
+      defaultInvocationMode: 'run',
+      model: { provider: 'ollama', model: 'llama3.2' },
+      workspaceRoot: '.',
+      tools: ['read_file'],
+      delegates: [],
+    }, null, 2));
+    await writeFile(join(sourceDir, 'skills', 'custom-skill', 'SKILL.md'), '---\nname: custom-skill\ndescription: Custom test skill.\n---\n\n# Custom\n\nDo custom work.\n');
+    await writeFile(join(sourceDir, 'adaptive-agent.install.json'), JSON.stringify({
+      version: 1,
+      bundles: ['research'],
+      agents: ['custom-agent.json'],
+      skills: ['skills/custom-skill'],
+    }));
+
+    const report = await runInit({ homeDir, cwd: tempDir, minimal: true, installManifests: [join(sourceDir, 'adaptive-agent.install.json')], yes: true, env: {} });
+
+    expect(report.bundles).toEqual(['research']);
+    expect(JSON.parse(await readFile(join(homeDir, 'agents', 'custom-agent.json'), 'utf8')).id).toBe('custom-agent');
+    expect(JSON.parse(await readFile(join(homeDir, 'agents', 'researcher.json'), 'utf8')).id).toBe('researcher');
+    expect(await readFile(join(homeDir, 'skills', 'custom-skill', 'SKILL.md'), 'utf8')).toContain('name: custom-skill');
+  });
+
   it('generates coding profile tools when requested', async () => {
     const report = await runInit({ homeDir: join(tempDir, 'home'), cwd: tempDir, provider: 'mesh', profile: 'coding', yes: true, env: {} });
     const agent = JSON.parse(await readFile(report.defaultAgentPath, 'utf8'));

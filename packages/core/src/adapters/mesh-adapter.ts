@@ -67,6 +67,7 @@ export class MeshAdapter extends BaseOpenAIChatAdapter {
     const parsed = this.parseResponse(completion as never);
     return {
       ...parsed,
+      rawProviderResponse: completion,
       performance: compactJsonObject({
         ...(parsed.performance ?? {}),
         adapterAttemptCount: 1,

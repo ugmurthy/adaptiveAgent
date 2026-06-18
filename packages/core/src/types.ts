@@ -468,6 +468,7 @@ export interface ModelResponse {
   finishReason: 'stop' | 'tool_calls' | 'length' | 'content_filter' | 'error';
   usage?: UsageSummary;
   providerResponseId?: string;
+  rawProviderResponse?: unknown;
   summary?: string;
   reasoning?: string;
   reasoningDetails?: JsonValue[];

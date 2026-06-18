@@ -1254,6 +1254,61 @@ describe('OllamaAdapter', () => {
 
     expect(fetchSpy.mock.calls[0][0]).toBe('http://gpu-box:11434/v1/chat/completions');
   });
+
+  it('fills a type on open tool-parameter schemas to avoid gpt-oss template crashes', async () => {
+    const adapter = new OllamaAdapter({ model: 'gpt-oss:latest' });
+    mockFetchResponse(NO_USAGE_RESPONSE);
+
+    await adapter.generate({
+      messages: [{ role: 'user', content: 'Research testing' }],
+      tools: [
+        {
+          name: 'delegate.researcher',
+          description: 'Delegates focused research work.',
+          inputSchema: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['goal'],
+            properties: {
+              goal: { type: 'string' },
+              input: {},
+              context: { type: 'object', additionalProperties: true },
+              tags: { type: 'array', items: {} },
+            },
+          },
+        },
+      ],
+    });
+
+    const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    const params = body.tools[0].function.parameters;
+
+    // Open "any" schemas get a concrete (multi-)type so Ollama's template renderer
+    // does not panic on `index $prop.Type 0`.
+    expect(params.properties.input.type).toEqual([
+      'string',
+      'number',
+      'boolean',
+      'object',
+      'array',
+      'null',
+    ]);
+    expect(params.properties.tags.items.type).toEqual([
+      'string',
+      'number',
+      'boolean',
+      'object',
+      'array',
+      'null',
+    ]);
+
+    // Already-typed and structural keywords are left intact.
+    expect(params.type).toBe('object');
+    expect(params.properties.goal.type).toBe('string');
+    expect(params.properties.context.type).toBe('object');
+    expect(params.required).toEqual(['goal']);
+    expect(params.additionalProperties).toBe(false);
+  });
 });
 
 describe('MistralAdapter', () => {
@@ -1412,12 +1467,13 @@ describe('MeshAdapter', () => {
     const adapter = new MeshAdapter({ model: 'openai/gpt-4o', apiKey: 'mesh-key' });
     mockFetchResponse(STOP_RESPONSE);
 
-    await adapter.generate(simpleRequest());
+    const response = await adapter.generate(simpleRequest());
 
     expect(fetchSpy.mock.calls[0][0]).toBe('https://api.meshapi.ai/v1/chat/completions');
     expect(fetchSpy.mock.calls[0][1].headers['Authorization']).toBe('Bearer mesh-key');
     expect(adapter.provider).toBe('mesh');
     expect(adapter.capabilities.usage).toBe(true);
+    expect(response.rawProviderResponse).toEqual(STOP_RESPONSE);
   });
 
   it('passes the runtime model timeout to the Mesh SDK HTTP timeout', async () => {

@@ -38,6 +38,9 @@ export function summarizeModelResponseForLog(response: ModelResponse) {
   return {
     finishReason: response.finishReason,
     providerResponseId: response.providerResponseId,
+    rawProviderResponse: response.rawProviderResponse === undefined
+      ? undefined
+      : captureValueForLog(response.rawProviderResponse, { mode: 'full' }),
     summary: response.summary,
     toolCalls:
       response.toolCalls?.map((toolCall) => ({

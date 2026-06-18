@@ -2691,6 +2691,20 @@ describe('AdaptiveAgent', () => {
           structuredOutput: {
             report: 'delegation complete',
           },
+          rawProviderResponse: {
+            id: 'chatcmpl_raw_123',
+            object: 'chat.completion',
+            choices: [
+              {
+                index: 0,
+                finish_reason: 'stop',
+                message: {
+                  role: 'assistant',
+                  content: '{"report":"delegation complete"}',
+                },
+              },
+            ],
+          },
         },
       ]),
       tools: [createLookupTool()],
@@ -2768,6 +2782,14 @@ describe('AdaptiveAgent', () => {
       durationMs: expect.any(Number),
       rawOutputBytes: expect.any(Number),
       modelOutputBytes: expect.any(Number),
+    });
+
+    const modelResponseLog = entries.find(
+      (entry) => entry.event === 'model.response' && entry.rawProviderResponse,
+    );
+    expect(modelResponseLog?.rawProviderResponse).toMatchObject({
+      id: 'chatcmpl_raw_123',
+      object: 'chat.completion',
     });
 
     const events = await eventStore.listByRun(result.runId);

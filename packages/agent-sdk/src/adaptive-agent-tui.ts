@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { stdout } from 'node:process';
 import { extname, resolve } from 'node:path';
 import chalk from 'chalk';
-import { SwarmCoordinator, createSwarmDecompositionOutputSchema, type AgentEvent, type AgentRun, type AudioInput, type ChatMessage, type JsonObject, type JsonValue, type ModelAdapterConfig, type ModelContentPart, type RunResult, type RunStatus, type SwarmRetryResult, type SwarmRunResult, type SwarmSubtask, type UsageSummary } from '@adaptive-agent/core';
+import { type AgentEvent, type AgentRun, type AudioInput, type ChatMessage, type JsonObject, type JsonValue, type ModelAdapterConfig, type ModelContentPart, type RunResult, type RunStatus, type SwarmCoordinator, type SwarmRetryResult, type SwarmRunResult, type SwarmSubtask, type UsageSummary } from '@adaptive-agent/core';
 import { Editor, matchesKey, ProcessTerminal, TUI, type OverlayHandle } from '@earendil-works/pi-tui';
 
 import {
@@ -24,6 +24,7 @@ import {
 import { AgentEventLabelRegistry, formatAgentEventSummary, summarizeAgentEvent } from './agent-event-rendering.js';
 import { formatSwarmExecutionPlan, formatSwarmRunStatuses } from './swarm-format.js';
 import { createSwarmRoleAgentConfig } from './swarm-role-config.js';
+import { buildSwarmCoordinator, parseSwarmSubtasks, runSwarmDecomposition, validateSdkDecomposition } from './swarm-runner.js';
 import {
   MessageLog,
   StatusBar,
@@ -655,34 +656,15 @@ async function runTui(sdkOptions: AgentSdkOptions, state: TuiClientState, cli: T
     const context = await createSwarmExecutionContext(command);
     try {
       const sessionId = state.sessionId;
-      const workerCatalog = context.workerSdks.map((workerSdk) => ({
-        id: workerSdk.config.agent.id,
-        name: workerSdk.config.agent.name,
-        description: workerSdk.config.agent.description ?? '',
-        capabilities: (workerSdk.config.agent.capabilities ?? {}) as JsonValue,
-      }));
       addSystem(`swarm-run decomposing task for workers: ${context.workerIds.join(', ')}`);
-      const decompositionResult = await sdk!.runRaw(command.objective, {
+      const decompositionResult = await runSwarmDecomposition({
+        coordinatorSdk: sdk!,
         sessionId,
-        input: {
-          originalInput: command.inputJson ?? null,
-          workerCatalog: workerCatalog as unknown as JsonValue,
-        },
-        contentParts: command.contentParts.length > 0 ? command.contentParts : undefined,
-        context: {
-          phase: 'swarm.decompose',
-          topLevelObjective: command.objective,
-          validWorkerAgentIds: context.workerIds as unknown as JsonValue,
-          instructions: [
-            'Decompose the top-level objective into independent subtasks.',
-            'Each subtask targetAgentId must exactly match one id from validWorkerAgentIds.',
-            'Each subtask must include id, subObjective, input, attachmentRefs, and targetAgentId.',
-            'Use input as a compact string or null, and use attachmentRefs [] when there is no attachment reference.',
-            'Return only structured subtasks; do not invent worker ids.',
-          ],
-        },
-        outputSchema: createSwarmDecompositionOutputSchema(context.workerIds),
-        metadata: { orchestration: { kind: 'swarm', coordinatorRunId: 'pending', role: 'coordinator' } as unknown as JsonValue },
+        topLevelObjective: command.objective,
+        inputJson: command.inputJson,
+        workerAgents: context.workerSdks.map((workerSdk) => workerSdk.config.agent),
+        workerIds: context.workerIds,
+        contentParts: command.contentParts,
       });
       state.currentRunId = decompositionResult.runId;
       state.currentCoordinatorRunId = decompositionResult.runId;
@@ -748,15 +730,11 @@ async function runTui(sdkOptions: AgentSdkOptions, state: TuiClientState, cli: T
         ? await createAgentSdk({ ...sdkOptions, agentConfigPath: command.synthesizerAgentPath, runtime: sdk!.created.runtime, eventListener: handleEvent })
         : await createAgentSdk({ ...sdkOptions, agentConfig: createSwarmRoleAgentConfig(sdk!.config.agent, 'synthesizer'), runtime: sdk!.created.runtime, eventListener: handleEvent });
       createdSdks.push(synthesizerSdk);
-      const swarm = new SwarmCoordinator({
-        runStore: sdk!.created.runtime.runStore,
-        coordinatorAgent: sdk!.agent,
-        coordinatorAgentId: sdk!.config.agent.id,
-        workerAgents: Object.fromEntries(workerSdks.map((workerSdk) => [workerSdk.config.agent.id, workerSdk.agent])),
-        qualityAgent: qualitySdk.agent,
-        qualityAgentId: qualitySdk.config.agent.id,
-        synthesizerAgent: synthesizerSdk.agent,
-        synthesizerAgentId: synthesizerSdk.config.agent.id,
+      const swarm = buildSwarmCoordinator({
+        coordinatorSdk: sdk!,
+        workerSdks,
+        qualitySdk,
+        synthesizerSdk,
         defaultMaxWorkers: command.maxWorkers,
       });
       return {
@@ -1014,49 +992,6 @@ function contextualAgentLoadError(flagName: string, value: string, error: unknow
   return wrapped;
 }
 
-function parseSwarmSubtasks(output: JsonValue): SwarmSubtask[] {
-  const raw: JsonValue[] | undefined = typeof output === 'object' && output !== null && !Array.isArray(output) && Array.isArray((output as JsonObject).subtasks)
-    ? (output as JsonObject).subtasks as JsonValue[]
-    : Array.isArray(output) ? output : undefined;
-  if (!raw || raw.length === 0) throw new Error('Coordinator produced no subtasks');
-  return raw.map((item, index) => {
-    if (!isRecord(item)) throw new Error(`Coordinator subtask ${index + 1} is not an object`);
-    const unsupportedKeys = Object.keys(item).filter((key) => !STRICT_SWARM_SUBTASK_OUTPUT_KEYS.has(key));
-    if (unsupportedKeys.length > 0) throw new Error(`Coordinator subtask ${index + 1} includes unsupported keys: ${unsupportedKeys.join(', ')}`);
-    const id = typeof item.id === 'string' ? item.id.trim() : '';
-    const subObjective = typeof item.subObjective === 'string' ? item.subObjective.trim() : '';
-    if (!id) throw new Error(`Coordinator subtask ${index + 1} is missing id`);
-    if (!subObjective) throw new Error(`Coordinator subtask ${id} is missing subObjective`);
-    if (!Object.hasOwn(item, 'input')) throw new Error(`Coordinator subtask ${id} is missing input`);
-    if (item.input !== null && typeof item.input !== 'string') throw new Error(`Coordinator subtask ${id} input must be a string or null`);
-    if (!Array.isArray(item.attachmentRefs) || !item.attachmentRefs.every((ref) => typeof ref === 'string' && ref.length > 0)) {
-      throw new Error(`Coordinator subtask ${id} attachmentRefs must be an array of strings`);
-    }
-    if (typeof item.targetAgentId !== 'string' || item.targetAgentId.length === 0) throw new Error(`Coordinator subtask ${id} is missing targetAgentId`);
-    const attachmentRefs = item.attachmentRefs.filter((ref): ref is string => typeof ref === 'string' && ref.length > 0);
-    return {
-      id,
-      subObjective,
-      input: item.input,
-      attachmentRefs,
-      targetAgentId: item.targetAgentId,
-    };
-  });
-}
-
-function validateSdkDecomposition(subtasks: SwarmSubtask[], validWorkerIds: string[]): void {
-  const ids = new Set<string>();
-  const validWorkers = new Set(validWorkerIds);
-  const issues: string[] = [];
-  for (const subtask of subtasks) {
-    if (ids.has(subtask.id)) issues.push(`duplicate subtask id: ${subtask.id}`);
-    ids.add(subtask.id);
-    if (!subtask.targetAgentId) issues.push(`subtask ${subtask.id} is missing targetAgentId`);
-    else if (!validWorkers.has(subtask.targetAgentId)) issues.push(`subtask ${subtask.id} targets unknown worker agent: ${subtask.targetAgentId}`);
-  }
-  if (issues.length > 0) throw new Error(`Invalid swarm decomposition: ${issues.join('; ')}. Valid worker ids: ${validWorkerIds.join(', ')}`);
-}
-
 function formatCoordinatorFailure(result: RunResult): string {
   if (result.status === 'failure') return `Coordinator decomposition failed: ${result.error}`;
   if (result.status === 'approval_requested' || result.status === 'clarification_requested') return `Coordinator decomposition stopped: ${result.message}`;
@@ -1148,8 +1083,6 @@ function isJsonValue(value: unknown): value is JsonValue {
 function isRecord(value: unknown): value is Record<string, JsonValue> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
-
-const STRICT_SWARM_SUBTASK_OUTPUT_KEYS = new Set(['id', 'subObjective', 'input', 'attachmentRefs', 'targetAgentId']);
 
 function isScrollUpInput(data: string, granularity: 'line' | 'page'): boolean {
   if (granularity === 'page') return matchesKey(data, 'pageUp') || data === '\x1b[5~';

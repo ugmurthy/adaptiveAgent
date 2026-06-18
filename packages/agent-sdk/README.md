@@ -43,6 +43,36 @@ Common options:
 
 Use `adaptive-agent catalog` to print a human-readable inventory of the active agent, every agent found in `settings.agents.dirs`, every registered tool, and delegate skills found in `settings.skills.dirs`. Add `--output json` or `--output jsonl` for scripts.
 
+## Init install options
+
+`adaptive-agent init` creates `~/.adaptiveAgent`, writes the default agent, and installs the built-in `core` bundle unless `--minimal` is used. Bundled assets are regular agent JSON files and skill directories copied into the configured home folders:
+
+```text
+~/.adaptiveAgent/agents/
+~/.adaptiveAgent/skills/
+```
+
+Useful init variants:
+
+```bash
+adaptive-agent init --yes
+adaptive-agent init --minimal --yes
+adaptive-agent init --bundle coding --bundle research --yes
+adaptive-agent init --install-agent ./agents --install-skill ./skills --yes
+adaptive-agent init --install-manifest ./adaptive-agent.install.json --yes
+```
+
+Install manifests are JSON files with paths relative to the manifest file:
+
+```json
+{
+  "version": 1,
+  "bundles": ["research"],
+  "agents": ["./agents/reviewer.json"],
+  "skills": ["./skills/code-review"]
+}
+```
+
 ## Configuration API
 
 The CLI has two config files:
