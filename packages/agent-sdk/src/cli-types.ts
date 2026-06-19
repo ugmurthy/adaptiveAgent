@@ -10,7 +10,7 @@ import type { ApprovalMode, ClarificationMode, RuntimeMode, createAgentSdk } fro
 import type { InitProfile } from './install/init.js';
 
 export interface ManualTestCliOptions {
-  command: 'run' | 'chat' | 'spec' | 'config' | 'catalog' | 'eval' | 'swarm-run' | 'retry' | 'init' | 'doctor' | 'update' | 'agent-create' | 'version';
+  command: 'run' | 'chat' | 'spec' | 'config' | 'catalog' | 'eval' | 'swarm-run' | 'retry' | 'init' | 'doctor' | 'update' | 'uninstall' | 'agent-create' | 'version';
   specPath: string;
   goalArgs: string[];
   runId?: string;

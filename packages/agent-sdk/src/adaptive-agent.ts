@@ -28,6 +28,7 @@ import {
 } from './index.js';
 import { doctorExitCode, renderDoctorReport, runDoctor } from './install/doctor.js';
 import { renderInitReport, runInit, type InitProfile } from './install/init.js';
+import { renderUninstallReport, runUninstall, uninstallExitCode } from './install/uninstall.js';
 import { renderUpdateReport, runUpdate, updateExitCode } from './install/update.js';
 import { getVersionInfo, renderVersion } from './install/version.js';
 import { renderAgentCreateReport, runAgentCreate } from './agent-create.js';
@@ -107,6 +108,7 @@ Usage:
   adaptive-agent init [options]
   adaptive-agent doctor [options]
   adaptive-agent update [options]
+  adaptive-agent uninstall [options]
   adaptive-agent agent-create [options] <agent-description...>
   adaptive-agent spec <path> [options]
   adaptive-agent config [options]
@@ -127,6 +129,7 @@ Commands:
   init                  Create first-run configuration under ~/.adaptiveAgent.
   doctor                Check CLI installation and local configuration.
   update                Check for or apply GitHub Release updates.
+  uninstall             Remove the installed adaptive-agent CLI binary.
   agent-create          Generate and write a new agent config JSON file.
   spec                  Run the existing JSON spec format.
   config                Print resolved SDK configuration.
@@ -233,6 +236,9 @@ Update options:
   --repo <owner/repo>     GitHub release repo for update checks.
   --base-url <url>        Release asset base URL for update downloads.
 
+Uninstall options:
+  --dry-run               Show which CLI binary would be removed.
+
 Agent-create options:
   --file <path>           Read the new agent description from a text file.
   --generator-agent <path-or-name>
@@ -321,6 +327,10 @@ export async function main(argv = Bun.argv.slice(2)): Promise<number> {
     return runUpdateCommand(cli);
   }
 
+  if (cli.command === 'uninstall') {
+    return runUninstallCommand(cli);
+  }
+
   if (cli.command === 'agent-create') {
     return runAgentCreateCommand(cli);
   }
@@ -404,6 +414,14 @@ async function runUpdateCommand(cli: ManualTestCliOptions): Promise<number> {
   });
   console.log(renderUpdateReport(report, cli.output));
   return updateExitCode(report, cli.updateCheck);
+}
+
+async function runUninstallCommand(cli: ManualTestCliOptions): Promise<number> {
+  const report = await runUninstall({
+    dryRun: cli.dryRun,
+  });
+  console.log(renderUninstallReport(report, cli.output));
+  return uninstallExitCode(report);
 }
 
 async function runAgentCreateCommand(cli: ManualTestCliOptions): Promise<number> {
@@ -1038,7 +1056,7 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if (!commandSeen && (arg === 'run' || arg === 'chat' || arg === 'spec' || arg === 'config' || arg === 'catalog' || arg === 'eval' || arg === 'swarm-run' || arg === 'retry' || arg === 'init' || arg === 'doctor' || arg === 'update' || arg === 'agent-create')) {
+    if (!commandSeen && (arg === 'run' || arg === 'chat' || arg === 'spec' || arg === 'config' || arg === 'catalog' || arg === 'eval' || arg === 'swarm-run' || arg === 'retry' || arg === 'init' || arg === 'doctor' || arg === 'update' || arg === 'uninstall' || arg === 'agent-create')) {
       options.command = arg;
       commandSeen = true;
       if (arg === 'spec' && argv[index + 1] && !argv[index + 1].startsWith('--')) {

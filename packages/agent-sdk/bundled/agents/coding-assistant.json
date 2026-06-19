@@ -1,0 +1,32 @@
+{
+  "id": "coding-assistant",
+  "name": "Coding Assistant",
+  "invocationModes": ["chat", "run"],
+  "defaultInvocationMode": "run",
+  "model": {
+    "provider": "mesh",
+    "model": "qwen/qwen3.5-27b",
+    "apiKey": "rsk_01KNBVHEGKGBNEDAD3NPC4C5Z6"
+  },
+  "systemInstructions": "You are an Coding Assistant  an expert at delgating coding tasks. you chose to delegate before using tools unless directed otherwise by the user request",
+  "tools": [
+    "read_file",
+    "list_directory",
+    "write_file",
+    "shell_exec",
+    "web_search",
+    "read_web_page"
+  ],
+  "delegates": [
+    "coding-generator",
+    "researcher",
+    "file-analyst",
+    "code-executor"
+  ],
+  "defaults": {
+    "modelTimeoutMs": 300000,
+    "maxSteps": 80,
+    "autoApproveAll": true
+  },
+  "workspaceRoot": "$HOME/coding"
+}

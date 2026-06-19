@@ -1,0 +1,47 @@
+{
+  "id": "default-agent",
+  "name": "Default Agent",
+  "invocationModes": ["chat", "run"],
+  "defaultInvocationMode": "chat",
+  "model": {
+    "provider": "mesh",
+    "model": "qwen/qwen3.5-27b",
+    "apiKey": "MESH_API_KEY",
+    "structuredOutputMode": "prompted"
+  },
+  "systemInstructions": "You are an Agent Manager can expert at delgating tasks. you MUST choose delegates before using tools unless directed otherwise by the user request",
+  "capabilities": {
+    "modalitiesSupported": ["text", "image", "file"],
+    "modalitiesPreferred": ["text", "file"],
+    "modalityRoles": {
+      "text": "analyze",
+      "file": "analyze"
+    }
+  },
+  "tools": [
+    "read_file",
+    "list_directory",
+    "write_file",
+    "web_search",
+    "read_web_page"
+  ],
+  "delegates": [
+    "persistent-code-executor",
+    "researcher",
+    "file-analyst",
+    "audio-analyst"
+  ],
+  "defaults": {
+    "modelTimeoutMs": 1000000,
+    "modelRetryPolicy": {
+      "maxRetries": 1,
+      "retryOn": ["timeout", "network", "rate_limit", "provider_error"],
+      "baseDelayMs": 500,
+      "maxDelayMs": 8000,
+      "jitter": true
+    },
+    "maxSteps": 50,
+    "autoApproveAll": true,
+    "researchPolicy": "deep"
+  }
+}

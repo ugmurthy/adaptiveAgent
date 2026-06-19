@@ -385,6 +385,11 @@ describe('adaptive-agent cli parsing', () => {
       updateRepo: 'owner/repo',
       updateBaseUrl: 'https://example.test/releases/{tag}',
     });
+    expect(parseCliArgs(['uninstall', '--dry-run', '--output', 'json'])).toMatchObject({
+      command: 'uninstall',
+      dryRun: true,
+      output: 'json',
+    });
   });
 
   it('parses agent-create flags and description text', () => {

@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { renderDoctorReport, runDoctor } from './doctor.js';
 import { compareSemver, resolveAssetName } from './github-release.js';
 import { renderInitReport, runInit } from './init.js';
+import { renderUninstallReport, runUninstall, uninstallExitCode } from './uninstall.js';
 import { runUpdate, updateExitCode } from './update.js';
 import { renderVersion } from './version.js';
 import { findChecksum, verifySha256File } from './checksum.js';
@@ -262,5 +263,32 @@ describe('install workflow helpers', () => {
 
     expect(report.status).toBe('updated');
     expect(await readFile(installPath, 'utf8')).toContain('0.2.0');
+  });
+
+  it('uninstalls a standalone macOS or Linux CLI without removing config', async () => {
+    const installPath = join(tempDir, 'adaptive-agent');
+    await writeFile(installPath, '#!/usr/bin/env sh\necho adaptive-agent 0.1.0\n');
+    await chmod(installPath, 0o755);
+
+    const report = await runUninstall({ platform: 'darwin', currentExecutablePath: installPath });
+
+    expect(report.status).toBe('uninstalled');
+    expect(renderUninstallReport(report)).toContain('~/.adaptiveAgent was not removed');
+    await expect(readFile(installPath, 'utf8')).rejects.toThrow();
+    expect(uninstallExitCode(report)).toBe(0);
+  });
+
+  it('dry-runs uninstall and refuses non adaptive-agent executable paths', async () => {
+    const installPath = join(tempDir, 'adaptive-agent');
+    await writeFile(installPath, '#!/usr/bin/env sh\necho adaptive-agent 0.1.0\n');
+
+    const dryRun = await runUninstall({ dryRun: true, platform: 'linux', currentExecutablePath: installPath });
+    expect(dryRun.status).toBe('would_uninstall');
+    expect(await readFile(installPath, 'utf8')).toContain('0.1.0');
+
+    const refused = await runUninstall({ platform: 'darwin', currentExecutablePath: join(tempDir, 'bun') });
+    expect(refused.status).toBe('failed');
+    expect(refused.error).toContain('Refusing to remove');
+    expect(uninstallExitCode(refused)).toBe(1);
   });
 });
