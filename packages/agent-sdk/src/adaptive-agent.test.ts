@@ -392,6 +392,35 @@ describe('adaptive-agent cli parsing', () => {
     });
   });
 
+  it('returns success for init when bundled defaults already exist', async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), 'adaptive-agent-init-'));
+    const homeDir = join(tempDir, 'home');
+    const originalHome = process.env.ADAPTIVE_AGENT_HOME;
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      process.env.ADAPTIVE_AGENT_HOME = homeDir;
+      await main(['init', '--yes', '--cwd', tempDir]);
+      log.mockClear();
+
+      const exitCode = await main(['init', '--yes', '--cwd', tempDir]);
+      const rendered = String(log.mock.calls[0]?.[0]);
+
+      expect(exitCode).toBe(0);
+      expect(rendered).toContain('Installed bundled assets: core');
+      expect(rendered).toContain('agents/default-agent.json');
+      expect(rendered).toContain('-- exists');
+    } finally {
+      log.mockRestore();
+      if (originalHome === undefined) {
+        delete process.env.ADAPTIVE_AGENT_HOME;
+      } else {
+        process.env.ADAPTIVE_AGENT_HOME = originalHome;
+      }
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('parses agent-create flags and description text', () => {
     expect(parseCliArgs([
       'agent-create',

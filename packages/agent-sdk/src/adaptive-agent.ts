@@ -383,7 +383,7 @@ async function runInitCommand(cli: ManualTestCliOptions): Promise<number> {
     dryRun: cli.dryRun,
   });
   console.log(renderInitReport(report, cli.output));
-  return report.actions.some((action) => action.kind === 'file' && action.status === 'exists') ? 1 : 0;
+  return report.actions.some((action) => action.status === 'failed') ? 1 : 0;
 }
 
 async function runDoctorCommand(cli: ManualTestCliOptions): Promise<number> {
