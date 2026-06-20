@@ -571,6 +571,105 @@ describe('adaptive-agent catalog command', () => {
   });
 });
 
+describe('adaptive-agent config command', () => {
+  let tempDir: string;
+  let originalWebSearchProvider: string | undefined;
+  let originalBraveApiKey: string | undefined;
+  let originalSerperApiKey: string | undefined;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'adaptive-agent-config-'));
+    originalWebSearchProvider = process.env.WEB_SEARCH_PROVIDER;
+    originalBraveApiKey = process.env.BRAVE_SEARCH_API_KEY;
+    originalSerperApiKey = process.env.SERPER_API_KEY;
+    delete process.env.WEB_SEARCH_PROVIDER;
+    delete process.env.BRAVE_SEARCH_API_KEY;
+    delete process.env.SERPER_API_KEY;
+    await writeAgentConfig(join(tempDir, 'agent.json'));
+  });
+
+  afterEach(async () => {
+    if (originalWebSearchProvider === undefined) {
+      delete process.env.WEB_SEARCH_PROVIDER;
+    } else {
+      process.env.WEB_SEARCH_PROVIDER = originalWebSearchProvider;
+    }
+    if (originalBraveApiKey === undefined) {
+      delete process.env.BRAVE_SEARCH_API_KEY;
+    } else {
+      process.env.BRAVE_SEARCH_API_KEY = originalBraveApiKey;
+    }
+    if (originalSerperApiKey === undefined) {
+      delete process.env.SERPER_API_KEY;
+    } else {
+      process.env.SERPER_API_KEY = originalSerperApiKey;
+    }
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it('prints the resolved web search provider in pretty output', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      const exitCode = await main(['config', '--cwd', tempDir]);
+      const rendered = log.mock.calls.map((call) => String(call[0])).join('\n');
+
+      expect(exitCode).toBe(0);
+      expect(rendered).toContain('model: ollama/qwen3.5');
+      expect(rendered).toContain('webSearchProvider: duckduckgo');
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('reports the API-backed web search provider when it will be used', async () => {
+    process.env.WEB_SEARCH_PROVIDER = 'brave';
+    process.env.BRAVE_SEARCH_API_KEY = 'brave-key';
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      const exitCode = await main(['config', '--cwd', tempDir, '--output', 'json']);
+      const output = JSON.parse(String(log.mock.calls[0]?.[0])) as { webSearch?: { provider?: string } };
+
+      expect(exitCode).toBe(0);
+      expect(output.webSearch?.provider).toBe('brave');
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('prints the resolved web search provider in pretty dry-run output', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      const exitCode = await main(['run', '--dry-run', '--cwd', tempDir, 'hello']);
+      const rendered = stripAnsi(log.mock.calls.map((call) => String(call[0])).join('\n'));
+
+      expect(exitCode).toBe(0);
+      expect(rendered).toContain('webSearchProvider');
+      expect(rendered).toContain('duckduckgo');
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('reports the resolved web search provider in json dry-run output', async () => {
+    process.env.WEB_SEARCH_PROVIDER = 'brave';
+    process.env.BRAVE_SEARCH_API_KEY = 'brave-key';
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      const exitCode = await main(['run', '--dry-run', '--cwd', tempDir, '--output', 'json', 'hello']);
+      const output = JSON.parse(String(log.mock.calls[0]?.[0])) as { webSearch?: { provider?: string } };
+
+      expect(exitCode).toBe(0);
+      expect(output.webSearch?.provider).toBe('brave');
+    } finally {
+      log.mockRestore();
+    }
+  });
+});
+
 describe('adaptive-agent benchmark cases', () => {
   let tempDir: string;
 
@@ -752,6 +851,40 @@ describe('adaptive-agent benchmark cases', () => {
         level: '1',
         split: 'validation',
       }]);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('preserves settings env for eval gaia dry-run when interaction flags override settings', async () => {
+    await writeAgentConfig(join(tempDir, 'agent.json'));
+    await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({
+      env: {
+        WEB_SEARCH_PROVIDER: 'serper',
+        SERPER_API_KEY: 'serper-key',
+      },
+    }));
+    const inputPath = join(tempDir, 'gaia-dry-run-serper.jsonl');
+    await writeFile(inputPath, JSON.stringify({
+      task_id: 'gaia-1',
+      Question: 'What is 2+2?',
+    }));
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      const exitCode = await main([
+        'eval', 'gaia',
+        '--input', inputPath,
+        '--cwd', tempDir,
+        '--dry-run',
+        '--output', 'json',
+        '--approval', 'auto',
+        '--clarification', 'fail',
+      ]);
+      const output = JSON.parse(String(log.mock.calls[0]?.[0])) as { webSearch?: { provider?: string } };
+
+      expect(exitCode).toBe(0);
+      expect(output.webSearch?.provider).toBe('serper');
     } finally {
       log.mockRestore();
     }

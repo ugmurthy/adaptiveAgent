@@ -13,6 +13,7 @@ import {
   skillToDelegate,
   type DelegateDefinition,
   type ToolDefinition,
+  type WebSearchProvider,
 } from '@adaptive-agent/core';
 
 import type {
@@ -50,11 +51,18 @@ function createBuiltinTools(workspaceRoot: string, shellCwd: string, env: NodeJS
   tools.set('write_file', createWriteFileTool({ allowedRoot: workspaceRoot }));
   tools.set('shell_exec', createShellExecTool({ cwd: shellCwd }));
   const timeoutMs = parsePositiveInteger(env.WEB_TOOL_TIMEOUT_MS);
-  if (env.WEB_SEARCH_PROVIDER === 'brave' && env.BRAVE_SEARCH_API_KEY) tools.set('web_search', createWebSearchTool({ provider: 'brave', apiKey: env.BRAVE_SEARCH_API_KEY, timeoutMs }));
-  else if (env.WEB_SEARCH_PROVIDER === 'serper' && env.SERPER_API_KEY) tools.set('web_search', createWebSearchTool({ provider: 'serper', apiKey: env.SERPER_API_KEY, timeoutMs }));
+  const webSearchProvider = resolveWebSearchProvider(env);
+  if (webSearchProvider === 'brave') tools.set('web_search', createWebSearchTool({ provider: 'brave', apiKey: env.BRAVE_SEARCH_API_KEY!, timeoutMs }));
+  else if (webSearchProvider === 'serper') tools.set('web_search', createWebSearchTool({ provider: 'serper', apiKey: env.SERPER_API_KEY!, timeoutMs }));
   else tools.set('web_search', createWebSearchTool({ provider: 'duckduckgo', timeoutMs }));
   tools.set('read_web_page', createReadWebPageTool({ timeoutMs }));
   return tools;
+}
+
+export function resolveWebSearchProvider(env: NodeJS.ProcessEnv): WebSearchProvider {
+  if (env.WEB_SEARCH_PROVIDER === 'brave' && env.BRAVE_SEARCH_API_KEY) return 'brave';
+  if (env.WEB_SEARCH_PROVIDER === 'serper' && env.SERPER_API_KEY) return 'serper';
+  return 'duckduckgo';
 }
 
 async function loadDelegates(names: string[], dirs: string[], availableTools: Set<string>): Promise<DelegateDefinition[]> {

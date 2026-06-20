@@ -153,6 +153,7 @@ export interface AgentSdkOptions {
   agentConfig?: AgentConfigFile;
   agentConfigPath?: string;
   settingsConfig?: AgentSettingsFile;
+  settingsOverrides?: AgentSettingsFile;
   settingsConfigPath?: string;
   model?: Partial<ModelAdapterConfig> & { apiKeyEnv?: string };
   runtimeMode?: RuntimeMode;

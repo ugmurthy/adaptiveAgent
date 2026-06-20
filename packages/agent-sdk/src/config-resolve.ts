@@ -40,12 +40,13 @@ export async function resolveAgentSdkConfigWithSources(options: AgentSdkOptions)
   const cwd = options.cwd ?? process.cwd();
   const env = { ...(options.env ?? process.env) };
   const settingsLoaded = options.settingsConfig ? { path: '<inline settings>', value: options.settingsConfig } : await loadOptionalSettings(cwd, options.settingsConfigPath, env);
-  const settings = validateSettings(expandStrings(settingsLoaded?.value ?? {}), settingsLoaded?.path ?? '<defaults>');
+  const settingsSource = settingsLoaded?.path ?? '<defaults>';
+  const settings = validateSettings(expandStrings(mergeSettings(settingsLoaded?.value ?? {}, options.settingsOverrides)), settingsSource);
   Object.assign(env, settings.env ?? {});
   const agentDirs = resolveAgentDirs(cwd, settings.agents?.dirs, env);
   const agentLoaded = options.agentConfig ? { path: '<inline agent>', value: options.agentConfig } : await loadRequiredAgent(cwd, options.agentConfigPath ?? settings.agent?.configPath, env, agentDirs);
   const agent = validateAgent(expandStrings(agentLoaded.value), agentLoaded.path);
-  if (settings.agent?.id && settings.agent.id !== agent.id) throw new AgentSettingsValidationError(settingsLoaded?.path ?? '<settings>', [`settings.agent.id (${settings.agent.id}) does not match agent.id (${agent.id})`]);
+  if (settings.agent?.id && settings.agent.id !== agent.id) throw new AgentSettingsValidationError(settingsSource, [`settings.agent.id (${settings.agent.id}) does not match agent.id (${agent.id})`]);
 
   const workspaceRoot = resolvePath(cwd, optionsString(settings.workspace?.overrideRoot) ?? optionsString(agent.workspace?.root) ?? optionsString(agent.workspaceRoot) ?? cwd);
   const shellCwd = resolvePath(workspaceRoot, optionsString(settings.workspace?.overrideShellCwd) ?? optionsString(agent.workspace?.shellCwd) ?? workspaceRoot);
@@ -57,7 +58,7 @@ export async function resolveAgentSdkConfigWithSources(options: AgentSdkOptions)
   const requestedMode = options.runtimeMode ?? settings.runtime?.mode ?? 'postgres';
   const postgresExplicit = Boolean(options.runtimeMode === 'postgres' || settings.runtime?.mode === 'postgres');
   const mode = requestedMode === 'postgres' && !env.DATABASE_URL && !postgresExplicit ? 'memory' : requestedMode;
-  if (requestedMode === 'postgres' && !env.DATABASE_URL && postgresExplicit && !options.runtime) throw new AgentSettingsValidationError(settingsLoaded?.path ?? '<settings>', ['runtime.mode is postgres but DATABASE_URL is not set']);
+  if (requestedMode === 'postgres' && !env.DATABASE_URL && postgresExplicit && !options.runtime) throw new AgentSettingsValidationError(settingsSource, ['runtime.mode is postgres but DATABASE_URL is not set']);
   const config: ResolvedAgentSdkConfig = {
     agent,
     settings,
@@ -84,6 +85,34 @@ export async function resolveAgentSdkConfigWithSources(options: AgentSdkOptions)
     config,
     agentPath: agentLoaded.path,
     ...(settingsLoaded?.path ? { settingsPath: settingsLoaded.path } : {}),
+  };
+}
+
+function mergeSettings(base: AgentSettingsFile, overrides: AgentSettingsFile | undefined): AgentSettingsFile {
+  if (!overrides) return base;
+  return {
+    ...base,
+    ...overrides,
+    ...(base.agent || overrides.agent ? { agent: { ...(base.agent ?? {}), ...(overrides.agent ?? {}) } } : {}),
+    ...(base.agents || overrides.agents ? { agents: { ...(base.agents ?? {}), ...(overrides.agents ?? {}) } } : {}),
+    ...(base.runtime || overrides.runtime ? { runtime: { ...(base.runtime ?? {}), ...(overrides.runtime ?? {}) } } : {}),
+    ...(base.logging || overrides.logging ? { logging: { ...(base.logging ?? {}), ...(overrides.logging ?? {}) } } : {}),
+    ...(base.interaction || overrides.interaction ? { interaction: { ...(base.interaction ?? {}), ...(overrides.interaction ?? {}) } } : {}),
+    ...(base.events || overrides.events ? { events: { ...(base.events ?? {}), ...(overrides.events ?? {}) } } : {}),
+    ...(base.skills || overrides.skills ? { skills: { ...(base.skills ?? {}), ...(overrides.skills ?? {}) } } : {}),
+    ...(base.workspace || overrides.workspace ? { workspace: { ...(base.workspace ?? {}), ...(overrides.workspace ?? {}) } } : {}),
+    ...(base.model || overrides.model ? { model: { ...(base.model ?? {}), ...(overrides.model ?? {}) } } : {}),
+    ...(base.defaults || overrides.defaults ? { defaults: { ...(base.defaults ?? {}), ...(overrides.defaults ?? {}) } } : {}),
+    ...(base.env || overrides.env ? { env: { ...(base.env ?? {}), ...(overrides.env ?? {}) } } : {}),
+    ...(base.tui || overrides.tui
+      ? {
+          tui: {
+            ...(base.tui ?? {}),
+            ...(overrides.tui ?? {}),
+            messages: { ...(base.tui?.messages ?? {}), ...(overrides.tui?.messages ?? {}) },
+          },
+        }
+      : {}),
   };
 }
 

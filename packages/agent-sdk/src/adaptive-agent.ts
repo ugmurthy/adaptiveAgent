@@ -35,6 +35,7 @@ import { renderAgentCreateReport, runAgentCreate } from './agent-create.js';
 import { formatSwarmExecutionPlan, formatSwarmRunStatuses, formatSwarmSubtasks } from './swarm-format.js';
 import { createSwarmRoleAgentConfig } from './swarm-role-config.js';
 import { buildSwarmCoordinator, parseSwarmSubtasks, runSwarmDecomposition, validateSdkDecomposition } from './swarm-runner.js';
+import { resolveWebSearchProvider } from './tool-registry.js';
 import type {
   BenchmarkAttachmentType,
   BenchmarkCase,
@@ -844,13 +845,16 @@ async function runRetryCommand(cli: ManualTestCliOptions): Promise<number> {
 
 async function runConfigCommand(cli: ManualTestCliOptions): Promise<number> {
   const resolvedCwd = resolve(cli.cwd ?? process.cwd());
-  const resolvedConfig = await loadAgentSdkConfig(buildSdkOptions(cli, resolvedCwd));
+  const sdkOptions = buildSdkOptions(cli, resolvedCwd);
+  const resolvedConfig = await loadAgentSdkConfig(sdkOptions);
+  const webSearchProvider = resolveWebSearchProvider({ ...(sdkOptions.env ?? process.env), ...(resolvedConfig.settings.env ?? {}) });
   if (cli.output === 'json') {
-    console.log(JSON.stringify(resolvedConfig, null, 2));
+    console.log(JSON.stringify({ ...resolvedConfig, webSearch: { provider: webSearchProvider } }, null, 2));
     return 0;
   }
   console.log(`agent: ${resolvedConfig.agent.id} (${resolvedConfig.agent.name})`);
   console.log(`model: ${resolvedConfig.model.provider}/${resolvedConfig.model.model}`);
+  console.log(`webSearchProvider: ${webSearchProvider}`);
   console.log(`runtime: ${resolvedConfig.runtime.mode} (requested ${resolvedConfig.runtime.requestedMode})`);
   console.log(`workspace: ${resolvedConfig.workspaceRoot}`);
   console.log(`shellCwd: ${resolvedConfig.shellCwd}`);
@@ -1419,14 +1423,14 @@ export function collectProviderWarnings(spec: ManualTestSpec, provider: 'openrou
   return warnings;
 }
 
-function buildSdkOptions(cli: ManualTestCliOptions, cwd: string) {
+function buildSdkOptions(cli: ManualTestCliOptions, cwd: string): AgentSdkOptions {
   return {
     cwd,
     agentConfigPath: cli.agentConfigPath,
     settingsConfigPath: cli.settingsConfigPath,
     runtimeMode: cli.runtimeMode,
     model: cli.provider || cli.model ? { ...(cli.provider ? { provider: cli.provider } : {}), ...(cli.model ? { model: cli.model } : {}) } : undefined,
-    settingsConfig: cli.approvalMode || cli.clarificationMode
+    settingsOverrides: cli.approvalMode || cli.clarificationMode
       ? {
           interaction: {
             ...(cli.approvalMode ? { approvalMode: cli.approvalMode } : {}),
@@ -2278,6 +2282,7 @@ function formatEvalDryRunMarkdown(
   totalCases: number,
 ): string {
   const config = inspection.config;
+  const webSearchProvider = resolveWebSearchProvider({ ...process.env, ...(config.settings.env ?? {}) });
   const lines = [
     '# Dry run',
     '',
@@ -2289,6 +2294,7 @@ function formatEvalDryRunMarkdown(
     `- \`swarm\`: \`${cli.evalSwarm}\``,
     `- \`approval\`: \`${config.interaction.approvalMode}\``,
     `- \`clarification\`: \`${config.interaction.clarificationMode}\``,
+    `- \`webSearchProvider\`: \`${webSearchProvider}\``,
     `- \`shellCwd\`: \`${config.shellCwd}\``,
     `- \`agentSearchDirs\`: ${formatNameList(config.agents.dirs)}`,
     `- \`skillSearchDirs\`: ${formatNameList(config.skills.dirs)}`,
@@ -2341,6 +2347,7 @@ function summarizeEvalDryRun(
     dryRun: true,
     cli: summarizeCli(cli),
     resolvedConfig: summarizeEvalResolvedConfig(inspection.config),
+    webSearch: { provider: resolveWebSearchProvider({ ...process.env, ...(inspection.config.settings.env ?? {}) }) },
     benchmark: {
       dataset: cli.evalDataset ?? 'benchmark',
       inputPath: cli.evalInputPath ? resolve(cli.cwd ? resolve(cli.cwd) : process.cwd(), cli.evalInputPath) : undefined,

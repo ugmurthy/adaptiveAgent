@@ -1137,7 +1137,7 @@ function buildSdkOptions(cli: TuiCliOptions): AgentSdkOptions {
     settingsConfigPath: cli.settingsConfigPath,
     runtimeMode: cli.runtimeMode,
     model: cli.provider || cli.model ? { ...(cli.provider ? { provider: cli.provider } : {}), ...(cli.model ? { model: cli.model } : {}) } : undefined,
-    settingsConfig: cli.approvalMode || cli.clarificationMode
+    settingsOverrides: cli.approvalMode || cli.clarificationMode
       ? {
           interaction: {
             ...(cli.approvalMode ? { approvalMode: cli.approvalMode } : {}),
