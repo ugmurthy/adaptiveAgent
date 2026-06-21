@@ -5026,6 +5026,76 @@ describe('AdaptiveAgent', () => {
     expect(model.receivedRequests[4]?.tools?.map((tool) => tool.name)).not.toContain('web_search');
   });
 
+  it('keeps returning skipped results when the model repeatedly calls an exhausted hidden-budget tool', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const toolExecutionStore = new InMemoryToolExecutionStore();
+    let executedSearches = 0;
+    const searchTool: ToolDefinition = {
+      ...createBudgetedSearchTool(),
+      execute: async (input) => {
+        executedSearches += 1;
+        return {
+          query: typeof input === 'object' && input && 'query' in input ? input.query : 'unknown',
+          results: [{ title: 'stub', url: 'https://example.com', snippet: 'stub' }],
+        };
+      },
+    };
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [{ id: 'search-1', name: 'web_search', input: { query: 'first', purpose: 'find starting evidence' } }],
+      },
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [{ id: 'search-2', name: 'web_search', input: { query: 'second', purpose: 'double check' } }],
+      },
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [{ id: 'search-3', name: 'web_search', input: { query: 'third', purpose: 'exhaust budget' } }],
+      },
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [{ id: 'search-4', name: 'web_search', input: { query: 'fourth', purpose: 'ignore hidden tool list' } }],
+      },
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [{ id: 'search-5', name: 'web_search', input: { query: 'fifth', purpose: 'repeat stale manifest call' } }],
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: { done: true },
+      },
+    ]);
+
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [searchTool],
+      runStore,
+      eventStore,
+      snapshotStore,
+      toolExecutionStore,
+      defaults: {
+        researchPolicy: 'light',
+      },
+    });
+
+    const result = await agent.run({ goal: 'Research something current' });
+    expect(result).toMatchObject({
+      status: 'success',
+      output: { done: true },
+    });
+    expect(executedSearches).toBe(2);
+    expect(model.receivedRequests[4]?.tools?.map((tool) => tool.name)).not.toContain('web_search');
+    expect(model.receivedRequests[5]?.messages.at(-1)).toMatchObject({
+      role: 'tool',
+      name: 'web_search',
+      toolCallId: 'search-5',
+      content: expect.stringContaining('budget_exhausted'),
+    });
+  });
+
   it('drains same-batch pending calls for exhausted research budgets as skipped tool results', async () => {
     const runStore = new InMemoryRunStore();
     const eventStore = new InMemoryEventStore();

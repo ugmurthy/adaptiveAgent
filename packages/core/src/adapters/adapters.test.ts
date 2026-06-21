@@ -324,6 +324,31 @@ function mockFetchResponse(body: unknown, status = 200) {
   );
 }
 
+function mockFetchSseResponse(chunks: unknown[], options?: { includeDone?: boolean }) {
+  const encoder = new TextEncoder();
+  const frames = chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`);
+  if (options?.includeDone !== false) {
+    frames.push('data: [DONE]\n\n');
+  }
+
+  fetchSpy.mockResolvedValueOnce(
+    new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const frame of frames) {
+            controller.enqueue(encoder.encode(frame));
+          }
+          controller.close();
+        },
+      }),
+      {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      },
+    ),
+  );
+}
+
 function fetchRequest(): Request {
   const input = fetchSpy.mock.calls[0]?.[0];
   if (!(input instanceof Request)) {
@@ -374,6 +399,8 @@ describe('BaseOpenAIChatAdapter', () => {
 
     const body = JSON.parse(init.body);
     expect(body.model).toBe(adapter.model);
+    expect(body.stream).toBe(true);
+    expect(body.stream_options).toEqual({ include_usage: true });
     expect(body.messages).toHaveLength(2);
     expect(body.messages[0].role).toBe('system');
 
@@ -395,6 +422,128 @@ describe('BaseOpenAIChatAdapter', () => {
       adapterResponseLatencyMs: expect.any(Number),
       adapterStatusCode: 200,
     });
+  });
+
+  it('aggregates OpenAI-compatible SSE text chunks and stops at DONE', async () => {
+    const adapter = createAdapter();
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        ': keepalive\n\n' +
+          `data: ${JSON.stringify(openAIStreamDelta({ content: 'Hello' }))}\n\n` +
+          `data: ${JSON.stringify(openAIStreamDelta({ content: ' world' }))}\n\n` +
+          `data: ${JSON.stringify(openAIStreamDelta({}, { finishReason: 'stop', usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } }))}\n\n` +
+          'data: [DONE]\n\n' +
+          'data: {"bad":"ignored after done"}\n\n',
+        {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        },
+      ),
+    );
+
+    const result = await adapter.generate(simpleRequest());
+
+    expect(result.text).toBe('Hello world');
+    expect(result.finishReason).toBe('stop');
+    expect(result.providerResponseId).toBe('chatcmpl-openai-stream');
+    expect(result.usage).toMatchObject({
+      promptTokens: 10,
+      completionTokens: 5,
+      totalTokens: 15,
+      provider: 'test',
+      model: adapter.model,
+    });
+  });
+
+  it('reconstructs fragmented OpenAI-compatible streaming tool calls by index', async () => {
+    const adapter = createAdapter();
+    mockFetchSseResponse([
+      openAIStreamDelta({ tool_calls: [{ index: 1, id: 'call-2', type: 'function', function: { name: 'lookup', arguments: '{"topic":"two"}' } }] }),
+      openAIStreamDelta({ tool_calls: [{ index: 0, id: 'call-1', type: 'function', function: { name: 'lookup', arguments: '{"topic"' } }] }),
+      openAIStreamDelta({ tool_calls: [{ index: 0, type: 'function', function: { arguments: ':"one"}' } }] }),
+      openAIStreamDelta({}, { finishReason: 'tool_calls' }),
+    ]);
+
+    const result = await adapter.generate(requestWithTools());
+
+    expect(result.finishReason).toBe('tool_calls');
+    expect(result.text).toBeUndefined();
+    expect(result.toolCalls).toEqual([
+      { id: 'call-1', name: 'lookup', input: { topic: 'one' } },
+      { id: 'call-2', name: 'lookup', input: { topic: 'two' } },
+    ]);
+  });
+
+  it('does not retry OpenAI-compatible mid-stream failures', async () => {
+    const adapter = createAdapter();
+    const encoder = new TextEncoder();
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(openAIStreamDelta({ content: 'partial' }))}\n\n`));
+            controller.error(new Error('stream broke'));
+          },
+        }),
+        {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        },
+      ),
+    );
+
+    await expect(adapter.generate(simpleRequest())).rejects.toMatchObject({
+      message: 'stream broke',
+      modelInvocationPhase: 'response_body',
+      modelInvocationAttempt: 1,
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails OpenAI-compatible provider error frames without retrying', async () => {
+    const adapter = createAdapter();
+    mockFetchSseResponse([
+      openAIStreamDelta({ content: 'partial' }),
+      { error: { code: 'upstream_error', message: 'upstream stream failed' }, request_id: 'req_stream_123' },
+    ]);
+
+    await expect(adapter.generate(simpleRequest())).rejects.toMatchObject({
+      message: 'upstream stream failed [requestId=req_stream_123]',
+      modelInvocationPhase: 'response_body',
+      modelInvocationAttempt: 1,
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('releases the OpenAI-compatible request gate when stream consumption aborts', async () => {
+    const adapter = createAdapter({ maxConcurrentRequests: 1 });
+    const controller = new AbortController();
+    const encoder = new TextEncoder();
+    fetchSpy.mockImplementationOnce((_url: string, init: RequestInit) => Promise.resolve(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(streamController) {
+            streamController.enqueue(encoder.encode(`data: ${JSON.stringify(openAIStreamDelta({ content: 'partial' }))}\n\n`));
+            init.signal?.addEventListener('abort', () => {
+              streamController.error(new DOMException('The operation was aborted.', 'AbortError'));
+            }, { once: true });
+          },
+        }),
+        {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        },
+      ),
+    ));
+
+    const first = adapter.generate(simpleRequest({ signal: controller.signal }));
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(1));
+    controller.abort(new Error('stop stream'));
+    await expect(first).rejects.toThrow('stop stream');
+
+    mockFetchSseResponse([openAIStreamDelta({ content: 'after abort' }), openAIStreamDelta({}, { finishReason: 'stop' })]);
+    await expect(adapter.generate(simpleRequest())).resolves.toMatchObject({ text: 'after abort' });
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
 
   it('uses provider-reported usage cost when present', async () => {
@@ -1138,6 +1287,42 @@ describe('OpenRouterAdapter', () => {
     });
   });
 
+  it('aggregates OpenRouter SDK stream chunks and restores delegate tool aliases', async () => {
+    const adapter = new OpenRouterAdapter({
+      model: 'anthropic/claude-sonnet-4',
+      apiKey: 'or-key',
+    });
+    mockFetchSseResponse([
+      openAIStreamDelta({ content: 'Preparing delegation. ' }),
+      openAIStreamDelta({ tool_calls: [{ index: 0, id: 'call-delegate-1', type: 'function', function: { name: 'delegate__72657365617263686572', arguments: '{"goal"' } }] }),
+      openAIStreamDelta({ tool_calls: [{ index: 0, type: 'function', function: { arguments: ':"research testing"}' } }] }),
+      openAIStreamDelta({}, { finishReason: 'tool_calls', usage: { prompt_tokens: 20, completion_tokens: 10, total_tokens: 30 } }),
+    ]);
+
+    const result = await adapter.generate(requestWithDelegateTools());
+
+    expect(result.text).toBe('Preparing delegation. ');
+    expect(result.finishReason).toBe('tool_calls');
+    expect(result.toolCalls).toEqual([
+      {
+        id: 'call-delegate-1',
+        name: 'delegate.researcher',
+        input: { goal: 'research testing' },
+      },
+    ]);
+    expect(result.usage).toMatchObject({
+      promptTokens: 20,
+      completionTokens: 10,
+      totalTokens: 30,
+      provider: 'openrouter',
+      model: 'anthropic/claude-sonnet-4',
+    });
+
+    const body = await fetchRequest().json() as { stream?: boolean; stream_options?: { include_usage?: boolean } };
+    expect(body.stream).toBe(true);
+    expect(body.stream_options).toEqual({ include_usage: true });
+  });
+
   it('rewrites local text file inputs into text content parts for OpenRouter', async () => {
     const tempDir = await mkdtemp(join(tmpdir(), 'openrouter-text-file-'));
     try {
@@ -1465,7 +1650,8 @@ describe('MistralAdapter', () => {
 describe('MeshAdapter', () => {
   it('uses Mesh base URL and auth', async () => {
     const adapter = new MeshAdapter({ model: 'openai/gpt-4o', apiKey: 'mesh-key' });
-    mockFetchResponse(STOP_RESPONSE);
+    const chunks = meshTextChunks('Hello world');
+    mockFetchSseResponse(chunks);
 
     const response = await adapter.generate(simpleRequest());
 
@@ -1473,13 +1659,13 @@ describe('MeshAdapter', () => {
     expect(fetchSpy.mock.calls[0][1].headers['Authorization']).toBe('Bearer mesh-key');
     expect(adapter.provider).toBe('mesh');
     expect(adapter.capabilities.usage).toBe(true);
-    expect(response.rawProviderResponse).toEqual(STOP_RESPONSE);
+    expect(response.rawProviderResponse).toEqual(chunks);
   });
 
   it('passes the runtime model timeout to the Mesh SDK HTTP timeout', async () => {
     const timeoutSpy = vi.spyOn(AbortSignal, 'timeout');
     const adapter = new MeshAdapter({ model: 'auto', apiKey: 'mesh-key' });
-    mockFetchResponse(STOP_RESPONSE);
+    mockFetchSseResponse(meshTextChunks('Hello world'));
 
     await adapter.generate(simpleRequest({ modelTimeoutMs: 900_000 }));
 
@@ -1489,7 +1675,7 @@ describe('MeshAdapter', () => {
   it('uses 15 minutes for Mesh SDK HTTP timeout when runtime model timeout is disabled', async () => {
     const timeoutSpy = vi.spyOn(AbortSignal, 'timeout');
     const adapter = new MeshAdapter({ model: 'auto', apiKey: 'mesh-key' });
-    mockFetchResponse(STOP_RESPONSE);
+    mockFetchSseResponse(meshTextChunks('Hello world'));
 
     await adapter.generate(simpleRequest({ modelTimeoutMs: 0 }));
 
@@ -1498,7 +1684,7 @@ describe('MeshAdapter', () => {
 
   it('preserves tool result names when using the Mesh SDK client path', async () => {
     const adapter = new MeshAdapter({ model: 'auto', apiKey: 'mesh-key' });
-    mockFetchResponse(STOP_RESPONSE);
+    mockFetchSseResponse(meshTextChunks('Hello world'));
 
     await adapter.generate(requestWithToolResult());
 
@@ -1510,6 +1696,139 @@ describe('MeshAdapter', () => {
       name: 'lookup',
       tool_call_id: 'call-1',
     });
+    expect(body.stream).toBe(true);
+  });
+
+  it('aggregates Mesh streaming text chunks into the final response', async () => {
+    const adapter = new MeshAdapter({ model: 'auto', apiKey: 'mesh-key' });
+    mockFetchSseResponse([
+      meshDelta({ content: 'Hello' }),
+      meshDelta({ content: ' world' }),
+      meshDelta({}, { finishReason: 'stop', usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } }),
+    ]);
+
+    const result = await adapter.generate(simpleRequest());
+
+    expect(result.text).toBe('Hello world');
+    expect(result.structuredOutput).toBeUndefined();
+    expect(result.finishReason).toBe('stop');
+    expect(result.providerResponseId).toBe('chatcmpl-mesh-stream');
+    expect(result.usage).toMatchObject({
+      promptTokens: 10,
+      completionTokens: 5,
+      totalTokens: 15,
+      provider: 'mesh',
+      model: 'auto',
+    });
+  });
+
+  it('parses structured output from completed Mesh streaming text', async () => {
+    const adapter = new MeshAdapter({ model: 'auto', apiKey: 'mesh-key' });
+    mockFetchSseResponse([
+      meshDelta({ content: '{"result"' }),
+      meshDelta({ content: ':"structured"}' }),
+      meshDelta({}, { finishReason: 'stop' }),
+    ]);
+
+    const result = await adapter.generate(simpleRequest({ outputSchema: { type: 'object' } }));
+
+    expect(result.text).toBe('{"result":"structured"}');
+    expect(result.structuredOutput).toEqual({ result: 'structured' });
+  });
+
+  it('reconstructs fragmented Mesh streaming tool call arguments', async () => {
+    const adapter = new MeshAdapter({ model: 'auto', apiKey: 'mesh-key' });
+    mockFetchSseResponse([
+      meshDelta({ tool_calls: [{ index: 0, id: 'call-1', type: 'function', function: { name: 'lookup', arguments: '{"topic"' } }] }),
+      meshDelta({ tool_calls: [{ index: 0, type: 'function', function: { arguments: ':"testing"}' } }] }),
+      meshDelta({}, { finishReason: 'tool_calls' }),
+    ]);
+
+    const result = await adapter.generate(requestWithTools());
+
+    expect(result.finishReason).toBe('tool_calls');
+    expect(result.text).toBeUndefined();
+    expect(result.toolCalls).toEqual([
+      {
+        id: 'call-1',
+        name: 'lookup',
+        input: { topic: 'testing' },
+      },
+    ]);
+  });
+
+  it('reconstructs multiple Mesh streaming tool calls by index', async () => {
+    const adapter = new MeshAdapter({ model: 'auto', apiKey: 'mesh-key' });
+    mockFetchSseResponse([
+      meshDelta({ tool_calls: [{ index: 1, id: 'call-2', type: 'function', function: { name: 'lookup', arguments: '{"topic":"two"}' } }] }),
+      meshDelta({ tool_calls: [{ index: 0, id: 'call-1', type: 'function', function: { name: 'lookup', arguments: '{"topic":"one"}' } }] }),
+      meshDelta({}, { finishReason: 'tool_calls' }),
+    ]);
+
+    const result = await adapter.generate(requestWithTools());
+
+    expect(result.toolCalls).toEqual([
+      { id: 'call-1', name: 'lookup', input: { topic: 'one' } },
+      { id: 'call-2', name: 'lookup', input: { topic: 'two' } },
+    ]);
+  });
+
+  it('handles Mesh streaming responses without usage', async () => {
+    const adapter = new MeshAdapter({ model: 'auto', apiKey: 'mesh-key' });
+    mockFetchSseResponse([
+      meshDelta({ content: 'no usage tracked' }),
+      meshDelta({}, { finishReason: 'stop' }),
+    ]);
+
+    const result = await adapter.generate(simpleRequest());
+
+    expect(result.text).toBe('no usage tracked');
+    expect(result.usage).toBeUndefined();
+  });
+
+  it('fails Mesh mid-stream errors without retrying', async () => {
+    const adapter = new MeshAdapter({ model: 'auto', apiKey: 'mesh-key' });
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        'data: {"id":"chatcmpl-mesh-stream","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}\n\n' +
+          'data: {"error":{"code":"upstream_error","message":"upstream stream failed"},"request_id":"req_stream_123"}\n\n',
+        {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        },
+      ),
+    );
+
+    await expect(adapter.generate(simpleRequest())).rejects.toThrow('upstream stream failed');
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels Mesh stream consumption when the request signal aborts', async () => {
+    const adapter = new MeshAdapter({ model: 'auto', apiKey: 'mesh-key' });
+    const controller = new AbortController();
+    const encoder = new TextEncoder();
+    fetchSpy.mockImplementationOnce((_url: string, init: RequestInit) => Promise.resolve(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(streamController) {
+            streamController.enqueue(encoder.encode('data: {"id":"chatcmpl-mesh-stream","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}\n\n'));
+            init.signal?.addEventListener('abort', () => {
+              streamController.error(new DOMException('The operation was aborted.', 'AbortError'));
+            }, { once: true });
+          },
+        }),
+        {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        },
+      ),
+    ));
+
+    const promise = adapter.generate(simpleRequest({ signal: controller.signal }));
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(1));
+    controller.abort();
+
+    await expect(promise).rejects.toThrow('aborted');
   });
 
   it('surfaces upstream provider detail from Mesh SDK errors', async () => {
@@ -1534,6 +1853,50 @@ describe('MeshAdapter', () => {
     );
   });
 });
+
+function openAIStreamDelta(
+  delta: Record<string, unknown>,
+  options?: { finishReason?: string; usage?: Record<string, unknown> },
+): Record<string, unknown> {
+  return {
+    id: 'chatcmpl-openai-stream',
+    object: 'chat.completion.chunk',
+    created: 1,
+    model: 'test-model',
+    choices: [
+      {
+        index: 0,
+        delta,
+        finish_reason: options?.finishReason ?? null,
+      },
+    ],
+    ...(options?.usage === undefined ? {} : { usage: options.usage }),
+  };
+}
+
+function meshTextChunks(text: string): unknown[] {
+  return [
+    meshDelta({ content: text }),
+    meshDelta({}, { finishReason: 'stop', usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } }),
+  ];
+}
+
+function meshDelta(delta: Record<string, unknown>, options?: { finishReason?: string; usage?: Record<string, unknown> }): Record<string, unknown> {
+  return {
+    id: 'chatcmpl-mesh-stream',
+    object: 'chat.completion.chunk',
+    created: 1,
+    model: 'auto',
+    choices: [
+      {
+        index: 0,
+        delta,
+        finish_reason: options?.finishReason ?? null,
+      },
+    ],
+    ...(options?.usage === undefined ? {} : { usage: options.usage }),
+  };
+}
 
 describe('createModelAdapter', () => {
   it('creates an OpenRouterAdapter', () => {

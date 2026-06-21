@@ -287,7 +287,7 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
   }
 
   async generate(request: ModelRequest): Promise<ModelResponse> {
-    const body = await this.buildRequestBody(request);
+    const body = this.buildStreamingRequestBody(await this.buildRequestBody(request));
     const headers = this.buildHeaders();
     const url = `${this.baseUrl}/chat/completions`;
     const bodyJson = JSON.stringify(body);
@@ -339,10 +339,17 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
         }
 
         let data: OpenAIChatCompletionResponse;
-        let responseText = '';
+        let responseBytes = 0;
         try {
-          responseText = await response.text();
-          data = JSON.parse(responseText) as OpenAIChatCompletionResponse;
+          if (isEventStreamResponse(response)) {
+            const chunks = await readOpenAICompatibleSseStream(response.body, request.signal);
+            responseBytes = approximateSerializedByteLengthForStream(chunks);
+            data = openAIChatCompletionFromStreamChunks(chunks);
+          } else {
+            const responseText = await response.text();
+            responseBytes = encodedByteLength(responseText);
+            data = JSON.parse(responseText) as OpenAIChatCompletionResponse;
+          }
         } catch (error) {
           throw withModelInvocationDiagnostics(error, {
             modelInvocationPhase: 'response_body',
@@ -361,7 +368,7 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
             adapterResponseLatencyMs: responseLatencyMs,
             adapterStatusCode: response.status,
             adapterRequestBytes: requestBytes,
-            adapterResponseBytes: encodedByteLength(responseText),
+            adapterResponseBytes: responseBytes,
           }),
         };
       } catch (error) {
@@ -460,6 +467,14 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
     return headers;
   }
 
+  protected buildStreamingRequestBody(body: Record<string, unknown>): Record<string, unknown> {
+    return {
+      ...body,
+      stream: true,
+      ...(this.capabilities.usage ? { stream_options: { include_usage: true } } : {}),
+    };
+  }
+
   protected parseResponse(data: OpenAIChatCompletionResponse): ModelResponse {
     const choice = data.choices[0];
     if (!choice) {
@@ -517,6 +532,330 @@ export class ModelRequestError extends Error {
     super(message);
     this.name = 'ModelRequestError';
   }
+}
+
+interface AccumulatedToolCall {
+  index: number;
+  id?: string;
+  name?: string;
+  argumentsText: string;
+}
+
+export class OpenAIChatStreamAccumulator {
+  private id: string | undefined;
+  private text = '';
+  private finishReason: string | undefined;
+  private usage: Record<string, unknown> | undefined;
+  private cost: unknown;
+  private reasoning = '';
+  private reasoningDetails: JsonValue[] | undefined;
+  private readonly toolCalls = new Map<number, AccumulatedToolCall>();
+  private nextToolCallIndex = 0;
+
+  add(chunk: unknown): void {
+    if (!isRecord(chunk)) {
+      return;
+    }
+
+    throwOnOpenAICompatibleStreamError(chunk);
+
+    if (typeof chunk.id === 'string' && this.id === undefined) {
+      this.id = chunk.id;
+    }
+    const usage = normalizeStreamUsage(readRecord(chunk, 'usage'));
+    if (usage) {
+      this.usage = usage;
+    }
+    if ('cost' in chunk && chunk.cost !== undefined && chunk.cost !== null) {
+      this.cost = chunk.cost;
+    }
+
+    const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+    for (const choice of choices) {
+      if (!isRecord(choice)) {
+        continue;
+      }
+      if (typeof choice.index === 'number' && choice.index !== 0) {
+        continue;
+      }
+
+      const finishReason = readStringProperty(choice, 'finish_reason') ?? readStringProperty(choice, 'finishReason');
+      if (finishReason) {
+        this.finishReason = finishReason;
+      }
+
+      const delta = readRecord(choice, 'delta');
+      if (!delta) {
+        continue;
+      }
+
+      const content = readStringProperty(delta, 'content');
+      if (content !== undefined) {
+        this.text += content;
+      }
+
+      const reasoning = readStringProperty(delta, 'reasoning') ?? readStringProperty(delta, 'reasoning_content');
+      if (reasoning !== undefined) {
+        this.reasoning += reasoning;
+      }
+
+      const reasoningDetails = readArrayProperty(delta, 'reasoning_details') ?? readArrayProperty(delta, 'reasoningDetails');
+      if (reasoningDetails) {
+        this.reasoningDetails = reasoningDetails as JsonValue[];
+      }
+
+      const toolCallDeltas = readArrayProperty(delta, 'tool_calls') ?? readArrayProperty(delta, 'toolCalls') ?? [];
+      for (const toolCallDelta of toolCallDeltas) {
+        this.addToolCall(toolCallDelta);
+      }
+    }
+  }
+
+  toCompletion(): OpenAIChatCompletionResponse {
+    const toolCalls = Array.from(this.toolCalls.values())
+      .sort((a, b) => a.index - b.index)
+      .filter((toolCall) => toolCall.id || toolCall.name || toolCall.argumentsText.length > 0)
+      .map((toolCall) => ({
+        id: toolCall.id ?? `call_${toolCall.index}`,
+        type: 'function' as const,
+        function: {
+          name: toolCall.name ?? '',
+          arguments: toolCall.argumentsText,
+        },
+      }));
+
+    return {
+      id: this.id ?? '',
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: this.text.length > 0 ? this.text : null,
+            ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+            ...(this.reasoning.length > 0 ? { reasoning: this.reasoning } : {}),
+            ...(this.reasoningDetails === undefined ? {} : { reasoning_details: this.reasoningDetails }),
+          },
+          finish_reason: (this.finishReason ?? (toolCalls.length > 0 ? 'tool_calls' : 'stop')) as never,
+        },
+      ],
+      ...(this.usage === undefined ? {} : { usage: this.usage as OpenAIChatCompletionResponse['usage'] }),
+      ...(this.cost === undefined ? {} : { cost: this.cost as never }),
+    };
+  }
+
+  private addToolCall(value: unknown): void {
+    if (!isRecord(value)) {
+      return;
+    }
+
+    const index = typeof value.index === 'number' && Number.isInteger(value.index)
+      ? value.index
+      : this.nextToolCallIndex++;
+    let toolCall = this.toolCalls.get(index);
+    if (!toolCall) {
+      toolCall = { index, argumentsText: '' };
+      this.toolCalls.set(index, toolCall);
+    }
+
+    const id = readStringProperty(value, 'id');
+    if (id && id.length > 0) {
+      toolCall.id = id;
+    }
+    const fn = readRecord(value, 'function');
+    if (!fn) {
+      return;
+    }
+    const name = readStringProperty(fn, 'name');
+    if (name && name.length > 0) {
+      toolCall.name = name;
+    }
+    const args = readStringProperty(fn, 'arguments');
+    if (args !== undefined) {
+      toolCall.argumentsText += args;
+    }
+  }
+}
+
+function openAIChatCompletionFromStreamChunks(chunks: unknown[]): OpenAIChatCompletionResponse {
+  const accumulator = new OpenAIChatStreamAccumulator();
+  for (const chunk of chunks) {
+    accumulator.add(chunk);
+  }
+  return accumulator.toCompletion();
+}
+
+async function readOpenAICompatibleSseStream(
+  body: ReadableStream<Uint8Array> | null,
+  signal?: AbortSignal,
+): Promise<unknown[]> {
+  if (!body) {
+    throw new Error('Streaming response did not include a response body');
+  }
+
+  const chunks: unknown[] = [];
+  const decoder = new TextDecoder();
+  const reader = body.getReader();
+  let buffered = '';
+  let eventData: string[] = [];
+  let complete = false;
+
+  const throwIfAborted = () => {
+    if (signal?.aborted) {
+      throw createAbortError(signal.reason);
+    }
+  };
+
+  const flushEvent = () => {
+    if (eventData.length === 0 || complete) {
+      eventData = [];
+      return;
+    }
+
+    const data = eventData.join('\n');
+    eventData = [];
+    if (data.trim() === '[DONE]') {
+      complete = true;
+      return;
+    }
+
+    const chunk = JSON.parse(data) as unknown;
+    throwOnOpenAICompatibleStreamError(chunk);
+    chunks.push(chunk);
+  };
+
+  const processLine = (rawLine: string) => {
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    if (line === '') {
+      flushEvent();
+      return;
+    }
+    if (line.startsWith(':')) {
+      return;
+    }
+    if (!line.startsWith('data:')) {
+      return;
+    }
+
+    const value = line.slice(5);
+    eventData.push(value.startsWith(' ') ? value.slice(1) : value);
+  };
+
+  const onAbort = () => {
+    void reader.cancel(createAbortError(signal?.reason)).catch(() => undefined);
+  };
+
+  signal?.addEventListener('abort', onAbort, { once: true });
+  try {
+    while (!complete) {
+      throwIfAborted();
+      let readResult: ReadableStreamReadResult<Uint8Array>;
+      try {
+        readResult = await reader.read();
+      } catch (error) {
+        throwIfAborted();
+        throw error;
+      }
+      throwIfAborted();
+      const { done, value } = readResult;
+      if (done) {
+        break;
+      }
+
+      buffered += decoder.decode(value, { stream: true });
+      let newlineIndex = buffered.indexOf('\n');
+      while (newlineIndex >= 0 && !complete) {
+        processLine(buffered.slice(0, newlineIndex));
+        buffered = buffered.slice(newlineIndex + 1);
+        newlineIndex = buffered.indexOf('\n');
+      }
+    }
+
+    buffered += decoder.decode();
+    if (!complete && buffered.length > 0) {
+      processLine(buffered);
+    }
+    if (!complete) {
+      flushEvent();
+    }
+
+    throwIfAborted();
+    return chunks;
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+    reader.releaseLock();
+  }
+}
+
+function isEventStreamResponse(response: Response): boolean {
+  return response.headers.get('Content-Type')?.toLowerCase().includes('text/event-stream') ?? false;
+}
+
+function approximateSerializedByteLengthForStream(chunks: unknown[]): number {
+  return encodedByteLength(JSON.stringify(chunks));
+}
+
+function normalizeStreamUsage(usage: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!usage) {
+    return undefined;
+  }
+
+  return {
+    ...usage,
+    prompt_tokens: usage.prompt_tokens ?? usage.promptTokens,
+    completion_tokens: usage.completion_tokens ?? usage.completionTokens,
+    total_tokens: usage.total_tokens ?? usage.totalTokens,
+    completion_tokens_details: usage.completion_tokens_details ?? normalizeCompletionTokensDetails(readRecord(usage, 'completionTokensDetails')),
+    cost_details: usage.cost_details ?? usage.costDetails,
+  };
+}
+
+function normalizeCompletionTokensDetails(details: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!details) {
+    return undefined;
+  }
+
+  return {
+    ...details,
+    reasoning_tokens: details.reasoning_tokens ?? details.reasoningTokens,
+  };
+}
+
+function throwOnOpenAICompatibleStreamError(chunk: unknown): void {
+  if (!isRecord(chunk)) {
+    return;
+  }
+
+  const error = chunk.error;
+  if (!isRecord(error)) {
+    return;
+  }
+
+  const message = readStringProperty(error, 'message')
+    ?? readStringProperty(error, 'detail')
+    ?? readStringProperty(error, 'code')
+    ?? 'provider stream error';
+  const requestId = readStringProperty(chunk, 'request_id') ?? readStringProperty(chunk, 'requestId');
+  throw new Error(requestId ? `${message} [requestId=${requestId}]` : message);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function readRecord(value: Record<string, unknown>, key: string): Record<string, unknown> | undefined {
+  const found = value[key];
+  return isRecord(found) ? found : undefined;
+}
+
+function readStringProperty(value: Record<string, unknown>, key: string): string | undefined {
+  const found = value[key];
+  return typeof found === 'string' ? found : undefined;
+}
+
+function readArrayProperty(value: Record<string, unknown>, key: string): unknown[] | undefined {
+  const found = value[key];
+  return Array.isArray(found) ? found : undefined;
 }
 
 async function toModelRequestError(provider: string, response: Response): Promise<ModelRequestError> {

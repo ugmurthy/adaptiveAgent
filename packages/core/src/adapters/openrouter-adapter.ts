@@ -9,6 +9,7 @@ import {
   BaseOpenAIChatAdapter,
   MAX_LOCAL_AUDIO_BYTES,
   MAX_LOCAL_FILE_BYTES,
+  OpenAIChatStreamAccumulator,
   type BaseOpenAIChatAdapterConfig,
   withModelInvocationDiagnostics,
 } from './base-openai-chat-adapter.js';
@@ -91,22 +92,32 @@ export class OpenRouterAdapter extends BaseOpenAIChatAdapter {
 
   override async generate(request: ModelRequest): Promise<ModelResponse> {
     const normalizedRequest = await normalizeOpenRouterRequest(request);
-    const body = await this.buildRequestBody(normalizedRequest);
+    const body = this.buildStreamingRequestBody(await this.buildRequestBody(normalizedRequest));
     const startedAt = Date.now();
+    const chunks: unknown[] = [];
     let completion: unknown;
     try {
       const sdkResult = await this.client.chat.send(
         {
           chatRequest: toSdkRequest(body),
         } as never,
-        { signal: request.signal, headers: this.sdkHeaders, timeoutMs: request.modelTimeoutMs } as never,
+        { signal: request.signal, headers: this.sdkHeaders } as never,
       );
-      completion = unwrapOpenRouterSdkResult(sdkResult);
+      if (isAsyncIterable(sdkResult)) {
+        const accumulator = new OpenAIChatStreamAccumulator();
+        for await (const chunk of sdkResult as AsyncIterable<unknown>) {
+          chunks.push(chunk);
+          accumulator.add(chunk);
+        }
+        completion = accumulator.toCompletion();
+      } else {
+        completion = fromSdkResponse(unwrapOpenRouterSdkResult(sdkResult));
+      }
     } catch (error) {
       throw enrichOpenRouterSdkError(error);
     }
 
-    const parsed = this.parseResponse(fromSdkResponse(completion));
+    const parsed = this.parseResponse(completion as never);
     return {
       ...parsed,
       performance: compactJsonObject({
@@ -114,10 +125,17 @@ export class OpenRouterAdapter extends BaseOpenAIChatAdapter {
         adapterAttemptCount: 1,
         adapterResponseLatencyMs: Date.now() - startedAt,
         adapterRequestBytes: approximateSerializedByteLength(body),
-        adapterResponseBytes: approximateSerializedByteLength(completion),
+        adapterResponseBytes: approximateSerializedByteLength(chunks.length > 0 ? chunks : completion),
       }),
     };
   }
+}
+
+function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
+  return typeof value === 'object'
+    && value !== null
+    && Symbol.asyncIterator in value
+    && typeof (value as { [Symbol.asyncIterator]?: unknown })[Symbol.asyncIterator] === 'function';
 }
 
 function toSdkRequest(body: Record<string, unknown>): Record<string, unknown> {
@@ -126,7 +144,19 @@ function toSdkRequest(body: Record<string, unknown>): Record<string, unknown> {
     messages: Array.isArray(body.messages) ? body.messages.map(toSdkMessage) : body.messages,
     response_format: undefined,
     responseFormat: toProviderSdkResponseFormat(body.response_format),
+    stream_options: undefined,
+    streamOptions: toSdkStreamOptions(body.stream_options),
     parallelToolCalls: false,
+  };
+}
+
+function toSdkStreamOptions(value: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  return {
+    includeUsage: value.include_usage ?? value.includeUsage,
   };
 }
 

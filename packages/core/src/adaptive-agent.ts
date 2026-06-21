@@ -1996,7 +1996,6 @@ export class AdaptiveAgent {
     pendingToolCalls: PendingToolCallState[],
   ): InvalidToolCallRejection | undefined {
     const validToolNames = this.plannerVisibleTools(state).map((tool) => tool.name);
-    const validToolNameSet = new Set(validToolNames);
 
     for (const pendingToolCall of pendingToolCalls) {
       const resolvedTool = this.resolveToolDefinitionByName(pendingToolCall.name);
@@ -2008,7 +2007,7 @@ export class AdaptiveAgent {
         };
       }
 
-      if (!validToolNameSet.has(resolvedTool.name)) {
+      if (state.visibleToolNames && !state.visibleToolNames.includes(resolvedTool.name)) {
         return {
           pendingToolCall,
           reason: 'tool_not_visible',

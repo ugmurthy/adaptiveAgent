@@ -1,7 +1,7 @@
 import { MeshAPI, MeshAPIApiError } from 'meshapi-node-sdk';
 
 import { approximateSerializedByteLength, compactJsonObject } from '../logging.js';
-import type { ModelRequest, ModelResponse, StructuredOutputMode } from '../types.js';
+import type { JsonValue, ModelRequest, ModelResponse, StructuredOutputMode } from '../types.js';
 import { BaseOpenAIChatAdapter, MAX_LOCAL_AUDIO_BYTES, type BaseOpenAIChatAdapterConfig } from './base-openai-chat-adapter.js';
 
 const MESH_BASE_URL = 'https://api.meshapi.ai/v1';
@@ -50,33 +50,177 @@ export class MeshAdapter extends BaseOpenAIChatAdapter {
 
   override async generate(request: ModelRequest): Promise<ModelResponse> {
     const body = await this.buildRequestBody(request);
-    let completion;
+    const chunks: unknown[] = [];
     const startedAt = Date.now();
     try {
-      completion = await this.client.chat.completions.create(
+      const stream = this.client.chat.completions.create(
         {
           ...body,
-          stream: false,
+          stream: true,
         } as never,
         { signal: request.signal, timeoutMs: resolveMeshHttpTimeoutMs(request.modelTimeoutMs) },
       );
+      const accumulator = new MeshStreamAccumulator();
+      for await (const chunk of stream as AsyncIterable<unknown>) {
+        chunks.push(chunk);
+        accumulator.add(chunk);
+      }
+
+      const completion = accumulator.toCompletion();
+      const parsed = this.parseResponse(completion as never);
+      return {
+        ...parsed,
+        providerResponseId: parsed.providerResponseId || undefined,
+        rawProviderResponse: chunks,
+        performance: compactJsonObject({
+          ...(parsed.performance ?? {}),
+          adapterAttemptCount: 1,
+          adapterResponseLatencyMs: Date.now() - startedAt,
+          adapterRequestBytes: approximateSerializedByteLength(body),
+          adapterResponseBytes: approximateSerializedByteLength(chunks),
+        }),
+      };
     } catch (error) {
       throw enrichMeshError(error);
     }
+  }
+}
 
-    const parsed = this.parseResponse(completion as never);
+interface MeshAccumulatedToolCall {
+  index: number;
+  id?: string;
+  name?: string;
+  argumentsText: string;
+}
+
+class MeshStreamAccumulator {
+  private id: string | undefined;
+  private text = '';
+  private finishReason: string | undefined;
+  private usage: Record<string, unknown> | undefined;
+  private cost: unknown;
+  private reasoning = '';
+  private reasoningDetails: JsonValue[] | undefined;
+  private readonly toolCalls = new Map<number, MeshAccumulatedToolCall>();
+  private nextToolCallIndex = 0;
+
+  add(chunk: unknown): void {
+    if (!isRecord(chunk)) {
+      return;
+    }
+
+    if (typeof chunk.id === 'string' && this.id === undefined) {
+      this.id = chunk.id;
+    }
+    if (isRecord(chunk.usage)) {
+      this.usage = chunk.usage;
+    }
+    if ('cost' in chunk && chunk.cost !== undefined && chunk.cost !== null) {
+      this.cost = chunk.cost;
+    }
+
+    const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+    for (const choice of choices) {
+      if (!isRecord(choice)) {
+        continue;
+      }
+      if (typeof choice.index === 'number' && choice.index !== 0) {
+        continue;
+      }
+
+      if (typeof choice.finish_reason === 'string') {
+        this.finishReason = choice.finish_reason;
+      }
+
+      const delta = isRecord(choice.delta) ? choice.delta : undefined;
+      if (!delta) {
+        continue;
+      }
+
+      if (typeof delta.content === 'string') {
+        this.text += delta.content;
+      }
+      if (typeof delta.reasoning === 'string') {
+        this.reasoning += delta.reasoning;
+      } else if (typeof delta.reasoning_content === 'string') {
+        this.reasoning += delta.reasoning_content;
+      }
+      if (Array.isArray(delta.reasoning_details)) {
+        this.reasoningDetails = delta.reasoning_details as JsonValue[];
+      }
+
+      const toolCallDeltas = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
+      for (const toolCallDelta of toolCallDeltas) {
+        this.addToolCall(toolCallDelta);
+      }
+    }
+  }
+
+  toCompletion(): Record<string, unknown> {
+    const toolCalls = Array.from(this.toolCalls.values())
+      .sort((a, b) => a.index - b.index)
+      .filter((toolCall) => toolCall.id || toolCall.name || toolCall.argumentsText.length > 0)
+      .map((toolCall) => ({
+        id: toolCall.id ?? `call_${toolCall.index}`,
+        type: 'function',
+        function: {
+          name: toolCall.name ?? '',
+          arguments: toolCall.argumentsText,
+        },
+      }));
+
     return {
-      ...parsed,
-      rawProviderResponse: completion,
-      performance: compactJsonObject({
-        ...(parsed.performance ?? {}),
-        adapterAttemptCount: 1,
-        adapterResponseLatencyMs: Date.now() - startedAt,
-        adapterRequestBytes: approximateSerializedByteLength(body),
-        adapterResponseBytes: approximateSerializedByteLength(completion),
-      }),
+      id: this.id ?? '',
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: this.text.length > 0 ? this.text : null,
+            ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+            ...(this.reasoning.length > 0 ? { reasoning: this.reasoning } : {}),
+            ...(this.reasoningDetails === undefined ? {} : { reasoning_details: this.reasoningDetails }),
+          },
+          finish_reason: this.finishReason ?? (toolCalls.length > 0 ? 'tool_calls' : 'stop'),
+        },
+      ],
+      ...(this.usage === undefined ? {} : { usage: this.usage }),
+      ...(this.cost === undefined ? {} : { cost: this.cost }),
     };
   }
+
+  private addToolCall(value: unknown): void {
+    if (!isRecord(value)) {
+      return;
+    }
+
+    const index = typeof value.index === 'number' && Number.isInteger(value.index)
+      ? value.index
+      : this.nextToolCallIndex++;
+    let toolCall = this.toolCalls.get(index);
+    if (!toolCall) {
+      toolCall = { index, argumentsText: '' };
+      this.toolCalls.set(index, toolCall);
+    }
+
+    if (typeof value.id === 'string' && value.id.length > 0) {
+      toolCall.id = value.id;
+    }
+    const fn = isRecord(value.function) ? value.function : undefined;
+    if (!fn) {
+      return;
+    }
+    if (typeof fn.name === 'string' && fn.name.length > 0) {
+      toolCall.name = fn.name;
+    }
+    if (typeof fn.arguments === 'string') {
+      toolCall.argumentsText += fn.arguments;
+    }
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function toMeshSdkBaseUrl(baseUrl: string): string {

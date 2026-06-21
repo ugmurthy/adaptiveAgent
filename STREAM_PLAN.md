@@ -38,12 +38,29 @@ minutes.
 - `ModelAdapter` already exposes a stable required `generate()` method and an
   optional `stream()` method.
 - OpenRouter, Mistral, Mesh, and Ollama declare streaming capability.
-- Current adapter implementations still use non-streaming generation paths:
-  - OpenRouter: SDK `client.chat.send(...)` without `stream: true`.
+- Current remaining adapter implementation that still uses a non-streaming
+  generation path:
   - Mistral: SDK `client.chat.complete(...)`.
-  - Mesh: SDK `client.chat.completions.create({ stream: false })`.
-  - Ollama: `BaseOpenAIChatAdapter.generate()` posts to `/chat/completions` and
-    waits for a full JSON body.
+- Phase 1 is implemented for Mesh:
+  - `MeshAdapter.generate()` now calls SDK chat completions with `stream: true`.
+  - Mesh stream chunks are consumed internally and aggregated back into the
+    existing final `ModelResponse` contract.
+  - Mesh text, structured output, fragmented and multiple tool calls, usage,
+    missing usage, abort, HTTP error enrichment, and mid-stream error behavior
+    have focused adapter coverage.
+- Phase 2 is implemented for the OpenAI-compatible base path:
+  - `BaseOpenAIChatAdapter.generate()` now sends `stream: true`, requests stream
+    usage where the adapter declares usage support, parses SSE frames, consumes
+    `[DONE]`, and aggregates chunks back into the existing final
+    `ModelResponse` contract.
+  - OpenAI-compatible text, fragmented and multiple tool calls, usage, abort,
+    gate release, HTTP retry-before-stream behavior, and mid-stream failure
+    behavior have focused adapter coverage.
+- Phase 3 is implemented for OpenRouter:
+  - `OpenRouterAdapter.generate()` now uses the SDK streaming overload while
+    preserving SDK request field normalization.
+  - SDK stream chunks are aggregated through the shared OpenAI-compatible stream
+    accumulator, including delegate tool-name alias restoration and usage.
 - `modelTimeoutMs` remains a core wall-clock timeout around the whole model turn.
   Streaming will not bypass this timeout.
 
@@ -117,7 +134,7 @@ as a follow-up with explicit runtime and gateway configuration.
 
 ## Provider Implementation Plan
 
-### Phase 1: Mesh first
+### Phase 1: Mesh first - Complete
 
 Mesh is the best first target because its installed SDK exposes explicit chat
 completion streaming:
@@ -138,10 +155,12 @@ Notes:
   connection behavior, so keep using `request.signal` for core cancellation.
 - Preserve `enrichMeshError()` for SDK and mid-stream errors.
 - Aggregate OpenAI-compatible stream chunks into the existing parser shape.
-- Verify whether final chunks include `usage`; if not, record this as a parity
-  risk before making Mesh streaming the default.
+- Mocked final usage chunks map to `UsageSummary`; missing usage is accepted
+  without throwing. Manual provider validation should still confirm whether live
+  Mesh streams include usage for the target models before relying on streaming
+  usage accounting in production.
 
-### Phase 2: OpenAI-compatible base path
+### Phase 2: OpenAI-compatible base path - Complete
 
 Add streaming-backed generation support to `BaseOpenAIChatAdapter` for Ollama
 and compatible endpoints.
@@ -169,7 +188,16 @@ Parsing behavior:
   non-streaming responses.
 - Map final finish reason using the same mapper as non-streaming responses.
 
-### Phase 3: OpenRouter SDK
+Implementation notes:
+
+- `BaseOpenAIChatAdapter.generate()` keeps JSON response parsing as a fallback if
+  an OpenAI-compatible endpoint returns a non-SSE response despite `stream: true`.
+- `stream_options: { include_usage: true }` is sent only when the adapter
+  declares usage support, so Ollama avoids an unsupported usage option.
+- Mid-stream read, parse, and abort failures are surfaced as response-body model
+  failures and are not automatically retried.
+
+### Phase 3: OpenRouter SDK - Complete
 
 Use the SDK streaming overload:
 
@@ -193,6 +221,16 @@ Notes:
   chunks where possible.
 - Preserve reasoning and `reasoningDetails` when the SDK returns them.
 - Verify tool-call streaming with delegate tool-name aliases.
+
+Implementation notes:
+
+- `toSdkRequest()` now maps REST `stream_options` to SDK `streamOptions` so
+  REST-only field names do not leak into SDK input.
+- The OpenRouter adapter keeps a non-streaming SDK result fallback for tests and
+  SDK/provider cases that return a full JSON completion despite requesting a
+  stream.
+- Focused coverage verifies streaming text/tool-call aggregation, usage, and
+  delegate alias restoration through the SDK path.
 
 ### Phase 4: Mistral SDK
 
@@ -335,19 +373,19 @@ bun run --cwd packages/agent-sdk typecheck
 
 ## Rollout Plan
 
-1. Implement Mesh streaming-backed `generate()` behind the existing
+1. Done: Implement Mesh streaming-backed `generate()` behind the existing
    `MeshAdapter.generate()` method.
-2. Add Mesh stream aggregation tests for text, tool calls, usage, abort, and
-   mid-stream errors.
-3. Manually validate one long-running Mesh inference with a large enough
+2. Done: Add Mesh stream aggregation tests for text, tool calls, usage, abort,
+   and mid-stream errors.
+3. Next: Manually validate one long-running Mesh inference with a large enough
    `modelTimeoutMs`.
 4. If Mesh parity is acceptable, decide whether Mesh should always use
    streaming internally or keep a private adapter fallback during burn-in.
-5. Implement OpenAI-compatible SSE support in `BaseOpenAIChatAdapter.generate()`
-   or in a private helper called by `generate()`.
-6. Validate Ollama locally.
-7. Implement OpenRouter SDK streaming-backed `generate()`.
-8. Implement Mistral SDK streaming-backed `generate()`.
+5. Done: Implement OpenAI-compatible SSE support in
+   `BaseOpenAIChatAdapter.generate()` and a shared stream accumulator.
+6. Next: Validate Ollama locally.
+7. Done: Implement OpenRouter SDK streaming-backed `generate()`.
+8. Next: Implement Mistral SDK streaming-backed `generate()`.
 9. Keep `ModelAdapter.stream()` optional and unused by core until a separate UX
    streaming feature is explicitly required.
 
