@@ -659,7 +659,7 @@ export class OpenAIChatStreamAccumulator {
     }
 
     const id = readStringProperty(value, 'id');
-    if (id && id.length > 0) {
+    if (id && id.length > 0 && id !== 'null') {
       toolCall.id = id;
     }
     const fn = readRecord(value, 'function');
@@ -673,6 +673,12 @@ export class OpenAIChatStreamAccumulator {
     const args = readStringProperty(fn, 'arguments');
     if (args !== undefined) {
       toolCall.argumentsText += args;
+      return;
+    }
+
+    const argumentsValue = fn.arguments;
+    if (argumentsValue !== undefined) {
+      toolCall.argumentsText += JSON.stringify(argumentsValue);
     }
   }
 }

@@ -1499,7 +1499,7 @@ describe('OllamaAdapter', () => {
 describe('MistralAdapter', () => {
   it('uses Mistral base URL and auth', async () => {
     const adapter = new MistralAdapter({ model: 'mistral-large-latest', apiKey: 'ms-key' });
-    mockFetchResponse(STOP_RESPONSE);
+    mockFetchSseResponse(mistralTextChunks('Hello world'));
 
     await adapter.generate(simpleRequest());
 
@@ -1512,7 +1512,7 @@ describe('MistralAdapter', () => {
 
   it('replays assistant tool call messages through the Mistral SDK', async () => {
     const adapter = new MistralAdapter({ model: 'mistral-large-latest', apiKey: 'ms-key' });
-    mockFetchResponse(STOP_RESPONSE);
+    mockFetchSseResponse(mistralTextChunks('Hello world'));
 
     await adapter.generate(requestWithAssistantToolCalls());
 
@@ -1536,7 +1536,7 @@ describe('MistralAdapter', () => {
 
   it('translates structured output into the Mistral SDK responseFormat shape', async () => {
     const adapter = new MistralAdapter({ model: 'mistral-large-latest', apiKey: 'ms-key', structuredOutputMode: 'strict' });
-    mockFetchResponse(STOP_RESPONSE);
+    mockFetchSseResponse(mistralTextChunks('{"answer":"structured"}'));
 
     const schema = { type: 'object', properties: { answer: { type: 'string' } } };
     await adapter.generate(simpleRequest({ outputSchema: schema }));
@@ -1559,6 +1559,63 @@ describe('MistralAdapter', () => {
         schema,
       },
     });
+    expect(body.stream).toBe(true);
+  });
+
+  it('aggregates Mistral stream text, structured output, and usage', async () => {
+    const adapter = new MistralAdapter({ model: 'mistral-large-latest', apiKey: 'ms-key' });
+    mockFetchSseResponse([
+      mistralStreamDelta({ content: '{"result"' }),
+      mistralStreamDelta({ content: ':"structured"}' }),
+      mistralStreamDelta({}, { finishReason: 'stop', usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } }),
+    ]);
+
+    const result = await adapter.generate(simpleRequest({ outputSchema: { type: 'object' } }));
+
+    expect(result.text).toBe('{"result":"structured"}');
+    expect(result.structuredOutput).toEqual({ result: 'structured' });
+    expect(result.finishReason).toBe('stop');
+    expect(result.providerResponseId).toBe('chatcmpl-mistral-stream');
+    expect(result.usage).toMatchObject({
+      promptTokens: 10,
+      completionTokens: 5,
+      totalTokens: 15,
+      provider: 'mistral',
+      model: 'mistral-large-latest',
+    });
+  });
+
+  it('reconstructs fragmented Mistral stream tool calls', async () => {
+    const adapter = new MistralAdapter({ model: 'mistral-large-latest', apiKey: 'ms-key' });
+    mockFetchSseResponse([
+      mistralStreamDelta({ tool_calls: [{ index: 0, id: 'call-1', type: 'function', function: { name: 'lookup', arguments: '{"topic"' } }] }),
+      mistralStreamDelta({ tool_calls: [{ index: 0, type: 'function', function: { name: 'lookup', arguments: ':"testing"}' } }] }),
+      mistralStreamDelta({}, { finishReason: 'tool_calls' }),
+    ]);
+
+    const result = await adapter.generate(requestWithTools());
+
+    expect(result.finishReason).toBe('tool_calls');
+    expect(result.toolCalls).toEqual([
+      {
+        id: 'call-1',
+        name: 'lookup',
+        input: { topic: 'testing' },
+      },
+    ]);
+  });
+
+  it('handles Mistral stream responses without usage', async () => {
+    const adapter = new MistralAdapter({ model: 'mistral-large-latest', apiKey: 'ms-key' });
+    mockFetchSseResponse([
+      mistralStreamDelta({ content: 'no usage tracked' }),
+      mistralStreamDelta({}, { finishReason: 'stop' }),
+    ]);
+
+    const result = await adapter.generate(simpleRequest());
+
+    expect(result.text).toBe('no usage tracked');
+    expect(result.usage).toBeUndefined();
   });
 
   it('rewrites local text file inputs into text content parts for Mistral', async () => {
@@ -1567,7 +1624,7 @@ describe('MistralAdapter', () => {
       const filePath = join(tempDir, 'sample-note.txt');
       await writeFile(filePath, 'Adaptive Agent fixture note\n\nPlain text file body.');
       const adapter = new MistralAdapter({ model: 'mistral-large-latest', apiKey: 'ms-key' });
-      mockFetchResponse(STOP_RESPONSE);
+      mockFetchSseResponse(mistralTextChunks('Hello world'));
 
       await adapter.generate({
         messages: [
@@ -1609,7 +1666,7 @@ describe('MistralAdapter', () => {
       const filePath = join(tempDir, 'sample-doc.pdf');
       await writeFile(filePath, Buffer.from('%PDF-1.4\n'));
       const adapter = new MistralAdapter({ model: 'mistral-large-latest', apiKey: 'ms-key' });
-      mockFetchResponse(STOP_RESPONSE);
+      mockFetchSseResponse(mistralTextChunks('Hello world'));
 
       await adapter.generate({
         messages: [
@@ -1863,6 +1920,33 @@ function openAIStreamDelta(
     object: 'chat.completion.chunk',
     created: 1,
     model: 'test-model',
+    choices: [
+      {
+        index: 0,
+        delta,
+        finish_reason: options?.finishReason ?? null,
+      },
+    ],
+    ...(options?.usage === undefined ? {} : { usage: options.usage }),
+  };
+}
+
+function mistralTextChunks(text: string): unknown[] {
+  return [
+    mistralStreamDelta({ content: text }),
+    mistralStreamDelta({}, { finishReason: 'stop', usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } }),
+  ];
+}
+
+function mistralStreamDelta(
+  delta: Record<string, unknown>,
+  options?: { finishReason?: string; usage?: Record<string, unknown> },
+): Record<string, unknown> {
+  return {
+    id: 'chatcmpl-mistral-stream',
+    object: 'chat.completion.chunk',
+    created: 1,
+    model: 'mistral-large-latest',
     choices: [
       {
         index: 0,

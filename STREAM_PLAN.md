@@ -38,9 +38,9 @@ minutes.
 - `ModelAdapter` already exposes a stable required `generate()` method and an
   optional `stream()` method.
 - OpenRouter, Mistral, Mesh, and Ollama declare streaming capability.
-- Current remaining adapter implementation that still uses a non-streaming
-  generation path:
-  - Mistral: SDK `client.chat.complete(...)`.
+- Mesh, OpenAI-compatible/Ollama, OpenRouter, and Mistral now use
+  streaming-backed `generate()` implementations internally while preserving the
+  existing final `ModelResponse` contract.
 - Phase 1 is implemented for Mesh:
   - `MeshAdapter.generate()` now calls SDK chat completions with `stream: true`.
   - Mesh stream chunks are consumed internally and aggregated back into the
@@ -61,6 +61,12 @@ minutes.
     preserving SDK request field normalization.
   - SDK stream chunks are aggregated through the shared OpenAI-compatible stream
     accumulator, including delegate tool-name alias restoration and usage.
+- Phase 4 is implemented for Mistral:
+  - `MistralAdapter.generate()` now uses `client.chat.stream(...)` instead of
+    `client.chat.complete(...)`.
+  - Mistral SDK `CompletionEvent.data` chunks are mapped into the shared
+    OpenAI-compatible stream accumulator, preserving text, structured output,
+    tool calls, finish reason, and usage when supplied.
 - `modelTimeoutMs` remains a core wall-clock timeout around the whole model turn.
   Streaming will not bypass this timeout.
 
@@ -232,7 +238,7 @@ Implementation notes:
 - Focused coverage verifies streaming text/tool-call aggregation, usage, and
   delegate alias restoration through the SDK path.
 
-### Phase 4: Mistral SDK
+### Phase 4: Mistral SDK - Complete
 
 Use the SDK streaming method:
 
@@ -248,6 +254,15 @@ Notes:
 - Map Mistral-specific stream events into the same final accumulator model.
 - Verify structured output, tool calls, and usage separately; do not assume
   non-streaming and streaming response fields match exactly.
+
+Implementation notes:
+
+- Mistral SDK stream iteration yields `CompletionEvent` objects; the adapter
+  passes each event's `data` chunk to the shared stream accumulator.
+- The Mistral SDK normalizes stream fields to camelCase after parsing, so the
+  shared accumulator accepts both snake_case and camelCase stream fields.
+- Focused coverage verifies streaming text, structured output, fragmented tool
+  calls, usage, missing usage, and existing file/message SDK normalization.
 
 ## Retry Policy
 
@@ -385,7 +400,7 @@ bun run --cwd packages/agent-sdk typecheck
    `BaseOpenAIChatAdapter.generate()` and a shared stream accumulator.
 6. Next: Validate Ollama locally.
 7. Done: Implement OpenRouter SDK streaming-backed `generate()`.
-8. Next: Implement Mistral SDK streaming-backed `generate()`.
+8. Done: Implement Mistral SDK streaming-backed `generate()`.
 9. Keep `ModelAdapter.stream()` optional and unused by core until a separate UX
    streaming feature is explicitly required.
 

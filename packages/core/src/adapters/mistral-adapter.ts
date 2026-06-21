@@ -5,7 +5,13 @@ import { Mistral } from '@mistralai/mistralai';
 
 import { approximateSerializedByteLength, compactJsonObject } from '../logging.js';
 import type { FileInput, ModelContentPart, ModelMessage, ModelRequest, ModelResponse, StructuredOutputMode } from '../types.js';
-import { BaseOpenAIChatAdapter, MAX_LOCAL_AUDIO_BYTES, MAX_LOCAL_FILE_BYTES, type BaseOpenAIChatAdapterConfig } from './base-openai-chat-adapter.js';
+import {
+  BaseOpenAIChatAdapter,
+  MAX_LOCAL_AUDIO_BYTES,
+  MAX_LOCAL_FILE_BYTES,
+  OpenAIChatStreamAccumulator,
+  type BaseOpenAIChatAdapterConfig,
+} from './base-openai-chat-adapter.js';
 import { toProviderSdkResponseFormat } from './provider-sdk-request.js';
 
 const MISTRAL_BASE_URL = 'https://api.mistral.ai/v1';
@@ -69,13 +75,23 @@ export class MistralAdapter extends BaseOpenAIChatAdapter {
 
   override async generate(request: ModelRequest): Promise<ModelResponse> {
     const normalizedRequest = await normalizeMistralRequest(request);
-    const body = await this.buildRequestBody(normalizedRequest);
+    const body = {
+      ...await this.buildRequestBody(normalizedRequest),
+      stream: true,
+    };
     const startedAt = Date.now();
-    const completion = await this.client.chat.complete(toSdkRequest(body) as never, {
+    const chunks: unknown[] = [];
+    const stream = await this.client.chat.stream(toSdkRequest(body) as never, {
       signal: request.signal,
     } as never);
+    const accumulator = new OpenAIChatStreamAccumulator();
+    for await (const event of stream as AsyncIterable<unknown>) {
+      chunks.push(event);
+      accumulator.add(fromMistralStreamEvent(event));
+    }
 
-    const parsed = this.parseResponse(fromSdkResponse(completion));
+    const completion = accumulator.toCompletion();
+    const parsed = this.parseResponse(completion as never);
     return {
       ...parsed,
       performance: compactJsonObject({
@@ -83,7 +99,7 @@ export class MistralAdapter extends BaseOpenAIChatAdapter {
         adapterAttemptCount: 1,
         adapterResponseLatencyMs: Date.now() - startedAt,
         adapterRequestBytes: approximateSerializedByteLength(body),
-        adapterResponseBytes: approximateSerializedByteLength(completion),
+        adapterResponseBytes: approximateSerializedByteLength(chunks),
       }),
     };
   }
@@ -186,6 +202,18 @@ function fromSdkUsage(usage: unknown): Record<string, unknown> {
     cost: data.cost,
     cost_details: data.costDetails,
   };
+}
+
+function fromMistralStreamEvent(event: unknown): unknown {
+  if (!isRecord(event) || !isRecord(event.data)) {
+    return event;
+  }
+
+  return event.data;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 async function normalizeMistralRequest(request: ModelRequest): Promise<ModelRequest> {
