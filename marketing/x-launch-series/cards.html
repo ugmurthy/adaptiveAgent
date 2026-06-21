@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AdaptiveAgent X Launch Cards</title>
+  <style>
+    :root {
+      --ink: #172026;
+      --muted: #5d6670;
+      --paper: #fbf7ef;
+      --cream: #fff4dc;
+      --teal: #0f766e;
+      --teal-soft: #d8f1ec;
+      --green-soft: #e0efdf;
+      --amber-soft: #f9e7c1;
+      --rust: #bd4b26;
+      --rust-soft: #f4d5c8;
+      --charcoal: #101418;
+      --charcoal-2: #1c2329;
+      --line: #ded5c8;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: #ece5da;
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .wrap {
+      display: grid;
+      gap: 40px;
+      padding: 40px;
+    }
+
+    .card {
+      position: relative;
+      width: 1200px;
+      height: 675px;
+      overflow: hidden;
+      background: var(--charcoal);
+      color: #fffaf0;
+      isolation: isolate;
+    }
+
+    .card::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      z-index: -3;
+      background:
+        linear-gradient(rgba(255, 244, 220, 0.04) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255, 244, 220, 0.04) 1px, transparent 1px),
+        radial-gradient(circle at 76% 34%, rgba(15, 118, 110, 0.32), transparent 34%),
+        radial-gradient(circle at 86% 70%, rgba(189, 75, 38, 0.16), transparent 34%),
+        var(--charcoal);
+      background-size: 84px 84px, 84px 84px, auto, auto, auto;
+    }
+
+    .card::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      z-index: -1;
+      background:
+        linear-gradient(90deg, rgba(16, 20, 24, 0.88) 0%, rgba(16, 20, 24, 0.62) 48%, rgba(16, 20, 24, 0.22) 100%),
+        linear-gradient(0deg, rgba(16, 20, 24, 0.72), transparent 42%);
+    }
+
+    .brand {
+      position: absolute;
+      top: 50px;
+      left: 58px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      font-weight: 900;
+      font-size: 25px;
+    }
+
+    .mark {
+      width: 48px;
+      height: 48px;
+      display: grid;
+      place-items: center;
+      border: 1px solid rgba(255, 244, 220, 0.36);
+      border-radius: 8px;
+      background: rgba(255, 244, 220, 0.09);
+    }
+
+    .mark svg {
+      width: 28px;
+      height: 28px;
+    }
+
+    .content {
+      position: absolute;
+      left: 58px;
+      top: 165px;
+      width: 650px;
+    }
+
+    .kicker {
+      margin: 0 0 18px;
+      color: var(--amber-soft);
+      font-weight: 900;
+      font-size: 19px;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      max-width: 640px;
+      color: #fffaf0;
+      font-size: 72px;
+      line-height: 0.98;
+      letter-spacing: 0;
+    }
+
+    .subhead {
+      margin: 24px 0 0;
+      max-width: 610px;
+      color: rgba(255, 250, 240, 0.86);
+      font-weight: 760;
+      font-size: 30px;
+      line-height: 1.18;
+    }
+
+    .tags {
+      position: absolute;
+      left: 58px;
+      bottom: 52px;
+      display: flex;
+      gap: 12px;
+      color: var(--charcoal);
+      font-weight: 900;
+      font-size: 18px;
+    }
+
+    .tags span {
+      padding: 9px 13px;
+      border-radius: 8px;
+      background: var(--cream);
+    }
+
+    .visual {
+      position: absolute;
+      right: 54px;
+      top: 116px;
+      width: 455px;
+      height: 455px;
+    }
+
+    .trace {
+      position: absolute;
+      inset: 20px 0 0;
+    }
+
+    .lane {
+      position: absolute;
+      left: 10px;
+      right: 0;
+      height: 1px;
+      background: rgba(255, 244, 220, 0.15);
+    }
+
+    .label {
+      position: absolute;
+      left: 0;
+      width: 142px;
+      padding: 10px 12px;
+      border: 1px solid rgba(255, 244, 220, 0.16);
+      border-radius: 8px;
+      background: rgba(16, 20, 24, 0.72);
+      color: var(--amber-soft);
+      font-size: 15px;
+      font-weight: 900;
+      line-height: 1;
+    }
+
+    .label small {
+      display: block;
+      margin-top: 6px;
+      color: rgba(255, 250, 240, 0.48);
+      font-size: 11px;
+      font-weight: 800;
+    }
+
+    .path {
+      position: absolute;
+      inset: 0;
+      overflow: visible;
+    }
+
+    .node,
+    .packet {
+      position: absolute;
+      border-radius: 999px;
+      transform: translate(-50%, -50%);
+    }
+
+    .node {
+      width: 18px;
+      height: 18px;
+      border: 2px solid var(--teal-soft);
+      background: rgba(16, 20, 24, 0.82);
+      box-shadow: 0 0 20px rgba(216, 241, 236, 0.34);
+    }
+
+    .packet {
+      width: 16px;
+      height: 16px;
+      background: var(--amber-soft);
+      box-shadow: 0 0 0 14px rgba(249, 231, 193, 0.14), 0 0 28px rgba(249, 231, 193, 0.46);
+    }
+
+    .chips {
+      position: absolute;
+      right: 10px;
+      bottom: 14px;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 10px;
+      max-width: 360px;
+    }
+
+    .chips span {
+      padding: 9px 11px;
+      border: 1px solid rgba(255, 244, 220, 0.18);
+      border-radius: 8px;
+      background: rgba(255, 244, 220, 0.08);
+      color: rgba(255, 250, 240, 0.82);
+      font-size: 14px;
+      font-weight: 850;
+    }
+
+    .cream {
+      background: var(--paper);
+      color: var(--ink);
+    }
+
+    .cream::before {
+      background:
+        linear-gradient(rgba(23, 32, 38, 0.045) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(23, 32, 38, 0.045) 1px, transparent 1px),
+        radial-gradient(circle at 72% 32%, rgba(15, 118, 110, 0.22), transparent 34%),
+        radial-gradient(circle at 86% 72%, rgba(189, 75, 38, 0.12), transparent 34%),
+        var(--paper);
+      background-size: 84px 84px, 84px 84px, auto, auto, auto;
+    }
+
+    .cream::after {
+      background: linear-gradient(90deg, rgba(251, 247, 239, 0.94) 0%, rgba(251, 247, 239, 0.74) 52%, rgba(251, 247, 239, 0.3) 100%);
+    }
+
+    .cream h1 {
+      color: var(--ink);
+    }
+
+    .cream .subhead {
+      color: var(--muted);
+    }
+
+    .cream .brand,
+    .cream .kicker {
+      color: var(--rust);
+    }
+
+    .cream .mark {
+      border-color: var(--line);
+      background: #fffdf8;
+    }
+
+    .cream .tags span {
+      color: var(--cream);
+      background: var(--charcoal);
+    }
+
+    .cream .label {
+      border-color: var(--line);
+      background: rgba(255, 253, 248, 0.78);
+      color: var(--ink);
+    }
+
+    .cream .label small,
+    .cream .chips span {
+      color: var(--muted);
+    }
+
+    .cream .lane {
+      background: rgba(23, 32, 38, 0.14);
+    }
+
+    .cream .chips span {
+      border-color: var(--line);
+      background: rgba(255, 253, 248, 0.78);
+    }
+
+    .cream .node {
+      border-color: var(--teal);
+      background: #fffdf8;
+    }
+
+    .cream .packet {
+      background: var(--rust);
+      box-shadow: 0 0 0 14px rgba(189, 75, 38, 0.12), 0 0 28px rgba(189, 75, 38, 0.35);
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="card" id="day-01">
+      <div class="brand"><span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12c2.8-5.8 7.2-7.6 13.4-5.4" stroke="#fff4dc" stroke-width="2" stroke-linecap="round"/><path d="M20 12c-2.8 5.8-7.2 7.6-13.4 5.4" stroke="#d8f1ec" stroke-width="2" stroke-linecap="round"/><path d="M8.5 12h7" stroke="#f9e7c1" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="12" r="2.25" fill="#fff4dc"/></svg></span>AdaptiveAgent</div>
+      <div class="content">
+        <p class="kicker">Day 01 / Runtime Stack</p>
+        <h1>A runtime for reliable AI agents</h1>
+        <p class="subhead">Goal-oriented runs with typed tools, structured events, approvals, retries, and recoverable history.</p>
+      </div>
+      <div class="visual">
+        <div class="trace">
+          <div class="lane" style="top: 8%"></div><div class="lane" style="top: 26%"></div><div class="lane" style="top: 44%"></div><div class="lane" style="top: 62%"></div><div class="lane" style="top: 80%"></div>
+          <div class="label" style="top: calc(8% - 18px)">objective<small>top-level goal</small></div>
+          <div class="label" style="top: calc(26% - 18px)">approval<small>policy gate</small></div>
+          <div class="label" style="top: calc(44% - 18px)">tool call<small>typed action</small></div>
+          <div class="label" style="top: calc(62% - 18px)">event log<small>runtime trace</small></div>
+          <div class="label" style="top: calc(80% - 18px)">result<small>inspectable output</small></div>
+          <svg class="path" viewBox="0 0 455 455"><path d="M188 52 C240 52 222 130 286 130 C352 130 312 210 372 210 C424 210 350 295 406 364" fill="none" stroke="rgba(216,241,236,.36)" stroke-width="3"/></svg>
+          <span class="node" style="left: 188px; top: 52px"></span><span class="node" style="left: 286px; top: 130px"></span><span class="node" style="left: 372px; top: 210px"></span><span class="node" style="left: 406px; top: 364px"></span><span class="packet" style="left: 286px; top: 130px"></span>
+        </div>
+      </div>
+      <div class="tags"><span>#AI</span><span>#AdaptiveAgent</span></div>
+    </section>
+
+    <section class="card cream" id="day-02">
+      <div class="brand"><span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12c2.8-5.8 7.2-7.6 13.4-5.4" stroke="#101418" stroke-width="2" stroke-linecap="round"/><path d="M20 12c-2.8 5.8-7.2 7.6-13.4 5.4" stroke="#0f766e" stroke-width="2" stroke-linecap="round"/><path d="M8.5 12h7" stroke="#bd4b26" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="12" r="2.25" fill="#101418"/></svg></span>AdaptiveAgent</div>
+      <div class="content">
+        <p class="kicker">Day 02 / Goals Become Sessions</p>
+        <h1>Start with a goal. Keep the session.</h1>
+        <p class="subhead">Run a local objective, watch progress, capture events, and keep enough history to understand what happened.</p>
+      </div>
+      <div class="visual">
+        <div class="trace">
+          <div class="lane" style="top: 14%"></div><div class="lane" style="top: 36%"></div><div class="lane" style="top: 58%"></div><div class="lane" style="top: 80%"></div>
+          <div class="label" style="top: calc(14% - 18px)">goal<small>user intent</small></div>
+          <div class="label" style="top: calc(36% - 18px)">session<small>run state</small></div>
+          <div class="label" style="top: calc(58% - 18px)">progress<small>visible loop</small></div>
+          <div class="label" style="top: calc(80% - 18px)">history<small>inspect later</small></div>
+          <svg class="path" viewBox="0 0 455 455"><path d="M178 64 C248 64 238 164 318 164 C388 164 300 262 392 262 C440 262 354 362 410 362" fill="none" stroke="rgba(15,118,110,.42)" stroke-width="3"/></svg>
+          <span class="node" style="left: 178px; top: 64px"></span><span class="node" style="left: 318px; top: 164px"></span><span class="node" style="left: 392px; top: 262px"></span><span class="node" style="left: 410px; top: 362px"></span><span class="packet" style="left: 392px; top: 262px"></span>
+        </div>
+      </div>
+      <div class="tags"><span>#AI</span><span>#AdaptiveAgent</span></div>
+    </section>
+
+    <section class="card" id="day-03">
+      <div class="brand"><span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12c2.8-5.8 7.2-7.6 13.4-5.4" stroke="#fff4dc" stroke-width="2" stroke-linecap="round"/><path d="M20 12c-2.8 5.8-7.2 7.6-13.4 5.4" stroke="#d8f1ec" stroke-width="2" stroke-linecap="round"/><path d="M8.5 12h7" stroke="#f9e7c1" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="12" r="2.25" fill="#fff4dc"/></svg></span>AdaptiveAgent</div>
+      <div class="content">
+        <p class="kicker">Day 03 / Typed Tools</p>
+        <h1>Make capabilities explicit</h1>
+        <p class="subhead">`Tool` is the executable primitive: clear inputs, clear behavior, fewer hidden side effects.</p>
+      </div>
+      <div class="visual">
+        <div class="chips"><span>read_file</span><span>web_search</span><span>shell</span><span>write_file</span><span>approval</span><span>output json</span></div>
+        <div class="trace">
+          <div class="lane" style="top: 22%"></div><div class="lane" style="top: 44%"></div><div class="lane" style="top: 66%"></div>
+          <div class="label" style="top: calc(22% - 18px)">agent<small>chooses tool</small></div>
+          <div class="label" style="top: calc(44% - 18px)">Tool<small>typed primitive</small></div>
+          <div class="label" style="top: calc(66% - 18px)">event<small>recorded call</small></div>
+          <svg class="path" viewBox="0 0 455 455"><path d="M184 102 C246 102 238 202 320 202 C400 202 310 304 386 304" fill="none" stroke="rgba(249,231,193,.38)" stroke-width="3"/></svg>
+          <span class="node" style="left: 184px; top: 102px"></span><span class="node" style="left: 320px; top: 202px"></span><span class="node" style="left: 386px; top: 304px"></span><span class="packet" style="left: 320px; top: 202px"></span>
+        </div>
+      </div>
+      <div class="tags"><span>#AI</span><span>#AdaptiveAgent</span></div>
+    </section>
+
+    <section class="card cream" id="day-04">
+      <div class="brand"><span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12c2.8-5.8 7.2-7.6 13.4-5.4" stroke="#101418" stroke-width="2" stroke-linecap="round"/><path d="M20 12c-2.8 5.8-7.2 7.6-13.4 5.4" stroke="#0f766e" stroke-width="2" stroke-linecap="round"/><path d="M8.5 12h7" stroke="#bd4b26" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="12" r="2.25" fill="#101418"/></svg></span>AdaptiveAgent</div>
+      <div class="content">
+        <p class="kicker">Day 04 / Structured Events</p>
+        <h1>Agent runs should leave a trace</h1>
+        <p class="subhead">Model activity, approvals, retries, child runs, and tools become runtime history teams can inspect.</p>
+      </div>
+      <div class="visual">
+        <div class="chips"><span>model.activity</span><span>tool.call</span><span>approval.requested</span><span>retry.started</span><span>child.run</span></div>
+        <div class="trace">
+          <div class="lane" style="top: 12%"></div><div class="lane" style="top: 29%"></div><div class="lane" style="top: 46%"></div><div class="lane" style="top: 63%"></div><div class="lane" style="top: 80%"></div>
+          <div class="label" style="top: calc(12% - 18px)">event 01<small>model</small></div><div class="label" style="top: calc(29% - 18px)">event 02<small>tool</small></div><div class="label" style="top: calc(46% - 18px)">event 03<small>approval</small></div><div class="label" style="top: calc(63% - 18px)">event 04<small>retry</small></div><div class="label" style="top: calc(80% - 18px)">event 05<small>result</small></div>
+        </div>
+      </div>
+      <div class="tags"><span>#AI</span><span>#AdaptiveAgent</span></div>
+    </section>
+
+    <section class="card" id="day-05">
+      <div class="brand"><span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12c2.8-5.8 7.2-7.6 13.4-5.4" stroke="#fff4dc" stroke-width="2" stroke-linecap="round"/><path d="M20 12c-2.8 5.8-7.2 7.6-13.4 5.4" stroke="#d8f1ec" stroke-width="2" stroke-linecap="round"/><path d="M8.5 12h7" stroke="#f9e7c1" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="12" r="2.25" fill="#fff4dc"/></svg></span>AdaptiveAgent</div>
+      <div class="content">
+        <p class="kicker">Day 05 / Recovery And Control</p>
+        <h1>Production agents need control surfaces</h1>
+        <p class="subhead">Approval modes, resumable runs, retryable failures, and history for work that must be inspected and recovered.</p>
+      </div>
+      <div class="visual">
+        <div class="chips"><span>--approval manual</span><span>--approval reject</span><span>retry --run-id</span><span>--runtime postgres</span></div>
+        <div class="trace">
+          <div class="lane" style="top: 16%"></div><div class="lane" style="top: 38%"></div><div class="lane" style="top: 60%"></div><div class="lane" style="top: 82%"></div>
+          <div class="label" style="top: calc(16% - 18px)">approval<small>human gate</small></div><div class="label" style="top: calc(38% - 18px)">failure<small>retryable</small></div><div class="label" style="top: calc(60% - 18px)">resume<small>keep context</small></div><div class="label" style="top: calc(82% - 18px)">history<small>audit trail</small></div>
+          <svg class="path" viewBox="0 0 455 455"><path d="M184 72 C260 72 238 172 344 172 C410 172 312 272 382 272 C430 272 350 372 412 372" fill="none" stroke="rgba(216,241,236,.36)" stroke-width="3"/></svg>
+          <span class="node" style="left: 184px; top: 72px"></span><span class="node" style="left: 344px; top: 172px"></span><span class="node" style="left: 382px; top: 272px"></span><span class="node" style="left: 412px; top: 372px"></span><span class="packet" style="left: 382px; top: 272px"></span>
+        </div>
+      </div>
+      <div class="tags"><span>#AI</span><span>#AdaptiveAgent</span></div>
+    </section>
+
+    <section class="card cream" id="day-06">
+      <div class="brand"><span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12c2.8-5.8 7.2-7.6 13.4-5.4" stroke="#101418" stroke-width="2" stroke-linecap="round"/><path d="M20 12c-2.8 5.8-7.2 7.6-13.4 5.4" stroke="#0f766e" stroke-width="2" stroke-linecap="round"/><path d="M8.5 12h7" stroke="#bd4b26" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="12" r="2.25" fill="#101418"/></svg></span>AdaptiveAgent</div>
+      <div class="content">
+        <p class="kicker">Day 06 / Agent Profiles</p>
+        <h1>Reusable agents as JSON profiles</h1>
+        <p class="subhead">Model, instructions, tools, defaults, and optional delegates in portable profiles you can run by name.</p>
+      </div>
+      <div class="visual">
+        <div class="chips"><span>reviewer.json</span><span>researcher.json</span><span>writer.json</span><span>release-manager.json</span></div>
+        <div class="trace">
+          <div class="lane" style="top: 20%"></div><div class="lane" style="top: 44%"></div><div class="lane" style="top: 68%"></div>
+          <div class="label" style="top: calc(20% - 18px)">profile<small>portable spec</small></div><div class="label" style="top: calc(44% - 18px)">agent<small>selected by name</small></div><div class="label" style="top: calc(68% - 18px)">workflow<small>repeatable run</small></div>
+          <svg class="path" viewBox="0 0 455 455"><path d="M190 92 C266 92 244 202 342 202 C412 202 318 314 400 314" fill="none" stroke="rgba(15,118,110,.42)" stroke-width="3"/></svg>
+          <span class="node" style="left: 190px; top: 92px"></span><span class="node" style="left: 342px; top: 202px"></span><span class="node" style="left: 400px; top: 314px"></span><span class="packet" style="left: 342px; top: 202px"></span>
+        </div>
+      </div>
+      <div class="tags"><span>#AI</span><span>#AdaptiveAgent</span></div>
+    </section>
+
+    <section class="card" id="day-07">
+      <div class="brand"><span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12c2.8-5.8 7.2-7.6 13.4-5.4" stroke="#fff4dc" stroke-width="2" stroke-linecap="round"/><path d="M20 12c-2.8 5.8-7.2 7.6-13.4 5.4" stroke="#d8f1ec" stroke-width="2" stroke-linecap="round"/><path d="M8.5 12h7" stroke="#f9e7c1" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="12" r="2.25" fill="#fff4dc"/></svg></span>AdaptiveAgent</div>
+      <div class="content">
+        <p class="kicker">Day 07 / Real Workflows</p>
+        <h1>Start small. Grow with the job.</h1>
+        <p class="subhead">Map a repo, review a PR, create release notes, run local analysis, evaluate agents, or coordinate specialists.</p>
+      </div>
+      <div class="visual">
+        <div class="chips"><span>map repository</span><span>review PR</span><span>release notes</span><span>local analysis</span><span>eval cases</span><span>specialists</span></div>
+        <div class="trace">
+          <div class="lane" style="top: 18%"></div><div class="lane" style="top: 40%"></div><div class="lane" style="top: 62%"></div><div class="lane" style="top: 84%"></div>
+          <div class="label" style="top: calc(18% - 18px)">goal<small>one command</small></div><div class="label" style="top: calc(40% - 18px)">profile<small>right agent</small></div><div class="label" style="top: calc(62% - 18px)">runtime<small>events + tools</small></div><div class="label" style="top: calc(84% - 18px)">output<small>repeatable work</small></div>
+          <svg class="path" viewBox="0 0 455 455"><path d="M184 82 C258 82 238 182 340 182 C414 182 312 282 390 282 C438 282 352 382 414 382" fill="none" stroke="rgba(249,231,193,.38)" stroke-width="3"/></svg>
+          <span class="node" style="left: 184px; top: 82px"></span><span class="node" style="left: 340px; top: 182px"></span><span class="node" style="left: 390px; top: 282px"></span><span class="node" style="left: 414px; top: 382px"></span><span class="packet" style="left: 390px; top: 282px"></span>
+        </div>
+      </div>
+      <div class="tags"><span>#AI</span><span>#AdaptiveAgent</span></div>
+    </section>
+  </main>
+</body>
+</html>

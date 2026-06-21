@@ -444,6 +444,84 @@
       color: var(--ink);
     }
 
+    .doc-card-wide {
+      grid-column: 1 / -1;
+    }
+
+    .doc-mini-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .doc-mini {
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fffaf1;
+    }
+
+    .doc-mini:nth-child(2n) {
+      background: var(--teal-soft);
+    }
+
+    .doc-mini:nth-child(3n) {
+      background: var(--amber-soft);
+    }
+
+    .doc-mini strong {
+      display: block;
+      margin-bottom: 6px;
+    }
+
+    .doc-mini span {
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .doc-recipe-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .doc-recipe {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .doc-recipe .code-block {
+      height: 100%;
+    }
+
+    .doc-table {
+      display: grid;
+      gap: 1px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--line);
+    }
+
+    .doc-table-row {
+      display: grid;
+      grid-template-columns: minmax(170px, 0.7fr) minmax(0, 1.3fr);
+      gap: 1px;
+    }
+
+    .doc-table-row > span {
+      padding: 12px 14px;
+      background: var(--paper-strong);
+      color: var(--muted);
+    }
+
+    .doc-table-row > span:first-child {
+      color: var(--ink);
+      font-weight: 900;
+      background: #f2eadc;
+    }
+
     .workflow {
       margin-top: 40px;
       border: 1px solid var(--line);
@@ -529,10 +607,33 @@
       background: rgba(255, 244, 220, 0.06);
     }
 
+    .step[open] {
+      background: rgba(255, 244, 220, 0.09);
+    }
+
     .step-label {
       display: flex;
       gap: 14px;
       align-items: flex-start;
+      cursor: pointer;
+      list-style: none;
+    }
+
+    .step-label::-webkit-details-marker {
+      display: none;
+    }
+
+    .step-label::after {
+      content: "+";
+      margin-left: auto;
+      color: var(--amber-soft);
+      font-size: 1.2rem;
+      font-weight: 900;
+      line-height: 1;
+    }
+
+    .step[open] .step-label::after {
+      content: "-";
     }
 
     .step-number {
@@ -736,6 +837,12 @@
         grid-template-columns: 1fr;
       }
 
+      .doc-mini-grid,
+      .doc-recipe-grid,
+      .doc-table-row {
+        grid-template-columns: 1fr;
+      }
+
       .overview-grid,
       .step {
         grid-template-columns: 1fr;
@@ -915,7 +1022,7 @@
       <div class="container">
         <p class="section-kicker">Runtime shape</p>
         <h2 class="section-title">A local stack for goals, tools, history, and recovery.</h2>
-        <p class="section-lede">The README positions AdaptiveAgent as a runtime and CLI for reliable agent execution. This page presents that same story as a product home page while preserving the quickstart commands below.</p>
+        <p class="section-lede">AdaptiveAgent runs goals as durable sessions: tools stay explicit, events record each step, approvals gate sensitive actions, and runtime history supports inspection, retries, and recovery.</p>
 
         <div class="workflow" aria-label="AdaptiveAgent runtime flow">
           <div class="workflow-header">
@@ -954,15 +1061,15 @@
         <h2 class="section-title">Install, add a key, then run your first local agent.</h2>
         <p class="section-lede">These commands are the complete README quickstart, with code blocks styled for scanning and terminal use.</p>
 
-        <div class="quickstart-grid">
-          <article class="step">
-            <div class="step-label">
+        <div class="quickstart-grid" data-quickstart-accordion>
+          <details class="step" open>
+            <summary class="step-label">
               <span class="step-number">1</span>
               <div>
                 <h3>Install</h3>
                 <p>Use the platform installer for macOS, Linux, or Windows PowerShell.</p>
               </div>
-            </div>
+            </summary>
             <div class="code-stack">
               <div class="code-block">
                 <div class="code-label">macOS</div>
@@ -978,16 +1085,16 @@
               </div>
               <p>If the installer says <code>adaptive-agent</code> is not on your <code>PATH</code>, run the exact PATH command it prints.</p>
             </div>
-          </article>
+          </details>
 
-          <article class="step">
-            <div class="step-label">
+          <details class="step">
+            <summary class="step-label">
               <span class="step-number">2</span>
               <div>
                 <h3>Add an API key</h3>
                 <p>The default hosted quickstart uses OpenRouter.</p>
               </div>
-            </div>
+            </summary>
             <div class="code-stack">
               <div class="code-block">
                 <div class="code-label">bash</div>
@@ -1029,16 +1136,16 @@
                 <li><span><strong>Ollama:</strong> no API key, but Ollama must be running locally</span></li>
               </ul>
             </div>
-          </article>
+          </details>
 
-          <article class="step">
-            <div class="step-label">
+          <details class="step">
+            <summary class="step-label">
               <span class="step-number">3</span>
               <div>
                 <h3>Init and run</h3>
                 <p>Create local config, check the provider, and confirm the agent is working.</p>
               </div>
-            </div>
+            </summary>
             <div class="code-stack">
               <div class="code-block">
                 <div class="code-label">terminal</div>
@@ -1048,7 +1155,7 @@ adaptive-agent run "Hello, confirm you are working"</code></pre>
               </div>
               <p class="final-note">That is it. You now have a configured local agent that can run goals, use tools, and produce inspectable runtime history.</p>
             </div>
-          </article>
+          </details>
         </div>
       </div>
     </section>
@@ -1154,6 +1261,195 @@ adaptive-agent run \
               <li><strong>Recovery:</strong> use <code>adaptive-agent retry --run-id &lt;runId&gt;</code> for failed retryable runs.</li>
             </ul>
           </article>
+
+          <article class="doc-card doc-card-wide">
+            <h3>Pick the workflow that matches the job</h3>
+            <div class="doc-table" role="table" aria-label="AdaptiveAgent workflow guide">
+              <div class="doc-table-row" role="row">
+                <span role="cell">Try one task</span>
+                <span role="cell"><code>adaptive-agent run "goal"</code> for a quick local run.</span>
+              </div>
+              <div class="doc-table-row" role="row">
+                <span role="cell">Make it visible</span>
+                <span role="cell">Add <code>--progress --events --inspect</code> to watch the loop and review the result.</span>
+              </div>
+              <div class="doc-table-row" role="row">
+                <span role="cell">Keep it safe</span>
+                <span role="cell">Use <code>--approval reject</code> for read-only audits, <code>manual</code> for prompts, or <code>auto</code> for trusted automation.</span>
+              </div>
+              <div class="doc-table-row" role="row">
+                <span role="cell">Automate it</span>
+                <span role="cell">Use <code>--output json</code> or <code>--output jsonl</code> from scripts, CI, and benchmark runs.</span>
+              </div>
+              <div class="doc-table-row" role="row">
+                <span role="cell">Make it durable</span>
+                <span role="cell">Use <code>--runtime postgres</code> when a run needs history, retry, or restart-safe execution.</span>
+              </div>
+            </div>
+          </article>
+
+          <article class="doc-card doc-card-wide">
+            <h3>Useful things to try first</h3>
+            <div class="doc-mini-grid">
+              <div class="doc-mini">
+                <strong>Map a repository</strong>
+                <span>Ask for packages, entrypoints, architecture, tests, and risky areas before changing code.</span>
+              </div>
+              <div class="doc-mini">
+                <strong>Review a pull request</strong>
+                <span>Run a reviewer profile with <code>--approval reject</code> so it can inspect but not mutate.</span>
+              </div>
+              <div class="doc-mini">
+                <strong>Write a research brief</strong>
+                <span>Use the STORM researcher for cited reports, market scans, or technical comparisons.</span>
+              </div>
+              <div class="doc-mini">
+                <strong>Generate release notes</strong>
+                <span>Turn commits, docs, or changelog fragments into user-facing summaries.</span>
+              </div>
+              <div class="doc-mini">
+                <strong>Run private local analysis</strong>
+                <span>Switch to <code>--provider ollama</code> when data should stay on your machine.</span>
+              </div>
+              <div class="doc-mini">
+                <strong>Evaluate agents</strong>
+                <span>Use JSONL input and output to compare providers, models, prompts, and agent profiles.</span>
+              </div>
+            </div>
+          </article>
+
+          <article class="doc-card doc-card-wide">
+            <h3>Create your own reusable agent profile</h3>
+            <p>An agent profile is a portable JSON workflow: model, instructions, tools, defaults, and optional delegates. Save named profiles such as <code>reviewer.json</code>, <code>researcher.json</code>, or <code>release-manager.json</code>, then run them with <code>--agent</code>.</p>
+            <div class="doc-recipe-grid">
+              <div class="doc-recipe">
+                <p>Start with a read-only reviewer that can inspect files and web pages but cannot write or run shell commands.</p>
+                <div class="code-block">
+                  <div class="code-label">agents/reviewer.json</div>
+                  <pre><code>{
+  "version": 1,
+  "id": "reviewer",
+  "name": "Repository Reviewer",
+  "invocationModes": ["run"],
+  "defaultInvocationMode": "run",
+  "model": {
+    "provider": "openrouter",
+    "model": "qwen/qwen3.5-27b",
+    "apiKeyEnv": "OPENROUTER_API_KEY"
+  },
+  "workspaceRoot": ".",
+  "systemInstructions": "Review code for correctness, safety, tests, and maintainability. Return prioritized findings with file references.",
+  "tools": ["read_file", "list_directory", "web_search", "read_web_page"],
+  "defaults": {
+    "maxSteps": 30,
+    "capture": "summary"
+  }
+}</code></pre>
+                </div>
+              </div>
+              <div class="doc-recipe">
+                <p>Use the profile by path, or place it in one of your configured agent directories and use the short name.</p>
+                <div class="code-block">
+                  <div class="code-label">terminal</div>
+                  <pre><code>adaptive-agent run \
+  --agent ./agents/reviewer.json \
+  --approval reject \
+  --progress \
+  --inspect \
+  "Review the current repository changes for risky runtime behavior."
+
+adaptive-agent catalog</code></pre>
+                </div>
+              </div>
+            </div>
+          </article>
+
+          <article class="doc-card doc-card-wide">
+            <h3>Recipes for real work</h3>
+            <div class="doc-recipe-grid">
+              <div class="doc-recipe">
+                <p><strong>Understand a codebase</strong></p>
+                <div class="code-block">
+                  <div class="code-label">terminal</div>
+                  <pre><code>adaptive-agent run \
+  --progress \
+  --events \
+  "Map this repository: packages, entrypoints, data flow, tests, and risky areas."</code></pre>
+                </div>
+              </div>
+              <div class="doc-recipe">
+                <p><strong>Create structured automation</strong></p>
+                <div class="code-block">
+                  <div class="code-label">terminal</div>
+                  <pre><code>adaptive-agent run \
+  --input-json '{"topic":"agent reliability","audience":"engineering leaders"}' \
+  --output json \
+  "Create a concise research brief."</code></pre>
+                </div>
+              </div>
+              <div class="doc-recipe">
+                <p><strong>Run with a local model</strong></p>
+                <div class="code-block">
+                  <div class="code-label">terminal</div>
+                  <pre><code>adaptive-agent run \
+  --provider ollama \
+  --model llama3.2 \
+  --runtime memory \
+  "Summarize this document without using a hosted provider."</code></pre>
+                </div>
+              </div>
+              <div class="doc-recipe">
+                <p><strong>Persist and retry long-running work</strong></p>
+                <div class="code-block">
+                  <div class="code-label">terminal</div>
+                  <pre><code>adaptive-agent run \
+  --runtime postgres \
+  --events \
+  --inspect \
+  "Audit these logs and summarize likely root causes."
+
+adaptive-agent retry --run-id &lt;runId&gt; --runtime postgres</code></pre>
+                </div>
+              </div>
+            </div>
+          </article>
+
+          <article class="doc-card">
+            <h3>Run evaluations</h3>
+            <p>Use eval commands when you want repeatable model or agent-profile comparisons over JSONL cases.</p>
+            <div class="code-block">
+              <div class="code-label">terminal</div>
+              <pre><code>adaptive-agent eval cases \
+  --input ./data/tasks.jsonl \
+  --out ./runs/results.jsonl \
+  --runtime postgres \
+  --output jsonl</code></pre>
+            </div>
+          </article>
+
+          <article class="doc-card">
+            <h3>Coordinate specialists</h3>
+            <p>For bigger objectives, use a coordinator profile and a worker catalog so research, writing, review, and synthesis can be separated.</p>
+            <div class="code-block">
+              <div class="code-label">terminal</div>
+              <pre><code>adaptive-agent swarm-run \
+  --agent coordinator \
+  --worker-catalog researcher,writer,reviewer \
+  --runtime postgres \
+  --events \
+  "Produce a launch strategy."</code></pre>
+            </div>
+          </article>
+
+          <article class="doc-card">
+            <h3>Beyond the terminal</h3>
+            <p>AdaptiveAgent is technical today, but the same runtime can be packaged for non-technical users.</p>
+            <ul class="doc-list">
+              <li><strong>Desktop app:</strong> guided setup, saved profiles, run history, and approval prompts.</li>
+              <li><strong>Team workspace:</strong> shared templates, durable runs, human review, and audit trails.</li>
+              <li><strong>Hosted forms:</strong> turn common workflows into simple inputs such as topic, files, and desired output.</li>
+            </ul>
+          </article>
         </div>
       </div>
     </section>
@@ -1237,22 +1533,53 @@ adaptive-agent run \
         label.appendChild(button);
       });
 
+      const quickstartAccordion = document.querySelector("[data-quickstart-accordion]");
+      if (quickstartAccordion) {
+        const panels = [...quickstartAccordion.querySelectorAll(".step")];
+        panels.forEach((panel) => {
+          panel.addEventListener("toggle", () => {
+            if (!panel.open) {
+              return;
+            }
+
+            panels.forEach((otherPanel) => {
+              if (otherPanel !== panel) {
+                otherPanel.open = false;
+              }
+            });
+          });
+        });
+      }
+
       const canvas = document.querySelector("[data-runtime-canvas]");
       const ctx = canvas.getContext("2d");
       const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-      const nodes = [
-        { label: "objective", x: 0.18, y: 0.24, color: "#fff4dc" },
-        { label: "run", x: 0.42, y: 0.19, color: "#d8f1ec" },
-        { label: "tools", x: 0.66, y: 0.3, color: "#f9e7c1" },
-        { label: "events", x: 0.78, y: 0.56, color: "#f4d5c8" },
-        { label: "resume", x: 0.48, y: 0.68, color: "#e0efdf" },
-        { label: "history", x: 0.24, y: 0.58, color: "#d8f1ec" }
+      const lanes = [
+        { label: "objective", detail: "top-level goal", color: "#fff4dc" },
+        { label: "approval", detail: "policy gate", color: "#f9e7c1" },
+        { label: "tool call", detail: "typed action", color: "#d8f1ec" },
+        { label: "event log", detail: "structured trace", color: "#f4d5c8" },
+        { label: "retry", detail: "recoverable run", color: "#e0efdf" },
+        { label: "result", detail: "inspectable output", color: "#d8f1ec" }
       ];
-      const links = [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [5, 0], [1, 4]];
+      const traceStops = [
+        { lane: 0, x: 0.23 },
+        { lane: 1, x: 0.39 },
+        { lane: 2, x: 0.56 },
+        { lane: 3, x: 0.72 },
+        { lane: 4, x: 0.58 },
+        { lane: 5, x: 0.82 }
+      ];
+      const packets = [
+        { offset: 0, color: "#fff4dc" },
+        { offset: 0.28, color: "#d8f1ec" },
+        { offset: 0.57, color: "#f9e7c1" }
+      ];
       const pointer = { x: 0.5, y: 0.5 };
       let frame = 0;
       let width = 0;
       let height = 0;
+      let traceBounds = { x: 0, y: 0, w: 0, h: 0 };
 
       function resize() {
         const scale = Math.min(window.devicePixelRatio || 1, 2);
@@ -1264,20 +1591,45 @@ adaptive-agent run \
         draw();
       }
 
-      function point(node) {
-        const driftX = (pointer.x - 0.5) * 18;
-        const driftY = (pointer.y - 0.5) * 12;
+      function layoutTrace() {
+        const driftX = (pointer.x - 0.5) * 26;
+        const driftY = (pointer.y - 0.5) * 16;
+        const w = Math.min(540, width * 0.36);
+        const h = Math.min(420, height * 0.56);
         return {
-          x: node.x * width + driftX * (node.x - 0.5),
-          y: node.y * height + driftY * (node.y - 0.5)
+          x: width - w - width * 0.07 + driftX,
+          y: height * 0.2 + driftY,
+          w,
+          h
         };
       }
 
-      function drawGrid() {
+      function laneY(index) {
+        const gap = traceBounds.h / Math.max(lanes.length - 1, 1);
+        return traceBounds.y + gap * index;
+      }
+
+      function stopPoint(stop) {
+        return {
+          x: traceBounds.x + traceBounds.w * stop.x,
+          y: laneY(stop.lane)
+        };
+      }
+
+      function drawBackground() {
+        const glow = ctx.createRadialGradient(width * 0.72, height * 0.36, 0, width * 0.72, height * 0.36, Math.max(width, height) * 0.72);
+        glow.addColorStop(0, "rgba(15, 118, 110, 0.2)");
+        glow.addColorStop(0.42, "rgba(189, 75, 38, 0.1)");
+        glow.addColorStop(1, "rgba(16, 20, 24, 0)");
+        ctx.fillStyle = "#101418";
+        ctx.fillRect(0, 0, width, height);
+        ctx.fillStyle = glow;
+        ctx.fillRect(0, 0, width, height);
+
         ctx.save();
-        ctx.strokeStyle = "rgba(255, 244, 220, 0.055)";
+        ctx.strokeStyle = "rgba(255, 244, 220, 0.045)";
         ctx.lineWidth = 1;
-        const gap = Math.max(42, Math.min(72, width / 16));
+        const gap = Math.max(46, Math.min(82, width / 18));
         for (let x = 0; x <= width; x += gap) {
           ctx.beginPath();
           ctx.moveTo(x, 0);
@@ -1293,63 +1645,123 @@ adaptive-agent run \
         ctx.restore();
       }
 
-      function drawPacket(a, b, offset, color) {
-        const p1 = point(nodes[a]);
-        const p2 = point(nodes[b]);
-        const t = (offset % 1 + 1) % 1;
-        const x = p1.x + (p2.x - p1.x) * t;
-        const y = p1.y + (p2.y - p1.y) * t;
+      function drawLanes() {
         ctx.save();
-        ctx.fillStyle = color;
-        ctx.globalAlpha = 0.82;
+        ctx.font = "700 11px ui-sans-serif, system-ui, sans-serif";
+        ctx.textBaseline = "middle";
+
+        lanes.forEach((lane, index) => {
+          const y = laneY(index);
+          const laneAlpha = 0.16 + Math.sin(frame / 70 + index) * 0.025;
+          ctx.strokeStyle = `rgba(255, 244, 220, ${laneAlpha})`;
+          ctx.lineWidth = 1.2;
+          ctx.beginPath();
+          ctx.moveTo(traceBounds.x + traceBounds.w * 0.16, y);
+          ctx.lineTo(traceBounds.x + traceBounds.w * 0.9, y);
+          ctx.stroke();
+
+          ctx.fillStyle = "rgba(16, 20, 24, 0.74)";
+          ctx.strokeStyle = "rgba(255, 244, 220, 0.16)";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.roundRect(traceBounds.x, y - 18, 112, 36, 8);
+          ctx.fill();
+          ctx.stroke();
+
+          ctx.fillStyle = lane.color;
+          ctx.textAlign = "left";
+          ctx.fillText(lane.label, traceBounds.x + 13, y - 4);
+          ctx.fillStyle = "rgba(255, 250, 240, 0.48)";
+          ctx.font = "600 9px ui-sans-serif, system-ui, sans-serif";
+          ctx.fillText(lane.detail, traceBounds.x + 13, y + 9);
+          ctx.font = "700 11px ui-sans-serif, system-ui, sans-serif";
+        });
+
+        ctx.restore();
+      }
+
+      function drawTracePath() {
+        const points = traceStops.map(stopPoint);
+        ctx.save();
+        ctx.lineWidth = 2.2;
+        ctx.strokeStyle = "rgba(216, 241, 236, 0.3)";
+        ctx.shadowBlur = 16;
+        ctx.shadowColor = "rgba(216, 241, 236, 0.24)";
         ctx.beginPath();
-        ctx.arc(x, y, 4.5, 0, Math.PI * 2);
+        ctx.moveTo(points[0].x, points[0].y);
+        for (let i = 1; i < points.length; i += 1) {
+          const prev = points[i - 1];
+          const next = points[i];
+          const midX = (prev.x + next.x) / 2;
+          ctx.bezierCurveTo(midX, prev.y, midX, next.y, next.x, next.y);
+        }
+        ctx.stroke();
+        ctx.restore();
+
+        points.forEach((point, index) => {
+          const lane = lanes[traceStops[index].lane];
+          const pulse = reduced ? 0 : Math.sin(frame / 34 + index * 0.8) * 2.4;
+          ctx.save();
+          ctx.fillStyle = "rgba(16, 20, 24, 0.86)";
+          ctx.strokeStyle = lane.color;
+          ctx.lineWidth = 1.5;
+          ctx.shadowBlur = 12;
+          ctx.shadowColor = lane.color;
+          ctx.beginPath();
+          ctx.arc(point.x, point.y, 7 + pulse, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+          ctx.restore();
+        });
+      }
+
+      function tracePoint(progress) {
+        const points = traceStops.map(stopPoint);
+        const segmentCount = points.length - 1;
+        const scaled = progress * segmentCount;
+        const index = Math.min(Math.floor(scaled), segmentCount - 1);
+        const t = scaled - index;
+        const p1 = points[index];
+        const p2 = points[index + 1];
+        const smooth = t * t * (3 - 2 * t);
+        return {
+          x: p1.x + (p2.x - p1.x) * smooth,
+          y: p1.y + (p2.y - p1.y) * smooth
+        };
+      }
+
+      function drawPacket(progress, color) {
+        const point = tracePoint(progress);
+        ctx.save();
+        ctx.globalAlpha = 0.86;
+        ctx.shadowBlur = 20;
+        ctx.shadowColor = color;
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(point.x, point.y, 5.5, 0, Math.PI * 2);
         ctx.fill();
+
+        ctx.globalAlpha = 0.22;
+        ctx.lineWidth = 8;
+        ctx.strokeStyle = color;
+        ctx.beginPath();
+        ctx.arc(point.x, point.y, 10, 0, Math.PI * 2);
+        ctx.stroke();
         ctx.restore();
       }
 
       function draw() {
         frame += 1;
         ctx.clearRect(0, 0, width, height);
-        ctx.fillStyle = "#101418";
-        ctx.fillRect(0, 0, width, height);
-        drawGrid();
-
-        ctx.save();
-        ctx.lineWidth = 1.4;
-        for (const [from, to] of links) {
-          const p1 = point(nodes[from]);
-          const p2 = point(nodes[to]);
-          ctx.strokeStyle = "rgba(255, 244, 220, 0.18)";
-          ctx.beginPath();
-          ctx.moveTo(p1.x, p1.y);
-          ctx.lineTo(p2.x, p2.y);
-          ctx.stroke();
-        }
-        ctx.restore();
+        traceBounds = layoutTrace();
+        drawBackground();
+        drawLanes();
+        drawTracePath();
 
         if (!reduced) {
-          links.forEach(([from, to], index) => {
-            drawPacket(from, to, frame / 210 + index * 0.16, nodes[to].color);
+          packets.forEach((packet) => {
+            drawPacket((frame / 260 + packet.offset) % 1, packet.color);
           });
-        }
-
-        for (const node of nodes) {
-          const p = point(node);
-          ctx.save();
-          ctx.fillStyle = "rgba(16, 20, 24, 0.78)";
-          ctx.strokeStyle = node.color;
-          ctx.lineWidth = 1.7;
-          ctx.beginPath();
-          ctx.roundRect(p.x - 46, p.y - 21, 92, 42, 8);
-          ctx.fill();
-          ctx.stroke();
-          ctx.fillStyle = node.color;
-          ctx.font = "700 12px ui-sans-serif, system-ui, sans-serif";
-          ctx.textAlign = "center";
-          ctx.textBaseline = "middle";
-          ctx.fillText(node.label, p.x, p.y);
-          ctx.restore();
         }
 
         if (!reduced) {
