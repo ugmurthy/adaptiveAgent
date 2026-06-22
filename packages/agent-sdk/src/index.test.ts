@@ -20,7 +20,7 @@ describe('agent-sdk config resolution', () => {
   it('loads agent.json and falls back from default postgres to memory without DATABASE_URL', async () => {
     await writeAgentConfig(join(tempDir, 'agent.json'));
 
-    const config = await loadAgentSdkConfig({ cwd: tempDir, env: {} });
+    const config = await loadAgentSdkConfig({ cwd: tempDir, env: { ADAPTIVE_AGENT_HOME: join(tempDir, 'home') } });
 
     expect(config.runtime.requestedMode).toBe('postgres');
     expect(config.runtime.mode).toBe('memory');

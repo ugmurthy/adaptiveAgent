@@ -159,17 +159,35 @@ Analyze logs carefully.
     );
   });
 
-  it('loads the bundled log-analyser skill as a Mesh-backed delegate profile', async () => {
+  it('loads a Mesh-backed delegate profile from a skill directory', async () => {
     process.env.MESH_API_KEY = 'mesh-test-key';
-    const skillDir = fileURLToPath(new URL('../../../../examples/skills/log-analyser', import.meta.url));
+    const skillDir = await mkdtemp(join(tmpdir(), 'mesh-skill-'));
+    await writeFile(join(skillDir, 'SKILL.md'), `---
+name: log-analyser
+description: Analyze gateway and runtime logs
+allowedTools:
+  - list_directory
+  - read_file
+  - write_file
+model.provider: mesh
+model.model: google/gemma-4-26b-a4b-it
+model.apiKeyEnv: MESH_API_KEY
+---
 
-    const skill = await loadSkillFromDirectory(skillDir);
-    const delegate = skillToDelegate(skill);
+Analyze logs carefully.
+`);
 
-    expect(delegate.name).toBe('log-analyser');
-    expect(delegate.allowedTools).toEqual(['list_directory', 'read_file', 'write_file']);
-    expect(delegate.model?.provider).toBe('mesh');
-    expect(delegate.model?.model).toBe('google/gemma-4-26b-a4b-it');
+    try {
+      const skill = await loadSkillFromDirectory(skillDir);
+      const delegate = skillToDelegate(skill);
+
+      expect(delegate.name).toBe('log-analyser');
+      expect(delegate.allowedTools).toEqual(['list_directory', 'read_file', 'write_file']);
+      expect(delegate.model?.provider).toBe('mesh');
+      expect(delegate.model?.model).toBe('google/gemma-4-26b-a4b-it');
+    } finally {
+      await rm(skillDir, { recursive: true, force: true });
+    }
   });
 
   it('loads the bundled file-converter skill with a handler-backed tool', async () => {

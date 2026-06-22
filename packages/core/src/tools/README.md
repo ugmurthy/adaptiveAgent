@@ -271,9 +271,6 @@ If the new built-in should be addressable by name in repository hosts, update
 the appropriate host-owned registry:
 
 - Agent SDK: `packages/agent-sdk/src/index.ts` (`createBuiltinTools`).
-- Core CLI: `packages/core-cli/src/local-modules.ts` (`createBuiltinTools`).
-- Fastify gateway local runtime: `packages/gateway-fastify/src/core.ts` and
-  related local module configuration.
 - User-facing docs or install defaults only if the new tool is meant to be part
   of that host's supported local tool set.
 

@@ -60,6 +60,7 @@ describe('createAdaptiveAgentLogger', () => {
       await flushLogger(logger);
 
       expect(logger.filePath).toBe(join(tempDir, `agent-${dateStamp}-2.log`));
+      await waitForFile(logger.filePath ?? '');
       expect(existsSync(logger.filePath ?? '')).toBe(true);
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
@@ -95,6 +96,15 @@ async function readLastJsonLogEntry(filePath: string): Promise<Record<string, un
   }
 
   throw new Error(`Timed out waiting for a complete JSON log entry in ${filePath}`);
+}
+
+async function waitForFile(filePath: string): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (existsSync(filePath)) {
+      return;
+    }
+    await sleep(5);
+  }
 }
 
 function sleep(ms: number): Promise<void> {

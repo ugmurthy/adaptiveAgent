@@ -1,0 +1,31 @@
+{
+  "name": "@adaptive-agent/trace-session",
+  "version": "0.1.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "src/trace-session.ts",
+  "bin": {
+    "adaptive-agent-trace-session": "./src/trace-session.ts",
+    "trace-session": "./src/trace-session.ts"
+  },
+  "scripts": {
+    "build": "bun build ./src/trace-session.ts --outdir dist --target bun",
+    "trace-session": "bun run ./src/trace-session.ts",
+    "test": "bunx vitest run",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "dependencies": {
+    "chalk": "^5.5.0",
+    "marked": "^15.0.12",
+    "marked-terminal": "^7.3.0",
+    "pg": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.2",
+    "@types/pg": "^8.20.0",
+    "bun-types": "^1.3.5",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.1"
+  }
+}

@@ -14,9 +14,9 @@ describe('tool budget policy', () => {
 
     expect(resolveResearchPolicy('gaia')).toEqual({
       mode: 'gaia',
-      maxSearches: 6,
+      maxSearches: 8,
       maxPagesRead: 12,
-      checkpointAfter: 3,
+      checkpointAfter: 7,
       requirePurpose: true,
     });
   });

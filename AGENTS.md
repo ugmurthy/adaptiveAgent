@@ -6,10 +6,7 @@
 - Primary packages currently include:
   - `@adaptive-agent/core` in `packages/core`
   - `@adaptive-agent/agent-sdk` in `packages/agent-sdk`
-  - `@adaptive-agent/core-cli` in `packages/core-cli`
-  - `@adaptive-agent/gateway-fastify` in `packages/gateway-fastify`
-  - `@adaptive-agent/gateway-web` in `packages/gateway-web`
-  - `@adaptive-agent/analysis` in `packages/analysis`
+  - `@adaptive-agent/trace-session` in `packages/trace-session`
 - Versioned specs and contract Markdown remain important architecture references. Preserve terminology and behavioral contracts when changing implementation code.
 - Treat `agen-spec-v1.5.md` and `agen-contracts-v1.5.md` as the newest versioned spec/contract sources unless a task explicitly targets v1.4 or earlier.
 - Treat `CORE-SESSION-SWARM-SPEC.md` as the reference for the core/session/swarm responsibility boundary between `@adaptive-agent/core` and `@adaptive-agent/agent-sdk`.
@@ -96,5 +93,4 @@ These rules protect the package boundary established by `CORE-SESSION-SWARM-SPEC
 
 ## Package-specific notes
 
-- In `packages/gateway-fastify`, prefer unit-testing upgrade auth helpers and pure protocol handlers directly.
-- Bun's `@fastify/websocket` `injectWS` harness is unreliable for live-upgrade tests, so keep one HTTP/listen smoke test and cover upgrade policy with focused auth tests.
+- In `packages/trace-session`, keep gateway tables optional. Trace reporting must work against core runtime Postgres tables even when `gateway_sessions` and `gateway_session_run_links` are absent.
