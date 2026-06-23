@@ -35,7 +35,7 @@ import type {
 import { agentEventColorKey, agentEventProgressPrefix, formatAgentEventSummary, summarizeAgentEvent } from './agent-event-rendering.js';
 import { formatSwarmExecutionPlan, formatSwarmRunStatuses } from './swarm-format.js';
 import { resolveWebSearchProvider } from './tool-registry.js';
-import { applyNamedStyle, formatStyledMessageBlock } from './tui/message-styles.js';
+import { applyNamedStyle, applyStyle, formatStyledMessageBlock, resolveMessageStyle } from './tui/message-styles.js';
 
 export const passthroughMarkdownStyle = (value: string): string => value;
 
@@ -828,6 +828,20 @@ export function wrapRenderedLine(line: string, width: number): string[] {
 
   for (const token of tokens) {
     const tokenWidth = visibleLength(token);
+    if (tokenWidth > width) {
+      if (current) {
+        lines.push(current);
+        current = '';
+        currentWidth = 0;
+      }
+      const strippedToken = stripAnsi(token);
+      const chunks = splitLongToken(strippedToken, Math.max(1, width - continuationIndent.length));
+      lines.push(chunks[0] ?? strippedToken);
+      for (const chunk of chunks.slice(1)) {
+        lines.push(`${continuationIndent}${chunk}`);
+      }
+      continue;
+    }
     if (current && currentWidth + 1 + tokenWidth > width) {
       lines.push(current);
       current = `${continuationIndent}${token}`;
@@ -847,6 +861,14 @@ export function wrapRenderedLine(line: string, width: number): string[] {
     lines.push(current);
   }
   return lines.length > 0 ? lines : [line];
+}
+
+function splitLongToken(token: string, width: number): string[] {
+  const chunks: string[] = [];
+  for (let index = 0; index < token.length; index += width) {
+    chunks.push(token.slice(index, index + width));
+  }
+  return chunks;
 }
 
 export function visibleLength(value: string): number {
@@ -1094,6 +1116,85 @@ export function printResult(
   if ('toolName' in result) {
     console.log(`tool: ${result.toolName}`);
   }
+}
+
+export function printInteractiveChatResult(
+  result: ChatResult,
+  theme: TuiSettingsConfig,
+  wrapWidth?: number,
+): void {
+  console.log(formatInteractiveChatResult(result, theme, wrapWidth));
+}
+
+export function formatInteractiveChatResult(
+  result: ChatResult,
+  theme: TuiSettingsConfig = {},
+  wrapWidth?: number,
+): string {
+  if (result.status !== 'success') {
+    return renderStyledPrettyMessage('system', result.status === 'failure' ? result.error : result.message, theme);
+  }
+
+  const footer = [
+    `run ${shortChatId(result.runId)}`,
+    `${result.stepsUsed} ${result.stepsUsed === 1 ? 'step' : 'steps'}`,
+    `prompt ${result.usage.promptTokens}`,
+    `completion ${result.usage.completionTokens}`,
+    `total ${result.usage.totalTokens ?? result.usage.promptTokens + result.usage.completionTokens + (result.usage.reasoningTokens ?? 0)}`,
+  ].join(' · ');
+
+  return formatInteractiveChatBlock('assistant', renderInteractiveChatValue(result.output), footer, theme, wrapWidth);
+}
+
+function shortChatId(id: string): string {
+  return id.slice(0, 8);
+}
+
+function renderInteractiveChatValue(value: unknown): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+  return JSON.stringify(value, null, 2) ?? String(value);
+}
+
+function formatInteractiveChatBlock(
+  type: Extract<TuiMessageType, 'assistant' | 'user'>,
+  renderedContent: string,
+  footer: string,
+  theme: TuiSettingsConfig,
+  wrapWidth?: number,
+): string {
+  const width = Math.max(32, Math.min(wrapWidth ?? process.stdout.columns ?? resolveDefaultWrapWidth(), 140));
+  const style = resolveMessageStyle(theme, type);
+  const labelText = type === 'user' ? 'user' : 'assistant';
+  const footerLine = applyNamedStyle(footer, 'dim');
+
+  if (width < 64) {
+    const contentWidth = Math.max(24, width);
+    const header = applyStyle(labelText, style.prefix);
+    const separator = applyNamedStyle('─'.repeat(Math.min(width, 48)), 'dim');
+    const body = wrapRenderedText(renderedContent, contentWidth)
+      .split(/\r?\n/)
+      .map((line) => applyStyle(line, style.body))
+      .join('\n');
+    return [header, separator, body, footerLine, ''].join('\n');
+  }
+
+  const labelWidth = 11;
+  const gutter = ' │ ';
+  const contentWidth = Math.max(32, width - labelWidth - gutter.length);
+  const label = applyStyle(labelText.padEnd(labelWidth), style.prefix);
+  const emptyLabel = ' '.repeat(labelWidth);
+  const bodyLines = wrapRenderedText(renderedContent, contentWidth).split(/\r?\n/);
+  const footerLines = wrapRenderedText(footerLine, contentWidth).split(/\r?\n/);
+  const lines = bodyLines.map((line, index) => {
+    const prefix = index === 0 ? label : emptyLabel;
+    return `${prefix}${gutter}${applyStyle(line, style.body)}`;
+  });
+  if (lines.length > 0) lines.push(`${emptyLabel}${gutter}`);
+  lines.push(...footerLines.map((line) => `${emptyLabel}${gutter}${line}`));
+  lines.push('');
+  return lines.join('\n');
 }
 
 export function printOrchestration(result: OrchestratedRunResult): void {

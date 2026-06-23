@@ -2,6 +2,7 @@
 
 import { access, appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, extname, resolve } from 'node:path';
+import { createInterface } from 'node:readline/promises';
 
 import { marked } from 'marked';
 import type {
@@ -53,6 +54,7 @@ import {
   collectContentParts,
   formatCatalogMarkdown,
   formatCoordinatorDecompositionFailure,
+  formatInteractiveChatResult,
   formatNameList,
   isSuccessfulResult,
   oneLine,
@@ -60,6 +62,7 @@ import {
   printEvent,
   printInlineConfigSummary,
   printInspection,
+  printInteractiveChatResult,
   printOrchestration,
   printOrchestrationLifecycleEvent,
   printProgressEvent,
@@ -87,7 +90,7 @@ import {
 } from './cli-render.js';
 
 export { formatSwarmExecutionPlan, formatSwarmRunStatuses, formatSwarmSubtasks } from './swarm-format.js';
-export { formatCoordinatorDecompositionFailure, renderPrettyString, renderStyledPrettyMessage };
+export { formatCoordinatorDecompositionFailure, formatInteractiveChatResult, renderPrettyString, renderStyledPrettyMessage };
 export type { BenchmarkAttachmentType, BenchmarkCase, ManualTestCliOptions };
 
 
@@ -126,7 +129,7 @@ Commands:
   run                   Run a one-shot goal.
   swarm-run             Decompose one task into bounded worker runs and synthesize a final result.
   retry                 Retry one failed run, or retry a swarm session by session id.
-  chat                  Send one chat turn. Reads stdin when no message is given.
+  chat                  Start an interactive chat in a TTY; reads piped stdin when no message is given.
   init                  Create first-run configuration under ~/.adaptiveAgent.
   doctor                Check CLI installation and local configuration.
   update                Check for or apply GitHub Release updates.
@@ -357,7 +360,7 @@ export async function main(argv = Bun.argv.slice(2)): Promise<number> {
   }
 
   if (cli.command === 'chat') {
-    return runInlineCommand(cli, 'chat');
+    return shouldRunInteractiveChat(cli) ? runInteractiveChatCommand(cli) : runInlineCommand(cli, 'chat');
   }
 
   if (cli.command === 'eval') {
@@ -646,6 +649,129 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
     await orchestrationSdk?.close();
     await sdk.close();
   }
+}
+
+function shouldRunInteractiveChat(cli: ManualTestCliOptions): boolean {
+  return !cli.promptFilePath && process.stdin.isTTY === true && cli.output === 'pretty';
+}
+
+async function runInteractiveChatCommand(cli: ManualTestCliOptions): Promise<number> {
+  const resolvedCwd = resolve(cli.cwd ?? process.cwd());
+  let nextUserMessage = cli.goalArgs.join(' ').trim();
+
+  while (nextUserMessage.length === 0) {
+    const line = await readChatLine();
+    if (line === undefined) return 0;
+    nextUserMessage = line.trim();
+    if (isChatExitCommand(nextUserMessage)) return 0;
+  }
+
+  if (isChatExitCommand(nextUserMessage)) return 0;
+
+  const sdkOptions = buildSdkOptions(cli, resolvedCwd);
+  const inspection = cli.dryRun ? await inspectAgentSdkResolution(sdkOptions) : undefined;
+  const resolvedConfig = inspection?.config ?? await loadAgentSdkConfig(sdkOptions);
+  const eventLog: Array<Record<string, JsonValue>> = [];
+  const lastProgressContentByRun = new Map<string, string>();
+  const progressRunColors = cli.progress ? new RunColorRegistry() : undefined;
+  const eventListener = shouldListenForCliEvents(cli) ? (event: AgentEvent) => {
+    const entry = summarizeEvent(event);
+    eventLog.push(entry);
+    if (progressRunColors) {
+      printRunBoundaryEvent(event, resolvedConfig.tui, progressRunColors, cli.wrapWidth);
+    }
+    if (cli.events) {
+      printEvent(entry, resolvedConfig.tui);
+    } else if (cli.progress) {
+      printProgressEvent(event, lastProgressContentByRun, resolvedConfig.tui, cli.showLines, cli.wrapWidth);
+    }
+  } : undefined;
+
+  const messages: ChatMessage[] = [];
+  const sessionId = cli.sessionId ?? crypto.randomUUID();
+  let summaryPrinted = false;
+  let exitCode = 0;
+
+  const sdk = cli.dryRun ? undefined : await createAgentSdk({
+    ...sdkOptions,
+    eventListener,
+  });
+
+  try {
+    while (true) {
+      const userMessage = nextUserMessage.trim();
+      nextUserMessage = '';
+
+      if (isChatExitCommand(userMessage)) break;
+      if (userMessage.length === 0) {
+        const line = await readChatLine();
+        if (line === undefined) break;
+        nextUserMessage = line;
+        continue;
+      }
+
+      messages.push({ role: 'user', content: userMessage });
+      const spec: ManualChatSpec = { mode: 'chat', messages };
+      const warnings = collectProviderWarnings(spec, resolvedConfig.model.provider);
+
+      if (!summaryPrinted) {
+        for (const warning of warnings) console.error(`warning: ${warning}`);
+        summaryPrinted = true;
+      }
+
+      if (cli.dryRun) {
+        printInlineConfigSummary(cli, resolvedConfig, spec, warnings);
+        printDryRun(cli, inspection!, spec, warnings);
+        return 0;
+      }
+
+      const result = await sdk!.chat(messages, { ...buildChatOptions(spec), sessionId });
+      const resultInspection = cli.inspect ? await summarizeInspection(sdk!, result.runId) : undefined;
+      if (result.status === 'success') {
+        printInteractiveChatResult(result, resolvedConfig.tui, cli.wrapWidth);
+      } else {
+        printResult(result, 'assistant', resolvedConfig.tui);
+      }
+      if (cli.inspect && resultInspection) printInspection(resultInspection);
+
+      if (result.status !== 'success') {
+        exitCode = isSuccessfulResult(result) ? 0 : 1;
+        break;
+      }
+
+      messages.push({ role: 'assistant', content: formatChatTranscriptOutput(result.output) });
+
+      const line = await readChatLine();
+      if (line === undefined) break;
+      nextUserMessage = line;
+    }
+
+    if (cli.events && eventLog.length > 0) console.error(`event log captured: ${eventLog.length}`);
+    return exitCode;
+  } finally {
+    await sdk?.close();
+  }
+}
+
+async function readChatLine(): Promise<string | undefined> {
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    return await rl.question('user> ');
+  } catch {
+    return undefined;
+  } finally {
+    rl.close();
+  }
+}
+
+function isChatExitCommand(message: string): boolean {
+  const normalized = message.trim().toLowerCase();
+  return normalized === '/exit' || normalized === '/quit' || normalized === 'exit' || normalized === 'quit';
+}
+
+function formatChatTranscriptOutput(output: JsonValue): string {
+  if (typeof output === 'string') return output;
+  return `\`\`\`json\n${JSON.stringify(output, null, 2)}\n\`\`\``;
 }
 
 async function runSwarmCommand(cli: ManualTestCliOptions): Promise<number> {

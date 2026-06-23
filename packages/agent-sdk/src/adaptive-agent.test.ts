@@ -13,6 +13,7 @@ import {
   main,
   parseCliArgs,
   formatCoordinatorDecompositionFailure,
+  formatInteractiveChatResult,
   formatSwarmRunStatuses,
   formatSwarmExecutionPlan,
   formatSwarmSubtasks,
@@ -1048,6 +1049,53 @@ describe('adaptive-agent pretty rendering', () => {
 
     expect(rendered).toContain('assistant>');
     expect(rendered).toContain('Heading');
+  });
+
+  it('formats interactive chat responses in a wrapped role column on wide terminals', () => {
+    const rendered = stripAnsi(formatInteractiveChatResult({
+      status: 'success',
+      runId: '524416f9-5ec3-4c88-88af-4fc177b9676d',
+      output: 'This is a long assistant response that should wrap under the message column instead of spilling across the terminal.',
+      stepsUsed: 1,
+      usage: { promptTokens: 3747, completionTokens: 360, totalTokens: 4200, estimatedCostUSD: 0.0005 },
+    }, {}, 72));
+
+    expect(rendered).toContain('assistant   │ This is a long assistant response that should wrap under');
+    expect(rendered).toContain('            │ the message column instead of spilling across the');
+    expect(rendered).toContain('            │ run 524416f9 · 1 step · prompt 3747 · completion 360');
+    expect(rendered).not.toContain('status: success');
+  });
+
+  it('formats interactive chat responses as stacked blocks on narrow terminals', () => {
+    const rendered = stripAnsi(formatInteractiveChatResult({
+      status: 'success',
+      runId: '524416f9-5ec3-4c88-88af-4fc177b9676d',
+      output: 'Short screens should use a stacked layout.',
+      stepsUsed: 2,
+      usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15, estimatedCostUSD: 0 },
+    }, {}, 40));
+
+    expect(rendered).toContain('assistant\n');
+    expect(rendered).toContain('────────────────────────────────────────');
+    expect(rendered).toContain('Short screens should use a stacked');
+    expect(rendered).toContain('run 524416f9 · 2 steps · prompt 10');
+    expect(rendered).not.toContain('│');
+  });
+
+  it('hard-wraps long unbroken divider lines inside interactive chat output', () => {
+    const rendered = stripAnsi(formatInteractiveChatResult({
+      status: 'success',
+      runId: '524416f9-5ec3-4c88-88af-4fc177b9676d',
+      output: ['Before divider', '', '-'.repeat(160), '', 'After divider'].join('\n'),
+      stepsUsed: 1,
+      usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15, estimatedCostUSD: 0 },
+    }, {}, 72));
+
+    for (const line of rendered.split(/\r?\n/)) {
+      expect(line.length).toBeLessThanOrEqual(72);
+    }
+    expect(rendered).toContain('            │ ----------------------------------------------------------');
+    expect(rendered).toContain('            │ After divider');
   });
 
   it('omits the prefix when the configured message style disables it', () => {
