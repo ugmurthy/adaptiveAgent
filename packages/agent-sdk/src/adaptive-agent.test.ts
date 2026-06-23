@@ -133,6 +133,13 @@ describe('adaptive-agent spec loading', () => {
 });
 
 describe('adaptive-agent cli parsing', () => {
+  it('parses top-level and command-specific help requests', () => {
+    expect(parseCliArgs(['--help'])).toMatchObject({ help: true });
+    expect(parseCliArgs(['swarm-run', '--help'])).toMatchObject({ help: true, helpTopic: 'swarm-run' });
+    expect(parseCliArgs(['--help', 'swarm-run'])).toMatchObject({ help: true, helpTopic: 'swarm-run' });
+    expect(parseCliArgs(['help', 'swarm-run'])).toMatchObject({ help: true, helpTopic: 'swarm-run' });
+  });
+
   it('parses common flags', () => {
     const parsed = parseCliArgs([
       '--spec', './tmp/spec.json',
@@ -192,6 +199,27 @@ describe('adaptive-agent cli parsing', () => {
       output: 'json',
       help: false,
     });
+  });
+
+  it('prints concise top-level help and focused command help', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      await expect(main(['--help'])).resolves.toBe(0);
+      const topLevelHelp = String(log.mock.calls.at(-1)?.[0]);
+      expect(topLevelHelp).toContain('Common commands:');
+      expect(topLevelHelp).toContain('More help:');
+      expect(topLevelHelp).not.toContain('Swarm-run options:');
+
+      await expect(main(['swarm-run', '--help'])).resolves.toBe(0);
+      const swarmHelp = String(log.mock.calls.at(-1)?.[0]);
+      expect(swarmHelp).toContain('adaptive-agent swarm-run');
+      expect(swarmHelp).toContain('Required:');
+      expect(swarmHelp).toContain('Swarm-run options:');
+      expect(swarmHelp).not.toContain('Init options:');
+    } finally {
+      log.mockRestore();
+    }
   });
 
   it('parses run subcommand prompt and attachments', () => {

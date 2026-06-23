@@ -46,6 +46,14 @@ export function validateOutputSchema(schema: unknown, path = 'outputSchema'): st
   return undefined;
 }
 
+export function validateJsonValueAgainstSchema(
+  value: JsonValue,
+  schema: JsonSchema,
+  path = 'input',
+): string | undefined {
+  return validateJsonSchemaValue(value, schema, path);
+}
+
 export function toModelVisibleToolResultObject(output: JsonValue): JsonObject {
   if (isJsonObject(output)) {
     return output;
@@ -109,6 +117,120 @@ function isJsonValue(value: unknown): value is JsonValue {
   }
 
   return false;
+}
+
+function validateJsonSchemaValue(value: JsonValue, schema: JsonSchema, path: string): string | undefined {
+  const typeError = validateSchemaType(value, schema.type, path);
+  if (typeError) {
+    return typeError;
+  }
+
+  if (Array.isArray(schema.enum) && !schema.enum.some((candidate) => jsonValuesEqual(candidate, value))) {
+    return `${path} must be one of ${JSON.stringify(schema.enum)}, not ${JSON.stringify(value)}`;
+  }
+
+  if (isJsonObject(value)) {
+    const required = schema.required;
+    if (Array.isArray(required)) {
+      for (const key of required) {
+        if (typeof key === 'string' && !(key in value)) {
+          return `${path}.${key} is required`;
+        }
+      }
+    }
+
+    const properties = isRecord(schema.properties) ? schema.properties : undefined;
+    if (properties) {
+      for (const [key, propertySchema] of Object.entries(properties)) {
+        if (!(key in value) || !isRecord(propertySchema)) {
+          continue;
+        }
+        const nestedError = validateJsonSchemaValue(value[key] as JsonValue, propertySchema as JsonSchema, `${path}.${key}`);
+        if (nestedError) {
+          return nestedError;
+        }
+      }
+    }
+
+    if (schema.additionalProperties === false) {
+      const allowed = new Set(Object.keys(properties ?? {}));
+      const unknown = Object.keys(value).find((key) => !allowed.has(key));
+      if (unknown) {
+        return `${path}.${unknown} is not allowed`;
+      }
+    }
+
+    if (isRecord(schema.additionalProperties)) {
+      const properties = isRecord(schema.properties) ? schema.properties : {};
+      for (const [key, childValue] of Object.entries(value)) {
+        if (key in properties) {
+          continue;
+        }
+        const nestedError = validateJsonSchemaValue(
+          childValue as JsonValue,
+          schema.additionalProperties as JsonSchema,
+          `${path}.${key}`,
+        );
+        if (nestedError) {
+          return nestedError;
+        }
+      }
+    }
+  }
+
+  if (Array.isArray(value) && isRecord(schema.items)) {
+    for (let index = 0; index < value.length; index += 1) {
+      const nestedError = validateJsonSchemaValue(value[index] as JsonValue, schema.items as JsonSchema, `${path}[${index}]`);
+      if (nestedError) {
+        return nestedError;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function validateSchemaType(value: JsonValue, rawType: unknown, path: string): string | undefined {
+  if (rawType === undefined) {
+    return undefined;
+  }
+
+  const allowedTypes = Array.isArray(rawType) ? rawType : [rawType];
+  if (!allowedTypes.every((entry) => typeof entry === 'string')) {
+    return undefined;
+  }
+
+  if (allowedTypes.some((type) => jsonSchemaTypeMatches(value, type))) {
+    return undefined;
+  }
+
+  const expected = allowedTypes.length === 1 ? `"${allowedTypes[0]}"` : JSON.stringify(allowedTypes);
+  return `${path} must be ${expected}, not ${describeJsonType(value)}`;
+}
+
+function jsonSchemaTypeMatches(value: JsonValue, type: string): boolean {
+  switch (type) {
+    case 'array':
+      return Array.isArray(value);
+    case 'boolean':
+      return typeof value === 'boolean';
+    case 'integer':
+      return typeof value === 'number' && Number.isInteger(value);
+    case 'null':
+      return value === null;
+    case 'number':
+      return typeof value === 'number';
+    case 'object':
+      return isJsonObject(value);
+    case 'string':
+      return typeof value === 'string';
+    default:
+      return true;
+  }
+}
+
+function jsonValuesEqual(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function isJsonObject(value: JsonValue): value is JsonObject {

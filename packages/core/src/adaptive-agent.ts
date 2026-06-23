@@ -28,6 +28,7 @@ import {
   assertValidOutputSchema,
   normalizeToolResultContentForModel,
   toModelVisibleToolResultObject,
+  validateJsonValueAgainstSchema,
 } from './model-payloads.js';
 import { RunRecoveryAnalyzer } from './run-recovery-analyzer.js';
 import { resolveResearchPolicy, resolveToolBudgets, type ResolvedResearchPolicy } from './tool-budget-policy.js';
@@ -1830,6 +1831,17 @@ export class AdaptiveAgent {
         });
       }
 
+      const inputError = validateNonDelegateToolInput(pendingToolCall.input, tool);
+      if (inputError) {
+        return this.checkInvalidToolCallRepairRetryability(run, state, pendingToolCall, failureKind, {
+          pendingToolCall,
+          reason: 'invalid_tool_input',
+          resolvedToolName: tool.name === pendingToolCall.name ? undefined : tool.name,
+          validToolNames: this.plannerVisibleTools(state).map((visibleTool) => visibleTool.name),
+          details: inputError,
+        });
+      }
+
       if (!tool.retryPolicy?.retryable) {
         return {
           retryable: false,
@@ -2027,6 +2039,17 @@ export class AdaptiveAgent {
             details: inputError,
           };
         }
+      } else {
+        const inputError = validateNonDelegateToolInput(pendingToolCall.input, resolvedTool);
+        if (inputError) {
+          return {
+            pendingToolCall,
+            reason: 'invalid_tool_input',
+            resolvedToolName: resolvedTool.name === pendingToolCall.name ? undefined : resolvedTool.name,
+            validToolNames,
+            details: inputError,
+          };
+        }
       }
     }
 
@@ -2215,6 +2238,11 @@ export class AdaptiveAgent {
     }
     if (state.visibleToolNames && !state.visibleToolNames.includes(tool.name)) {
       throw new Error(`Tool ${tool.name} is not visible for this run`);
+    }
+
+    const inputError = validateNonDelegateToolInput(pendingToolCall.input, tool);
+    if (inputError) {
+      throw new Error(inputError);
     }
 
     if (tool.requiresApproval && !this.options.defaults?.autoApproveAll && !state.approvedToolCallIds.includes(pendingToolCall.id)) {
@@ -5836,6 +5864,14 @@ function recoverToolError<O extends JsonValue>(
   input: JsonValue,
 ): O | undefined {
   return tool.recoverError?.(error, input);
+}
+
+function validateNonDelegateToolInput(input: JsonValue, tool: ToolDefinition): string | undefined {
+  if (tool.name.startsWith(RESERVED_DELEGATE_PREFIX)) {
+    return undefined;
+  }
+
+  return validateJsonValueAgainstSchema(input, tool.inputSchema, `${tool.name} input`);
 }
 
 function readRetryAttempts(metadata?: Record<string, JsonValue>): number {

@@ -8,6 +8,7 @@ import { marked } from 'marked';
 import type {
   AgentEvent,
   ChatMessage,
+  ChatResult,
   ImageInput,
   JsonObject,
   JsonSchema,
@@ -99,64 +100,98 @@ const IMAGE_FILE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp',
 const AUDIO_FILE_EXTENSIONS = new Set(['.wav', '.mp3', '.flac', '.m4a', '.ogg', '.aac', '.aiff', '.aif', '.opus', '.oga', '.weba']);
 const VIDEO_FILE_EXTENSIONS = new Set(['.mp4', '.m4v', '.mov', '.webm', '.mkv', '.avi', '.mpeg', '.mpg', '.ogv', '.wmv', '.flv', '.3gp', '.ts', '.mts', '.m2ts']);
 
-const HELP_TEXT = `adaptive-agent
+const CLI_COMMANDS = ['run', 'chat', 'spec', 'config', 'catalog', 'eval', 'swarm-run', 'retry', 'init', 'doctor', 'update', 'uninstall', 'agent-create'] as const;
+type CliCommand = (typeof CLI_COMMANDS)[number];
+const CLI_COMMAND_SET = new Set<string>(CLI_COMMANDS);
 
-Agent SDK CLI
+function isCliCommand(value: string): value is CliCommand {
+  return CLI_COMMAND_SET.has(value);
+}
+
+const TOP_LEVEL_HELP_TEXT = `adaptive-agent
+
+Run agent profiles, chat interactively, orchestrate swarm tasks, and inspect local config.
 
 Usage:
-  adaptive-agent run [options] <goal...>
-  adaptive-agent swarm-run --agent <path-or-name> --worker-catalog <paths-or-names> [options] <task...>
-  adaptive-agent retry --run-id <runId> [options]
-  adaptive-agent retry --agent <path-or-name> --worker-catalog <paths-or-names> [options] <sessionId>
-  adaptive-agent chat [options] [message...]
-  adaptive-agent init [options]
-  adaptive-agent doctor [options]
-  adaptive-agent update [options]
-  adaptive-agent uninstall [options]
-  adaptive-agent agent-create [options] <agent-description...>
-  adaptive-agent spec <path> [options]
-  adaptive-agent config [options]
-  adaptive-agent catalog [options]
+  adaptive-agent <command> [options]
+  adaptive-agent <command> --help
   adaptive-agent --version
-  adaptive-agent --spec <path> [options]
-  bun run ./packages/agent-sdk/dist/adaptive-agent.js --spec <path> [options]
 
-Eval usage:
-  adaptive-agent eval cases --input <path> --out <path> [options]
-  adaptive-agent eval gaia --input <path> --out <path> [options]
+Common commands:
+  run                   Run a one-shot goal
+  chat                  Start an interactive chat
+  swarm-run             Decompose one task into worker runs and synthesize a result
+  retry                 Retry one failed run or swarm session
 
-Commands:
-  run                   Run a one-shot goal.
-  swarm-run             Decompose one task into bounded worker runs and synthesize a final result.
-  retry                 Retry one failed run, or retry a swarm session by session id.
-  chat                  Start an interactive chat in a TTY; reads piped stdin when no message is given.
-  init                  Create first-run configuration under ~/.adaptiveAgent.
-  doctor                Check CLI installation and local configuration.
-  update                Check for or apply GitHub Release updates.
-  uninstall             Remove the installed adaptive-agent CLI binary.
-  agent-create          Generate and write a new agent config JSON file.
-  spec                  Run the existing JSON spec format.
-  config                Print resolved SDK configuration.
-  catalog               List available agents, tools, and delegate skills.
+Setup and inspection:
+  init                  Create first-run configuration under ~/.adaptiveAgent
+  doctor                Check CLI installation and local configuration
+  config                Print resolved SDK configuration
+  catalog               List available agents, tools, and delegate skills
 
-Eval commands:
-  eval cases            Run generic benchmark cases from JSON/JSONL.
-  eval gaia             Run GAIA benchmark rows from JSON/JSONL.
+Other commands:
+  agent-create          Generate and write a new agent config JSON file
+  spec                  Run an existing JSON spec file
+  eval                  Run benchmark cases
+  update                Check for or apply GitHub Release updates
+  uninstall             Remove the installed adaptive-agent CLI binary
+
+Examples:
+  adaptive-agent run "Summarize this repo"
+  adaptive-agent chat
+  adaptive-agent swarm-run --help
+  adaptive-agent doctor --provider-check
 
 Global options:
   --cwd <path>            Working directory used for SDK config lookup.
   --output <format>       Output format: pretty, json, or jsonl. Default: pretty.
   --version               Print adaptive-agent version.
-  --help                  Show this help text.
+  --help                  Show this overview.
 
-Agent/config options (run, chat, spec, config, catalog, eval, swarm-run, retry):
+More help:
+  adaptive-agent <command> --help
+  adaptive-agent help <command>
+  adaptive-agent --help <command>`;
+
+const COMMON_AGENT_OPTIONS_TEXT = `Agent/config options:
   --agent <path-or-name>  Explicit path to agent.json, or filename from agents.dirs.
   --settings <path>       Explicit path to agent.settings.json.
   --runtime <mode>        Runtime mode: memory or postgres.
   --provider <name>       Override provider: openrouter, ollama, mistral, mesh.
   --model <name>          Override model name.
   --approval <mode>       Approval mode: auto, manual, reject.
-  --clarification <mode>  Clarification mode: interactive or fail.
+  --clarification <mode>  Clarification mode: interactive or fail.`;
+
+const COMMON_RUNTIME_OPTIONS_TEXT = `Additional agent/config options:
+  --settings <path>       Explicit path to agent.settings.json.
+  --runtime <mode>        Runtime mode: memory or postgres.
+  --provider <name>       Override provider: openrouter, ollama, mistral, mesh.
+  --model <name>          Override model name.
+  --approval <mode>       Approval mode: auto, manual, reject.
+  --clarification <mode>  Clarification mode: interactive or fail.`;
+
+const RUN_OUTPUT_OPTIONS_TEXT = `Output/debug options:
+  --progress              Print assistant progress updates as they arrive.
+  --events                Print lifecycle events as they arrive.
+  --show-lines <n>        Maximum pretty-rendered progress lines to show. Default: 3.
+  --wrap-width <n>        Fold progress/event text after this many columns. Default: terminal width or 100.
+  --dry-run               Resolve config, request, tools, and delegates without running.`;
+
+const INSPECTION_OPTIONS_TEXT = `Inspection options:
+  --inspect               Print a compact inspection summary after completion.`;
+
+const RUN_HELP_TEXT = `adaptive-agent run
+
+Run a one-shot goal through an agent profile.
+
+Usage:
+  adaptive-agent run [options] <goal...>
+  adaptive-agent run --file <path> [options]
+
+Examples:
+  adaptive-agent run "Summarize this repository"
+  adaptive-agent run --file ./prompt.md
+  adaptive-agent run --image ./diagram.png "Answer using this image"
 
 Run options:
   --file <path>           Read run prompt from a file.
@@ -168,14 +203,52 @@ Run options:
   --orchestrate           Route run requests through the orchestration SDK.
   --catalog <path>        Agent config path to add to orchestration catalog. Repeatable.
 
+${COMMON_AGENT_OPTIONS_TEXT}
+
+${RUN_OUTPUT_OPTIONS_TEXT}
+
+${INSPECTION_OPTIONS_TEXT}`;
+
+const CHAT_HELP_TEXT = `adaptive-agent chat
+
+Start an interactive chat in a TTY. When no message is given and stdin is piped,
+the command reads the piped message instead.
+
+Usage:
+  adaptive-agent chat [options] [message...]
+
+Examples:
+  adaptive-agent chat
+  adaptive-agent chat "Help me review this plan"
+  cat prompt.md | adaptive-agent chat
+
 Chat options:
   --file <path>           Read chat message from a file.
 
-Spec options:
-  --spec <path>           Path to the JSON spec file.
-  --mode <chat|run>       Override the spec mode.
-  --orchestrate           Route run-mode specs through the orchestration SDK.
-  --catalog <path>        Agent config path to add to orchestration catalog. Repeatable.
+${COMMON_AGENT_OPTIONS_TEXT}
+
+${RUN_OUTPUT_OPTIONS_TEXT}
+
+${INSPECTION_OPTIONS_TEXT}`;
+
+const SWARM_RUN_HELP_TEXT = `adaptive-agent swarm-run
+
+Decompose one top-level objective into bounded worker runs, optionally assess
+quality, and synthesize a final answer.
+
+Usage:
+  adaptive-agent swarm-run --agent <path-or-name> --worker-catalog <paths-or-names> [options] <task...>
+  adaptive-agent swarm-run --agent <path-or-name> --worker-catalog <paths-or-names> --file <path> [options]
+
+Examples:
+  adaptive-agent swarm-run --agent coordinator-agent --worker-catalog researcher.json,writer.json "Build a launch brief"
+  adaptive-agent swarm-run --agent coordinator-agent --worker-catalog ./agents --file ./task.md --max-workers 3
+
+Required:
+  --agent <path-or-name>  Coordinator agent JSON path or filename.
+  --worker-catalog <paths>
+                          Comma-separated worker agent JSON paths or filenames.
+  <task...> or --file     Top-level objective to decompose.
 
 Swarm-run options:
   --file <path>           Read swarm task from a file.
@@ -184,14 +257,28 @@ Swarm-run options:
   --audio <path>          Add an audio attachment to the coordinator request. Repeatable.
   --file-attachment <path>
                           Add a file attachment to the coordinator request. Repeatable.
-  --worker-catalog <paths>
-                          Comma-separated worker agent JSON paths or filenames.
   --quality-agent <path-or-name>
                           Optional quality agent JSON path or filename.
   --synthesizer-agent <path-or-name>
                           Optional synthesizer agent JSON path or filename.
   --max-workers <n>       Maximum concurrent swarm workers.
   --session-id <id>       Session id for run grouping.
+
+${COMMON_RUNTIME_OPTIONS_TEXT}
+
+${RUN_OUTPUT_OPTIONS_TEXT}`;
+
+const RETRY_HELP_TEXT = `adaptive-agent retry
+
+Retry one failed run, or retry a swarm session by session id.
+
+Usage:
+  adaptive-agent retry --run-id <runId> [options]
+  adaptive-agent retry --agent <path-or-name> --worker-catalog <paths-or-names> [options] <sessionId>
+
+Examples:
+  adaptive-agent retry --run-id run_123
+  adaptive-agent retry --agent coordinator-agent --worker-catalog researcher.json,writer.json session_123
 
 Retry options:
   --run-id <id>           Retry this single failed run instead of a swarm session.
@@ -203,66 +290,60 @@ Retry options:
                           Optional synthesizer agent JSON path or filename for session retry.
   --max-workers <n>       Maximum concurrent swarm workers for session retry.
 
-Init options:
-  --provider <name>       Provider to write: openrouter, ollama, mistral, mesh.
-  --model <name>          Model name to write.
-  --api-key-env <name>    Environment variable containing provider API key.
-  --profile <name>        Init profile: safe or coding.
-  --minimal               Create only the default agent and getting-started skill.
-  --bundle <name>         Install a bundled agent/skill pack. Repeatable.
-  --install-agent <path>  Install an additional agent JSON file or directory.
-                          Repeatable.
-  --install-skill <path>  Install an additional skill directory or parent dir.
-                          Repeatable.
-  --install-manifest <path>
-                          Install agents, skills, or bundles from a manifest.
-                          Repeatable.
-  --yes                   Accept command defaults for non-interactive setup.
-  --force                 Overwrite files when supported.
-  --dry-run               Show what init would create without writing files.
+${COMMON_AGENT_OPTIONS_TEXT}
 
-Doctor options:
-  --agent <path-or-name>  Explicit path to agent.json, or filename from agents.dirs.
-  --settings <path>       Explicit path to agent.settings.json.
-  --runtime <mode>        Runtime store mode to validate: memory or postgres.
-  --provider <name>       Provider override to validate: openrouter, ollama, mistral, mesh.
-  --model <name>          Model override to validate.
-  --network               Allow doctor network checks against GitHub.
-  --provider-check        Allow doctor provider reachability checks.
-  --strict                Treat doctor warnings as failures.
+${RUN_OUTPUT_OPTIONS_TEXT}`;
 
-Update options:
-  --check                 Check for updates without installing.
-  --version <version>     Install or check a specific release version.
-  --channel <name>        Update channel: stable or preview. Default: stable.
-  --force                 Reinstall even when already up to date.
-  --yes                   Accept update prompts when supported.
-  --repo <owner/repo>     GitHub release repo for update checks.
-  --base-url <url>        Release asset base URL for update downloads.
+const SPEC_HELP_TEXT = `adaptive-agent spec
 
-Uninstall options:
-  --dry-run               Show which CLI binary would be removed.
+Run the existing JSON spec format.
 
-Agent-create options:
-  --file <path>           Read the new agent description from a text file.
-  --generator-agent <path-or-name>
-                          Existing agent used to generate the new config. Default: default-agent.
-  --id <id>               Override the generated agent id.
-  --provider <name>       Override generated config provider: openrouter, ollama, mistral, mesh.
-  --model <name>          Override generated config model name.
-  --yes                   Write without an interactive confirmation prompt.
-  --force                 Overwrite an existing generated config path.
-  --dry-run               Preview the config and ask before writing; Enter means no.
+Usage:
+  adaptive-agent spec <path> [options]
+  adaptive-agent --spec <path> [options]
+  bun run ./packages/agent-sdk/dist/adaptive-agent.js --spec <path> [options]
 
-Run output/debug options (run, chat, spec, eval, swarm-run, retry):
-  --progress              Print assistant progress updates as they arrive.
-  --events                Print lifecycle events as they arrive.
-  --show-lines <n>        Maximum pretty-rendered progress lines to show. Default: 3.
-  --wrap-width <n>        Fold progress/event text after this many columns. Default: terminal width or 100.
-  --dry-run               Resolve config, request, tools, and delegates without running.
+Spec options:
+  --spec <path>           Path to the JSON spec file.
+  --mode <chat|run>       Override the spec mode.
+  --orchestrate           Route run-mode specs through the orchestration SDK.
+  --catalog <path>        Agent config path to add to orchestration catalog. Repeatable.
 
-Inspection options (run, chat, spec):
-  --inspect               Print a compact inspection summary after completion.
+${COMMON_AGENT_OPTIONS_TEXT}
+
+${RUN_OUTPUT_OPTIONS_TEXT}
+
+${INSPECTION_OPTIONS_TEXT}`;
+
+const CONFIG_HELP_TEXT = `adaptive-agent config
+
+Print resolved SDK configuration.
+
+Usage:
+  adaptive-agent config [options]
+
+${COMMON_AGENT_OPTIONS_TEXT}`;
+
+const CATALOG_HELP_TEXT = `adaptive-agent catalog
+
+List available agents, tools, and delegate skills.
+
+Usage:
+  adaptive-agent catalog [options]
+
+${COMMON_AGENT_OPTIONS_TEXT}`;
+
+const EVAL_HELP_TEXT = `adaptive-agent eval
+
+Run benchmark cases from JSON/JSONL files.
+
+Usage:
+  adaptive-agent eval cases --input <path> --out <path> [options]
+  adaptive-agent eval gaia --input <path> --out <path> [options]
+
+Eval commands:
+  eval cases            Run generic benchmark cases from JSON/JSONL.
+  eval gaia             Run GAIA benchmark rows from JSON/JSONL.
 
 Eval options:
   --input <path>          Benchmark input JSONL for eval cases.
@@ -282,7 +363,139 @@ Eval options:
                           image, video, or other. Rows without attachments do not match.
   --orchestrate           Route benchmark cases through the orchestration SDK.
   --catalog <path>        Agent config path to add to orchestration catalog. Repeatable.
-`;
+
+${COMMON_AGENT_OPTIONS_TEXT}
+
+${RUN_OUTPUT_OPTIONS_TEXT}`;
+
+const INIT_HELP_TEXT = `adaptive-agent init
+
+Create first-run configuration under ~/.adaptiveAgent.
+
+Usage:
+  adaptive-agent init [options]
+
+Init options:
+  --provider <name>       Provider to write: openrouter, ollama, mistral, mesh.
+  --model <name>          Model name to write.
+  --api-key-env <name>    Environment variable containing provider API key.
+  --profile <name>        Init profile: safe or coding.
+  --minimal               Create only the default agent and getting-started skill.
+  --bundle <name>         Install a bundled agent/skill pack. Repeatable.
+  --install-agent <path>  Install an additional agent JSON file or directory.
+                          Repeatable.
+  --install-skill <path>  Install an additional skill directory or parent dir.
+                          Repeatable.
+  --install-manifest <path>
+                          Install agents, skills, or bundles from a manifest.
+                          Repeatable.
+  --yes                   Accept command defaults for non-interactive setup.
+  --force                 Overwrite files when supported.
+  --dry-run               Show what init would create without writing files.`;
+
+const DOCTOR_HELP_TEXT = `adaptive-agent doctor
+
+Check CLI installation and local configuration.
+
+Usage:
+  adaptive-agent doctor [options]
+
+Doctor options:
+  --agent <path-or-name>  Explicit path to agent.json, or filename from agents.dirs.
+  --settings <path>       Explicit path to agent.settings.json.
+  --runtime <mode>        Runtime store mode to validate: memory or postgres.
+  --provider <name>       Provider override to validate: openrouter, ollama, mistral, mesh.
+  --model <name>          Model override to validate.
+  --network               Allow doctor network checks against GitHub.
+  --provider-check        Allow doctor provider reachability checks.
+  --strict                Treat doctor warnings as failures.`;
+
+const UPDATE_HELP_TEXT = `adaptive-agent update
+
+Check for or apply GitHub Release updates.
+
+Usage:
+  adaptive-agent update [options]
+
+Update options:
+  --check                 Check for updates without installing.
+  --version <version>     Install or check a specific release version.
+  --channel <name>        Update channel: stable or preview. Default: stable.
+  --force                 Reinstall even when already up to date.
+  --yes                   Accept update prompts when supported.
+  --repo <owner/repo>     GitHub release repo for update checks.
+  --base-url <url>        Release asset base URL for update downloads.`;
+
+const UNINSTALL_HELP_TEXT = `adaptive-agent uninstall
+
+Remove the installed adaptive-agent CLI binary.
+
+Usage:
+  adaptive-agent uninstall [options]
+
+Uninstall options:
+  --dry-run               Show which CLI binary would be removed.`;
+
+const AGENT_CREATE_HELP_TEXT = `adaptive-agent agent-create
+
+Generate and write a new agent config JSON file.
+
+Usage:
+  adaptive-agent agent-create [options] <agent-description...>
+  adaptive-agent agent-create --file <path> [options]
+
+Agent-create options:
+  --file <path>           Read the new agent description from a text file.
+  --generator-agent <path-or-name>
+                          Existing agent used to generate the new config. Default: default-agent.
+  --id <id>               Override the generated agent id.
+  --provider <name>       Override generated config provider: openrouter, ollama, mistral, mesh.
+  --model <name>          Override generated config model name.
+  --yes                   Write without an interactive confirmation prompt.
+  --force                 Overwrite an existing generated config path.
+  --dry-run               Preview the config and ask before writing; Enter means no.`;
+
+const VERSION_HELP_TEXT = `adaptive-agent --version
+
+Print adaptive-agent version.
+
+Usage:
+  adaptive-agent --version`;
+
+function getHelpText(topic?: ManualTestCliOptions['helpTopic']): string {
+  switch (topic) {
+    case 'run':
+      return RUN_HELP_TEXT;
+    case 'chat':
+      return CHAT_HELP_TEXT;
+    case 'swarm-run':
+      return SWARM_RUN_HELP_TEXT;
+    case 'retry':
+      return RETRY_HELP_TEXT;
+    case 'spec':
+      return SPEC_HELP_TEXT;
+    case 'config':
+      return CONFIG_HELP_TEXT;
+    case 'catalog':
+      return CATALOG_HELP_TEXT;
+    case 'eval':
+      return EVAL_HELP_TEXT;
+    case 'init':
+      return INIT_HELP_TEXT;
+    case 'doctor':
+      return DOCTOR_HELP_TEXT;
+    case 'update':
+      return UPDATE_HELP_TEXT;
+    case 'uninstall':
+      return UNINSTALL_HELP_TEXT;
+    case 'agent-create':
+      return AGENT_CREATE_HELP_TEXT;
+    case 'version':
+      return VERSION_HELP_TEXT;
+    default:
+      return TOP_LEVEL_HELP_TEXT;
+  }
+}
 
 const PROVIDER_INPUT_CAPABILITIES: Record<
   'openrouter' | 'ollama' | 'mistral' | 'mesh',
@@ -310,7 +523,7 @@ const PROVIDER_INPUT_CAPABILITIES: Record<
 export async function main(argv = Bun.argv.slice(2)): Promise<number> {
   const cli = parseCliArgs(argv);
   if (cli.help) {
-    console.log(HELP_TEXT);
+    console.log(getHelpText(cli.helpTopic));
     return 0;
   }
 
@@ -736,7 +949,14 @@ async function runInteractiveChatCommand(cli: ManualTestCliOptions): Promise<num
 
       if (result.status !== 'success') {
         exitCode = isSuccessfulResult(result) ? 0 : 1;
-        break;
+        messages.push({
+          role: 'assistant',
+          content: formatFailedChatTranscriptOutput(result),
+        });
+        const line = await readChatLine();
+        if (line === undefined) break;
+        nextUserMessage = line;
+        continue;
       }
 
       messages.push({ role: 'assistant', content: formatChatTranscriptOutput(result.output) });
@@ -766,12 +986,24 @@ async function readChatLine(): Promise<string | undefined> {
 
 function isChatExitCommand(message: string): boolean {
   const normalized = message.trim().toLowerCase();
-  return normalized === '/exit' || normalized === '/quit' || normalized === 'exit' || normalized === 'quit';
+  return normalized === '/quit';
 }
 
 function formatChatTranscriptOutput(output: JsonValue): string {
   if (typeof output === 'string') return output;
   return `\`\`\`json\n${JSON.stringify(output, null, 2)}\n\`\`\``;
+}
+
+function formatFailedChatTranscriptOutput(result: Exclude<ChatResult, { status: 'success' }>): string {
+  if (result.status === 'failure') {
+    return `Previous assistant turn failed with ${result.code}: ${result.error}`;
+  }
+
+  if (result.status === 'clarification_requested') {
+    return `Previous assistant turn requested clarification: ${result.message}`;
+  }
+
+  return `Previous assistant turn requested approval for ${result.toolName}: ${result.message}`;
 }
 
 async function runSwarmCommand(cli: ManualTestCliOptions): Promise<number> {
@@ -1186,8 +1418,14 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if (!commandSeen && (arg === 'run' || arg === 'chat' || arg === 'spec' || arg === 'config' || arg === 'catalog' || arg === 'eval' || arg === 'swarm-run' || arg === 'retry' || arg === 'init' || arg === 'doctor' || arg === 'update' || arg === 'uninstall' || arg === 'agent-create')) {
+    if (!commandSeen && arg === 'help') {
+      options.help = true;
+      continue;
+    }
+
+    if (!commandSeen && isCliCommand(arg)) {
       options.command = arg;
+      if (options.help) options.helpTopic = arg;
       commandSeen = true;
       if (arg === 'spec' && argv[index + 1] && !argv[index + 1].startsWith('--')) {
         options.specPath = argv[++index];
@@ -1202,6 +1440,7 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
       case '--help':
       case '-h':
         options.help = true;
+        if (commandSeen) options.helpTopic = options.command;
         break;
       case '--version':
         if (options.command === 'update') {
@@ -1209,6 +1448,7 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
           break;
         }
         options.command = 'version';
+        if (options.help) options.helpTopic = 'version';
         break;
       case '--check':
         options.updateCheck = true;
@@ -1259,6 +1499,7 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
       case '--spec':
         options.specPath = requireOptionValue(arg, argv[++index]);
         options.command = 'spec';
+        if (options.help) options.helpTopic = 'spec';
         break;
       case '--file':
         options.promptFilePath = requireOptionValue(arg, argv[++index]);

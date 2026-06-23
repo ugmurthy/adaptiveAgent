@@ -76,6 +76,7 @@ export interface ManualTestCliOptions {
   dryRun: boolean;
   output: 'pretty' | 'json' | 'jsonl';
   help: boolean;
+  helpTopic?: ManualTestCliOptions['command'];
 }
 
 export interface ManualChatSpec {

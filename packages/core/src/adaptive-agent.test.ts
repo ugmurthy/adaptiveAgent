@@ -1,5 +1,5 @@
 import { PassThrough } from 'node:stream';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -1977,6 +1977,86 @@ describe('AdaptiveAgent', () => {
         'step-1': 1,
       },
     });
+  });
+
+  it('repairs malformed normal tool input before executing write_file', async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), 'adaptive-agent-write-repair-'));
+    try {
+      const runStore = new InMemoryRunStore();
+      const eventStore = new InMemoryEventStore();
+      const snapshotStore = new InMemorySnapshotStore();
+      const model = new SequenceModel([
+        {
+          finishReason: 'tool_calls',
+          toolCalls: [
+            {
+              id: 'bad-write-call',
+              name: 'write_file',
+              input: 'rubik.html',
+            },
+          ],
+        },
+        {
+          finishReason: 'tool_calls',
+          toolCalls: [
+            {
+              id: 'good-write-call',
+              name: 'write_file',
+              input: {
+                path: 'rubik.html',
+                content: '<script src="bundle.js"></script>',
+              },
+            },
+          ],
+        },
+        {
+          finishReason: 'stop',
+          text: 'fixed',
+        },
+      ]);
+
+      const agent = new AdaptiveAgent({
+        model,
+        tools: [createWriteFileTool({ allowedRoot: tempDir })],
+        runStore,
+        eventStore,
+        snapshotStore,
+        defaults: { autoApproveAll: true },
+      });
+
+      const result = await agent.run({ goal: 'Fix rubik html' });
+
+      expect(result).toMatchObject({
+        status: 'success',
+        output: 'fixed',
+      });
+      await expect(readFile(join(tempDir, 'rubik.html'), 'utf-8')).resolves.toBe('<script src="bundle.js"></script>');
+
+      const events = await eventStore.listByRun(result.runId);
+      expect(events).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: 'model.tool_call_rejected',
+          toolCallId: 'bad-write-call',
+          payload: expect.objectContaining({
+            requestedToolName: 'write_file',
+            reason: 'invalid_tool_input',
+            willRetry: true,
+          }),
+        }),
+      ]));
+      expect(events.some((event) => event.type === 'tool.started' && event.toolCallId === 'bad-write-call')).toBe(false);
+      expect(events.some((event) => event.type === 'tool.started' && event.toolCallId === 'good-write-call')).toBe(true);
+      expect(
+        model.receivedRequests[1]?.messages.some(
+          (message) =>
+            message.role === 'system' &&
+            typeof message.content === 'string' &&
+            message.content.includes('called tool "write_file" with invalid input'),
+        ),
+      ).toBe(true);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
   });
 
   it('retries an existing pre-tool unknown-tool failure by clearing the invalid tool call and reprompting', async () => {
