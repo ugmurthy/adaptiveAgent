@@ -1,9 +1,10 @@
-import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 import type { JsonObject, JsonValue, RunResult } from '@adaptive-agent/core';
 
 import { AgentSdk, type AgentConfigFile, type AgentSdkOptions, type AgentSdkRunOptions, type SupportedModality } from './index.js';
+import { adaptiveAgentHome, expandStrings, readJson, resolveAgentConfigByName, resolveAgentDirs, resolvePath, pathExists } from './sdk-utils.js';
+import type { AgentSettingsFile } from './config-types.js';
 
 export type OrchestrationSessionStatus = 'routing' | 'running' | 'succeeded' | 'failed';
 export type OrchestrationStageKind = 'single' | 'modality_specialist' | 'parallel_specialist' | 'subject_specialist' | 'final_synthesis';
@@ -546,13 +547,41 @@ function specialistScore(entry: AgentCatalogEntry, modality: SupportedModality):
 async function buildCatalog(options: OrchestrationSdkOptions): Promise<AgentCatalogEntry[]> {
   const entries = new Map<string, AgentCatalogEntry>();
   for (const entry of options.agentCatalog ?? []) entries.set(entry.agentId, entry);
-  for (const path of options.agentCatalogPaths ?? []) {
-    const agentConfig = JSON.parse(await readFile(resolve(options.cwd ?? process.cwd(), path), 'utf-8')) as AgentConfigFile;
-    entries.set(agentConfig.id, { agentId: agentConfig.id, configPath: path, agentConfig });
+  const cwd = options.cwd ?? process.cwd();
+  const env = { ...(options.env ?? process.env), ...(options.settingsConfig?.env ?? {}) };
+  const agentDirs = await resolveCatalogAgentDirs(options, cwd, env);
+  for (const pathOrName of options.agentCatalogPaths ?? []) {
+    const configPath = await resolveAgentConfigByName(pathOrName, agentDirs) ?? resolvePath(cwd, pathOrName);
+    const agentConfig = expandStrings(await readJson(configPath), env) as AgentConfigFile;
+    entries.set(agentConfig.id, { agentId: agentConfig.id, configPath, agentConfig });
   }
   const requestedConfig = options.requestedAgentConfig ?? options.agentConfig;
   if (requestedConfig) entries.set(requestedConfig.id, { agentId: requestedConfig.id, configPath: options.requestedAgentConfigPath ?? options.agentConfigPath, agentConfig: requestedConfig });
   return [...entries.values()];
+}
+
+async function resolveCatalogAgentDirs(options: OrchestrationSdkOptions, cwd: string, env: NodeJS.ProcessEnv): Promise<string[]> {
+  let settings = options.settingsConfig;
+  if (!settings) {
+    const settingsPath = await findSettingsPath(options, cwd, env);
+    settings = settingsPath ? await readJson(settingsPath) as AgentSettingsFile : undefined;
+  }
+  if (settings?.env) Object.assign(env, settings.env);
+  return resolveAgentDirs(cwd, options.settingsOverrides?.agents?.dirs ?? settings?.agents?.dirs, env);
+}
+
+async function findSettingsPath(options: OrchestrationSdkOptions, cwd: string, env: NodeJS.ProcessEnv): Promise<string | undefined> {
+  const candidates = [
+    options.settingsConfigPath,
+    env.ADAPTIVE_AGENT_SETTINGS,
+    resolve(cwd, 'agent.settings.json'),
+    resolve(adaptiveAgentHome(env), 'agent.settings.json'),
+  ].filter(Boolean) as string[];
+  for (const candidate of candidates) {
+    const path = resolvePath(cwd, candidate);
+    if (await pathExists(path)) return path;
+  }
+  return undefined;
 }
 
 class InMemoryOrchestrationSessionStore implements OrchestrationSessionStore {

@@ -64,6 +64,15 @@ function Write-PathInstructions {
   Write-Host 'Then open a new PowerShell session.'
 }
 
+function Install-Executable($ExtractDir, $ArchiveName, $CommandName) {
+  $binary = Get-ChildItem -Path $ExtractDir -Filter $ArchiveName -Recurse | Select-Object -First 1
+  if (-not $binary) { Fail "archive did not contain $ArchiveName" }
+
+  $installPath = Join-Path $InstallDir $CommandName
+  Copy-Item -Path $binary.FullName -Destination $installPath -Force
+  Write-Host "Installed $installPath"
+}
+
 function Main {
   $target = Resolve-Target
   $tag = Resolve-ReleaseTag
@@ -88,16 +97,12 @@ function Main {
     New-Item -ItemType Directory -Path $extractDir | Out-Null
     Expand-Archive -Path $archive -DestinationPath $extractDir -Force
 
-    $binary = Get-ChildItem -Path $extractDir -Filter 'adaptive-agent.exe' -Recurse | Select-Object -First 1
-    if (-not $binary) { Fail 'archive did not contain adaptive-agent.exe' }
-
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-    $installPath = Join-Path $InstallDir 'adaptive-agent.exe'
-    Copy-Item -Path $binary.FullName -Destination $installPath -Force
+    Install-Executable $extractDir 'adaptive-agent.exe' 'adaptive-agent.exe'
+    Install-Executable $extractDir 'trace-session.exe' 'trace-session.exe'
 
-    Write-Host "Installed $installPath"
     Write-PathInstructions
-    & $installPath --version
+    & (Join-Path $InstallDir 'adaptive-agent.exe') --version
   } finally {
     Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
   }

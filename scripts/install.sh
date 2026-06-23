@@ -124,6 +124,26 @@ print_path_instructions() {
   esac
 }
 
+install_executable() {
+  extract_dir="$1"
+  archive_name="$2"
+  command_name="$3"
+
+  binary="$extract_dir/$archive_name"
+  if [ ! -f "$binary" ]; then
+    binary=$(find "$extract_dir" -type f -name "$archive_name" -perm -u+x | head -n 1 || true)
+  fi
+  [ -n "$binary" ] && [ -f "$binary" ] || fail "archive did not contain $archive_name binary"
+
+  install_path="$INSTALL_DIR/$command_name"
+  tmp_install="$INSTALL_DIR/.$command_name.tmp.$$"
+  cp "$binary" "$tmp_install"
+  chmod 755 "$tmp_install"
+  mv "$tmp_install" "$install_path"
+
+  printf 'Installed %s\n' "$install_path"
+}
+
 main() {
   detect_target
   tag=$(resolve_version)
@@ -149,22 +169,12 @@ main() {
   mkdir -p "$extract_dir"
   tar -xzf "$archive" -C "$extract_dir"
 
-  binary="$extract_dir/adaptive-agent"
-  if [ ! -f "$binary" ]; then
-    binary=$(find "$extract_dir" -type f -name adaptive-agent -perm -u+x | head -n 1 || true)
-  fi
-  [ -n "$binary" ] && [ -f "$binary" ] || fail 'archive did not contain adaptive-agent binary'
-
   mkdir -p "$INSTALL_DIR"
-  install_path="$INSTALL_DIR/adaptive-agent"
-  tmp_install="$INSTALL_DIR/.adaptive-agent.tmp.$$"
-  cp "$binary" "$tmp_install"
-  chmod 755 "$tmp_install"
-  mv "$tmp_install" "$install_path"
+  install_executable "$extract_dir" adaptive-agent adaptive-agent
+  install_executable "$extract_dir" trace-session trace-session
 
-  printf 'Installed %s\n' "$install_path"
   print_path_instructions
-  "$install_path" --version
+  "$INSTALL_DIR/adaptive-agent" --version
 }
 
 main "$@"

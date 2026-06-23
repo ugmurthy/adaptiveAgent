@@ -1,5 +1,4 @@
-import { readdir } from 'node:fs/promises';
-import { extname, isAbsolute, resolve } from 'node:path';
+import { resolve } from 'node:path';
 
 import type { ModelAdapterConfig } from '@adaptive-agent/core';
 
@@ -20,6 +19,7 @@ import {
   expandStrings,
   optionsString,
   pathExists,
+  resolveAgentConfigByName,
   readJson,
   resolveAgentDirs,
   resolvePath,
@@ -140,27 +140,4 @@ async function loadRequiredAgent(cwd: string, explicitPath: string | undefined, 
     if (candidate === explicitPath || candidate === env.ADAPTIVE_AGENT_CONFIG) throw new AgentSdkLookupError('agent.json', candidates.map((entry) => resolvePath(cwd, entry)));
   }
   throw new AgentSdkLookupError('agent.json', candidates.map((entry) => resolvePath(cwd, entry)));
-}
-
-async function resolveAgentConfigByName(name: string, dirs: string[]): Promise<string | undefined> {
-  if (!isAgentName(name)) return undefined;
-  const fileNames = extname(name) ? [name] : [name, `${name}.json`];
-  const matches: string[] = [];
-  for (const dir of dirs) {
-    if (!(await pathExists(dir))) continue;
-    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
-    for (const entry of entries) {
-      if (!entry.isFile() || !fileNames.includes(entry.name)) continue;
-      matches.push(resolve(dir, entry.name));
-    }
-  }
-  matches.sort();
-  if (matches.length > 1) {
-    throw new Error(`Ambiguous agent config "${name}". Matches:\n${matches.map((match) => `- ${match}`).join('\n')}`);
-  }
-  return matches[0];
-}
-
-function isAgentName(value: string): boolean {
-  return Boolean(value.trim()) && !isAbsolute(value) && !/[\\/]/.test(value);
 }

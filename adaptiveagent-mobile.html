@@ -1,0 +1,2066 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AdaptiveAgent | Reliable AI Agents Mobile First</title>
+  <meta name="description" content="AdaptiveAgent is the operating layer for reliable AI agents, built as a Bun and TypeScript runtime and CLI stack.">
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #172026;
+      --muted: #5d6670;
+      --paper: #fbf7ef;
+      --paper-strong: #fffdf8;
+      --line: #ded5c8;
+      --charcoal: #101418;
+      --charcoal-2: #1c2329;
+      --cream: #fff4dc;
+      --teal: #0f766e;
+      --teal-soft: #d8f1ec;
+      --green: #2f7d52;
+      --green-soft: #e0efdf;
+      --amber: #b7791f;
+      --amber-soft: #f9e7c1;
+      --rust: #bd4b26;
+      --rust-soft: #f4d5c8;
+      --code-bg: #0e151b;
+      --code-line: #26343f;
+      --code-text: #e9f0f1;
+      --shadow: 0 24px 70px rgba(23, 32, 38, 0.16);
+      --max: 1180px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.55;
+      text-rendering: optimizeLegibility;
+    }
+
+    a {
+      color: inherit;
+    }
+
+    .skip-link {
+      position: absolute;
+      left: 16px;
+      top: -80px;
+      z-index: 20;
+      background: var(--cream);
+      color: var(--charcoal);
+      padding: 10px 14px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      font-weight: 700;
+      transition: top 160ms ease;
+    }
+
+    .skip-link:focus {
+      top: 16px;
+    }
+
+    .hero {
+      position: relative;
+      min-height: 84svh;
+      overflow: hidden;
+      background: var(--charcoal);
+      color: #fffaf0;
+      isolation: isolate;
+    }
+
+    .hero-canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      z-index: -2;
+      background: #101418;
+    }
+
+    .hero::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      z-index: -1;
+      background: rgba(16, 20, 24, 0.42);
+      box-shadow: inset 700px 0 360px rgba(16, 20, 24, 0.56), inset 0 -260px 190px rgba(16, 20, 24, 0.78);
+    }
+
+    .nav {
+      width: min(var(--max), calc(100% - 40px));
+      margin: 0 auto;
+      padding: 24px 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+    }
+
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      text-decoration: none;
+      font-weight: 800;
+      letter-spacing: 0;
+    }
+
+    .brand-mark {
+      width: 38px;
+      height: 38px;
+      display: inline-grid;
+      place-items: center;
+      border: 1px solid rgba(255, 244, 220, 0.36);
+      border-radius: 8px;
+      background: rgba(255, 244, 220, 0.1);
+      box-shadow: inset 0 0 0 1px rgba(255, 244, 220, 0.08);
+    }
+
+    .brand-mark svg {
+      width: 22px;
+      height: 22px;
+    }
+
+    .nav-toggle {
+      display: none;
+      width: 44px;
+      height: 44px;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid rgba(255, 244, 220, 0.32);
+      border-radius: 7px;
+      color: #fffaf0;
+      background: rgba(255, 244, 220, 0.08);
+      cursor: pointer;
+    }
+
+    .nav-toggle svg {
+      width: 23px;
+      height: 23px;
+    }
+
+    .nav-toggle:hover,
+    .nav-toggle:focus {
+      background: rgba(255, 244, 220, 0.14);
+      outline: none;
+    }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .nav-links a {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      text-decoration: none;
+      color: rgba(255, 250, 240, 0.76);
+      font-size: 0.94rem;
+      font-weight: 700;
+      padding: 8px 10px;
+      border-radius: 6px;
+    }
+
+    .nav-links svg {
+      width: 17px;
+      height: 17px;
+      flex: 0 0 auto;
+    }
+
+    .nav-links a:hover,
+    .nav-links a:focus {
+      color: #fffaf0;
+      background: rgba(255, 244, 220, 0.1);
+      outline: none;
+    }
+
+    .hero-inner {
+      width: min(var(--max), calc(100% - 40px));
+      margin: 0 auto;
+      padding: clamp(50px, 9vw, 112px) 0 76px;
+    }
+
+    .eyebrow {
+      margin: 0 0 18px;
+      color: var(--amber-soft);
+      font-size: 0.82rem;
+      font-weight: 800;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    h1,
+    h2,
+    h3 {
+      margin: 0;
+      line-height: 1.04;
+      letter-spacing: 0;
+    }
+
+    h1 {
+      max-width: 860px;
+      font-size: 7rem;
+      font-weight: 900;
+    }
+
+    .lede {
+      max-width: 730px;
+      margin: 24px 0 0;
+      color: #fff4dc;
+      font-size: 1.78rem;
+      line-height: 1.24;
+      font-weight: 700;
+    }
+
+    .hero-copy {
+      max-width: 760px;
+      margin: 22px 0 0;
+      color: rgba(255, 250, 240, 0.84);
+      font-size: 1.15rem;
+    }
+
+    .hero-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-top: 34px;
+    }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      min-height: 44px;
+      padding: 11px 16px;
+      border: 1px solid rgba(255, 244, 220, 0.38);
+      border-radius: 7px;
+      color: #fffaf0;
+      text-decoration: none;
+      font-weight: 800;
+      background: rgba(255, 244, 220, 0.08);
+    }
+
+    .button svg {
+      width: 18px;
+      height: 18px;
+      flex: 0 0 auto;
+    }
+
+    .button-primary {
+      background: var(--cream);
+      border-color: var(--cream);
+      color: var(--charcoal);
+    }
+
+    .button:hover,
+    .button:focus {
+      transform: translateY(-1px);
+      outline: none;
+    }
+
+    .hero-index {
+      width: min(var(--max), calc(100% - 40px));
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      color: rgba(255, 250, 240, 0.82);
+    }
+
+    .hero-index span {
+      min-height: 70px;
+      padding: 12px 14px;
+      border-top: 1px solid rgba(255, 244, 220, 0.28);
+      font-size: 0.9rem;
+      font-weight: 700;
+    }
+
+    .signal-strip {
+      margin-top: -1px;
+      padding: 0 0 30px;
+      background: var(--charcoal);
+    }
+
+    .band {
+      padding: clamp(56px, 8vw, 96px) 0;
+    }
+
+    .band-light {
+      background: var(--paper);
+    }
+
+    .band-white {
+      background: var(--paper-strong);
+    }
+
+    .band-dark {
+      background: var(--charcoal-2);
+      color: #fffaf0;
+    }
+
+    .container {
+      width: min(var(--max), calc(100% - 40px));
+      margin: 0 auto;
+    }
+
+    .section-kicker {
+      margin: 0 0 12px;
+      color: var(--rust);
+      font-size: 0.78rem;
+      font-weight: 900;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    .band-dark .section-kicker {
+      color: var(--amber-soft);
+    }
+
+    .section-title {
+      max-width: 820px;
+      font-size: 3.6rem;
+      font-weight: 900;
+    }
+
+    .section-lede {
+      max-width: 780px;
+      margin: 18px 0 0;
+      color: var(--muted);
+      font-size: 1.18rem;
+    }
+
+    .band-dark .section-lede {
+      color: rgba(255, 250, 240, 0.72);
+    }
+
+    .overview-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.04fr) minmax(320px, 0.76fr);
+      gap: clamp(24px, 5vw, 60px);
+      align-items: start;
+      margin-top: 34px;
+    }
+
+    .prose {
+      font-size: 1.05rem;
+    }
+
+    .prose p {
+      margin: 0 0 18px;
+    }
+
+    .feature-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .feature {
+      min-height: 116px;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fffaf1;
+    }
+
+    .feature:nth-child(2n) {
+      background: var(--green-soft);
+    }
+
+    .feature:nth-child(3n) {
+      background: var(--amber-soft);
+    }
+
+    .feature:nth-child(4n) {
+      background: var(--teal-soft);
+    }
+
+    .feature strong {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 1rem;
+    }
+
+    .feature span {
+      color: #40505a;
+      font-size: 0.93rem;
+    }
+
+    .example-grid,
+    .docs-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 16px;
+      margin-top: 36px;
+    }
+
+    .example-card,
+    .doc-card {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      min-width: 0;
+      min-height: 100%;
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--paper-strong);
+      box-shadow: 0 16px 46px rgba(23, 32, 38, 0.08);
+    }
+
+    .example-card h3,
+    .doc-card h3 {
+      font-size: 1.28rem;
+    }
+
+    .example-card p,
+    .doc-card p {
+      margin: 0;
+      color: var(--muted);
+    }
+
+    .example-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .example-meta li {
+      padding: 5px 8px;
+      border-radius: 999px;
+      background: var(--teal-soft);
+      color: #0f544f;
+      font-size: 0.78rem;
+      font-weight: 900;
+    }
+
+    .example-card .code-block {
+      margin-top: auto;
+    }
+
+    .doc-list {
+      display: grid;
+      gap: 10px;
+      margin: 0;
+      padding-left: 18px;
+      color: var(--muted);
+    }
+
+    .doc-list strong {
+      color: var(--ink);
+    }
+
+    .doc-card-wide {
+      grid-column: 1 / -1;
+    }
+
+    .doc-mini-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .doc-mini {
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fffaf1;
+    }
+
+    .doc-mini:nth-child(2n) {
+      background: var(--teal-soft);
+    }
+
+    .doc-mini:nth-child(3n) {
+      background: var(--amber-soft);
+    }
+
+    .doc-mini strong {
+      display: block;
+      margin-bottom: 6px;
+    }
+
+    .doc-mini span {
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .doc-recipe-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .doc-recipe {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .doc-recipe .code-block {
+      height: 100%;
+    }
+
+    .doc-table {
+      display: grid;
+      gap: 1px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--line);
+    }
+
+    .doc-table-row {
+      display: grid;
+      grid-template-columns: minmax(170px, 0.7fr) minmax(0, 1.3fr);
+      gap: 1px;
+    }
+
+    .doc-table-row > span {
+      padding: 12px 14px;
+      background: var(--paper-strong);
+      color: var(--muted);
+    }
+
+    .doc-table-row > span:first-child {
+      color: var(--ink);
+      font-weight: 900;
+      background: #f2eadc;
+    }
+
+    .workflow {
+      margin-top: 40px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      background: var(--paper-strong);
+      box-shadow: var(--shadow);
+    }
+
+    .workflow-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+      background: #f2eadc;
+      font-weight: 900;
+    }
+
+    .workflow-dots {
+      display: flex;
+      gap: 6px;
+      flex: 0 0 auto;
+    }
+
+    .workflow-dots i {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: var(--rust);
+    }
+
+    .workflow-dots i:nth-child(2) {
+      background: var(--amber);
+    }
+
+    .workflow-dots i:nth-child(3) {
+      background: var(--green);
+    }
+
+    .runtime-map {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 1px;
+      background: var(--line);
+    }
+
+    .runtime-node {
+      min-height: 170px;
+      padding: 18px;
+      background: var(--paper-strong);
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+    }
+
+    .runtime-node b {
+      display: block;
+      font-size: 1.04rem;
+    }
+
+    .runtime-node code {
+      align-self: flex-start;
+      margin-top: 18px;
+      color: var(--charcoal);
+      background: #f0e6d8;
+    }
+
+    .quickstart-grid {
+      display: grid;
+      gap: 18px;
+      margin-top: 36px;
+    }
+
+    .step {
+      display: grid;
+      grid-template-columns: minmax(180px, 0.34fr) minmax(0, 1fr);
+      gap: 22px;
+      padding: 22px;
+      min-width: 0;
+      border: 1px solid rgba(255, 244, 220, 0.22);
+      border-radius: 8px;
+      background: rgba(255, 244, 220, 0.06);
+    }
+
+    .step[open] {
+      background: rgba(255, 244, 220, 0.09);
+    }
+
+    .step-label {
+      display: flex;
+      gap: 14px;
+      align-items: flex-start;
+      cursor: pointer;
+      list-style: none;
+    }
+
+    .step-label::-webkit-details-marker {
+      display: none;
+    }
+
+    .step-label::after {
+      content: "+";
+      margin-left: auto;
+      color: var(--amber-soft);
+      font-size: 1.2rem;
+      font-weight: 900;
+      line-height: 1;
+    }
+
+    .step[open] .step-label::after {
+      content: "-";
+    }
+
+    .step-number {
+      width: 38px;
+      height: 38px;
+      flex: 0 0 auto;
+      display: grid;
+      place-items: center;
+      border-radius: 8px;
+      background: var(--cream);
+      color: var(--charcoal);
+      font-weight: 900;
+    }
+
+    .step h3 {
+      font-size: 1.3rem;
+      margin-top: 4px;
+    }
+
+    .step p {
+      margin: 8px 0 0;
+      color: rgba(255, 250, 240, 0.68);
+    }
+
+    .code-stack {
+      display: grid;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .code-block {
+      overflow: hidden;
+      min-width: 0;
+      border: 1px solid var(--code-line);
+      border-radius: 8px;
+      background: var(--code-bg);
+    }
+
+    .code-label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--code-line);
+      color: #afc0c8;
+      font-size: 0.78rem;
+      font-weight: 900;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    .copy-button {
+      width: 30px;
+      height: 30px;
+      display: inline-grid;
+      place-items: center;
+      border: 1px solid rgba(255, 244, 220, 0.16);
+      border-radius: 6px;
+      color: #d6e1e4;
+      background: rgba(255, 244, 220, 0.06);
+      cursor: pointer;
+    }
+
+    .copy-button svg {
+      width: 16px;
+      height: 16px;
+    }
+
+    .copy-button:hover,
+    .copy-button:focus {
+      color: #fffaf0;
+      background: rgba(255, 244, 220, 0.13);
+      outline: none;
+    }
+
+    .copy-button.is-copied {
+      color: #d8f1ec;
+      border-color: rgba(216, 241, 236, 0.42);
+      background: rgba(15, 118, 110, 0.24);
+    }
+
+    pre {
+      margin: 0;
+      max-width: 100%;
+      overflow-x: auto;
+      padding: 16px;
+      color: var(--code-text);
+      font: 0.95rem/1.6 "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      tab-size: 2;
+    }
+
+    code {
+      padding: 0.12em 0.38em;
+      border-radius: 5px;
+      background: rgba(15, 118, 110, 0.12);
+      color: #0f544f;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 0.92em;
+    }
+
+    pre code {
+      padding: 0;
+      border-radius: 0;
+      background: transparent;
+      color: inherit;
+      font-size: inherit;
+    }
+
+    .provider-list {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin: 14px 0 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .provider-list li {
+      padding: 12px 14px;
+      border: 1px solid rgba(255, 244, 220, 0.18);
+      border-radius: 8px;
+      background: rgba(255, 244, 220, 0.06);
+      color: rgba(255, 250, 240, 0.78);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+    }
+
+    .provider-list strong {
+      color: #fffaf0;
+    }
+
+    .provider-list span {
+      min-width: 0;
+    }
+
+    .provider-key-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      flex: 0 0 auto;
+      color: #fff4dc;
+      font-weight: 800;
+      text-decoration: none;
+    }
+
+    .provider-key-link svg {
+      width: 16px;
+      height: 16px;
+    }
+
+    .provider-key-link:hover,
+    .provider-key-link:focus {
+      color: #d8f1ec;
+      outline: none;
+    }
+
+    .final-note {
+      margin: 18px 0 0;
+      padding: 16px 18px;
+      border-left: 4px solid var(--green);
+      background: rgba(224, 239, 223, 0.12);
+      color: rgba(255, 250, 240, 0.8);
+      font-weight: 700;
+    }
+
+    .footer {
+      padding: 28px 0 34px;
+      background: var(--charcoal);
+      color: rgba(255, 250, 240, 0.64);
+      border-top: 1px solid rgba(255, 244, 220, 0.16);
+    }
+
+    .footer-inner {
+      width: min(var(--max), calc(100% - 40px));
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+      font-size: 0.94rem;
+    }
+
+    /* Mobile-first cascade for this standalone page. */
+    .hero {
+      min-height: 92svh;
+    }
+
+    .hero::after {
+      background: rgba(16, 20, 24, 0.54);
+      box-shadow: inset 0 -260px 190px rgba(16, 20, 24, 0.82);
+    }
+
+    .nav,
+    .hero-inner,
+    .hero-index,
+    .container,
+    .footer-inner {
+      width: min(var(--max), calc(100% - 32px));
+    }
+
+    .nav {
+      align-items: center;
+      flex-direction: row;
+      flex-wrap: wrap;
+      padding: 18px 0;
+    }
+
+    .brand {
+      min-height: 44px;
+    }
+
+    .nav-toggle {
+      display: inline-flex;
+      margin-left: auto;
+    }
+
+    .nav-links {
+      display: none;
+      width: 100%;
+      justify-content: flex-start;
+      gap: 4px;
+      padding: 10px 0 0;
+    }
+
+    .nav-links a {
+      width: 100%;
+      min-height: 40px;
+      padding: 8px 9px;
+      font-size: 0.88rem;
+    }
+
+    .nav.is-open .nav-links {
+      display: flex;
+      align-items: stretch;
+      flex-direction: column;
+    }
+
+    .hero-inner {
+      padding: 44px 0 64px;
+    }
+
+    h1 {
+      max-width: 100%;
+      font-size: clamp(2.78rem, 14vw, 3.75rem);
+    }
+
+    .lede {
+      font-size: 1.34rem;
+    }
+
+    .hero-copy,
+    .section-lede {
+      font-size: 1.02rem;
+    }
+
+    .hero-actions {
+      align-items: stretch;
+      flex-direction: column;
+    }
+
+    .button {
+      width: 100%;
+      justify-content: center;
+    }
+
+    .hero-index,
+    .overview-grid,
+    .feature-grid,
+    .runtime-map,
+    .quickstart-grid,
+    .example-grid,
+    .docs-grid,
+    .doc-mini-grid,
+    .doc-recipe-grid,
+    .provider-list,
+    .doc-table-row,
+    .step {
+      grid-template-columns: 1fr;
+    }
+
+    .hero-index span {
+      min-height: auto;
+    }
+
+    .section-title {
+      font-size: 2.1rem;
+    }
+
+    .workflow-header,
+    .provider-list li {
+      align-items: flex-start;
+      flex-direction: column;
+    }
+
+    .runtime-node {
+      min-height: 138px;
+    }
+
+    .step {
+      display: grid;
+      padding: 18px;
+    }
+
+    .step-label {
+      width: 100%;
+    }
+
+    pre {
+      font-size: 0.86rem;
+      white-space: pre;
+    }
+
+    .footer-inner {
+      align-items: flex-start;
+      flex-direction: column;
+    }
+
+    @media (min-width: 621px) {
+      h1 {
+        font-size: 4.75rem;
+      }
+
+      .section-title {
+        font-size: 2.7rem;
+      }
+
+      .nav {
+        align-items: center;
+        flex-direction: row;
+      }
+
+      .nav-links {
+        width: 100%;
+        justify-content: flex-start;
+      }
+
+      .hero-index,
+      .runtime-map,
+      .provider-list {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .hero-actions {
+        align-items: center;
+        flex-direction: row;
+      }
+
+      .button {
+        width: auto;
+      }
+
+      .doc-table-row {
+        grid-template-columns: minmax(170px, 0.7fr) minmax(0, 1.3fr);
+      }
+
+      .workflow-header,
+      .provider-list li,
+      .footer-inner {
+        align-items: center;
+        flex-direction: row;
+      }
+    }
+
+    @media (min-width: 881px) {
+      .nav,
+      .hero-inner,
+      .hero-index,
+      .container,
+      .footer-inner {
+        width: min(var(--max), calc(100% - 40px));
+      }
+
+      .hero {
+        min-height: 84svh;
+      }
+
+      .hero::after {
+        background: rgba(16, 20, 24, 0.42);
+        box-shadow: inset 700px 0 360px rgba(16, 20, 24, 0.56), inset 0 -260px 190px rgba(16, 20, 24, 0.78);
+      }
+
+      .hero-inner {
+        padding: clamp(50px, 9vw, 112px) 0 76px;
+      }
+
+      h1 {
+        max-width: 860px;
+        font-size: 7rem;
+      }
+
+      .lede {
+        font-size: 1.78rem;
+      }
+
+      .hero-copy {
+        font-size: 1.15rem;
+      }
+
+      .section-title {
+        font-size: 3.6rem;
+      }
+
+      .section-lede {
+        font-size: 1.18rem;
+      }
+
+      .hero-index,
+      .runtime-map {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+      }
+
+      .overview-grid {
+        grid-template-columns: minmax(0, 1.04fr) minmax(320px, 0.76fr);
+      }
+
+      .feature-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .example-grid,
+      .docs-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .doc-mini-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .doc-recipe-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .step {
+        grid-template-columns: minmax(180px, 0.34fr) minmax(0, 1fr);
+        padding: 22px;
+      }
+
+      .runtime-node {
+        min-height: 170px;
+      }
+
+      .provider-list {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      pre {
+        font-size: 0.95rem;
+      }
+    }
+
+    @media (min-width: 1025px) {
+      .nav {
+        flex-wrap: nowrap;
+      }
+
+      .nav-toggle {
+        display: none;
+      }
+
+      .nav-links {
+        display: flex;
+        width: auto;
+        align-items: center;
+        flex-direction: row;
+        justify-content: flex-end;
+        padding: 0;
+      }
+
+      .nav-links a {
+        width: auto;
+      }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="hero" id="top">
+    <canvas class="hero-canvas" data-runtime-canvas aria-hidden="true"></canvas>
+    <nav class="nav" aria-label="Primary navigation">
+      <a class="brand" href="#top" aria-label="AdaptiveAgent home">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" role="img">
+            <path d="M4 12c2.8-5.8 7.2-7.6 13.4-5.4" stroke="#fff4dc" stroke-width="2" stroke-linecap="round"/>
+            <path d="M20 12c-2.8 5.8-7.2 7.6-13.4 5.4" stroke="#d8f1ec" stroke-width="2" stroke-linecap="round"/>
+            <path d="M8.5 12h7" stroke="#f9e7c1" stroke-width="2" stroke-linecap="round"/>
+            <circle cx="12" cy="12" r="2.25" fill="#fff4dc"/>
+          </svg>
+        </span>
+        <span>AdaptiveAgent</span>
+      </a>
+      <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="primary-nav" aria-label="Open navigation menu">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+      </button>
+      <div class="nav-links" id="primary-nav">
+        <a href="#overview">Overview</a>
+        <a href="#runtime">Runtime</a>
+        <a href="#quickstart">Quickstart</a>
+        <a href="#examples">Examples</a>
+        <a href="#docs">Docs</a>
+        <a href="https://github.com/ugmurthy/adaptiveAgent" target="_blank" rel="noopener">
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path d="M12 .5C5.65.5.5 5.65.5 12c0 5.1 3.29 9.41 7.86 10.94.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.38-3.88-1.38-.52-1.33-1.28-1.68-1.28-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.03 1.75 2.69 1.25 3.35.96.1-.74.4-1.25.73-1.54-2.55-.29-5.23-1.28-5.23-5.68 0-1.25.45-2.28 1.18-3.08-.12-.29-.51-1.46.11-3.04 0 0 .96-.31 3.16 1.18A10.9 10.9 0 0 1 12 6.21c.98 0 1.96.13 2.88.39 2.2-1.49 3.16-1.18 3.16-1.18.62 1.58.23 2.75.11 3.04.74.8 1.18 1.83 1.18 3.08 0 4.41-2.69 5.39-5.25 5.67.41.36.78 1.06.78 2.14v3.03c0 .31.21.67.79.56A11.52 11.52 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z"/>
+          </svg>
+          GitHub
+        </a>
+      </div>
+    </nav>
+
+    <div class="hero-inner">
+      <p class="eyebrow">Bun + TypeScript runtime and CLI stack</p>
+      <h1>Adaptive<wbr>Agent</h1>
+      <p class="lede">AdaptiveAgent is the operating layer for reliable AI agents.</p>
+      <p class="hero-copy">Run goal-oriented agents with typed tools, structured events, approvals, resumable runs, retries, child-run delegation, and multi-model support.</p>
+      <div class="hero-actions">
+        <a class="button button-primary" href="#quickstart">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M5 12h13" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            <path d="m13 6 6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          Start in 60 secs
+        </a>
+        <a class="button" href="#overview">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M6 4h12a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1Z" stroke="currentColor" stroke-width="2"/>
+            <path d="M8 8h8M8 12h8M8 16h5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+          Read the overview
+        </a>
+      </div>
+    </div>
+
+  </header>
+
+  <main id="main">
+    <section class="signal-strip" aria-label="AdaptiveAgent capabilities">
+      <div class="hero-index">
+        <span>Typed tools and structured events</span>
+        <span>Approvals and controlled execution</span>
+        <span>Resumable runs with retries</span>
+        <span>Child-run delegation and multi-model support</span>
+      </div>
+    </section>
+
+    <section class="band band-light" id="overview">
+      <div class="container">
+        <p class="section-kicker">What is AdaptiveAgent?</p>
+        <h2 class="section-title">From fragile agent demos to controlled production workflows.</h2>
+        <div class="overview-grid">
+          <div class="prose">
+            <p>AdaptiveAgent is the operating layer for reliable AI agents.</p>
+            <p>It is a Bun + TypeScript runtime and CLI stack for running goal-oriented agents with typed tools, structured events, approvals, resumable runs, retries, child-run delegation, and multi-model support.</p>
+            <p>It helps teams move from fragile agent demos to controlled, inspectable, recoverable production workflows.</p>
+          </div>
+          <div class="feature-grid" aria-label="Core capabilities">
+            <div class="feature">
+              <strong>Typed tools</strong>
+              <span>Keep executable primitives explicit and inspectable.</span>
+            </div>
+            <div class="feature">
+              <strong>Structured events</strong>
+              <span>Make runtime history legible for teams and systems.</span>
+            </div>
+            <div class="feature">
+              <strong>Approvals</strong>
+              <span>Put human and policy gates around sensitive actions.</span>
+            </div>
+            <div class="feature">
+              <strong>Resumable runs</strong>
+              <span>Recover work without losing execution context.</span>
+            </div>
+            <div class="feature">
+              <strong>Retries</strong>
+              <span>Handle transient model and tool failures deliberately.</span>
+            </div>
+            <div class="feature">
+              <strong>Multi-model support</strong>
+              <span>Route work across providers that match the task.</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="band band-white" id="runtime">
+      <div class="container">
+        <p class="section-kicker">Runtime shape</p>
+        <h2 class="section-title">A local stack for goals, tools, history, and recovery.</h2>
+        <p class="section-lede">AdaptiveAgent runs goals as durable sessions: tools stay explicit, events record each step, approvals gate sensitive actions, and runtime history supports inspection, retries, and recovery.</p>
+
+        <div class="workflow" aria-label="AdaptiveAgent runtime flow">
+          <div class="workflow-header">
+            <span>Inspectable agent execution loop</span>
+            <span class="workflow-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+          </div>
+          <div class="runtime-map">
+            <div class="runtime-node">
+              <b>Goal-oriented agents</b>
+              <span>Begin with a top-level objective and run through the CLI.</span>
+              <code>adaptive-agent run</code>
+            </div>
+            <div class="runtime-node">
+              <b>Typed tools</b>
+              <span>Use explicit capabilities instead of hidden side effects.</span>
+              <code>Tool</code>
+            </div>
+            <div class="runtime-node">
+              <b>Structured events</b>
+              <span>Trace approvals, retries, child runs, and model activity.</span>
+              <code>event log</code>
+            </div>
+            <div class="runtime-node">
+              <b>Recoverable history</b>
+              <span>Resume, inspect, and reason about production workflows.</span>
+              <code>runtime history</code>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="band band-dark" id="quickstart">
+      <div class="container">
+        <p class="section-kicker">Getting Started in 60secs</p>
+        <h2 class="section-title">Install, add a key, then run your first local agent.</h2>
+        <p class="section-lede">These commands are the complete README quickstart, with code blocks styled for scanning and terminal use.</p>
+
+        <div class="quickstart-grid" data-quickstart-accordion>
+          <details class="step" open>
+            <summary class="step-label">
+              <span class="step-number">1</span>
+              <div>
+                <h3>Install</h3>
+                <p>Use the platform installer for macOS, Linux, or Windows PowerShell.</p>
+              </div>
+            </summary>
+            <div class="code-stack">
+              <div class="code-block">
+                <div class="code-label">macOS</div>
+                <pre><code>curl -fsSL https://github.com/ugmurthy/adaptiveAgent/releases/latest/download/install.sh | sh</code></pre>
+              </div>
+              <div class="code-block">
+                <div class="code-label">Linux</div>
+                <pre><code>curl -fsSL https://github.com/ugmurthy/adaptiveAgent/releases/latest/download/install.sh | sh</code></pre>
+              </div>
+              <div class="code-block">
+                <div class="code-label">Windows PowerShell</div>
+                <pre><code>irm https://github.com/ugmurthy/adaptiveAgent/releases/latest/download/install.ps1 | iex</code></pre>
+              </div>
+              <p>If the installer says <code>adaptive-agent</code> is not on your <code>PATH</code>, run the exact PATH command it prints.</p>
+            </div>
+          </details>
+
+          <details class="step">
+            <summary class="step-label">
+              <span class="step-number">2</span>
+              <div>
+                <h3>Add an API key</h3>
+                <p>The default hosted quickstart uses OpenRouter.</p>
+              </div>
+            </summary>
+            <div class="code-stack">
+              <div class="code-block">
+                <div class="code-label">bash</div>
+                <pre><code>export OPENROUTER_API_KEY="&lt;your-key&gt;"</code></pre>
+              </div>
+              <div class="code-block">
+                <div class="code-label">Windows PowerShell</div>
+                <pre><code>$env:OPENROUTER_API_KEY = "&lt;your-key&gt;"</code></pre>
+              </div>
+              <p>Other supported providers use their own keys:</p>
+              <ul class="provider-list">
+                <li>
+                  <span><strong>OpenRouter:</strong> <code>OPENROUTER_API_KEY</code></span>
+                  <a class="provider-key-link" href="https://openrouter.ai/keys" target="_blank" rel="noopener" aria-label="Get an OpenRouter API key">
+                    Get key
+                    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                      <path d="M7 17 17 7M9 7h8v8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                  </a>
+                </li>
+                <li>
+                  <span><strong>Mistral:</strong> <code>MISTRAL_API_KEY</code></span>
+                  <a class="provider-key-link" href="https://console.mistral.ai/api-keys" target="_blank" rel="noopener" aria-label="Get a Mistral API key">
+                    Get key
+                    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                      <path d="M7 17 17 7M9 7h8v8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                  </a>
+                </li>
+                <li>
+                  <span><strong>Mesh:</strong> <code>MESH_API_KEY</code></span>
+                  <a class="provider-key-link" href="https://app.meshapi.ai/" target="_blank" rel="noopener" aria-label="Get a Mesh API key">
+                    Get key
+                    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                      <path d="M7 17 17 7M9 7h8v8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                  </a>
+                </li>
+                <li><span><strong>Ollama:</strong> no API key, but Ollama must be running locally</span></li>
+              </ul>
+            </div>
+          </details>
+
+          <details class="step">
+            <summary class="step-label">
+              <span class="step-number">3</span>
+              <div>
+                <h3>Init and run</h3>
+                <p>Create local config, check the provider, and confirm the agent is working.</p>
+              </div>
+            </summary>
+            <div class="code-stack">
+              <div class="code-block">
+                <div class="code-label">terminal</div>
+                <pre><code>adaptive-agent init
+adaptive-agent doctor --provider-check
+adaptive-agent run "Hello, confirm you are working"</code></pre>
+              </div>
+              <p class="final-note">That is it. You now have a configured local agent that can run goals, use tools, and produce inspectable runtime history.</p>
+            </div>
+          </details>
+        </div>
+      </div>
+    </section>
+
+    <section class="band band-light" id="examples">
+      <div class="container">
+        <p class="section-kicker">Examples</p>
+        <h2 class="section-title">Start with one command, then grow into reusable agent workflows.</h2>
+        <p class="section-lede">Use these examples after the quickstart has created local config and your provider API key is available in the shell.</p>
+
+        <div class="example-grid">
+          <article class="example-card">
+            <ul class="example-meta" aria-label="Simple example traits">
+              <li>Simple</li>
+              <li>Default agent</li>
+              <li>Read-only goal</li>
+            </ul>
+            <h3>Run one local goal</h3>
+            <p>Use the generated default agent for a small, safe task. Add <code>--progress</code> and <code>--events</code> when you want to see the execution loop.</p>
+            <div class="code-block">
+              <div class="code-label">terminal</div>
+              <pre><code>adaptive-agent run \
+  --progress \
+  --events \
+  "Summarize this repository in five bullets."</code></pre>
+            </div>
+          </article>
+
+          <article class="example-card">
+            <ul class="example-meta" aria-label="Intermediate example traits">
+              <li>Intermediate</li>
+              <li>Scripted prompt</li>
+              <li>Article output</li>
+            </ul>
+            <h3>Generate an article from a topic</h3>
+            <p>The <code>examples/writing-adaptive-agent.sh</code> script builds a dated writing prompt, chooses the installed CLI when available, and runs with automatic approvals.</p>
+            <div class="code-block">
+              <div class="code-label">terminal</div>
+              <pre><code>chmod +x ./examples/writing-adaptive-agent.sh
+
+./examples/writing-adaptive-agent.sh \
+  "The impact of Grok 4 on open source AI"</code></pre>
+            </div>
+          </article>
+
+          <article class="example-card">
+            <ul class="example-meta" aria-label="Complex example traits">
+              <li>Complex</li>
+              <li>STORM methodology</li>
+              <li>Deep research</li>
+            </ul>
+            <h3>Use the STORM researcher agent</h3>
+            <p>Run the bundled <code>storm-researcher</code> profile for a long-form, citation-heavy article that discovers perspectives, outlines first, then writes.</p>
+            <div class="code-block">
+              <div class="code-label">terminal</div>
+              <pre><code>export MESH_API_KEY="&lt;your-key&gt;"
+
+adaptive-agent run \
+  --agent ./packages/agent-sdk/bundled/agents/storm-researcher.json \
+  --approval auto \
+  --events \
+  --progress \
+  "Write a cited STORM-style article about agent reliability patterns in 2026."</code></pre>
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="band band-white" id="docs">
+      <div class="container">
+        <p class="section-kicker">Docs</p>
+        <h2 class="section-title">How to use AdaptiveAgent from install to repeatable runs.</h2>
+        <p class="section-lede">AdaptiveAgent is a CLI-facing shell workflow backed by a typed runtime. The normal path is initialize config, choose an agent profile, run a goal, and inspect or retry the result.</p>
+
+        <div class="docs-grid">
+          <article class="doc-card">
+            <h3>1. Initialize your local agent home</h3>
+            <p>Run <code>adaptive-agent init</code> once to create <code>~/.adaptiveAgent</code>, install bundled agents and skills, and write default settings.</p>
+            <ul class="doc-list">
+              <li><strong>Health check:</strong> <code>adaptive-agent doctor --provider-check</code></li>
+              <li><strong>Inventory:</strong> <code>adaptive-agent catalog</code></li>
+              <li><strong>Resolved config:</strong> <code>adaptive-agent config</code></li>
+            </ul>
+          </article>
+
+          <article class="doc-card">
+            <h3>2. Run goals with the right agent</h3>
+            <p>The default command is <code>adaptive-agent run "goal"</code>. Pass <code>--agent</code> to use a specific JSON profile by path or by a name found in your configured agent directories.</p>
+            <ul class="doc-list">
+              <li><strong>Provider:</strong> override with <code>--provider</code> and <code>--model</code>.</li>
+              <li><strong>Runtime:</strong> use <code>--runtime memory</code> locally or <code>--runtime postgres</code> for durable history.</li>
+              <li><strong>Safety:</strong> choose <code>--approval manual</code>, <code>auto</code>, or <code>reject</code>.</li>
+            </ul>
+          </article>
+
+          <article class="doc-card">
+            <h3>3. Inspect, automate, and recover</h3>
+            <p>Use runtime output modes and event flags to make runs easy to debug locally or consume from scripts.</p>
+            <ul class="doc-list">
+              <li><strong>Readable runs:</strong> add <code>--progress</code>, <code>--events</code>, and <code>--inspect</code>.</li>
+              <li><strong>Automation:</strong> use <code>--output json</code> or <code>--output jsonl</code>.</li>
+              <li><strong>Recovery:</strong> use <code>adaptive-agent retry --run-id &lt;runId&gt;</code> for failed retryable runs.</li>
+            </ul>
+          </article>
+
+          <article class="doc-card doc-card-wide">
+            <h3>Pick the workflow that matches the job</h3>
+            <div class="doc-table" role="table" aria-label="AdaptiveAgent workflow guide">
+              <div class="doc-table-row" role="row">
+                <span role="cell">Try one task</span>
+                <span role="cell"><code>adaptive-agent run "goal"</code> for a quick local run.</span>
+              </div>
+              <div class="doc-table-row" role="row">
+                <span role="cell">Make it visible</span>
+                <span role="cell">Add <code>--progress --events --inspect</code> to watch the loop and review the result.</span>
+              </div>
+              <div class="doc-table-row" role="row">
+                <span role="cell">Keep it safe</span>
+                <span role="cell">Use <code>--approval reject</code> for read-only audits, <code>manual</code> for prompts, or <code>auto</code> for trusted automation.</span>
+              </div>
+              <div class="doc-table-row" role="row">
+                <span role="cell">Automate it</span>
+                <span role="cell">Use <code>--output json</code> or <code>--output jsonl</code> from scripts, CI, and benchmark runs.</span>
+              </div>
+              <div class="doc-table-row" role="row">
+                <span role="cell">Make it durable</span>
+                <span role="cell">Use <code>--runtime postgres</code> when a run needs history, retry, or restart-safe execution.</span>
+              </div>
+            </div>
+          </article>
+
+          <article class="doc-card doc-card-wide">
+            <h3>Useful things to try first</h3>
+            <div class="doc-mini-grid">
+              <div class="doc-mini">
+                <strong>Map a repository</strong>
+                <span>Ask for packages, entrypoints, architecture, tests, and risky areas before changing code.</span>
+              </div>
+              <div class="doc-mini">
+                <strong>Review a pull request</strong>
+                <span>Run a reviewer profile with <code>--approval reject</code> so it can inspect but not mutate.</span>
+              </div>
+              <div class="doc-mini">
+                <strong>Write a research brief</strong>
+                <span>Use the STORM researcher for cited reports, market scans, or technical comparisons.</span>
+              </div>
+              <div class="doc-mini">
+                <strong>Generate release notes</strong>
+                <span>Turn commits, docs, or changelog fragments into user-facing summaries.</span>
+              </div>
+              <div class="doc-mini">
+                <strong>Run private local analysis</strong>
+                <span>Switch to <code>--provider ollama</code> when data should stay on your machine.</span>
+              </div>
+              <div class="doc-mini">
+                <strong>Evaluate agents</strong>
+                <span>Use JSONL input and output to compare providers, models, prompts, and agent profiles.</span>
+              </div>
+            </div>
+          </article>
+
+          <article class="doc-card doc-card-wide">
+            <h3>Create your own reusable agent profile</h3>
+            <p>An agent profile is a portable JSON workflow: model, instructions, tools, defaults, and optional delegates. Save named profiles such as <code>reviewer.json</code>, <code>researcher.json</code>, or <code>release-manager.json</code>, then run them with <code>--agent</code>.</p>
+            <div class="doc-recipe-grid">
+              <div class="doc-recipe">
+                <p>Start with a read-only reviewer that can inspect files and web pages but cannot write or run shell commands.</p>
+                <div class="code-block">
+                  <div class="code-label">agents/reviewer.json</div>
+                  <pre><code>{
+  "version": 1,
+  "id": "reviewer",
+  "name": "Repository Reviewer",
+  "invocationModes": ["run"],
+  "defaultInvocationMode": "run",
+  "model": {
+    "provider": "openrouter",
+    "model": "qwen/qwen3.5-27b",
+    "apiKeyEnv": "OPENROUTER_API_KEY"
+  },
+  "workspaceRoot": ".",
+  "systemInstructions": "Review code for correctness, safety, tests, and maintainability. Return prioritized findings with file references.",
+  "tools": ["read_file", "list_directory", "web_search", "read_web_page"],
+  "defaults": {
+    "maxSteps": 30,
+    "capture": "summary"
+  }
+}</code></pre>
+                </div>
+              </div>
+              <div class="doc-recipe">
+                <p>Use the profile by path, or place it in one of your configured agent directories and use the short name.</p>
+                <div class="code-block">
+                  <div class="code-label">terminal</div>
+                  <pre><code>adaptive-agent run \
+  --agent ./agents/reviewer.json \
+  --approval reject \
+  --progress \
+  --inspect \
+  "Review the current repository changes for risky runtime behavior."
+
+adaptive-agent catalog</code></pre>
+                </div>
+              </div>
+            </div>
+          </article>
+
+          <article class="doc-card doc-card-wide">
+            <h3>Recipes for real work</h3>
+            <div class="doc-recipe-grid">
+              <div class="doc-recipe">
+                <p><strong>Understand a codebase</strong></p>
+                <div class="code-block">
+                  <div class="code-label">terminal</div>
+                  <pre><code>adaptive-agent run \
+  --progress \
+  --events \
+  "Map this repository: packages, entrypoints, data flow, tests, and risky areas."</code></pre>
+                </div>
+              </div>
+              <div class="doc-recipe">
+                <p><strong>Create structured automation</strong></p>
+                <div class="code-block">
+                  <div class="code-label">terminal</div>
+                  <pre><code>adaptive-agent run \
+  --input-json '{"topic":"agent reliability","audience":"engineering leaders"}' \
+  --output json \
+  "Create a concise research brief."</code></pre>
+                </div>
+              </div>
+              <div class="doc-recipe">
+                <p><strong>Run with a local model</strong></p>
+                <div class="code-block">
+                  <div class="code-label">terminal</div>
+                  <pre><code>adaptive-agent run \
+  --provider ollama \
+  --model llama3.2 \
+  --runtime memory \
+  "Summarize this document without using a hosted provider."</code></pre>
+                </div>
+              </div>
+              <div class="doc-recipe">
+                <p><strong>Persist and retry long-running work</strong></p>
+                <div class="code-block">
+                  <div class="code-label">terminal</div>
+                  <pre><code>adaptive-agent run \
+  --runtime postgres \
+  --events \
+  --inspect \
+  "Audit these logs and summarize likely root causes."
+
+adaptive-agent retry --run-id &lt;runId&gt; --runtime postgres</code></pre>
+                </div>
+              </div>
+            </div>
+          </article>
+
+          <article class="doc-card">
+            <h3>Run evaluations</h3>
+            <p>Use eval commands when you want repeatable model or agent-profile comparisons over JSONL cases.</p>
+            <div class="code-block">
+              <div class="code-label">terminal</div>
+              <pre><code>adaptive-agent eval cases \
+  --input ./data/tasks.jsonl \
+  --out ./runs/results.jsonl \
+  --runtime postgres \
+  --output jsonl</code></pre>
+            </div>
+          </article>
+
+          <article class="doc-card">
+            <h3>Coordinate specialists</h3>
+            <p>For bigger objectives, use a coordinator profile and a worker catalog so research, writing, review, and synthesis can be separated.</p>
+            <div class="code-block">
+              <div class="code-label">terminal</div>
+              <pre><code>adaptive-agent swarm-run \
+  --agent coordinator \
+  --worker-catalog researcher,writer,reviewer \
+  --runtime postgres \
+  --events \
+  "Produce a launch strategy."</code></pre>
+            </div>
+          </article>
+
+          <article class="doc-card">
+            <h3>Beyond the terminal</h3>
+            <p>AdaptiveAgent is technical today, but the same runtime can be packaged for non-technical users.</p>
+            <ul class="doc-list">
+              <li><strong>Desktop app:</strong> guided setup, saved profiles, run history, and approval prompts.</li>
+              <li><strong>Team workspace:</strong> shared templates, durable runs, human review, and audit trails.</li>
+              <li><strong>Hosted forms:</strong> turn common workflows into simple inputs such as topic, files, and desired output.</li>
+            </ul>
+          </article>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="footer-inner">
+      <span>AdaptiveAgent</span>
+      <span>Reliable AI agents with inspectable runtime history.</span>
+    </div>
+  </footer>
+
+  <script>
+    (() => {
+      const copyIcon = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M8 8h9a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1Z" stroke="currentColor" stroke-width="2"/><path d="M5 16H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h9a1 1 0 0 1 1 1v1" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
+      const checkIcon = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m5 12 4 4L19 6" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
+      function copyTextWithSelection(text) {
+        const textArea = document.createElement("textarea");
+        textArea.value = text;
+        textArea.setAttribute("readonly", "");
+        textArea.style.position = "fixed";
+        textArea.style.left = "-9999px";
+        textArea.style.top = "0";
+        document.body.appendChild(textArea);
+        textArea.focus();
+        textArea.select();
+        textArea.setSelectionRange(0, textArea.value.length);
+        const copied = document.execCommand("copy");
+        textArea.remove();
+        if (!copied) {
+          throw new Error("Copy command failed");
+        }
+      }
+
+      async function copyText(text) {
+        try {
+          copyTextWithSelection(text);
+          return;
+        } catch {
+          if (window.navigator?.clipboard && window.isSecureContext) {
+            await window.navigator.clipboard.writeText(text);
+            return;
+          }
+          throw new Error("Copy command failed");
+        }
+      }
+
+      const nav = document.querySelector(".nav");
+      const navToggle = document.querySelector(".nav-toggle");
+      const navLinks = document.querySelector(".nav-links");
+      const desktopNav = window.matchMedia("(min-width: 881px)");
+
+      function setNavOpen(open) {
+        if (!nav || !navToggle) {
+          return;
+        }
+
+        nav.classList.toggle("is-open", open);
+        navToggle.setAttribute("aria-expanded", String(open));
+        navToggle.setAttribute("aria-label", open ? "Close navigation menu" : "Open navigation menu");
+      }
+
+      if (nav && navToggle && navLinks) {
+        navToggle.addEventListener("click", () => {
+          setNavOpen(!nav.classList.contains("is-open"));
+        });
+
+        navLinks.addEventListener("click", (event) => {
+          if (event.target.closest("a")) {
+            setNavOpen(false);
+          }
+        });
+
+        document.addEventListener("keydown", (event) => {
+          if (event.key === "Escape") {
+            setNavOpen(false);
+          }
+        });
+
+        desktopNav.addEventListener("change", (event) => {
+          if (event.matches) {
+            setNavOpen(false);
+          }
+        });
+      }
+
+      document.querySelectorAll(".code-block").forEach((block) => {
+        const label = block.querySelector(".code-label");
+        const code = block.querySelector("pre code");
+        if (!label || !code) {
+          return;
+        }
+
+        const labelText = label.textContent.trim();
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "copy-button";
+        button.innerHTML = copyIcon;
+        button.title = "Copy command";
+        button.setAttribute("aria-label", `Copy ${labelText} command to clipboard`);
+        button.addEventListener("click", async () => {
+          try {
+            await copyText(code.textContent.trim());
+            button.classList.add("is-copied");
+            button.innerHTML = checkIcon;
+            button.title = "Copied";
+            button.setAttribute("aria-label", "Copied to clipboard");
+            window.setTimeout(() => {
+              button.classList.remove("is-copied");
+              button.innerHTML = copyIcon;
+              button.title = "Copy command";
+              button.setAttribute("aria-label", `Copy ${labelText} command to clipboard`);
+            }, 1400);
+          } catch {
+            button.title = "Copy failed";
+            button.setAttribute("aria-label", "Copy failed");
+          }
+        });
+        label.appendChild(button);
+      });
+
+      const quickstartAccordion = document.querySelector("[data-quickstart-accordion]");
+      if (quickstartAccordion) {
+        const panels = [...quickstartAccordion.querySelectorAll(".step")];
+        panels.forEach((panel) => {
+          panel.addEventListener("toggle", () => {
+            if (!panel.open) {
+              return;
+            }
+
+            panels.forEach((otherPanel) => {
+              if (otherPanel !== panel) {
+                otherPanel.open = false;
+              }
+            });
+          });
+        });
+      }
+
+      const canvas = document.querySelector("[data-runtime-canvas]");
+      const ctx = canvas.getContext("2d");
+      const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      const lanes = [
+        { label: "objective", detail: "top-level goal", color: "#fff4dc" },
+        { label: "approval", detail: "policy gate", color: "#f9e7c1" },
+        { label: "tool call", detail: "typed action", color: "#d8f1ec" },
+        { label: "event log", detail: "structured trace", color: "#f4d5c8" },
+        { label: "retry", detail: "recoverable run", color: "#e0efdf" },
+        { label: "result", detail: "inspectable output", color: "#d8f1ec" }
+      ];
+      const traceStops = [
+        { lane: 0, x: 0.23 },
+        { lane: 1, x: 0.39 },
+        { lane: 2, x: 0.56 },
+        { lane: 3, x: 0.72 },
+        { lane: 4, x: 0.58 },
+        { lane: 5, x: 0.82 }
+      ];
+      const packets = [
+        { offset: 0, color: "#fff4dc" },
+        { offset: 0.28, color: "#d8f1ec" },
+        { offset: 0.57, color: "#f9e7c1" }
+      ];
+      const pointer = { x: 0.5, y: 0.5 };
+      let frame = 0;
+      let width = 0;
+      let height = 0;
+      let traceBounds = { x: 0, y: 0, w: 0, h: 0 };
+
+      function resize() {
+        const scale = Math.min(window.devicePixelRatio || 1, 2);
+        width = canvas.clientWidth;
+        height = canvas.clientHeight;
+        canvas.width = Math.floor(width * scale);
+        canvas.height = Math.floor(height * scale);
+        ctx.setTransform(scale, 0, 0, scale, 0, 0);
+        draw();
+      }
+
+      function layoutTrace() {
+        const driftX = (pointer.x - 0.5) * 26;
+        const driftY = (pointer.y - 0.5) * 16;
+        const w = Math.min(540, width * 0.36);
+        const h = Math.min(420, height * 0.56);
+        return {
+          x: width - w - width * 0.07 + driftX,
+          y: height * 0.2 + driftY,
+          w,
+          h
+        };
+      }
+
+      function laneY(index) {
+        const gap = traceBounds.h / Math.max(lanes.length - 1, 1);
+        return traceBounds.y + gap * index;
+      }
+
+      function stopPoint(stop) {
+        return {
+          x: traceBounds.x + traceBounds.w * stop.x,
+          y: laneY(stop.lane)
+        };
+      }
+
+      function drawBackground() {
+        const glow = ctx.createRadialGradient(width * 0.72, height * 0.36, 0, width * 0.72, height * 0.36, Math.max(width, height) * 0.72);
+        glow.addColorStop(0, "rgba(15, 118, 110, 0.2)");
+        glow.addColorStop(0.42, "rgba(189, 75, 38, 0.1)");
+        glow.addColorStop(1, "rgba(16, 20, 24, 0)");
+        ctx.fillStyle = "#101418";
+        ctx.fillRect(0, 0, width, height);
+        ctx.fillStyle = glow;
+        ctx.fillRect(0, 0, width, height);
+
+        ctx.save();
+        ctx.strokeStyle = "rgba(255, 244, 220, 0.045)";
+        ctx.lineWidth = 1;
+        const gap = Math.max(46, Math.min(82, width / 18));
+        for (let x = 0; x <= width; x += gap) {
+          ctx.beginPath();
+          ctx.moveTo(x, 0);
+          ctx.lineTo(x, height);
+          ctx.stroke();
+        }
+        for (let y = 0; y <= height; y += gap) {
+          ctx.beginPath();
+          ctx.moveTo(0, y);
+          ctx.lineTo(width, y);
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
+
+      function drawLanes() {
+        ctx.save();
+        ctx.font = "700 11px ui-sans-serif, system-ui, sans-serif";
+        ctx.textBaseline = "middle";
+
+        lanes.forEach((lane, index) => {
+          const y = laneY(index);
+          const laneAlpha = 0.16 + Math.sin(frame / 70 + index) * 0.025;
+          ctx.strokeStyle = `rgba(255, 244, 220, ${laneAlpha})`;
+          ctx.lineWidth = 1.2;
+          ctx.beginPath();
+          ctx.moveTo(traceBounds.x + traceBounds.w * 0.16, y);
+          ctx.lineTo(traceBounds.x + traceBounds.w * 0.9, y);
+          ctx.stroke();
+
+          ctx.fillStyle = "rgba(16, 20, 24, 0.74)";
+          ctx.strokeStyle = "rgba(255, 244, 220, 0.16)";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.roundRect(traceBounds.x, y - 18, 112, 36, 8);
+          ctx.fill();
+          ctx.stroke();
+
+          ctx.fillStyle = lane.color;
+          ctx.textAlign = "left";
+          ctx.fillText(lane.label, traceBounds.x + 13, y - 4);
+          ctx.fillStyle = "rgba(255, 250, 240, 0.48)";
+          ctx.font = "600 9px ui-sans-serif, system-ui, sans-serif";
+          ctx.fillText(lane.detail, traceBounds.x + 13, y + 9);
+          ctx.font = "700 11px ui-sans-serif, system-ui, sans-serif";
+        });
+
+        ctx.restore();
+      }
+
+      function drawTracePath() {
+        const points = traceStops.map(stopPoint);
+        ctx.save();
+        ctx.lineWidth = 2.2;
+        ctx.strokeStyle = "rgba(216, 241, 236, 0.3)";
+        ctx.shadowBlur = 16;
+        ctx.shadowColor = "rgba(216, 241, 236, 0.24)";
+        ctx.beginPath();
+        ctx.moveTo(points[0].x, points[0].y);
+        for (let i = 1; i < points.length; i += 1) {
+          const prev = points[i - 1];
+          const next = points[i];
+          const midX = (prev.x + next.x) / 2;
+          ctx.bezierCurveTo(midX, prev.y, midX, next.y, next.x, next.y);
+        }
+        ctx.stroke();
+        ctx.restore();
+
+        points.forEach((point, index) => {
+          const lane = lanes[traceStops[index].lane];
+          const pulse = reduced ? 0 : Math.sin(frame / 34 + index * 0.8) * 2.4;
+          ctx.save();
+          ctx.fillStyle = "rgba(16, 20, 24, 0.86)";
+          ctx.strokeStyle = lane.color;
+          ctx.lineWidth = 1.5;
+          ctx.shadowBlur = 12;
+          ctx.shadowColor = lane.color;
+          ctx.beginPath();
+          ctx.arc(point.x, point.y, 7 + pulse, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+          ctx.restore();
+        });
+      }
+
+      function tracePoint(progress) {
+        const points = traceStops.map(stopPoint);
+        const segmentCount = points.length - 1;
+        const scaled = progress * segmentCount;
+        const index = Math.min(Math.floor(scaled), segmentCount - 1);
+        const t = scaled - index;
+        const p1 = points[index];
+        const p2 = points[index + 1];
+        const smooth = t * t * (3 - 2 * t);
+        return {
+          x: p1.x + (p2.x - p1.x) * smooth,
+          y: p1.y + (p2.y - p1.y) * smooth
+        };
+      }
+
+      function drawPacket(progress, color) {
+        const point = tracePoint(progress);
+        ctx.save();
+        ctx.globalAlpha = 0.86;
+        ctx.shadowBlur = 20;
+        ctx.shadowColor = color;
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(point.x, point.y, 5.5, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.globalAlpha = 0.22;
+        ctx.lineWidth = 8;
+        ctx.strokeStyle = color;
+        ctx.beginPath();
+        ctx.arc(point.x, point.y, 10, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      function draw() {
+        frame += 1;
+        ctx.clearRect(0, 0, width, height);
+        traceBounds = layoutTrace();
+        drawBackground();
+        drawLanes();
+        drawTracePath();
+
+        if (!reduced) {
+          packets.forEach((packet) => {
+            drawPacket((frame / 260 + packet.offset) % 1, packet.color);
+          });
+        }
+
+        if (!reduced) {
+          requestAnimationFrame(draw);
+        }
+      }
+
+      window.addEventListener("resize", resize, { passive: true });
+      window.addEventListener("pointermove", (event) => {
+        pointer.x = event.clientX / Math.max(window.innerWidth, 1);
+        pointer.y = event.clientY / Math.max(window.innerHeight, 1);
+      }, { passive: true });
+
+      if (!CanvasRenderingContext2D.prototype.roundRect) {
+        CanvasRenderingContext2D.prototype.roundRect = function roundRect(x, y, w, h, r) {
+          const radius = Math.min(r, w / 2, h / 2);
+          this.moveTo(x + radius, y);
+          this.arcTo(x + w, y, x + w, y + h, radius);
+          this.arcTo(x + w, y + h, x, y + h, radius);
+          this.arcTo(x, y + h, x, y, radius);
+          this.arcTo(x, y, x + w, y, radius);
+          return this;
+        };
+      }
+
+      resize();
+    })();
+  </script>
+</body>
+</html>

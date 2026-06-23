@@ -1,4 +1,6 @@
-import { MeshAPI, MeshAPIApiError } from 'meshapi-node-sdk';
+import { createHash } from 'node:crypto';
+
+import { MeshAPI, MeshAPIApiError, type ModelInfo } from 'meshapi-node-sdk';
 
 import { approximateSerializedByteLength, compactJsonObject } from '../logging.js';
 import type { JsonValue, ModelRequest, ModelResponse, StructuredOutputMode } from '../types.js';
@@ -6,6 +8,8 @@ import { BaseOpenAIChatAdapter, MAX_LOCAL_AUDIO_BYTES, type BaseOpenAIChatAdapte
 
 const MESH_BASE_URL = 'https://api.meshapi.ai/v1';
 const DISABLED_MODEL_TIMEOUT_MESH_HTTP_TIMEOUT_MS = 900_000;
+const MESH_MODEL_RATE_CACHE_TTL_MS = 30 * 60 * 1000;
+const MESH_MODEL_PRICING_TIMEOUT_MS = 5_000;
 
 export interface MeshAdapterConfig {
   model: string;
@@ -17,12 +21,15 @@ export interface MeshAdapterConfig {
 
 export class MeshAdapter extends BaseOpenAIChatAdapter {
   private readonly client: MeshAPI;
+  private readonly baseUrl: string;
+  private readonly apiKey: string;
 
   constructor(config: MeshAdapterConfig) {
+    const baseUrl = config.baseUrl ?? MESH_BASE_URL;
     const baseConfig: BaseOpenAIChatAdapterConfig = {
       provider: 'mesh',
       model: config.model,
-      baseUrl: config.baseUrl ?? MESH_BASE_URL,
+      baseUrl,
       apiKey: config.apiKey,
       maxConcurrentRequests: config.maxConcurrentRequests,
       structuredOutputMode: config.structuredOutputMode,
@@ -41,8 +48,11 @@ export class MeshAdapter extends BaseOpenAIChatAdapter {
 
     super(baseConfig);
 
+    this.baseUrl = baseUrl;
+    this.apiKey = config.apiKey;
+
     this.client = new MeshAPI({
-      baseUrl: toMeshSdkBaseUrl(config.baseUrl ?? MESH_BASE_URL),
+      baseUrl: toMeshSdkBaseUrl(baseUrl),
       token: config.apiKey,
       maxRetries: 0,
     });
@@ -67,13 +77,15 @@ export class MeshAdapter extends BaseOpenAIChatAdapter {
       }
 
       const completion = accumulator.toCompletion();
+      const providerReportedCost = hasPositiveProviderReportedCost(completion);
       const parsed = this.parseResponse(completion as never);
+      const priced = await this.withEstimatedMeshCost(parsed, completion, providerReportedCost, request.signal);
       return {
-        ...parsed,
-        providerResponseId: parsed.providerResponseId || undefined,
+        ...priced,
+        providerResponseId: priced.providerResponseId || undefined,
         rawProviderResponse: chunks,
         performance: compactJsonObject({
-          ...(parsed.performance ?? {}),
+          ...(priced.performance ?? {}),
           adapterAttemptCount: 1,
           adapterResponseLatencyMs: Date.now() - startedAt,
           adapterRequestBytes: approximateSerializedByteLength(body),
@@ -84,6 +96,82 @@ export class MeshAdapter extends BaseOpenAIChatAdapter {
       throw enrichMeshError(error);
     }
   }
+
+  private async withEstimatedMeshCost(
+    response: ModelResponse,
+    completion: Record<string, unknown>,
+    providerReportedCost: boolean,
+    signal: AbortSignal | undefined,
+  ): Promise<ModelResponse> {
+    if (!response.usage) {
+      return response;
+    }
+
+    const responseUsageModel = response.usage.model;
+    const actualModel = readString(completion.model) ?? responseUsageModel ?? this.model;
+    const usage = response.usage.model === actualModel
+      ? response.usage
+      : { ...response.usage, model: actualModel };
+
+    if (providerReportedCost) {
+      return usage === response.usage ? response : { ...response, usage };
+    }
+
+    const rate = await getMeshModelRateForCandidates(
+      this.client,
+      this.baseUrl,
+      this.apiKey,
+      meshModelRateCandidates(actualModel, responseUsageModel, this.model),
+      signal,
+    );
+    if (!rate) {
+      return usage === response.usage ? response : { ...response, usage };
+    }
+
+    return {
+      ...response,
+      usage: {
+        ...usage,
+        estimatedCostUSD: estimateCostFromRate(usage.promptTokens, usage.completionTokens, rate),
+      },
+    };
+  }
+}
+
+interface MeshModelRate {
+  promptUsdPer1k: number;
+  completionUsdPer1k: number;
+}
+
+interface MeshModelRateCacheEntry {
+  ratesByModel: Map<string, MeshModelRate>;
+  expiresAt: number;
+}
+
+const meshModelRateCache = new Map<string, MeshModelRateCacheEntry>();
+const meshModelRateRefreshes = new Map<string, Promise<MeshModelRateCacheEntry>>();
+
+function meshModelRateCandidates(...models: Array<string | undefined>): string[] {
+  const candidates: string[] = [];
+  for (const model of models) {
+    addModelRateCandidate(candidates, model);
+  }
+
+  for (const model of [...candidates]) {
+    const slashIndex = model.indexOf('/');
+    if (slashIndex >= 0 && slashIndex < model.length - 1) {
+      addModelRateCandidate(candidates, model.slice(slashIndex + 1));
+    }
+  }
+
+  return candidates;
+}
+
+function addModelRateCandidate(candidates: string[], model: string | undefined): void {
+  if (!model || candidates.includes(model)) {
+    return;
+  }
+  candidates.push(model);
 }
 
 interface MeshAccumulatedToolCall {
@@ -95,6 +183,7 @@ interface MeshAccumulatedToolCall {
 
 class MeshStreamAccumulator {
   private id: string | undefined;
+  private model: string | undefined;
   private text = '';
   private finishReason: string | undefined;
   private usage: Record<string, unknown> | undefined;
@@ -111,6 +200,9 @@ class MeshStreamAccumulator {
 
     if (typeof chunk.id === 'string' && this.id === undefined) {
       this.id = chunk.id;
+    }
+    if (typeof chunk.model === 'string' && this.model === undefined) {
+      this.model = chunk.model;
     }
     if (isRecord(chunk.usage)) {
       this.usage = chunk.usage;
@@ -171,6 +263,7 @@ class MeshStreamAccumulator {
 
     return {
       id: this.id ?? '',
+      ...(this.model === undefined ? {} : { model: this.model }),
       choices: [
         {
           index: 0,
@@ -217,6 +310,168 @@ class MeshStreamAccumulator {
       toolCall.argumentsText += fn.arguments;
     }
   }
+}
+
+async function getMeshModelRate(
+  client: MeshAPI,
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+  signal: AbortSignal | undefined,
+): Promise<MeshModelRate | undefined> {
+  const cacheKey = meshModelRateCacheKey(baseUrl, apiKey);
+  const now = Date.now();
+  const cached = meshModelRateCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return cached.ratesByModel.get(model);
+  }
+
+  let refresh = meshModelRateRefreshes.get(cacheKey);
+  if (!refresh) {
+    refresh = refreshMeshModelRates(client, signal);
+    meshModelRateRefreshes.set(cacheKey, refresh);
+    refresh.then(() => {
+      if (meshModelRateRefreshes.get(cacheKey) === refresh) {
+        meshModelRateRefreshes.delete(cacheKey);
+      }
+    }, () => {
+      if (meshModelRateRefreshes.get(cacheKey) === refresh) {
+        meshModelRateRefreshes.delete(cacheKey);
+      }
+    });
+  }
+
+  try {
+    const entry = await refresh;
+    meshModelRateCache.set(cacheKey, entry);
+    return entry.ratesByModel.get(model);
+  } catch {
+    return cached?.ratesByModel.get(model);
+  }
+}
+
+async function getMeshModelRateForCandidates(
+  client: MeshAPI,
+  baseUrl: string,
+  apiKey: string,
+  models: string[],
+  signal: AbortSignal | undefined,
+): Promise<MeshModelRate | undefined> {
+  for (const model of models) {
+    const rate = await getMeshModelRate(client, baseUrl, apiKey, model, signal);
+    if (rate) {
+      return rate;
+    }
+  }
+  return undefined;
+}
+
+async function refreshMeshModelRates(
+  client: MeshAPI,
+  signal: AbortSignal | undefined,
+): Promise<MeshModelRateCacheEntry> {
+  const models = await client.models.list(undefined, { signal, timeoutMs: MESH_MODEL_PRICING_TIMEOUT_MS });
+  const ratesByModel = new Map<string, MeshModelRate>();
+  for (const model of models) {
+    const rate = toMeshModelRate(model);
+    if (rate) {
+      ratesByModel.set(model.id, rate);
+    }
+  }
+  return {
+    ratesByModel,
+    expiresAt: Date.now() + MESH_MODEL_RATE_CACHE_TTL_MS,
+  };
+}
+
+function toMeshModelRate(model: ModelInfo): MeshModelRate | undefined {
+  const promptUsdPer1k = readFiniteNumber(
+    model.pricing.prompt_usd_per_1k_discounted,
+    model.pricing.prompt_usd_per_1k,
+  );
+  const completionUsdPer1k = readFiniteNumber(
+    model.pricing.completion_usd_per_1k_discounted,
+    model.pricing.completion_usd_per_1k,
+  );
+
+  if (promptUsdPer1k === undefined || completionUsdPer1k === undefined) {
+    if (model.is_free) {
+      return { promptUsdPer1k: 0, completionUsdPer1k: 0 };
+    }
+    return undefined;
+  }
+
+  return { promptUsdPer1k, completionUsdPer1k };
+}
+
+function estimateCostFromRate(
+  promptTokens: number,
+  completionTokens: number,
+  rate: MeshModelRate,
+): number {
+  return (promptTokens / 1000) * rate.promptUsdPer1k + (completionTokens / 1000) * rate.completionUsdPer1k;
+}
+
+function meshModelRateCacheKey(baseUrl: string, apiKey: string): string {
+  return `${baseUrl.replace(/\/+$/, '')}|${apiKeyFingerprint(apiKey)}`;
+}
+
+function apiKeyFingerprint(apiKey: string): string {
+  return createHash('sha256').update(apiKey).digest('hex').slice(0, 12);
+}
+
+function hasPositiveProviderReportedCost(completion: Record<string, unknown>): boolean {
+  const usage = isRecord(completion.usage) ? completion.usage : undefined;
+  const costDetails = usage && isRecord(usage.cost_details) ? usage.cost_details : undefined;
+
+  const cost = readFiniteNumber(
+    completion.estimated_cost_usd,
+    completion.cost_usd,
+    completion.total_cost_usd,
+    completion.cost,
+    completion.total_cost,
+    usage?.estimated_cost_usd,
+    usage?.cost_usd,
+    usage?.total_cost_usd,
+    usage?.cost,
+    usage?.total_cost,
+    costDetails?.upstream_inference_cost,
+    sumFiniteNumbers(
+      costDetails?.upstream_inference_prompt_cost,
+      costDetails?.upstream_inference_completions_cost,
+    ),
+  );
+  return cost !== undefined && cost > 0;
+}
+
+function sumFiniteNumbers(...values: unknown[]): number | undefined {
+  let total = 0;
+  let found = false;
+  for (const value of values) {
+    const parsed = readFiniteNumber(value);
+    if (parsed === undefined) continue;
+    total += parsed;
+    found = true;
+  }
+  return found ? total : undefined;
+}
+
+function readFiniteNumber(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    const parsed = typeof value === 'number'
+      ? value
+      : typeof value === 'string'
+        ? Number(value.replace(/^\$/, '').trim())
+        : undefined;
+    if (parsed !== undefined && Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return undefined;
+}
+
+function readString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

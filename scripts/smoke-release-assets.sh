@@ -33,6 +33,8 @@ trap 'rm -rf "$tmp_dir"' EXIT INT TERM
 tar -xzf "$asset" -C "$tmp_dir"
 binary="$tmp_dir/adaptive-agent"
 [ -x "$binary" ] || fail "extracted binary is not executable: $binary"
+trace_binary="$tmp_dir/trace-session"
+[ -x "$trace_binary" ] || fail "extracted trace-session binary is not executable: $trace_binary"
 
 home_dir="$tmp_dir/home"
 cwd_dir="$tmp_dir/workspace"
@@ -40,6 +42,7 @@ mkdir -p "$home_dir" "$cwd_dir"
 
 "$binary" --version
 "$binary" --help >/dev/null
+"$trace_binary" --help >/dev/null
 ADAPTIVE_AGENT_HOME="$home_dir" "$binary" init --dry-run --yes --cwd "$cwd_dir" >/dev/null
 ADAPTIVE_AGENT_HOME="$home_dir" "$binary" init --yes --cwd "$cwd_dir" >/dev/null
 ADAPTIVE_AGENT_HOME="$home_dir" "$binary" doctor --cwd "$cwd_dir" --output json >/dev/null || true

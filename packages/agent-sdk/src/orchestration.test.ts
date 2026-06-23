@@ -1,3 +1,7 @@
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import { describe, expect, it } from 'vitest';
 
 import type { AgentConfigFile, AgentSdkRunOptions, SupportedModality } from './index.js';
@@ -167,6 +171,34 @@ describe('orchestration sdk', () => {
     ]);
     expect(events[0]).toMatchObject({ type: 'orchestration.plan.created', sessionId: 'session-1', executionShape: 'parallel_fanout_then_synthesis' });
     expect(events.at(-1)).toMatchObject({ type: 'orchestration.session.completed', sessionId: 'session-1', status: 'succeeded', finalRunId: 'general-run-1' });
+  });
+
+  it('resolves catalog agent names from configured agent search dirs', async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), 'orchestration-catalog-'));
+    const calls: Array<{ agentId: string; goal: string; options: AgentSdkRunOptions }> = [];
+    try {
+      await mkdir(join(tempDir, 'agents'));
+      await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({ agents: { dirs: ['./agents'] } }));
+      await writeFile(join(tempDir, 'agents', 'audio-agent.json'), JSON.stringify(agent('mesh-audio-min', ['text', 'audio'], ['audio'])));
+
+      const sdk = await createOrchestrationSdk({
+        cwd: tempDir,
+        agentCatalogPaths: ['audio-agent'],
+        requestedAgentConfig: agent('general', ['text']),
+        sessionIdFactory: () => 'session-1',
+        agentRunnerFactory: async (agentId) => fakeRunner(agentId, calls),
+      });
+
+      const result = await sdk.run('transcribe this audio', {
+        contentParts: [{ type: 'audio', audio: { source: { kind: 'path', path: '/tmp/audio.mp3' }, format: 'mp3' } }],
+      });
+
+      expect(result.stages.map((stage) => stage.agentId)).toEqual(['mesh-audio-min', 'general']);
+      expect(calls[0]?.options.contentParts).toEqual([{ type: 'audio', audio: { source: { kind: 'path', path: '/tmp/audio.mp3' }, format: 'mp3' } }]);
+      await sdk.close();
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
   });
 });
 

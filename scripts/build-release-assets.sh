@@ -3,7 +3,8 @@ set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 OUT_DIR="${ADAPTIVE_AGENT_RELEASE_DIR:-$ROOT_DIR/dist/release}"
-ENTRYPOINT="$ROOT_DIR/packages/agent-sdk/src/adaptive-agent.ts"
+ADAPTIVE_AGENT_ENTRYPOINT="$ROOT_DIR/packages/agent-sdk/src/adaptive-agent.ts"
+TRACE_SESSION_ENTRYPOINT="$ROOT_DIR/packages/trace-session/src/trace-session.ts"
 BUILD_INFO="$ROOT_DIR/packages/agent-sdk/src/install/build-info.generated.ts"
 BUNDLED_ASSETS="$ROOT_DIR/packages/agent-sdk/src/install/bundled-assets.generated.ts"
 REPOSITORY="${ADAPTIVE_AGENT_REPOSITORY:-https://github.com/ugmurthy/adaptiveAgent}"
@@ -154,8 +155,9 @@ write_bundled_assets() {
 compile_target() {
   target="$1"
   bun_target="$2"
-  exe_name="$3"
-  asset_name="$4"
+  adaptive_agent_exe_name="$3"
+  trace_session_exe_name="$4"
+  asset_name="$5"
 
   work_dir="$OUT_DIR/work/$target"
   rm -rf "$work_dir"
@@ -163,21 +165,26 @@ compile_target() {
   write_build_info "$target"
 
   printf 'Building %s\n' "$target"
-  bun build "$ENTRYPOINT" \
+  bun build "$ADAPTIVE_AGENT_ENTRYPOINT" \
     --compile \
     --target="$bun_target" \
-    --outfile="$work_dir/$exe_name"
+    --outfile="$work_dir/$adaptive_agent_exe_name"
+
+  bun build "$TRACE_SESSION_ENTRYPOINT" \
+    --compile \
+    --target="$bun_target" \
+    --outfile="$work_dir/$trace_session_exe_name"
 
   if [ "${asset_name##*.}" = "zip" ]; then
     if command -v zip >/dev/null 2>&1; then
-      (cd "$work_dir" && zip -q "$OUT_DIR/$asset_name" "$exe_name")
+      (cd "$work_dir" && zip -q "$OUT_DIR/$asset_name" "$adaptive_agent_exe_name" "$trace_session_exe_name")
     elif command -v ditto >/dev/null 2>&1; then
-      ditto -c -k --sequesterRsrc --keepParent "$work_dir/$exe_name" "$OUT_DIR/$asset_name"
+      (cd "$work_dir" && ditto -c -k --sequesterRsrc . "$OUT_DIR/$asset_name")
     else
       fail 'zip or ditto is required to package Windows assets'
     fi
   else
-    tar -czf "$OUT_DIR/$asset_name" -C "$work_dir" "$exe_name"
+    tar -czf "$OUT_DIR/$asset_name" -C "$work_dir" "$adaptive_agent_exe_name" "$trace_session_exe_name"
   fi
 }
 
@@ -185,11 +192,11 @@ rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 write_bundled_assets
 
-compile_target darwin-arm64 bun-darwin-arm64 adaptive-agent "adaptive-agent-$TAG-darwin-arm64.tar.gz"
-compile_target darwin-x64 bun-darwin-x64 adaptive-agent "adaptive-agent-$TAG-darwin-x64.tar.gz"
-compile_target linux-arm64 bun-linux-arm64 adaptive-agent "adaptive-agent-$TAG-linux-arm64.tar.gz"
-compile_target linux-x64 bun-linux-x64 adaptive-agent "adaptive-agent-$TAG-linux-x64.tar.gz"
-compile_target windows-x64 bun-windows-x64 adaptive-agent.exe "adaptive-agent-$TAG-windows-x64.zip"
+compile_target darwin-arm64 bun-darwin-arm64 adaptive-agent trace-session "adaptive-agent-$TAG-darwin-arm64.tar.gz"
+compile_target darwin-x64 bun-darwin-x64 adaptive-agent trace-session "adaptive-agent-$TAG-darwin-x64.tar.gz"
+compile_target linux-arm64 bun-linux-arm64 adaptive-agent trace-session "adaptive-agent-$TAG-linux-arm64.tar.gz"
+compile_target linux-x64 bun-linux-x64 adaptive-agent trace-session "adaptive-agent-$TAG-linux-x64.tar.gz"
+compile_target windows-x64 bun-windows-x64 adaptive-agent.exe trace-session.exe "adaptive-agent-$TAG-windows-x64.zip"
 
 cp "$ROOT_DIR/scripts/install.sh" "$OUT_DIR/install.sh"
 cp "$ROOT_DIR/scripts/install.ps1" "$OUT_DIR/install.ps1"

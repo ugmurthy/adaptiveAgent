@@ -1779,6 +1779,184 @@ describe('MeshAdapter', () => {
     });
   });
 
+  it('estimates Mesh usage cost from cached model pricing when provider cost is absent', async () => {
+    const adapter = new MeshAdapter({ model: 'auto', apiKey: 'mesh-pricing-key-1' });
+    mockFetchSseResponse([
+      meshDelta({ content: 'priced' }, { model: 'openai/gpt-4o-mini' }),
+      meshDelta(
+        {},
+        {
+          finishReason: 'stop',
+          model: 'openai/gpt-4o-mini',
+          usage: { prompt_tokens: 1000, completion_tokens: 500, total_tokens: 1500 },
+        },
+      ),
+    ]);
+    mockFetchResponse([
+      {
+        id: 'openai/gpt-4o-mini',
+        name: 'GPT-4o mini',
+        context_length: 128000,
+        is_free: false,
+        pricing: {
+          prompt_usd_per_1k: '0.001',
+          completion_usd_per_1k: '0.002',
+        },
+      },
+    ]);
+
+    const result = await adapter.generate(simpleRequest());
+
+    expect(result.usage).toMatchObject({
+      promptTokens: 1000,
+      completionTokens: 500,
+      totalTokens: 1500,
+      estimatedCostUSD: 0.002,
+      provider: 'mesh',
+      model: 'openai/gpt-4o-mini',
+    });
+    expect(fetchSpy.mock.calls[1][0]).toBe('https://api.meshapi.ai/v1/models');
+  });
+
+  it('uses discounted Mesh pricing and caches model rates across adapter instances', async () => {
+    const firstAdapter = new MeshAdapter({ model: 'openai/gpt-4o-mini', apiKey: 'mesh-pricing-key-2' });
+    const secondAdapter = new MeshAdapter({ model: 'openai/gpt-4o-mini', apiKey: 'mesh-pricing-key-2' });
+    mockFetchSseResponse([
+      meshDelta({ content: 'first' }, { model: 'openai/gpt-4o-mini' }),
+      meshDelta(
+        {},
+        {
+          finishReason: 'stop',
+          model: 'openai/gpt-4o-mini',
+          usage: { prompt_tokens: 1000, completion_tokens: 1000, total_tokens: 2000 },
+        },
+      ),
+    ]);
+    mockFetchResponse([
+      {
+        id: 'openai/gpt-4o-mini',
+        name: 'GPT-4o mini',
+        context_length: 128000,
+        is_free: false,
+        pricing: {
+          prompt_usd_per_1k: '0.010',
+          completion_usd_per_1k: '0.020',
+          prompt_usd_per_1k_discounted: '0.001',
+          completion_usd_per_1k_discounted: '0.002',
+        },
+      },
+    ]);
+    mockFetchSseResponse([
+      meshDelta({ content: 'second' }, { model: 'openai/gpt-4o-mini' }),
+      meshDelta(
+        {},
+        {
+          finishReason: 'stop',
+          model: 'openai/gpt-4o-mini',
+          usage: { prompt_tokens: 2000, completion_tokens: 500, total_tokens: 2500 },
+        },
+      ),
+    ]);
+
+    const first = await firstAdapter.generate(simpleRequest());
+    const second = await secondAdapter.generate(simpleRequest());
+
+    expect(first.usage?.estimatedCostUSD).toBeCloseTo(0.003);
+    expect(second.usage?.estimatedCostUSD).toBeCloseTo(0.003);
+    expect(fetchSpy.mock.calls.filter((call) => call[0] === 'https://api.meshapi.ai/v1/models')).toHaveLength(1);
+  });
+
+  it('falls back to configured Mesh model id when the streamed model id is shortened', async () => {
+    const adapter = new MeshAdapter({ model: 'qwen/qwen3.5-27b', apiKey: 'mesh-pricing-key-4' });
+    mockFetchSseResponse([
+      meshDelta({ content: 'priced' }, { model: 'qwen3.5-27b' }),
+      meshDelta(
+        {},
+        {
+          finishReason: 'stop',
+          model: 'qwen3.5-27b',
+          usage: { prompt_tokens: 1000, completion_tokens: 500, total_tokens: 1500 },
+        },
+      ),
+    ]);
+    mockFetchResponse([
+      {
+        id: 'qwen/qwen3.5-27b',
+        name: 'Qwen 3.5 27B',
+        context_length: 128000,
+        is_free: false,
+        pricing: {
+          prompt_usd_per_1k: '0.003',
+          completion_usd_per_1k: '0.006',
+        },
+      },
+    ]);
+
+    const result = await adapter.generate(simpleRequest());
+
+    expect(result.usage).toMatchObject({
+      promptTokens: 1000,
+      completionTokens: 500,
+      totalTokens: 1500,
+      estimatedCostUSD: 0.006,
+      provider: 'mesh',
+      model: 'qwen3.5-27b',
+    });
+    expect(fetchSpy.mock.calls.filter((call) => call[0] === 'https://api.meshapi.ai/v1/models')).toHaveLength(1);
+  });
+
+  it('keeps provider-reported Mesh cost ahead of model pricing estimates', async () => {
+    const adapter = new MeshAdapter({ model: 'openai/gpt-4o-mini', apiKey: 'mesh-pricing-key-3' });
+    mockFetchSseResponse([
+      meshDelta({ content: 'provider cost' }, { model: 'openai/gpt-4o-mini' }),
+      meshDelta(
+        {},
+        {
+          finishReason: 'stop',
+          model: 'openai/gpt-4o-mini',
+          usage: { prompt_tokens: 1000, completion_tokens: 1000, total_tokens: 2000, cost: '0.123' },
+        },
+      ),
+    ]);
+
+    const result = await adapter.generate(simpleRequest());
+
+    expect(result.usage?.estimatedCostUSD).toBeCloseTo(0.123);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses Mesh model pricing when provider reports a zero cost for a paid model', async () => {
+    const adapter = new MeshAdapter({ model: 'qwen/qwen3.5-27b', apiKey: 'mesh-pricing-key-5' });
+    mockFetchSseResponse([
+      meshDelta({ content: 'zero provider cost' }, { model: 'qwen3.5-27b' }),
+      meshDelta(
+        {},
+        {
+          finishReason: 'stop',
+          model: 'qwen3.5-27b',
+          usage: { prompt_tokens: 1000, completion_tokens: 500, total_tokens: 1500, cost: '0' },
+        },
+      ),
+    ]);
+    mockFetchResponse([
+      {
+        id: 'qwen/qwen3.5-27b',
+        name: 'Qwen 3.5 27B',
+        context_length: 128000,
+        is_free: false,
+        pricing: {
+          prompt_usd_per_1k: '0.003',
+          completion_usd_per_1k: '0.006',
+        },
+      },
+    ]);
+
+    const result = await adapter.generate(simpleRequest());
+
+    expect(result.usage?.estimatedCostUSD).toBeCloseTo(0.006);
+    expect(fetchSpy.mock.calls.filter((call) => call[0] === 'https://api.meshapi.ai/v1/models')).toHaveLength(1);
+  });
+
   it('parses structured output from completed Mesh streaming text', async () => {
     const adapter = new MeshAdapter({ model: 'auto', apiKey: 'mesh-key' });
     mockFetchSseResponse([
@@ -1965,12 +2143,15 @@ function meshTextChunks(text: string): unknown[] {
   ];
 }
 
-function meshDelta(delta: Record<string, unknown>, options?: { finishReason?: string; usage?: Record<string, unknown> }): Record<string, unknown> {
+function meshDelta(
+  delta: Record<string, unknown>,
+  options?: { finishReason?: string; usage?: Record<string, unknown>; model?: string },
+): Record<string, unknown> {
   return {
     id: 'chatcmpl-mesh-stream',
     object: 'chat.completion.chunk',
     created: 1,
-    model: 'auto',
+    model: options?.model ?? 'auto',
     choices: [
       {
         index: 0,
