@@ -1095,7 +1095,7 @@ async function toOpenAIContent(content: ModelMessage['content']): Promise<string
       }
 
       const imageUrl: { url: string; detail?: 'auto' | 'low' | 'high' } = {
-        url: await localImageToDataUrl(part.image),
+        url: await imageToOpenAIUrl(part.image),
       };
       if (part.image.detail) {
         imageUrl.detail = part.image.detail;
@@ -1144,9 +1144,16 @@ function contentAsText(content: ModelMessage['content']): string {
   return textParts.join('\n');
 }
 
-async function localImageToDataUrl(image: ImageInput): Promise<string> {
-  if (!image.path.trim()) {
-    throw new Error('Image input requires a non-empty path');
+async function imageToOpenAIUrl(image: ImageInput): Promise<string> {
+  if (image.url !== undefined) {
+    if (!image.url.trim()) {
+      throw new Error('Image input requires a non-empty url');
+    }
+    return image.url;
+  }
+
+  if (!image.path?.trim()) {
+    throw new Error('Image input requires a non-empty path or url');
   }
 
   const mimeType = normalizeImageMimeType(image.mimeType ?? inferImageMimeType(image.path));

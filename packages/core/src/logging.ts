@@ -219,6 +219,7 @@ function summarizeModelContentPartForLog(part: ModelContentPart) {
     type: part.type,
     image: {
       path: part.image.path,
+      url: part.image.url,
       mimeType: part.image.mimeType,
       detail: part.image.detail,
       name: part.image.name,

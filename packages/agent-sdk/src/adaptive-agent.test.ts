@@ -75,6 +75,23 @@ describe('adaptive-agent spec loading', () => {
     });
   });
 
+  it('accepts image URLs in run specs', async () => {
+    const specPath = join(tempDir, 'image-url-run-spec.json');
+    await writeFile(
+      specPath,
+      JSON.stringify({
+        mode: 'run',
+        goal: 'describe',
+        images: [{ url: 'https://example.test/diagram.png', detail: 'high' }],
+      }),
+    );
+
+    const spec = await loadManualTestSpec(specPath);
+    expect(spec.mode).toBe('run');
+    if (spec.mode !== 'run') throw new Error('expected run spec');
+    expect(spec.images).toEqual([{ url: 'https://example.test/diagram.png', detail: 'high' }]);
+  });
+
   it('rejects chat messages that mix array content with legacy images', async () => {
     const specPath = join(tempDir, 'invalid-chat-spec.json');
     await writeFile(
@@ -251,6 +268,21 @@ describe('adaptive-agent cli parsing', () => {
       dryRun: false,
       output: 'pretty',
       help: false,
+    });
+  });
+
+  it('preserves image URL arguments for inline runs', () => {
+    const parsed = parseCliArgs([
+      'run',
+      '--image', 'https://example.test/chart.png',
+      'answer',
+      'this',
+    ]);
+
+    expect(parsed).toMatchObject({
+      command: 'run',
+      imagePaths: ['https://example.test/chart.png'],
+      goalArgs: ['answer', 'this'],
     });
   });
 

@@ -125,7 +125,8 @@ export interface InputModalityCapability {
 export type ImageDetail = 'auto' | 'low' | 'high';
 
 export interface ImageInput {
-  path: string;
+  path?: string;
+  url?: string;
   mimeType?: string;
   detail?: ImageDetail;
   name?: string;

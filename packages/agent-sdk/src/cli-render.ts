@@ -138,7 +138,7 @@ export function summarizeCli(cli: ManualTestCliOptions): Record<string, JsonValu
     command: cli.command,
     ...(cli.specPath ? { specPath: resolve(cli.specPath) } : {}),
     ...(cli.promptFilePath ? { promptFilePath: resolve(cli.promptFilePath) } : {}),
-    ...(cli.imagePaths.length > 0 ? { imagePaths: cli.imagePaths.map((path) => resolve(path)) } : {}),
+    ...(cli.imagePaths.length > 0 ? { imagePaths: cli.imagePaths.map(resolvePathUnlessUrl) } : {}),
     ...(cli.audioPaths.length > 0 ? { audioPaths: cli.audioPaths.map((path) => resolve(path)) } : {}),
     ...(cli.fileAttachmentPaths.length > 0 ? { fileAttachmentPaths: cli.fileAttachmentPaths.map((path) => resolve(path)) } : {}),
     orchestrate: cli.orchestrate,
@@ -179,6 +179,16 @@ export function summarizeCli(cli: ManualTestCliOptions): Record<string, JsonValu
     dryRun: cli.dryRun,
     output: cli.output,
   };
+}
+
+function resolvePathUnlessUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    if (url.protocol === 'http:' || url.protocol === 'https:' || url.protocol === 'data:') return value;
+  } catch {
+    // Not a URL; resolve as a local path below.
+  }
+  return resolve(value);
 }
 
 export function summarizeResolvedConfig(

@@ -5279,8 +5279,10 @@ function isImageInput(value: unknown): value is ImageInput {
   }
 
   const candidate = value as Record<string, unknown>;
+  const hasPath = typeof candidate.path === 'string';
+  const hasUrl = typeof candidate.url === 'string';
   return (
-    typeof candidate.path === 'string' &&
+    hasPath !== hasUrl &&
     (candidate.mimeType === undefined || typeof candidate.mimeType === 'string') &&
     (candidate.detail === undefined || ['auto', 'low', 'high'].includes(String(candidate.detail))) &&
     (candidate.name === undefined || typeof candidate.name === 'string')

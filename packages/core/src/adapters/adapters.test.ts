@@ -1128,6 +1128,35 @@ describe('BaseOpenAIChatAdapter', () => {
     }
   });
 
+  it('passes image URL content parts through as OpenAI image_url URLs', async () => {
+    const adapter = createAdapter({ capabilities: { imageInput: true } });
+    mockFetchResponse(STOP_RESPONSE);
+
+    await adapter.generate({
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Read this chart.' },
+            { type: 'image', image: { url: 'https://example.test/chart.png', detail: 'high' } },
+          ],
+        },
+      ],
+    });
+
+    const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    expect(body.messages[0].content).toEqual([
+      { type: 'text', text: 'Read this chart.' },
+      {
+        type: 'image_url',
+        image_url: {
+          url: 'https://example.test/chart.png',
+          detail: 'high',
+        },
+      },
+    ]);
+  });
+
   it('rejects image input when the adapter does not declare image support', async () => {
     const adapter = createAdapter();
 

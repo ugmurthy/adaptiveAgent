@@ -192,11 +192,12 @@ Examples:
   adaptive-agent run "Summarize this repository"
   adaptive-agent run --file ./prompt.md
   adaptive-agent run --image ./diagram.png "Answer using this image"
+  adaptive-agent run --image https://example.test/diagram.png "Answer using this image"
 
 Run options:
   --file <path>           Read run prompt from a file.
   --input-json <json>     JSON input passed to run requests.
-  --image <path>          Add an image attachment to a run request. Repeatable.
+  --image <path-or-url>   Add an image attachment to a run request. Repeatable.
   --audio <path>          Add an audio attachment to a run request. Repeatable.
   --file-attachment <path>
                           Add a file attachment to a run request. Repeatable.
@@ -253,7 +254,7 @@ Required:
 Swarm-run options:
   --file <path>           Read swarm task from a file.
   --input-json <json>     JSON input passed to swarm runs.
-  --image <path>          Add an image attachment to the coordinator request. Repeatable.
+  --image <path-or-url>   Add an image attachment to the coordinator request. Repeatable.
   --audio <path>          Add an audio attachment to the coordinator request. Repeatable.
   --file-attachment <path>
                           Add a file attachment to the coordinator request. Repeatable.
@@ -502,20 +503,20 @@ const PROVIDER_INPUT_CAPABILITIES: Record<
   Partial<Record<'image' | 'file' | 'audio', Array<'path' | 'url' | 'data' | 'file_id'>>>
 > = {
   openrouter: {
-    image: ['path'],
+    image: ['path', 'url'],
     file: ['path', 'url', 'file_id'],
     audio: ['path', 'data'],
   },
   ollama: {
-    image: ['path'],
+    image: ['path', 'url'],
   },
   mistral: {
-    image: ['path'],
+    image: ['path', 'url'],
     file: ['path', 'url', 'file_id'],
     audio: ['path', 'data'],
   },
   mesh: {
-    image: ['path'],
+    image: ['path', 'url'],
     audio: ['path', 'data'],
   },
 };
@@ -767,9 +768,9 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
         mode: 'run',
         goal,
         ...(cli.inputJson === undefined ? {} : { input: cli.inputJson }),
-        ...(cli.imagePaths.length > 0 ? { images: cli.imagePaths.map((path) => ({ path: resolveAssetPath(path, resolvedCwd) })) } : {}),
+        ...(cli.imagePaths.length > 0 ? { images: cli.imagePaths.map((value) => buildInlineImageInput(value, resolvedCwd)) } : {}),
         ...(cli.audioPaths.length > 0 || cli.fileAttachmentPaths.length > 0
-          ? { contentParts: buildInlineContentParts(cli, resolvedCwd) }
+          ? { contentParts: buildInlineContentParts(cli, resolvedCwd, { includeImages: false }) }
           : {}),
       }
     : { mode: 'chat', messages: [{ role: 'user', content: goal }] };
@@ -1054,7 +1055,7 @@ async function runSwarmCommand(cli: ManualTestCliOptions): Promise<number> {
 
   try {
     const sessionId = cli.sessionId ?? crypto.randomUUID();
-    const contentParts = buildInlineContentParts(cli, resolvedCwd);
+    const contentParts = buildInlineContentParts(cli, resolvedCwd, { includeImages: true });
     const decompositionResult = await runSwarmDecomposition({
       coordinatorSdk,
       sessionId,
@@ -1778,7 +1779,7 @@ export function collectProviderWarnings(spec: ManualTestSpec, provider: 'openrou
     }
 
     const sourceKind = part.type === 'image'
-      ? 'path'
+      ? part.image.url ? 'url' : 'path'
       : part.type === 'file'
         ? part.file.source.kind
         : part.audio.source.kind;
@@ -1827,8 +1828,12 @@ function buildRunOptions(spec: ManualRunSpec): AgentSdkRunOptions {
   };
 }
 
-function buildInlineContentParts(cli: ManualTestCliOptions, cwd: string): ModelContentPart[] {
+function buildInlineContentParts(cli: ManualTestCliOptions, cwd: string, options: { includeImages: boolean }): ModelContentPart[] {
   return [
+    ...(options.includeImages ? cli.imagePaths.map((value) => ({
+      type: 'image' as const,
+      image: buildInlineImageInput(value, cwd),
+    })) : []),
     ...cli.fileAttachmentPaths.map((path) => ({
       type: 'file' as const,
       file: { source: { kind: 'path' as const, path: resolveAssetPath(path, cwd) } },
@@ -1838,6 +1843,21 @@ function buildInlineContentParts(cli: ManualTestCliOptions, cwd: string): ModelC
       audio: { source: { kind: 'path' as const, path: resolveAssetPath(path, cwd) }, format: inferAudioFormat(path) },
     })),
   ];
+}
+
+function buildInlineImageInput(value: string, cwd: string): ImageInput {
+  return isUrlInput(value)
+    ? { url: value }
+    : { path: resolveAssetPath(value, cwd) };
+}
+
+function isUrlInput(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:' || url.protocol === 'data:';
+  } catch {
+    return false;
+  }
 }
 
 function inferAudioFormat(path: string): Extract<ModelContentPart, { type: 'audio' }>['audio']['format'] {
@@ -1973,9 +1993,15 @@ function parseOptionalImageArray(value: unknown, baseDir: string, label: string)
 
 function parseImageInput(value: unknown, baseDir: string, label: string): ImageInput {
   const raw = ensureObject(value, label);
-  const path = resolveAssetPath(requireString(raw.path, `${label}.path`), baseDir);
+  const hasPath = raw.path !== undefined;
+  const hasUrl = raw.url !== undefined;
+  if (hasPath === hasUrl) {
+    throw new Error(`${label} must include exactly one of path or url`);
+  }
   return {
-    path,
+    ...(hasPath
+      ? { path: resolveAssetPath(requireString(raw.path, `${label}.path`), baseDir) }
+      : { url: requireString(raw.url, `${label}.url`) }),
     ...(raw.mimeType === undefined ? {} : { mimeType: requireString(raw.mimeType, `${label}.mimeType`) }),
     ...(raw.detail === undefined ? {} : { detail: parseEnumField(raw.detail, `${label}.detail`, ['auto', 'low', 'high']) }),
     ...(raw.name === undefined ? {} : { name: requireString(raw.name, `${label}.name`) }),
@@ -2269,7 +2295,7 @@ function summarizeBenchmarkCaseAttachment(
     return {
       type: 'image',
       ...(image.name ? { fileName: image.name } : {}),
-      path: image.path,
+      path: pathFromImageInput(image),
     };
   }
 
@@ -2278,7 +2304,7 @@ function summarizeBenchmarkCaseAttachment(
       return {
         type: 'image',
         ...(part.image.name ? { fileName: part.image.name } : {}),
-        path: part.image.path,
+        path: pathFromImageInput(part.image),
       };
     }
     if (part.type === 'audio') {
@@ -2332,6 +2358,18 @@ function pathFromFileInputSource(source: Extract<ModelContentPart, { type: 'file
       return new URL(source.url).pathname;
     } catch {
       return source.url;
+    }
+  }
+  return undefined;
+}
+
+function pathFromImageInput(image: ImageInput): string | undefined {
+  if (image.path) return image.path;
+  if (image.url) {
+    try {
+      return new URL(image.url).pathname;
+    } catch {
+      return image.url;
     }
   }
   return undefined;
@@ -2760,7 +2798,7 @@ function summarizeEvalResolvedConfig(
 
 async function validateLocalPaths(spec: ManualTestSpec): Promise<void> {
   const checks = collectContentParts(spec).flatMap((part) => {
-    if (part.type === 'image') return [{ path: part.image.path, label: `image ${part.image.name ?? part.image.path}` }];
+    if (part.type === 'image' && part.image.path) return [{ path: part.image.path, label: `image ${part.image.name ?? part.image.path}` }];
     if (part.type === 'file' && part.file.source.kind === 'path') return [{ path: part.file.source.path, label: `file ${part.file.name ?? part.file.source.path}` }];
     if (part.type === 'audio' && part.audio.source.kind === 'path') return [{ path: part.audio.source.path, label: `audio ${part.audio.name ?? part.audio.source.path}` }];
     return [];
