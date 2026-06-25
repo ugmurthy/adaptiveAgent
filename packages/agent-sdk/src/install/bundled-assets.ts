@@ -111,6 +111,8 @@ triggers: [research, sources, web, evidence]
 # Research
 
 Gather only information needed for the assigned sub-objective. Prefer authoritative sources, preserve important URLs or file paths, distinguish evidence from inference, and summarize uncertainty or missing data explicitly.
+
+When using web tools, use web_search to find relevant pages, then choose at least one promising result and call read_web_page before issuing another broad web_search, unless the search returned no usable results. Do not synthesize final claims from search snippets alone for named alternatives; prefer page-level evidence from official documentation or a page read with read_web_page. If near the research budget, prefer reading an already discovered high-value URL over starting another search.
 `,
       },
     },

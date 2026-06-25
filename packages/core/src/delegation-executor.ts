@@ -1289,7 +1289,11 @@ function isJsonObject(value: unknown): value is JsonObject {
 
 export function validateDelegateToolInput(input: JsonValue, toolName = 'delegate.*'): string | undefined {
   if (typeof input === 'string') {
-    return undefined;
+    const parsedInput = parseDelegateToolInputString(input);
+    if (!parsedInput) {
+      return undefined;
+    }
+    input = parsedInput;
   }
 
   if (!isJsonObject(input)) {
@@ -1374,16 +1378,17 @@ function runLineagePayload(
 }
 
 function toDelegateToolInput(input: JsonValue): DelegateToolInput {
-  const validationError = validateDelegateToolInput(input);
+  const normalizedInput = typeof input === 'string' ? parseDelegateToolInputString(input) ?? input : input;
+  const validationError = validateDelegateToolInput(normalizedInput);
   if (validationError) {
     throw new DelegationError(validationError);
   }
 
-  if (typeof input === 'string') {
-    return { goal: input };
+  if (typeof normalizedInput === 'string') {
+    return { goal: normalizedInput };
   }
 
-  const objectInput = input as JsonObject & { goal: string };
+  const objectInput = normalizedInput as JsonObject & { goal: string };
   return {
     goal: objectInput.goal,
     ...(objectInput.input === undefined ? {} : { input: objectInput.input }),
@@ -1391,6 +1396,15 @@ function toDelegateToolInput(input: JsonValue): DelegateToolInput {
     ...(objectInput.outputSchema === undefined ? {} : { outputSchema: objectInput.outputSchema as unknown as JsonSchema }),
     ...(objectInput.metadata === undefined ? {} : { metadata: objectInput.metadata as Record<string, JsonValue> }),
   };
+}
+
+function parseDelegateToolInputString(input: string): JsonObject | undefined {
+  try {
+    const parsed = JSON.parse(input) as unknown;
+    return isJsonObject(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function describeJsonType(value: unknown): string {

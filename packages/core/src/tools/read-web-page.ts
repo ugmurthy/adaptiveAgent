@@ -38,10 +38,18 @@ type ReadWebPageOutput = {
   };
 };
 
+type ReadResponseBodyResult = {
+  rawBuffer: ArrayBuffer;
+  truncated: boolean;
+};
+
 const DEFAULT_MAX_SIZE = 524_288; // 512 KiB
 const DEFAULT_MAX_TEXT_LENGTH = 50_000;
 const DEFAULT_WEB_TOOL_TIMEOUT_MS = 90_000;
 const DEFAULT_MODEL_RESULT_MAX_BYTES = 32 * 1024;
+const PARTIAL_CONTENT_USEFUL_MIN_CHARS = 500;
+const PARTIAL_CONTENT_USEFUL_MIN_WORDS = 80;
+const PARTIAL_CONTENT_USEFUL_MIN_ALPHA_RATIO = 0.45;
 
 class RecoverableReadWebPageError extends Error {
   constructor(readonly output: ReadWebPageOutput) {
@@ -127,8 +135,9 @@ export function createReadWebPageTool(config?: ReadWebPageToolConfig): ToolDefin
           });
         }
 
+        const partialContentSupported = isPartiallyReadableContentType(contentType);
         const contentLength = parseContentLength(response.headers.get('content-length'));
-        if (contentLength !== undefined && contentLength > maxSizeBytes) {
+        if (contentLength !== undefined && contentLength > maxSizeBytes && !partialContentSupported) {
           throw createRecoverableReadWebPageError({
             url,
             kind: 'content_error',
@@ -136,28 +145,26 @@ export function createReadWebPageTool(config?: ReadWebPageToolConfig): ToolDefin
           });
         }
 
-        const rawBuffer = await readResponseBodyWithinLimit(response, maxSizeBytes, url, context.signal);
-        const { title, text } = await extractReadableText(rawBuffer, contentType, extractPdfText);
-        const relevantExcerpts = objective ? extractRelevantExcerpts(text, objective) : undefined;
-        let normalizedText = text;
-        const effectiveMaxTextLength = perCallMaxTextLength ?? maxTextLength;
-        const wasTruncated = normalizedText.length > effectiveMaxTextLength;
+        const body = await readResponseBodyWithinLimit(response, maxSizeBytes, url, partialContentSupported, context.signal);
+        const extracted = await extractReadableText(body.rawBuffer, contentType, extractPdfText);
+        const output = buildReadWebPageOutput({
+          url,
+          objective,
+          extracted,
+          bytesFetched: body.rawBuffer.byteLength,
+          maxTextLength: perCallMaxTextLength ?? maxTextLength,
+          bodyTruncated: body.truncated || (contentLength !== undefined && contentLength > maxSizeBytes),
+          maxSizeBytes,
+        });
 
-        if (wasTruncated) {
-          normalizedText = `${normalizedText.slice(0, effectiveMaxTextLength)}\n[truncated]`;
+        if (body.truncated && !isUsefulPartialText(extracted.text)) {
+          throw createRecoverableReadWebPageError({
+            url,
+            kind: 'content_error',
+            message: `Response from ${url} exceeds maximum size of ${maxSizeBytes} bytes and no useful partial text could be extracted`,
+          });
         }
 
-        const output = {
-          url,
-          title,
-          text: normalizedText,
-          ...(relevantExcerpts === undefined ? {} : { relevantExcerpts }),
-          bytesFetched: rawBuffer.byteLength,
-          textLength: text.length,
-          maxTextLength: effectiveMaxTextLength,
-          truncated: wasTruncated,
-          ...(wasTruncated ? { next: { url, maxTextLength: Math.min(text.length, effectiveMaxTextLength * 2) } } : {}),
-        } satisfies ReadWebPageOutput;
         cache.set(cacheKey, output);
         return output;
       } catch (error) {
@@ -238,6 +245,57 @@ function isSupportedContentType(contentType: string): boolean {
   );
 }
 
+function isPartiallyReadableContentType(contentType: string): boolean {
+  return (
+    contentType.includes('text/') ||
+    contentType.includes('html') ||
+    contentType.includes('xml')
+  );
+}
+
+function buildReadWebPageOutput({
+  url,
+  objective,
+  extracted,
+  bytesFetched,
+  maxTextLength,
+  bodyTruncated,
+  maxSizeBytes,
+}: {
+  url: string;
+  objective?: string;
+  extracted: { title: string; text: string };
+  bytesFetched: number;
+  maxTextLength: number;
+  bodyTruncated: boolean;
+  maxSizeBytes: number;
+}): ReadWebPageOutput {
+  const relevantExcerpts = objective ? extractRelevantExcerpts(extracted.text, objective) : undefined;
+  const textTruncated = extracted.text.length > maxTextLength;
+  const truncated = bodyTruncated || textTruncated;
+  const text = textTruncated ? `${extracted.text.slice(0, maxTextLength)}\n[truncated]` : extracted.text;
+
+  return {
+    url,
+    title: extracted.title,
+    text,
+    ...(relevantExcerpts === undefined ? {} : { relevantExcerpts }),
+    bytesFetched,
+    textLength: extracted.text.length,
+    maxTextLength,
+    truncated,
+    ...(textTruncated ? { next: { url, maxTextLength: Math.min(extracted.text.length, maxTextLength * 2) } } : {}),
+    ...(bodyTruncated
+      ? {
+          error: {
+            kind: 'content_error',
+            message: `Response from ${url} exceeds maximum size of ${maxSizeBytes} bytes; returned partial content`,
+          },
+        }
+      : {}),
+  };
+}
+
 async function extractReadableText(
   rawBuffer: ArrayBuffer,
   contentType: string,
@@ -267,25 +325,31 @@ async function readResponseBodyWithinLimit(
   response: Response,
   maxSizeBytes: number,
   url: string,
+  allowPartial: boolean,
   signal?: AbortSignal,
-): Promise<ArrayBuffer> {
+): Promise<ReadResponseBodyResult> {
   signal?.throwIfAborted();
   if (!response.body) {
     const rawBuffer = await response.arrayBuffer();
     if (rawBuffer.byteLength > maxSizeBytes) {
-      throw createRecoverableReadWebPageError({
-        url,
-        kind: 'content_error',
-        message: `Response from ${url} exceeds maximum size of ${maxSizeBytes} bytes`,
-      });
+      if (!allowPartial) {
+        throw createRecoverableReadWebPageError({
+          url,
+          kind: 'content_error',
+          message: `Response from ${url} exceeds maximum size of ${maxSizeBytes} bytes`,
+        });
+      }
+
+      return { rawBuffer: rawBuffer.slice(0, maxSizeBytes), truncated: true };
     }
 
-    return rawBuffer;
+    return { rawBuffer, truncated: false };
   }
 
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let totalBytes = 0;
+  let truncated = false;
 
   while (true) {
     signal?.throwIfAborted();
@@ -298,16 +362,28 @@ async function readResponseBodyWithinLimit(
       continue;
     }
 
-    totalBytes += value.byteLength;
-    if (totalBytes > maxSizeBytes) {
+    const nextTotalBytes = totalBytes + value.byteLength;
+    if (nextTotalBytes > maxSizeBytes) {
       await reader.cancel();
-      throw createRecoverableReadWebPageError({
-        url,
-        kind: 'content_error',
-        message: `Response from ${url} exceeds maximum size of ${maxSizeBytes} bytes`,
-      });
+      if (!allowPartial) {
+        throw createRecoverableReadWebPageError({
+          url,
+          kind: 'content_error',
+          message: `Response from ${url} exceeds maximum size of ${maxSizeBytes} bytes`,
+        });
+      }
+
+      const remainingBytes = maxSizeBytes - totalBytes;
+      if (remainingBytes > 0) {
+        chunks.push(value.subarray(0, remainingBytes));
+        totalBytes += remainingBytes;
+      }
+
+      truncated = true;
+      break;
     }
 
+    totalBytes = nextTotalBytes;
     chunks.push(value);
   }
 
@@ -318,7 +394,22 @@ async function readResponseBodyWithinLimit(
     offset += chunk.byteLength;
   }
 
-  return merged.buffer;
+  return { rawBuffer: merged.buffer, truncated };
+}
+
+function isUsefulPartialText(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed.length < PARTIAL_CONTENT_USEFUL_MIN_CHARS) {
+    return false;
+  }
+
+  const words = trimmed.match(/[A-Za-z0-9]+/g) ?? [];
+  if (words.length < PARTIAL_CONTENT_USEFUL_MIN_WORDS) {
+    return false;
+  }
+
+  const alphaChars = trimmed.match(/[A-Za-z]/g)?.length ?? 0;
+  return alphaChars / trimmed.length >= PARTIAL_CONTENT_USEFUL_MIN_ALPHA_RATIO;
 }
 
 function truncateUtf8(text: string, maxBytes: number): { text: string; bytes: number } {

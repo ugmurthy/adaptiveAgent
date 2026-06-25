@@ -1708,15 +1708,6 @@ export class AdaptiveAgent {
           );
         }
 
-        if (!isJsonObject(structuredOutput)) {
-          return this.failRun(
-            currentRun,
-            state,
-            'Model response did not satisfy outputSchema: structured output must be a JSON object',
-            'MODEL_ERROR',
-          );
-        }
-
         output = structuredOutput;
       } else {
         output = response.structuredOutput ?? response.text ?? null;
@@ -1822,6 +1813,11 @@ export class AdaptiveAgent {
         });
       }
 
+      const budgetGroup = this.resolveBudgetGroup(tool);
+      if (this.isToolBudgetGroupExhausted(state, budgetGroup)) {
+        return { retryable: true, failureKind };
+      }
+
       if (state.visibleToolNames && !state.visibleToolNames.includes(tool.name)) {
         return this.checkInvalidToolCallRepairRetryability(run, state, pendingToolCall, failureKind, {
           pendingToolCall,
@@ -1831,6 +1827,7 @@ export class AdaptiveAgent {
         });
       }
 
+      pendingToolCall.input = normalizeModelToolInputForSchema(pendingToolCall.input, tool.inputSchema);
       const inputError = validateNonDelegateToolInput(pendingToolCall.input, tool);
       if (inputError) {
         return this.checkInvalidToolCallRepairRetryability(run, state, pendingToolCall, failureKind, {
@@ -2019,6 +2016,11 @@ export class AdaptiveAgent {
         };
       }
 
+      const budgetGroup = this.resolveBudgetGroup(resolvedTool);
+      if (this.isToolBudgetGroupExhausted(state, budgetGroup)) {
+        continue;
+      }
+
       if (state.visibleToolNames && !state.visibleToolNames.includes(resolvedTool.name)) {
         return {
           pendingToolCall,
@@ -2040,6 +2042,7 @@ export class AdaptiveAgent {
           };
         }
       } else {
+        pendingToolCall.input = normalizeModelToolInputForSchema(pendingToolCall.input, resolvedTool.inputSchema);
         const inputError = validateNonDelegateToolInput(pendingToolCall.input, resolvedTool);
         if (inputError) {
           return {
@@ -2236,10 +2239,21 @@ export class AdaptiveAgent {
     if (!tool) {
       throw new Error(`Unknown tool ${pendingToolCall.name}`);
     }
+
+    const toolTimeoutMs = tool.timeoutMs ?? this.defaults.toolTimeoutMs;
+    const toolContext = this.createToolContext(run, pendingToolCall.stepId, pendingToolCall.id, toolTimeoutMs);
+    const budgetGroup = this.resolveBudgetGroup(tool);
+    const budget = budgetGroup ? this.resolvedToolBudgets?.[budgetGroup] : undefined;
+
+    if (this.isToolBudgetGroupExhausted(state, budgetGroup)) {
+      return this.completeSkippedBudgetToolCall(run, state, pendingToolCall, tool, toolContext, toolTimeoutMs, budgetGroup, budget);
+    }
+
     if (state.visibleToolNames && !state.visibleToolNames.includes(tool.name)) {
       throw new Error(`Tool ${tool.name} is not visible for this run`);
     }
 
+    pendingToolCall.input = normalizeModelToolInputForSchema(pendingToolCall.input, tool.inputSchema);
     const inputError = validateNonDelegateToolInput(pendingToolCall.input, tool);
     if (inputError) {
       throw new Error(inputError);
@@ -2272,10 +2286,6 @@ export class AdaptiveAgent {
 
     state.approvedToolCallIds = removeApprovedToolCallId(state.approvedToolCallIds, pendingToolCall.id);
 
-    const toolTimeoutMs = tool.timeoutMs ?? this.defaults.toolTimeoutMs;
-    const toolContext = this.createToolContext(run, pendingToolCall.stepId, pendingToolCall.id, toolTimeoutMs);
-    const budgetGroup = this.resolveBudgetGroup(tool);
-    const budget = budgetGroup ? this.resolvedToolBudgets?.[budgetGroup] : undefined;
     const existingExecution = await this.options.toolExecutionStore?.getByIdempotencyKey(toolContext.idempotencyKey);
     if (existingExecution?.status === 'completed') {
       const output = existingExecution.output ?? null;
@@ -2310,64 +2320,7 @@ export class AdaptiveAgent {
         }
       : this.admitBudgetedToolCall(run, state, tool, pendingToolCall.input, budgetGroup, budget);
     if (!budgetAdmission.admitted) {
-      this.markToolBudgetExhausted(state, budgetGroup);
-      await this.options.toolExecutionStore?.markStarted({
-        runId: run.id,
-        stepId: pendingToolCall.stepId,
-        toolCallId: pendingToolCall.id,
-        toolName: tool.name,
-        idempotencyKey: toolContext.idempotencyKey,
-        inputHash: stableJsonFingerprint(pendingToolCall.input),
-        input: pendingToolCall.input,
-      });
-
-      const eventInput = captureToolInputForLog(tool, pendingToolCall.input, this.defaultCaptureMode);
-      const budgetOutput = budgetAdmission.output;
-      const modelOutput = this.formatToolOutputForModel(run, pendingToolCall, tool, budgetOutput);
-      const performance = toolCompletionPerformanceMetrics({
-        input: pendingToolCall.input,
-        eventInput,
-        output: budgetOutput,
-        eventOutput: budgetOutput,
-        modelOutput,
-        durationMs: 0,
-        timeoutMs: toolTimeoutMs,
-        skipped: true,
-      });
-
-      this.logLifecycle('warn', 'tool.budget_exhausted', {
-        ...runLogBindings(run),
-        stepId: pendingToolCall.stepId,
-        toolName: tool.name,
-        budgetGroup,
-        output: captureValueForLog(budgetOutput, { mode: 'summary' }),
-        performance,
-      });
-
-      return {
-        output: budgetOutput,
-        modelOutput,
-        completion: {
-          idempotencyKey: toolContext.idempotencyKey,
-          output: budgetOutput,
-          event: {
-            runId: run.id,
-            stepId: pendingToolCall.stepId,
-            toolCallId: pendingToolCall.id,
-            type: 'tool.completed',
-            schemaVersion: 1,
-            payload: {
-              toolName: tool.name,
-              ...(pendingToolCall.assistantContent === undefined ? {} : { assistantContent: pendingToolCall.assistantContent }),
-              ...(eventInput === undefined ? {} : { input: eventInput }),
-              output: budgetOutput,
-              ...(budgetGroup === undefined ? {} : { budgetGroup }),
-              skipped: true,
-              performance,
-            },
-          },
-        },
-      };
+      return this.completeSkippedBudgetToolCall(run, state, pendingToolCall, tool, toolContext, toolTimeoutMs, budgetGroup, budget, budgetAdmission.output);
     }
 
     await this.options.toolExecutionStore?.markStarted({
@@ -2567,6 +2520,77 @@ export class AdaptiveAgent {
 
       throw new ToolExecutionError(error instanceof Error ? error.message : String(error));
     }
+  }
+
+  private async completeSkippedBudgetToolCall(
+    run: AgentRun,
+    state: ExecutionState,
+    pendingToolCall: PendingToolCallState,
+    tool: ToolDefinition,
+    toolContext: ToolContext,
+    toolTimeoutMs: number,
+    budgetGroup: string | undefined,
+    budget: ToolBudget | undefined,
+    output?: JsonObject,
+  ): Promise<PendingToolCallExecutionResult> {
+    this.markToolBudgetExhausted(state, budgetGroup);
+    await this.options.toolExecutionStore?.markStarted({
+      runId: run.id,
+      stepId: pendingToolCall.stepId,
+      toolCallId: pendingToolCall.id,
+      toolName: tool.name,
+      idempotencyKey: toolContext.idempotencyKey,
+      inputHash: stableJsonFingerprint(pendingToolCall.input),
+      input: pendingToolCall.input,
+    });
+
+    const eventInput = captureToolInputForLog(tool, pendingToolCall.input, this.defaultCaptureMode);
+    const budgetOutput = output ?? createBudgetExhaustedToolOutput(tool.name, budgetGroup!, budget?.onExhausted);
+    const modelOutput = this.formatToolOutputForModel(run, pendingToolCall, tool, budgetOutput);
+    const performance = toolCompletionPerformanceMetrics({
+      input: pendingToolCall.input,
+      eventInput,
+      output: budgetOutput,
+      eventOutput: budgetOutput,
+      modelOutput,
+      durationMs: 0,
+      timeoutMs: toolTimeoutMs,
+      skipped: true,
+    });
+
+    this.logLifecycle('warn', 'tool.budget_exhausted', {
+      ...runLogBindings(run),
+      stepId: pendingToolCall.stepId,
+      toolName: tool.name,
+      budgetGroup,
+      output: captureValueForLog(budgetOutput, { mode: 'summary' }),
+      performance,
+    });
+
+    return {
+      output: budgetOutput,
+      modelOutput,
+      completion: {
+        idempotencyKey: toolContext.idempotencyKey,
+        output: budgetOutput,
+        event: {
+          runId: run.id,
+          stepId: pendingToolCall.stepId,
+          toolCallId: pendingToolCall.id,
+          type: 'tool.completed',
+          schemaVersion: 1,
+          payload: {
+            toolName: tool.name,
+            ...(pendingToolCall.assistantContent === undefined ? {} : { assistantContent: pendingToolCall.assistantContent }),
+            ...(eventInput === undefined ? {} : { input: eventInput }),
+            output: budgetOutput,
+            ...(budgetGroup === undefined ? {} : { budgetGroup }),
+            skipped: true,
+            performance,
+          },
+        },
+      },
+    };
   }
 
   private async executeChildRun(request: ExecuteChildRunRequest): Promise<RunResult> {
@@ -3113,7 +3137,7 @@ export class AdaptiveAgent {
         run,
         state,
         'tool_budget.checkpoint',
-        'You are near the web research budget. Use current evidence if it is sufficient. Only call another web research tool if you can name the specific missing fact needed for the user\'s goal. If evidence is incomplete, say what is uncertain instead of continuing to search broadly.',
+        'You are near the web search budget. Stop broad searching unless a specific fact is missing. Prefer reading already discovered high-value URLs with `read_web_page` before final synthesis. If current page-level evidence is sufficient, answer now; otherwise read one targeted page.',
       );
     }
 
@@ -4760,7 +4784,7 @@ function normalizeToolResultMessagesForModel(messages: ModelMessage[]): ModelMes
   return changed ? normalized : [...messages];
 }
 
-function readStructuredOutputCandidate(response: Pick<ModelResponse, 'structuredOutput' | 'text'>): JsonValue | undefined {
+function readStructuredOutputCandidate(response: Pick<ModelResponse, 'structuredOutput' | 'text'>): JsonObject | undefined {
   if (response.structuredOutput === undefined) {
     return parseStructuredOutputText(response.text);
   }
@@ -4769,14 +4793,14 @@ function readStructuredOutputCandidate(response: Pick<ModelResponse, 'structured
     return parseStructuredOutputText(response.structuredOutput) ?? parseStructuredOutputText(response.text);
   }
 
-  return response.structuredOutput;
+  return normalizeStructuredOutputCandidate(response.structuredOutput);
 }
 
 function readStructuredOutputRepairText(response: Pick<ModelResponse, 'structuredOutput' | 'text'>): string | undefined {
   return response.text ?? (typeof response.structuredOutput === 'string' ? response.structuredOutput : undefined);
 }
 
-function parseStructuredOutputText(text: string | undefined): JsonValue | undefined {
+function parseStructuredOutputText(text: string | undefined): JsonObject | undefined {
   const trimmed = text?.trim();
   if (!trimmed) {
     return undefined;
@@ -4787,25 +4811,25 @@ function parseStructuredOutputText(text: string | undefined): JsonValue | undefi
     return direct;
   }
 
-  return parseSingleFencedJsonObject(trimmed);
+  return parseSingleFencedJsonObject(trimmed) ?? parseSingleEmbeddedJsonObject(trimmed);
 }
 
-function parseJsonObjectText(text: string | undefined): JsonValue | undefined {
+function parseJsonObjectText(text: string | undefined): JsonObject | undefined {
   if (!text) {
     return undefined;
   }
 
   try {
     const parsed = JSON.parse(text) as unknown;
-    return isJsonObjectPayload(parsed) ? parsed : undefined;
+    return normalizeStructuredOutputCandidate(parsed);
   } catch {
     return undefined;
   }
 }
 
-function parseSingleFencedJsonObject(text: string): JsonValue | undefined {
+function parseSingleFencedJsonObject(text: string): JsonObject | undefined {
   const fencedBlockPattern = /```[ \t]*(?:json)?[ \t]*\r?\n?([\s\S]*?)```/gi;
-  let parsed: JsonValue | undefined;
+  let parsed: JsonObject | undefined;
   let match: RegExpExecArray | null;
 
   while ((match = fencedBlockPattern.exec(text)) !== null) {
@@ -4822,6 +4846,85 @@ function parseSingleFencedJsonObject(text: string): JsonValue | undefined {
   }
 
   return parsed;
+}
+
+function parseSingleEmbeddedJsonObject(text: string): JsonObject | undefined {
+  let parsed: JsonObject | undefined;
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+
+    if (start < 0) {
+      if (char === '{') {
+        start = index;
+        depth = 1;
+        inString = false;
+        escaped = false;
+      }
+      continue;
+    }
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (char === '{') {
+      depth += 1;
+      continue;
+    }
+
+    if (char !== '}') {
+      continue;
+    }
+
+    depth -= 1;
+    if (depth > 0) {
+      continue;
+    }
+
+    const candidate = parseJsonObjectText(text.slice(start, index + 1));
+    if (candidate) {
+      if (parsed) {
+        return undefined;
+      }
+      parsed = candidate;
+    }
+
+    start = -1;
+    depth = 0;
+    inString = false;
+    escaped = false;
+  }
+
+  return parsed;
+}
+
+function normalizeStructuredOutputCandidate(value: unknown): JsonObject | undefined {
+  if (isJsonObjectPayload(value)) {
+    return value;
+  }
+
+  if (Array.isArray(value) && value.length === 1 && isJsonObjectPayload(value[0])) {
+    return value[0];
+  }
+
+  return undefined;
 }
 
 function normalizeSystemMessagesAtStart(messages: ModelMessage[]): ModelMessage[] {
@@ -5874,6 +5977,117 @@ function validateNonDelegateToolInput(input: JsonValue, tool: ToolDefinition): s
   }
 
   return validateJsonValueAgainstSchema(input, tool.inputSchema, `${tool.name} input`);
+}
+
+function normalizeModelToolInputForSchema(input: JsonValue, schema: JsonSchema): JsonValue {
+  const normalized = normalizeJsonValueForSchema(input, schema);
+  return normalized === undefined ? input : normalized;
+}
+
+function normalizeJsonValueForSchema(value: JsonValue, schema: JsonSchema): JsonValue | undefined {
+  const coerced = coerceScalarJsonValueForSchema(value, schema);
+  const current = coerced ?? value;
+
+  if (isJsonObject(current)) {
+    const properties = isRecord(schema.properties) ? schema.properties : undefined;
+    const additionalProperties = isRecord(schema.additionalProperties)
+      ? (schema.additionalProperties as JsonSchema)
+      : undefined;
+    if (!properties && !additionalProperties) {
+      return coerced;
+    }
+
+    let changed = coerced !== undefined;
+    const normalized: JsonObject = { ...current };
+    for (const [key, childValue] of Object.entries(current)) {
+      const propertySchema = properties && isRecord(properties[key])
+        ? (properties[key] as JsonSchema)
+        : additionalProperties;
+      if (!propertySchema) {
+        continue;
+      }
+
+      const childNormalized = normalizeJsonValueForSchema(childValue as JsonValue, propertySchema);
+      if (childNormalized !== undefined) {
+        normalized[key] = childNormalized;
+        changed = true;
+      }
+    }
+
+    return changed ? normalized : undefined;
+  }
+
+  if (Array.isArray(current) && isRecord(schema.items)) {
+    let changed = coerced !== undefined;
+    const normalized = current.map((entry) => {
+      const childNormalized = normalizeJsonValueForSchema(entry as JsonValue, schema.items as JsonSchema);
+      if (childNormalized !== undefined) {
+        changed = true;
+        return childNormalized;
+      }
+      return entry;
+    });
+    return changed ? normalized : undefined;
+  }
+
+  return coerced;
+}
+
+function coerceScalarJsonValueForSchema(value: JsonValue, schema: JsonSchema): JsonValue | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  const allowedTypes = readAllowedJsonSchemaTypes(schema);
+  if (allowedTypes.has('number') || allowedTypes.has('integer')) {
+    const trimmed = value.trim();
+    if (trimmed.length > 0) {
+      const numeric = Number(trimmed);
+      if (Number.isFinite(numeric) && (!allowedTypes.has('integer') || Number.isInteger(numeric))) {
+        return numeric;
+      }
+    }
+  }
+
+  if (allowedTypes.has('boolean')) {
+    if (value === 'true') {
+      return true;
+    }
+    if (value === 'false') {
+      return false;
+    }
+  }
+
+  if (allowedTypes.has('object') || allowedTypes.has('array')) {
+    try {
+      const parsed = JSON.parse(value) as JsonValue;
+      if (allowedTypes.has('object') && isJsonObject(parsed)) {
+        return parsed;
+      }
+      if (allowedTypes.has('array') && Array.isArray(parsed)) {
+        return parsed;
+      }
+    } catch {
+      return undefined;
+    }
+  }
+
+  return undefined;
+}
+
+function readAllowedJsonSchemaTypes(schema: JsonSchema): Set<string> {
+  const rawType = schema.type;
+  if (typeof rawType === 'string') {
+    return new Set([rawType]);
+  }
+  if (Array.isArray(rawType)) {
+    return new Set(rawType.filter((entry): entry is string => typeof entry === 'string'));
+  }
+  return new Set();
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function readRetryAttempts(metadata?: Record<string, JsonValue>): number {

@@ -1323,6 +1323,68 @@ describe('createReadWebPageTool', () => {
     expect(result.error.message).toContain('exceeds maximum size');
   });
 
+  it('returns useful partial text for oversized readable responses', async () => {
+    const tool = createReadWebPageTool({ maxSizeBytes: 1_200 });
+    const usefulLead = Array.from({ length: 120 }, (_, index) => `Important research sentence ${index} describes Apollo mission evidence.`).join(' ');
+    const omittedTail = 'This sentence should not be fetched because it is beyond the byte cap.';
+    const html = `<html><head><title>Large Page</title></head><body><p>${usefulLead}</p><p>${omittedTail}</p></body></html>`;
+
+    fetchSpy.mockResolvedValueOnce(
+      new Response(html, {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/html',
+          'Content-Length': String(Buffer.byteLength(html, 'utf8')),
+        },
+      }),
+    );
+
+    const result = (await tool.execute(
+      { url: 'https://example.com/large', objective: 'Apollo mission evidence' } as any,
+      stubToolContext(),
+    )) as any;
+
+    expect(result).toMatchObject({
+      url: 'https://example.com/large',
+      title: 'Large Page',
+      bytesFetched: 1_200,
+      truncated: true,
+      error: {
+        kind: 'content_error',
+      },
+    });
+    expect(result.error.message).toContain('returned partial content');
+    expect(result.text).toContain('Important research sentence');
+    expect(result.text).not.toContain(omittedTail);
+    expect(result.relevantExcerpts.length).toBeGreaterThan(0);
+  });
+
+  it('keeps oversized PDFs as recoverable content errors', async () => {
+    const extractPdfText = vi.fn();
+    const tool = createReadWebPageTool({ maxSizeBytes: 4, extractPdfText });
+
+    fetchSpy.mockResolvedValueOnce(
+      new Response(new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d]), {
+        status: 200,
+        headers: { 'Content-Type': 'application/pdf', 'Content-Length': '5' },
+      }),
+    );
+
+    const result = (await executeRecoverableTool(tool, { url: 'https://example.com/file.pdf' })) as any;
+
+    expect(result).toMatchObject({
+      url: 'https://example.com/file.pdf',
+      title: '',
+      text: '',
+      bytesFetched: 0,
+      error: {
+        kind: 'content_error',
+      },
+    });
+    expect(result.error.message).toContain('exceeds maximum size');
+    expect(extractPdfText).not.toHaveBeenCalled();
+  });
+
   it('returns a recoverable timeout error for slow page reads', () => {
     const tool = createReadWebPageTool();
     const result = tool.recoverError?.(new Error('Timed out after 30000ms'), {

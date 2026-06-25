@@ -89,6 +89,34 @@ function createBudgetedSearchTool(): ToolDefinition {
   };
 }
 
+function createStrictSearchTool(onExecute?: (input: Record<string, unknown>) => void): ToolDefinition {
+  return {
+    name: 'web_search',
+    description: 'Search the web.',
+    inputSchema: {
+      type: 'object',
+      required: ['query'],
+      additionalProperties: false,
+      properties: {
+        query: { type: 'string' },
+        purpose: { type: 'string' },
+        maxResults: { type: 'number' },
+      },
+    },
+    budgetGroup: 'web_research.search',
+    execute: async (input) => {
+      const objectInput = typeof input === 'object' && input !== null && !Array.isArray(input)
+        ? input as Record<string, unknown>
+        : {};
+      onExecute?.(objectInput);
+      return {
+        query: typeof objectInput.query === 'string' ? objectInput.query : 'unknown',
+        results: [{ title: 'stub', url: 'https://example.com', snippet: 'stub' }],
+      };
+    },
+  };
+}
+
 function createBudgetedReadWebPageTool(onExecute?: () => void): ToolDefinition {
   return {
     name: 'read_web_page',
@@ -1492,6 +1520,64 @@ describe('AdaptiveAgent', () => {
     expect(model.receivedRequests).toHaveLength(1);
   });
 
+  it('normalizes prose-wrapped JSON object text for outputSchema before repair', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const outputSchema = {
+      type: 'object',
+      properties: { answer: { type: 'string' } },
+      required: ['answer'],
+    };
+    const model = new SequenceModel([
+      {
+        finishReason: 'stop',
+        text: 'Here is the answer:\n{\n  "answer": "done"\n}\nThanks.',
+      },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.run({ goal: 'Return prose-wrapped structured output', outputSchema });
+
+    expect(result).toMatchObject({ status: 'success', output: { answer: 'done' } });
+    expect(model.receivedRequests).toHaveLength(1);
+  });
+
+  it('unwraps single-object JSON arrays for outputSchema before repair', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const outputSchema = {
+      type: 'object',
+      properties: { answer: { type: 'string' } },
+      required: ['answer'],
+    };
+    const model = new SequenceModel([
+      {
+        finishReason: 'stop',
+        text: '[\n  { "answer": "done" }\n]',
+      },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.run({ goal: 'Return array-wrapped structured output', outputSchema });
+
+    expect(result).toMatchObject({ status: 'success', output: { answer: 'done' } });
+    expect(model.receivedRequests).toHaveLength(1);
+  });
+
   it('normalizes provider structuredOutput strings for outputSchema before repair', async () => {
     const runStore = new InMemoryRunStore();
     const eventStore = new InMemoryEventStore();
@@ -1979,6 +2065,59 @@ describe('AdaptiveAgent', () => {
     });
   });
 
+  it('parses double-serialized delegate object input before spawning the child run', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'delegate-call',
+            name: 'delegate.researcher',
+            input: JSON.stringify({
+              goal: 'Research parsed delegate object',
+              context: { source: 'model-json-string' },
+            }),
+          },
+        ],
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: { finding: 'child-done' },
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: { report: 'done' },
+      },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      delegates: [
+        {
+          name: 'researcher',
+          description: 'Researches a topic.',
+          allowedTools: [],
+        },
+      ],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.run({ goal: 'Delegate double-serialized input' });
+
+    expect(result).toMatchObject({ status: 'success', output: { report: 'done' } });
+    const children = await runStore.listChildren(result.runId);
+    expect(children).toHaveLength(1);
+    expect(children[0]).toMatchObject({
+      goal: 'Research parsed delegate object',
+      context: { source: 'model-json-string' },
+    });
+  });
+
   it('repairs malformed normal tool input before executing write_file', async () => {
     const tempDir = await mkdtemp(join(tmpdir(), 'adaptive-agent-write-repair-'));
     try {
@@ -2057,6 +2196,87 @@ describe('AdaptiveAgent', () => {
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
+  });
+
+  it('normalizes schema-guided numeric string tool input before validation and execution', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    let executedInput: Record<string, unknown> | undefined;
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'search-1',
+            name: 'web_search',
+            input: { query: 'first', purpose: 'find evidence', maxResults: '10' },
+          },
+        ],
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: { done: true },
+      },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [createStrictSearchTool((input) => { executedInput = input; })],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.run({ goal: 'Search with numeric string' });
+
+    expect(result).toMatchObject({ status: 'success', output: { done: true } });
+    expect(executedInput?.maxResults).toBe(10);
+    const events = await eventStore.listByRun(result.runId);
+    expect(events.some((event) => event.type === 'model.tool_call_rejected')).toBe(false);
+    expect(events.find((event) => event.type === 'tool.started')?.payload).toMatchObject({
+      input: expect.objectContaining({
+        preview: expect.objectContaining({ maxResults: 10 }),
+      }),
+    });
+  });
+
+  it('still rejects non-numeric strings for numeric tool schema fields', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'search-1',
+            name: 'web_search',
+            input: { query: 'first', purpose: 'find evidence', maxResults: 'ten' },
+          },
+        ],
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: { done: true },
+      },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [createStrictSearchTool()],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.run({ goal: 'Reject invalid numeric string' });
+
+    expect(result).toMatchObject({ status: 'success', output: { done: true } });
+    const rejection = (await eventStore.listByRun(result.runId)).find((event) => event.type === 'model.tool_call_rejected');
+    expect(rejection?.payload).toMatchObject({
+      requestedToolName: 'web_search',
+      reason: 'invalid_tool_input',
+      error: expect.stringContaining('web_search input.maxResults must be "number", not a string'),
+    });
   });
 
   it('retries an existing pre-tool unknown-tool failure by clearing the invalid tool call and reprompting', async () => {
@@ -4987,7 +5207,7 @@ describe('AdaptiveAgent', () => {
     });
     expect(checkpointLog?.content).toMatchObject({
       type: 'string',
-      preview: expect.stringContaining('near the web research budget'),
+      preview: expect.stringContaining('near the web search budget'),
     });
 
     const secondRequestMessages = model.receivedRequests[1]?.messages ?? [];
@@ -4995,12 +5215,12 @@ describe('AdaptiveAgent', () => {
       expect.arrayContaining([
         expect.objectContaining({
           role: 'user',
-          content: expect.stringContaining('near the web research budget'),
+          content: expect.stringContaining('near the web search budget'),
         }),
       ]),
     );
     const checkpointIndex = secondRequestMessages.findIndex(
-      (message) => message.role === 'user' && typeof message.content === 'string' && message.content.includes('near the web research budget'),
+      (message) => message.role === 'user' && typeof message.content === 'string' && message.content.includes('near the web search budget'),
     );
     expect(checkpointIndex).toBeGreaterThanOrEqual(0);
     expect(secondRequestMessages[checkpointIndex - 1]).toMatchObject({ role: 'tool' });
@@ -5101,6 +5321,63 @@ describe('AdaptiveAgent', () => {
     expect(model.receivedRequests[4]?.messages.at(-1)).toMatchObject({
       role: 'tool',
       name: 'web_search',
+      content: expect.stringContaining('budget_exhausted'),
+    });
+    expect(model.receivedRequests[4]?.tools?.map((tool) => tool.name)).not.toContain('web_search');
+  });
+
+  it('returns skipped partial results for exhausted hidden-budget calls before validating stale input', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const toolExecutionStore = new InMemoryToolExecutionStore();
+    let executedSearches = 0;
+    const searchTool = createStrictSearchTool(() => { executedSearches += 1; });
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [{ id: 'search-1', name: 'web_search', input: { query: 'first', purpose: 'find starting evidence' } }],
+      },
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [{ id: 'search-2', name: 'web_search', input: { query: 'second', purpose: 'double check' } }],
+      },
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [{ id: 'search-3', name: 'web_search', input: { query: 'third', purpose: 'exhaust budget' } }],
+      },
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [{ id: 'search-4', name: 'web_search', input: { query: 'fourth', purpose: 'stale hidden call', maxResults: '10' } }],
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: { done: true },
+      },
+    ]);
+
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [searchTool],
+      runStore,
+      eventStore,
+      snapshotStore,
+      toolExecutionStore,
+      defaults: {
+        researchPolicy: 'light',
+      },
+    });
+
+    const result = await agent.run({ goal: 'Research something current' });
+
+    expect(result).toMatchObject({ status: 'success', output: { done: true } });
+    expect(executedSearches).toBe(2);
+    const events = await eventStore.listByRun(result.runId);
+    expect(events.filter((event) => event.type === 'model.tool_call_rejected')).toHaveLength(0);
+    expect(model.receivedRequests[4]?.messages.at(-1)).toMatchObject({
+      role: 'tool',
+      name: 'web_search',
+      toolCallId: 'search-4',
       content: expect.stringContaining('budget_exhausted'),
     });
     expect(model.receivedRequests[4]?.tools?.map((tool) => tool.name)).not.toContain('web_search');
