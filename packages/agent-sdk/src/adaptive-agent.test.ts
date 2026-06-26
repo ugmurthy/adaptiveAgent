@@ -155,6 +155,7 @@ describe('adaptive-agent cli parsing', () => {
     expect(parseCliArgs(['swarm-run', '--help'])).toMatchObject({ help: true, helpTopic: 'swarm-run' });
     expect(parseCliArgs(['--help', 'swarm-run'])).toMatchObject({ help: true, helpTopic: 'swarm-run' });
     expect(parseCliArgs(['help', 'swarm-run'])).toMatchObject({ help: true, helpTopic: 'swarm-run' });
+    expect(parseCliArgs(['help', 'replay'])).toMatchObject({ help: true, helpTopic: 'replay' });
   });
 
   it('parses common flags', () => {
@@ -292,6 +293,29 @@ describe('adaptive-agent cli parsing', () => {
       agentConfigPath: 'reviewer',
       output: 'json',
     });
+  });
+
+  it('parses single-run recovery and inspection commands', () => {
+    expect(parseCliArgs(['inspect', 'run-1'])).toMatchObject({
+      command: 'inspect',
+      goalArgs: ['run-1'],
+    });
+    expect(parseCliArgs(['resume', '--run-id', 'run-1', '--progress'])).toMatchObject({
+      command: 'resume',
+      runId: 'run-1',
+      progress: true,
+    });
+    expect(parseCliArgs(['interrupt', 'run-1', '--output', 'json'])).toMatchObject({
+      command: 'interrupt',
+      goalArgs: ['run-1'],
+      output: 'json',
+    });
+    expect(parseCliArgs(['replay', '--run-id', 'run-1'])).toMatchObject({
+      command: 'replay',
+      runId: 'run-1',
+    });
+    expect(() => parseCliArgs(['inspect'])).toThrow('inspect requires --run-id <runId> or exactly one positional <runId>');
+    expect(() => parseCliArgs(['resume', '--run-id', 'run-1', 'run-2'])).toThrow('resume accepts --run-id <runId> or one positional <runId>, but not both');
   });
 
   it('parses eval cases benchmark flags', () => {
@@ -727,6 +751,93 @@ describe('adaptive-agent config command', () => {
       expect(output.webSearch?.provider).toBe('brave');
     } finally {
       log.mockRestore();
+    }
+  });
+});
+
+describe('adaptive-agent single-run recovery commands', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'adaptive-agent-recovery-'));
+    await writeAgentConfig(join(tempDir, 'agent.json'));
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it('inspects a missing run as a compact json summary', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      const exitCode = await main(['inspect', 'missing-run', '--cwd', tempDir, '--output', 'json']);
+      const output = JSON.parse(String(log.mock.calls[0]?.[0])) as {
+        command: string;
+        runId: string;
+        inspection: { run: unknown; eventCount: number; eventTypes: Record<string, number> };
+      };
+
+      expect(exitCode).toBe(1);
+      expect(output).toMatchObject({
+        command: 'inspect',
+        runId: 'missing-run',
+        inspection: { run: null, eventCount: 0, eventTypes: {} },
+      });
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('prints replay metadata as jsonl without re-executing anything', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      const exitCode = await main(['replay', '--run-id', 'missing-run', '--cwd', tempDir, '--output', 'jsonl']);
+      const metadata = JSON.parse(String(log.mock.calls[0]?.[0])) as Record<string, unknown>;
+
+      expect(exitCode).toBe(1);
+      expect(metadata).toMatchObject({
+        command: 'replay',
+        runId: 'missing-run',
+        type: 'run',
+        run: null,
+        eventCount: 0,
+      });
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('requests interrupt for a run id through the SDK boundary', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      const exitCode = await main(['interrupt', 'missing-run', '--cwd', tempDir, '--output', 'json']);
+      const output = JSON.parse(String(log.mock.calls[0]?.[0])) as Record<string, unknown>;
+
+      expect(exitCode).toBe(0);
+      expect(output).toEqual({ command: 'interrupt', runId: 'missing-run', status: 'requested' });
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('explains missing resume runs when memory runtime hides a Postgres-backed run', async () => {
+    const previousDatabaseUrl = process.env.DATABASE_URL;
+    process.env.DATABASE_URL = 'postgres://adaptive:asdf1234@localhost:5432/adaptive_agent';
+    await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({ runtime: { mode: 'memory' } }));
+
+    try {
+      await expect(main(['resume', '--run-id', 'missing-run', '--cwd', tempDir])).rejects.toThrow(
+        'Run missing-run was not found in the resolved memory runtime. DATABASE_URL is set, so this may be a Postgres-backed run; retry with --runtime postgres or update agent.settings.json runtime.mode to postgres.',
+      );
+    } finally {
+      if (previousDatabaseUrl === undefined) {
+        delete process.env.DATABASE_URL;
+      } else {
+        process.env.DATABASE_URL = previousDatabaseUrl;
+      }
     }
   });
 });

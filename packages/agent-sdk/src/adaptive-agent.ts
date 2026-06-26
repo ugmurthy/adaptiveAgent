@@ -34,6 +34,7 @@ import { renderUninstallReport, runUninstall, uninstallExitCode } from './instal
 import { renderUpdateReport, runUpdate, updateExitCode } from './install/update.js';
 import { getVersionInfo, renderVersion } from './install/version.js';
 import { renderAgentCreateReport, runAgentCreate } from './agent-create.js';
+import { AgentEventLabelRegistry, formatAgentEventSummary, summarizeAgentEvent } from './agent-event-rendering.js';
 import { formatSwarmExecutionPlan, formatSwarmRunStatuses, formatSwarmSubtasks } from './swarm-format.js';
 import { createSwarmRoleAgentConfig } from './swarm-role-config.js';
 import { buildSwarmCoordinator, parseSwarmSubtasks, runSwarmDecomposition, validateSdkDecomposition } from './swarm-runner.js';
@@ -74,6 +75,7 @@ import {
   printSwarmExecutionPlan,
   printSwarmResult,
   printSwarmRetryResult,
+  renderPrettyValue,
   renderPrettyString,
   renderStyledPrettyMessage,
   RunColorRegistry,
@@ -100,12 +102,16 @@ const IMAGE_FILE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp',
 const AUDIO_FILE_EXTENSIONS = new Set(['.wav', '.mp3', '.flac', '.m4a', '.ogg', '.aac', '.aiff', '.aif', '.opus', '.oga', '.weba']);
 const VIDEO_FILE_EXTENSIONS = new Set(['.mp4', '.m4v', '.mov', '.webm', '.mkv', '.avi', '.mpeg', '.mpg', '.ogv', '.wmv', '.flv', '.3gp', '.ts', '.mts', '.m2ts']);
 
-const CLI_COMMANDS = ['run', 'chat', 'spec', 'config', 'catalog', 'eval', 'swarm-run', 'retry', 'init', 'doctor', 'update', 'uninstall', 'agent-create'] as const;
+const CLI_COMMANDS = ['run', 'chat', 'spec', 'config', 'catalog', 'eval', 'swarm-run', 'inspect', 'resume', 'retry', 'interrupt', 'replay', 'init', 'doctor', 'update', 'uninstall', 'agent-create'] as const;
 type CliCommand = (typeof CLI_COMMANDS)[number];
 const CLI_COMMAND_SET = new Set<string>(CLI_COMMANDS);
 
 function isCliCommand(value: string): value is CliCommand {
   return CLI_COMMAND_SET.has(value);
+}
+
+function isSingleRunCommand(command: ManualTestCliOptions['command']): command is 'inspect' | 'resume' | 'interrupt' | 'replay' {
+  return command === 'inspect' || command === 'resume' || command === 'interrupt' || command === 'replay';
 }
 
 const TOP_LEVEL_HELP_TEXT = `adaptive-agent
@@ -122,6 +128,12 @@ Common commands:
   chat                  Start an interactive chat
   swarm-run             Decompose one task into worker runs and synthesize a result
   retry                 Retry one failed run or swarm session
+
+Recovery and inspection:
+  inspect               Inspect a stored run and event summary
+  resume                Resume an interrupted or waiting run in place
+  interrupt             Request interruption for an active run
+  replay                Render stored run events without re-executing
 
 Setup and inspection:
   init                  Create first-run configuration under ~/.adaptiveAgent
@@ -294,6 +306,65 @@ Retry options:
 ${COMMON_AGENT_OPTIONS_TEXT}
 
 ${RUN_OUTPUT_OPTIONS_TEXT}`;
+
+const INSPECT_HELP_TEXT = `adaptive-agent inspect
+
+Inspect a stored run and compact event summary.
+
+Usage:
+  adaptive-agent inspect <runId> [options]
+  adaptive-agent inspect --run-id <runId> [options]
+
+Examples:
+  adaptive-agent inspect run_123
+  adaptive-agent inspect --run-id run_123 --output json
+
+${COMMON_AGENT_OPTIONS_TEXT}`;
+
+const RESUME_HELP_TEXT = `adaptive-agent resume
+
+Resume an interrupted or waiting persisted run in place.
+
+Usage:
+  adaptive-agent resume <runId> [options]
+  adaptive-agent resume --run-id <runId> [options]
+
+Examples:
+  adaptive-agent resume run_123
+  adaptive-agent resume --run-id run_123 --progress
+
+${COMMON_AGENT_OPTIONS_TEXT}
+
+${RUN_OUTPUT_OPTIONS_TEXT}`;
+
+const INTERRUPT_HELP_TEXT = `adaptive-agent interrupt
+
+Request interruption for an active run. This is most useful with a durable
+runtime such as Postgres; memory runtime cannot interrupt a different process.
+
+Usage:
+  adaptive-agent interrupt <runId> [options]
+  adaptive-agent interrupt --run-id <runId> [options]
+
+Examples:
+  adaptive-agent interrupt run_123
+  adaptive-agent interrupt --run-id run_123 --runtime postgres
+
+${COMMON_AGENT_OPTIONS_TEXT}`;
+
+const REPLAY_HELP_TEXT = `adaptive-agent replay
+
+Render stored run events without re-executing tools or reconstructing runtime state.
+
+Usage:
+  adaptive-agent replay <runId> [options]
+  adaptive-agent replay --run-id <runId> [options]
+
+Examples:
+  adaptive-agent replay run_123
+  adaptive-agent replay --run-id run_123 --output jsonl
+
+${COMMON_AGENT_OPTIONS_TEXT}`;
 
 const SPEC_HELP_TEXT = `adaptive-agent spec
 
@@ -471,8 +542,16 @@ function getHelpText(topic?: ManualTestCliOptions['helpTopic']): string {
       return CHAT_HELP_TEXT;
     case 'swarm-run':
       return SWARM_RUN_HELP_TEXT;
+    case 'inspect':
+      return INSPECT_HELP_TEXT;
+    case 'resume':
+      return RESUME_HELP_TEXT;
     case 'retry':
       return RETRY_HELP_TEXT;
+    case 'interrupt':
+      return INTERRUPT_HELP_TEXT;
+    case 'replay':
+      return REPLAY_HELP_TEXT;
     case 'spec':
       return SPEC_HELP_TEXT;
     case 'config':
@@ -569,8 +648,24 @@ export async function main(argv = Bun.argv.slice(2)): Promise<number> {
     return runSwarmCommand(cli);
   }
 
+  if (cli.command === 'inspect') {
+    return runInspectCommand(cli);
+  }
+
+  if (cli.command === 'resume') {
+    return runResumeCommand(cli);
+  }
+
   if (cli.command === 'retry') {
     return runRetryCommand(cli);
+  }
+
+  if (cli.command === 'interrupt') {
+    return runInterruptCommand(cli);
+  }
+
+  if (cli.command === 'replay') {
+    return runReplayCommand(cli);
   }
 
   if (cli.command === 'chat') {
@@ -1117,6 +1212,143 @@ async function runSwarmCommand(cli: ManualTestCliOptions): Promise<number> {
   }
 }
 
+function readRunIdArgument(cli: ManualTestCliOptions): string {
+  return cli.runId ?? cli.goalArgs[0]!;
+}
+
+async function assertRunAgentMatchesLoadedAgent(sdk: Awaited<ReturnType<typeof createAgentSdk>>, runId: string): Promise<void> {
+  const inspection = await sdk.inspect(runId);
+  if (!inspection.run && sdk.config.runtime.mode === 'memory' && process.env.DATABASE_URL) {
+    throw new Error(`Run ${runId} was not found in the resolved memory runtime. DATABASE_URL is set, so this may be a Postgres-backed run; retry with --runtime postgres or update agent.settings.json runtime.mode to postgres.`);
+  }
+  const runAgentId = typeof inspection.run?.metadata?.agentId === 'string' ? inspection.run.metadata.agentId : undefined;
+  if (runAgentId && runAgentId !== sdk.config.agent.id) {
+    throw new Error(`Run ${runId} belongs to agent ${runAgentId}; loaded agent is ${sdk.config.agent.id}`);
+  }
+}
+
+async function runInspectCommand(cli: ManualTestCliOptions): Promise<number> {
+  const runId = readRunIdArgument(cli);
+  const resolvedCwd = resolve(cli.cwd ?? process.cwd());
+  const sdk = await createAgentSdk(buildSdkOptions(cli, resolvedCwd));
+  try {
+    const inspection = await summarizeInspection(sdk, runId);
+    if (cli.output === 'json') {
+      console.log(JSON.stringify({ command: 'inspect', runId, inspection }, null, 2));
+    } else if (cli.output === 'jsonl') {
+      console.log(JSON.stringify({ command: 'inspect', runId, inspection }));
+    } else {
+      printInspection(inspection);
+    }
+    return inspection.run ? 0 : 1;
+  } finally {
+    await sdk.close();
+  }
+}
+
+async function runResumeCommand(cli: ManualTestCliOptions): Promise<number> {
+  const runId = readRunIdArgument(cli);
+  const resolvedCwd = resolve(cli.cwd ?? process.cwd());
+  const sdkOptions = buildSdkOptions(cli, resolvedCwd);
+  const eventLog: Array<Record<string, JsonValue>> = [];
+  const resolvedConfig = await loadAgentSdkConfig(sdkOptions);
+  const lastProgressContentByRun = new Map<string, string>();
+  const resumeColors = cli.output === 'pretty' ? new RunColorRegistry() : undefined;
+  const eventListener = shouldListenForCliEvents(cli) ? (event: AgentEvent) => {
+    const entry = summarizeEvent(event);
+    eventLog.push(entry);
+    if (resumeColors && cli.progress) {
+      printRunBoundaryEvent(event, resolvedConfig.tui, resumeColors, cli.wrapWidth);
+    }
+    if (cli.events && cli.output === 'pretty') {
+      printEvent(entry, resolvedConfig.tui, resumeColors);
+    } else if (cli.progress && cli.output === 'pretty') {
+      printProgressEvent(event, lastProgressContentByRun, resolvedConfig.tui, cli.showLines, cli.wrapWidth, resumeColors);
+    }
+  } : undefined;
+
+  const sdk = await createAgentSdk({ ...sdkOptions, eventListener });
+  try {
+    await assertRunAgentMatchesLoadedAgent(sdk, runId);
+    const result = await sdk.resume(runId);
+    if (cli.output === 'json') {
+      console.log(JSON.stringify({ command: 'resume', runId, result: summarizeResult(result) }, null, 2));
+    } else if (cli.output === 'jsonl') {
+      console.log(JSON.stringify({ command: 'resume', runId, result: summarizeResult(result) }));
+    } else {
+      printResult(result, 'run', resolvedConfig.tui);
+      if (cli.events && eventLog.length > 0) console.error(`event log captured: ${eventLog.length}`);
+    }
+    return isSuccessfulResult(result) ? 0 : 1;
+  } finally {
+    await sdk.close();
+  }
+}
+
+async function runInterruptCommand(cli: ManualTestCliOptions): Promise<number> {
+  const runId = readRunIdArgument(cli);
+  const resolvedCwd = resolve(cli.cwd ?? process.cwd());
+  const sdkOptions = buildSdkOptions(cli, resolvedCwd);
+  const resolvedConfig = await loadAgentSdkConfig(sdkOptions);
+  const eventLog: Array<Record<string, JsonValue>> = [];
+  const interruptColors = cli.output === 'pretty' ? new RunColorRegistry() : undefined;
+  const eventListener = cli.events ? (event: AgentEvent) => {
+    const entry = summarizeEvent(event);
+    eventLog.push(entry);
+    if (cli.output === 'pretty') {
+      printEvent(entry, resolvedConfig.tui, interruptColors);
+    }
+  } : undefined;
+
+  const sdk = await createAgentSdk({ ...sdkOptions, eventListener });
+  try {
+    await sdk.interrupt(runId);
+    if (cli.output === 'json') {
+      console.log(JSON.stringify({ command: 'interrupt', runId, status: 'requested' }, null, 2));
+    } else if (cli.output === 'jsonl') {
+      console.log(JSON.stringify({ command: 'interrupt', runId, status: 'requested' }));
+    } else {
+      console.log(`interrupt requested for ${runId}`);
+      if (cli.events && eventLog.length > 0) console.error(`event log captured: ${eventLog.length}`);
+    }
+    return 0;
+  } finally {
+    await sdk.close();
+  }
+}
+
+async function runReplayCommand(cli: ManualTestCliOptions): Promise<number> {
+  const runId = readRunIdArgument(cli);
+  const resolvedCwd = resolve(cli.cwd ?? process.cwd());
+  const sdk = await createAgentSdk(buildSdkOptions(cli, resolvedCwd));
+  try {
+    const inspection = await sdk.inspect(runId);
+    const events = inspection.events.map((event) => summarizeEvent(event));
+    if (cli.output === 'json') {
+      console.log(JSON.stringify({ command: 'replay', runId, run: inspection.run, eventCount: events.length, events }, null, 2));
+    } else if (cli.output === 'jsonl') {
+      console.log(JSON.stringify({ command: 'replay', runId, type: 'run', run: inspection.run, eventCount: events.length }));
+      for (const event of events) {
+        console.log(JSON.stringify({ command: 'replay', runId, type: 'event', event }));
+      }
+    } else {
+      console.log(`replay ${runId}: ${events.length} event(s)`);
+      const replayLabels = new AgentEventLabelRegistry();
+      for (const event of inspection.events) {
+        console.log(`[event] ${formatAgentEventSummary(summarizeAgentEvent(event, replayLabels))}`);
+      }
+      if (inspection.run?.result !== undefined) {
+        console.log('');
+        console.log('result:');
+        console.log(renderPrettyValue(inspection.run.result));
+      }
+    }
+    return inspection.run ? 0 : 1;
+  } finally {
+    await sdk.close();
+  }
+}
+
 async function runRetryCommand(cli: ManualTestCliOptions): Promise<number> {
   const resolvedCwd = resolve(cli.cwd ?? process.cwd());
   const sdkOptions = buildSdkOptions(cli, resolvedCwd);
@@ -1140,11 +1372,7 @@ async function runRetryCommand(cli: ManualTestCliOptions): Promise<number> {
   const coordinatorSdk = await createAgentSdk({ ...sdkOptions, eventListener });
   if (cli.runId) {
     try {
-      const inspection = await coordinatorSdk.inspect(cli.runId);
-      const runAgentId = typeof inspection.run?.metadata?.agentId === 'string' ? inspection.run.metadata.agentId : undefined;
-      if (runAgentId && runAgentId !== coordinatorSdk.config.agent.id) {
-        throw new Error(`Run ${cli.runId} belongs to agent ${runAgentId}; loaded agent is ${coordinatorSdk.config.agent.id}`);
-      }
+      await assertRunAgentMatchesLoadedAgent(coordinatorSdk, cli.runId);
       const result = await coordinatorSdk.retry(cli.runId);
       if (cli.output === 'json') {
         console.log(JSON.stringify({ command: 'retry', runId: cli.runId, result: summarizeResult(result) }, null, 2));
@@ -1639,7 +1867,7 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
         options.output = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['pretty', 'json', 'jsonl']);
         break;
       default:
-        if (options.command === 'run' || options.command === 'chat' || options.command === 'swarm-run' || options.command === 'retry' || options.command === 'agent-create') {
+        if (options.command === 'run' || options.command === 'chat' || options.command === 'swarm-run' || options.command === 'inspect' || options.command === 'resume' || options.command === 'retry' || options.command === 'interrupt' || options.command === 'replay' || options.command === 'agent-create') {
           options.goalArgs.push(arg);
           break;
         }
@@ -1730,6 +1958,16 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
       if (options.workerCatalogPaths.length === 0) {
         throw new Error('retry <sessionId> requires --worker-catalog <path-or-name,...>');
       }
+    }
+  }
+
+  if (!options.help && isSingleRunCommand(options.command)) {
+    if (options.runId) {
+      if (options.goalArgs.length > 0) {
+        throw new Error(`${options.command} accepts --run-id <runId> or one positional <runId>, but not both`);
+      }
+    } else if (options.goalArgs.length !== 1 || !options.goalArgs[0]?.trim()) {
+      throw new Error(`${options.command} requires --run-id <runId> or exactly one positional <runId>`);
     }
   }
 

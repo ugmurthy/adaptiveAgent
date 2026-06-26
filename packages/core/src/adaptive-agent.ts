@@ -4335,7 +4335,15 @@ export class AdaptiveAgent {
     });
 
     if (!acquired) {
-      throw new Error(`Could not acquire lease for run ${runId}`);
+      const run = await this.options.runStore.getRun(runId);
+      const details = run
+        ? [
+            run.leaseOwner ? `owner=${run.leaseOwner}` : undefined,
+            run.leaseExpiresAt ? `expiresAt=${run.leaseExpiresAt}` : undefined,
+            run.heartbeatAt ? `heartbeatAt=${run.heartbeatAt}` : undefined,
+          ].filter(Boolean).join(', ')
+        : undefined;
+      throw new Error(`Could not acquire lease for run ${runId}${details ? ` (${details})` : ''}`);
     }
   }
 

@@ -21,7 +21,8 @@
     "@e2b/code-interpreter": "^2.4.0",
     "@types/marked-terminal": "^6.1.1",
     "marked": "^15.0.12",
-    "marked-terminal": "^7.3.0"
+    "marked-terminal": "^7.3.0",
+    "meshapi-node-sdk": "^0.1.0"
   },
   "patchedDependencies": {
     "@openrouter/sdk@0.12.35": "patches/@openrouter%2Fsdk@0.12.35.patch"

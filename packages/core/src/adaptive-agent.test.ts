@@ -4960,6 +4960,52 @@ describe('AdaptiveAgent', () => {
     expect(model.receivedRequests).toHaveLength(0);
   });
 
+  it('includes current lease details when resume cannot acquire a run lease', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const run = await runStore.createRun({
+      goal: 'Leased resume',
+      status: 'running',
+    });
+    const leaseNow = new Date();
+    await runStore.tryAcquireLease({
+      runId: run.id,
+      owner: 'worker-old',
+      ttlMs: 60_000,
+      now: leaseNow,
+    });
+    await snapshotStore.save({
+      runId: run.id,
+      snapshotSeq: 1,
+      status: 'running',
+      summary: {
+        status: 'running',
+        stepsUsed: 0,
+      },
+      state: {
+        schemaVersion: 1,
+        messages: [
+          { role: 'system', content: 'You are AdaptiveAgent.' },
+          { role: 'user', content: '{"goal":"Leased resume"}' },
+        ],
+        stepsUsed: 0,
+      },
+    });
+
+    const agent = new AdaptiveAgent({
+      model: new SequenceModel([]),
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    await expect(agent.resume(run.id)).rejects.toThrow(
+      `owner=worker-old, expiresAt=${new Date(leaseNow.getTime() + 60_000).toISOString()}, heartbeatAt=${leaseNow.toISOString()}`,
+    );
+  });
+
   it('rejects persisted delegate steps during executePlan with replan.required', async () => {
     const runStore = new InMemoryRunStore();
     const eventStore = new InMemoryEventStore();
