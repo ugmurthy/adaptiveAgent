@@ -125,6 +125,8 @@ describe('agent-sdk config resolution', () => {
     expect(inspection.config.agent.id).toBe('agent');
     expect(inspection.tools.map((tool) => tool.name)).toEqual(['read_file']);
     expect(inspection.registeredToolNames).toContain('read_file');
+    expect(inspection.registeredToolNames).toContain('search_files');
+    expect(inspection.registeredToolNames).toContain('edit_file');
     expect(inspection.delegates).toEqual([]);
   });
 });

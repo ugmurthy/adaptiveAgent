@@ -3,9 +3,11 @@ import { dirname, extname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  createEditFileTool,
   createListDirectoryTool,
   createReadFileTool,
   createReadWebPageTool,
+  createSearchFilesTool,
   createShellExecTool,
   createWebSearchTool,
   createWriteFileTool,
@@ -48,7 +50,9 @@ function createBuiltinTools(workspaceRoot: string, shellCwd: string, env: NodeJS
   const tools = new Map<string, ToolDefinition<any, any>>();
   tools.set('read_file', createReadFileTool({ allowedRoot: workspaceRoot }));
   tools.set('list_directory', createListDirectoryTool({ allowedRoot: workspaceRoot }));
+  tools.set('search_files', createSearchFilesTool({ allowedRoot: workspaceRoot }));
   tools.set('write_file', createWriteFileTool({ allowedRoot: workspaceRoot }));
+  tools.set('edit_file', createEditFileTool({ allowedRoot: workspaceRoot }));
   tools.set('shell_exec', createShellExecTool({ cwd: shellCwd }));
   const timeoutMs = parsePositiveInteger(env.WEB_TOOL_TIMEOUT_MS);
   const webSearchProvider = resolveWebSearchProvider(env);

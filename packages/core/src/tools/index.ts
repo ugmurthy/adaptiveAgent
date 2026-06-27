@@ -7,6 +7,12 @@ export type { ListDirectoryToolConfig } from './list-directory.js';
 export { createWriteFileTool } from './write-file.js';
 export type { WriteFileToolConfig } from './write-file.js';
 
+export { createSearchFilesTool } from './search-files.js';
+export type { SearchFilesToolConfig } from './search-files.js';
+
+export { createEditFileTool } from './edit-file.js';
+export type { EditFileToolConfig } from './edit-file.js';
+
 export { createShellExecTool } from './shell-exec.js';
 export type { ShellExecToolConfig } from './shell-exec.js';
 

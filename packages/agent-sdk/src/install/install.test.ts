@@ -71,7 +71,7 @@ describe('install workflow helpers', () => {
     expect(report.provider).toBe('openrouter');
     expect(agent.model).toEqual({ provider: 'openrouter', model: 'qwen/qwen3.5-27b', apiKeyEnv: 'OPENROUTER_API_KEY' });
     expect(agent.workspaceRoot).toBe('.');
-    expect(agent.tools).toEqual(['read_file', 'list_directory', 'web_search', 'read_web_page']);
+    expect(agent.tools).toEqual(['read_file', 'list_directory', 'search_files', 'web_search', 'read_web_page']);
     expect(renderInitReport(report)).toContain('adaptive-agent run "Hello, confirm you are working"');
   });
 
@@ -133,6 +133,7 @@ describe('install workflow helpers', () => {
 
     expect(agent.model).toEqual({ provider: 'mesh', model: 'qwen/qwen3.5-27b', apiKeyEnv: 'MESH_API_KEY' });
     expect(agent.tools).toContain('write_file');
+    expect(agent.tools).toContain('edit_file');
     expect(agent.tools).toContain('shell_exec');
   });
 

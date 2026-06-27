@@ -75,8 +75,8 @@ const PROVIDER_DEFAULT_API_KEY_ENV: Partial<Record<InitProvider, string>> = {
   mesh: 'MESH_API_KEY',
 };
 
-const SAFE_TOOLS = ['read_file', 'list_directory', 'web_search', 'read_web_page'];
-const CODING_TOOLS = [...SAFE_TOOLS, 'write_file', 'shell_exec'];
+const SAFE_TOOLS = ['read_file', 'list_directory', 'search_files', 'web_search', 'read_web_page'];
+const CODING_TOOLS = [...SAFE_TOOLS, 'write_file', 'edit_file', 'shell_exec'];
 
 export async function runInit(options: InitOptions = {}): Promise<InitReport> {
   const env = options.env ?? process.env;

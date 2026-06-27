@@ -12,7 +12,9 @@
   "tools": [
     "read_file",
     "list_directory",
+    "search_files",
     "write_file",
+    "edit_file",
     "shell_exec",
     "web_search",
     "read_web_page"
