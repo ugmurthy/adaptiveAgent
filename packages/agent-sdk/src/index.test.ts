@@ -82,6 +82,41 @@ describe('agent-sdk config resolution', () => {
     await expect(loadAgentSdkConfig({ cwd: tempDir, env: {} })).rejects.toThrow(AgentSettingsValidationError);
   });
 
+  it('loads ground truth calendar policy from settings', async () => {
+    await writeAgentConfig(join(tempDir, 'agent.json'));
+    await writeFile(
+      join(tempDir, 'agent.settings.json'),
+      JSON.stringify({
+        groundTruth: {
+          timezone: 'Asia/Kolkata',
+          locale: 'en-IN',
+          weekStartsOn: 'monday',
+          fiscalYearStartMonth: 4,
+          fiscalQuarterNaming: 'endYear',
+          businessDays: ['monday', 'tuesday', 'wednesday', 'thursday', 'friday'],
+        },
+      }),
+    );
+
+    const config = await loadAgentSdkConfig({ cwd: tempDir, env: {} });
+
+    expect(config.groundTruth).toMatchObject({
+      enabled: true,
+      timezone: 'Asia/Kolkata',
+      locale: 'en-IN',
+      weekStartsOn: 'monday',
+      fiscalYearStartMonth: 4,
+      fiscalQuarterNaming: 'endYear',
+    });
+  });
+
+  it('rejects invalid fiscal year start month', async () => {
+    await writeAgentConfig(join(tempDir, 'agent.json'));
+    await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({ groundTruth: { fiscalYearStartMonth: 13 } }));
+
+    await expect(loadAgentSdkConfig({ cwd: tempDir, env: {} })).rejects.toThrow(AgentSettingsValidationError);
+  });
+
   it('inspects resolved tools without creating a runtime bundle', async () => {
     await writeAgentConfig(join(tempDir, 'agent.json'));
 

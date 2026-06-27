@@ -79,6 +79,7 @@ export async function resolveAgentSdkConfigWithSources(options: AgentSdkOptions)
     agents: { dirs: agentDirs },
     skills: { dirs: resolveSkillDirs(cwd, settings.skills?.dirs, settings.skills?.allowExampleSkills, env), allowExampleSkills: settings.skills?.allowExampleSkills ?? false },
     tui: normalizeTuiSettings(settings.tui),
+    groundTruth: { enabled: settings.groundTruth?.enabled ?? true, ...(settings.groundTruth ?? {}) },
   };
 
   return {
@@ -104,6 +105,7 @@ function mergeSettings(base: AgentSettingsFile, overrides: AgentSettingsFile | u
     ...(base.model || overrides.model ? { model: { ...(base.model ?? {}), ...(overrides.model ?? {}) } } : {}),
     ...(base.defaults || overrides.defaults ? { defaults: { ...(base.defaults ?? {}), ...(overrides.defaults ?? {}) } } : {}),
     ...(base.env || overrides.env ? { env: { ...(base.env ?? {}), ...(overrides.env ?? {}) } } : {}),
+    ...(base.groundTruth || overrides.groundTruth ? { groundTruth: { ...(base.groundTruth ?? {}), ...(overrides.groundTruth ?? {}) } } : {}),
     ...(base.tui || overrides.tui
       ? {
           tui: {

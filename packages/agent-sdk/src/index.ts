@@ -30,12 +30,14 @@ import type {
   ResolvedAgentSdkModuleInspection,
 } from './config-types.js';
 import { resolveAgentSdkConfig, resolveAgentSdkConfigWithSources } from './config-resolve.js';
+import { groundTruthSystemInstructions, mergeGroundTruthContext } from './ground-truth-context.js';
 import { resolveRuntimeBundle } from './postgres-runtime.js';
 import { discoverCatalogAgents, discoverCatalogDelegates, resolveToolsAndDelegates } from './tool-registry.js';
 import { mergeMetadata, normalizeRecovery, promptText, promptYesNo } from './sdk-utils.js';
 
 export * from './config-types.js';
 export * from './errors.js';
+export { buildGroundTruthContext, mergeGroundTruthContext } from './ground-truth-context.js';
 export { expandEnvironmentVariables } from './sdk-utils.js';
 export { createOrchestrationSdk, OrchestrationSdk } from './orchestration.js';
 export type {
@@ -65,15 +67,17 @@ export class AgentSdk {
   readonly metadata: JsonObject;
   readonly registeredToolNames: string[];
   private readonly closeRuntime?: () => Promise<void>;
+  private readonly clock?: () => Date;
   private unsubscribe?: () => void;
 
-  private constructor(args: { created: CreatedAdaptiveAgent<RunStore, EventStore, SnapshotStore, PlanStore | undefined, ContinuationStore>; config: ResolvedAgentSdkConfig; metadata: JsonObject; registeredToolNames: string[]; closeRuntime?: () => Promise<void>; unsubscribe?: () => void }) {
+  private constructor(args: { created: CreatedAdaptiveAgent<RunStore, EventStore, SnapshotStore, PlanStore | undefined, ContinuationStore>; config: ResolvedAgentSdkConfig; metadata: JsonObject; registeredToolNames: string[]; closeRuntime?: () => Promise<void>; unsubscribe?: () => void; clock?: () => Date }) {
     this.created = args.created;
     this.agent = args.created.agent;
     this.config = args.config;
     this.metadata = args.metadata;
     this.registeredToolNames = args.registeredToolNames;
     this.closeRuntime = args.closeRuntime;
+    this.clock = args.clock;
     this.unsubscribe = args.unsubscribe;
   }
 
@@ -90,31 +94,31 @@ export class AgentSdk {
       delegation: config.agent.delegation,
       recovery: normalizeRecovery(config.agent.recovery),
       defaults: { ...(config.agent.defaults ?? {}), ...(config.settings.defaults ?? {}), autoApproveAll: config.interaction.approvalMode === 'auto' || config.settings.defaults?.autoApproveAll === true },
-      systemInstructions: config.agent.systemInstructions,
+      systemInstructions: combineSystemInstructions(config.agent.systemInstructions, groundTruthSystemInstructions(config.groundTruth.enabled)),
       runtime: runtime.runtime,
       eventSink: options.eventListener ? { emit: options.eventListener } : undefined,
       logger,
     });
     const unsubscribe = config.events.subscribe && created.runtime.eventStore.subscribe ? created.runtime.eventStore.subscribe((event) => options.eventListener?.(event)) : undefined;
-    return new AgentSdk({ created, config, metadata, registeredToolNames: modules.registeredToolNames, closeRuntime: runtime.close, unsubscribe });
+    return new AgentSdk({ created, config, metadata, registeredToolNames: modules.registeredToolNames, closeRuntime: runtime.close, unsubscribe, clock: options.clock });
   }
 
   async run(goal: string, options: AgentSdkRunOptions = {}): Promise<RunResult> {
-    return this.resolveInteractions(await this.agent.run({ ...options, goal, metadata: mergeMetadata(this.metadata, options.metadata) }));
+    return this.resolveInteractions(await this.agent.run({ ...options, goal, context: this.enrichContext(options.context), metadata: mergeMetadata(this.metadata, options.metadata) }));
   }
 
   async runRaw(goal: string, options: AgentSdkRunOptions = {}): Promise<RunResult> {
-    return this.agent.run({ ...options, goal, metadata: mergeMetadata(this.metadata, options.metadata) });
+    return this.agent.run({ ...options, goal, context: this.enrichContext(options.context), metadata: mergeMetadata(this.metadata, options.metadata) });
   }
 
   async chat(messageOrMessages: string | ChatMessage[], options: AgentSdkChatOptions = {}): Promise<ChatResult> {
     const messages = typeof messageOrMessages === 'string' ? [{ role: 'user' as const, content: messageOrMessages }] : messageOrMessages;
-    return this.resolveInteractions(await this.agent.chat({ ...options, messages, metadata: mergeMetadata(this.metadata, options.metadata) }));
+    return this.resolveInteractions(await this.agent.chat({ ...options, messages, context: this.enrichContext(options.context), metadata: mergeMetadata(this.metadata, options.metadata) }));
   }
 
   async chatRaw(messageOrMessages: string | ChatMessage[], options: AgentSdkChatOptions = {}): Promise<ChatResult> {
     const messages = typeof messageOrMessages === 'string' ? [{ role: 'user' as const, content: messageOrMessages }] : messageOrMessages;
-    return this.agent.chat({ ...options, messages, metadata: mergeMetadata(this.metadata, options.metadata) });
+    return this.agent.chat({ ...options, messages, context: this.enrichContext(options.context), metadata: mergeMetadata(this.metadata, options.metadata) });
   }
 
   async resume(runId: UUID): Promise<RunResult> { return this.resolveInteractions(await this.agent.resume(runId)); }
@@ -130,6 +134,10 @@ export class AgentSdk {
   async inspect(runId: UUID): Promise<{ run: Awaited<ReturnType<RunStore['getRun']>>; events: AgentEvent[] }> { return { run: await this.created.runtime.runStore.getRun(runId), events: await this.created.runtime.eventStore.listByRun(runId) }; }
   subscribe(listener: (event: AgentEvent) => void): () => void { return this.created.runtime.eventStore.subscribe?.(listener) ?? (() => undefined); }
   async close(): Promise<void> { this.unsubscribe?.(); this.unsubscribe = undefined; await this.closeRuntime?.(); }
+
+  private enrichContext(context: Record<string, JsonValue> | undefined): JsonObject | undefined {
+    return mergeGroundTruthContext(context, this.config.groundTruth, { now: this.clock?.() });
+  }
 
   private async resolveInteractions<T extends RunResult | ChatResult>(initial: T): Promise<T> {
     let result: RunResult | ChatResult = initial;
@@ -203,4 +211,9 @@ function pickToolInspectionFields(tool: ToolDefinition<any, any>): Pick<ToolDefi
     inputSchema: tool.inputSchema,
     requiresApproval: tool.requiresApproval,
   };
+}
+
+function combineSystemInstructions(agentInstructions: string | undefined, runtimeInstructions: string): string | undefined {
+  const parts = [runtimeInstructions.trim(), agentInstructions?.trim()].filter((part): part is string => Boolean(part));
+  return parts.length > 0 ? parts.join('\n\n') : undefined;
 }

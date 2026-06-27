@@ -27,6 +27,7 @@ export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'silent';
 export type LogDestination = 'console' | 'file' | 'both';
 export type TuiMessageType = 'user' | 'assistant' | 'progress' | 'run' | 'system' | 'event';
 export type TuiTextStyleName = 'default' | 'dim' | 'bold' | 'italic' | 'underline' | 'red' | 'green' | 'yellow' | 'blue' | 'magenta' | 'cyan' | 'white' | 'gray';
+export type WeekdayName = 'monday' | 'tuesday' | 'wednesday' | 'thursday' | 'friday' | 'saturday' | 'sunday';
 
 export type SupportedModality = 'text' | 'image' | 'file' | 'audio';
 
@@ -45,6 +46,16 @@ export interface TuiMessageStyleConfig {
 
 export interface TuiSettingsConfig {
   messages?: Partial<Record<TuiMessageType, TuiMessageStyleConfig>>;
+}
+
+export interface GroundTruthSettingsConfig {
+  enabled?: boolean;
+  timezone?: string;
+  locale?: string;
+  weekStartsOn?: WeekdayName;
+  fiscalYearStartMonth?: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12;
+  fiscalQuarterNaming?: 'startYear' | 'endYear';
+  businessDays?: WeekdayName[];
 }
 
 export interface AgentConfigFile {
@@ -84,6 +95,7 @@ export interface AgentSettingsFile {
   defaults?: Partial<AgentDefaults>;
   env?: Record<string, string>;
   tui?: TuiSettingsConfig;
+  groundTruth?: GroundTruthSettingsConfig;
 }
 
 export interface ResolvedAgentSdkConfig {
@@ -99,6 +111,7 @@ export interface ResolvedAgentSdkConfig {
   agents: { dirs: string[] };
   skills: { dirs: string[]; allowExampleSkills: boolean };
   tui: TuiSettingsConfig;
+  groundTruth: Required<Pick<GroundTruthSettingsConfig, 'enabled'>> & GroundTruthSettingsConfig;
 }
 
 export interface ResolvedAgentSdkModuleInspection {
@@ -162,6 +175,7 @@ export interface AgentSdkOptions {
   delegates?: DelegateDefinition[];
   logger?: ReturnType<typeof createAdaptiveAgentLogger>;
   eventListener?: (event: AgentEvent) => void;
+  clock?: () => Date;
 }
 
 export interface AgentSdkRunOptions extends Omit<RunRequest, 'goal' | 'metadata'> { metadata?: JsonObject }
