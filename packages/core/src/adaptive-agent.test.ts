@@ -1607,6 +1607,55 @@ describe('AdaptiveAgent', () => {
     expect(model.receivedRequests).toHaveLength(1);
   });
 
+  it('records capped diagnostics when outputSchema fails with no visible model output', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const outputSchema = {
+      type: 'object',
+      properties: { answer: { type: 'string' } },
+      required: ['answer'],
+    };
+    const model = new SequenceModel([
+      {
+        finishReason: 'stop',
+        reasoning: 'internal-only reasoning',
+        providerResponseId: 'provider-response-1',
+      },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const result = await agent.run({ goal: 'Return structured output', outputSchema });
+
+    expect(result).toMatchObject({
+      status: 'failure',
+      code: 'MODEL_ERROR',
+      error: expect.stringContaining('outputSchema'),
+    });
+    const failedEvent = (await eventStore.listByRun(result.runId)).find((event) => event.type === 'run.failed');
+    expect(failedEvent?.payload).toMatchObject({
+      code: 'MODEL_ERROR',
+      diagnostics: {
+        kind: 'output_schema_noncompliance',
+        parseFailureReason: 'no_visible_text_or_structured_output',
+        finishReason: 'stop',
+        providerResponseId: 'provider-response-1',
+        toolCallCount: 0,
+        visibleTextBytes: 0,
+        structuredOutputBytes: 0,
+        reasoningBytes: 23,
+        repairAttempted: false,
+      },
+    });
+    expect(JSON.stringify(failedEvent?.payload)).not.toContain('internal-only reasoning');
+  });
+
   it('repairs a child run with outputSchema when the child model returns only text', async () => {
     const runStore = new InMemoryRunStore();
     const eventStore = new InMemoryEventStore();

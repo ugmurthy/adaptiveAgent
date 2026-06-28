@@ -118,6 +118,16 @@ interface ToolBudgetUsage {
   checkpointEmitted: boolean;
 }
 
+interface RunFailureEventOptions {
+  diagnostics?: JsonObject;
+}
+
+interface OutputSchemaRepairResult {
+  output?: JsonObject;
+  usage?: UsageSummary;
+  diagnostics?: JsonObject;
+}
+
 interface RuntimeToolContext extends ToolContext {
   abort(reason?: unknown): void;
 }
@@ -164,6 +174,8 @@ const EXECUTION_STATE_SCHEMA_VERSION = 1;
 const DEFAULT_TOOL_TERMINAL_RETRY_LIMIT = 1;
 const DEFAULT_INVALID_TOOL_CALL_REPAIR_LIMIT = 1;
 const DEFAULT_MODEL_RESULT_MAX_BYTES = 64 * 1024;
+const OUTPUT_SCHEMA_DIAGNOSTIC_PREVIEW_CHARS = 1_000;
+const diagnosticTextEncoder = new TextEncoder();
 
 const TERMINAL_RUN_STATUSES = new Set<RunStatus>([
   'succeeded',
@@ -1687,7 +1699,10 @@ export class AdaptiveAgent {
       if (state.outputSchema) {
         let structuredOutput = readStructuredOutputCandidate(response);
         const repairText = readStructuredOutputRepairText(response);
+        let repairAttempted = false;
+        let repairDiagnostics: JsonObject | undefined;
         if (structuredOutput === undefined && repairText) {
+          repairAttempted = true;
           const repairResult = await this.repairStructuredOutputFromText(
             currentRun,
             repairText,
@@ -1697,6 +1712,7 @@ export class AdaptiveAgent {
             currentRun = await this.applyUsage(currentRun, repairResult.usage);
           }
           structuredOutput = repairResult.output;
+          repairDiagnostics = repairResult.diagnostics;
         }
 
         if (structuredOutput === undefined) {
@@ -1705,6 +1721,12 @@ export class AdaptiveAgent {
             state,
             'Model response did not satisfy outputSchema: expected structured JSON object but received text output',
             'MODEL_ERROR',
+            {
+              diagnostics: buildOutputSchemaFailureDiagnostics(response, {
+                repairAttempted,
+                repairDiagnostics,
+              }),
+            },
           );
         }
 
@@ -3963,7 +3985,7 @@ export class AdaptiveAgent {
     run: AgentRun,
     text: string,
     outputSchema: JsonSchema,
-  ): Promise<{ output?: JsonObject; usage?: UsageSummary }> {
+  ): Promise<OutputSchemaRepairResult> {
     const repairRequest: ModelRequest = {
       messages: buildOutputSchemaRepairMessages(text, outputSchema),
       tools: [],
@@ -4009,7 +4031,15 @@ export class AdaptiveAgent {
         }),
         error: errorForLog(error),
       });
-      return {};
+      return {
+        diagnostics: compactJsonObject({
+          attempted: true,
+          failed: true,
+          failureReason: 'repair_model_error',
+          error: errorToMessage(error),
+          durationMs,
+        }),
+      };
     } finally {
       timeoutContext.dispose();
     }
@@ -4032,6 +4062,7 @@ export class AdaptiveAgent {
     return {
       ...(output ? { output } : {}),
       ...(response.usage ? { usage: response.usage } : {}),
+      diagnostics: buildOutputSchemaRepairDiagnostics(response, Boolean(output), durationMs),
     };
   }
 
@@ -4145,6 +4176,7 @@ export class AdaptiveAgent {
     state: ExecutionState,
     error: string,
     code: RunFailureCode,
+    options: RunFailureEventOptions = {},
   ): Promise<RunResult> {
     const currentRun = await this.refreshRun(run.id);
     const failedRun = await this.persistTerminalRunTransition({
@@ -4164,6 +4196,7 @@ export class AdaptiveAgent {
         payload: {
           error,
           code,
+          ...(options.diagnostics ? { diagnostics: options.diagnostics } : {}),
           ...runLineagePayload(failedRun),
         },
       }),
@@ -4175,6 +4208,7 @@ export class AdaptiveAgent {
       durationMs: this.runDurationMs(failedRun),
       error,
       code,
+      diagnostics: options.diagnostics,
       stepsUsed: state.stepsUsed,
       usage: captureValueForLog(failedRun.usage, { mode: 'full' }),
     });
@@ -4806,6 +4840,92 @@ function readStructuredOutputCandidate(response: Pick<ModelResponse, 'structured
 
 function readStructuredOutputRepairText(response: Pick<ModelResponse, 'structuredOutput' | 'text'>): string | undefined {
   return response.text ?? (typeof response.structuredOutput === 'string' ? response.structuredOutput : undefined);
+}
+
+function buildOutputSchemaFailureDiagnostics(
+  response: ModelResponse,
+  options: {
+    repairAttempted: boolean;
+    repairDiagnostics?: JsonObject;
+  },
+): JsonObject {
+  return compactJsonObject({
+    kind: 'output_schema_noncompliance',
+    parseFailureReason: outputSchemaParseFailureReason(response, options.repairAttempted, options.repairDiagnostics),
+    finishReason: response.finishReason,
+    providerResponseId: response.providerResponseId,
+    toolCallCount: response.toolCalls?.length ?? 0,
+    visibleTextBytes: response.text === undefined ? 0 : encodedDiagnosticByteLength(response.text),
+    visibleTextPreview: response.text === undefined ? undefined : previewDiagnosticText(response.text),
+    structuredOutputBytes: response.structuredOutput === undefined ? 0 : approximateSerializedByteLength(response.structuredOutput),
+    structuredOutputPreview: response.structuredOutput === undefined ? undefined : previewDiagnosticValue(response.structuredOutput),
+    reasoningBytes: response.reasoning === undefined ? 0 : encodedDiagnosticByteLength(response.reasoning),
+    repairAttempted: options.repairAttempted,
+    repair: options.repairDiagnostics,
+  });
+}
+
+function buildOutputSchemaRepairDiagnostics(response: ModelResponse, repaired: boolean, durationMs: number): JsonObject {
+  return compactJsonObject({
+    attempted: true,
+    repaired,
+    failureReason: repaired ? undefined : 'repair_output_not_structured_json_object',
+    finishReason: response.finishReason,
+    providerResponseId: response.providerResponseId,
+    durationMs,
+    toolCallCount: response.toolCalls?.length ?? 0,
+    visibleTextBytes: response.text === undefined ? 0 : encodedDiagnosticByteLength(response.text),
+    visibleTextPreview: response.text === undefined ? undefined : previewDiagnosticText(response.text),
+    structuredOutputBytes: response.structuredOutput === undefined ? 0 : approximateSerializedByteLength(response.structuredOutput),
+    structuredOutputPreview: response.structuredOutput === undefined ? undefined : previewDiagnosticValue(response.structuredOutput),
+    reasoningBytes: response.reasoning === undefined ? 0 : encodedDiagnosticByteLength(response.reasoning),
+  });
+}
+
+function outputSchemaParseFailureReason(
+  response: ModelResponse,
+  repairAttempted: boolean,
+  repairDiagnostics: JsonObject | undefined,
+): string {
+  if (repairAttempted) {
+    const repairReason = typeof repairDiagnostics?.failureReason === 'string'
+      ? repairDiagnostics.failureReason
+      : 'repair_failed';
+    return repairReason;
+  }
+
+  if (response.text === undefined && response.structuredOutput === undefined) {
+    return 'no_visible_text_or_structured_output';
+  }
+
+  if (response.structuredOutput !== undefined && typeof response.structuredOutput !== 'string') {
+    return 'structured_output_not_json_object';
+  }
+
+  return 'visible_text_not_structured_json_object';
+}
+
+function previewDiagnosticValue(value: JsonValue): JsonValue {
+  if (typeof value === 'string') {
+    return previewDiagnosticText(value);
+  }
+
+  const serialized = JSON.stringify(value);
+  if (serialized.length <= OUTPUT_SCHEMA_DIAGNOSTIC_PREVIEW_CHARS) {
+    return value;
+  }
+
+  return `${serialized.slice(0, OUTPUT_SCHEMA_DIAGNOSTIC_PREVIEW_CHARS)}...`;
+}
+
+function previewDiagnosticText(text: string): string {
+  return text.length <= OUTPUT_SCHEMA_DIAGNOSTIC_PREVIEW_CHARS
+    ? text
+    : `${text.slice(0, OUTPUT_SCHEMA_DIAGNOSTIC_PREVIEW_CHARS)}...`;
+}
+
+function encodedDiagnosticByteLength(text: string): number {
+  return diagnosticTextEncoder.encode(text).byteLength;
 }
 
 function parseStructuredOutputText(text: string | undefined): JsonObject | undefined {
