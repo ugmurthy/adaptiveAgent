@@ -26,7 +26,18 @@ export type EventType =
   | 'snapshot.created'
   | 'replan.required';
 
-export type ReportView = 'overview' | 'performance' | 'milestones' | 'timeline' | 'delegates' | 'messages' | 'plans' | 'all';
+export type ReportView =
+  | 'brief'
+  | 'overview'
+  | 'investigate'
+  | 'policy'
+  | 'performance'
+  | 'milestones'
+  | 'timeline'
+  | 'delegates'
+  | 'messages'
+  | 'plans'
+  | 'all';
 export type MessageView = 'compact' | 'delta' | 'full';
 
 export interface CliOptions {
@@ -47,6 +58,7 @@ export interface CliOptions {
   messagesView?: MessageView;
   focusRunId?: string;
   previewChars?: number;
+  htmlPath?: string;
   configPath?: string;
   databaseUrl?: string;
   databaseUrlEnv?: string;
@@ -377,6 +389,129 @@ export interface RunMessageTrace {
   effectiveMessages: TraceMessage[];
 }
 
+export type TraceFindingSeverity = 'info' | 'warning' | 'error';
+
+export type TraceFindingCategory = 'failure' | 'blocked' | 'policy' | 'performance' | 'data-quality';
+
+export interface EvidenceRef {
+  kind: 'run' | 'root-run' | 'event' | 'tool' | 'delegate' | 'message' | 'usage' | 'snapshot';
+  label: string;
+  rootRunId?: string;
+  runId?: string;
+  stepId?: string | null;
+  toolCallId?: string | null;
+  eventSeq?: number | null;
+  eventType?: string | null;
+  detail?: string;
+}
+
+export interface TraceFinding {
+  id: string;
+  severity: TraceFindingSeverity;
+  category: TraceFindingCategory;
+  title: string;
+  summary: string;
+  evidence: EvidenceRef[];
+}
+
+export interface SuggestedCommand {
+  reason: string;
+  command: string;
+}
+
+export interface TraceBrief {
+  status: TraceReport['summary']['status'];
+  headline: string;
+  targetLabel: string;
+  rootRunCount: number;
+  runCount: number;
+  totalSteps: number | null;
+  wallDurationMs: number | null;
+  cumulativeModelDurationMs: number;
+  cumulativeToolDurationMs: number;
+  cumulativeSnapshotSaveMs: number;
+  cumulativeMeasuredDurationMs: number;
+  parallelismFactor: number | null;
+  modelCalls: number;
+  failedModelCalls: number;
+  toolCalls: number;
+  failedToolCalls: number;
+  totalTokens: number;
+  estimatedCostUSD: number;
+}
+
+export interface TopRunUsage {
+  rootRunId: string;
+  runId: string;
+  goal: string | null;
+  promptTokens: number;
+  completionTokens: number;
+  reasoningTokens?: number;
+  totalTokens: number;
+  estimatedCostUSD: number;
+}
+
+export interface TopToolSpan {
+  rootRunId: string;
+  runId: string;
+  stepId: string | null;
+  toolCallId: string | null;
+  toolName: string | null;
+  outcome: string;
+  durationMs: number;
+  childRunId: string | null;
+}
+
+export interface TopToolMetric {
+  toolName: string;
+  started: number;
+  completed: number;
+  failed: number;
+  durationMs: PerformanceBucketSummary;
+  rawOutputBytes: PerformanceBucketSummary;
+  modelOutputBytes: PerformanceBucketSummary;
+}
+
+export interface PerformanceDigest {
+  wallDurationMs: number | null;
+  cumulativeModelDurationMs: number;
+  cumulativeToolDurationMs: number;
+  cumulativeSnapshotSaveMs: number;
+  cumulativeMeasuredDurationMs: number;
+  otherDurationMs: number | null;
+  parallelismFactor: number | null;
+  topToolSpans: TopToolSpan[];
+  topToolsByDuration: TopToolMetric[];
+  topToolsByModelOutput: TopToolMetric[];
+  topRunsByUsage: TopRunUsage[];
+  notes: string[];
+}
+
+export interface PolicyBudgetGroupSummary {
+  budgetGroup: string;
+  skippedCalls: number;
+  toolNames: string[];
+}
+
+export interface PolicyDigest {
+  budgetExhaustedToolCalls: number;
+  budgetGroups: PolicyBudgetGroupSummary[];
+  rejectedToolCalls: number;
+  approvalRequests: number;
+  approvalResolved: number;
+  unresolvedApprovalRequests: number;
+  runtimePolicyMessages: number;
+  warnings: string[];
+}
+
+export interface TraceDiagnostics {
+  brief: TraceBrief;
+  findings: TraceFinding[];
+  performance: PerformanceDigest;
+  policy: PolicyDigest;
+  suggestedNextViews: SuggestedCommand[];
+}
+
 export interface SnapshotMessageRow {
   root_run_id: string;
   run_id: string;
@@ -409,6 +544,7 @@ export interface TraceReport {
     reason: string;
   };
   warnings: string[];
+  diagnostics?: TraceDiagnostics;
 }
 
 export interface TraceTarget {

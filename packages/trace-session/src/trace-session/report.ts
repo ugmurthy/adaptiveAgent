@@ -2,15 +2,22 @@ import { formatCompactAgentEventFrame, type AgentEventFrame } from '../event-for
 
 import type {
   DelegateRow,
+  EvidenceRef,
   EventType,
   MilestoneEntry,
   PerformanceBucketSummary,
+  PerformanceDigest,
   PerformanceSummary,
+  PolicyDigest,
   RootRun,
   RunSnapshotSummary,
   RunTreeEntry,
   SessionOverview,
+  TopRunUsage,
+  TopToolMetric,
   TimelineEntry,
+  TraceDiagnostics,
+  TraceFinding,
   TraceReport,
   TraceRow,
 } from './types.js';
@@ -200,6 +207,42 @@ export function summarizeTrace(
   }
 
   return { status: 'unknown', reason: 'not enough persisted trace data to determine the terminal reason' };
+}
+
+export function buildTraceDiagnostics(report: TraceReport): TraceDiagnostics {
+  const performance = report.performance ?? emptyPerformanceSummaryForDiagnostics();
+  const wallDurationMs = traceWallDurationMs(report.rootRuns, report.session);
+  const performanceDigest = buildPerformanceDigest(report, performance, wallDurationMs);
+  const policyDigest = buildPolicyDigest(report);
+  const findings = buildTraceFindings(report, performance, performanceDigest, policyDigest);
+  const brief = {
+    status: report.summary.status,
+    headline: report.summary.reason,
+    targetLabel: traceTargetLabel(report),
+    rootRunCount: report.rootRuns.length,
+    runCount: runCount(report),
+    totalSteps: report.totalSteps ?? null,
+    wallDurationMs,
+    cumulativeModelDurationMs: performance.model.durationMs.total,
+    cumulativeToolDurationMs: performance.tools.durationMs.total,
+    cumulativeSnapshotSaveMs: performance.snapshots.saveDurationMs.total,
+    cumulativeMeasuredDurationMs: performanceDigest.cumulativeMeasuredDurationMs,
+    parallelismFactor: performanceDigest.parallelismFactor,
+    modelCalls: performance.model.started,
+    failedModelCalls: performance.model.failed,
+    toolCalls: performance.tools.started,
+    failedToolCalls: performance.tools.failed,
+    totalTokens: report.usage.total.totalTokens,
+    estimatedCostUSD: report.usage.total.estimatedCostUSD,
+  };
+
+  return {
+    brief,
+    findings,
+    performance: performanceDigest,
+    policy: policyDigest,
+    suggestedNextViews: buildSuggestedNextViews(report, findings, policyDigest, performanceDigest),
+  };
 }
 
 export function summarizePerformance(rows: TraceRow[]): PerformanceSummary {
@@ -470,6 +513,253 @@ export function summarizePerformance(rows: TraceRow[]): PerformanceSummary {
   }
 }
 
+function buildPerformanceDigest(
+  report: TraceReport,
+  performance: PerformanceSummary,
+  wallDurationMs: number | null,
+): PerformanceDigest {
+  const cumulativeMeasuredDurationMs = performance.model.durationMs.total
+    + performance.tools.durationMs.total
+    + performance.snapshots.saveDurationMs.total;
+  const otherDurationMs = wallDurationMs === null ? null : Math.max(0, wallDurationMs - cumulativeMeasuredDurationMs);
+  const parallelismFactor = wallDurationMs && wallDurationMs > 0
+    ? cumulativeMeasuredDurationMs / wallDurationMs
+    : null;
+  const topToolSpans = report.timeline
+    .filter((entry): entry is TimelineEntry & { durationMs: number } => entry.durationMs !== null && entry.durationMs > 0)
+    .sort((left, right) => right.durationMs - left.durationMs)
+    .slice(0, 5)
+    .map((entry) => ({
+      rootRunId: entry.rootRunId,
+      runId: entry.runId,
+      stepId: entry.stepId,
+      toolCallId: entry.toolCallId,
+      toolName: entry.toolName,
+      outcome: entry.outcome,
+      durationMs: entry.durationMs,
+      childRunId: entry.childRunId,
+    }));
+  const topToolsByDuration = topToolMetrics(performance.tools.byTool, (tool) => tool.durationMs.total);
+  const topToolsByModelOutput = topToolMetrics(performance.tools.byTool, (tool) => tool.modelOutputBytes.total);
+  const topRunsByUsage = buildTopRunsByUsage(report);
+  const notes: string[] = [];
+
+  if (parallelismFactor !== null && parallelismFactor > 1.25) {
+    notes.push('Cumulative measured time exceeds wall time; model/tool/snapshot totals represent parallel or nested work, not critical path latency.');
+  }
+  if (performance.snapshots.messageBytes.max > 0 && performance.model.requestBytes.max > 0) {
+    notes.push('Compare largest snapshot message bytes with largest model request bytes to identify prompt-context growth.');
+  }
+  if (performance.tools.rawOutputBytes.total > performance.tools.modelOutputBytes.total) {
+    notes.push('Tool raw output is larger than model-visible output; tool summarization/compression is reducing context load.');
+  }
+
+  return {
+    wallDurationMs,
+    cumulativeModelDurationMs: performance.model.durationMs.total,
+    cumulativeToolDurationMs: performance.tools.durationMs.total,
+    cumulativeSnapshotSaveMs: performance.snapshots.saveDurationMs.total,
+    cumulativeMeasuredDurationMs,
+    otherDurationMs,
+    parallelismFactor,
+    topToolSpans,
+    topToolsByDuration,
+    topToolsByModelOutput,
+    topRunsByUsage,
+    notes,
+  };
+}
+
+function buildPolicyDigest(report: TraceReport): PolicyDigest {
+  const budgetGroups = new Map<string, { skippedCalls: number; toolNames: Set<string> }>();
+  let budgetExhaustedToolCalls = 0;
+
+  for (const entry of report.timeline) {
+    const budget = findBudgetExhaustedRecord(entry.output) ?? findBudgetExhaustedRecord(entry.params);
+    if (!budget) {
+      continue;
+    }
+    budgetExhaustedToolCalls += 1;
+    const budgetGroup = readStringFromRecord(budget, 'budgetGroup') ?? 'unknown';
+    const group = budgetGroups.get(budgetGroup) ?? { skippedCalls: 0, toolNames: new Set<string>() };
+    group.skippedCalls += 1;
+    if (entry.toolName) {
+      group.toolNames.add(entry.toolName);
+    }
+    budgetGroups.set(budgetGroup, group);
+  }
+
+  const rejectedToolCalls = (report.milestones ?? []).filter((entry) => entry.eventType === 'model.tool_call_rejected').length;
+  const approvalRequests = (report.milestones ?? []).filter((entry) => entry.eventType === 'approval.requested').length;
+  const approvalResolved = (report.milestones ?? []).filter((entry) => entry.eventType === 'approval.resolved').length;
+  const runtimePolicyMessages = report.llmMessages.reduce((total, trace) =>
+    total + trace.effectiveMessages.filter((message) => isRuntimePolicyMessage(message.category, message.content)).length,
+  0);
+  const unresolvedApprovalRequests = Math.max(0, approvalRequests - approvalResolved);
+  const warnings: string[] = [];
+
+  if (budgetExhaustedToolCalls > 0) {
+    warnings.push(`Observed ${budgetExhaustedToolCalls} tool calls skipped after a budget was exhausted.`);
+  }
+  if (rejectedToolCalls > 0) {
+    warnings.push(`Observed ${rejectedToolCalls} rejected model tool calls.`);
+  }
+  if (unresolvedApprovalRequests > 0) {
+    warnings.push(`Observed ${unresolvedApprovalRequests} approval requests without matching approval.resolved events.`);
+  }
+  if (runtimePolicyMessages > 0) {
+    warnings.push(`Observed ${runtimePolicyMessages} runtime-injected policy or budget messages in LLM context.`);
+  }
+
+  return {
+    budgetExhaustedToolCalls,
+    budgetGroups: [...budgetGroups.entries()]
+      .map(([budgetGroup, group]) => ({
+        budgetGroup,
+        skippedCalls: group.skippedCalls,
+        toolNames: [...group.toolNames].sort((left, right) => left.localeCompare(right)),
+      }))
+      .sort((left, right) => right.skippedCalls - left.skippedCalls || left.budgetGroup.localeCompare(right.budgetGroup)),
+    rejectedToolCalls,
+    approvalRequests,
+    approvalResolved,
+    unresolvedApprovalRequests,
+    runtimePolicyMessages,
+    warnings,
+  };
+}
+
+function buildTraceFindings(
+  report: TraceReport,
+  performance: PerformanceSummary,
+  performanceDigest: PerformanceDigest,
+  policyDigest: PolicyDigest,
+): TraceFinding[] {
+  const findings: TraceFinding[] = [];
+  let nextId = 1;
+  const pushFinding = (finding: Omit<TraceFinding, 'id'>): void => {
+    findings.push({ id: `finding-${nextId}`, ...finding });
+    nextId += 1;
+  };
+
+  if (report.summary.status === 'failed' || report.summary.status === 'blocked') {
+    pushFinding({
+      severity: report.summary.status === 'failed' ? 'error' : 'warning',
+      category: report.summary.status === 'failed' ? 'failure' : 'blocked',
+      title: report.summary.status === 'failed' ? 'Trace failed' : 'Trace is blocked',
+      summary: report.summary.reason,
+      evidence: primaryOutcomeEvidence(report),
+    });
+  }
+
+  if (performance.model.failed > 0) {
+    pushFinding({
+      severity: 'error',
+      category: 'failure',
+      title: 'Model failures observed',
+      summary: `${performance.model.failed} model lifecycle events ended in failure.`,
+      evidence: modelFailureEvidence(report),
+    });
+  }
+
+  if (performance.tools.failed > 0) {
+    pushFinding({
+      severity: 'error',
+      category: 'failure',
+      title: 'Tool failures observed',
+      summary: `${performance.tools.failed} tool executions ended in failure.`,
+      evidence: failedToolEvidence(report),
+    });
+  }
+
+  if (performanceDigest.parallelismFactor !== null && performanceDigest.parallelismFactor > 1.25) {
+    pushFinding({
+      severity: performanceDigest.parallelismFactor >= 2 ? 'warning' : 'info',
+      category: 'performance',
+      title: 'Cumulative work exceeds wall time',
+      summary: `Measured model/tool/snapshot time is ${performanceDigest.parallelismFactor.toFixed(2)}x wall time, so totals should be read as cumulative work rather than critical-path latency.`,
+      evidence: [{
+        kind: 'usage',
+        label: 'duration split',
+        detail: `wall=${performanceDigest.wallDurationMs ?? 'unknown'}ms cumulative=${performanceDigest.cumulativeMeasuredDurationMs}ms`,
+      }],
+    });
+  }
+
+  const topRun = performanceDigest.topRunsByUsage[0];
+  if (topRun && report.usage.total.totalTokens > 0) {
+    const share = topRun.totalTokens / report.usage.total.totalTokens;
+    if (share >= 0.5) {
+      pushFinding({
+        severity: 'info',
+        category: 'performance',
+        title: 'Token usage is concentrated in one root run',
+        summary: `Root run ${shortId(topRun.rootRunId)} accounts for ${(share * 100).toFixed(1)}% of total tokens.`,
+        evidence: [{
+          kind: 'usage',
+          label: `root ${shortId(topRun.rootRunId)} usage`,
+          rootRunId: topRun.rootRunId,
+          runId: topRun.runId,
+          detail: `${topRun.totalTokens} total tokens`,
+        }],
+      });
+    }
+  }
+
+  for (const warning of policyDigest.warnings) {
+    pushFinding({
+      severity: 'warning',
+      category: 'policy',
+      title: policyFindingTitle(warning),
+      summary: warning,
+      evidence: policyEvidence(report, warning),
+    });
+  }
+
+  for (const warning of report.warnings) {
+    pushFinding({
+      severity: 'warning',
+      category: 'data-quality',
+      title: 'Trace data warning',
+      summary: warning,
+      evidence: [{ kind: 'event', label: 'trace warning', detail: warning }],
+    });
+  }
+
+  return findings;
+}
+
+function buildSuggestedNextViews(
+  report: TraceReport,
+  findings: TraceFinding[],
+  policyDigest: PolicyDigest,
+  performanceDigest: PerformanceDigest,
+): TraceDiagnostics['suggestedNextViews'] {
+  const suggestions = new Map<string, string>();
+  const add = (reason: string, command: string): void => {
+    if (!suggestions.has(command)) {
+      suggestions.set(command, reason);
+    }
+  };
+  const failingRunId = firstEvidenceRunId(findings.find((finding) => finding.severity === 'error'));
+
+  if (failingRunId) {
+    add('Inspect the failed run message context.', `trace-session --run ${failingRunId} --view messages --messages-view delta`);
+    add('Inspect the failed run tool timeline.', `trace-session --run ${failingRunId} --view timeline`);
+  }
+  if (policyDigest.warnings.length > 0) {
+    add('Review budget, rejected-call, and approval adherence.', `${traceTargetCommand(report)} --view policy`);
+  }
+  if (performanceDigest.topToolSpans.length > 0 || performanceDigest.topRunsByUsage.length > 0) {
+    add('Review duration and token hotspots.', `${traceTargetCommand(report)} --view performance`);
+  }
+  if (suggestions.size === 0) {
+    add('Review the concise trace overview.', `${traceTargetCommand(report)} --view overview`);
+  }
+
+  return [...suggestions.entries()].map(([command, reason]) => ({ reason, command }));
+}
+
 
 export function buildMilestones(rows: TraceRow[]): MilestoneEntry[] {
   const entries = new Map<string, MilestoneEntry>();
@@ -593,6 +883,390 @@ export function filterReportForFocusedRun(report: TraceReport, focusedRunIds: Se
     delegates: report.delegates.filter((delegate) => focusedRunIds.has(delegate.parent_run_id) || (delegate.child_run_id !== null && focusedRunIds.has(delegate.child_run_id))),
     plans: report.plans.filter((plan) => focusedRunIds.has(plan.run_id)),
   };
+}
+
+function topToolMetrics(
+  tools: PerformanceSummary['tools']['byTool'],
+  score: (tool: PerformanceSummary['tools']['byTool'][number]) => number,
+): TopToolMetric[] {
+  return [...tools]
+    .filter((tool) => score(tool) > 0 || tool.started > 0 || tool.failed > 0)
+    .sort((left, right) => score(right) - score(left) || left.toolName.localeCompare(right.toolName))
+    .slice(0, 5)
+    .map((tool) => ({
+      toolName: tool.toolName,
+      started: tool.started,
+      completed: tool.completed,
+      failed: tool.failed,
+      durationMs: tool.durationMs,
+      rawOutputBytes: tool.rawOutputBytes,
+      modelOutputBytes: tool.modelOutputBytes,
+    }));
+}
+
+function buildTopRunsByUsage(report: TraceReport): TopRunUsage[] {
+  const rootRunsById = new Map(report.rootRuns.map((run) => [run.rootRunId, run]));
+  return report.usage.byRootRun
+    .map((item) => {
+      const rootRun = rootRunsById.get(item.rootRunId);
+      return {
+        rootRunId: item.rootRunId,
+        runId: rootRun?.runId ?? item.rootRunId,
+        goal: rootRun?.goal ?? null,
+        promptTokens: item.usage.promptTokens,
+        completionTokens: item.usage.completionTokens,
+        reasoningTokens: item.usage.reasoningTokens,
+        totalTokens: item.usage.totalTokens,
+        estimatedCostUSD: item.usage.estimatedCostUSD,
+      };
+    })
+    .filter((item) => item.totalTokens > 0 || item.estimatedCostUSD > 0)
+    .sort((left, right) => right.totalTokens - left.totalTokens || right.estimatedCostUSD - left.estimatedCostUSD)
+    .slice(0, 5);
+}
+
+function traceWallDurationMs(rootRuns: RootRun[], session: SessionOverview | null): number | null {
+  let earliestStart: number | null = null;
+  let latestEnd: number | null = null;
+
+  for (const run of rootRuns) {
+    const start = parseTimestamp(run.startedAt ?? run.linkedAt);
+    const end = parseTimestamp(run.completedAt ?? run.updatedAt ?? run.startedAt ?? run.linkedAt);
+    if (start === null || end === null || end < start) {
+      continue;
+    }
+    earliestStart = earliestStart === null ? start : Math.min(earliestStart, start);
+    latestEnd = latestEnd === null ? end : Math.max(latestEnd, end);
+  }
+
+  if (earliestStart !== null && latestEnd !== null) {
+    return latestEnd - earliestStart;
+  }
+  return session ? durationMs(session.createdAt, session.updatedAt) : null;
+}
+
+function runCount(report: TraceReport): number {
+  const runIds = new Set<string>();
+  for (const run of report.rootRuns) {
+    runIds.add(run.runId);
+  }
+  for (const entry of report.runTree ?? []) {
+    runIds.add(entry.runId);
+  }
+  for (const entry of report.timeline) {
+    runIds.add(entry.runId);
+  }
+  for (const trace of report.llmMessages) {
+    runIds.add(trace.runId);
+  }
+  return runIds.size;
+}
+
+function traceTargetLabel(report: TraceReport): string {
+  switch (report.target.kind) {
+    case 'session':
+      return `session ${report.target.requestedId}`;
+    case 'root-run':
+      return `root run ${report.target.requestedId}`;
+    case 'run':
+      return report.target.resolvedRootRunId
+        ? `run ${report.target.requestedId} in root ${report.target.resolvedRootRunId}`
+        : `run ${report.target.requestedId}`;
+  }
+}
+
+function traceTargetCommand(report: TraceReport): string {
+  switch (report.target.kind) {
+    case 'session':
+      return `trace-session ${report.target.requestedId}`;
+    case 'root-run':
+      return `trace-session --root-run ${report.target.requestedId}`;
+    case 'run':
+      return `trace-session --run ${report.target.requestedId}`;
+  }
+}
+
+function emptyPerformanceSummaryForDiagnostics(): PerformanceSummary {
+  const bucket = (): PerformanceBucketSummary => ({ count: 0, total: 0, max: 0, average: 0 });
+  return {
+    events: {
+      totalEvents: 0,
+      measuredEvents: 0,
+      payloadBytes: bucket(),
+      emitDurationMs: bucket(),
+    },
+    model: {
+      started: 0,
+      completed: 0,
+      failed: 0,
+      retries: 0,
+      requestBytes: bucket(),
+      responseBytes: bucket(),
+      durationMs: bucket(),
+      retryDelayMs: bucket(),
+      pendingToolCallCount: bucket(),
+      adapterGateWaitMs: bucket(),
+      adapterResponseLatencyMs: bucket(),
+      adapterRequestBytes: bucket(),
+      adapterResponseBytes: bucket(),
+      adapterAttemptCount: bucket(),
+      adapterRetryDelayMs: bucket(),
+      adapterStatusCodes: {},
+    },
+    tools: {
+      started: 0,
+      completed: 0,
+      failed: 0,
+      inputBytes: bucket(),
+      eventInputBytes: bucket(),
+      rawOutputBytes: bucket(),
+      eventOutputBytes: bucket(),
+      modelOutputBytes: bucket(),
+      durationMs: bucket(),
+      childRunDurationMs: bucket(),
+      byTool: [],
+    },
+    snapshots: {
+      created: 0,
+      stateBytes: bucket(),
+      messageBytes: bucket(),
+      messageCount: bucket(),
+      saveDurationMs: bucket(),
+      pendingToolCallBytes: bucket(),
+    },
+  };
+}
+
+function findBudgetExhaustedRecord(value: unknown, depth = 0, seen: Set<object> = new Set()): Record<string, unknown> | null {
+  if (depth > 5 || value === null || value === undefined || typeof value !== 'object') {
+    return null;
+  }
+  if (seen.has(value)) {
+    return null;
+  }
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const match = findBudgetExhaustedRecord(item, depth + 1, seen);
+      if (match) {
+        return match;
+      }
+    }
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  if (readStringFromRecord(record, 'reason') === 'budget_exhausted') {
+    return record;
+  }
+  for (const item of Object.values(record)) {
+    const match = findBudgetExhaustedRecord(item, depth + 1, seen);
+    if (match) {
+      return match;
+    }
+  }
+  return null;
+}
+
+function readStringFromRecord(record: Record<string, unknown>, key: string): string | null {
+  const value = record[key];
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+function isRuntimePolicyMessage(category: string, content: string): boolean {
+  if (category !== 'runtime-injected-system' && category !== 'runtime-injected-user') {
+    return false;
+  }
+  const normalized = content.toLowerCase();
+  return normalized.includes('budget')
+    || normalized.includes('policy')
+    || normalized.includes('approval')
+    || normalized.includes('tool call')
+    || normalized.includes('tool_');
+}
+
+function primaryOutcomeEvidence(report: TraceReport): EvidenceRef[] {
+  const failedDelegate = report.delegates.find((delegate) => delegate.child_status === 'failed');
+  if (failedDelegate) {
+    return [delegateEvidence(failedDelegate)];
+  }
+
+  const activeDelegate = report.delegates.find((delegate) =>
+    ['queued', 'planning', 'running', 'awaiting_approval', 'awaiting_subagent', 'interrupted'].includes(delegate.child_status ?? ''),
+  );
+  if (activeDelegate) {
+    return [delegateEvidence(activeDelegate)];
+  }
+
+  const failedRoot = report.rootRuns.find((run) => run.status === 'failed');
+  if (failedRoot) {
+    return [rootRunEvidence(failedRoot)];
+  }
+
+  const failedTimeline = report.timeline.find((entry) => entry.outcome.startsWith('failed'));
+  if (failedTimeline) {
+    return [toolEvidence(failedTimeline)];
+  }
+
+  const blockedRoot = report.rootRuns.find((run) => run.status && !['succeeded', 'failed', 'cancelled'].includes(run.status));
+  if (blockedRoot) {
+    return [rootRunEvidence(blockedRoot)];
+  }
+
+  return [{ kind: 'run', label: traceTargetLabel(report), detail: report.summary.reason }];
+}
+
+function modelFailureEvidence(report: TraceReport): EvidenceRef[] {
+  const events = (report.milestones ?? [])
+    .filter((entry) => entry.eventType === 'model.failed')
+    .slice(0, 5)
+    .map((entry): EvidenceRef => ({
+      kind: 'event',
+      label: `${shortId(entry.runId)} #${entry.eventSeq ?? '?'}`,
+      rootRunId: entry.rootRunId,
+      runId: entry.runId,
+      stepId: entry.stepId,
+      eventSeq: entry.eventSeq,
+      eventType: entry.eventType,
+      detail: entry.text,
+    }));
+  return events.length > 0 ? events : primaryOutcomeEvidence(report);
+}
+
+function failedToolEvidence(report: TraceReport): EvidenceRef[] {
+  const tools = report.timeline
+    .filter((entry) => entry.outcome.startsWith('failed'))
+    .slice(0, 5)
+    .map(toolEvidence);
+  return tools.length > 0 ? tools : primaryOutcomeEvidence(report);
+}
+
+function policyEvidence(report: TraceReport, warning: string): EvidenceRef[] {
+  if (warning.includes('runtime-injected')) {
+    return runtimePolicyMessageEvidence(report);
+  }
+  if (warning.includes('budget')) {
+    return report.timeline
+      .filter((entry) => findBudgetExhaustedRecord(entry.output) ?? findBudgetExhaustedRecord(entry.params))
+      .slice(0, 5)
+      .map(toolEvidence);
+  }
+  if (warning.includes('rejected')) {
+    return (report.milestones ?? [])
+      .filter((entry) => entry.eventType === 'model.tool_call_rejected')
+      .slice(0, 5)
+      .map((entry): EvidenceRef => ({
+        kind: 'event',
+        label: `${shortId(entry.runId)} #${entry.eventSeq ?? '?'}`,
+        rootRunId: entry.rootRunId,
+        runId: entry.runId,
+        stepId: entry.stepId,
+        eventSeq: entry.eventSeq,
+        eventType: entry.eventType,
+        detail: entry.text,
+      }));
+  }
+  if (warning.includes('approval')) {
+    return (report.milestones ?? [])
+      .filter((entry) => entry.eventType === 'approval.requested')
+      .slice(0, 5)
+      .map((entry): EvidenceRef => ({
+        kind: 'event',
+        label: `${shortId(entry.runId)} #${entry.eventSeq ?? '?'}`,
+        rootRunId: entry.rootRunId,
+        runId: entry.runId,
+        stepId: entry.stepId,
+        eventSeq: entry.eventSeq,
+        eventType: entry.eventType,
+        detail: entry.text,
+      }));
+  }
+  return runtimePolicyMessageEvidence(report);
+}
+
+function runtimePolicyMessageEvidence(report: TraceReport): EvidenceRef[] {
+  return report.llmMessages
+    .flatMap((trace) => trace.effectiveMessages
+      .filter((message) => isRuntimePolicyMessage(message.category, message.content))
+      .slice(0, 2)
+      .map((message): EvidenceRef => ({
+        kind: 'message',
+        label: `${shortId(trace.runId)} message ${message.position + 1}`,
+        rootRunId: trace.rootRunId,
+        runId: trace.runId,
+        detail: oneLine(message.content),
+      })))
+    .slice(0, 5);
+}
+
+function policyFindingTitle(warning: string): string {
+  if (warning.includes('budget')) {
+    return 'Tool budget signal observed';
+  }
+  if (warning.includes('rejected')) {
+    return 'Rejected tool call signal observed';
+  }
+  if (warning.includes('approval')) {
+    return 'Approval signal requires inspection';
+  }
+  return 'Runtime policy message observed';
+}
+
+function delegateEvidence(delegate: DelegateRow): EvidenceRef {
+  const childRunId = delegate.child_run_id ?? delegate.snapshot_child_run_id ?? undefined;
+  return {
+    kind: 'delegate',
+    label: `${delegate.child_delegate_name ?? delegate.snapshot_delegate_name ?? 'delegate'} ${childRunId ? shortId(childRunId) : '(missing child)'}`,
+    rootRunId: delegate.root_run_id,
+    runId: childRunId ?? delegate.parent_run_id,
+    stepId: delegate.parent_step_id,
+    detail: delegate.child_error_message ?? delegate.child_error_code ?? delegate.delegate_reason,
+  };
+}
+
+function rootRunEvidence(run: RootRun): EvidenceRef {
+  return {
+    kind: 'root-run',
+    label: `${shortId(run.rootRunId)} ${run.status ?? 'unknown'}`,
+    rootRunId: run.rootRunId,
+    runId: run.runId,
+    detail: run.errorMessage ?? run.errorCode ?? run.goal ?? undefined,
+  };
+}
+
+function toolEvidence(entry: TimelineEntry): EvidenceRef {
+  return {
+    kind: 'tool',
+    label: `${entry.toolName ?? entry.eventType ?? 'tool'} ${entry.stepId ?? '-'}`,
+    rootRunId: entry.rootRunId,
+    runId: entry.runId,
+    stepId: entry.stepId,
+    toolCallId: entry.toolCallId,
+    eventSeq: entry.eventSeq,
+    eventType: entry.eventType,
+    detail: entry.outcome,
+  };
+}
+
+function firstEvidenceRunId(finding: TraceFinding | undefined): string | null {
+  if (!finding) {
+    return null;
+  }
+  for (const evidence of finding.evidence) {
+    if (evidence.runId) {
+      return evidence.runId;
+    }
+  }
+  return null;
+}
+
+function parseTimestamp(value: string | null | undefined): number | null {
+  if (!value) {
+    return null;
+  }
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : null;
 }
 
 function toEventData(value: unknown): AgentEventFrame['data'] {

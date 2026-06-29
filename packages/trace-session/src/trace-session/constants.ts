@@ -24,10 +24,11 @@ Options:
   --messages             Include the current snapshot-backed LLM message context.
   --messages-view <mode> Message view: compact, delta, or full. Default: compact.
   --system-only          Include only system messages in the LLM message view.
-  --view <name>          Report view: overview, performance, milestones, timeline, delegates, messages, plans, or all.
+  --view <name>          Report view: brief, overview, investigate, policy, performance, milestones, timeline, delegates, messages, plans, or all.
   --focus-run <id>       Limit the rendered report to a run subtree within the traced tree.
   --preview-chars <n>    Preview length for --ls goals and compact/delta message views. Default: ${DEFAULT_MESSAGE_PREVIEW_CHARS}
   --json                 Print the trace report as JSON.
+  --html <path>          Write a self-contained static HTML trace report.
   --root-run <id>        Restrict a session trace to one root run, or trace that root run directly.
   --run <id>             Trace the root run tree that contains this run id.
   --include-plans        Include plan execution and step details.

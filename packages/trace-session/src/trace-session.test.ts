@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildTimeline, computeDelegateReason, listSessions, parseArgs, renderDeleteEmptyGoalSessionsSql, renderSessionList, renderSessionPerformanceList, renderSessionlessRunList, renderTraceReport, renderUsageReport, summarizePerformance, summarizeTrace, traceSession } from './trace-session.js';
+import { buildTimeline, buildTraceDiagnostics, computeDelegateReason, listSessions, parseArgs, renderDeleteEmptyGoalSessionsSql, renderSessionList, renderSessionPerformanceList, renderSessionlessRunList, renderTraceHtml, renderTraceReport, renderUsageReport, summarizePerformance, summarizeTrace, traceSession } from './trace-session.js';
 import type { TraceRow } from './trace-session.js';
 
 describe('trace-session CLI helpers', () => {
@@ -64,6 +64,19 @@ describe('trace-session CLI helpers', () => {
     expect(parseArgs(['trace-session', 'sess-1', '--view', 'performance'])).toMatchObject({
       sessionId: 'sess-1',
       view: 'performance',
+    });
+  });
+
+  it('parses diagnostic report views', () => {
+    expect(parseArgs(['trace-session', 'sess-1', '--view', 'brief'])).toMatchObject({ view: 'brief' });
+    expect(parseArgs(['trace-session', 'sess-1', '--view', 'investigate'])).toMatchObject({ view: 'investigate' });
+    expect(parseArgs(['trace-session', 'sess-1', '--view', 'policy'])).toMatchObject({ view: 'policy' });
+  });
+
+  it('parses the static HTML report path', () => {
+    expect(parseArgs(['trace-session', 'sess-1', '--html', 'artifacts/trace.html'])).toMatchObject({
+      sessionId: 'sess-1',
+      htmlPath: 'artifacts/trace.html',
     });
   });
 
@@ -1218,6 +1231,312 @@ describe('trace-session CLI helpers', () => {
     expect(output).toContain('tools=12ms');
     expect(output).toContain('snapshot save=5ms');
     expect(output).toContain('other=483ms');
+  });
+
+  it('builds diagnostics and renders brief, investigation, and policy views', () => {
+    const rows = [
+      traceRow({
+        event_id: 'model-failed',
+        event_seq: 1,
+        event_type: 'model.failed',
+        payload: { performance: { durationMs: 12000 } },
+      }),
+      traceRow({
+        event_id: 'budget-search',
+        event_seq: 2,
+        event_type: 'tool.completed',
+        event_step_id: 'step-2',
+        tool_call_id: 'call-search',
+        event_tool_name: 'web_search',
+        ledger_tool_name: 'web_search',
+        tool_execution_status: 'completed',
+        tool_started_at: '2026-04-16T10:00:01.000Z',
+        tool_completed_at: '2026-04-16T10:00:01.000Z',
+        resolved_input: { query: 'extra search' },
+        tool_output: {
+          reason: 'budget_exhausted',
+          budgetGroup: 'web_research.search',
+          status: 'partial',
+        },
+        payload: {
+          toolName: 'web_search',
+          output: {
+            reason: 'budget_exhausted',
+            budgetGroup: 'web_research.search',
+            status: 'partial',
+          },
+          performance: { durationMs: 0, modelOutputBytes: 96 },
+        },
+      }),
+      traceRow({
+        event_id: 'read-failed',
+        event_seq: 3,
+        event_type: 'tool.failed',
+        event_step_id: 'step-3',
+        tool_call_id: 'call-read',
+        event_tool_name: 'read_web_page',
+        ledger_tool_name: 'read_web_page',
+        tool_execution_status: 'failed',
+        tool_started_at: '2026-04-16T10:00:02.000Z',
+        tool_completed_at: '2026-04-16T10:00:03.500Z',
+        resolved_input: { url: 'https://example.com' },
+        tool_error_message: 'request timed out',
+        payload: { toolName: 'read_web_page', performance: { durationMs: 1500 } },
+      }),
+    ];
+    const performance = summarizePerformance(rows);
+    const timeline = buildTimeline(rows);
+    const report = {
+      target: traceTarget('session', 'sess-1'),
+      session: session('failed'),
+      rootRuns: [{
+        rootRunId: 'root-1',
+        runId: 'root-1',
+        invocationKind: 'run',
+        turnIndex: 0,
+        linkedAt: '2026-04-16T10:00:00.000Z',
+        startedAt: '2026-04-16T10:00:00.000Z',
+        updatedAt: '2026-04-16T10:00:05.000Z',
+        completedAt: '2026-04-16T10:00:05.000Z',
+        status: 'failed',
+        goal: 'Diagnose a research run',
+        result: null,
+        errorMessage: 'Model timed out',
+      }],
+      usage: usage({
+        total: {
+          promptTokens: 900,
+          completionTokens: 100,
+          totalTokens: 1000,
+          estimatedCostUSD: 0.01,
+        },
+        byRootRun: [{
+          rootRunId: 'root-1',
+          usage: {
+            promptTokens: 900,
+            completionTokens: 100,
+            totalTokens: 1000,
+            estimatedCostUSD: 0.01,
+          },
+        }],
+      }),
+      performance,
+      timeline,
+      milestones: [
+        {
+          rootRunId: 'root-1',
+          runId: 'root-1',
+          depth: 0,
+          eventType: 'model.tool_call_rejected' as const,
+          stepId: 'step-4',
+          createdAt: now(),
+          eventSeq: 4,
+          text: 'model.tool_call_rejected requested bad_tool',
+        },
+        {
+          rootRunId: 'root-1',
+          runId: 'root-1',
+          depth: 0,
+          eventType: 'approval.requested' as const,
+          stepId: 'step-5',
+          createdAt: now(),
+          eventSeq: 5,
+          text: 'approval requested',
+        },
+      ],
+      llmMessages: [{
+        rootRunId: 'root-1',
+        runId: 'root-1',
+        delegateName: null,
+        depth: 0,
+        initialSnapshotSeq: 1,
+        initialSnapshotCreatedAt: now(),
+        latestSnapshotSeq: 2,
+        latestSnapshotCreatedAt: now(),
+        effectiveMessages: [{
+          position: 0,
+          persistence: 'pending' as const,
+          role: 'user' as const,
+          category: 'runtime-injected-user' as const,
+          content: 'You are near the web research budget.',
+        }],
+      }],
+      delegates: [delegate({ child_status: 'failed', child_error_message: 'delegate timed out' })],
+      plans: [],
+      warnings: [],
+      summary: { status: 'failed' as const, reason: 'failed because delegate analyst failed: delegate timed out' },
+    };
+
+    const diagnostics = buildTraceDiagnostics(report);
+    expect(diagnostics.brief.status).toBe('failed');
+    expect(diagnostics.policy).toMatchObject({
+      budgetExhaustedToolCalls: 1,
+      rejectedToolCalls: 1,
+      approvalRequests: 1,
+      unresolvedApprovalRequests: 1,
+      runtimePolicyMessages: 1,
+    });
+    expect(diagnostics.policy.budgetGroups[0]).toMatchObject({
+      budgetGroup: 'web_research.search',
+      skippedCalls: 1,
+      toolNames: ['web_search'],
+    });
+    expect(diagnostics.findings.map((finding) => finding.category)).toEqual(expect.arrayContaining(['failure', 'policy', 'performance']));
+
+    const brief = renderTraceReport({ ...report, diagnostics }, { json: false, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false, view: 'brief' });
+    expect(brief).toContain('Trace Brief');
+    expect(brief).toContain('Top findings');
+    expect(brief).not.toContain('Goal');
+
+    const investigation = renderTraceReport({ ...report, diagnostics }, { json: false, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false, view: 'investigate' });
+    expect(investigation).toContain('Investigation');
+    expect(investigation).toContain('Delegate chain evidence');
+    expect(investigation).toContain('Suggested next views');
+    expect(investigation).toContain('1. ERROR failure Trace failed');
+    expect(investigation).toContain('Evidence');
+    expect(investigation).toContain('$ trace-session --run child-run --view messages --messages-view delta');
+    expect(investigation).not.toContain('severity  category');
+
+    const policy = renderTraceReport({ ...report, diagnostics }, { json: false, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false, view: 'policy' });
+    expect(policy).toContain('Policy Adherence');
+    expect(policy).toContain('web_research.search');
+    expect(policy).toContain('rejected tool calls');
+
+    const performanceOutput = renderTraceReport({ ...report, diagnostics }, { json: false, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false, view: 'performance' });
+    expect(performanceOutput).toContain('Digest');
+    expect(performanceOutput).toContain('Top Token Runs');
+    expect(performanceOutput).toContain('Slowest Tool Spans');
+  });
+
+  it('renders a self-contained static HTML report with escaped trace data', () => {
+    const rows = [traceRow({
+      event_id: 'tool-1',
+      event_seq: 1,
+      event_type: 'tool.completed',
+      event_step_id: 'step-1',
+      tool_call_id: 'call-1',
+      event_tool_name: 'read_file',
+      ledger_tool_name: 'read_file',
+      tool_execution_status: 'completed',
+      tool_started_at: '2026-04-16T10:00:01.000Z',
+      tool_completed_at: '2026-04-16T10:00:02.000Z',
+      resolved_input: { path: '<unsafe>.txt' },
+      tool_output: '<script>alert(1)</script>',
+      payload: {
+        toolName: 'read_file',
+        performance: {
+          durationMs: 1000,
+          rawOutputBytes: 128,
+          modelOutputBytes: 64,
+        },
+      },
+    })];
+    const performance = summarizePerformance(rows);
+    const report = {
+      target: traceTarget('session', 'sess-1'),
+      session: session('failed'),
+      rootRuns: [{
+        rootRunId: 'root-1',
+        runId: 'root-1',
+        invocationKind: 'run',
+        turnIndex: 0,
+        linkedAt: '2026-04-16T10:00:00.000Z',
+        startedAt: '2026-04-16T10:00:00.000Z',
+        updatedAt: '2026-04-16T10:00:03.000Z',
+        completedAt: '2026-04-16T10:00:03.000Z',
+        status: 'failed',
+        goal: 'Investigate <unsafe> workflow',
+        result: { answer: 'Use <safe> output' },
+        errorMessage: 'Exploded <b>bad</b>',
+        modelProvider: 'openai',
+        modelName: 'gpt-test',
+      }],
+      usage: usage({
+        total: {
+          promptTokens: 10,
+          completionTokens: 5,
+          totalTokens: 15,
+          estimatedCostUSD: 0.001,
+        },
+        byRootRun: [{
+          rootRunId: 'root-1',
+          usage: {
+            promptTokens: 10,
+            completionTokens: 5,
+            totalTokens: 15,
+            estimatedCostUSD: 0.001,
+          },
+        }],
+      }),
+      performance,
+      timeline: buildTimeline(rows),
+      milestones: [],
+      llmMessages: [{
+        rootRunId: 'root-1',
+        runId: 'root-1',
+        delegateName: null,
+        depth: 0,
+        initialSnapshotSeq: 1,
+        initialSnapshotCreatedAt: now(),
+        latestSnapshotSeq: 2,
+        latestSnapshotCreatedAt: now(),
+        effectiveMessages: [{
+          position: 0,
+          persistence: 'persisted' as const,
+          role: 'system' as const,
+          category: 'runtime-injected-system' as const,
+          content: 'System says <policy>stay safe</policy>',
+        }],
+      }],
+      delegates: [delegate({ child_status: 'failed', child_error_message: 'delegate <timeout>' })],
+      plans: [{
+        root_run_id: 'root-1',
+        run_id: 'root-1',
+        plan_execution_id: 'plan-exec-1',
+        plan_execution_status: 'running',
+        attempt: 1,
+        current_step_id: 'step-1',
+        current_step_index: 0,
+        replan_reason: 'Need <more evidence>',
+        plan_id: 'plan-1',
+        plan_goal: 'Investigate unsafe workflow',
+        plan_summary: null,
+        step_index: 0,
+        step_key: 'inspect',
+        title: 'Inspect <unsafe> file',
+        tool_name: 'read_file',
+        failure_policy: null,
+        requires_approval: false,
+      }],
+      warnings: ['warning <check>'],
+      summary: { status: 'failed' as const, reason: 'failed because <bad>' },
+    };
+
+    const html = renderTraceHtml(report, {
+      includePlans: true,
+      messages: true,
+      generatedAt: '2026-04-16T11:00:00.000Z',
+    });
+
+    expect(html).toContain('<!doctype html>');
+    expect(html).toContain('Adaptive Agent Trace Report');
+    expect(html).toContain('Trace Brief');
+    expect(html).toContain('Findings');
+    expect(html).toContain('Policy Adherence');
+    expect(html).toContain('Performance');
+    expect(html).toContain('Workflow');
+    expect(html).toContain('LLM Message Context');
+    expect(html).toContain('Plans');
+    expect(html).toContain('Raw Trace JSON');
+    expect(html).toContain('read_file');
+    expect(html).toContain('&lt;unsafe&gt;');
+    expect(html).toContain('&lt;b&gt;bad&lt;/b&gt;');
+    expect(html).toContain('&lt;policy&gt;stay safe&lt;/policy&gt;');
+    expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+    expect(html).not.toContain('<unsafe>');
+    expect(html).not.toContain('<b>bad</b>');
+    expect(html).not.toContain('<policy>stay safe</policy>');
+    expect(html).not.toContain('<script>alert(1)</script>');
   });
 
   it('counts tool calls by durable execution status instead of terminal lifecycle events', () => {

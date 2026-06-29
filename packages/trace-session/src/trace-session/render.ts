@@ -2,14 +2,16 @@ import chalk from 'chalk';
 import { marked } from 'marked';
 import TerminalRenderer from 'marked-terminal';
 
-import { shortId } from './report.js';
+import { buildTraceDiagnostics, shortId } from './report.js';
 import { DEFAULT_MESSAGE_PREVIEW_CHARS } from './constants.js';
 import type {
   CliOptions,
   DelegateRow,
+  EvidenceRef,
   MessageView,
   MilestoneEntry,
   PerformanceBucketSummary,
+  PerformanceDigest,
   PerformanceSummary,
   PlanRow,
   ReportView,
@@ -21,6 +23,8 @@ import type {
   SessionUsageSummary,
   SessionlessRunListItem,
   TimelineEntry,
+  TraceDiagnostics,
+  TraceFinding,
   TraceMessage,
   TraceMessageRole,
   TraceReport,
@@ -35,13 +39,20 @@ marked.setOptions({
   }) as never,
 });
 
+type HtmlTraceRenderOptions = Partial<Pick<CliOptions, 'includePlans' | 'messages' | 'systemOnly' | 'previewChars'>> & {
+  generatedAt?: string;
+};
+
+type HtmlTableCell = string | { value: string | number; className?: string };
+
 export function renderTraceReport(
   report: TraceReport,
   options: Pick<CliOptions, 'json' | 'includePlans' | 'onlyDelegates' | 'messages' | 'systemOnly'>
     & Partial<Pick<CliOptions, 'view' | 'messagesView' | 'previewChars'>>,
 ): string {
+  const diagnostics = report.diagnostics ?? buildTraceDiagnostics(report);
   if (options.json) {
-    return JSON.stringify(report, null, 2);
+    return JSON.stringify(report.diagnostics ? report : { ...report, diagnostics }, null, 2);
   }
 
   const effectiveView = resolveReportView(options);
@@ -50,6 +61,32 @@ export function renderTraceReport(
   const milestones = report.milestones ?? [];
 
   const lines: string[] = [];
+  if (shouldRenderDiagnosticLead(effectiveView, options.onlyDelegates)) {
+    lines.push(markdownBlock('# Trace Brief'));
+    lines.push(renderTraceBrief(diagnostics));
+  }
+
+  if (effectiveView === 'brief') {
+    return lines.join('\n');
+  }
+
+  if (effectiveView === 'investigate') {
+    lines.push('');
+    lines.push(markdownBlock('# Investigation'));
+    lines.push(renderInvestigation(report, diagnostics));
+    return lines.join('\n');
+  }
+
+  if (effectiveView === 'policy') {
+    lines.push('');
+    lines.push(markdownBlock('# Policy Adherence'));
+    lines.push(renderPolicyDiagnostics(diagnostics));
+    return lines.join('\n');
+  }
+
+  if (lines.length > 0) {
+    lines.push('');
+  }
   lines.push(markdownBlock('# Goal'));
   lines.push(renderGoal(report.rootRuns));
   lines.push('');
@@ -66,7 +103,7 @@ export function renderTraceReport(
   if (shouldRenderSection(effectiveView, 'performance')) {
     lines.push('');
     lines.push(markdownBlock('# Performance'));
-    lines.push(renderPerformance(report.performance ?? emptyPerformanceSummary(), traceDurationMs(report)));
+    lines.push(renderPerformance(report.performance ?? emptyPerformanceSummary(), traceDurationMs(report), diagnostics.performance));
   }
 
   if (shouldRenderSection(effectiveView, 'milestones')) {
@@ -110,6 +147,43 @@ export function renderTraceReport(
   }
 
   return lines.join('\n');
+}
+
+export function renderTraceHtml(report: TraceReport, options: HtmlTraceRenderOptions = {}): string {
+  const diagnostics = report.diagnostics ?? buildTraceDiagnostics(report);
+  const reportWithDiagnostics: TraceReport = report.diagnostics ? report : { ...report, diagnostics };
+  const generatedAt = options.generatedAt ?? new Date().toISOString();
+  const title = `Trace Report: ${diagnostics.brief.targetLabel}`;
+
+  return [
+    '<!doctype html>',
+    '<html lang="en">',
+    '<head>',
+    '  <meta charset="utf-8">',
+    '  <meta name="viewport" content="width=device-width, initial-scale=1">',
+    `  <title>${escapeHtml(title)}</title>`,
+    `  <style>${traceHtmlStyles()}</style>`,
+    '</head>',
+    '<body>',
+    '  <div class="page-shell">',
+    renderHtmlHero(report, diagnostics, generatedAt),
+    renderHtmlNav(),
+    '    <main>',
+    renderHtmlBrief(diagnostics),
+    renderHtmlFindings(diagnostics),
+    renderHtmlPolicy(diagnostics),
+    renderHtmlPerformance(report, diagnostics),
+    renderHtmlWorkflow(report),
+    renderHtmlDelegates(report.delegates),
+    renderHtmlMessages(report, options),
+    renderHtmlPlans(report.plans, options),
+    renderHtmlFinalOutputs(report.rootRuns),
+    renderHtmlRawJson(reportWithDiagnostics),
+    '    </main>',
+    '  </div>',
+    '</body>',
+    '</html>',
+  ].join('\n');
 }
 
 export function renderSessionList(sessions: SessionListItem[], options: Pick<CliOptions, 'json'> & Partial<Pick<CliOptions, 'previewChars'>>): string {
@@ -247,6 +321,837 @@ export function renderUsageReport(usage: SessionUsageSummary, options: Pick<CliO
   return lines.join('\n');
 }
 
+function traceHtmlStyles(): string {
+  return `
+:root {
+  color-scheme: light;
+  --bg: #f6f7fb;
+  --panel: #ffffff;
+  --panel-soft: #f9fafb;
+  --ink: #172033;
+  --muted: #667085;
+  --line: #d9e0ea;
+  --accent: #315efb;
+  --accent-soft: #e8edff;
+  --good: #087443;
+  --good-soft: #e8f6ee;
+  --warn: #a15c00;
+  --warn-soft: #fff4df;
+  --bad: #b42318;
+  --bad-soft: #fff0ed;
+  --info: #026aa2;
+  --info-soft: #eaf6ff;
+  --code-bg: #111827;
+  --code-ink: #e5e7eb;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: radial-gradient(circle at top left, #eef3ff 0, #f6f7fb 30rem, #f6f7fb 100%);
+  color: var(--ink);
+  font: 14px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+.page-shell { max-width: 1180px; margin: 0 auto; padding: 32px 20px 56px; }
+.hero, .toc, .section {
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  box-shadow: 0 16px 50px rgba(23, 32, 51, 0.08);
+}
+.hero { padding: 30px; }
+.eyebrow { margin: 0 0 8px; color: var(--accent); font-size: 12px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+.hero-title { display: flex; gap: 16px; align-items: flex-start; justify-content: space-between; }
+h1, h2, h3 { line-height: 1.18; margin: 0; }
+h1 { font-size: clamp(30px, 4vw, 48px); max-width: 820px; }
+h2 { font-size: 24px; }
+h3 { font-size: 17px; }
+.lead { max-width: 900px; margin: 16px 0 0; color: #344054; font-size: 17px; }
+.hero-meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin: 24px 0 0; }
+.meta-item, .metric-card {
+  background: var(--panel-soft);
+  border: 1px solid #edf0f5;
+  border-radius: 16px;
+  padding: 14px 16px;
+}
+.meta-label, .metric-label { display: block; color: var(--muted); font-size: 12px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+.meta-value, .metric-value { display: block; margin-top: 4px; font-size: 18px; font-weight: 800; overflow-wrap: anywhere; }
+.metric-note { margin: 8px 0 0; color: var(--muted); font-size: 13px; }
+.toc { display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0; padding: 14px; position: sticky; top: 0; z-index: 2; }
+.toc a { color: var(--accent); background: var(--accent-soft); border-radius: 999px; font-weight: 700; padding: 8px 12px; text-decoration: none; }
+.section { margin: 18px 0 0; padding: 24px; }
+.section-header { display: flex; gap: 12px; align-items: flex-start; justify-content: space-between; margin-bottom: 18px; }
+.section-description { margin: 6px 0 0; color: var(--muted); max-width: 820px; }
+.metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+.finding-list, .message-list { display: grid; gap: 12px; }
+.finding-card, .message-run, .message-card, .details-card {
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--panel);
+  padding: 16px;
+}
+.finding-card.error { border-color: #ffb4aa; background: var(--bad-soft); }
+.finding-card.warning { border-color: #fedf89; background: var(--warn-soft); }
+.finding-card.info { border-color: #b9e6fe; background: var(--info-soft); }
+.finding-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+.badge {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: #fff;
+  color: #344054;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1;
+  padding: 6px 9px;
+  text-transform: uppercase;
+}
+.badge.status-succeeded, .badge.status-returned-successfully { background: var(--good-soft); border-color: #abefc6; color: var(--good); }
+.badge.status-failed, .badge.status-error { background: var(--bad-soft); border-color: #ffb4aa; color: var(--bad); }
+.badge.status-blocked, .badge.status-running, .badge.status-awaiting-subagent, .badge.status-waiting { background: var(--warn-soft); border-color: #fedf89; color: var(--warn); }
+.badge.severity-error { background: var(--bad-soft); border-color: #ffb4aa; color: var(--bad); }
+.badge.severity-warning { background: var(--warn-soft); border-color: #fedf89; color: var(--warn); }
+.badge.severity-info { background: var(--info-soft); border-color: #b9e6fe; color: var(--info); }
+.warning-list, .evidence-list, .command-list { margin: 10px 0 0; padding-left: 20px; }
+.command-list code { color: var(--accent); font-weight: 800; }
+.table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 16px; background: var(--panel); }
+table { border-collapse: collapse; min-width: 100%; }
+th, td { border-bottom: 1px solid #edf0f5; padding: 10px 12px; text-align: left; vertical-align: top; }
+th { background: #f3f5f9; color: #475467; font-size: 12px; letter-spacing: .05em; text-transform: uppercase; white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+td { overflow-wrap: anywhere; }
+.status-cell.status-succeeded, .status-cell.status-returned-successfully { color: var(--good); font-weight: 800; }
+.status-cell.status-failed, .status-cell.status-error { color: var(--bad); font-weight: 800; }
+.status-cell.status-blocked, .status-cell.status-running, .status-cell.status-awaiting-subagent, .status-cell.status-waiting { color: var(--warn); font-weight: 800; }
+.stack { display: grid; gap: 14px; }
+.subsection { margin-top: 18px; }
+details { margin-top: 10px; }
+summary { cursor: pointer; font-weight: 800; }
+pre {
+  background: var(--code-bg);
+  border-radius: 14px;
+  color: var(--code-ink);
+  overflow-x: auto;
+  padding: 14px;
+  white-space: pre-wrap;
+}
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+.empty { color: var(--muted); font-style: italic; }
+.message-card summary { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.message-preview { color: var(--muted); font-weight: 500; }
+.message-meta { color: var(--muted); margin: 6px 0 10px; }
+@media print {
+  body { background: #fff; }
+  .toc { position: static; }
+  .hero, .toc, .section { box-shadow: none; }
+}
+`.trim();
+}
+
+function renderHtmlHero(report: TraceReport, diagnostics: TraceDiagnostics, generatedAt: string): string {
+  const brief = diagnostics.brief;
+  const modelLabels = [...new Set(report.rootRuns.map(formatRunModel).filter((label): label is string => label !== null))];
+  return `
+    <header class="hero">
+      <div class="hero-title">
+        <div>
+          <p class="eyebrow">Adaptive Agent Trace Report</p>
+          <h1>${escapeHtml(brief.targetLabel)}</h1>
+        </div>
+        ${htmlBadge(brief.status, `status-${classToken(brief.status)}`)}
+      </div>
+      <p class="lead">${escapeHtml(brief.headline)}</p>
+      <div class="hero-meta">
+        ${htmlMetaItem('Generated', formatTime(generatedAt))}
+        ${htmlMetaItem('Target', `${report.target.kind} ${report.target.requestedId}`)}
+        ${htmlMetaItem('Roots / runs', `${formatNumber(brief.rootRunCount)} / ${formatNumber(brief.runCount)}`)}
+        ${htmlMetaItem('Provider / model', modelLabels.length > 0 ? modelLabels.join(', ') : 'unknown')}
+      </div>
+      ${renderHtmlWarnings(report.warnings)}
+    </header>`;
+}
+
+function renderHtmlNav(): string {
+  const links = [
+    ['#brief', 'Brief'],
+    ['#findings', 'Findings'],
+    ['#policy', 'Policy'],
+    ['#performance', 'Performance'],
+    ['#workflow', 'Workflow'],
+    ['#delegates', 'Delegates'],
+    ['#messages', 'Messages'],
+    ['#plans', 'Plans'],
+    ['#final-output', 'Final Output'],
+    ['#raw-json', 'Raw JSON'],
+  ];
+  return `
+    <nav class="toc" aria-label="Trace report sections">
+      ${links.map(([href, label]) => `<a href="${href}">${label}</a>`).join('\n      ')}
+    </nav>`;
+}
+
+function renderHtmlBrief(diagnostics: TraceDiagnostics): string {
+  const brief = diagnostics.brief;
+  return htmlSection(
+    'brief',
+    'Trace Brief',
+    'High-level outcome, scale, duration, and usage for fast triage.',
+    htmlMetricGrid([
+      ['Outcome', brief.status, diagnostics.brief.headline],
+      ['Runs', `${formatNumber(brief.rootRunCount)} roots / ${formatNumber(brief.runCount)} total`, `steps=${brief.totalSteps === null ? 'unknown' : formatNumber(brief.totalSteps)}`],
+      ['Wall duration', formatDuration(brief.wallDurationMs), 'Elapsed time across root runs.'],
+      ['Cumulative measured', formatDuration(brief.cumulativeMeasuredDurationMs), 'Model + tool + snapshot save time.'],
+      ['Parallelism', formatRatio(brief.parallelismFactor), 'Measured cumulative time divided by wall time.'],
+      ['Model calls', `${formatNumber(brief.modelCalls)} total / ${formatNumber(brief.failedModelCalls)} failed`, 'Model lifecycle events.'],
+      ['Tool calls', `${formatNumber(brief.toolCalls)} total / ${formatNumber(brief.failedToolCalls)} failed`, 'Durable tool execution outcomes.'],
+      ['Usage', `${formatNumber(brief.totalTokens)} tokens`, `$${brief.estimatedCostUSD.toFixed(6)} estimated cost`],
+    ]),
+  );
+}
+
+function renderHtmlFindings(diagnostics: TraceDiagnostics): string {
+  const findings = diagnostics.findings.length > 0 ? diagnostics.findings : [{
+    id: 'finding-0',
+    severity: 'info' as const,
+    category: 'data-quality' as const,
+    title: 'No diagnostic findings',
+    summary: 'No failure, policy, or performance findings were derived from the persisted trace.',
+    evidence: [],
+  }];
+
+  const body = [
+    `<div class="finding-list">${findings.map(renderHtmlFinding).join('\n')}</div>`,
+    renderHtmlSuggestedCommands(diagnostics),
+  ].join('\n');
+  return htmlSection('findings', 'Findings', 'Derived explanations and evidence for failures, policy issues, data-quality gaps, and performance risks.', body);
+}
+
+function renderHtmlFinding(finding: TraceFinding): string {
+  const evidence = finding.evidence.length === 0
+    ? '<p class="empty">No direct evidence rows were attached to this finding.</p>'
+    : `<ul class="evidence-list">${finding.evidence.map((item) => `<li>${escapeHtml(formatEvidenceRef(item))}</li>`).join('\n')}</ul>`;
+
+  return `
+      <article class="finding-card ${classToken(finding.severity)}">
+        <div class="finding-head">
+          ${htmlBadge(finding.severity, `severity-${classToken(finding.severity)}`)}
+          ${htmlBadge(finding.category)}
+        </div>
+        <h3>${escapeHtml(finding.title)}</h3>
+        <p>${escapeHtml(finding.summary)}</p>
+        <details>
+          <summary>Evidence (${formatNumber(finding.evidence.length)})</summary>
+          ${evidence}
+        </details>
+      </article>`;
+}
+
+function renderHtmlPolicy(diagnostics: TraceDiagnostics): string {
+  const policy = diagnostics.policy;
+  const policyFindings = diagnostics.findings.filter((finding) => finding.category === 'policy');
+  const budgetGroups = policy.budgetGroups.length === 0
+    ? '<p class="empty">No budget exhaustion groups were observed.</p>'
+    : htmlTable(
+      ['Budget group', 'Skipped calls', 'Tools'],
+      policy.budgetGroups.map((group) => [
+        group.budgetGroup,
+        formatNumber(group.skippedCalls),
+        group.toolNames.length > 0 ? group.toolNames.join(', ') : '-',
+      ]),
+    );
+  const warnings = policy.warnings.length === 0
+    ? '<p class="empty">No policy warnings were derived.</p>'
+    : `<ul class="warning-list">${policy.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join('\n')}</ul>`;
+  const findings = policyFindings.length === 0
+    ? '<p class="empty">No policy adherence findings were derived from this trace.</p>'
+    : `<div class="finding-list">${policyFindings.map(renderHtmlFinding).join('\n')}</div>`;
+
+  return htmlSection(
+    'policy',
+    'Policy Adherence',
+    'Tool budget, rejected-call, approval, and runtime-injected policy signals.',
+    [
+      htmlMetricGrid([
+        ['Budget exhausted', formatNumber(policy.budgetExhaustedToolCalls), 'Tool calls skipped because a budget was already exhausted.'],
+        ['Rejected tool calls', formatNumber(policy.rejectedToolCalls), '`model.tool_call_rejected` events emitted by core.'],
+        ['Approval lifecycle', `${formatNumber(policy.approvalRequests)} requested / ${formatNumber(policy.approvalResolved)} resolved`, `${formatNumber(policy.unresolvedApprovalRequests)} unresolved.`],
+        ['Runtime policy messages', formatNumber(policy.runtimePolicyMessages), 'Runtime-injected budget or policy guidance found in LLM messages.'],
+      ]),
+      htmlSubsection('Budget groups', budgetGroups),
+      htmlSubsection('Policy warnings', warnings),
+      htmlSubsection('Policy findings', findings),
+    ].join('\n'),
+  );
+}
+
+function renderHtmlPerformance(report: TraceReport, diagnostics: TraceDiagnostics): string {
+  const performance = report.performance ?? emptyPerformanceSummary();
+  const digest = diagnostics.performance;
+  const split = durationSplitParts(performance, traceDurationMs(report));
+  const statusCodes = Object.entries(performance.model.adapterStatusCodes)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([status, count]) => `${status}:${count}`)
+    .join(', ') || '-';
+
+  return htmlSection(
+    'performance',
+    'Performance',
+    'Quantitative view of model latency, tool time, snapshot overhead, bytes, retries, and high-volume contributors.',
+    [
+      htmlMetricGrid([
+        ['Wall time', formatDuration(digest.wallDurationMs), 'Elapsed time across root runs.'],
+        ['Cumulative measured', formatDuration(digest.cumulativeMeasuredDurationMs), 'Model + tool + snapshot save time.'],
+        ['Model / tools / snapshots', `${formatDuration(digest.cumulativeModelDurationMs)} / ${formatDuration(digest.cumulativeToolDurationMs)} / ${formatDuration(digest.cumulativeSnapshotSaveMs)}`, 'Main measured duration buckets.'],
+        ['Other wall time', formatDuration(digest.otherDurationMs), 'Wall time not explained by measured buckets.'],
+        ['Parallelism factor', formatRatio(digest.parallelismFactor), 'Cumulative measured time divided by wall time.'],
+        ['Duration split', `total=${formatDuration(split.totalDurationMs)}`, `model=${formatDuration(split.modelDurationMs)}, tools=${formatDuration(split.toolDurationMs)}, snapshot=${formatDuration(split.snapshotSaveMs)}, other=${formatDuration(split.otherDurationMs)}`],
+      ]),
+      renderHtmlPerformanceNotes(digest),
+      htmlSubsection('Model metrics', htmlTable(['Metric', 'Value', 'Meaning'], [
+        ['Calls', `started=${formatNumber(performance.model.started)} completed=${formatNumber(performance.model.completed)} failed=${formatNumber(performance.model.failed)}`, 'Model lifecycle counts.'],
+        ['Duration', formatBucketDuration(performance.model.durationMs), 'Wall-clock model call time measured by core.'],
+        ['Request bytes', formatBucketBytes(performance.model.requestBytes), 'Serialized model request size before adapter conversion.'],
+        ['Response bytes', formatBucketBytes(performance.model.responseBytes), 'Serialized model response size after parsing.'],
+        ['Retries', `${formatNumber(performance.model.retries)} events, delay ${formatBucketDuration(performance.model.retryDelayMs)}`, 'Adapter or provider retry activity.'],
+        ['Adapter latency', formatBucketDuration(performance.model.adapterResponseLatencyMs), 'Provider SDK or HTTP response latency.'],
+        ['Adapter gate wait', formatBucketDuration(performance.model.adapterGateWaitMs), 'Time waiting for adapter request admission.'],
+        ['Adapter status', statusCodes, 'HTTP status codes observed by adapters.'],
+      ])),
+      htmlSubsection('Tool metrics', htmlTable(['Metric', 'Value', 'Meaning'], [
+        ['Calls', `started=${formatNumber(performance.tools.started)} completed=${formatNumber(performance.tools.completed)} failed=${formatNumber(performance.tools.failed)}`, 'Durable tool execution call counts.'],
+        ['Duration', formatBucketDuration(performance.tools.durationMs), 'Host tool execution time.'],
+        ['Child duration', formatBucketDuration(performance.tools.childRunDurationMs), 'Synthetic delegate child-run wall time, not added to duration split.'],
+        ['Input bytes', formatBucketBytes(performance.tools.inputBytes), 'Raw tool input size.'],
+        ['Raw output bytes', formatBucketBytes(performance.tools.rawOutputBytes), 'Raw tool output size.'],
+        ['Model output bytes', formatBucketBytes(performance.tools.modelOutputBytes), 'Tool output size visible to the model.'],
+      ])),
+      htmlSubsection('Snapshot metrics', htmlTable(['Metric', 'Value', 'Meaning'], [
+        ['Created', formatNumber(performance.snapshots.created), 'Snapshot events observed in the trace.'],
+        ['State bytes', formatBucketBytes(performance.snapshots.stateBytes), 'Serialized snapshot state size.'],
+        ['Message bytes', formatBucketBytes(performance.snapshots.messageBytes), 'Serialized persisted message context size.'],
+        ['Message count', formatBucketNumber(performance.snapshots.messageCount), 'Messages persisted in snapshots.'],
+        ['Pending tool bytes', formatBucketBytes(performance.snapshots.pendingToolCallBytes), 'Serialized pending tool call state.'],
+        ['Save time', formatBucketDuration(performance.snapshots.saveDurationMs), 'Snapshot store write time when measured.'],
+      ])),
+      htmlSubsection('Top token runs', digest.topRunsByUsage.length === 0 ? '<p class="empty">No usage rows were available.</p>' : htmlTable(
+        ['Root', 'Run', 'Tokens', 'Prompt', 'Completion', 'Cost', 'Goal'],
+        digest.topRunsByUsage.map((run) => [
+          shortId(run.rootRunId),
+          shortId(run.runId),
+          formatNumber(run.totalTokens),
+          formatNumber(run.promptTokens),
+          formatNumber(run.completionTokens),
+          `$${run.estimatedCostUSD.toFixed(6)}`,
+          run.goal ? truncatePlain(oneLine(run.goal), 120) : '-',
+        ]),
+      )),
+      htmlSubsection('Slowest tool spans', digest.topToolSpans.length === 0 ? '<p class="empty">No measured tool spans were available.</p>' : htmlTable(
+        ['Duration', 'Root/run', 'Step', 'Tool', 'Outcome'],
+        digest.topToolSpans.map((span) => [
+          formatDuration(span.durationMs),
+          `${shortId(span.rootRunId)}/${shortId(span.runId)}`,
+          span.stepId ?? '-',
+          span.toolName ?? 'tool',
+          statusCell(span.outcome),
+        ]),
+      )),
+      htmlSubsection('Top tools by duration', digest.topToolsByDuration.length === 0 ? '<p class="empty">No tool duration aggregates were available.</p>' : htmlTable(
+        ['Tool', 'Calls', 'Duration', 'Model output'],
+        digest.topToolsByDuration.map((tool) => [
+          tool.toolName,
+          `${formatNumber(tool.completed)} completed / ${formatNumber(tool.failed)} failed`,
+          formatBucketDuration(tool.durationMs),
+          formatBucketBytes(tool.modelOutputBytes),
+        ]),
+      )),
+      htmlSubsection('Largest model-visible tool outputs', digest.topToolsByModelOutput.length === 0 ? '<p class="empty">No model-visible tool output measurements were available.</p>' : htmlTable(
+        ['Tool', 'Calls', 'Model output', 'Raw output'],
+        digest.topToolsByModelOutput.map((tool) => [
+          tool.toolName,
+          `${formatNumber(tool.completed)} completed / ${formatNumber(tool.failed)} failed`,
+          formatBucketBytes(tool.modelOutputBytes),
+          formatBucketBytes(tool.rawOutputBytes),
+        ]),
+      )),
+    ].join('\n'),
+  );
+}
+
+function renderHtmlPerformanceNotes(digest: PerformanceDigest): string {
+  if (digest.notes.length === 0) {
+    return '';
+  }
+  return htmlSubsection('Digest notes', `<ul class="warning-list">${digest.notes.map((note) => `<li>${escapeHtml(note)}</li>`).join('\n')}</ul>`);
+}
+
+function renderHtmlWorkflow(report: TraceReport): string {
+  const rootRows = report.rootRuns.map((run) => [
+    shortId(run.rootRunId),
+    shortId(run.runId),
+    statusCell(run.status ?? 'unknown'),
+    formatDuration(durationMs(run.startedAt ?? null, run.completedAt ?? run.updatedAt ?? null)),
+    formatRunModel(run) ?? 'unknown',
+    run.errorMessage ?? run.errorCode ?? run.goal ?? '-',
+  ]);
+  const runTree = report.runTree && report.runTree.length > 0
+    ? htmlSubsection('Run tree', htmlTable(
+      ['Depth', 'Root', 'Run', 'Parent', 'Delegate'],
+      report.runTree.map((entry) => [
+        String(entry.depth),
+        shortId(entry.rootRunId),
+        shortId(entry.runId),
+        entry.parentRunId ? shortId(entry.parentRunId) : '-',
+        entry.delegateName ?? '-',
+      ]),
+    ))
+    : '';
+  const snapshots = report.snapshotSummaries && report.snapshotSummaries.length > 0
+    ? htmlSubsection('Snapshots', htmlTable(
+      ['Depth', 'Root/run', 'Delegate', 'Latest seq', 'Created at', 'Steps used'],
+      report.snapshotSummaries.map((snapshot) => [
+        String(snapshot.depth),
+        `${shortId(snapshot.rootRunId)}/${shortId(snapshot.runId)}`,
+        snapshot.delegateName ?? '-',
+        snapshot.latestSnapshotSeq === null ? '-' : String(snapshot.latestSnapshotSeq),
+        formatTime(snapshot.latestSnapshotCreatedAt),
+        snapshot.latestStepsUsed === null || snapshot.latestStepsUsed === undefined ? '-' : formatNumber(snapshot.latestStepsUsed),
+      ]),
+    ))
+    : '';
+  const timeline = report.timeline.length === 0
+    ? '<p class="empty">No migrated tool timeline rows were found.</p>'
+    : htmlTable(
+      ['Started', 'Duration', 'Run/depth', 'Step', 'Tool/event', 'Outcome', 'Preview'],
+      report.timeline.map((entry) => [
+        formatTimeOfDay(entry.startedAt),
+        formatDuration(entry.durationMs),
+        `${shortId(entry.rootRunId)}/${shortId(entry.runId)} d${entry.depth}`,
+        entry.stepId ?? '-',
+        entry.toolName ?? entry.eventType ?? 'tool',
+        statusCell(entry.outcome),
+        previewUnknown(entry.params ?? entry.output, 160),
+      ]),
+    );
+
+  return htmlSection(
+    'workflow',
+    'Workflow',
+    'Root runs, child-run shape, snapshots, and tool timeline for studying how the agent executed the objective.',
+    [
+      htmlSubsection('Root runs', rootRows.length === 0 ? '<p class="empty">No root runs were found.</p>' : htmlTable(['Root', 'Linked run', 'Status', 'Duration', 'Model', 'Goal/error'], rootRows)),
+      runTree,
+      snapshots,
+      htmlSubsection(formatTimelineTitle(report.timeline, report.session), timeline),
+    ].filter(Boolean).join('\n'),
+  );
+}
+
+function renderHtmlDelegates(delegates: DelegateRow[]): string {
+  const body = delegates.length === 0
+    ? '<p class="empty">No delegate chains were found.</p>'
+    : htmlTable(
+      ['Parent', 'Delegate', 'Child', 'Child status', 'Heartbeat', 'Lease expiry', 'Last event', 'Reason'],
+      delegates.map((delegate) => [
+        shortId(delegate.parent_run_id),
+        delegate.child_delegate_name ?? delegate.snapshot_delegate_name ?? 'delegate',
+        delegate.child_run_id ? shortId(delegate.child_run_id) : '-',
+        statusCell(delegate.child_status ?? 'missing'),
+        formatTime(delegate.child_heartbeat_at),
+        formatTime(delegate.child_lease_expires_at),
+        delegate.child_last_event_type ?? '-',
+        statusCell(delegate.delegate_reason),
+      ]),
+    );
+  return htmlSection('delegates', 'Delegates', 'Delegate handoff evidence, including child status, lease freshness, last event, and derived reason.', body);
+}
+
+function renderHtmlMessages(report: TraceReport, options: HtmlTraceRenderOptions): string {
+  const previewChars = options.previewChars ?? DEFAULT_MESSAGE_PREVIEW_CHARS;
+  const visibleRuns = report.llmMessages
+    .map((trace) => ({
+      trace,
+      messages: trace.effectiveMessages.filter((message) => !options.systemOnly || message.role === 'system'),
+    }))
+    .filter((item) => item.messages.length > 0);
+
+  if (visibleRuns.length === 0) {
+    const message = options.messages || options.systemOnly
+      ? 'No snapshot-backed LLM messages were found for the traced runs.'
+      : 'LLM message context was not loaded for this report. Re-run with --messages --html <path> to include snapshot-backed prompts and tool messages.';
+    return htmlSection('messages', options.systemOnly ? 'LLM System Messages' : 'LLM Message Context', 'Prompt, assistant, tool, and runtime-injected messages when loaded from run snapshots.', `<p class="empty">${escapeHtml(message)}</p>`);
+  }
+
+  const body = `<div class="message-list">${visibleRuns.map(({ trace, messages }) => renderHtmlMessageRun(trace, messages, previewChars)).join('\n')}</div>`;
+  return htmlSection('messages', options.systemOnly ? 'LLM System Messages' : 'LLM Message Context', 'Snapshot-backed model context for prompt analysis, policy injection checks, and tool-result study.', body);
+}
+
+function renderHtmlMessageRun(trace: RunMessageTrace, messages: TraceMessage[], previewChars: number): string {
+  const counts = summarizeMessages(messages);
+  const runLabel = `${shortId(trace.rootRunId)}/${shortId(trace.runId)} d${trace.depth}${trace.delegateName ? ` ${trace.delegateName}` : ''}`;
+  return `
+      <article class="message-run">
+        <h3>${escapeHtml(runLabel)}</h3>
+        <p class="message-meta">initial ${escapeHtml(String(trace.initialSnapshotSeq ?? '-'))} @ ${escapeHtml(formatTime(trace.initialSnapshotCreatedAt))} · latest ${escapeHtml(String(trace.latestSnapshotSeq ?? '-'))} @ ${escapeHtml(formatTime(trace.latestSnapshotCreatedAt))} · persisted=${formatNumber(counts.persisted)} pending=${formatNumber(counts.pending)} system=${formatNumber(counts.system)} runtime-injected=${formatNumber(counts.runtimeInjected)} user=${formatNumber(counts.user)} assistant=${formatNumber(counts.assistant)} tool=${formatNumber(counts.tool)}</p>
+        <div class="message-list">
+          ${messages.map((message) => renderHtmlMessageCard(message, previewChars)).join('\n')}
+        </div>
+      </article>`;
+}
+
+function renderHtmlMessageCard(message: TraceMessage, previewChars: number): string {
+  const preview = formatMessagePreview(message, previewChars);
+  const metadata = [
+    message.name ? `name=${message.name}` : undefined,
+    message.toolCallId ? `toolCallId=${message.toolCallId}` : undefined,
+  ].filter((part): part is string => part !== undefined);
+  const toolCalls = message.toolCalls && message.toolCalls.length > 0
+    ? `<details><summary>Tool calls (${formatNumber(message.toolCalls.length)})</summary><pre><code>${escapeHtml(stringifyJson(message.toolCalls))}</code></pre></details>`
+    : '';
+
+  return `
+          <details class="message-card role-${classToken(message.role)}">
+            <summary>
+              ${htmlBadge(`#${message.position + 1}`)}
+              ${htmlBadge(message.persistence)}
+              ${htmlBadge(message.role)}
+              ${htmlBadge(humanMessageCategoryPlain(message.category))}
+              <span class="message-preview">${escapeHtml(preview)}</span>
+            </summary>
+            ${metadata.length > 0 ? `<p class="message-meta">${escapeHtml(metadata.join(' · '))}</p>` : ''}
+            ${toolCalls}
+            <pre><code>${escapeHtml(message.content || '(empty)')}</code></pre>
+          </details>`;
+}
+
+function renderHtmlPlans(plans: PlanRow[], options: HtmlTraceRenderOptions): string {
+  if (plans.length === 0) {
+    const message = options.includePlans
+      ? 'No plan rows were found.'
+      : 'Plan execution rows were not loaded for this report. Re-run with --include-plans --html <path> to include plan details.';
+    return htmlSection('plans', 'Plans', 'Plan execution and replan details when requested.', `<p class="empty">${escapeHtml(message)}</p>`);
+  }
+
+  return htmlSection(
+    'plans',
+    'Plans',
+    'Plan execution rows, step titles, tools, approval flags, and replan reasons.',
+    htmlTable(
+      ['Run', 'Execution', 'Status', 'Attempt', 'Step', 'Title', 'Tool', 'Approval', 'Replan'],
+      plans.map((plan) => [
+        shortId(plan.run_id),
+        plan.plan_execution_id ? shortId(plan.plan_execution_id) : '-',
+        statusCell(plan.plan_execution_status ?? 'unknown'),
+        plan.attempt === null ? '-' : String(plan.attempt),
+        plan.step_index === null ? '-' : String(plan.step_index),
+        plan.title ?? plan.step_key ?? '-',
+        plan.tool_name ?? '-',
+        plan.requires_approval === null ? '-' : String(plan.requires_approval),
+        plan.replan_reason ?? '-',
+      ]),
+    ),
+  );
+}
+
+function renderHtmlFinalOutputs(rootRuns: RootRun[]): string {
+  const rootsWithOutput = rootRuns.filter((run) => run.result !== null && run.result !== undefined);
+  const body = rootsWithOutput.length === 0
+    ? '<p class="empty">No final output was found for the linked root runs.</p>'
+    : `<div class="stack">${rootsWithOutput.map((run) => `
+      <article class="details-card">
+        <h3>${escapeHtml(shortId(run.rootRunId))}</h3>
+        <pre><code>${escapeHtml(typeof run.result === 'string' ? run.result : stringifyJson(run.result))}</code></pre>
+      </article>`).join('\n')}</div>`;
+  return htmlSection('final-output', 'Final Output', 'Persisted root-run result values.', body);
+}
+
+function renderHtmlRawJson(report: TraceReport): string {
+  return htmlSection(
+    'raw-json',
+    'Raw Trace JSON',
+    'Escaped source report for exact machine-readable inspection. Includes derived diagnostics when they were not already present on the report.',
+    `<details class="details-card"><summary>Open raw JSON</summary><pre><code>${escapeHtml(stringifyJson(report))}</code></pre></details>`,
+  );
+}
+
+function renderHtmlWarnings(warnings: string[]): string {
+  if (warnings.length === 0) {
+    return '';
+  }
+  return `<ul class="warning-list">${warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join('\n')}</ul>`;
+}
+
+function renderHtmlSuggestedCommands(diagnostics: TraceDiagnostics): string {
+  if (diagnostics.suggestedNextViews.length === 0) {
+    return htmlSubsection('Suggested next views', '<p class="empty">No follow-up views were suggested.</p>');
+  }
+  return htmlSubsection(
+    'Suggested next views',
+    `<ul class="command-list">${diagnostics.suggestedNextViews.map((suggestion) => `<li>${escapeHtml(suggestion.reason)}<br><code>$ ${escapeHtml(suggestion.command)}</code></li>`).join('\n')}</ul>`,
+  );
+}
+
+function htmlSection(id: string, title: string, description: string, body: string): string {
+  return `
+      <section class="section" id="${escapeHtml(id)}">
+        <div class="section-header">
+          <div>
+            <h2>${escapeHtml(title)}</h2>
+            <p class="section-description">${escapeHtml(description)}</p>
+          </div>
+        </div>
+        ${body}
+      </section>`;
+}
+
+function htmlSubsection(title: string, body: string): string {
+  return `
+        <div class="subsection">
+          <h3>${escapeHtml(title)}</h3>
+          ${body}
+        </div>`;
+}
+
+function htmlMetricGrid(items: Array<[label: string, value: string, note?: string]>): string {
+  return `<div class="metric-grid">${items.map(([label, value, note]) => `
+        <div class="metric-card">
+          <span class="metric-label">${escapeHtml(label)}</span>
+          <span class="metric-value">${escapeHtml(value)}</span>
+          ${note ? `<p class="metric-note">${escapeHtml(note)}</p>` : ''}
+        </div>`).join('\n')}
+      </div>`;
+}
+
+function htmlMetaItem(label: string, value: string): string {
+  return `
+        <div class="meta-item">
+          <span class="meta-label">${escapeHtml(label)}</span>
+          <span class="meta-value">${escapeHtml(value)}</span>
+        </div>`;
+}
+
+function htmlTable(headers: string[], rows: HtmlTableCell[][]): string {
+  if (rows.length === 0) {
+    return '<p class="empty">No rows.</p>';
+  }
+  return `
+        <div class="table-wrap">
+          <table>
+            <thead><tr>${headers.map((header) => `<th>${escapeHtml(header)}</th>`).join('')}</tr></thead>
+            <tbody>
+              ${rows.map((row) => `<tr>${row.map((cell) => htmlTableCell(cell)).join('')}</tr>`).join('\n              ')}
+            </tbody>
+          </table>
+        </div>`;
+}
+
+function htmlTableCell(cell: HtmlTableCell): string {
+  if (typeof cell === 'string') {
+    return `<td>${escapeHtml(cell)}</td>`;
+  }
+  const className = cell.className ? ` class="${escapeHtml(cell.className)}"` : '';
+  return `<td${className}>${escapeHtml(String(cell.value))}</td>`;
+}
+
+function htmlBadge(value: string, className?: string): string {
+  const classes = ['badge', className].filter((item): item is string => item !== undefined).join(' ');
+  return `<span class="${escapeHtml(classes)}">${escapeHtml(value)}</span>`;
+}
+
+function statusCell(status: string): HtmlTableCell {
+  return { value: status, className: `status-cell status-${classToken(status)}` };
+}
+
+function classToken(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'unknown';
+}
+
+function previewUnknown(value: unknown, width: number): string {
+  if (value === null || value === undefined) {
+    return '-';
+  }
+  const raw = typeof value === 'string' ? value : stringifyJson(value);
+  return truncatePlain(oneLine(raw), width);
+}
+
+function stringifyJson(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+
+
+function renderTraceBrief(diagnostics: TraceDiagnostics): string {
+  const brief = diagnostics.brief;
+  const lines: string[] = [
+    `${chalk.cyan('outcome')} ${statusColor(brief.status)(brief.status)}`,
+    `${chalk.cyan('reason')} ${brief.headline}`,
+    `${chalk.cyan('target')} ${brief.targetLabel}`,
+    `${chalk.cyan('runs')} roots=${formatNumber(brief.rootRunCount)} total=${formatNumber(brief.runCount)} steps=${brief.totalSteps === null ? 'unknown' : formatNumber(brief.totalSteps)}`,
+    `${chalk.cyan('duration')} wall=${formatDuration(brief.wallDurationMs)} cumulative=${formatDuration(brief.cumulativeMeasuredDurationMs)} parallelism=${formatRatio(brief.parallelismFactor)}`,
+    `${chalk.cyan('model')} calls=${formatNumber(brief.modelCalls)} failed=${formatNumber(brief.failedModelCalls)}  ${chalk.cyan('tools')} calls=${formatNumber(brief.toolCalls)} failed=${formatNumber(brief.failedToolCalls)}`,
+    `${chalk.cyan('usage')} tokens=${formatNumber(brief.totalTokens)} cost=$${brief.estimatedCostUSD.toFixed(6)}`,
+  ];
+  const notableFindings = diagnostics.findings
+    .filter((finding) => finding.severity !== 'info')
+    .slice(0, 3);
+  if (notableFindings.length > 0) {
+    lines.push('');
+    lines.push(chalk.bold('Top findings'));
+    for (const finding of notableFindings) {
+      lines.push(`- ${findingSeverityColor(finding.severity)(finding.severity)} ${finding.title}`);
+      lines.push(...wrapPlain(finding.summary, 112).map((line) => `  ${line}`));
+    }
+  }
+  if (diagnostics.suggestedNextViews.length > 0) {
+    lines.push('');
+    lines.push(chalk.bold('Suggested next views'));
+    lines.push(renderSuggestedNextViews(diagnostics, { limit: 3 }));
+  }
+  return lines.join('\n');
+}
+
+function renderInvestigation(report: TraceReport, diagnostics: TraceDiagnostics): string {
+  const lines: string[] = [];
+  lines.push(markdownBlock('## Findings'));
+  lines.push(renderDiagnosticFindings(diagnostics.findings.length > 0 ? diagnostics.findings : [{
+    id: 'finding-0',
+    severity: 'info',
+    category: 'data-quality',
+    title: 'No diagnostic findings',
+    summary: 'No failure, policy, or performance findings were derived from the persisted trace.',
+    evidence: [],
+  }]));
+
+  const nonSucceededRoots = report.rootRuns.filter((run) => run.status && run.status !== 'succeeded');
+  if (nonSucceededRoots.length > 0) {
+    lines.push('');
+    lines.push(markdownBlock('## Non-succeeded root runs'));
+    lines.push(renderTable(
+      ['root', 'status', 'detail'],
+      nonSucceededRoots.map((run) => [
+        shortId(run.rootRunId),
+        statusColor(run.status ?? 'unknown')(run.status ?? 'unknown'),
+        truncatePlain(oneLine(run.errorMessage ?? run.errorCode ?? run.goal ?? '-'), 96),
+      ]),
+    ));
+  }
+
+  const suspiciousDelegates = report.delegates.filter((delegate) => delegate.delegate_reason !== 'returned successfully');
+  if (suspiciousDelegates.length > 0) {
+    lines.push('');
+    lines.push(markdownBlock('## Delegate chain evidence'));
+    lines.push(renderDelegates(suspiciousDelegates));
+  }
+
+  lines.push('');
+  lines.push(markdownBlock('## Suggested next views'));
+  lines.push(renderSuggestedNextViews(diagnostics));
+  return lines.join('\n');
+}
+
+function renderPolicyDiagnostics(diagnostics: TraceDiagnostics): string {
+  const policy = diagnostics.policy;
+  const lines: string[] = [];
+  lines.push(markdownBlock('## Summary'));
+  lines.push(renderMetricTable([
+    ['budget exhausted', formatNumber(policy.budgetExhaustedToolCalls), 'Tool calls skipped because a budget was already exhausted.'],
+    ['rejected tool calls', formatNumber(policy.rejectedToolCalls), '`model.tool_call_rejected` events emitted by core.'],
+    ['approval requests', `${formatNumber(policy.approvalRequests)} requested / ${formatNumber(policy.approvalResolved)} resolved`, 'Approval lifecycle events observed in the trace.'],
+    ['runtime policy messages', formatNumber(policy.runtimePolicyMessages), 'Runtime-injected budget/policy guidance found in LLM messages.'],
+  ]));
+
+  if (policy.budgetGroups.length > 0) {
+    lines.push('');
+    lines.push(markdownBlock('## Budget groups'));
+    lines.push(renderTable(
+      ['budget group', 'skipped calls', 'tools'],
+      policy.budgetGroups.map((group) => [
+        group.budgetGroup,
+        formatNumber(group.skippedCalls),
+        group.toolNames.length > 0 ? group.toolNames.join(', ') : '-',
+      ]),
+    ));
+  }
+
+  const policyFindings = diagnostics.findings.filter((finding) => finding.category === 'policy');
+  if (policyFindings.length > 0) {
+    lines.push('');
+    lines.push(markdownBlock('## Policy findings'));
+    lines.push(renderDiagnosticFindings(policyFindings));
+  } else {
+    lines.push('');
+    lines.push(chalk.gray('No policy adherence findings were derived from this trace.'));
+  }
+
+  lines.push('');
+  lines.push(markdownBlock('## Suggested next views'));
+  lines.push(renderSuggestedNextViews(diagnostics));
+  return lines.join('\n');
+}
+
+function renderDiagnosticFindings(findings: TraceFinding[]): string {
+  return findings.map((finding, index) => renderDiagnosticFinding(finding, index)).join('\n\n');
+}
+
+function renderDiagnosticFinding(finding: TraceFinding, index: number): string {
+  const severity = findingSeverityColor(finding.severity)(finding.severity.toUpperCase());
+  const lines = [
+    `${chalk.bold(`${index + 1}.`)} ${severity} ${chalk.gray(finding.category)} ${chalk.bold(finding.title)}`,
+    ...wrapPlain(finding.summary, 112).map((line) => `   ${line}`),
+  ];
+
+  if (finding.evidence.length > 0) {
+    lines.push(`   ${chalk.cyan('Evidence')}`);
+    for (const evidence of finding.evidence.slice(0, 4)) {
+      const wrapped = wrapPlain(formatEvidenceRef(evidence), 108);
+      lines.push(`   - ${wrapped[0] ?? '-'}`);
+      for (const continuation of wrapped.slice(1)) {
+        lines.push(`     ${continuation}`);
+      }
+    }
+    if (finding.evidence.length > 4) {
+      lines.push(`   - ${chalk.gray(`+${finding.evidence.length - 4} more evidence items`)}`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
+function formatEvidenceRef(item: EvidenceRef): string {
+  const location = [
+    item.runId ? `run=${shortId(item.runId)}` : undefined,
+    item.stepId ? `step=${item.stepId}` : undefined,
+    item.toolCallId ? `toolCall=${shortId(item.toolCallId)}` : undefined,
+    item.eventSeq !== undefined && item.eventSeq !== null ? `event=#${item.eventSeq}` : undefined,
+  ].filter((part): part is string => part !== undefined).join(' ');
+  const detail = item.detail ? ` - ${oneLine(item.detail)}` : '';
+  return `${item.label}${location ? ` (${location})` : ''}${detail}`;
+}
+
+function renderSuggestedNextViews(diagnostics: TraceDiagnostics, options: { limit?: number } = {}): string {
+  if (diagnostics.suggestedNextViews.length === 0) {
+    return chalk.gray('No follow-up views were suggested.');
+  }
+  const suggestions = options.limit === undefined
+    ? diagnostics.suggestedNextViews
+    : diagnostics.suggestedNextViews.slice(0, options.limit);
+  return suggestions
+    .map((suggestion) => `- ${suggestion.reason}\n  ${chalk.cyan(`$ ${suggestion.command}`)}`)
+    .join('\n');
+}
+
 
 function normalizeGoal(goal: string | null): string | null {
   if (typeof goal !== 'string') {
@@ -361,7 +1266,11 @@ function renderUsage(usage: SessionUsageSummary): string {
   return lines.join('\n');
 }
 
-function renderPerformance(performance: PerformanceSummary, totalDurationMs: number | null): string {
+function renderPerformance(
+  performance: PerformanceSummary,
+  totalDurationMs: number | null,
+  digest: PerformanceDigest,
+): string {
   const lines: string[] = [];
   const statusCodes = Object.entries(performance.model.adapterStatusCodes)
     .sort(([left], [right]) => left.localeCompare(right))
@@ -372,6 +1281,10 @@ function renderPerformance(performance: PerformanceSummary, totalDurationMs: num
     lines.push(chalk.gray('No Phase 0 performance payloads were found for this trace.'));
   }
 
+  lines.push(markdownBlock('## Digest'));
+  lines.push(renderPerformanceDigest(digest, performance.events.totalEvents > 0));
+
+  lines.push('');
   lines.push(markdownBlock('## Overview'));
   lines.push(renderMetricTable([
     ['events', `${formatNumber(performance.events.measuredEvents)} measured / ${formatNumber(performance.events.totalEvents)} total`, 'Events carrying `payload.performance`.'],
@@ -445,6 +1358,72 @@ function renderPerformance(performance: PerformanceSummary, totalDurationMs: num
   lines.push('- `total` shows cumulative volume or time across measured events; `max` points to the largest single event.');
   lines.push('- Request and snapshot bytes usually explain prompt or persistence bloat; adapter latency usually explains provider wait.');
   lines.push('- `raw output` versus `model output` shows whether tool results are being compressed before returning to the model.');
+
+  return lines.join('\n');
+}
+
+function renderPerformanceDigest(digest: PerformanceDigest, includeTimelineSpans: boolean): string {
+  const lines: string[] = [];
+  lines.push(renderMetricTable([
+    ['wall time', formatDuration(digest.wallDurationMs), 'Elapsed time across root runs; falls back to session duration when run timing is unavailable.'],
+    ['cumulative measured', formatDuration(digest.cumulativeMeasuredDurationMs), 'Model + tool + snapshot save time. May exceed wall time when work is parallel or nested.'],
+    ['model / tools / snapshots', `${formatDuration(digest.cumulativeModelDurationMs)} / ${formatDuration(digest.cumulativeToolDurationMs)} / ${formatDuration(digest.cumulativeSnapshotSaveMs)}`, 'Main cumulative duration buckets.'],
+    ['other wall time', formatDuration(digest.otherDurationMs), 'Wall time not explained by measured model/tool/snapshot buckets.'],
+    ['parallelism factor', formatRatio(digest.parallelismFactor), 'Cumulative measured time divided by wall time.'],
+  ]));
+
+  if (digest.topRunsByUsage.length > 0) {
+    lines.push('');
+    lines.push(markdownBlock('### Top Token Runs'));
+    lines.push(renderTable(
+      ['root', 'tokens', 'prompt', 'completion', 'cost', 'goal'],
+      digest.topRunsByUsage.map((run) => [
+        shortId(run.rootRunId),
+        formatNumber(run.totalTokens),
+        formatNumber(run.promptTokens),
+        formatNumber(run.completionTokens),
+        `$${run.estimatedCostUSD.toFixed(6)}`,
+        run.goal ? truncatePlain(oneLine(run.goal), 80) : '-',
+      ]),
+    ));
+  }
+
+  if (includeTimelineSpans && digest.topToolSpans.length > 0) {
+    lines.push('');
+    lines.push(markdownBlock('### Slowest Tool Spans'));
+    lines.push(renderTable(
+      ['duration', 'run/depth', 'step', 'tool', 'outcome'],
+      digest.topToolSpans.map((span) => [
+        formatDuration(span.durationMs),
+        `${shortId(span.rootRunId)}/${shortId(span.runId)}`,
+        span.stepId ?? '-',
+        span.toolName ?? 'tool',
+        statusColor(span.outcome)(span.outcome),
+      ]),
+    ));
+  }
+
+  if (digest.topToolsByModelOutput.length > 0) {
+    lines.push('');
+    lines.push(markdownBlock('### Largest Model-Visible Tool Outputs'));
+    lines.push(renderTable(
+      ['tool', 'calls', 'model output', 'raw output'],
+      digest.topToolsByModelOutput.map((tool) => [
+        toolColor(tool.toolName)(tool.toolName),
+        `${formatNumber(tool.completed)} completed / ${formatNumber(tool.failed)} failed`,
+        formatBucketBytes(tool.modelOutputBytes),
+        formatBucketBytes(tool.rawOutputBytes),
+      ]),
+    ));
+  }
+
+  if (digest.notes.length > 0) {
+    lines.push('');
+    lines.push(markdownBlock('### Digest Notes'));
+    for (const note of digest.notes) {
+      lines.push(`- ${note}`);
+    }
+  }
 
   return lines.join('\n');
 }
@@ -922,7 +1901,21 @@ function resolveReportView(options: Pick<CliOptions, 'onlyDelegates'> & Partial<
   return 'all';
 }
 
-function shouldRenderSection(view: ReportView, section: Exclude<ReportView, 'overview' | 'all'>): boolean {
+function shouldRenderDiagnosticLead(view: ReportView, onlyDelegates: boolean): boolean {
+  if (onlyDelegates) {
+    return false;
+  }
+  return view === 'all'
+    || view === 'overview'
+    || view === 'brief'
+    || view === 'investigate'
+    || view === 'policy';
+}
+
+function shouldRenderSection(
+  view: ReportView,
+  section: 'performance' | 'milestones' | 'timeline' | 'delegates' | 'messages' | 'plans',
+): boolean {
   return view === 'all' || view === section;
 }
 
@@ -967,6 +1960,17 @@ function statusColor(status: string): (value: string) => string {
     return chalk.yellow;
   }
   return chalk.white;
+}
+
+function findingSeverityColor(severity: TraceFinding['severity']): (value: string) => string {
+  switch (severity) {
+    case 'error':
+      return chalk.red;
+    case 'warning':
+      return chalk.yellow;
+    case 'info':
+      return chalk.cyan;
+  }
 }
 
 function messageRoleColor(role: TraceMessageRole): (value: string) => string {
@@ -1072,6 +2076,10 @@ function formatNumber(value: number): string {
   return new Intl.NumberFormat('en-US').format(value);
 }
 
+function formatRatio(value: number | null): string {
+  return value === null ? '-' : `${value.toFixed(2)}x`;
+}
+
 function formatBucketBytes(bucket: PerformanceBucketSummary): string {
   if (bucket.count === 0) {
     return '-';
@@ -1123,6 +2131,32 @@ function markdownBlock(source: string): string {
 
 function oneLine(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
+}
+
+function wrapPlain(value: string, width: number): string[] {
+  const normalized = oneLine(value);
+  if (normalized.length === 0) {
+    return [''];
+  }
+
+  const lines: string[] = [];
+  let current = '';
+  for (const word of normalized.split(' ')) {
+    if (current.length === 0) {
+      current = word;
+      continue;
+    }
+    if (current.length + 1 + word.length <= width) {
+      current += ` ${word}`;
+      continue;
+    }
+    lines.push(current);
+    current = word;
+  }
+  if (current.length > 0) {
+    lines.push(current);
+  }
+  return lines;
 }
 
 function truncatePlain(value: string, width: number): string {

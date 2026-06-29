@@ -1,4 +1,6 @@
 import { inspect } from 'node:util';
+import { dirname, resolve } from 'node:path';
+import { mkdir, writeFile } from 'node:fs/promises';
 import readline from 'node:readline/promises';
 
 import chalk from 'chalk';
@@ -12,6 +14,7 @@ import {
   renderSessionPerformanceList,
   renderSessionList,
   renderSessionlessRunList,
+  renderTraceHtml,
   renderTraceReport,
   renderUsageReport,
 } from './render.js';
@@ -44,6 +47,9 @@ export function parseArgs(args: string[]): CliOptions {
         break;
       case '--json':
         options.json = true;
+        break;
+      case '--html':
+        options.htmlPath = requireValue(arg, args[++index]);
         break;
       case '--ls':
         options.listSessions = true;
@@ -160,6 +166,9 @@ export async function main(): Promise<void> {
     if ((options.listSessions || options.listPerformance || options.listSessionless || options.deleteEmptyGoalSessions || options.usageOnly) && (options.view || options.messagesView || options.focusRunId)) {
       throw new Error(`--view, --messages-view, and --focus-run can only be used when rendering a full trace.\n\n${USAGE}`);
     }
+    if ((options.listSessions || options.listPerformance || options.listSessionless || options.deleteEmptyGoalSessions || options.usageOnly) && options.htmlPath) {
+      throw new Error(`--html can only be used when rendering a full trace.\n\n${USAGE}`);
+    }
     if ((options.listSessionless || options.deleteEmptyGoalSessions || options.usageOnly) && options.previewChars) {
       throw new Error(`--preview-chars can only be used with --ls, --lsp, or when rendering a full trace.\n\n${USAGE}`);
     }
@@ -201,11 +210,28 @@ export async function main(): Promise<void> {
     }
 
     const report = await runTraceSessionWithPasswordRetry(postgresConfig, options);
+    if (options.htmlPath) {
+      const htmlPath = await writeTraceHtmlReport(options.htmlPath, renderTraceHtml(report, options));
+      const message = `Wrote trace HTML report: ${htmlPath}`;
+      if (options.json) {
+        console.error(chalk.gray(message));
+      } else {
+        console.log(message);
+        return;
+      }
+    }
     console.log(renderTraceReport(report, options));
   } catch (error) {
     console.error(chalk.red(errorMessage(error)));
     process.exitCode = 1;
   }
+}
+
+async function writeTraceHtmlReport(htmlPath: string, html: string): Promise<string> {
+  const resolvedPath = resolve(htmlPath);
+  await mkdir(dirname(resolvedPath), { recursive: true });
+  await writeFile(resolvedPath, html, 'utf8');
+  return resolvedPath;
 }
 
 async function runTraceSessionWithPasswordRetry(
@@ -441,10 +467,10 @@ function requireValue(option: string, value: string | undefined): string {
 }
 
 function parseReportView(value: string): ReportView {
-  if (value === 'overview' || value === 'performance' || value === 'milestones' || value === 'timeline' || value === 'delegates' || value === 'messages' || value === 'plans' || value === 'all') {
+  if (value === 'brief' || value === 'overview' || value === 'investigate' || value === 'policy' || value === 'performance' || value === 'milestones' || value === 'timeline' || value === 'delegates' || value === 'messages' || value === 'plans' || value === 'all') {
     return value;
   }
-  throw new Error(`Invalid --view value: ${value}. Expected one of overview, performance, milestones, timeline, delegates, messages, plans, or all.`);
+  throw new Error(`Invalid --view value: ${value}. Expected one of brief, overview, investigate, policy, performance, milestones, timeline, delegates, messages, plans, or all.`);
 }
 
 function parseMessageView(value: string): MessageView {

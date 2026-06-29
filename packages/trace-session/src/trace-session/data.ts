@@ -1,6 +1,7 @@
 import { inspect } from 'node:util';
 
 import {
+  buildTraceDiagnostics,
   buildMilestones,
   buildRunTreeEntries,
   buildTimeline,
@@ -133,6 +134,8 @@ export async function traceSession(client: PostgresClient, options: CliOptions):
       report.performance = summarizePerformance(traceRows.filter((row) => focusedRunIds.has(row.run_id)));
     }
   }
+
+  report.diagnostics = buildTraceDiagnostics(report);
 
   return report;
 }
