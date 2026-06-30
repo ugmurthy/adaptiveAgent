@@ -14,6 +14,7 @@ import type {
   JsonSchema,
   JsonValue,
   ModelContentPart,
+  RunRecoveryPlan,
 } from '@adaptive-agent/core';
 
 import {
@@ -102,7 +103,7 @@ const IMAGE_FILE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp',
 const AUDIO_FILE_EXTENSIONS = new Set(['.wav', '.mp3', '.flac', '.m4a', '.ogg', '.aac', '.aiff', '.aif', '.opus', '.oga', '.weba']);
 const VIDEO_FILE_EXTENSIONS = new Set(['.mp4', '.m4v', '.mov', '.webm', '.mkv', '.avi', '.mpeg', '.mpg', '.ogv', '.wmv', '.flv', '.3gp', '.ts', '.mts', '.m2ts']);
 
-const CLI_COMMANDS = ['run', 'chat', 'spec', 'config', 'catalog', 'eval', 'swarm-run', 'inspect', 'resume', 'retry', 'interrupt', 'replay', 'init', 'doctor', 'update', 'uninstall', 'agent-create'] as const;
+const CLI_COMMANDS = ['run', 'chat', 'spec', 'config', 'catalog', 'eval', 'swarm-run', 'inspect', 'resume', 'retry', 'recover', 'interrupt', 'replay', 'init', 'doctor', 'update', 'uninstall', 'agent-create'] as const;
 type CliCommand = (typeof CLI_COMMANDS)[number];
 const CLI_COMMAND_SET = new Set<string>(CLI_COMMANDS);
 
@@ -110,8 +111,8 @@ function isCliCommand(value: string): value is CliCommand {
   return CLI_COMMAND_SET.has(value);
 }
 
-function isSingleRunCommand(command: ManualTestCliOptions['command']): command is 'inspect' | 'resume' | 'interrupt' | 'replay' {
-  return command === 'inspect' || command === 'resume' || command === 'interrupt' || command === 'replay';
+function isSingleRunCommand(command: ManualTestCliOptions['command']): command is 'inspect' | 'resume' | 'recover' | 'interrupt' | 'replay' {
+  return command === 'inspect' || command === 'resume' || command === 'recover' || command === 'interrupt' || command === 'replay';
 }
 
 const TOP_LEVEL_HELP_TEXT = `adaptive-agent
@@ -128,6 +129,7 @@ Common commands:
   chat                  Start an interactive chat
   swarm-run             Decompose one task into worker runs and synthesize a result
   retry                 Retry one failed run or swarm session
+  recover               Choose the cheapest safe recovery action for one run
 
 Recovery and inspection:
   inspect               Inspect a stored run and event summary
@@ -302,6 +304,26 @@ Retry options:
   --synthesizer-agent <path-or-name>
                           Optional synthesizer agent JSON path or filename for session retry.
   --max-workers <n>       Maximum concurrent swarm workers for session retry.
+
+${COMMON_AGENT_OPTIONS_TEXT}
+
+${RUN_OUTPUT_OPTIONS_TEXT}`;
+
+const RECOVER_HELP_TEXT = `adaptive-agent recover
+
+Choose the cheapest safe recovery action for one persisted run.
+
+Usage:
+  adaptive-agent recover <runId> [options]
+  adaptive-agent recover --run-id <runId> [options]
+
+Examples:
+  adaptive-agent recover run_123 --dry-run
+  adaptive-agent recover --run-id run_123 --strategy continue
+
+Recover options:
+  --strategy <mode>       Recovery mode: auto, resume, retry, or continue. Default: auto.
+  --dry-run               Print the selected recovery plan without executing it.
 
 ${COMMON_AGENT_OPTIONS_TEXT}
 
@@ -548,6 +570,8 @@ function getHelpText(topic?: ManualTestCliOptions['helpTopic']): string {
       return RESUME_HELP_TEXT;
     case 'retry':
       return RETRY_HELP_TEXT;
+    case 'recover':
+      return RECOVER_HELP_TEXT;
     case 'interrupt':
       return INTERRUPT_HELP_TEXT;
     case 'replay':
@@ -658,6 +682,10 @@ export async function main(argv = Bun.argv.slice(2)): Promise<number> {
 
   if (cli.command === 'retry') {
     return runRetryCommand(cli);
+  }
+
+  if (cli.command === 'recover') {
+    return runRecoverCommand(cli);
   }
 
   if (cli.command === 'interrupt') {
@@ -1227,6 +1255,35 @@ async function assertRunAgentMatchesLoadedAgent(sdk: Awaited<ReturnType<typeof c
   }
 }
 
+async function resolveSdkForRunAgent(
+  sdk: Awaited<ReturnType<typeof createAgentSdk>>,
+  sdkOptions: AgentSdkOptions,
+  runId: string,
+  explicitAgentConfigPath: string | undefined,
+  eventListener: ((event: AgentEvent) => void) | undefined,
+): Promise<Awaited<ReturnType<typeof createAgentSdk>>> {
+  const inspection = await sdk.inspect(runId);
+  if (!inspection.run && sdk.config.runtime.mode === 'memory' && process.env.DATABASE_URL) {
+    throw new Error(`Run ${runId} was not found in the resolved memory runtime. DATABASE_URL is set, so this may be a Postgres-backed run; retry with --runtime postgres or update agent.settings.json runtime.mode to postgres.`);
+  }
+
+  const runAgentId = typeof inspection.run?.metadata?.agentId === 'string' ? inspection.run.metadata.agentId : undefined;
+  if (!runAgentId || runAgentId === sdk.config.agent.id) {
+    return sdk;
+  }
+
+  if (explicitAgentConfigPath) {
+    throw new Error(`Run ${runId} belongs to agent ${runAgentId}; loaded agent is ${sdk.config.agent.id}`);
+  }
+
+  return createAgentSdk({
+    ...sdkOptions,
+    agentConfigPath: runAgentId,
+    runtime: sdk.created.runtime,
+    eventListener,
+  });
+}
+
 async function runInspectCommand(cli: ManualTestCliOptions): Promise<number> {
   const runId = readRunIdArgument(cli);
   const resolvedCwd = resolve(cli.cwd ?? process.cwd());
@@ -1283,6 +1340,93 @@ async function runResumeCommand(cli: ManualTestCliOptions): Promise<number> {
   } finally {
     await sdk.close();
   }
+}
+
+async function runRecoverCommand(cli: ManualTestCliOptions): Promise<number> {
+  const runId = readRunIdArgument(cli);
+  const resolvedCwd = resolve(cli.cwd ?? process.cwd());
+  const sdkOptions = buildSdkOptions(cli, resolvedCwd);
+  const eventLog: Array<Record<string, JsonValue>> = [];
+  const resolvedConfig = await loadAgentSdkConfig(sdkOptions);
+  const lastProgressContentByRun = new Map<string, string>();
+  const recoverColors = cli.output === 'pretty' ? new RunColorRegistry() : undefined;
+  const eventListener = shouldListenForCliEvents(cli) && !cli.dryRun ? (event: AgentEvent) => {
+    const entry = summarizeEvent(event);
+    eventLog.push(entry);
+    if (recoverColors && cli.progress) {
+      printRunBoundaryEvent(event, resolvedConfig.tui, recoverColors, cli.wrapWidth);
+    }
+    if (cli.events && cli.output === 'pretty') {
+      printEvent(entry, resolvedConfig.tui, recoverColors);
+    } else if (cli.progress && cli.output === 'pretty') {
+      printProgressEvent(event, lastProgressContentByRun, resolvedConfig.tui, cli.showLines, cli.wrapWidth, recoverColors);
+    }
+  } : undefined;
+
+  const initialSdk = await createAgentSdk({ ...sdkOptions, eventListener });
+  let sdk = initialSdk;
+  try {
+    sdk = await resolveSdkForRunAgent(initialSdk, sdkOptions, runId, cli.agentConfigPath, eventListener);
+    const plan = await sdk.getRecoveryPlan(runId);
+
+    if (cli.dryRun) {
+      if (cli.output === 'json') {
+        console.log(JSON.stringify({ command: 'recover', runId, dryRun: true, plan }, null, 2));
+      } else if (cli.output === 'jsonl') {
+        console.log(JSON.stringify({ command: 'recover', runId, dryRun: true, plan }));
+      } else {
+        printRecoveryPlan(plan);
+      }
+      return plan.executable ? 0 : 1;
+    }
+
+    const recovered = await sdk.recover({
+      runId,
+      strategy: cli.recoveryStrategy,
+    });
+
+    if (cli.output === 'json') {
+      console.log(JSON.stringify({
+        command: 'recover',
+        runId,
+        action: recovered.action,
+        plan: recovered.plan,
+        result: recovered.result ? summarizeResult(recovered.result) : undefined,
+      }, null, 2));
+    } else if (cli.output === 'jsonl') {
+      console.log(JSON.stringify({
+        command: 'recover',
+        runId,
+        action: recovered.action,
+        result: recovered.result ? summarizeResult(recovered.result) : undefined,
+      }));
+    } else {
+      console.log(`recover: action=${recovered.action} run=${runId}`);
+      if (recovered.result) {
+        printResult(recovered.result, 'run', resolvedConfig.tui);
+      }
+      if (cli.events && eventLog.length > 0) console.error(`event log captured: ${eventLog.length}`);
+    }
+
+    return recovered.result ? (isSuccessfulResult(recovered.result) ? 0 : 1) : 0;
+  } finally {
+    if (sdk !== initialSdk) await sdk.close();
+    await initialSdk.close();
+  }
+}
+
+function printRecoveryPlan(plan: RunRecoveryPlan): void {
+  console.log(`recover ${plan.runId}: ${plan.action}`);
+  console.log(`status: ${plan.status}`);
+  console.log(`executable: ${plan.executable ? 'yes' : 'no'}`);
+  console.log(`reason: ${plan.reason}`);
+  if (plan.retryability) {
+    console.log(`retryable: ${plan.retryability.retryable ? 'yes' : 'no'} (${plan.retryability.failureKind})`);
+    if (plan.retryability.reason) console.log(`retry reason: ${plan.retryability.reason}`);
+  }
+  if (plan.recovery?.lastCompletedStepId) console.log(`last completed step: ${plan.recovery.lastCompletedStepId}`);
+  if (plan.recovery?.nextStepId) console.log(`next step: ${plan.recovery.nextStepId}`);
+  if (plan.recovery?.unsafeReason) console.log(`unsafe reason: ${plan.recovery.unsafeReason}`);
 }
 
 async function runInterruptCommand(cli: ManualTestCliOptions): Promise<number> {
@@ -1621,6 +1765,7 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
     evalFailFast: false,
     evalSwarm: 1,
     evalOffset: 0,
+    recoveryStrategy: 'auto',
     minimal: false,
     bundles: [],
     installAgents: [],
@@ -1863,11 +2008,14 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
       case '--clarification':
         options.clarificationMode = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['interactive', 'fail']);
         break;
+      case '--strategy':
+        options.recoveryStrategy = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['auto', 'resume', 'retry', 'continue']);
+        break;
       case '--output':
         options.output = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['pretty', 'json', 'jsonl']);
         break;
       default:
-        if (options.command === 'run' || options.command === 'chat' || options.command === 'swarm-run' || options.command === 'inspect' || options.command === 'resume' || options.command === 'retry' || options.command === 'interrupt' || options.command === 'replay' || options.command === 'agent-create') {
+        if (options.command === 'run' || options.command === 'chat' || options.command === 'swarm-run' || options.command === 'inspect' || options.command === 'resume' || options.command === 'retry' || options.command === 'recover' || options.command === 'interrupt' || options.command === 'replay' || options.command === 'agent-create') {
           options.goalArgs.push(arg);
           break;
         }

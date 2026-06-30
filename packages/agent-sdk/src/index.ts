@@ -13,7 +13,10 @@ import {
   type JsonObject,
   type JsonValue,
   type PlanStore,
+  type RecoverRunOptions,
+  type RecoverRunResult,
   type RunRecoveryOptions,
+  type RunRecoveryPlan,
   type RunResult,
   type RunStore,
   type SnapshotStore,
@@ -126,6 +129,12 @@ export class AgentSdk {
   async retry(runId: UUID): Promise<RunResult> { return this.resolveInteractions(await this.agent.retry(runId)); }
   async retryRaw(runId: UUID): Promise<RunResult> { return this.agent.retry(runId); }
   async getRecoveryOptions(runId: UUID): Promise<RunRecoveryOptions> { return this.agent.getRecoveryOptions(runId); }
+  async getRecoveryPlan(runId: UUID): Promise<RunRecoveryPlan> { return this.agent.getRecoveryPlan(runId); }
+  async recover(options: RecoverRunOptions): Promise<RecoverRunResult> {
+    const recovered = await this.agent.recover(options);
+    return recovered.result ? { ...recovered, result: await this.resolveInteractions(recovered.result) } : recovered;
+  }
+  async recoverRaw(options: RecoverRunOptions): Promise<RecoverRunResult> { return this.agent.recover(options); }
   async createContinuationRun(options: ContinueRunOptions): Promise<ContinueRunResult> { return this.agent.createContinuationRun(options); }
   async continueRun(options: ContinueRunOptions): Promise<RunResult> { return this.resolveInteractions(await this.agent.continueRun(options)); }
   async continueRunRaw(options: ContinueRunOptions): Promise<RunResult> { return this.agent.continueRun(options); }

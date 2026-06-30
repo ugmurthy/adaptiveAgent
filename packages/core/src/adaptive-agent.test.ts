@@ -482,6 +482,18 @@ describe('AdaptiveAgent', () => {
       nextStepId: 'step-2',
     });
 
+    const plan = await agent.getRecoveryPlan(failedResult.runId);
+    expect(plan).toMatchObject({
+      runId: failedResult.runId,
+      status: 'failed',
+      action: 'retry_same_run',
+      executable: true,
+      retryability: {
+        retryable: true,
+        failureKind: 'timeout',
+      },
+    });
+
     const continuedResult = await agent.continueRun({ fromRunId: failedResult.runId });
     expect(continuedResult).toMatchObject({
       status: 'success',

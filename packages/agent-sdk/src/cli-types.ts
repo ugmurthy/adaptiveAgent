@@ -10,7 +10,7 @@ import type { ApprovalMode, ClarificationMode, RuntimeMode, createAgentSdk } fro
 import type { InitProfile } from './install/init.js';
 
 export interface ManualTestCliOptions {
-  command: 'run' | 'chat' | 'spec' | 'config' | 'catalog' | 'eval' | 'swarm-run' | 'inspect' | 'resume' | 'retry' | 'interrupt' | 'replay' | 'init' | 'doctor' | 'update' | 'uninstall' | 'agent-create' | 'version';
+  command: 'run' | 'chat' | 'spec' | 'config' | 'catalog' | 'eval' | 'swarm-run' | 'inspect' | 'resume' | 'retry' | 'recover' | 'interrupt' | 'replay' | 'init' | 'doctor' | 'update' | 'uninstall' | 'agent-create' | 'version';
   specPath: string;
   goalArgs: string[];
   runId?: string;
@@ -40,6 +40,7 @@ export interface ManualTestCliOptions {
   evalLevel?: string;
   evalSplit?: string;
   evalType?: BenchmarkAttachmentType;
+  recoveryStrategy: 'auto' | 'resume' | 'retry' | 'continue';
   mode?: 'chat' | 'run';
   cwd?: string;
   agentConfigPath?: string;

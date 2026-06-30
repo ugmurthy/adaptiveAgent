@@ -51,6 +51,14 @@ export type RecoveryDecision =
   | 'requires_reconciliation'
   | 'requires_user_action';
 
+export type RunRecoveryAction =
+  | 'resume_same_run'
+  | 'retry_same_run'
+  | 'continue_new_run'
+  | 'requires_reconciliation'
+  | 'requires_user_action'
+  | 'not_recoverable';
+
 export type FailureClass =
   | 'provider_transient'
   | 'provider_terminal'
@@ -628,6 +636,30 @@ export interface RunRecoveryOptions {
   nextStepId?: string;
   requiresReconciliation?: boolean;
   unsafeReason?: string;
+}
+
+export interface RunRecoveryPlan {
+  runId: UUID;
+  status: RunStatus;
+  action: RunRecoveryAction;
+  executable: boolean;
+  reason: string;
+  retryability?: RunRetryability;
+  recovery?: RunRecoveryOptions;
+}
+
+export interface RecoverRunOptions {
+  runId: UUID;
+  strategy?: 'auto' | 'resume' | 'retry' | 'continue';
+  requireApproval?: boolean;
+  metadata?: Record<string, JsonValue>;
+}
+
+export interface RecoverRunResult {
+  runId: UUID;
+  action: RunRecoveryAction;
+  plan: RunRecoveryPlan;
+  result?: RunResult;
 }
 
 export interface ContinueRunOptions {

@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Shield Management Diagram</title>
+    <script type="module">
+      import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10.0.0/dist/mermaid.esm.min.mjs';
+      mermaid.initialize({startOnLoad:true});
+    </script>
+</head>
+<body>
+    <div class="mermaid">
+        graph TD;
+        A{[Start: Shield Activation]} 
+        -->> B{[Energy Source: Warp Core]} 
+        B -->> C{[Shield Generator]} 
+        C -->> D{[Shield Matrix]} 
+        D -->> E{[Adjustable Modulation]} 
+        E -->> F{[Active Scanning for Threats]} 
+        D -->> G{[Shield Levels]} 
+        F -->> H{[Threat Detected?]} 
+        H -->>|Yes| I{[Raise Shields to Maximum]} 
+        H -->>|No| J{[Maintain Current Status]} 
+        I -->> K{[Evasive Maneuvers]} 
+        K -->> L{[Engage Countermeasures]} 
+        J -->> L 
+        L -->> M{[Shields Regenerate]} 
+        M -->> D
+    </div>
+</body>
+</html>

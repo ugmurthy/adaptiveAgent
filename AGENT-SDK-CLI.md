@@ -60,6 +60,7 @@ Commands:
   inspect <run-id>              Inspect run/event summary
   resume <run-id>               Resume interrupted or waiting persisted run in place[^recovery-commands]
   retry <run-id>                Retry failed persisted run in place[^recovery-commands]
+  recover <run-id>              Choose the cheapest safe recovery action for a run[^recovery-commands]
   continue <run-id>             Start a new continuation run from a failed run[^recovery-commands]
   replay <run-id>               Render stored run events without re-executing[^recovery-commands]
   config                        Print resolved config
@@ -74,12 +75,13 @@ The recovery verbs are intentionally distinct:
 
 - `resume` continues the same existing run from its latest persisted snapshot. Use it for non-terminal runs such as `queued`, `planning`, `running`, `awaiting_approval`, `awaiting_subagent`, or `interrupted`. For example, if run `r1` is interrupted, `resume r1` moves `r1` back toward execution without creating a new run.
 - `retry` retries the same failed run in place after core decides the failure is retryable. "Failed but retryable" means the run has `status: failed`, the failure looks temporary or repairable, and retrying should not obviously duplicate unsafe side effects. Examples include transient provider/model failures, rate limits, repairable invalid tool calls, retryable tool failures, and retryable delegate child failures. The `runId` stays the same.
+- `recover` asks core for a recovery plan and executes the cheapest safe action: `resume` for non-terminal runs, `retry` for retryable failed runs, or `continue` when retry is unsafe but a continuation boundary exists. Use `--dry-run` to inspect the plan without executing it.
 - `continue` creates a new continuation run from a failed source run. Use it when the source run failed but core can build a recovery brief from snapshots and events. For example, if `r1` failed after durable partial progress, `continue r1` creates a new run such as `r2` linked back to `r1`; `r1` remains failed.
 - `replay` renders stored run history for inspection. It should not re-execute model calls, tool calls, or state transitions. For example, `replay r1` prints stored events and any final result for `r1`.
 
 A terminal failure is a failed run that is not safe or useful to retry in place. Examples include rejected approval, policy blocks, non-retryable tool errors after possible side effects, missing or incompatible snapshots, and failures that require `replan.required` instead of repeating the same boundary.
 
-[^recovery-commands]: Current implementation status: the programmatic `AgentSdk` exposes `resume`, `retry`, `continueRun`, `createContinuationRun`, `interrupt`, `steer`, and `inspect`; the TUI exposes `/retry`, `/interrupt`, `/replay`, `/steer`, and `/inspect`; the non-TUI `adaptive-agent` CLI currently implements `retry` but does not yet expose top-level `resume`, `continue`, `replay`, or `interrupt` commands.
+[^recovery-commands]: Current implementation status: the programmatic `AgentSdk` exposes `resume`, `retry`, `getRecoveryPlan`, `recover`, `continueRun`, `createContinuationRun`, `interrupt`, `steer`, and `inspect`; the TUI exposes `/retry`, `/interrupt`, `/replay`, `/steer`, and `/inspect`; the non-TUI `adaptive-agent` CLI exposes `resume`, `retry`, `recover`, `interrupt`, and `replay`. A top-level `continue` command is still not exposed.
 
 ## Global Options
 

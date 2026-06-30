@@ -27,8 +27,15 @@ export async function resolveAgentConfigByName(name: string, dirs: string[]): Pr
     if (!(await pathExists(dir))) continue;
     const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
     for (const entry of entries) {
-      if (!entry.isFile() || !fileNames.includes(entry.name)) continue;
-      matches.push(resolve(dir, entry.name));
+      if (!entry.isFile()) continue;
+      const path = resolve(dir, entry.name);
+      if (fileNames.includes(entry.name)) {
+        matches.push(path);
+        continue;
+      }
+      if (entry.name.endsWith('.json') && await agentConfigIdMatches(path, name)) {
+        matches.push(path);
+      }
     }
   }
   matches.sort();
@@ -47,4 +54,13 @@ export async function promptText(question: string): Promise<string> { const rl =
 
 function isAgentName(value: string): boolean {
   return Boolean(value.trim()) && !isAbsolute(value) && !/[\\/]/.test(value);
+}
+
+async function agentConfigIdMatches(path: string, name: string): Promise<boolean> {
+  try {
+    const value = JSON.parse(await readFile(path, 'utf-8')) as unknown;
+    return Boolean(value && typeof value === 'object' && 'id' in value && (value as { id?: unknown }).id === name);
+  } catch {
+    return false;
+  }
 }

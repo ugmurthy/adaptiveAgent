@@ -190,6 +190,7 @@ describe('adaptive-agent cli parsing', () => {
       evalFailFast: false,
       evalSwarm: 1,
       evalOffset: 0,
+      recoveryStrategy: 'auto',
       minimal: false,
       bundles: [],
       installAgents: [],
@@ -304,6 +305,12 @@ describe('adaptive-agent cli parsing', () => {
       command: 'resume',
       runId: 'run-1',
       progress: true,
+    });
+    expect(parseCliArgs(['recover', 'run-1', '--strategy', 'continue', '--dry-run'])).toMatchObject({
+      command: 'recover',
+      goalArgs: ['run-1'],
+      recoveryStrategy: 'continue',
+      dryRun: true,
     });
     expect(parseCliArgs(['interrupt', 'run-1', '--output', 'json'])).toMatchObject({
       command: 'interrupt',

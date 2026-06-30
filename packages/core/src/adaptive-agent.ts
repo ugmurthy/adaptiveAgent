@@ -63,6 +63,9 @@ import type {
   PlanRequest,
   PlanStep,
   RunRecoveryOptions,
+  RecoverRunOptions,
+  RecoverRunResult,
+  RunRecoveryPlan,
   RuntimeStores,
   RunFailureCode,
   RunRequest,
@@ -1291,6 +1294,147 @@ export class AdaptiveAgent {
 
   async getRecoveryOptions(runId: UUID): Promise<RunRecoveryOptions> {
     return this.recoveryAnalyzer.getRecoveryOptions(runId);
+  }
+
+  async getRecoveryPlan(runId: UUID): Promise<RunRecoveryPlan> {
+    const run = await this.options.runStore.getRun(runId);
+    if (!run) {
+      throw new Error(`Run ${runId} does not exist`);
+    }
+
+    if (!TERMINAL_RUN_STATUSES.has(run.status)) {
+      if (run.status === 'awaiting_approval' || run.status === 'clarification_requested') {
+        return {
+          runId,
+          status: run.status,
+          action: 'requires_user_action',
+          executable: false,
+          reason: `Run ${runId} is ${run.status}; user action is required before automatic recovery`,
+        };
+      }
+
+      return {
+        runId,
+        status: run.status,
+        action: 'resume_same_run',
+        executable: true,
+        reason: `Run ${runId} is ${run.status}; resume can continue from the latest persisted snapshot`,
+      };
+    }
+
+    if (run.status !== 'failed') {
+      return {
+        runId,
+        status: run.status,
+        action: 'not_recoverable',
+        executable: false,
+        reason: `Run ${runId} is terminal with status ${run.status}`,
+      };
+    }
+
+    const retryability = await this.getRetryability(runId);
+    if (retryability.retryable) {
+      return {
+        runId,
+        status: run.status,
+        action: 'retry_same_run',
+        executable: true,
+        reason: `Run ${runId} failed with retryable failure kind "${retryability.failureKind}"`,
+        retryability,
+      };
+    }
+
+    const recovery = await this.getRecoveryOptions(runId);
+    if (recovery.requiresReconciliation || recovery.decision === 'requires_reconciliation') {
+      return {
+        runId,
+        status: run.status,
+        action: 'requires_reconciliation',
+        executable: false,
+        reason: recovery.unsafeReason ?? recovery.reason,
+        retryability,
+        recovery,
+      };
+    }
+
+    if (recovery.decision === 'requires_user_action') {
+      return {
+        runId,
+        status: run.status,
+        action: 'requires_user_action',
+        executable: false,
+        reason: recovery.reason,
+        retryability,
+        recovery,
+      };
+    }
+
+    if (recovery.continuable) {
+      return {
+        runId,
+        status: run.status,
+        action: 'continue_new_run',
+        executable: Boolean(this.options.continuationStore),
+        reason: this.options.continuationStore
+          ? recovery.reason
+          : 'Run is continuable, but this agent was not configured with a continuationStore',
+        retryability,
+        recovery,
+      };
+    }
+
+    return {
+      runId,
+      status: run.status,
+      action: 'not_recoverable',
+      executable: false,
+      reason: retryability.reason ?? recovery.unsafeReason ?? recovery.reason,
+      retryability,
+      recovery,
+    };
+  }
+
+  async recover(options: RecoverRunOptions): Promise<RecoverRunResult> {
+    const plan = await this.getRecoveryPlan(options.runId);
+    const action = resolveRecoveryActionOverride(plan.action, options.strategy);
+    if (action !== plan.action) {
+      return this.recoverWithAction(options, plan, action);
+    }
+
+    return this.recoverWithAction(options, plan, plan.action);
+  }
+
+  private async recoverWithAction(
+    options: RecoverRunOptions,
+    plan: RunRecoveryPlan,
+    action: RunRecoveryPlan['action'],
+  ): Promise<RecoverRunResult> {
+    if (action === plan.action && !plan.executable) {
+      throw new Error(plan.reason);
+    }
+
+    if (action === 'resume_same_run') {
+      return { runId: options.runId, action, plan, result: await this.resume(options.runId) };
+    }
+
+    if (action === 'retry_same_run') {
+      return { runId: options.runId, action, plan, result: await this.retry(options.runId) };
+    }
+
+    if (action === 'continue_new_run') {
+      return {
+        runId: options.runId,
+        action,
+        plan,
+        result: await this.continueRun({
+          fromRunId: options.runId,
+          requireApproval: options.requireApproval,
+          metadata: options.metadata,
+        }),
+      };
+    }
+
+    throw new Error(plan.reason);
   }
 
   async continueRun(options: ContinueRunOptions): Promise<RunResult> {
@@ -6383,6 +6527,24 @@ function resolveModelRetryDelayMs(
 
 function isRetryableModelFailureKind(failureKind: FailureKind): boolean {
   return failureKind === 'timeout' || failureKind === 'network' || failureKind === 'rate_limit' || failureKind === 'provider_error';
+}
+
+function resolveRecoveryActionOverride(
+  action: RunRecoveryPlan['action'],
+  strategy: RecoverRunOptions['strategy'],
+): RunRecoveryPlan['action'] {
+  if (!strategy || strategy === 'auto') {
+    return action;
+  }
+
+  switch (strategy) {
+    case 'resume':
+      return 'resume_same_run';
+    case 'retry':
+      return 'retry_same_run';
+    case 'continue':
+      return 'continue_new_run';
+  }
 }
 
 function toolRetryPolicyAllows(tool: ToolDefinition, failureKind: FailureKind): boolean {

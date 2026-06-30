@@ -42,6 +42,16 @@ describe('agent-sdk config resolution', () => {
     expect(config.agents.dirs).toEqual([join(tempDir, 'catalog')]);
   });
 
+  it('resolves an agent id from settings agents dirs when the filename differs', async () => {
+    await mkdir(join(tempDir, 'catalog'));
+    await writeAgentConfig(join(tempDir, 'catalog', 'gaia2-improved.json'), 'gaia-agent-improved');
+    await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({ agents: { dirs: ['./catalog'] } }));
+
+    const config = await loadAgentSdkConfig({ cwd: tempDir, agentConfigPath: 'gaia-agent-improved', env: {} });
+
+    expect(config.agent.id).toBe('gaia-agent-improved');
+  });
+
   it('rejects ambiguous agent filenames from settings agents dirs', async () => {
     await mkdir(join(tempDir, 'catalog-a'));
     await mkdir(join(tempDir, 'catalog-b'));
