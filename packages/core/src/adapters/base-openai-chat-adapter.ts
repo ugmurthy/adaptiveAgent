@@ -498,17 +498,7 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
 
     const finishReason = mapFinishReason(choice.finish_reason);
 
-    const usage: UsageSummary | undefined = data.usage
-      ? {
-          promptTokens: data.usage.prompt_tokens,
-          completionTokens: data.usage.completion_tokens,
-          reasoningTokens: data.usage.completion_tokens_details?.reasoning_tokens,
-          totalTokens: data.usage.total_tokens,
-          estimatedCostUSD: estimateCompletionCostUSD(data),
-          provider: this.provider,
-          model: this.model,
-        }
-      : undefined;
+    const usage = data.usage ? toUsageSummary(data.usage, this.provider, this.model, estimateCompletionCostUSD(data)) : undefined;
 
     return {
       text,
@@ -1309,6 +1299,25 @@ function estimateCompletionCostUSD(completion: OpenAIChatCompletionResponse): nu
     completion.total_cost,
     estimateUsageCostUSD(completion.usage),
   ) ?? 0;
+}
+
+function toUsageSummary(
+  usage: NonNullable<OpenAIChatCompletionResponse['usage']>,
+  provider: string,
+  model: string,
+  estimatedCostUSD: number,
+): UsageSummary {
+  const reasoningTokens = usage.completion_tokens_details?.reasoning_tokens;
+  const computedTotalTokens = usage.prompt_tokens + usage.completion_tokens + (reasoningTokens ?? 0);
+  return {
+    promptTokens: usage.prompt_tokens,
+    completionTokens: usage.completion_tokens,
+    reasoningTokens,
+    totalTokens: usage.total_tokens > 0 ? usage.total_tokens : computedTotalTokens,
+    estimatedCostUSD,
+    provider,
+    model,
+  };
 }
 
 function estimateUsageCostUSD(usage: OpenAIChatCompletionResponse['usage']): number | undefined {

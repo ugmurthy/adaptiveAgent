@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildTimeline, buildTraceDiagnostics, computeDelegateReason, listSessions, parseArgs, renderDeleteEmptyGoalSessionsSql, renderSessionList, renderSessionPerformanceList, renderSessionlessRunList, renderTraceHtml, renderTraceReport, renderUsageReport, summarizePerformance, summarizeTrace, traceSession } from './trace-session.js';
+import { buildTimeline, buildTraceDiagnostics, computeDelegateReason, listSessions, loadUsageForTraceTarget, parseArgs, renderDeleteEmptyGoalSessionsSql, renderSessionList, renderSessionPerformanceList, renderSessionlessRunList, renderTraceHtml, renderTraceReport, renderUsageReport, summarizePerformance, summarizeTrace, traceSession } from './trace-session.js';
 import type { TraceRow } from './trace-session.js';
 
 describe('trace-session CLI helpers', () => {
@@ -575,6 +575,108 @@ describe('trace-session CLI helpers', () => {
     expect(output).toContain('reasoning=25');
     expect(output).toContain('root-1 : prompt=700');
     expect(output).toContain('root-2 : prompt=300');
+  });
+
+  it('includes completed non-delegate tool output usage in trace target totals', async () => {
+    const client = {
+      query: async <TRow extends Record<string, unknown>>(sql: string, params?: unknown[]) => {
+        if (sql.includes('select to_regclass')) {
+          return { rows: [{ exists: false }] } as unknown as { rows: TRow[] };
+        }
+
+        if (sql.includes('from information_schema.columns')) {
+          return { rows: [{ count: '3' }] } as unknown as { rows: TRow[] };
+        }
+
+        if (sql.includes('from information_schema.tables')) {
+          return { rows: [{ count: '0' }] } as unknown as { rows: TRow[] };
+        }
+
+        if (sql.includes('run_usage_by_root as')) {
+          expect(params).toEqual([['root-usage']]);
+          expect(sql).toContain('tool_output_usage_by_root as');
+          expect(sql).toContain('te.child_run_id is null');
+          expect(sql).toContain("te.output #>> '{usage,prompt_tokens}'");
+          expect(sql).toContain("te.output #>> '{usage,cost_details,upstream_inference_cost}'");
+          return {
+            rows: [{
+              root_run_id: 'root-usage',
+              total_prompt_tokens: '143',
+              total_completion_tokens: '4160',
+              total_reasoning_tokens: '0',
+              estimated_cost_usd: '0.16783',
+            }],
+          } as unknown as { rows: TRow[] };
+        }
+
+        if (sql.includes('attributed_usage as')) {
+          expect(params).toEqual([['root-usage']]);
+          return { rows: [] } as unknown as { rows: TRow[] };
+        }
+
+        if (sql.includes('attributed_tool_usage as')) {
+          expect(params).toEqual([['root-usage']]);
+          expect(sql).toContain("raw_usage.api_key_env ~* '^[A-Z0-9_]+_API_KEY$'");
+          expect(sql).toContain("when te.tool_name ilike '%openrouter%' then 'openrouter'");
+          return {
+            rows: [{
+              provider: 'openrouter',
+              model: 'openai/gpt-image-1',
+              tool_call_count: '1',
+              total_prompt_tokens: '143',
+              total_completion_tokens: '4160',
+              total_reasoning_tokens: '0',
+              estimated_cost_usd: '0.16783',
+            }],
+          } as unknown as { rows: TRow[] };
+        }
+
+        throw new Error(`Unexpected SQL in test:\n${sql}`);
+      },
+    };
+
+    await expect(loadUsageForTraceTarget(client as never, {
+      rootRunId: 'root-usage',
+      json: false,
+      listSessions: false,
+      listPerformance: false,
+      listSessionless: false,
+      deleteEmptyGoalSessions: false,
+      usageOnly: true,
+      includePlans: false,
+      onlyDelegates: false,
+      messages: false,
+      systemOnly: false,
+      help: false,
+    })).resolves.toEqual({
+      total: {
+        promptTokens: 143,
+        completionTokens: 4160,
+        totalTokens: 4303,
+        estimatedCostUSD: 0.16783,
+      },
+      byRootRun: [{
+        rootRunId: 'root-usage',
+        usage: {
+          promptTokens: 143,
+          completionTokens: 4160,
+          totalTokens: 4303,
+          estimatedCostUSD: 0.16783,
+        },
+      }],
+      byProviderModel: [],
+      toolOutputByProviderModel: [{
+        provider: 'openrouter',
+        model: 'openai/gpt-image-1',
+        usage: {
+          promptTokens: 143,
+          completionTokens: 4160,
+          totalTokens: 4303,
+          estimatedCostUSD: 0.16783,
+        },
+        toolCallCount: 1,
+      }],
+    });
   });
 
   it('renders a succeeded session summary', () => {
@@ -1865,7 +1967,7 @@ describe('trace-session CLI helpers', () => {
           } as unknown as { rows: TRow[] };
         }
 
-        if (sql.includes('coalesce(sum(r.total_prompt_tokens)')) {
+        if (sql.includes('run_usage_by_root as')) {
           return {
             rows: [{
               root_run_id: 'root-msg',
@@ -1875,6 +1977,11 @@ describe('trace-session CLI helpers', () => {
               estimated_cost_usd: '0',
             }],
           } as unknown as { rows: TRow[] };
+        }
+
+        if (sql.includes('attributed_usage as') || sql.includes('attributed_tool_usage as')) {
+          expect(params).toEqual([['root-msg']]);
+          return { rows: [] } as unknown as { rows: TRow[] };
         }
 
         if (sql.includes('initial_snapshot.snapshot_seq') && sql.includes('latest_snapshot.snapshot_seq')) {
@@ -1991,7 +2098,7 @@ describe('trace-session CLI helpers', () => {
           } as unknown as { rows: TRow[] };
         }
 
-        if (sql.includes('coalesce(sum(r.total_prompt_tokens)')) {
+        if (sql.includes('run_usage_by_root as')) {
           expect(params).toEqual([['root-standalone']]);
           return {
             rows: [{
@@ -2002,6 +2109,11 @@ describe('trace-session CLI helpers', () => {
               estimated_cost_usd: '0.002',
             }],
           } as unknown as { rows: TRow[] };
+        }
+
+        if (sql.includes('attributed_usage as') || sql.includes('attributed_tool_usage as')) {
+          expect(params).toEqual([['root-standalone']]);
+          return { rows: [] } as unknown as { rows: TRow[] };
         }
 
         if (sql.includes('left join agent_events e on e.run_id = rt.run_id')) {
@@ -2161,7 +2273,7 @@ describe('trace-session CLI helpers', () => {
           } as unknown as { rows: TRow[] };
         }
 
-        if (sql.includes('coalesce(sum(r.total_prompt_tokens)')) {
+        if (sql.includes('run_usage_by_root as')) {
           expect(params).toEqual([['root-fallback']]);
           return {
             rows: [{
@@ -2172,6 +2284,11 @@ describe('trace-session CLI helpers', () => {
               estimated_cost_usd: '0.001',
             }],
           } as unknown as { rows: TRow[] };
+        }
+
+        if (sql.includes('attributed_usage as') || sql.includes('attributed_tool_usage as')) {
+          expect(params).toEqual([['root-fallback']]);
+          return { rows: [] } as unknown as { rows: TRow[] };
         }
 
         if (sql.includes('with recursive root_runs as') && sql.includes('from unnest($1::text[]) as roots(root_run_id)')) {
@@ -2302,7 +2419,7 @@ describe('trace-session CLI helpers', () => {
           } as unknown as { rows: TRow[] };
         }
 
-        if (sql.includes('coalesce(sum(r.total_prompt_tokens)')) {
+        if (sql.includes('run_usage_by_root as')) {
           expect(params).toEqual([['root-swarm-a', 'root-swarm-b']]);
           return {
             rows: [
@@ -2322,6 +2439,11 @@ describe('trace-session CLI helpers', () => {
               },
             ],
           } as unknown as { rows: TRow[] };
+        }
+
+        if (sql.includes('attributed_usage as') || sql.includes('attributed_tool_usage as')) {
+          expect(params).toEqual([['root-swarm-a', 'root-swarm-b']]);
+          return { rows: [] } as unknown as { rows: TRow[] };
         }
 
         if (sql.includes('left join agent_events e on e.run_id = rt.run_id')) {

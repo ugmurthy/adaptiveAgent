@@ -14,6 +14,7 @@ import type {
   PerformanceDigest,
   PerformanceSummary,
   PlanRow,
+  ProviderModelUsageSummary,
   ReportView,
   RootRun,
   RunMessageTrace,
@@ -103,7 +104,7 @@ export function renderTraceReport(
   if (shouldRenderSection(effectiveView, 'performance')) {
     lines.push('');
     lines.push(markdownBlock('# Performance'));
-    lines.push(renderPerformance(report.performance ?? emptyPerformanceSummary(), traceDurationMs(report), diagnostics.performance));
+    lines.push(renderPerformance(report.performance ?? emptyPerformanceSummary(), traceDurationMs(report), diagnostics.performance, report.usage));
   }
 
   if (shouldRenderSection(effectiveView, 'milestones')) {
@@ -318,6 +319,8 @@ export function renderUsageReport(usage: SessionUsageSummary, options: Pick<CliO
       lines.push(`${item.rootRunId} : ${formatUsageSummary(item.usage)}`);
     }
   }
+  appendProviderModelUsageLines(lines, 'Model usage by provider/model', usage.byProviderModel ?? [], 'runs');
+  appendProviderModelUsageLines(lines, 'Tool-output usage by provider/model', usage.toolOutputByProviderModel ?? [], 'tool calls');
   return lines.join('\n');
 }
 
@@ -606,6 +609,7 @@ function renderHtmlPerformance(report: TraceReport, diagnostics: TraceDiagnostic
         ['Parallelism factor', formatRatio(digest.parallelismFactor), 'Cumulative measured time divided by wall time.'],
         ['Duration split', `total=${formatDuration(split.totalDurationMs)}`, `model=${formatDuration(split.modelDurationMs)}, tools=${formatDuration(split.toolDurationMs)}, snapshot=${formatDuration(split.snapshotSaveMs)}, other=${formatDuration(split.otherDurationMs)}`],
       ]),
+      renderHtmlUsageBreakdown(report.usage),
       renderHtmlPerformanceNotes(digest),
       htmlSubsection('Model metrics', htmlTable(['Metric', 'Value', 'Meaning'], [
         ['Calls', `started=${formatNumber(performance.model.started)} completed=${formatNumber(performance.model.completed)} failed=${formatNumber(performance.model.failed)}`, 'Model lifecycle counts.'],
@@ -682,6 +686,40 @@ function renderHtmlPerformanceNotes(digest: PerformanceDigest): string {
     return '';
   }
   return htmlSubsection('Digest notes', `<ul class="warning-list">${digest.notes.map((note) => `<li>${escapeHtml(note)}</li>`).join('\n')}</ul>`);
+}
+
+function renderHtmlUsageBreakdown(usage: SessionUsageSummary): string {
+  const sections: string[] = [];
+  const modelUsageRows = usage.byProviderModel ?? [];
+  const toolOutputUsageRows = usage.toolOutputByProviderModel ?? [];
+
+  if (modelUsageRows.length > 0) {
+    sections.push(htmlSubsection('Model usage by provider/model', renderHtmlProviderModelUsageTable(modelUsageRows, 'runs')));
+  }
+  if (toolOutputUsageRows.length > 0) {
+    sections.push(htmlSubsection('Tool-output usage by provider/model', renderHtmlProviderModelUsageTable(toolOutputUsageRows, 'tool calls')));
+  }
+
+  return sections.join('\n');
+}
+
+function renderHtmlProviderModelUsageTable(
+  rows: ProviderModelUsageSummary[],
+  countLabel: 'runs' | 'tool calls',
+): string {
+  return htmlTable(
+    ['Provider', 'Model', countLabel === 'runs' ? 'Runs' : 'Tool calls', 'Tokens', 'Prompt', 'Completion', 'Reasoning', 'Cost'],
+    rows.map((row) => [
+      row.provider,
+      row.model,
+      formatNumber(countLabel === 'runs' ? row.runCount ?? 0 : row.toolCallCount ?? 0),
+      formatNumber(row.usage.totalTokens),
+      formatNumber(row.usage.promptTokens),
+      formatNumber(row.usage.completionTokens),
+      formatNumber(row.usage.reasoningTokens ?? 0),
+      `$${row.usage.estimatedCostUSD.toFixed(6)}`,
+    ]),
+  );
 }
 
 function renderHtmlWorkflow(report: TraceReport): string {
@@ -1266,10 +1304,65 @@ function renderUsage(usage: SessionUsageSummary): string {
   return lines.join('\n');
 }
 
+function appendProviderModelUsageLines(
+  lines: string[],
+  title: string,
+  rows: ProviderModelUsageSummary[],
+  countLabel: 'runs' | 'tool calls',
+): void {
+  if (rows.length === 0) {
+    return;
+  }
+
+  lines.push('');
+  lines.push(title);
+  lines.push(renderProviderModelUsageTable(rows, countLabel));
+}
+
+function renderProviderModelUsageSections(usage: SessionUsageSummary): string | null {
+  const sections: string[] = [];
+  const modelUsageRows = usage.byProviderModel ?? [];
+  const toolOutputUsageRows = usage.toolOutputByProviderModel ?? [];
+
+  if (modelUsageRows.length > 0) {
+    sections.push(markdownBlock('### Model Usage by Provider / Model'));
+    sections.push(renderProviderModelUsageTable(modelUsageRows, 'runs'));
+  }
+  if (toolOutputUsageRows.length > 0) {
+    if (sections.length > 0) {
+      sections.push('');
+    }
+    sections.push(markdownBlock('### Tool-Output Usage by Provider / Model'));
+    sections.push(renderProviderModelUsageTable(toolOutputUsageRows, 'tool calls'));
+  }
+
+  return sections.length === 0 ? null : sections.join('\n');
+}
+
+function renderProviderModelUsageTable(
+  rows: ProviderModelUsageSummary[],
+  countLabel: 'runs' | 'tool calls',
+): string {
+  return renderTable(
+    ['provider', 'model', countLabel, 'tokens', 'prompt', 'completion', 'reasoning', 'cost'],
+    rows.map((row) => [
+      row.provider,
+      row.model,
+      formatNumber(countLabel === 'runs' ? row.runCount ?? 0 : row.toolCallCount ?? 0),
+      formatNumber(row.usage.totalTokens),
+      formatNumber(row.usage.promptTokens),
+      formatNumber(row.usage.completionTokens),
+      formatNumber(row.usage.reasoningTokens ?? 0),
+      `$${row.usage.estimatedCostUSD.toFixed(6)}`,
+    ]),
+  );
+}
+
 function renderPerformance(
   performance: PerformanceSummary,
   totalDurationMs: number | null,
   digest: PerformanceDigest,
+  usage: SessionUsageSummary,
 ): string {
   const lines: string[] = [];
   const statusCodes = Object.entries(performance.model.adapterStatusCodes)
@@ -1283,6 +1376,12 @@ function renderPerformance(
 
   lines.push(markdownBlock('## Digest'));
   lines.push(renderPerformanceDigest(digest, performance.events.totalEvents > 0));
+
+  const usageBreakdown = renderProviderModelUsageSections(usage);
+  if (usageBreakdown) {
+    lines.push('');
+    lines.push(usageBreakdown);
+  }
 
   lines.push('');
   lines.push(markdownBlock('## Overview'));

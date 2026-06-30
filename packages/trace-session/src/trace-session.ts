@@ -30,6 +30,7 @@ export type {
   PolicyBudgetGroupSummary,
   PolicyDigest,
   PlanRow,
+  ProviderModelUsageSummary,
   ReportView,
   RootRun,
   RunMessageTrace,

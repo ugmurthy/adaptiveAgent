@@ -1456,8 +1456,9 @@ describe('OllamaAdapter', () => {
 
     expect(fetchSpy.mock.calls[0][0]).toBe('http://localhost:11434/v1/chat/completions');
     expect(fetchSpy.mock.calls[0][1].headers['Authorization']).toBeUndefined();
+    expect(JSON.parse(fetchSpy.mock.calls[0][1].body).stream_options).toEqual({ include_usage: true });
     expect(adapter.provider).toBe('ollama');
-    expect(adapter.capabilities.usage).toBe(false);
+    expect(adapter.capabilities.usage).toBe(true);
   });
 
   it('allows custom baseUrl', async () => {
@@ -2207,6 +2208,28 @@ describe('createModelAdapter', () => {
     const adapter = createModelAdapter({ provider: 'ollama', model: 'llama3.2' });
     expect(adapter.provider).toBe('ollama');
     expect(adapter.model).toBe('llama3.2');
+  });
+
+  it('requests and parses Ollama OpenAI-compatible streaming usage', async () => {
+    const adapter = new OllamaAdapter({ model: 'llama3.2', baseUrl: 'http://ollama.test/v1' });
+    mockFetchSseResponse([
+      openAIStreamDelta({ content: 'Hello from Ollama' }),
+      openAIStreamDelta({}, { finishReason: 'stop', usage: { prompt_tokens: 12, completion_tokens: 6, total_tokens: 0 } }),
+    ]);
+
+    const result = await adapter.generate(simpleRequest());
+
+    const [, init] = fetchSpy.mock.calls[0];
+    const body = JSON.parse(init.body);
+    expect(body.stream_options).toEqual({ include_usage: true });
+    expect(result.usage).toMatchObject({
+      promptTokens: 12,
+      completionTokens: 6,
+      totalTokens: 18,
+      estimatedCostUSD: 0,
+      provider: 'ollama',
+      model: 'llama3.2',
+    });
   });
 
   it('creates a MistralAdapter', () => {

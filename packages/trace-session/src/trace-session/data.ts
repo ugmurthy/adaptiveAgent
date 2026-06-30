@@ -16,6 +16,7 @@ import type {
   CliOptions,
   DelegateRow,
   PlanRow,
+  ProviderModelUsageSummary,
   RootRun,
   RunMessageTrace,
   RunSnapshotSummary,
@@ -49,7 +50,7 @@ export async function traceSession(client: PostgresClient, options: CliOptions):
   const { target, session, rootRunIds } = resolvedTarget;
   const [rootRuns, usage] = await Promise.all([
     loadRootRuns(client, rootRunIds, options.sessionId, migration.hasRunModelColumns, migration.hasGatewaySessionTables),
-    loadSessionUsage(client, rootRunIds),
+    loadSessionUsage(client, rootRunIds, migration.hasToolObservabilityColumns, migration.hasRunModelColumns),
   ]);
 
   const warnings: string[] = [];
@@ -143,7 +144,7 @@ export async function traceSession(client: PostgresClient, options: CliOptions):
 export async function loadUsageForTraceTarget(client: PostgresClient, options: CliOptions): Promise<SessionUsageSummary> {
   const support = await detectTraceSupport(client);
   const { rootRunIds } = await resolveTraceTarget(client, options, support.hasGatewaySessionTables);
-  return loadSessionUsage(client, rootRunIds);
+  return loadSessionUsage(client, rootRunIds, support.hasToolObservabilityColumns, support.hasRunModelColumns);
 }
 
 
@@ -433,10 +434,10 @@ function parseSessionGoals(value: unknown): SessionListItem['goals'] {
 }
 
 function usageSummaryFromRow(row: {
-  total_prompt_tokens: string | number;
-  total_completion_tokens: string | number;
-  total_reasoning_tokens: string | number | null;
-  estimated_cost_usd: string | number;
+  total_prompt_tokens?: string | number;
+  total_completion_tokens?: string | number;
+  total_reasoning_tokens?: string | number | null;
+  estimated_cost_usd?: string | number;
 }): UsageSummary {
   const promptTokens = Number(row.total_prompt_tokens ?? 0);
   const completionTokens = Number(row.total_completion_tokens ?? 0);
@@ -448,6 +449,29 @@ function usageSummaryFromRow(row: {
     totalTokens: promptTokens + completionTokens + reasoningTokens,
     estimatedCostUSD: Number(row.estimated_cost_usd ?? 0),
   };
+}
+
+function providerModelUsageSummaryFromRow(row: {
+  provider: string | null;
+  model: string | null;
+  run_count?: string | number;
+  tool_call_count?: string | number;
+  total_prompt_tokens?: string | number;
+  total_completion_tokens?: string | number;
+  total_reasoning_tokens?: string | number | null;
+  estimated_cost_usd?: string | number;
+}): ProviderModelUsageSummary {
+  return {
+    provider: normalizedProviderModelLabel(row.provider),
+    model: normalizedProviderModelLabel(row.model),
+    usage: usageSummaryFromRow(row),
+    ...(row.run_count === undefined ? {} : { runCount: Number(row.run_count) }),
+    ...(row.tool_call_count === undefined ? {} : { toolCallCount: Number(row.tool_call_count) }),
+  };
+}
+
+function normalizedProviderModelLabel(value: string | null): string {
+  return value && value.trim() ? value : 'unknown';
 }
 
 function durationMs(startedAt: string | null, completedAt: string | null): number | null {
@@ -846,13 +870,112 @@ function rootRunRowsToRootRuns(rows: Array<{
   }));
 }
 
-async function loadSessionUsage(client: PostgresClient, rootRunIds: string[]): Promise<SessionUsageSummary> {
+async function loadSessionUsage(
+  client: PostgresClient,
+  rootRunIds: string[],
+  hasToolObservabilityColumns: boolean,
+  hasRunModelColumns: boolean,
+): Promise<SessionUsageSummary> {
   if (rootRunIds.length === 0) {
     return {
       total: { promptTokens: 0, completionTokens: 0, totalTokens: 0, estimatedCostUSD: 0 },
       byRootRun: [],
+      byProviderModel: [],
+      toolOutputByProviderModel: [],
     };
   }
+
+  const toolOutputUsageCte = hasToolObservabilityColumns
+    ? `,
+      tool_output_usage_by_root as (
+        select
+          rt.root_run_id,
+          coalesce(sum(coalesce(tool_usage.prompt_tokens, 0)), 0) as total_prompt_tokens,
+          coalesce(sum(coalesce(tool_usage.completion_tokens, 0)), 0) as total_completion_tokens,
+          coalesce(sum(coalesce(tool_usage.reasoning_tokens, 0)), 0) as total_reasoning_tokens,
+          coalesce(sum(coalesce(tool_usage.estimated_cost_usd, 0)), 0) as estimated_cost_usd
+        from run_tree rt
+        join tool_executions te on te.run_id = rt.id
+        cross join lateral (
+          select
+            nullif(raw_usage.prompt_tokens, '')::numeric as prompt_tokens,
+            nullif(raw_usage.completion_tokens, '')::numeric as completion_tokens,
+            nullif(raw_usage.reasoning_tokens, '')::numeric as reasoning_tokens,
+            coalesce(
+              nullif(nullif(raw_usage.estimated_cost_usd, '')::numeric, 0),
+              nullif(nullif(raw_usage.cost_usd, '')::numeric, 0),
+              nullif(nullif(raw_usage.total_cost_usd, '')::numeric, 0),
+              nullif(nullif(raw_usage.cost, '')::numeric, 0),
+              nullif(nullif(raw_usage.total_cost, '')::numeric, 0),
+              nullif(nullif(raw_usage.upstream_inference_cost, '')::numeric, 0),
+              case
+                when nullif(raw_usage.prompt_cost, '') is not null or nullif(raw_usage.completion_cost, '') is not null then
+                  coalesce(nullif(raw_usage.prompt_cost, '')::numeric, 0) + coalesce(nullif(raw_usage.completion_cost, '')::numeric, 0)
+                else null
+              end
+            ) as estimated_cost_usd
+          from (
+            select
+              coalesce(
+                te.output #>> '{usage,promptTokens}',
+                te.output #>> '{usage,prompt_tokens}'
+              ) as prompt_tokens,
+              coalesce(
+                te.output #>> '{usage,completionTokens}',
+                te.output #>> '{usage,completion_tokens}'
+              ) as completion_tokens,
+              coalesce(
+                te.output #>> '{usage,reasoningTokens}',
+                te.output #>> '{usage,reasoning_tokens}',
+                te.output #>> '{usage,completionTokensDetails,reasoningTokens}',
+                te.output #>> '{usage,completion_tokens_details,reasoning_tokens}'
+              ) as reasoning_tokens,
+              coalesce(
+                te.output #>> '{usage,estimatedCostUSD}',
+                te.output #>> '{usage,estimated_cost_usd}'
+              ) as estimated_cost_usd,
+              coalesce(
+                te.output #>> '{usage,costUSD}',
+                te.output #>> '{usage,cost_usd}'
+              ) as cost_usd,
+              coalesce(
+                te.output #>> '{usage,totalCostUSD}',
+                te.output #>> '{usage,total_cost_usd}'
+              ) as total_cost_usd,
+              te.output #>> '{usage,cost}' as cost,
+              te.output #>> '{usage,total_cost}' as total_cost,
+              te.output #>> '{usage,cost_details,upstream_inference_cost}' as upstream_inference_cost,
+              coalesce(
+                te.output #>> '{usage,cost_details,upstream_inference_prompt_cost}',
+                te.output #>> '{usage,cost_breakdown,prompt_cost}'
+              ) as prompt_cost,
+              coalesce(
+                te.output #>> '{usage,cost_details,upstream_inference_completions_cost}',
+                te.output #>> '{usage,cost_breakdown,completions_cost}',
+                te.output #>> '{usage,cost_breakdown,completion_cost}'
+              ) as completion_cost
+          ) raw_usage
+        ) tool_usage
+        where te.status = 'completed'
+          and te.child_run_id is null
+          and (
+            tool_usage.prompt_tokens is not null
+            or tool_usage.completion_tokens is not null
+            or tool_usage.reasoning_tokens is not null
+            or tool_usage.estimated_cost_usd is not null
+          )
+        group by rt.root_run_id
+      )`
+    : `,
+      tool_output_usage_by_root as (
+        select
+          null::uuid as root_run_id,
+          0::numeric as total_prompt_tokens,
+          0::numeric as total_completion_tokens,
+          0::numeric as total_reasoning_tokens,
+          0::numeric as estimated_cost_usd
+        where false
+      )`;
 
   const result = await client.query<{
     root_run_id: string;
@@ -875,36 +998,68 @@ async function loadSessionUsage(client: PostgresClient, rootRunIds: string[]): P
         select c.id, c.root_run_id, c.created_at
         from agent_runs c
         join run_tree rt on c.parent_run_id = rt.id
-      )
-      select
-        rt.root_run_id::text as root_run_id,
-        coalesce(sum(r.total_prompt_tokens), 0)::text as total_prompt_tokens,
-        coalesce(sum(r.total_completion_tokens), 0)::text as total_completion_tokens,
-        coalesce(sum(r.total_reasoning_tokens), 0)::text as total_reasoning_tokens,
-        coalesce(
-          sum(coalesce(nullif(r.estimated_cost_usd, 0), usage_event.estimated_cost_usd, 0)),
-          0
-        )::text as estimated_cost_usd
-      from run_tree rt
-      join agent_runs r on r.id = rt.id
-      join root_runs rr on rr.root_run_id = rt.root_run_id
-      left join lateral (
-        select nullif(event_usage.estimated_cost_usd, '')::numeric as estimated_cost_usd
-        from agent_events e
-        cross join lateral (
-          select coalesce(
-            e.payload #>> '{usage,estimatedCostUSD}',
-            e.payload #>> '{usage,estimated_cost_usd}'
+      ), run_usage_by_root as (
+        select
+          rt.root_run_id,
+          coalesce(sum(coalesce(nullif(r.total_prompt_tokens, 0), usage_event.total_prompt_tokens, 0)), 0) as total_prompt_tokens,
+          coalesce(sum(coalesce(nullif(r.total_completion_tokens, 0), usage_event.total_completion_tokens, 0)), 0) as total_completion_tokens,
+          coalesce(sum(coalesce(nullif(coalesce(r.total_reasoning_tokens, 0), 0), usage_event.total_reasoning_tokens, 0)), 0) as total_reasoning_tokens,
+          coalesce(
+            sum(coalesce(nullif(r.estimated_cost_usd, 0), usage_event.estimated_cost_usd, 0)),
+            0
           ) as estimated_cost_usd
-        ) event_usage
-        where e.run_id = rt.id
-          and e.event_type = 'usage.updated'
-          and nullif(event_usage.estimated_cost_usd, '') is not null
-        order by e.seq desc, e.created_at desc
-        limit 1
-      ) usage_event on true
-      group by rt.root_run_id, rr.ordinality
-      order by rr.ordinality asc, rt.root_run_id asc
+        from run_tree rt
+        join agent_runs r on r.id = rt.id
+        left join lateral (
+          select
+            nullif(event_usage.total_prompt_tokens, '')::numeric as total_prompt_tokens,
+            nullif(event_usage.total_completion_tokens, '')::numeric as total_completion_tokens,
+            nullif(event_usage.total_reasoning_tokens, '')::numeric as total_reasoning_tokens,
+            nullif(event_usage.estimated_cost_usd, '')::numeric as estimated_cost_usd
+          from agent_events e
+          cross join lateral (
+            select
+              coalesce(
+                e.payload #>> '{usage,promptTokens}',
+                e.payload #>> '{usage,prompt_tokens}'
+              ) as total_prompt_tokens,
+              coalesce(
+                e.payload #>> '{usage,completionTokens}',
+                e.payload #>> '{usage,completion_tokens}'
+              ) as total_completion_tokens,
+              coalesce(
+                e.payload #>> '{usage,reasoningTokens}',
+                e.payload #>> '{usage,reasoning_tokens}'
+              ) as total_reasoning_tokens,
+              coalesce(
+                e.payload #>> '{usage,estimatedCostUSD}',
+                e.payload #>> '{usage,estimated_cost_usd}'
+              ) as estimated_cost_usd
+          ) event_usage
+          where e.run_id = rt.id
+            and e.event_type = 'usage.updated'
+            and (
+              nullif(event_usage.total_prompt_tokens, '') is not null
+              or nullif(event_usage.total_completion_tokens, '') is not null
+              or nullif(event_usage.total_reasoning_tokens, '') is not null
+              or nullif(event_usage.estimated_cost_usd, '') is not null
+            )
+          order by e.seq desc, e.created_at desc
+          limit 1
+        ) usage_event on true
+        group by rt.root_run_id
+        order by rt.root_run_id asc
+      )${toolOutputUsageCte}
+      select
+        rr.root_run_id::text as root_run_id,
+        (coalesce(run_usage.total_prompt_tokens, 0) + coalesce(tool_usage.total_prompt_tokens, 0))::text as total_prompt_tokens,
+        (coalesce(run_usage.total_completion_tokens, 0) + coalesce(tool_usage.total_completion_tokens, 0))::text as total_completion_tokens,
+        (coalesce(run_usage.total_reasoning_tokens, 0) + coalesce(tool_usage.total_reasoning_tokens, 0))::text as total_reasoning_tokens,
+        (coalesce(run_usage.estimated_cost_usd, 0) + coalesce(tool_usage.estimated_cost_usd, 0))::text as estimated_cost_usd
+      from root_runs rr
+      join run_usage_by_root run_usage on run_usage.root_run_id = rr.root_run_id
+      left join tool_output_usage_by_root tool_usage on tool_usage.root_run_id = rr.root_run_id
+      order by rr.ordinality asc, rr.root_run_id asc
     `,
     [rootRunIds],
   );
@@ -928,7 +1083,340 @@ async function loadSessionUsage(client: PostgresClient, rootRunIds: string[]): P
     { promptTokens: 0, completionTokens: 0, totalTokens: 0, estimatedCostUSD: 0 },
   );
 
-  return { total, byRootRun };
+  const [byProviderModel, toolOutputByProviderModel] = await Promise.all([
+    loadRunUsageByProviderModel(client, rootRunIds, hasRunModelColumns),
+    hasToolObservabilityColumns ? loadToolOutputUsageByProviderModel(client, rootRunIds) : Promise.resolve([]),
+  ]);
+
+  return { total, byRootRun, byProviderModel, toolOutputByProviderModel };
+}
+
+async function loadRunUsageByProviderModel(
+  client: PostgresClient,
+  rootRunIds: string[],
+  hasRunModelColumns: boolean,
+): Promise<ProviderModelUsageSummary[]> {
+  const rootModelColumns = hasRunModelColumns
+    ? 'r.model_provider, r.model_name'
+    : 'null::text as model_provider, null::text as model_name';
+  const childModelColumns = hasRunModelColumns
+    ? 'c.model_provider, c.model_name'
+    : 'null::text as model_provider, null::text as model_name';
+
+  const result = await client.query<{
+    provider: string | null;
+    model: string | null;
+    run_count: string | number;
+    total_prompt_tokens: string | number;
+    total_completion_tokens: string | number;
+    total_reasoning_tokens: string | number | null;
+    estimated_cost_usd: string | number;
+  }>(
+    `
+      with recursive root_runs as (
+        select root_run_id::uuid as root_run_id, ordinality
+        from unnest($1::text[]) with ordinality as roots(root_run_id, ordinality)
+      ), run_tree as (
+        select
+          rr.root_run_id,
+          rr.ordinality,
+          r.id,
+          r.created_at,
+          ${rootModelColumns},
+          r.total_prompt_tokens,
+          r.total_completion_tokens,
+          r.total_reasoning_tokens,
+          r.estimated_cost_usd
+        from root_runs rr
+        join agent_runs r on r.id = rr.root_run_id
+
+        union all
+
+        select
+          rt.root_run_id,
+          rt.ordinality,
+          c.id,
+          c.created_at,
+          ${childModelColumns},
+          c.total_prompt_tokens,
+          c.total_completion_tokens,
+          c.total_reasoning_tokens,
+          c.estimated_cost_usd
+        from agent_runs c
+        join run_tree rt on c.parent_run_id = rt.id
+      ), attributed_usage as (
+        select
+          coalesce(nullif(rt.model_provider, ''), nullif(model_event.provider, ''), nullif(usage_event.provider, ''), 'unknown') as provider,
+          coalesce(nullif(rt.model_name, ''), nullif(model_event.model, ''), nullif(usage_event.model, ''), 'unknown') as model,
+          coalesce(nullif(rt.total_prompt_tokens, 0), usage_event.total_prompt_tokens, 0) as total_prompt_tokens,
+          coalesce(nullif(rt.total_completion_tokens, 0), usage_event.total_completion_tokens, 0) as total_completion_tokens,
+          coalesce(nullif(coalesce(rt.total_reasoning_tokens, 0), 0), usage_event.total_reasoning_tokens, 0) as total_reasoning_tokens,
+          coalesce(nullif(rt.estimated_cost_usd, 0), usage_event.estimated_cost_usd, 0) as estimated_cost_usd
+        from run_tree rt
+        left join lateral (
+          select
+            e.payload ->> 'provider' as provider,
+            e.payload ->> 'model' as model
+          from agent_events e
+          where e.run_id = rt.id
+            and e.event_type in ('model.started', 'model.completed', 'model.retry', 'model.failed')
+            and (nullif(e.payload ->> 'provider', '') is not null or nullif(e.payload ->> 'model', '') is not null)
+          order by e.seq desc, e.created_at desc
+          limit 1
+        ) model_event on true
+        left join lateral (
+          select
+            nullif(event_usage.total_prompt_tokens, '')::numeric as total_prompt_tokens,
+            nullif(event_usage.total_completion_tokens, '')::numeric as total_completion_tokens,
+            nullif(event_usage.total_reasoning_tokens, '')::numeric as total_reasoning_tokens,
+            nullif(event_usage.estimated_cost_usd, '')::numeric as estimated_cost_usd,
+            event_usage.provider,
+            event_usage.model
+          from agent_events e
+          cross join lateral (
+            select
+              coalesce(
+                e.payload #>> '{usage,promptTokens}',
+                e.payload #>> '{usage,prompt_tokens}'
+              ) as total_prompt_tokens,
+              coalesce(
+                e.payload #>> '{usage,completionTokens}',
+                e.payload #>> '{usage,completion_tokens}'
+              ) as total_completion_tokens,
+              coalesce(
+                e.payload #>> '{usage,reasoningTokens}',
+                e.payload #>> '{usage,reasoning_tokens}'
+              ) as total_reasoning_tokens,
+              coalesce(
+                e.payload #>> '{usage,estimatedCostUSD}',
+                e.payload #>> '{usage,estimated_cost_usd}'
+              ) as estimated_cost_usd,
+              coalesce(
+                e.payload #>> '{usage,provider}',
+                e.payload #>> '{provider}'
+              ) as provider,
+              coalesce(
+                e.payload #>> '{usage,model}',
+                e.payload #>> '{model}'
+              ) as model
+          ) event_usage
+          where e.run_id = rt.id
+            and e.event_type = 'usage.updated'
+            and (
+              nullif(event_usage.total_prompt_tokens, '') is not null
+              or nullif(event_usage.total_completion_tokens, '') is not null
+              or nullif(event_usage.total_reasoning_tokens, '') is not null
+              or nullif(event_usage.estimated_cost_usd, '') is not null
+              or nullif(event_usage.provider, '') is not null
+              or nullif(event_usage.model, '') is not null
+            )
+          order by e.seq desc, e.created_at desc
+          limit 1
+        ) usage_event on true
+      )
+      select
+        provider,
+        model,
+        count(*)::text as run_count,
+        coalesce(sum(total_prompt_tokens), 0)::text as total_prompt_tokens,
+        coalesce(sum(total_completion_tokens), 0)::text as total_completion_tokens,
+        coalesce(sum(total_reasoning_tokens), 0)::text as total_reasoning_tokens,
+        coalesce(sum(estimated_cost_usd), 0)::text as estimated_cost_usd
+      from attributed_usage
+      where total_prompt_tokens <> 0
+         or total_completion_tokens <> 0
+         or total_reasoning_tokens <> 0
+         or estimated_cost_usd <> 0
+      group by provider, model
+      order by sum(total_prompt_tokens + total_completion_tokens + total_reasoning_tokens) desc,
+               sum(estimated_cost_usd) desc,
+               provider asc,
+               model asc
+    `,
+    [rootRunIds],
+  );
+
+  return result.rows.map(providerModelUsageSummaryFromRow);
+}
+
+async function loadToolOutputUsageByProviderModel(
+  client: PostgresClient,
+  rootRunIds: string[],
+): Promise<ProviderModelUsageSummary[]> {
+  const result = await client.query<{
+    provider: string | null;
+    model: string | null;
+    tool_call_count: string | number;
+    total_prompt_tokens: string | number;
+    total_completion_tokens: string | number;
+    total_reasoning_tokens: string | number | null;
+    estimated_cost_usd: string | number;
+  }>(
+    `
+      with recursive root_runs as (
+        select root_run_id::uuid as root_run_id, ordinality
+        from unnest($1::text[]) with ordinality as roots(root_run_id, ordinality)
+      ), run_tree as (
+        select r.id, r.root_run_id, r.created_at
+        from agent_runs r
+        join root_runs rr on rr.root_run_id = r.id
+
+        union all
+
+        select c.id, c.root_run_id, c.created_at
+        from agent_runs c
+        join run_tree rt on c.parent_run_id = rt.id
+      ), attributed_tool_usage as (
+        select
+          coalesce(
+            nullif(raw_usage.output_provider, ''),
+            nullif(raw_usage.usage_provider, ''),
+            nullif(raw_usage.input_provider, ''),
+            case
+              when nullif(raw_usage.api_key_env, '') is not null and raw_usage.api_key_env ~* '^[A-Z0-9_]+_API_KEY$' then
+                lower(regexp_replace(raw_usage.api_key_env, '_API_KEY$', '', 'i'))
+              else null
+            end,
+            case
+              when te.tool_name ilike '%openrouter%' then 'openrouter'
+              when te.tool_name ilike '%mistral%' then 'mistral'
+              when te.tool_name ilike '%mesh%' then 'mesh'
+              when te.tool_name ilike '%ollama%' then 'ollama'
+              when te.tool_name ilike '%openai%' then 'openai'
+              when te.tool_name ilike '%anthropic%' then 'anthropic'
+              else null
+            end,
+            'unknown'
+          ) as provider,
+          coalesce(nullif(raw_usage.output_model, ''), nullif(raw_usage.usage_model, ''), nullif(raw_usage.input_model, ''), 'unknown') as model,
+          coalesce(tool_usage.prompt_tokens, 0) as total_prompt_tokens,
+          coalesce(tool_usage.completion_tokens, 0) as total_completion_tokens,
+          coalesce(tool_usage.reasoning_tokens, 0) as total_reasoning_tokens,
+          coalesce(tool_usage.estimated_cost_usd, 0) as estimated_cost_usd
+        from run_tree rt
+        join tool_executions te on te.run_id = rt.id
+        cross join lateral (
+          select
+            coalesce(
+              te.output ->> 'provider',
+              te.output #>> '{provider}'
+            ) as output_provider,
+            coalesce(
+              te.output #>> '{usage,provider}',
+              te.output #>> '{metadata,provider}'
+            ) as usage_provider,
+            coalesce(
+              te.input ->> 'provider',
+              te.input #>> '{provider}'
+            ) as input_provider,
+            coalesce(
+              te.input ->> 'apiKeyEnv',
+              te.input ->> 'api_key_env',
+              te.input #>> '{model,apiKeyEnv}',
+              te.input #>> '{model,api_key_env}',
+              te.output ->> 'apiKeyEnv',
+              te.output ->> 'api_key_env',
+              te.output #>> '{model,apiKeyEnv}',
+              te.output #>> '{model,api_key_env}'
+            ) as api_key_env,
+            coalesce(
+              te.output ->> 'model',
+              te.output #>> '{model}'
+            ) as output_model,
+            coalesce(
+              te.output #>> '{usage,model}',
+              te.output #>> '{metadata,model}'
+            ) as usage_model,
+            coalesce(
+              te.input ->> 'model',
+              te.input #>> '{model}'
+            ) as input_model,
+            coalesce(
+              te.output #>> '{usage,promptTokens}',
+              te.output #>> '{usage,prompt_tokens}'
+            ) as prompt_tokens,
+            coalesce(
+              te.output #>> '{usage,completionTokens}',
+              te.output #>> '{usage,completion_tokens}'
+            ) as completion_tokens,
+            coalesce(
+              te.output #>> '{usage,reasoningTokens}',
+              te.output #>> '{usage,reasoning_tokens}',
+              te.output #>> '{usage,completionTokensDetails,reasoningTokens}',
+              te.output #>> '{usage,completion_tokens_details,reasoning_tokens}'
+            ) as reasoning_tokens,
+            coalesce(
+              te.output #>> '{usage,estimatedCostUSD}',
+              te.output #>> '{usage,estimated_cost_usd}'
+            ) as estimated_cost_usd,
+            coalesce(
+              te.output #>> '{usage,costUSD}',
+              te.output #>> '{usage,cost_usd}'
+            ) as cost_usd,
+            coalesce(
+              te.output #>> '{usage,totalCostUSD}',
+              te.output #>> '{usage,total_cost_usd}'
+            ) as total_cost_usd,
+            te.output #>> '{usage,cost}' as cost,
+            te.output #>> '{usage,total_cost}' as total_cost,
+            te.output #>> '{usage,cost_details,upstream_inference_cost}' as upstream_inference_cost,
+            coalesce(
+              te.output #>> '{usage,cost_details,upstream_inference_prompt_cost}',
+              te.output #>> '{usage,cost_breakdown,prompt_cost}'
+            ) as prompt_cost,
+            coalesce(
+              te.output #>> '{usage,cost_details,upstream_inference_completions_cost}',
+              te.output #>> '{usage,cost_breakdown,completions_cost}',
+              te.output #>> '{usage,cost_breakdown,completion_cost}'
+            ) as completion_cost
+        ) raw_usage
+        cross join lateral (
+          select
+            nullif(raw_usage.prompt_tokens, '')::numeric as prompt_tokens,
+            nullif(raw_usage.completion_tokens, '')::numeric as completion_tokens,
+            nullif(raw_usage.reasoning_tokens, '')::numeric as reasoning_tokens,
+            coalesce(
+              nullif(nullif(raw_usage.estimated_cost_usd, '')::numeric, 0),
+              nullif(nullif(raw_usage.cost_usd, '')::numeric, 0),
+              nullif(nullif(raw_usage.total_cost_usd, '')::numeric, 0),
+              nullif(nullif(raw_usage.cost, '')::numeric, 0),
+              nullif(nullif(raw_usage.total_cost, '')::numeric, 0),
+              nullif(nullif(raw_usage.upstream_inference_cost, '')::numeric, 0),
+              case
+                when nullif(raw_usage.prompt_cost, '') is not null or nullif(raw_usage.completion_cost, '') is not null then
+                  coalesce(nullif(raw_usage.prompt_cost, '')::numeric, 0) + coalesce(nullif(raw_usage.completion_cost, '')::numeric, 0)
+                else null
+              end
+            ) as estimated_cost_usd
+        ) tool_usage
+        where te.status = 'completed'
+          and te.child_run_id is null
+          and (
+            tool_usage.prompt_tokens is not null
+            or tool_usage.completion_tokens is not null
+            or tool_usage.reasoning_tokens is not null
+            or tool_usage.estimated_cost_usd is not null
+          )
+      )
+      select
+        provider,
+        model,
+        count(*)::text as tool_call_count,
+        coalesce(sum(total_prompt_tokens), 0)::text as total_prompt_tokens,
+        coalesce(sum(total_completion_tokens), 0)::text as total_completion_tokens,
+        coalesce(sum(total_reasoning_tokens), 0)::text as total_reasoning_tokens,
+        coalesce(sum(estimated_cost_usd), 0)::text as estimated_cost_usd
+      from attributed_tool_usage
+      group by provider, model
+      order by sum(total_prompt_tokens + total_completion_tokens + total_reasoning_tokens) desc,
+               sum(estimated_cost_usd) desc,
+               provider asc,
+               model asc
+    `,
+    [rootRunIds],
+  );
+
+  return result.rows.map(providerModelUsageSummaryFromRow);
 }
 
 async function loadRunMessageTraces(client: PostgresClient, rootRunIds: string[]): Promise<RunMessageTrace[]> {

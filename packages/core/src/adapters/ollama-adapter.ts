@@ -91,7 +91,7 @@ export class OllamaAdapter extends BaseOpenAIChatAdapter {
         toolCalling: true,
         jsonOutput: true,
         streaming: true,
-        usage: false,
+        usage: true,
         imageInput: true,
       },
     };

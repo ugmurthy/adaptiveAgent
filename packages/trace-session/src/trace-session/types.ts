@@ -105,12 +105,22 @@ export interface UsageSummary {
   estimatedCostUSD: number;
 }
 
+export interface ProviderModelUsageSummary {
+  provider: string;
+  model: string;
+  usage: UsageSummary;
+  runCount?: number;
+  toolCallCount?: number;
+}
+
 export interface SessionUsageSummary {
   total: UsageSummary;
   byRootRun: Array<{
     rootRunId: string;
     usage: UsageSummary;
   }>;
+  byProviderModel?: ProviderModelUsageSummary[];
+  toolOutputByProviderModel?: ProviderModelUsageSummary[];
 }
 
 export interface SessionListItem {
