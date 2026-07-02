@@ -1,4 +1,4 @@
-import { resolve } from 'node:path';
+import { basename, resolve } from 'node:path';
 
 import { marked } from 'marked';
 import { markedTerminal } from 'marked-terminal';
@@ -793,20 +793,127 @@ export function printProgressEvent(
   colors?: RunColorRegistry,
 ): void {
   const assistantContent = extractAssistantProgressContent(event);
-  if (!assistantContent) {
-    return;
+  if (assistantContent && lastContentByRun.get(event.runId) !== assistantContent) {
+    lastContentByRun.set(event.runId, assistantContent);
+    printProgressContent(assistantContent, event, theme, showLines, wrapWidth, colors);
   }
-  if (lastContentByRun.get(event.runId) === assistantContent) {
-    return;
+
+  const toolContent = extractToolProgressContent(event);
+  if (toolContent) {
+    printProgressContent(toolContent, event, theme, showLines, wrapWidth, colors);
   }
-  lastContentByRun.set(event.runId, assistantContent);
-  const rendered = limitRenderedProgressLines(wrapRenderedText(renderPrettyString(assistantContent), wrapWidth), showLines);
+}
+
+function printProgressContent(
+  content: string,
+  event: { runId: string; payload: JsonValue },
+  theme: TuiSettingsConfig,
+  showLines: number,
+  wrapWidth?: number,
+  colors?: RunColorRegistry,
+): void {
+  const rendered = limitRenderedProgressLines(wrapRenderedText(renderPrettyString(content), wrapWidth), showLines);
   if (colors) {
     const prefix = agentEventProgressPrefix(event);
     console.error(formatStyledMessageBlock('progress', wrapRenderedText(colors.colorize(agentEventColorKey(event), `${prefix} ${rendered}`), wrapWidth), swarmProgressTheme(theme)));
     return;
   }
   console.error(formatStyledMessageBlock('progress', rendered, theme));
+}
+
+export function extractToolProgressContent(event: { type: string; payload: JsonValue }): string | undefined {
+  if (event.type !== 'tool.started') {
+    return undefined;
+  }
+  const payload = asJsonObject(event.payload);
+  const toolName = readString(payload, 'toolName');
+  if (!toolName) {
+    return undefined;
+  }
+
+  const input = normalizeToolInput(payload?.input);
+  const detail = formatToolProgressDetail(toolName, input);
+  return detail ? `${toolName} ${detail}` : toolName;
+}
+
+function formatToolProgressDetail(toolName: string, input: JsonObject | undefined): string | undefined {
+  switch (toolName) {
+    case 'read_file':
+    case 'write_file':
+    case 'edit_file':
+      return basenameForDisplay(readString(input, 'path'));
+    case 'list_directory':
+      return compactDisplayString(readString(input, 'filter') ?? readString(input, 'path'));
+    case 'web_search':
+      return compactDisplayString(readString(input, 'query'), 50);
+    case 'read_web_page':
+      return domainForDisplay(readString(input, 'url'));
+    case 'search_files':
+      return compactDisplayString(readString(input, 'query') ?? readString(input, 'filename') ?? readString(input, 'path'));
+    case 'shell_exec':
+      return compactDisplayString(readString(input, 'command'), 50);
+    default:
+      return undefined;
+  }
+}
+
+function normalizeToolInput(value: JsonValue | undefined): JsonObject | undefined {
+  if (typeof value === 'string') {
+    try {
+      return normalizeToolInput(JSON.parse(value) as JsonValue);
+    } catch {
+      return undefined;
+    }
+  }
+
+  const object = asJsonObject(value);
+  const preview = asJsonObject(object?.preview);
+  return preview ?? object;
+}
+
+function basenameForDisplay(value: string | undefined): string | undefined {
+  const compact = compactDisplayString(value);
+  if (!compact) return undefined;
+  const hashIndex = compact.indexOf('#');
+  const pathForName = hashIndex >= 0 && compact.slice(hashIndex + 1).trim()
+    ? compact.slice(hashIndex + 1)
+    : compact;
+  const normalized = pathForName.replace(/[\\/]+$/, '');
+  const name = basename(normalized);
+  return name || normalized || compact;
+}
+
+function domainForDisplay(value: string | undefined): string | undefined {
+  const compact = compactDisplayString(value);
+  if (!compact) return undefined;
+  try {
+    const hostname = new URL(compact).hostname.replace(/^www\./i, '');
+    return hostname || compact;
+  } catch {
+    return compactDisplayString(compact, 50);
+  }
+}
+
+function compactDisplayString(value: string | undefined, maxLength?: number): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const compact = value.replace(/\s+/g, ' ').trim();
+  if (!compact) return undefined;
+  if (maxLength !== undefined && compact.length > maxLength) {
+    return `${compact.slice(0, maxLength)}...`;
+  }
+  return compact;
+}
+
+function readString(value: JsonObject | undefined, key: string): string | undefined {
+  const field = value?.[key];
+  if (typeof field === 'string') return field;
+  const summary = asJsonObject(field);
+  const preview = summary?.preview;
+  return typeof preview === 'string' ? preview.replace(/\.\.\.$/, '') : undefined;
+}
+
+function asJsonObject(value: JsonValue | undefined): JsonObject | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as JsonObject : undefined;
 }
 
 export const ANSI_PATTERN = /\x1B\[[0-?]*[ -/]*[@-~]/g;

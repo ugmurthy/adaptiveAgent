@@ -24,7 +24,7 @@ Options:
   --messages             Include the current snapshot-backed LLM message context.
   --messages-view <mode> Message view: compact, delta, or full. Default: compact.
   --system-only          Include only system messages in the LLM message view.
-  --view <name>          Report view: brief, overview, investigate, policy, performance, milestones, timeline, delegates, messages, plans, or all.
+  --view <name>          Report view: brief, overview, output, investigate, policy, performance, milestones, timeline, delegates, messages, plans, or all.
   --focus-run <id>       Limit the rendered report to a run subtree within the traced tree.
   --preview-chars <n>    Preview length for --ls goals and compact/delta message views. Default: ${DEFAULT_MESSAGE_PREVIEW_CHARS}
   --json                 Print the trace report as JSON.

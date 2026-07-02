@@ -45,6 +45,7 @@ type HtmlTraceRenderOptions = Partial<Pick<CliOptions, 'includePlans' | 'message
 };
 
 type HtmlTableCell = string | { value: string | number; className?: string };
+type HtmlTableCellKind = 'numeric' | 'descriptive' | 'compact';
 
 export function renderTraceReport(
   report: TraceReport,
@@ -69,6 +70,10 @@ export function renderTraceReport(
 
   if (effectiveView === 'brief') {
     return lines.join('\n');
+  }
+
+  if (effectiveView === 'output') {
+    return renderFinalOutput(report.rootRuns);
   }
 
   if (effectiveView === 'investigate') {
@@ -104,7 +109,7 @@ export function renderTraceReport(
   if (shouldRenderSection(effectiveView, 'performance')) {
     lines.push('');
     lines.push(markdownBlock('# Performance'));
-    lines.push(renderPerformance(report.performance ?? emptyPerformanceSummary(), traceDurationMs(report), diagnostics.performance, report.usage));
+    lines.push(renderPerformance(report.performance ?? emptyPerformanceSummary(), traceDurationMs(report), diagnostics.performance, report.usage, report.rootRuns));
   }
 
   if (shouldRenderSection(effectiveView, 'milestones')) {
@@ -177,7 +182,6 @@ export function renderTraceHtml(report: TraceReport, options: HtmlTraceRenderOpt
     renderHtmlWorkflow(report),
     renderHtmlDelegates(report.delegates),
     renderHtmlMessages(report, options),
-    renderHtmlPlans(report.plans, options),
     renderHtmlFinalOutputs(report.rootRuns),
     renderHtmlRawJson(reportWithDiagnostics),
     '    </main>',
@@ -315,9 +319,8 @@ export function renderUsageReport(usage: SessionUsageSummary, options: Pick<CliO
   const lines = [formatUsageSummary(usage.total)];
   if (usage.byRootRun.length > 0) {
     lines.push('');
-    for (const item of usage.byRootRun) {
-      lines.push(`${item.rootRunId} : ${formatUsageSummary(item.usage)}`);
-    }
+    lines.push('Run usage by root run');
+    lines.push(renderRootRunUsageTable(usage.byRootRun));
   }
   appendProviderModelUsageLines(lines, 'Model usage by provider/model', usage.byProviderModel ?? [], 'runs');
   appendProviderModelUsageLines(lines, 'Tool-output usage by provider/model', usage.toolOutputByProviderModel ?? [], 'tool calls');
@@ -361,23 +364,27 @@ body {
   border-radius: 22px;
   box-shadow: 0 16px 50px rgba(23, 32, 51, 0.08);
 }
-.hero { padding: 30px; }
-.eyebrow { margin: 0 0 8px; color: var(--accent); font-size: 12px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
-.hero-title { display: flex; gap: 16px; align-items: flex-start; justify-content: space-between; }
+.hero { padding: 22px 26px; }
+.eyebrow { margin: 0; color: var(--accent); font-size: 12px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; white-space: nowrap; }
+.hero-title { display: flex; gap: 16px; align-items: center; justify-content: space-between; }
+.hero-heading { min-width: 0; display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: baseline; }
 h1, h2, h3 { line-height: 1.18; margin: 0; }
-h1 { font-size: clamp(30px, 4vw, 48px); max-width: 820px; }
+h1 { font-size: clamp(20px, 2.1vw, 28px); font-weight: 800; max-width: 100%; overflow-wrap: anywhere; }
 h2 { font-size: 24px; }
 h3 { font-size: 17px; }
-.lead { max-width: 900px; margin: 16px 0 0; color: #344054; font-size: 17px; }
-.hero-meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin: 24px 0 0; }
-.meta-item, .metric-card {
+.lead { max-width: 980px; margin: 10px 0 0; color: #344054; font-size: 15px; }
+.hero-meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); column-gap: 28px; row-gap: 2px; margin: 16px 0 0; padding-top: 10px; border-top: 1px solid #edf0f5; }
+.meta-item { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 10px; align-items: baseline; padding: 4px 0; }
+.metric-card {
   background: var(--panel-soft);
   border: 1px solid #edf0f5;
   border-radius: 16px;
   padding: 14px 16px;
 }
+.meta-label { color: var(--muted); font-size: 12px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+.meta-value { min-width: 0; font-size: 14px; font-weight: 700; overflow-wrap: anywhere; }
 .meta-label, .metric-label { display: block; color: var(--muted); font-size: 12px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
-.meta-value, .metric-value { display: block; margin-top: 4px; font-size: 18px; font-weight: 800; overflow-wrap: anywhere; }
+.metric-value { display: block; margin-top: 4px; font-size: 18px; font-weight: 800; overflow-wrap: anywhere; }
 .metric-note { margin: 8px 0 0; color: var(--muted); font-size: 13px; }
 .toc { display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0; padding: 14px; position: sticky; top: 0; z-index: 2; }
 .toc a { color: var(--accent); background: var(--accent-soft); border-radius: 999px; font-weight: 700; padding: 8px 12px; text-decoration: none; }
@@ -422,7 +429,9 @@ table { border-collapse: collapse; min-width: 100%; }
 th, td { border-bottom: 1px solid #edf0f5; padding: 10px 12px; text-align: left; vertical-align: top; }
 th { background: #f3f5f9; color: #475467; font-size: 12px; letter-spacing: .05em; text-transform: uppercase; white-space: nowrap; }
 tr:last-child td { border-bottom: 0; }
-td { overflow-wrap: anywhere; }
+td { white-space: nowrap; overflow-wrap: normal; }
+th.num-cell, td.num-cell { text-align: right; font-variant-numeric: tabular-nums; }
+td.text-cell { min-width: 260px; white-space: normal; overflow-wrap: break-word; }
 .status-cell.status-succeeded, .status-cell.status-returned-successfully { color: var(--good); font-weight: 800; }
 .status-cell.status-failed, .status-cell.status-error { color: var(--bad); font-weight: 800; }
 .status-cell.status-blocked, .status-cell.status-running, .status-cell.status-awaiting-subagent, .status-cell.status-waiting { color: var(--warn); font-weight: 800; }
@@ -457,7 +466,7 @@ function renderHtmlHero(report: TraceReport, diagnostics: TraceDiagnostics, gene
   return `
     <header class="hero">
       <div class="hero-title">
-        <div>
+        <div class="hero-heading">
           <p class="eyebrow">Adaptive Agent Trace Report</p>
           <h1>${escapeHtml(brief.targetLabel)}</h1>
         </div>
@@ -483,7 +492,6 @@ function renderHtmlNav(): string {
     ['#workflow', 'Workflow'],
     ['#delegates', 'Delegates'],
     ['#messages', 'Messages'],
-    ['#plans', 'Plans'],
     ['#final-output', 'Final Output'],
     ['#raw-json', 'Raw JSON'],
   ];
@@ -507,7 +515,7 @@ function renderHtmlBrief(diagnostics: TraceDiagnostics): string {
       ['Parallelism', formatRatio(brief.parallelismFactor), 'Measured cumulative time divided by wall time.'],
       ['Model calls', `${formatNumber(brief.modelCalls)} total / ${formatNumber(brief.failedModelCalls)} failed`, 'Model lifecycle events.'],
       ['Tool calls', `${formatNumber(brief.toolCalls)} total / ${formatNumber(brief.failedToolCalls)} failed`, 'Durable tool execution outcomes.'],
-      ['Usage', `${formatNumber(brief.totalTokens)} tokens`, `$${brief.estimatedCostUSD.toFixed(6)} estimated cost`],
+      ['Usage', `${formatNumber(brief.totalTokens)} tokens`, `${formatCost(brief.estimatedCostUSD)} estimated cost`],
     ]),
   );
 }
@@ -645,7 +653,7 @@ function renderHtmlPerformance(report: TraceReport, diagnostics: TraceDiagnostic
           formatNumber(run.totalTokens),
           formatNumber(run.promptTokens),
           formatNumber(run.completionTokens),
-          `$${run.estimatedCostUSD.toFixed(6)}`,
+          formatCost(run.estimatedCostUSD),
           run.goal ? truncatePlain(oneLine(run.goal), 120) : '-',
         ]),
       )),
@@ -717,7 +725,7 @@ function renderHtmlProviderModelUsageTable(
       formatNumber(row.usage.promptTokens),
       formatNumber(row.usage.completionTokens),
       formatNumber(row.usage.reasoningTokens ?? 0),
-      `$${row.usage.estimatedCostUSD.toFixed(6)}`,
+      formatCost(row.usage.estimatedCostUSD),
     ]),
   );
 }
@@ -861,35 +869,6 @@ function renderHtmlMessageCard(message: TraceMessage, previewChars: number): str
           </details>`;
 }
 
-function renderHtmlPlans(plans: PlanRow[], options: HtmlTraceRenderOptions): string {
-  if (plans.length === 0) {
-    const message = options.includePlans
-      ? 'No plan rows were found.'
-      : 'Plan execution rows were not loaded for this report. Re-run with --include-plans --html <path> to include plan details.';
-    return htmlSection('plans', 'Plans', 'Plan execution and replan details when requested.', `<p class="empty">${escapeHtml(message)}</p>`);
-  }
-
-  return htmlSection(
-    'plans',
-    'Plans',
-    'Plan execution rows, step titles, tools, approval flags, and replan reasons.',
-    htmlTable(
-      ['Run', 'Execution', 'Status', 'Attempt', 'Step', 'Title', 'Tool', 'Approval', 'Replan'],
-      plans.map((plan) => [
-        shortId(plan.run_id),
-        plan.plan_execution_id ? shortId(plan.plan_execution_id) : '-',
-        statusCell(plan.plan_execution_status ?? 'unknown'),
-        plan.attempt === null ? '-' : String(plan.attempt),
-        plan.step_index === null ? '-' : String(plan.step_index),
-        plan.title ?? plan.step_key ?? '-',
-        plan.tool_name ?? '-',
-        plan.requires_approval === null ? '-' : String(plan.requires_approval),
-        plan.replan_reason ?? '-',
-      ]),
-    ),
-  );
-}
-
 function renderHtmlFinalOutputs(rootRuns: RootRun[]): string {
   const rootsWithOutput = rootRuns.filter((run) => run.result !== null && run.result !== undefined);
   const body = rootsWithOutput.length === 0
@@ -971,23 +950,63 @@ function htmlTable(headers: string[], rows: HtmlTableCell[][]): string {
   if (rows.length === 0) {
     return '<p class="empty">No rows.</p>';
   }
+  const cellKinds = headers.map((header, index) => inferHtmlTableCellKind(header, rows.map((row) => row[index])));
   return `
         <div class="table-wrap">
           <table>
-            <thead><tr>${headers.map((header) => `<th>${escapeHtml(header)}</th>`).join('')}</tr></thead>
+            <thead><tr>${headers.map((header, index) => `<th${cellKinds[index] === 'numeric' ? ' class="num-cell"' : ''}>${escapeHtml(header)}</th>`).join('')}</tr></thead>
             <tbody>
-              ${rows.map((row) => `<tr>${row.map((cell) => htmlTableCell(cell)).join('')}</tr>`).join('\n              ')}
+              ${rows.map((row) => `<tr>${row.map((cell, index) => htmlTableCell(cell, cellKinds[index] ?? 'compact')).join('')}</tr>`).join('\n              ')}
             </tbody>
           </table>
         </div>`;
 }
 
-function htmlTableCell(cell: HtmlTableCell): string {
-  if (typeof cell === 'string') {
-    return `<td>${escapeHtml(cell)}</td>`;
+function htmlTableCell(cell: HtmlTableCell, kind: HtmlTableCellKind): string {
+  const value = typeof cell === 'string' ? cell : String(cell.value);
+  const explicitClassName = typeof cell === 'string' ? undefined : cell.className;
+  const classNames = [
+    explicitClassName,
+    kind === 'numeric' ? 'num-cell' : undefined,
+    kind === 'descriptive' ? 'text-cell' : undefined,
+  ].filter((item): item is string => item !== undefined).join(' ');
+  const className = classNames ? ` class="${escapeHtml(classNames)}"` : '';
+  const escapedValue = kind === 'compact' ? escapeHtmlWithSlashBreaks(value) : escapeHtml(value);
+  return `<td${className}>${escapedValue}</td>`;
+}
+
+function inferHtmlTableCellKind(header: string, cells: Array<HtmlTableCell | undefined>): HtmlTableCellKind {
+  if (isDescriptiveHtmlHeader(header)) {
+    return 'descriptive';
   }
-  const className = cell.className ? ` class="${escapeHtml(cell.className)}"` : '';
-  return `<td${className}>${escapeHtml(String(cell.value))}</td>`;
+  if (isNumericHtmlHeader(header) || cells.some((cell) => cell !== undefined && isNumericHtmlTableValue(cell))) {
+    return 'numeric';
+  }
+  return 'compact';
+}
+
+function isDescriptiveHtmlHeader(header: string): boolean {
+  const normalized = header.toLowerCase();
+  return /goal|error|message|preview|params|output|meaning|reason|summary|title|detail|evidence|command|policy|replan/.test(normalized);
+}
+
+function isNumericHtmlHeader(header: string): boolean {
+  const normalized = header.toLowerCase();
+  return /\b(tokens?|prompt|completion|reasoning|cost|duration|latency|wait|bytes?|calls?|runs?|skipped|depth|step|attempt|seq|created|failed|completed|started|total|average|avg|max|count)\b/.test(normalized)
+    && !/created at|started$|started at|provider|model|tool|status|root|run|parent|delegate|outcome/.test(normalized);
+}
+
+function isNumericHtmlTableValue(cell: HtmlTableCell): boolean {
+  const value = typeof cell === 'string' ? cell : String(cell.value);
+  const trimmed = stripAnsi(value).trim();
+  if (trimmed === '-' || trimmed.length === 0 || /[a-z]/i.test(trimmed.replace(/ms|s|b|kib|mib|total|max|avg|x/gi, ''))) {
+    return false;
+  }
+  return /^\$?\d[\d,]*(?:\.\d+)?(?:ms|s|B|KiB|MiB|x)?(?:\s|$)/.test(trimmed);
+}
+
+function escapeHtmlWithSlashBreaks(value: string): string {
+  return escapeHtml(value).replaceAll('/', '/<wbr>');
 }
 
 function htmlBadge(value: string, className?: string): string {
@@ -1039,7 +1058,7 @@ function renderTraceBrief(diagnostics: TraceDiagnostics): string {
     `${chalk.cyan('runs')} roots=${formatNumber(brief.rootRunCount)} total=${formatNumber(brief.runCount)} steps=${brief.totalSteps === null ? 'unknown' : formatNumber(brief.totalSteps)}`,
     `${chalk.cyan('duration')} wall=${formatDuration(brief.wallDurationMs)} cumulative=${formatDuration(brief.cumulativeMeasuredDurationMs)} parallelism=${formatRatio(brief.parallelismFactor)}`,
     `${chalk.cyan('model')} calls=${formatNumber(brief.modelCalls)} failed=${formatNumber(brief.failedModelCalls)}  ${chalk.cyan('tools')} calls=${formatNumber(brief.toolCalls)} failed=${formatNumber(brief.failedToolCalls)}`,
-    `${chalk.cyan('usage')} tokens=${formatNumber(brief.totalTokens)} cost=$${brief.estimatedCostUSD.toFixed(6)}`,
+    `${chalk.cyan('usage')} tokens=${formatNumber(brief.totalTokens)} cost=${formatCost(brief.estimatedCostUSD)}`,
   ];
   const notableFindings = diagnostics.findings
     .filter((finding) => finding.severity !== 'info')
@@ -1233,21 +1252,35 @@ function renderTraceSummary(report: TraceReport): string {
     lines.push(renderModelSummary(report.rootRuns));
   }
   lines.push(`${chalk.cyan('total steps')} ${report.totalSteps ?? 'unknown'}`);
-  lines.push(renderUsage(report.usage));
-  lines.push('');
-  lines.push(markdownBlock('# Root Runs'));
-  if (report.rootRuns.length === 0) {
-    lines.push(chalk.gray('No root runs were found.'));
-  } else {
-    for (const run of report.rootRuns) {
-      const parts = [run.rootRunId, statusColor(run.status ?? 'unknown')(run.status ?? 'unknown')];
-      if (run.runId !== run.rootRunId) {
-        parts.push(`linkedRun=${run.runId}`);
-      }
-      lines.push(`- ${parts.join('  ')}`);
+  lines.push(renderUsage(report.usage, report.rootRuns));
+
+  const rootRunsWithoutUsage = rootRunsNotCoveredByUsage(report.rootRuns, report.usage);
+  if (rootRunsWithoutUsage.length > 0 || report.usage.byRootRun.length === 0) {
+    const visibleRootRuns = report.usage.byRootRun.length === 0 ? report.rootRuns : rootRunsWithoutUsage;
+    lines.push('');
+    lines.push(markdownBlock('# Root Runs'));
+    if (visibleRootRuns.length === 0) {
+      lines.push(chalk.gray('No root runs were found.'));
+    } else {
+      lines.push(renderRootRunStatusList(visibleRootRuns));
     }
   }
   return lines.join('\n');
+}
+
+function rootRunsNotCoveredByUsage(rootRuns: RootRun[], usage: SessionUsageSummary): RootRun[] {
+  const usageRootRunIds = new Set(usage.byRootRun.map((item) => item.rootRunId));
+  return rootRuns.filter((run) => !usageRootRunIds.has(run.rootRunId));
+}
+
+function renderRootRunStatusList(rootRuns: RootRun[]): string {
+  return rootRuns.map((run) => {
+    const parts = [run.rootRunId, statusColor(run.status ?? 'unknown')(run.status ?? 'unknown')];
+    if (run.runId !== run.rootRunId) {
+      parts.push(`linkedRun=${run.runId}`);
+    }
+    return `- ${parts.join('  ')}`;
+  }).join('\n');
 }
 
 function renderModelSummary(rootRuns: RootRun[]): string {
@@ -1294,14 +1327,47 @@ function traceDurationMs(report: TraceReport): number | null {
   return report.session ? durationMs(report.session.createdAt, report.session.updatedAt) : null;
 }
 
-function renderUsage(usage: SessionUsageSummary): string {
+function renderUsage(usage: SessionUsageSummary, rootRuns: RootRun[] = []): string {
   const lines = [`${chalk.cyan('usage')} ${formatUsageSummary(usage.total)}`];
-  if (usage.byRootRun.length > 1) {
-    for (const item of usage.byRootRun) {
-      lines.push(`  ${chalk.green(item.rootRunId)} ${formatUsageSummary(item.usage)}`);
-    }
+  if (usage.byRootRun.length > 1 || (usage.byRootRun.length > 0 && rootRuns.length > 0)) {
+    lines.push('');
+    lines.push(renderRootRunUsageTable(usage.byRootRun, { rootRuns }));
   }
   return lines.join('\n');
+}
+
+function renderRootRunUsageTable(items: SessionUsageSummary['byRootRun'], options: { rootRuns?: RootRun[] } = {}): string {
+  const rootRuns = options.rootRuns ?? [];
+  const runByRootRunId = new Map(rootRuns.map((run) => [run.rootRunId, run]));
+  const includeStatus = rootRuns.length > 0;
+  const includeLinkedRun = rootRuns.some((run) => run.runId !== run.rootRunId);
+  const headers = [
+    'root run',
+    ...(includeStatus ? ['status'] : []),
+    ...(includeLinkedRun ? ['linked run'] : []),
+    'tokens',
+    'prompt',
+    'completion',
+    'reasoning',
+    'cost',
+  ];
+
+  return renderTable(
+    headers,
+    items.map((item) => {
+      const run = runByRootRunId.get(item.rootRunId);
+      return [
+        item.rootRunId,
+        ...(includeStatus ? [statusColor(run?.status ?? 'unknown')(run?.status ?? 'unknown')] : []),
+        ...(includeLinkedRun ? [run && run.runId !== run.rootRunId ? run.runId : '-'] : []),
+        formatNumber(item.usage.totalTokens),
+        formatNumber(item.usage.promptTokens),
+        formatNumber(item.usage.completionTokens),
+        formatNumber(item.usage.reasoningTokens ?? 0),
+        formatCost(item.usage.estimatedCostUSD),
+      ];
+    }),
+  );
 }
 
 function appendProviderModelUsageLines(
@@ -1339,6 +1405,27 @@ function renderProviderModelUsageSections(usage: SessionUsageSummary): string | 
   return sections.length === 0 ? null : sections.join('\n');
 }
 
+function renderPerformanceUsageSections(usage: SessionUsageSummary, rootRuns: RootRun[]): string {
+  const sections: string[] = [];
+
+  sections.push(markdownBlock('## Usage'));
+  sections.push(`${chalk.cyan('total')} ${formatUsageSummary(usage.total)}`);
+
+  if (usage.byRootRun.length > 0) {
+    sections.push('');
+    sections.push(markdownBlock('### Run Usage by Root Run'));
+    sections.push(renderRootRunUsageTable(usage.byRootRun, { rootRuns }));
+  }
+
+  const providerModelSections = renderProviderModelUsageSections(usage);
+  if (providerModelSections) {
+    sections.push('');
+    sections.push(providerModelSections);
+  }
+
+  return sections.join('\n');
+}
+
 function renderProviderModelUsageTable(
   rows: ProviderModelUsageSummary[],
   countLabel: 'runs' | 'tool calls',
@@ -1353,7 +1440,7 @@ function renderProviderModelUsageTable(
       formatNumber(row.usage.promptTokens),
       formatNumber(row.usage.completionTokens),
       formatNumber(row.usage.reasoningTokens ?? 0),
-      `$${row.usage.estimatedCostUSD.toFixed(6)}`,
+      formatCost(row.usage.estimatedCostUSD),
     ]),
   );
 }
@@ -1363,6 +1450,7 @@ function renderPerformance(
   totalDurationMs: number | null,
   digest: PerformanceDigest,
   usage: SessionUsageSummary,
+  rootRuns: RootRun[],
 ): string {
   const lines: string[] = [];
   const statusCodes = Object.entries(performance.model.adapterStatusCodes)
@@ -1377,11 +1465,8 @@ function renderPerformance(
   lines.push(markdownBlock('## Digest'));
   lines.push(renderPerformanceDigest(digest, performance.events.totalEvents > 0));
 
-  const usageBreakdown = renderProviderModelUsageSections(usage);
-  if (usageBreakdown) {
-    lines.push('');
-    lines.push(usageBreakdown);
-  }
+  lines.push('');
+  lines.push(renderPerformanceUsageSections(usage, rootRuns));
 
   lines.push('');
   lines.push(markdownBlock('## Overview'));
@@ -1481,7 +1566,7 @@ function renderPerformanceDigest(digest: PerformanceDigest, includeTimelineSpans
         formatNumber(run.totalTokens),
         formatNumber(run.promptTokens),
         formatNumber(run.completionTokens),
-        `$${run.estimatedCostUSD.toFixed(6)}`,
+        formatCost(run.estimatedCostUSD),
         run.goal ? truncatePlain(oneLine(run.goal), 80) : '-',
       ]),
     ));
@@ -1649,7 +1734,7 @@ function formatUsageSummary(usage: UsageSummary): string {
     parts.push(`reasoning=${formatNumber(usage.reasoningTokens)}`);
   }
   parts.push(`total=${formatNumber(usage.totalTokens)}`);
-  parts.push(`cost=$${usage.estimatedCostUSD.toFixed(6)}`);
+  parts.push(`cost=${formatCost(usage.estimatedCostUSD)}`);
   return parts.join('  ');
 }
 
@@ -2173,6 +2258,10 @@ function formatTimeOfDay(value: string | null): string {
 
 function formatNumber(value: number): string {
   return new Intl.NumberFormat('en-US').format(value);
+}
+
+function formatCost(value: number): string {
+  return `$${value.toFixed(6)}`;
 }
 
 function formatRatio(value: number | null): string {

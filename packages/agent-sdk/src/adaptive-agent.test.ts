@@ -22,6 +22,7 @@ import {
   summarizeGaiaDryRunTasks,
 } from './adaptive-agent.js';
 import type { BenchmarkAttachmentType, BenchmarkCase, ManualTestCliOptions } from './adaptive-agent.js';
+import { extractToolProgressContent, printProgressEvent } from './cli-render.js';
 
 describe('adaptive-agent spec loading', () => {
   let tempDir: string;
@@ -1312,6 +1313,78 @@ describe('adaptive-agent pretty rendering', () => {
 
     expect(rendered.endsWith('\n')).toBe(false);
     expect(rendered).toBe('progress> Checking available data');
+  });
+
+  it('formats tool progress summaries from tool inputs', () => {
+    expect(extractToolProgressContent({
+      type: 'tool.started',
+      payload: { toolName: 'read_file', input: { path: '/tmp/reports/summary.md' } },
+    })).toBe('read_file summary.md');
+    expect(extractToolProgressContent({
+      type: 'tool.started',
+      payload: { toolName: 'read_file', input: { path: 'archive.zip#docs/report.md' } },
+    })).toBe('read_file report.md');
+    expect(extractToolProgressContent({
+      type: 'tool.started',
+      payload: { toolName: 'list_directory', input: { path: 'packages/core', filter: 'tool' } },
+    })).toBe('list_directory tool');
+    expect(extractToolProgressContent({
+      type: 'tool.started',
+      payload: { toolName: 'read_web_page', input: { url: 'https://www.example.com/docs/start?x=1' } },
+    })).toBe('read_web_page example.com');
+    expect(extractToolProgressContent({
+      type: 'tool.started',
+      payload: { toolName: 'search_files', input: { query: 'needle' } },
+    })).toBe('search_files needle');
+    expect(extractToolProgressContent({
+      type: 'tool.started',
+      payload: { toolName: 'write_file', input: { type: 'object', keyCount: 2, preview: { path: '/tmp/out/report.md', content: 'draft' } } },
+    })).toBe('write_file report.md');
+  });
+
+  it('truncates long shell and web search progress details', () => {
+    const longCommand = 'bunx vitest run packages/agent-sdk/src/adaptive-agent.test.ts --runInBand';
+    expect(extractToolProgressContent({
+      type: 'tool.started',
+      payload: { toolName: 'shell_exec', input: { command: longCommand } },
+    })).toBe(`shell_exec ${longCommand.slice(0, 50)}...`);
+    expect(extractToolProgressContent({
+      type: 'tool.started',
+      payload: { toolName: 'web_search', input: { query: 'a'.repeat(51) } },
+    })).toBe(`web_search ${'a'.repeat(50)}...`);
+  });
+
+  it('falls back to only the tool name when progress input is unavailable', () => {
+    expect(extractToolProgressContent({
+      type: 'tool.started',
+      payload: { toolName: 'read_file' },
+    })).toBe('read_file');
+  });
+
+  it('prints assistant progress and tool progress for tool start events', () => {
+    const errors: string[] = [];
+    const spy = vi.spyOn(console, 'error').mockImplementation((value: unknown) => {
+      errors.push(stripAnsi(String(value)));
+    });
+
+    try {
+      printProgressEvent({
+        type: 'tool.started',
+        runId: 'run-1',
+        payload: {
+          toolName: 'read_file',
+          assistantContent: 'Checking the README first.',
+          input: { path: '/workspace/README.md' },
+        },
+      }, new Map(), {}, 3, 100);
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(errors).toEqual([
+      'progress> Checking the README first.',
+      'progress> read_file README.md',
+    ]);
   });
 });
 

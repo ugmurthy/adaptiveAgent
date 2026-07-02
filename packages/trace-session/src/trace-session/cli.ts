@@ -467,10 +467,10 @@ function requireValue(option: string, value: string | undefined): string {
 }
 
 function parseReportView(value: string): ReportView {
-  if (value === 'brief' || value === 'overview' || value === 'investigate' || value === 'policy' || value === 'performance' || value === 'milestones' || value === 'timeline' || value === 'delegates' || value === 'messages' || value === 'plans' || value === 'all') {
+  if (value === 'brief' || value === 'overview' || value === 'output' || value === 'investigate' || value === 'policy' || value === 'performance' || value === 'milestones' || value === 'timeline' || value === 'delegates' || value === 'messages' || value === 'plans' || value === 'all') {
     return value;
   }
-  throw new Error(`Invalid --view value: ${value}. Expected one of brief, overview, investigate, policy, performance, milestones, timeline, delegates, messages, plans, or all.`);
+  throw new Error(`Invalid --view value: ${value}. Expected one of brief, overview, output, investigate, policy, performance, milestones, timeline, delegates, messages, plans, or all.`);
 }
 
 function parseMessageView(value: string): MessageView {

@@ -29,6 +29,7 @@ export type EventType =
 export type ReportView =
   | 'brief'
   | 'overview'
+  | 'output'
   | 'investigate'
   | 'policy'
   | 'performance'

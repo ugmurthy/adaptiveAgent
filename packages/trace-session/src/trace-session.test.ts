@@ -67,6 +67,13 @@ describe('trace-session CLI helpers', () => {
     });
   });
 
+  it('parses the final output report view', () => {
+    expect(parseArgs(['trace-session', 'sess-1', '--view', 'output'])).toMatchObject({
+      sessionId: 'sess-1',
+      view: 'output',
+    });
+  });
+
   it('parses diagnostic report views', () => {
     expect(parseArgs(['trace-session', 'sess-1', '--view', 'brief'])).toMatchObject({ view: 'brief' });
     expect(parseArgs(['trace-session', 'sess-1', '--view', 'investigate'])).toMatchObject({ view: 'investigate' });
@@ -573,8 +580,15 @@ describe('trace-session CLI helpers', () => {
     expect(output).toContain('prompt=1,000');
     expect(output).toContain('completion=250');
     expect(output).toContain('reasoning=25');
-    expect(output).toContain('root-1 : prompt=700');
-    expect(output).toContain('root-2 : prompt=300');
+    expect(output).toContain('Run usage by root run');
+    expect(output).toContain('root run');
+    expect(output).toContain('tokens');
+    expect(output).toContain('root-1');
+    expect(output).toContain('900');
+    expect(output).toContain('700');
+    expect(output).toContain('root-2');
+    expect(output).toContain('375');
+    expect(output).toContain('300');
   });
 
   it('includes completed non-delegate tool output usage in trace target totals', async () => {
@@ -1098,6 +1112,41 @@ describe('trace-session CLI helpers', () => {
     expect(timelineLine?.replace(/Tool Timeline:.*/, 'Goal')).toBe(goalLine);
   });
 
+  it('renders only the final root-run result in the output view', () => {
+    const output = renderTraceReport(
+      {
+        target: traceTarget('session', 'sess-1'),
+        session: session('succeeded'),
+        rootRuns: [{
+          rootRunId: 'root-1',
+          runId: 'root-1',
+          invocationKind: 'run',
+          turnIndex: 0,
+          linkedAt: now(),
+          startedAt: '2026-04-16T10:00:00.000Z',
+          updatedAt: '2026-04-16T10:00:03.000Z',
+          completedAt: '2026-04-16T10:00:03.000Z',
+          status: 'succeeded',
+          goal: 'Measure performance',
+          result: { answer: 'Done' },
+        }],
+        usage: usage(),
+        timeline: [],
+        llmMessages: [],
+        delegates: [],
+        plans: [],
+        warnings: [],
+        summary: { status: 'succeeded', reason: 'ok' },
+      },
+      { json: false, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false, view: 'output' },
+    );
+
+    expect(output).toContain('"answer": "Done"');
+    expect(output).not.toContain('Trace Brief');
+    expect(output).not.toContain('# Goal');
+    expect(output).not.toContain('Final Output');
+  });
+
   it('prints JSON as machine-readable report output', () => {
     const output = renderTraceReport(
       {
@@ -1217,6 +1266,11 @@ describe('trace-session CLI helpers', () => {
     expect(output).toContain('reasoning=40');
     expect(output).toContain('total=1,540');
     expect(output).toContain('cost=$0.012345');
+    expect(output).toContain('root run');
+    expect(output).toContain('status');
+    expect(output).toContain('root-1');
+    expect(output).toContain('succeeded');
+    expect(output).not.toContain('Root Runs');
   });
 
   it('summarizes and renders persisted performance metrics', () => {
@@ -1308,7 +1362,23 @@ describe('trace-session CLI helpers', () => {
           goal: 'Measure performance',
           result: 'Done',
         }],
-        usage: usage(),
+        usage: usage({
+          total: {
+            promptTokens: 120,
+            completionTokens: 30,
+            totalTokens: 150,
+            estimatedCostUSD: 0.0042,
+          },
+          byRootRun: [{
+            rootRunId: 'root-1',
+            usage: {
+              promptTokens: 120,
+              completionTokens: 30,
+              totalTokens: 150,
+              estimatedCostUSD: 0.0042,
+            },
+          }],
+        }),
         performance,
         timeline: [],
         llmMessages: [],
@@ -1321,6 +1391,14 @@ describe('trace-session CLI helpers', () => {
     );
 
     expect(output).toContain('Performance');
+    expect(output).toContain('Usage');
+    expect(output).toContain('Run Usage by Root Run');
+    expect(output).toContain('root run');
+    expect(output).toContain('status');
+    expect(output).toContain('succeeded');
+    expect(output).toContain('tokens');
+    expect(output).toContain('root-1');
+    expect(output).toContain('150');
     expect(output).toContain('model');
     expect(output).toContain('adapter status');
     expect(output).toContain('200:1');
@@ -1628,7 +1706,8 @@ describe('trace-session CLI helpers', () => {
     expect(html).toContain('Performance');
     expect(html).toContain('Workflow');
     expect(html).toContain('LLM Message Context');
-    expect(html).toContain('Plans');
+    expect(html).not.toContain('#plans');
+    expect(html).not.toContain('>Plans<');
     expect(html).toContain('Raw Trace JSON');
     expect(html).toContain('read_file');
     expect(html).toContain('&lt;unsafe&gt;');

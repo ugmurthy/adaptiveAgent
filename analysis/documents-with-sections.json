@@ -1,0 +1,89 @@
+{
+  "summary": {
+    "totalDocumentsWithSections": 17,
+    "description": "Documents containing level-2 sections (##) with their second section titles identified"
+  },
+  "documents": [
+    {
+      "file": "adaptive-agent-gateway-diagrams.md",
+      "firstSection": "0. Executive View: Thin Gateway, Tool-Centric Core",
+      "secondSection": "1. High-Level Architecture"
+    },
+    {
+      "file": "adaptive-agent-gateway-proposal.md",
+      "firstSection": "Overview",
+      "secondSection": "Goals"
+    },
+    {
+      "file": "agen-contracts-v1.3.md",
+      "firstSection": "1. TypeScript Contracts",
+      "secondSection": "2. Postgres Schema"
+    },
+    {
+      "file": "agen-contracts-v1.4-multi-agent.md",
+      "firstSection": "1. Scope And Constraints",
+      "secondSection": "2. TypeScript Contract Delta"
+    },
+    {
+      "file": "agen-contracts-v1.4.md",
+      "firstSection": "1. TypeScript Contracts",
+      "secondSection": "2. Contract Notes"
+    },
+    {
+      "file": "agen-contracts-v1.5.md",
+      "firstSection": "1. Updated TypeScript Contracts",
+      "secondSection": "2. Provider Adapter Clarifications"
+    },
+    {
+      "file": "agen-design-v2-parallel-children.md",
+      "firstSection": "1. Motivation",
+      "secondSection": "2. Design Goals And Constraints"
+    },
+    {
+      "file": "agen-runtime-v1.4-algorithms.md",
+      "firstSection": "1. Core Invariants",
+      "secondSection": "2. Delegate Tool Registration"
+    },
+    {
+      "file": "agen-spec-v1.4.md",
+      "firstSection": "1. Product Goal",
+      "secondSection": "2. Design Rules"
+    },
+    {
+      "file": "agen-spec-v1.5.md",
+      "firstSection": "1. Scope",
+      "secondSection": "2. What Changed From v1.4"
+    },
+    {
+      "file": "agen-v1.4-research-budget-plan.md",
+      "firstSection": "Purpose",
+      "secondSection": "Current Context"
+    },
+    {
+      "file": "AGENT-SDK-CLI.md",
+      "firstSection": "Current Starting Point",
+      "secondSection": "Design Goals"
+    },
+    {
+      "file": "AGENT-SDK.md",
+      "firstSection": "Purpose",
+      "secondSection": "Naming"
+    },
+    {
+      "file": "AGENTS.md",
+      "firstSection": "Current repository status",
+      "secondSection": "Runtime and verification"
+    },
+    {
+      "file": "archive/2026-04-08-file-log-performance-analyzer/progress.txt",
+      "firstSection": "Codebase Patterns",
+      "secondSection": "2026-04-04 19:23:30 +0530 - US-001"
+    },
+    {
+      "file": "artifacts/adaptive-gateway.md",
+      "firstSection": "Overview",
+      "secondSection": "Goals"
+    }
+  ],
+  "methodology": "Used regex pattern '^## ' to identify all level-2 markdown headers across the workspace, then extracted the first two sections from each file that contained multiple sections."
+}
