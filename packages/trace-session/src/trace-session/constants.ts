@@ -22,6 +22,7 @@ Options:
   --database-url-env <n> Read the Postgres connection string from this env var instead of DATABASE_URL.
   --pgssl                Enable Postgres SSL with rejectUnauthorized=false.
   --messages             Include the current snapshot-backed LLM message context.
+  --reasoning            Include assistant reasoning from snapshots in message reports. Implies --messages.
   --messages-view <mode> Message view: compact, delta, or full. Default: compact.
   --system-only          Include only system messages in the LLM message view.
   --view <name>          Report view: brief, overview, output, investigate, policy, performance, milestones, timeline, delegates, messages, plans, or all.

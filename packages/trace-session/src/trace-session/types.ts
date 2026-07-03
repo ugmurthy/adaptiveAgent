@@ -54,6 +54,7 @@ export interface CliOptions {
   includePlans: boolean;
   onlyDelegates: boolean;
   messages: boolean;
+  reasoning?: boolean;
   systemOnly: boolean;
   view?: ReportView;
   messagesView?: MessageView;
@@ -376,6 +377,8 @@ export interface TraceMessage {
   name?: string;
   toolCallId?: string;
   toolCalls?: TraceToolCall[];
+  reasoning?: string;
+  reasoningDetails?: unknown[];
   category:
     | 'initial-runtime-system'
     | 'gateway-chat-system-context'

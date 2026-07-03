@@ -23,9 +23,11 @@ import {
   inspectAgentSdkCatalog,
   inspectAgentSdkResolution,
   loadAgentSdkConfig,
+  runAmbientStart,
   type AgentSdkOptions,
   type AgentSdkChatOptions,
   type AgentSdkRunOptions,
+  type AmbientStartResult,
   type OrchestrationLifecycleEvent,
   type OrchestrationSdk,
 } from './index.js';
@@ -103,7 +105,7 @@ const IMAGE_FILE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp',
 const AUDIO_FILE_EXTENSIONS = new Set(['.wav', '.mp3', '.flac', '.m4a', '.ogg', '.aac', '.aiff', '.aif', '.opus', '.oga', '.weba']);
 const VIDEO_FILE_EXTENSIONS = new Set(['.mp4', '.m4v', '.mov', '.webm', '.mkv', '.avi', '.mpeg', '.mpg', '.ogv', '.wmv', '.flv', '.3gp', '.ts', '.mts', '.m2ts']);
 
-const CLI_COMMANDS = ['run', 'chat', 'spec', 'config', 'catalog', 'eval', 'swarm-run', 'inspect', 'resume', 'retry', 'recover', 'interrupt', 'replay', 'init', 'doctor', 'update', 'uninstall', 'agent-create'] as const;
+const CLI_COMMANDS = ['run', 'chat', 'spec', 'config', 'catalog', 'eval', 'swarm-run', 'ambient', 'inspect', 'resume', 'retry', 'recover', 'interrupt', 'replay', 'init', 'doctor', 'update', 'uninstall', 'agent-create'] as const;
 type CliCommand = (typeof CLI_COMMANDS)[number];
 const CLI_COMMAND_SET = new Set<string>(CLI_COMMANDS);
 
@@ -128,6 +130,7 @@ Common commands:
   run                   Run a one-shot goal
   chat                  Start an interactive chat
   swarm-run             Decompose one task into worker runs and synthesize a result
+  ambient               Start an ambient supervisor for filesystem and cron triggers
   retry                 Retry one failed run or swarm session
   recover               Choose the cheapest safe recovery action for one run
 
@@ -154,6 +157,7 @@ Examples:
   adaptive-agent run "Summarize this repo"
   adaptive-agent chat
   adaptive-agent swarm-run --help
+  adaptive-agent ambient start --config ambient.config.json
   adaptive-agent doctor --provider-check
 
 Global options:
@@ -282,6 +286,30 @@ Swarm-run options:
 ${COMMON_RUNTIME_OPTIONS_TEXT}
 
 ${RUN_OUTPUT_OPTIONS_TEXT}`;
+
+const AMBIENT_HELP_TEXT = `adaptive-agent ambient
+
+Run a foreground ambient supervisor that turns external triggers into ordinary
+durable agent runs. Supports filesystem inbox and cron triggers.
+
+Usage:
+  adaptive-agent ambient start --config <path> [options]
+
+Filesystem trigger layout:
+  <inbox>/pending      Drop .md task files here.
+  <inbox>/processing   Claimed tasks while runs are active.
+  <inbox>/processed    Source files after successful runs.
+  <inbox>/failed       Source files after failed or waiting-for-user-action runs.
+
+Cron trigger config:
+  { "id": "daily", "type": "cron", "schedule": "0 8 * * 1-5",
+    "timezone": "America/New_York", "goalFile": "tasks/daily.md" }
+
+Ambient options:
+  --config <path>        Ambient config JSON path.
+  --dry-run              Validate and print resolved ambient config without starting.
+
+${COMMON_AGENT_OPTIONS_TEXT}`;
 
 const RETRY_HELP_TEXT = `adaptive-agent retry
 
@@ -564,6 +592,8 @@ function getHelpText(topic?: ManualTestCliOptions['helpTopic']): string {
       return CHAT_HELP_TEXT;
     case 'swarm-run':
       return SWARM_RUN_HELP_TEXT;
+    case 'ambient':
+      return AMBIENT_HELP_TEXT;
     case 'inspect':
       return INSPECT_HELP_TEXT;
     case 'resume':
@@ -670,6 +700,10 @@ export async function main(argv = Bun.argv.slice(2)): Promise<number> {
 
   if (cli.command === 'swarm-run') {
     return runSwarmCommand(cli);
+  }
+
+  if (cli.command === 'ambient') {
+    return runAmbientCommand(cli);
   }
 
   if (cli.command === 'inspect') {
@@ -782,6 +816,63 @@ async function runAgentCreateCommand(cli: ManualTestCliOptions): Promise<number>
   });
   console.log(renderAgentCreateReport(report, cli.output));
   return report.status === 'created' || report.status === 'overwritten' ? 0 : 1;
+}
+
+async function runAmbientCommand(cli: ManualTestCliOptions): Promise<number> {
+  if (cli.goalArgs[0] !== 'start') throw new Error('ambient currently supports only: adaptive-agent ambient start --config <path>');
+  if (!cli.ambientConfigPath) throw new Error('ambient start requires --config <path>');
+
+  const resolvedCwd = resolve(cli.cwd ?? process.cwd());
+  const controller = new AbortController();
+  let signalCount = 0;
+  const stop = (signalName: string) => {
+    signalCount += 1;
+    if (signalCount > 1) {
+      console.error(`received ${signalName} again; exiting immediately`);
+      process.exit(130);
+    }
+    if (cli.output === 'pretty') console.error(`received ${signalName}; stopping ambient supervisor after active task drains...`);
+    controller.abort();
+  };
+  const onSigint = () => stop('SIGINT');
+  const onSigterm = () => stop('SIGTERM');
+
+  process.once('SIGINT', onSigint);
+  process.once('SIGTERM', onSigterm);
+  try {
+    const result = await runAmbientStart({
+      configPath: cli.ambientConfigPath,
+      cwd: resolvedCwd,
+      agentConfigPath: cli.agentConfigPath,
+      settingsConfigPath: cli.settingsConfigPath,
+      runtimeMode: cli.runtimeMode,
+      provider: cli.provider,
+      model: cli.model,
+      approvalMode: cli.approvalMode,
+      clarificationMode: cli.clarificationMode,
+      output: cli.output,
+      dryRun: cli.dryRun,
+      signal: controller.signal,
+    });
+
+    if (cli.output === 'json') {
+      console.log(JSON.stringify(summarizeAmbientStartResult(result), null, 2));
+      return 0;
+    }
+    if (cli.output === 'jsonl') {
+      console.log(JSON.stringify(summarizeAmbientStartResult(result)));
+      return 0;
+    }
+    if (cli.dryRun) {
+      console.log(JSON.stringify(summarizeAmbientStartResult(result), null, 2));
+      return 0;
+    }
+    console.log(`ambient supervisor stopped; tasks handled: ${result.tasks.length}`);
+    return 0;
+  } finally {
+    process.removeListener('SIGINT', onSigint);
+    process.removeListener('SIGTERM', onSigterm);
+  }
 }
 
 async function runSpecCommand(cli: ManualTestCliOptions): Promise<number> {
@@ -1875,6 +1966,9 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
         options.command = 'spec';
         if (options.help) options.helpTopic = 'spec';
         break;
+      case '--config':
+        options.ambientConfigPath = requireOptionValue(arg, argv[++index]);
+        break;
       case '--file':
         options.promptFilePath = requireOptionValue(arg, argv[++index]);
         break;
@@ -2015,7 +2109,7 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
         options.output = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['pretty', 'json', 'jsonl']);
         break;
       default:
-        if (options.command === 'run' || options.command === 'chat' || options.command === 'swarm-run' || options.command === 'inspect' || options.command === 'resume' || options.command === 'retry' || options.command === 'recover' || options.command === 'interrupt' || options.command === 'replay' || options.command === 'agent-create') {
+        if (options.command === 'run' || options.command === 'chat' || options.command === 'swarm-run' || options.command === 'ambient' || options.command === 'inspect' || options.command === 'resume' || options.command === 'retry' || options.command === 'recover' || options.command === 'interrupt' || options.command === 'replay' || options.command === 'agent-create') {
           options.goalArgs.push(arg);
           break;
         }
@@ -2029,6 +2123,25 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
 
   if (!options.help && options.command === 'eval' && !options.evalDataset) {
     throw new Error('Missing eval dataset. Expected `adaptive-agent eval cases` or `adaptive-agent eval gaia`.');
+  }
+
+  if (!options.help && options.ambientConfigPath && options.command !== 'ambient') {
+    throw new Error('--config is supported for ambient start requests');
+  }
+
+  if (!options.help && options.command === 'ambient') {
+    if (options.goalArgs.length !== 1 || options.goalArgs[0] !== 'start') {
+      throw new Error('ambient currently supports only: adaptive-agent ambient start --config <path>');
+    }
+    if (!options.ambientConfigPath) {
+      throw new Error('ambient start requires --config <path>');
+    }
+    if (options.promptFilePath) throw new Error('--file is not supported for ambient start requests');
+    if (options.inputJson !== undefined) throw new Error('--input-json is not supported for ambient start requests');
+    if (options.imagePaths.length > 0 || options.audioPaths.length > 0 || options.fileAttachmentPaths.length > 0) {
+      throw new Error('--image, --audio, and --file-attachment are not supported for ambient start requests');
+    }
+    if (options.orchestrate) throw new Error('--orchestrate is not supported for ambient start requests');
   }
 
   if (!options.help && options.command !== 'agent-create' && options.generatorAgentPath) {
@@ -2192,6 +2305,52 @@ function buildSdkOptions(cli: ManualTestCliOptions, cwd: string): AgentSdkOption
           },
         }
       : undefined,
+  };
+}
+
+function summarizeAmbientStartResult(result: AmbientStartResult): JsonValue {
+  return {
+    status: result.status,
+    config: {
+      workspaceRoot: result.config.workspaceRoot,
+      artifactsRoot: result.config.artifactsRoot,
+      agentConfigPath: result.config.agentConfigPath ?? null,
+      settingsConfigPath: result.config.settingsConfigPath ?? null,
+      runtimeMode: result.config.runtimeMode ?? null,
+      interaction: result.config.interaction,
+      triggers: result.config.triggers.map((trigger): JsonObject => trigger.type === 'filesystem'
+        ? {
+            id: trigger.id,
+            type: trigger.type,
+            inboxDir: trigger.inboxDir,
+            pendingDir: trigger.pendingDir,
+            processingDir: trigger.processingDir,
+            processedDir: trigger.processedDir,
+            failedDir: trigger.failedDir,
+            pattern: trigger.pattern,
+            pollIntervalMs: trigger.pollIntervalMs,
+            stabilityDelayMs: trigger.stabilityDelayMs,
+          }
+        : {
+            id: trigger.id,
+            type: trigger.type,
+            schedule: trigger.schedule,
+            timezone: trigger.timezone,
+            goalFilePath: trigger.goalFilePath ?? null,
+            artifactPath: trigger.artifactPath ?? null,
+            ledgerPath: trigger.ledgerPath,
+            pollIntervalMs: trigger.pollIntervalMs,
+            concurrency: trigger.concurrency,
+            misfirePolicy: trigger.misfirePolicy,
+          }),
+    },
+    sdk: {
+      cwd: result.sdkOptions.cwd ?? null,
+      agentConfigPath: result.sdkOptions.agentConfigPath ?? null,
+      settingsConfigPath: result.sdkOptions.settingsConfigPath ?? null,
+      runtimeMode: result.sdkOptions.runtimeMode ?? null,
+    },
+    tasks: result.tasks as unknown as JsonValue,
   };
 }
 

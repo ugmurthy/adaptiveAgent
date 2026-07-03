@@ -17,6 +17,7 @@ describe('trace-session CLI helpers', () => {
       includePlans: true,
       onlyDelegates: true,
       messages: false,
+      reasoning: false,
       systemOnly: false,
       help: false,
     });
@@ -34,8 +35,17 @@ describe('trace-session CLI helpers', () => {
       includePlans: false,
       onlyDelegates: false,
       messages: true,
+      reasoning: false,
       systemOnly: true,
       help: false,
+    });
+  });
+
+  it('parses reasoning as an explicit message-inspection opt-in', () => {
+    expect(parseArgs(['trace-session', 'sess-1', '--reasoning'])).toMatchObject({
+      sessionId: 'sess-1',
+      messages: true,
+      reasoning: true,
     });
   });
 
@@ -51,6 +61,7 @@ describe('trace-session CLI helpers', () => {
       includePlans: false,
       onlyDelegates: false,
       messages: true,
+      reasoning: false,
       messagesView: 'delta',
       view: 'messages',
       focusRunId: 'run-2',
@@ -99,6 +110,7 @@ describe('trace-session CLI helpers', () => {
       onlyDelegates: false,
       runId: 'run-1',
       messages: true,
+      reasoning: false,
       systemOnly: false,
       help: false,
     });
@@ -116,6 +128,7 @@ describe('trace-session CLI helpers', () => {
       includePlans: false,
       onlyDelegates: false,
       messages: false,
+      reasoning: false,
       previewChars: 40,
       systemOnly: false,
       help: false,
@@ -134,6 +147,7 @@ describe('trace-session CLI helpers', () => {
       includePlans: false,
       onlyDelegates: false,
       messages: false,
+      reasoning: false,
       previewChars: 40,
       systemOnly: false,
       help: false,
@@ -152,6 +166,7 @@ describe('trace-session CLI helpers', () => {
       includePlans: false,
       onlyDelegates: false,
       messages: false,
+      reasoning: false,
       systemOnly: false,
       help: false,
     });
@@ -169,6 +184,7 @@ describe('trace-session CLI helpers', () => {
       includePlans: false,
       onlyDelegates: false,
       messages: false,
+      reasoning: false,
       systemOnly: false,
       help: false,
     });
@@ -457,6 +473,7 @@ describe('trace-session CLI helpers', () => {
       includePlans: false,
       onlyDelegates: false,
       messages: false,
+      reasoning: false,
       systemOnly: false,
       help: false,
     });
@@ -1883,6 +1900,46 @@ describe('trace-session CLI helpers', () => {
     expect(output).toContain('Show me the prompt.');
   });
 
+  it('renders opt-in reasoning in full LLM message context', () => {
+    const output = renderTraceReport(
+      {
+        target: traceTarget('session', 'sess-1'),
+        session: session('succeeded'),
+        rootRuns: [],
+        usage: usage(),
+        timeline: [],
+        llmMessages: [{
+          rootRunId: 'root-1',
+          runId: 'root-1',
+          delegateName: null,
+          depth: 0,
+          initialSnapshotSeq: 1,
+          initialSnapshotCreatedAt: now(),
+          latestSnapshotSeq: 2,
+          latestSnapshotCreatedAt: now(),
+          effectiveMessages: [{
+            position: 0,
+            persistence: 'persisted',
+            role: 'assistant',
+            category: 'assistant',
+            content: 'I will call the lookup tool.',
+            reasoning: 'Need evidence before answering.',
+            reasoningDetails: [{ type: 'reasoning.text', text: 'Need evidence before answering.' }],
+          }],
+        }],
+        delegates: [],
+        plans: [],
+        warnings: [],
+        summary: { status: 'succeeded', reason: 'ok' },
+      },
+      { json: false, includePlans: false, onlyDelegates: false, messages: true, systemOnly: false, messagesView: 'full' },
+    );
+
+    expect(output).toContain('reasoning:');
+    expect(output).toContain('Need evidence before answering.');
+    expect(output).toContain('reasoningDetails:');
+  });
+
   it('renders message deltas when requested', () => {
     const output = renderTraceReport(
       {
@@ -2085,7 +2142,12 @@ describe('trace-session CLI helpers', () => {
                 messages: [
                   { role: 'system', content: 'You are AdaptiveAgent.' },
                   { role: 'system', content: 'Conversation summary:\nEarlier turn.' },
-                  { role: 'assistant', content: 'Working...' },
+                  {
+                    role: 'assistant',
+                    content: 'Working...',
+                    reasoning: 'Need to inspect the stored context.',
+                    reasoningDetails: [{ type: 'reasoning.text', text: 'Need to inspect the stored context.' }],
+                  },
                 ],
                 pendingRuntimeMessages: [
                   { role: 'user', content: 'Future web_search calls should include a short purpose.' },
@@ -2138,6 +2200,33 @@ describe('trace-session CLI helpers', () => {
           }),
         ]),
       }),
+    );
+    expect(JSON.stringify(report.llmMessages)).not.toContain('Need to inspect the stored context.');
+
+    const reportWithReasoning = await traceSession(client as never, {
+      sessionId: 'sess-msg',
+      json: false,
+      listSessions: false,
+      listPerformance: false,
+      listSessionless: false,
+      deleteEmptyGoalSessions: false,
+      usageOnly: false,
+      includePlans: false,
+      onlyDelegates: false,
+      messages: true,
+      reasoning: true,
+      systemOnly: false,
+      help: false,
+    });
+
+    expect(reportWithReasoning.llmMessages[0]?.effectiveMessages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          role: 'assistant',
+          reasoning: 'Need to inspect the stored context.',
+          reasoningDetails: [{ type: 'reasoning.text', text: 'Need to inspect the stored context.' }],
+        }),
+      ]),
     );
   });
 

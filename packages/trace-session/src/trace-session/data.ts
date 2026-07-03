@@ -73,7 +73,7 @@ export async function traceSession(client: PostgresClient, options: CliOptions):
 
   const shouldLoadMessages = options.messages || options.systemOnly || options.view === 'messages';
   const llmMessagesPromise = shouldLoadMessages
-    ? loadRunMessageTraces(client, rootRunIds).catch((error: unknown) => {
+    ? loadRunMessageTraces(client, rootRunIds, { includeReasoning: options.reasoning }).catch((error: unknown) => {
         warnings.push(`LLM messages are unavailable: ${errorMessage(error)}`);
         return [] as RunMessageTrace[];
       })
@@ -1419,7 +1419,11 @@ async function loadToolOutputUsageByProviderModel(
   return result.rows.map(providerModelUsageSummaryFromRow);
 }
 
-async function loadRunMessageTraces(client: PostgresClient, rootRunIds: string[]): Promise<RunMessageTrace[]> {
+async function loadRunMessageTraces(
+  client: PostgresClient,
+  rootRunIds: string[],
+  options: { includeReasoning?: boolean } = {},
+): Promise<RunMessageTrace[]> {
   if (rootRunIds.length === 0) {
     return [];
   }
@@ -1484,7 +1488,7 @@ async function loadRunMessageTraces(client: PostgresClient, rootRunIds: string[]
   );
 
   return result.rows
-    .map(runMessageTraceFromRow)
+    .map((row) => runMessageTraceFromRow(row, options))
     .filter((trace): trace is RunMessageTrace => trace !== null);
 }
 
@@ -1824,9 +1828,12 @@ async function loadPlans(client: PostgresClient, rootRunIds: string[]): Promise<
   return result.rows;
 }
 
-function runMessageTraceFromRow(row: SnapshotMessageRow): RunMessageTrace | null {
-  const initialState = parseSnapshotState(row.initial_snapshot_state);
-  const latestState = parseSnapshotState(row.latest_snapshot_state ?? row.initial_snapshot_state);
+function runMessageTraceFromRow(
+  row: SnapshotMessageRow,
+  options: { includeReasoning?: boolean } = {},
+): RunMessageTrace | null {
+  const initialState = parseSnapshotState(row.initial_snapshot_state, options);
+  const latestState = parseSnapshotState(row.latest_snapshot_state ?? row.initial_snapshot_state, options);
   if (!initialState || !latestState) {
     return null;
   }
@@ -1846,6 +1853,8 @@ function runMessageTraceFromRow(row: SnapshotMessageRow): RunMessageTrace | null
       name: message.name,
       toolCallId: message.toolCallId,
       toolCalls: message.toolCalls,
+      reasoning: message.reasoning,
+      reasoningDetails: message.reasoningDetails,
       category,
     };
   });
@@ -1864,6 +1873,8 @@ function runMessageTraceFromRow(row: SnapshotMessageRow): RunMessageTrace | null
       name: message.name,
       toolCallId: message.toolCallId,
       toolCalls: message.toolCalls,
+      reasoning: message.reasoning,
+      reasoningDetails: message.reasoningDetails,
       category,
     };
   });
@@ -1877,6 +1888,8 @@ function runMessageTraceFromRow(row: SnapshotMessageRow): RunMessageTrace | null
       name: message.name,
       toolCallId: message.toolCallId,
       toolCalls: message.toolCalls,
+      reasoning: message.reasoning,
+      reasoningDetails: message.reasoningDetails,
       category: classifyPendingMessage(message),
     });
   }
@@ -1908,15 +1921,18 @@ function snapshotSummaryFromMessageTrace(trace: RunMessageTrace): RunSnapshotSum
   };
 }
 
-function parseSnapshotState(value: unknown): { messages: ParsedTraceMessage[]; pendingRuntimeMessages: ParsedTraceMessage[]; stepsUsed: number | null } | null {
+function parseSnapshotState(
+  value: unknown,
+  options: { includeReasoning?: boolean } = {},
+): { messages: ParsedTraceMessage[]; pendingRuntimeMessages: ParsedTraceMessage[]; stepsUsed: number | null } | null {
   if (!value || typeof value !== 'object') {
     return null;
   }
 
   const record = value as Record<string, unknown>;
   return {
-    messages: parseTraceMessages(record.messages),
-    pendingRuntimeMessages: parseTraceMessages(record.pendingRuntimeMessages),
+    messages: parseTraceMessages(record.messages, options),
+    pendingRuntimeMessages: parseTraceMessages(record.pendingRuntimeMessages, options),
     stepsUsed: typeof record.stepsUsed === 'number' ? record.stepsUsed : null,
   };
 }
@@ -1927,20 +1943,22 @@ interface ParsedTraceMessage {
   name?: string;
   toolCallId?: string;
   toolCalls?: TraceToolCall[];
+  reasoning?: string;
+  reasoningDetails?: unknown[];
 }
 
-function parseTraceMessages(value: unknown): ParsedTraceMessage[] {
+function parseTraceMessages(value: unknown, options: { includeReasoning?: boolean } = {}): ParsedTraceMessage[] {
   if (!Array.isArray(value)) {
     return [];
   }
 
   return value.flatMap((entry) => {
-    const parsed = parseTraceMessage(entry);
+    const parsed = parseTraceMessage(entry, options);
     return parsed ? [parsed] : [];
   });
 }
 
-function parseTraceMessage(value: unknown): ParsedTraceMessage | null {
+function parseTraceMessage(value: unknown, options: { includeReasoning?: boolean } = {}): ParsedTraceMessage | null {
   if (!value || typeof value !== 'object') {
     return null;
   }
@@ -1957,6 +1975,8 @@ function parseTraceMessage(value: unknown): ParsedTraceMessage | null {
     name: typeof record.name === 'string' ? record.name : undefined,
     toolCallId: typeof record.toolCallId === 'string' ? record.toolCallId : undefined,
     toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+    ...(options.includeReasoning && typeof record.reasoning === 'string' ? { reasoning: record.reasoning } : {}),
+    ...(options.includeReasoning && Array.isArray(record.reasoningDetails) ? { reasoningDetails: record.reasoningDetails } : {}),
   };
 }
 

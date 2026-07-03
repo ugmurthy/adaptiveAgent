@@ -156,7 +156,32 @@ describe('adaptive-agent cli parsing', () => {
     expect(parseCliArgs(['swarm-run', '--help'])).toMatchObject({ help: true, helpTopic: 'swarm-run' });
     expect(parseCliArgs(['--help', 'swarm-run'])).toMatchObject({ help: true, helpTopic: 'swarm-run' });
     expect(parseCliArgs(['help', 'swarm-run'])).toMatchObject({ help: true, helpTopic: 'swarm-run' });
+    expect(parseCliArgs(['help', 'ambient'])).toMatchObject({ help: true, helpTopic: 'ambient' });
     expect(parseCliArgs(['help', 'replay'])).toMatchObject({ help: true, helpTopic: 'replay' });
+  });
+
+  it('parses ambient start requests', () => {
+    const parsed = parseCliArgs([
+      'ambient',
+      'start',
+      '--config',
+      './ambient.config.json',
+      '--runtime',
+      'memory',
+      '--approval',
+      'reject',
+      '--clarification',
+      'fail',
+    ]);
+
+    expect(parsed).toMatchObject({
+      command: 'ambient',
+      goalArgs: ['start'],
+      ambientConfigPath: './ambient.config.json',
+      runtimeMode: 'memory',
+      approvalMode: 'reject',
+      clarificationMode: 'fail',
+    });
   });
 
   it('parses common flags', () => {
@@ -237,6 +262,12 @@ describe('adaptive-agent cli parsing', () => {
       expect(swarmHelp).toContain('Required:');
       expect(swarmHelp).toContain('Swarm-run options:');
       expect(swarmHelp).not.toContain('Init options:');
+
+      await expect(main(['ambient', '--help'])).resolves.toBe(0);
+      const ambientHelp = String(log.mock.calls.at(-1)?.[0]);
+      expect(ambientHelp).toContain('adaptive-agent ambient');
+      expect(ambientHelp).toContain('Filesystem trigger layout:');
+      expect(ambientHelp).toContain('--config <path>');
     } finally {
       log.mockRestore();
     }

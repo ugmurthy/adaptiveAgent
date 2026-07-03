@@ -849,9 +849,17 @@ function renderHtmlMessageCard(message: TraceMessage, previewChars: number): str
   const metadata = [
     message.name ? `name=${message.name}` : undefined,
     message.toolCallId ? `toolCallId=${message.toolCallId}` : undefined,
+    message.reasoning !== undefined ? `reasoning=${message.reasoning.length} chars` : undefined,
+    message.reasoningDetails !== undefined ? `reasoningDetails=${message.reasoningDetails.length}` : undefined,
   ].filter((part): part is string => part !== undefined);
   const toolCalls = message.toolCalls && message.toolCalls.length > 0
     ? `<details><summary>Tool calls (${formatNumber(message.toolCalls.length)})</summary><pre><code>${escapeHtml(stringifyJson(message.toolCalls))}</code></pre></details>`
+    : '';
+  const reasoning = message.reasoning !== undefined
+    ? `<details><summary>Reasoning</summary><pre><code>${escapeHtml(message.reasoning)}</code></pre></details>`
+    : '';
+  const reasoningDetails = message.reasoningDetails !== undefined
+    ? `<details><summary>Reasoning details (${formatNumber(message.reasoningDetails.length)})</summary><pre><code>${escapeHtml(stringifyJson(message.reasoningDetails))}</code></pre></details>`
     : '';
 
   return `
@@ -865,6 +873,8 @@ function renderHtmlMessageCard(message: TraceMessage, previewChars: number): str
             </summary>
             ${metadata.length > 0 ? `<p class="message-meta">${escapeHtml(metadata.join(' · '))}</p>` : ''}
             ${toolCalls}
+            ${reasoning}
+            ${reasoningDetails}
             <pre><code>${escapeHtml(message.content || '(empty)')}</code></pre>
           </details>`;
 }
@@ -1900,6 +1910,14 @@ function renderLlmMessageFull(
         if (message.toolCalls && message.toolCalls.length > 0) {
           lines.push(markdownBlock(`\`\`\`json\n${JSON.stringify(message.toolCalls, null, 2)}\n\`\`\``));
         }
+        if (message.reasoning !== undefined) {
+          lines.push('reasoning:');
+          lines.push(markdownBlock(`\`\`\`text\n${message.reasoning}\n\`\`\``));
+        }
+        if (message.reasoningDetails !== undefined) {
+          lines.push('reasoningDetails:');
+          lines.push(markdownBlock(`\`\`\`json\n${JSON.stringify(message.reasoningDetails, null, 2)}\n\`\`\``));
+        }
         lines.push(markdownBlock(`\`\`\`text\n${message.content}\n\`\`\``));
       }
 
@@ -2036,6 +2054,12 @@ function formatMessagePreview(message: TraceMessage, previewChars: number): stri
   if (message.toolCalls && message.toolCalls.length > 0) {
     parts.push(`toolCalls=${message.toolCalls.length} [${message.toolCalls.map((toolCall) => toolCall.name).join(', ')}]`);
   }
+  if (message.reasoning !== undefined) {
+    parts.push(`reasoning=${message.reasoning.length} chars`);
+  }
+  if (message.reasoningDetails !== undefined) {
+    parts.push(`reasoningDetails=${message.reasoningDetails.length}`);
+  }
   const content = oneLine(message.content).trim();
   if (content.length > 0) {
     parts.push(truncatePlain(content, previewChars));
@@ -2072,7 +2096,9 @@ function messagesEquivalent(left: TraceMessage, right: TraceMessage): boolean {
     && left.content === right.content
     && left.name === right.name
     && left.toolCallId === right.toolCallId
-    && JSON.stringify(left.toolCalls ?? []) === JSON.stringify(right.toolCalls ?? []);
+    && JSON.stringify(left.toolCalls ?? []) === JSON.stringify(right.toolCalls ?? [])
+    && left.reasoning === right.reasoning
+    && JSON.stringify(left.reasoningDetails ?? []) === JSON.stringify(right.reasoningDetails ?? []);
 }
 
 function resolveReportView(options: Pick<CliOptions, 'onlyDelegates'> & Partial<Pick<CliOptions, 'view'>>): ReportView {

@@ -31,6 +31,7 @@ export function parseArgs(args: string[]): CliOptions {
     includePlans: false,
     onlyDelegates: false,
     messages: false,
+    reasoning: false,
     systemOnly: false,
     help: false,
   };
@@ -67,6 +68,10 @@ export function parseArgs(args: string[]): CliOptions {
         options.usageOnly = true;
         break;
       case '--messages':
+        options.messages = true;
+        break;
+      case '--reasoning':
+        options.reasoning = true;
         options.messages = true;
         break;
       case '--messages-view':
@@ -160,8 +165,8 @@ export async function main(): Promise<void> {
     if (options.rootRunId && options.runId) {
       throw new Error(`Choose either --root-run or --run, not both.\n\n${USAGE}`);
     }
-    if ((options.listSessions || options.listPerformance || options.listSessionless || options.deleteEmptyGoalSessions || options.usageOnly) && (options.messages || options.systemOnly)) {
-      throw new Error(`--messages and --system-only can only be used when rendering a full trace.\n\n${USAGE}`);
+    if ((options.listSessions || options.listPerformance || options.listSessionless || options.deleteEmptyGoalSessions || options.usageOnly) && (options.messages || options.systemOnly || options.reasoning)) {
+      throw new Error(`--messages, --reasoning, and --system-only can only be used when rendering a full trace.\n\n${USAGE}`);
     }
     if ((options.listSessions || options.listPerformance || options.listSessionless || options.deleteEmptyGoalSessions || options.usageOnly) && (options.view || options.messagesView || options.focusRunId)) {
       throw new Error(`--view, --messages-view, and --focus-run can only be used when rendering a full trace.\n\n${USAGE}`);
