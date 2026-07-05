@@ -34,7 +34,7 @@ import type {
 } from './cli-types.js';
 import { agentEventColorKey, agentEventProgressPrefix, formatAgentEventSummary, summarizeAgentEvent } from './agent-event-rendering.js';
 import { formatSwarmExecutionPlan, formatSwarmRunStatuses } from './swarm-format.js';
-import { resolveWebSearchProvider } from './tool-registry.js';
+import { resolveReadWebPageProvider, resolveWebSearchProvider } from './tool-registry.js';
 import { applyNamedStyle, applyStyle, formatStyledMessageBlock, resolveMessageStyle } from './tui/message-styles.js';
 
 export const passthroughMarkdownStyle = (value: string): string => value;
@@ -520,6 +520,7 @@ export function printSwarmDryRun(
     quality: summarizeSwarmAgentConfig(qualityConfig, 'quality', cli.qualityAgentPath ? 'explicit' : 'derived'),
     synthesizer: summarizeSwarmAgentConfig(synthesizerConfig, 'synthesizer', cli.synthesizerAgentPath ? 'explicit' : 'derived'),
     webSearch: { provider: resolvedWebSearchProviderForConfig(coordinatorConfig) },
+    readWebPage: { provider: resolvedReadWebPageProviderForConfig(coordinatorConfig) },
     defaultsUsed: {
       qualityAgent: cli.qualityAgentPath ? 'explicit' : 'coordinator_with_quality_instructions',
       synthesizerAgent: cli.synthesizerAgentPath ? 'explicit' : 'coordinator_with_synthesis_instructions',
@@ -537,6 +538,7 @@ export function printSwarmDryRun(
     printSwarmAgentConfigSummary('quality', qualityConfig, cli.qualityAgentPath ? 'explicit' : 'derived');
     printSwarmAgentConfigSummary('synthesizer', synthesizerConfig, cli.synthesizerAgentPath ? 'explicit' : 'derived');
     console.log(`webSearchProvider: ${resolvedWebSearchProviderForConfig(coordinatorConfig)}`);
+    console.log(`readWebPageProvider: ${resolvedReadWebPageProviderForConfig(coordinatorConfig)}`);
     console.log(`maxWorkers: ${cli.maxWorkers ?? 'default'}`);
   }
 }
@@ -555,6 +557,7 @@ export function summarizeSwarmAgentConfig(
     provider: resolvedConfig.model.provider,
     model: resolvedConfig.model.model,
     webSearchProvider: resolvedWebSearchProviderForConfig(resolvedConfig),
+    readWebPageProvider: resolvedReadWebPageProviderForConfig(resolvedConfig),
     runtimeMode: resolvedConfig.runtime.mode,
     requestedRuntimeMode: resolvedConfig.runtime.requestedMode,
     workspaceRoot: resolvedConfig.workspaceRoot,
@@ -574,6 +577,7 @@ export function printSwarmAgentConfigSummary(
   console.log(`${label}: ${resolvedConfig.agent.id} (${resolvedConfig.agent.name}) [${source}]`);
   console.log(`  model: ${resolvedConfig.model.provider}/${resolvedConfig.model.model}`);
   console.log(`  webSearchProvider: ${resolvedWebSearchProviderForConfig(resolvedConfig)}`);
+  console.log(`  readWebPageProvider: ${resolvedReadWebPageProviderForConfig(resolvedConfig)}`);
   console.log(`  runtime: ${resolvedConfig.runtime.mode} (requested ${resolvedConfig.runtime.requestedMode})`);
   console.log(`  workspace: ${resolvedConfig.workspaceRoot}`);
   console.log(`  shellCwd: ${resolvedConfig.shellCwd}`);
@@ -1090,6 +1094,7 @@ export function formatDryRunMarkdown(
 ): string {
   const config = inspection.config;
   const webSearchProvider = resolvedWebSearchProviderForConfig(config);
+  const readWebPageProvider = resolvedReadWebPageProviderForConfig(config);
   const summary = summarizeSpec(spec);
   const lines = [
     '# Dry run',
@@ -1098,6 +1103,7 @@ export function formatDryRunMarkdown(
     `- \`approval\`: \`${config.interaction.approvalMode}\``,
     `- \`clarification\`: \`${config.interaction.clarificationMode}\``,
     `- \`webSearchProvider\`: \`${webSearchProvider}\``,
+    `- \`readWebPageProvider\`: \`${readWebPageProvider}\``,
     `- \`shellCwd\`: \`${config.shellCwd}\``,
     `- \`agentSearchDirs\`: ${formatNameList(config.agents.dirs)}`,
     `- \`skillSearchDirs\`: ${formatNameList(config.skills.dirs)}`,
@@ -1149,6 +1155,7 @@ export function summarizeDryRun(
     cli: summarizeCli(cli),
     resolvedConfig: summarizeResolvedConfig(inspection.config, spec),
     webSearch: { provider: resolvedWebSearchProviderForConfig(inspection.config) },
+    readWebPage: { provider: resolvedReadWebPageProviderForConfig(inspection.config) },
     request: spec as unknown as JsonValue,
     tools: inspection.tools.map((tool) => tool.name),
     delegates: inspection.delegates as unknown as JsonValue,
@@ -1159,6 +1166,10 @@ export function summarizeDryRun(
 
 function resolvedWebSearchProviderForConfig(config: Awaited<ReturnType<typeof loadAgentSdkConfig>>): string {
   return resolveWebSearchProvider({ ...process.env, ...(config.settings.env ?? {}) });
+}
+
+function resolvedReadWebPageProviderForConfig(config: Awaited<ReturnType<typeof loadAgentSdkConfig>>): string {
+  return resolveReadWebPageProvider({ ...process.env, ...(config.settings.env ?? {}) });
 }
 export function printInlineConfigSummary(
   cli: ManualTestCliOptions,

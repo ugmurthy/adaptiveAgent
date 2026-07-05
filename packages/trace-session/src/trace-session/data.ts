@@ -26,6 +26,7 @@ import type {
   SessionUsageSummary,
   SessionlessRunListItem,
   SnapshotMessageRow,
+  ToolAccountingSummary,
   TraceMessage,
   TraceMessageRole,
   TraceReport,
@@ -144,7 +145,7 @@ export async function traceSession(client: PostgresClient, options: CliOptions):
 export async function loadUsageForTraceTarget(client: PostgresClient, options: CliOptions): Promise<SessionUsageSummary> {
   const support = await detectTraceSupport(client);
   const { rootRunIds } = await resolveTraceTarget(client, options, support.hasGatewaySessionTables);
-  return loadSessionUsage(client, rootRunIds, support.hasToolObservabilityColumns, support.hasRunModelColumns);
+  return loadSessionUsage(client, rootRunIds, support.hasToolObservabilityColumns, support.hasRunModelColumns, true);
 }
 
 
@@ -468,6 +469,22 @@ function providerModelUsageSummaryFromRow(row: {
     ...(row.run_count === undefined ? {} : { runCount: Number(row.run_count) }),
     ...(row.tool_call_count === undefined ? {} : { toolCallCount: Number(row.tool_call_count) }),
   };
+}
+
+function emptyToolAccountingSummary(): ToolAccountingSummary {
+  return {
+    totalRequests: 0,
+    billableRequests: 0,
+    cachedToolCalls: 0,
+    unpricedRequests: 0,
+    estimatedCostUSD: 0,
+    byProviderOperation: [],
+  };
+}
+
+function numberFromValue(value: string | number | null | undefined): number {
+  const parsed = Number(value ?? 0);
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 function normalizedProviderModelLabel(value: string | null): string {
@@ -875,6 +892,7 @@ async function loadSessionUsage(
   rootRunIds: string[],
   hasToolObservabilityColumns: boolean,
   hasRunModelColumns: boolean,
+  includeToolAccounting = false,
 ): Promise<SessionUsageSummary> {
   if (rootRunIds.length === 0) {
     return {
@@ -882,6 +900,7 @@ async function loadSessionUsage(
       byRootRun: [],
       byProviderModel: [],
       toolOutputByProviderModel: [],
+      toolAccounting: emptyToolAccountingSummary(),
     };
   }
 
@@ -1083,12 +1102,107 @@ async function loadSessionUsage(
     { promptTokens: 0, completionTokens: 0, totalTokens: 0, estimatedCostUSD: 0 },
   );
 
-  const [byProviderModel, toolOutputByProviderModel] = await Promise.all([
+  const [byProviderModel, toolOutputByProviderModel, toolAccounting] = await Promise.all([
     loadRunUsageByProviderModel(client, rootRunIds, hasRunModelColumns),
     hasToolObservabilityColumns ? loadToolOutputUsageByProviderModel(client, rootRunIds) : Promise.resolve([]),
+    includeToolAccounting ? loadToolAccountingSummary(client, rootRunIds) : Promise.resolve(undefined),
   ]);
 
-  return { total, byRootRun, byProviderModel, toolOutputByProviderModel };
+  return {
+    total,
+    byRootRun,
+    byProviderModel,
+    toolOutputByProviderModel,
+    ...(toolAccounting === undefined ? {} : { toolAccounting }),
+  };
+}
+
+async function loadToolAccountingSummary(
+  client: PostgresClient,
+  rootRunIds: string[],
+): Promise<ToolAccountingSummary> {
+  if (rootRunIds.length === 0) {
+    return emptyToolAccountingSummary();
+  }
+
+  const result = await client.query<{
+    provider: string;
+    operation: string;
+    tool_calls: string | number;
+    requests: string | number;
+    billable_requests: string | number;
+    cached_tool_calls: string | number;
+    unpriced_requests: string | number;
+    estimated_cost_usd: string | number;
+  }>(
+    `
+      with recursive root_runs as (
+        select root_run_id::uuid as root_run_id, ordinality
+        from unnest($1::text[]) with ordinality as roots(root_run_id, ordinality)
+      ), run_tree as (
+        select r.id, r.root_run_id, r.created_at
+        from agent_runs r
+        join root_runs rr on rr.root_run_id = r.id
+
+        union all
+
+        select c.id, c.root_run_id, c.created_at
+        from agent_runs c
+        join run_tree rt on c.parent_run_id = rt.id
+      ), accounting_events as (
+        select
+          coalesce(nullif(e.payload #>> '{accounting,provider}', ''), 'unknown') as provider,
+          coalesce(nullif(e.payload #>> '{accounting,operation}', ''), 'unknown') as operation,
+          coalesce(nullif(e.payload #>> '{accounting,units,requests}', '')::numeric, 0) as requests,
+          coalesce((e.payload #>> '{accounting,billable}')::boolean, false) as billable,
+          coalesce((e.payload #>> '{accounting,cached}')::boolean, false) as cached,
+          nullif(e.payload #>> '{accounting,estimatedCostUSD}', '')::numeric as estimated_cost_usd
+        from run_tree rt
+        join agent_events e on e.run_id = rt.id
+        where e.event_type in ('tool.completed', 'tool.failed')
+          and e.payload ? 'accounting'
+      )
+      select
+        provider,
+        operation,
+        count(*)::text as tool_calls,
+        coalesce(sum(requests), 0)::text as requests,
+        coalesce(sum(case when billable then requests else 0 end), 0)::text as billable_requests,
+        count(*) filter (where cached)::text as cached_tool_calls,
+        coalesce(sum(case when estimated_cost_usd is null and requests > 0 then requests else 0 end), 0)::text as unpriced_requests,
+        coalesce(sum(coalesce(estimated_cost_usd, 0)), 0)::text as estimated_cost_usd
+      from accounting_events
+      group by provider, operation
+      order by sum(coalesce(estimated_cost_usd, 0)) desc,
+               sum(requests) desc,
+               provider asc,
+               operation asc
+    `,
+    [rootRunIds],
+  );
+
+  const byProviderOperation = result.rows.map((row) => ({
+    provider: row.provider,
+    operation: row.operation,
+    toolCalls: numberFromValue(row.tool_calls),
+    requests: numberFromValue(row.requests),
+    billableRequests: numberFromValue(row.billable_requests),
+    cachedToolCalls: numberFromValue(row.cached_tool_calls),
+    unpricedRequests: numberFromValue(row.unpriced_requests),
+    estimatedCostUSD: numberFromValue(row.estimated_cost_usd),
+  }));
+
+  return byProviderOperation.reduce<ToolAccountingSummary>(
+    (acc, row) => ({
+      totalRequests: acc.totalRequests + row.requests,
+      billableRequests: acc.billableRequests + row.billableRequests,
+      cachedToolCalls: acc.cachedToolCalls + row.cachedToolCalls,
+      unpricedRequests: acc.unpricedRequests + row.unpricedRequests,
+      estimatedCostUSD: acc.estimatedCostUSD + row.estimatedCostUSD,
+      byProviderOperation: acc.byProviderOperation,
+    }),
+    { ...emptyToolAccountingSummary(), byProviderOperation },
+  );
 }
 
 async function loadRunUsageByProviderModel(

@@ -48,6 +48,7 @@ export function resolveSkillDirs(cwd: string, dirs: string[] | undefined, allowE
 export function normalizeRecovery(recovery: AgentConfigFile['recovery']) { return recovery ? { ...recovery, continuation: recovery.continuation ? { enabled: recovery.continuation.enabled ?? true, defaultStrategy: recovery.continuation.defaultStrategy, requireUserApproval: recovery.continuation.requireUserApproval } : undefined } : undefined; }
 export function mergeMetadata(base: JsonObject, extra: JsonObject | undefined): JsonObject { return { ...base, ...(extra ?? {}) }; }
 export function parsePositiveInteger(value: string | undefined): number | undefined { const parsed = value ? Number.parseInt(value, 10) : NaN; return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined; }
+export function parseNonNegativeNumber(value: string | undefined): number | undefined { const parsed = value ? Number.parseFloat(value) : NaN; return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined; }
 export function readBooleanEnv(value: string | undefined): boolean { return value === '1' || value === 'true' || value === 'yes'; }
 export async function promptYesNo(question: string): Promise<boolean> { return ['y', 'yes'].includes((await promptText(question)).trim().toLowerCase()); }
 export async function promptText(question: string): Promise<string> { const rl = createInterface({ input: stdin, output: stderr }); try { return await rl.question(question); } finally { rl.close(); } }

@@ -19,6 +19,12 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
@@ -31,8 +37,24 @@ jobs:
       - name: Smoke test macOS release asset
         run: ./scripts/smoke-release-assets.sh
 
+      - name: Build npm packages
+        run: ./scripts/build-npm-packages.sh
+
+      - name: Smoke test npm packages
+        run: ./scripts/smoke-npm-packages.sh
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/release/*
           generate_release_notes: true
+
+      - name: Publish npm packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo 'NPM_TOKEN is not configured; skipping npm publish.'
+            exit 0
+          fi
+          ./scripts/publish-npm-packages.sh

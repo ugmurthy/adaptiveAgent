@@ -1,7 +1,15 @@
-import type { ToolDefinition } from '../types.js';
+import type { ToolAccounting, ToolDefinition } from '../types.js';
 import { extractPdfTextWithPdfJs } from './pdf-text.js';
 
+export type ReadWebPageProvider = 'direct' | 'parallel';
+
 export interface ReadWebPageToolConfig {
+  /** Page read provider. Defaults to `'direct'`. */
+  provider?: ReadWebPageProvider;
+  /** API key for API-backed page read providers. Required for Parallel. */
+  apiKey?: string;
+  /** Base URL override for testing. */
+  baseUrl?: string;
   /** Maximum response body size in bytes. Defaults to 512 KiB. */
   maxSizeBytes?: number;
   /** Maximum extracted text length in characters. Defaults to 50000. */
@@ -10,6 +18,8 @@ export interface ReadWebPageToolConfig {
   timeoutMs?: number;
   /** Override PDF extraction for tests or custom runtimes. */
   extractPdfText?: (rawBuffer: ArrayBuffer) => Promise<{ title: string; text: string }>;
+  /** Estimated cost for one provider page-read request. Defaults to 0 for direct reads, otherwise unpriced. */
+  estimatedCostPerRequestUSD?: number;
 }
 
 type ReadWebPageInput = {
@@ -43,13 +53,37 @@ type ReadResponseBodyResult = {
   truncated: boolean;
 };
 
+interface ParallelExtractResponse {
+  results?: Array<{
+    url?: string | null;
+    title?: string | null;
+    excerpts?: string[] | null;
+    full_content?: string | null;
+  }>;
+  errors?: Array<{
+    url?: string | null;
+    error_type?: string | null;
+    http_status_code?: number | null;
+    content?: string | null;
+  }>;
+}
+
 const DEFAULT_MAX_SIZE = 524_288; // 512 KiB
 const DEFAULT_MAX_TEXT_LENGTH = 50_000;
 const DEFAULT_WEB_TOOL_TIMEOUT_MS = 90_000;
 const DEFAULT_MODEL_RESULT_MAX_BYTES = 32 * 1024;
+const PARALLEL_BASE_URL = 'https://api.parallel.ai/v1';
+const MAX_PARALLEL_EXTRACT_CHARS_TOTAL = 100_000;
+const MAX_PARALLEL_ERROR_BODY_BYTES = 524_288;
 const PARTIAL_CONTENT_USEFUL_MIN_CHARS = 500;
 const PARTIAL_CONTENT_USEFUL_MIN_WORDS = 80;
 const PARTIAL_CONTENT_USEFUL_MIN_ALPHA_RATIO = 0.45;
+const READ_WEB_PAGE_DIAGNOSTICS = Symbol('read_web_page.diagnostics');
+
+interface ReadWebPageDiagnostics {
+  provider: ReadWebPageProvider;
+  cached?: boolean;
+}
 
 class RecoverableReadWebPageError extends Error {
   constructor(readonly output: ReadWebPageOutput) {
@@ -59,10 +93,17 @@ class RecoverableReadWebPageError extends Error {
 }
 
 export function createReadWebPageTool(config?: ReadWebPageToolConfig): ToolDefinition<ReadWebPageInput, ReadWebPageOutput> {
+  const provider = config?.provider ?? 'direct';
+  if (provider === 'parallel' && !config?.apiKey) {
+    throw new Error('createReadWebPageTool requires apiKey when provider is parallel');
+  }
+
   const maxSizeBytes = config?.maxSizeBytes ?? DEFAULT_MAX_SIZE;
   const maxTextLength = config?.maxTextLength ?? DEFAULT_MAX_TEXT_LENGTH;
   const timeoutMs = config?.timeoutMs ?? DEFAULT_WEB_TOOL_TIMEOUT_MS;
+  const baseUrl = config?.baseUrl ?? PARALLEL_BASE_URL;
   const extractPdfText = config?.extractPdfText ?? extractPdfTextWithPdfJs;
+  const estimatedCostPerRequestUSD = config?.estimatedCostPerRequestUSD;
   const cache = new Map<string, ReadWebPageOutput>();
 
   return {
@@ -102,13 +143,29 @@ export function createReadWebPageTool(config?: ReadWebPageToolConfig): ToolDefin
       // Some models send tool input as a JSON string instead of an object — normalise.
       const input = typeof rawInput === 'string' ? JSON.parse(rawInput) : rawInput;
       const { url, objective, maxTextLength: perCallMaxTextLength } = input as unknown as ReadWebPageInput;
-      const cacheKey = `${context.runId}:${url}:${objective ?? ''}:${perCallMaxTextLength ?? ''}`;
+      const effectiveMaxTextLength = perCallMaxTextLength ?? maxTextLength;
+      const cacheKey = `${context.runId}:${provider}:${url}:${objective ?? ''}:${effectiveMaxTextLength}`;
       const cached = cache.get(cacheKey);
       if (cached) {
-        return cached;
+        return cloneReadWebPageOutputWithCachedDiagnostics(cached);
       }
 
       try {
+        if (provider === 'parallel') {
+          const output = await extractParallelWebPage({
+            apiKey: config!.apiKey!,
+            url,
+            objective,
+            maxTextLength: effectiveMaxTextLength,
+            runId: context.runId,
+            baseUrl,
+            signal: context.signal,
+          });
+          const outputWithDiagnostics = attachReadWebPageDiagnostics(output, { provider: 'parallel' });
+          cache.set(cacheKey, outputWithDiagnostics);
+          return outputWithDiagnostics;
+        }
+
         const response = await fetch(url, {
           headers: {
             'User-Agent': 'AdaptiveAgent/1.0 (compatible; bot)',
@@ -152,7 +209,7 @@ export function createReadWebPageTool(config?: ReadWebPageToolConfig): ToolDefin
           objective,
           extracted,
           bytesFetched: body.rawBuffer.byteLength,
-          maxTextLength: perCallMaxTextLength ?? maxTextLength,
+          maxTextLength: effectiveMaxTextLength,
           bodyTruncated: body.truncated || (contentLength !== undefined && contentLength > maxSizeBytes),
           maxSizeBytes,
         });
@@ -165,16 +222,78 @@ export function createReadWebPageTool(config?: ReadWebPageToolConfig): ToolDefin
           });
         }
 
-        cache.set(cacheKey, output);
-        return output;
+        const outputWithDiagnostics = attachReadWebPageDiagnostics(output, { provider: 'direct' });
+        cache.set(cacheKey, outputWithDiagnostics);
+        return outputWithDiagnostics;
       } catch (error) {
         throw normalizeReadWebPageError(error, url);
       }
     },
     recoverError(error, input) {
       const { url } = input;
-      return normalizeReadWebPageError(error, url).output;
+      return attachReadWebPageDiagnostics(normalizeReadWebPageError(error, url).output, { provider });
     },
+    getAccounting(output) {
+      return getReadWebPageAccounting(output, provider, estimatedCostPerRequestUSD);
+    },
+  };
+}
+
+function attachReadWebPageDiagnostics(
+  output: ReadWebPageOutput,
+  diagnostics: ReadWebPageDiagnostics,
+): ReadWebPageOutput {
+  Object.defineProperty(output, READ_WEB_PAGE_DIAGNOSTICS, {
+    value: diagnostics,
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+
+  return output;
+}
+
+function cloneReadWebPageOutputWithCachedDiagnostics(output: ReadWebPageOutput): ReadWebPageOutput {
+  const diagnostics = getReadWebPageDiagnostics(output);
+  if (!diagnostics) {
+    return output;
+  }
+  return attachReadWebPageDiagnostics({ ...output }, { ...diagnostics, cached: true });
+}
+
+function getReadWebPageDiagnostics(output: ReadWebPageOutput): ReadWebPageDiagnostics | undefined {
+  return (output as ReadWebPageOutput & { [READ_WEB_PAGE_DIAGNOSTICS]?: ReadWebPageDiagnostics })[
+    READ_WEB_PAGE_DIAGNOSTICS
+  ];
+}
+
+function getReadWebPageAccounting(
+  output: ReadWebPageOutput,
+  configuredProvider: ReadWebPageProvider,
+  estimatedCostPerRequestUSD: number | undefined,
+): ToolAccounting | undefined {
+  if (typeof output.url !== 'string' || !output.url) {
+    return undefined;
+  }
+
+  const diagnostics = getReadWebPageDiagnostics(output);
+  const provider = diagnostics?.provider ?? configuredProvider;
+  const cached = diagnostics?.cached === true;
+  const requests = cached ? 0 : 1;
+  const defaultCost = provider === 'direct' ? 0 : undefined;
+  const perRequestCost = estimatedCostPerRequestUSD ?? defaultCost;
+
+  return {
+    provider,
+    operation: 'read_web_page',
+    billable: provider !== 'direct',
+    ...(cached ? { cached } : {}),
+    units: { requests },
+    ...(perRequestCost === undefined ? {} : { estimatedCostUSD: requests * perRequestCost }),
+    pricingSource:
+      estimatedCostPerRequestUSD === undefined
+        ? provider === 'direct' ? 'default_zero' : 'unpriced'
+        : 'configured',
   };
 }
 
@@ -261,6 +380,8 @@ function buildReadWebPageOutput({
   maxTextLength,
   bodyTruncated,
   maxSizeBytes,
+  providerRelevantExcerpts,
+  providerTruncated,
 }: {
   url: string;
   objective?: string;
@@ -269,10 +390,12 @@ function buildReadWebPageOutput({
   maxTextLength: number;
   bodyTruncated: boolean;
   maxSizeBytes: number;
+  providerRelevantExcerpts?: string[];
+  providerTruncated?: boolean;
 }): ReadWebPageOutput {
-  const relevantExcerpts = objective ? extractRelevantExcerpts(extracted.text, objective) : undefined;
+  const relevantExcerpts = providerRelevantExcerpts ?? (objective ? extractRelevantExcerpts(extracted.text, objective) : undefined);
   const textTruncated = extracted.text.length > maxTextLength;
-  const truncated = bodyTruncated || textTruncated;
+  const truncated = bodyTruncated || textTruncated || Boolean(providerTruncated);
   const text = textTruncated ? `${extracted.text.slice(0, maxTextLength)}\n[truncated]` : extracted.text;
 
   return {
@@ -284,7 +407,7 @@ function buildReadWebPageOutput({
     textLength: extracted.text.length,
     maxTextLength,
     truncated,
-    ...(textTruncated ? { next: { url, maxTextLength: Math.min(extracted.text.length, maxTextLength * 2) } } : {}),
+    ...(textTruncated || providerTruncated ? { next: { url, maxTextLength: Math.min(extracted.text.length || maxTextLength * 2, maxTextLength * 2) } } : {}),
     ...(bodyTruncated
       ? {
           error: {
@@ -294,6 +417,97 @@ function buildReadWebPageOutput({
         }
       : {}),
   };
+}
+
+async function extractParallelWebPage({
+  apiKey,
+  url,
+  objective,
+  maxTextLength,
+  runId,
+  baseUrl,
+  signal,
+}: {
+  apiKey: string;
+  url: string;
+  objective?: string;
+  maxTextLength: number;
+  runId: string;
+  baseUrl: string;
+  signal: AbortSignal;
+}): Promise<ReadWebPageOutput> {
+  const endpoint = new URL(`${baseUrl.replace(/\/$/, '')}/extract`);
+  const providerContentCap = Math.min(Math.max(maxTextLength * 2, maxTextLength), MAX_PARALLEL_EXTRACT_CHARS_TOTAL);
+  const response = await fetch(endpoint.toString(), {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+    },
+    body: JSON.stringify({
+      urls: [url],
+      ...(objective === undefined ? {} : { objective }),
+      max_chars_total: MAX_PARALLEL_EXTRACT_CHARS_TOTAL,
+      session_id: runId,
+      advanced_settings: {
+        excerpt_settings: {
+          max_chars_per_result: Math.min(maxTextLength, MAX_PARALLEL_EXTRACT_CHARS_TOTAL),
+        },
+        full_content: {
+          max_chars_per_result: providerContentCap,
+        },
+      },
+    }),
+    signal,
+  });
+
+  if (!response.ok) {
+    throw createRecoverableReadWebPageError({
+      url,
+      kind: 'http_error',
+      message: `Parallel Extract API returned ${response.status}: ${await readResponseTextWithinLimit(response, MAX_PARALLEL_ERROR_BODY_BYTES, signal).catch(() => 'unknown error')}`,
+      status: response.status,
+    });
+  }
+
+  const data = (await response.json()) as ParallelExtractResponse;
+  const result = (data.results ?? []).find((candidate) => candidate.url === url) ?? data.results?.[0];
+  if (!result) {
+    const providerError = (data.errors ?? []).find((candidate) => candidate.url === url) ?? data.errors?.[0];
+    if (providerError) {
+      throw createRecoverableReadWebPageError({
+        url,
+        kind: providerError.http_status_code === null || providerError.http_status_code === undefined ? 'content_error' : 'http_error',
+        message: providerError.content || providerError.error_type || `Parallel Extract API could not extract ${url}`,
+        ...(providerError.http_status_code === null || providerError.http_status_code === undefined ? {} : { status: providerError.http_status_code }),
+      });
+    }
+
+    throw createRecoverableReadWebPageError({
+      url,
+      kind: 'content_error',
+      message: `Parallel Extract API returned no result for ${url}`,
+    });
+  }
+
+  const providerText = result.full_content?.trim() || (result.excerpts ?? []).join('\n\n').trim();
+  const providerExcerpts = (result.excerpts ?? []).map((excerpt) => excerpt.trim()).filter(Boolean);
+  const providerTruncated = Boolean(result.full_content && result.full_content.length >= providerContentCap);
+  return buildReadWebPageOutput({
+    url: result.url?.trim() || url,
+    objective,
+    extracted: {
+      title: result.title?.trim() ?? '',
+      text: providerText,
+    },
+    bytesFetched: Buffer.byteLength(providerText, 'utf8'),
+    maxTextLength,
+    bodyTruncated: false,
+    maxSizeBytes: MAX_PARALLEL_EXTRACT_CHARS_TOTAL,
+    ...(objective && providerExcerpts.length > 0 ? { providerRelevantExcerpts: providerExcerpts } : {}),
+    providerTruncated,
+  });
 }
 
 async function extractReadableText(
@@ -310,6 +524,46 @@ async function extractReadableText(
     title: extractTitle(html),
     text: stripHtmlToText(html),
   };
+}
+
+async function readResponseTextWithinLimit(
+  response: Response,
+  maxBytes: number,
+  signal: AbortSignal,
+): Promise<string> {
+  signal.throwIfAborted();
+  if (!response.body) {
+    const text = await response.text();
+    if (Buffer.byteLength(text, 'utf8') > maxBytes) {
+      throw new Error(`Response body exceeds maximum size of ${maxBytes} bytes`);
+    }
+    return text;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const chunks: string[] = [];
+  let totalBytes = 0;
+
+  while (true) {
+    signal.throwIfAborted();
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    if (!value) {
+      continue;
+    }
+
+    totalBytes += value.byteLength;
+    if (totalBytes > maxBytes) {
+      await reader.cancel();
+      throw new Error(`Response body exceeds maximum size of ${maxBytes} bytes`);
+    }
+    chunks.push(decoder.decode(value, { stream: true }));
+  }
+  chunks.push(decoder.decode());
+  return chunks.join('');
 }
 
 function parseContentLength(value: string | null): number | undefined {

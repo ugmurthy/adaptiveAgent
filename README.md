@@ -51,6 +51,16 @@ Other supported providers use their own keys:
 - Mesh: `MESH_API_KEY`
 - Ollama: no API key, but Ollama must be running locally
 
+Optional web tool providers are configured independently:
+
+```bash
+export PARALLEL_API_KEY="<your-key>"
+export WEB_SEARCH_PROVIDER=parallel
+export WEB_READ_PAGE_PROVIDER=parallel
+```
+
+`web_search` defaults to DuckDuckGo unless an API-backed provider is configured. `read_web_page` defaults to direct HTTP fetch unless `WEB_READ_PAGE_PROVIDER=parallel` is set with `PARALLEL_API_KEY`.
+
 ### 3. Init and run
 
 ```bash

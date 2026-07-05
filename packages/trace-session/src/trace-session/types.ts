@@ -123,6 +123,7 @@ export interface SessionUsageSummary {
   }>;
   byProviderModel?: ProviderModelUsageSummary[];
   toolOutputByProviderModel?: ProviderModelUsageSummary[];
+  toolAccounting?: ToolAccountingSummary;
 }
 
 export interface SessionListItem {
@@ -218,6 +219,7 @@ export interface TimelineEntry {
   outcome: string;
   childRunId: string | null;
   eventSeq: number | null;
+  accounting?: unknown;
 }
 
 export interface PerformanceBucketSummary {
@@ -486,6 +488,24 @@ export interface TopToolMetric {
   modelOutputBytes: PerformanceBucketSummary;
 }
 
+export interface ToolAccountingSummary {
+  totalRequests: number;
+  billableRequests: number;
+  cachedToolCalls: number;
+  unpricedRequests: number;
+  estimatedCostUSD: number;
+  byProviderOperation: Array<{
+    provider: string;
+    operation: string;
+    toolCalls: number;
+    requests: number;
+    billableRequests: number;
+    cachedToolCalls: number;
+    unpricedRequests: number;
+    estimatedCostUSD: number;
+  }>;
+}
+
 export interface PerformanceDigest {
   wallDurationMs: number | null;
   cumulativeModelDurationMs: number;
@@ -498,6 +518,7 @@ export interface PerformanceDigest {
   topToolsByDuration: TopToolMetric[];
   topToolsByModelOutput: TopToolMetric[];
   topRunsByUsage: TopRunUsage[];
+  toolAccounting: ToolAccountingSummary;
   notes: string[];
 }
 

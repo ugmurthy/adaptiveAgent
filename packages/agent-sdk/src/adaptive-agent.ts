@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 
+import { closeSync, createReadStream, createWriteStream, openSync } from 'node:fs';
 import { access, appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, extname, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
@@ -41,7 +42,7 @@ import { AgentEventLabelRegistry, formatAgentEventSummary, summarizeAgentEvent }
 import { formatSwarmExecutionPlan, formatSwarmRunStatuses, formatSwarmSubtasks } from './swarm-format.js';
 import { createSwarmRoleAgentConfig } from './swarm-role-config.js';
 import { buildSwarmCoordinator, parseSwarmSubtasks, runSwarmDecomposition, validateSdkDecomposition } from './swarm-runner.js';
-import { resolveWebSearchProvider } from './tool-registry.js';
+import { resolveReadWebPageProvider, resolveWebSearchProvider } from './tool-registry.js';
 import type {
   BenchmarkAttachmentType,
   BenchmarkCase,
@@ -976,7 +977,16 @@ async function runSpecCommand(cli: ManualTestCliOptions): Promise<number> {
 
 async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat'): Promise<number> {
   const resolvedCwd = resolve(cli.cwd ?? process.cwd());
-  const goal = await readInlinePrompt(cli, mode === 'run' ? 'run goal' : 'chat message');
+  const promptLabel = mode === 'run' ? 'run goal' : 'chat message';
+  let goal: string;
+  try {
+    goal = await readInlinePrompt(cli, promptLabel);
+  } catch (error) {
+    if (mode === 'chat' && cli.output === 'pretty' && isMissingInlinePromptError(error, promptLabel)) {
+      return runInteractiveChatCommand(cli);
+    }
+    throw error;
+  }
   const spec: ManualTestSpec = mode === 'run'
     ? {
         mode: 'run',
@@ -1189,13 +1199,35 @@ async function runInteractiveChatCommand(cli: ManualTestCliOptions): Promise<num
 }
 
 async function readChatLine(): Promise<string | undefined> {
-  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  const tty = openPromptTty();
+  const rl = createInterface({
+    input: tty?.input ?? process.stdin,
+    output: tty?.output ?? process.stderr,
+  });
   try {
     return await rl.question('user> ');
   } catch {
     return undefined;
   } finally {
     rl.close();
+    tty?.input.destroy();
+    tty?.output.end();
+  }
+}
+
+function openPromptTty(): { input: ReturnType<typeof createReadStream>; output: ReturnType<typeof createWriteStream> } | undefined {
+  if (process.stdin.isTTY === true) return undefined;
+  let inputFd: number | undefined;
+  try {
+    inputFd = openSync('/dev/tty', 'r');
+    const outputFd = openSync('/dev/tty', 'w');
+    return {
+      input: createReadStream('', { fd: inputFd, autoClose: true }),
+      output: createWriteStream('', { fd: outputFd, autoClose: true }),
+    };
+  } catch {
+    if (inputFd !== undefined) closeSync(inputFd);
+    return undefined;
   }
 }
 
@@ -1669,14 +1701,17 @@ async function runConfigCommand(cli: ManualTestCliOptions): Promise<number> {
   const resolvedCwd = resolve(cli.cwd ?? process.cwd());
   const sdkOptions = buildSdkOptions(cli, resolvedCwd);
   const resolvedConfig = await loadAgentSdkConfig(sdkOptions);
-  const webSearchProvider = resolveWebSearchProvider({ ...(sdkOptions.env ?? process.env), ...(resolvedConfig.settings.env ?? {}) });
+  const providerEnv = { ...(sdkOptions.env ?? process.env), ...(resolvedConfig.settings.env ?? {}) };
+  const webSearchProvider = resolveWebSearchProvider(providerEnv);
+  const readWebPageProvider = resolveReadWebPageProvider(providerEnv);
   if (cli.output === 'json') {
-    console.log(JSON.stringify({ ...resolvedConfig, webSearch: { provider: webSearchProvider } }, null, 2));
+    console.log(JSON.stringify({ ...resolvedConfig, webSearch: { provider: webSearchProvider }, readWebPage: { provider: readWebPageProvider } }, null, 2));
     return 0;
   }
   console.log(`agent: ${resolvedConfig.agent.id} (${resolvedConfig.agent.name})`);
   console.log(`model: ${resolvedConfig.model.provider}/${resolvedConfig.model.model}`);
   console.log(`webSearchProvider: ${webSearchProvider}`);
+  console.log(`readWebPageProvider: ${readWebPageProvider}`);
   console.log(`runtime: ${resolvedConfig.runtime.mode} (requested ${resolvedConfig.runtime.requestedMode})`);
   console.log(`workspace: ${resolvedConfig.workspaceRoot}`);
   console.log(`shellCwd: ${resolvedConfig.shellCwd}`);
@@ -2687,6 +2722,10 @@ async function readInlinePrompt(cli: ManualTestCliOptions, label: string): Promi
   throw new Error(`Missing ${label}; provide positional text, --file <path>, or stdin.`);
 }
 
+function isMissingInlinePromptError(error: unknown, label: string): boolean {
+  return error instanceof Error && error.message === `Missing ${label}; provide positional text, --file <path>, or stdin.`;
+}
+
 function resolveAssetPath(inputPath: string, baseDir: string): string {
   return resolve(baseDir, inputPath);
 }
@@ -3232,7 +3271,9 @@ function formatEvalDryRunMarkdown(
   totalCases: number,
 ): string {
   const config = inspection.config;
-  const webSearchProvider = resolveWebSearchProvider({ ...process.env, ...(config.settings.env ?? {}) });
+  const providerEnv = { ...process.env, ...(config.settings.env ?? {}) };
+  const webSearchProvider = resolveWebSearchProvider(providerEnv);
+  const readWebPageProvider = resolveReadWebPageProvider(providerEnv);
   const lines = [
     '# Dry run',
     '',
@@ -3245,6 +3286,7 @@ function formatEvalDryRunMarkdown(
     `- \`approval\`: \`${config.interaction.approvalMode}\``,
     `- \`clarification\`: \`${config.interaction.clarificationMode}\``,
     `- \`webSearchProvider\`: \`${webSearchProvider}\``,
+    `- \`readWebPageProvider\`: \`${readWebPageProvider}\``,
     `- \`shellCwd\`: \`${config.shellCwd}\``,
     `- \`agentSearchDirs\`: ${formatNameList(config.agents.dirs)}`,
     `- \`skillSearchDirs\`: ${formatNameList(config.skills.dirs)}`,
@@ -3298,6 +3340,7 @@ function summarizeEvalDryRun(
     cli: summarizeCli(cli),
     resolvedConfig: summarizeEvalResolvedConfig(inspection.config),
     webSearch: { provider: resolveWebSearchProvider({ ...process.env, ...(inspection.config.settings.env ?? {}) }) },
+    readWebPage: { provider: resolveReadWebPageProvider({ ...process.env, ...(inspection.config.settings.env ?? {}) }) },
     benchmark: {
       dataset: cli.evalDataset ?? 'benchmark',
       inputPath: cli.evalInputPath ? resolve(cli.cwd ? resolve(cli.cwd) : process.cwd(), cli.evalInputPath) : undefined,

@@ -590,10 +590,46 @@ describe('trace-session CLI helpers', () => {
             },
           },
         ],
+        byProviderModel: [{
+          provider: 'openrouter',
+          model: 'openai/gpt-4.1',
+          runCount: 2,
+          usage: {
+            promptTokens: 1000,
+            completionTokens: 250,
+            reasoningTokens: 25,
+            totalTokens: 1275,
+            estimatedCostUSD: 0.01,
+          },
+        }],
+        toolAccounting: {
+          totalRequests: 3,
+          billableRequests: 2,
+          cachedToolCalls: 1,
+          unpricedRequests: 0,
+          estimatedCostUSD: 0.007,
+          byProviderOperation: [{
+            provider: 'serper',
+            operation: 'web_search',
+            toolCalls: 3,
+            requests: 3,
+            billableRequests: 2,
+            cachedToolCalls: 1,
+            unpricedRequests: 0,
+            estimatedCostUSD: 0.007,
+          }],
+        },
       }),
       { json: false },
     );
 
+    expect(output).toContain('model');
+    expect(output).toContain('tool providers');
+    expect(output).toContain('requests=3');
+    expect(output).toContain('cost=$0.007000');
+    expect(output).toContain('combined model/tool-output');
+    expect(output).toContain('estimated grand total');
+    expect(output).toContain('cost=$0.017000');
     expect(output).toContain('prompt=1,000');
     expect(output).toContain('completion=250');
     expect(output).toContain('reasoning=25');
@@ -606,6 +642,9 @@ describe('trace-session CLI helpers', () => {
     expect(output).toContain('root-2');
     expect(output).toContain('375');
     expect(output).toContain('300');
+    expect(output).toContain('Tool provider usage by provider/operation');
+    expect(output).toContain('serper');
+    expect(output).toContain('web_search');
   });
 
   it('includes completed non-delegate tool output usage in trace target totals', async () => {
@@ -662,6 +701,24 @@ describe('trace-session CLI helpers', () => {
           } as unknown as { rows: TRow[] };
         }
 
+        if (sql.includes('accounting_events as')) {
+          expect(params).toEqual([['root-usage']]);
+          expect(sql).toContain("e.payload #>> '{accounting,provider}'");
+          expect(sql).toContain("e.payload #>> '{accounting,units,requests}'");
+          return {
+            rows: [{
+              provider: 'serper',
+              operation: 'web_search',
+              tool_calls: '2',
+              requests: '1',
+              billable_requests: '1',
+              cached_tool_calls: '1',
+              unpriced_requests: '0',
+              estimated_cost_usd: '0.002',
+            }],
+          } as unknown as { rows: TRow[] };
+        }
+
         throw new Error(`Unexpected SQL in test:\n${sql}`);
       },
     };
@@ -707,6 +764,23 @@ describe('trace-session CLI helpers', () => {
         },
         toolCallCount: 1,
       }],
+      toolAccounting: {
+        totalRequests: 1,
+        billableRequests: 1,
+        cachedToolCalls: 1,
+        unpricedRequests: 0,
+        estimatedCostUSD: 0.002,
+        byProviderOperation: [{
+          provider: 'serper',
+          operation: 'web_search',
+          toolCalls: 2,
+          requests: 1,
+          billableRequests: 1,
+          cachedToolCalls: 1,
+          unpricedRequests: 0,
+          estimatedCostUSD: 0.002,
+        }],
+      },
     });
   });
 
@@ -1825,6 +1899,113 @@ describe('trace-session CLI helpers', () => {
       failed: 0,
     });
     expect(performance.tools.durationMs.count).toBe(4);
+  });
+
+  it('aggregates tool provider accounting by provider and operation', () => {
+    const rows = [
+      traceRow({
+        event_id: 'tool-completed-1',
+        event_seq: 1,
+        event_type: 'tool.completed',
+        tool_call_id: 'call-1',
+        event_tool_name: 'web_search',
+        ledger_tool_name: 'web_search',
+        tool_execution_status: 'completed',
+        tool_started_at: '2026-04-16T10:00:00.000Z',
+        tool_completed_at: '2026-04-16T10:00:01.000Z',
+        payload: {
+          toolName: 'web_search',
+          accounting: {
+            provider: 'serper',
+            operation: 'web_search',
+            billable: true,
+            units: { requests: 1 },
+            estimatedCostUSD: 0.002,
+            pricingSource: 'configured',
+          },
+          performance: { durationMs: 1000 },
+        },
+      }),
+      traceRow({
+        event_id: 'tool-completed-2',
+        event_seq: 2,
+        event_type: 'tool.completed',
+        tool_call_id: 'call-2',
+        event_tool_name: 'web_search',
+        ledger_tool_name: 'web_search',
+        tool_execution_status: 'completed',
+        tool_started_at: '2026-04-16T10:00:02.000Z',
+        tool_completed_at: '2026-04-16T10:00:03.000Z',
+        payload: {
+          toolName: 'web_search',
+          accounting: {
+            provider: 'serper',
+            operation: 'web_search',
+            billable: true,
+            cached: true,
+            units: { requests: 0 },
+            estimatedCostUSD: 0,
+            pricingSource: 'configured',
+          },
+          performance: { durationMs: 1000 },
+        },
+      }),
+      traceRow({
+        event_id: 'tool-completed-3',
+        event_seq: 3,
+        event_type: 'tool.completed',
+        tool_call_id: 'call-3',
+        event_tool_name: 'read_web_page',
+        ledger_tool_name: 'read_web_page',
+        tool_execution_status: 'completed',
+        tool_started_at: '2026-04-16T10:00:04.000Z',
+        tool_completed_at: '2026-04-16T10:00:05.000Z',
+        payload: {
+          toolName: 'read_web_page',
+          accounting: {
+            provider: 'parallel',
+            operation: 'read_web_page',
+            billable: true,
+            units: { requests: 1 },
+            pricingSource: 'unpriced',
+          },
+          performance: { durationMs: 1000 },
+        },
+      }),
+    ];
+    const timeline = buildTimeline(rows);
+    const diagnostics = buildTraceDiagnostics({
+      target: traceTarget('session', 'sess-1'),
+      session: session('succeeded'),
+      rootRuns: [],
+      usage: usage(),
+      performance: summarizePerformance(rows),
+      timeline,
+      milestones: [],
+      llmMessages: [],
+      delegates: [],
+      plans: [],
+      summary: { status: 'succeeded', reason: 'test' },
+      warnings: [],
+    });
+
+    expect(diagnostics.performance.toolAccounting).toMatchObject({
+      totalRequests: 2,
+      billableRequests: 2,
+      cachedToolCalls: 1,
+      unpricedRequests: 1,
+      estimatedCostUSD: 0.002,
+    });
+    expect(diagnostics.performance.toolAccounting.byProviderOperation).toContainEqual({
+      provider: 'serper',
+      operation: 'web_search',
+      toolCalls: 2,
+      requests: 1,
+      billableRequests: 1,
+      cachedToolCalls: 1,
+      unpricedRequests: 0,
+      estimatedCostUSD: 0.002,
+    });
   });
 
   it('renders the effective LLM message context and classifies system messages', () => {

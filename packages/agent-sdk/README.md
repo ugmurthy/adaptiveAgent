@@ -145,6 +145,14 @@ Built-in tool names available to `agent.json` are:
 - `web_search`
 - `read_web_page`
 
+Web providers are opt-in through env. `web_search` defaults to DuckDuckGo unless `WEB_SEARCH_PROVIDER=brave`, `serper`, or `parallel` is set with the matching API key. `read_web_page` defaults to direct HTTP fetch unless `WEB_READ_PAGE_PROVIDER=parallel` is set with `PARALLEL_API_KEY`.
+
+```bash
+export PARALLEL_API_KEY="<your-key>"
+export WEB_SEARCH_PROVIDER=parallel
+export WEB_READ_PAGE_PROVIDER=parallel
+```
+
 `write_file` and `shell_exec` are approval-gated tools. Use `--approval manual` when you want the CLI to prompt before executing them, `--approval auto` for unattended runs, and `--approval reject` when a run must not perform gated actions.
 
 ## Simple use case: first local run

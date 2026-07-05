@@ -14,6 +14,7 @@ import {
   loadSkillFromDirectory,
   skillToDelegate,
   type DelegateDefinition,
+  type ReadWebPageProvider,
   type ToolDefinition,
   type WebSearchProvider,
 } from '@adaptive-agent/core';
@@ -26,7 +27,7 @@ import type {
   ResolvedAgentSdkConfig,
 } from './config-types.js';
 import { validateAgent } from './config-validate.js';
-import { expandStrings, parsePositiveInteger, pathExists, readJson } from './sdk-utils.js';
+import { expandStrings, parseNonNegativeNumber, parsePositiveInteger, pathExists, readJson } from './sdk-utils.js';
 
 const DEFAULT_MODULE_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
 
@@ -56,17 +57,47 @@ function createBuiltinTools(workspaceRoot: string, shellCwd: string, env: NodeJS
   tools.set('shell_exec', createShellExecTool({ cwd: shellCwd }));
   const timeoutMs = parsePositiveInteger(env.WEB_TOOL_TIMEOUT_MS);
   const webSearchProvider = resolveWebSearchProvider(env);
-  if (webSearchProvider === 'brave') tools.set('web_search', createWebSearchTool({ provider: 'brave', apiKey: env.BRAVE_SEARCH_API_KEY!, timeoutMs }));
-  else if (webSearchProvider === 'serper') tools.set('web_search', createWebSearchTool({ provider: 'serper', apiKey: env.SERPER_API_KEY!, timeoutMs }));
-  else tools.set('web_search', createWebSearchTool({ provider: 'duckduckgo', timeoutMs }));
-  tools.set('read_web_page', createReadWebPageTool({ timeoutMs }));
+  const webSearchCost = resolveWebSearchCostPerRequest(env, webSearchProvider);
+  if (webSearchProvider === 'brave') tools.set('web_search', createWebSearchTool({ provider: 'brave', apiKey: env.BRAVE_SEARCH_API_KEY!, timeoutMs, estimatedCostPerRequestUSD: webSearchCost }));
+  else if (webSearchProvider === 'serper') tools.set('web_search', createWebSearchTool({ provider: 'serper', apiKey: env.SERPER_API_KEY!, timeoutMs, estimatedCostPerRequestUSD: webSearchCost }));
+  else if (webSearchProvider === 'parallel') tools.set('web_search', createWebSearchTool({ provider: 'parallel', apiKey: env.PARALLEL_API_KEY!, timeoutMs, estimatedCostPerRequestUSD: webSearchCost }));
+  else tools.set('web_search', createWebSearchTool({ provider: 'duckduckgo', timeoutMs, estimatedCostPerRequestUSD: webSearchCost }));
+  const readWebPageProvider = resolveReadWebPageProvider(env);
+  const readWebPageCost = resolveReadWebPageCostPerRequest(env, readWebPageProvider);
+  tools.set(
+    'read_web_page',
+    readWebPageProvider === 'parallel'
+      ? createReadWebPageTool({ provider: 'parallel', apiKey: env.PARALLEL_API_KEY!, timeoutMs, estimatedCostPerRequestUSD: readWebPageCost })
+      : createReadWebPageTool({ provider: 'direct', timeoutMs, estimatedCostPerRequestUSD: readWebPageCost }),
+  );
   return tools;
 }
 
 export function resolveWebSearchProvider(env: NodeJS.ProcessEnv): WebSearchProvider {
   if (env.WEB_SEARCH_PROVIDER === 'brave' && env.BRAVE_SEARCH_API_KEY) return 'brave';
   if (env.WEB_SEARCH_PROVIDER === 'serper' && env.SERPER_API_KEY) return 'serper';
+  if (env.WEB_SEARCH_PROVIDER === 'parallel' && env.PARALLEL_API_KEY) return 'parallel';
   return 'duckduckgo';
+}
+
+export function resolveReadWebPageProvider(env: NodeJS.ProcessEnv): ReadWebPageProvider {
+  if (env.WEB_READ_PAGE_PROVIDER === 'parallel' && env.PARALLEL_API_KEY) return 'parallel';
+  return 'direct';
+}
+
+function resolveWebSearchCostPerRequest(env: NodeJS.ProcessEnv, provider: WebSearchProvider): number | undefined {
+  const providerEnvName = `${provider.toUpperCase()}_SEARCH_COST_USD_PER_REQUEST`;
+  return parseNonNegativeNumber(env[providerEnvName])
+    ?? parseNonNegativeNumber(env.WEB_SEARCH_COST_USD_PER_REQUEST);
+}
+
+function resolveReadWebPageCostPerRequest(env: NodeJS.ProcessEnv, provider: ReadWebPageProvider): number | undefined {
+  if (provider === 'parallel') {
+    return parseNonNegativeNumber(env.PARALLEL_EXTRACT_COST_USD_PER_REQUEST)
+      ?? parseNonNegativeNumber(env.WEB_READ_PAGE_COST_USD_PER_REQUEST);
+  }
+  return parseNonNegativeNumber(env.DIRECT_READ_PAGE_COST_USD_PER_REQUEST)
+    ?? parseNonNegativeNumber(env.WEB_READ_PAGE_COST_USD_PER_REQUEST);
 }
 
 async function loadDelegates(names: string[], dirs: string[], availableTools: Set<string>): Promise<DelegateDefinition[]> {

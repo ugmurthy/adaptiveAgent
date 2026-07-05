@@ -1,6 +1,6 @@
-import type { JsonValue, ToolDefinition } from '../types.js';
+import type { JsonValue, ToolAccounting, ToolDefinition } from '../types.js';
 
-export type WebSearchProvider = 'brave' | 'duckduckgo' | 'serper';
+export type WebSearchProvider = 'brave' | 'duckduckgo' | 'serper' | 'parallel';
 
 export interface WebSearchToolConfig {
   /** Search provider. Defaults to `'brave'`. */
@@ -15,6 +15,8 @@ export interface WebSearchToolConfig {
   timeoutMs?: number;
   /** Maximum provider HTML/error body size in bytes. Defaults to 512 KiB. */
   maxResponseBodyBytes?: number;
+  /** Estimated cost for one provider search request. Defaults to 0 for DuckDuckGo, otherwise unpriced. */
+  estimatedCostPerRequestUSD?: number;
 }
 
 type WebSearchInput = {
@@ -62,6 +64,7 @@ interface WebSearchDiagnostics {
   provider: WebSearchProvider;
   providerPath: 'api' | 'deep' | 'html-fallback';
   deduplicatedResults?: number;
+  cached?: boolean;
 }
 
 interface WebSearchExecutionResult {
@@ -93,8 +96,17 @@ interface SerperSearchResponse {
   }>;
 }
 
+interface ParallelSearchResponse {
+  results?: Array<{
+    title?: string | null;
+    url?: string | null;
+    excerpts?: string[] | null;
+  }>;
+}
+
 const BRAVE_BASE_URL = 'https://api.search.brave.com/res/v1';
 const SERPER_BASE_URL = 'https://google.serper.dev';
+const PARALLEL_BASE_URL = 'https://api.parallel.ai/v1';
 const DUCKDUCKGO_BASE_URL = 'https://duckduckgo.com/';
 const DUCKDUCKGO_HTML_BASE_URL = 'https://html.duckduckgo.com/html/';
 const DUCKDUCKGO_ORIGIN = 'https://duckduckgo.com';
@@ -116,6 +128,8 @@ const WEB_SEARCH_DIAGNOSTICS = Symbol('web_search.diagnostics');
 const DEFAULT_WEB_TOOL_TIMEOUT_MS = 90_000;
 const DEFAULT_MAX_RESPONSE_BODY_BYTES = 524_288;
 const DEFAULT_MODEL_RESULT_MAX_BYTES = 32 * 1024;
+const DEFAULT_PARALLEL_SEARCH_MAX_CHARS_TOTAL = 8_000;
+const DEFAULT_PARALLEL_SEARCH_MAX_CHARS_PER_RESULT = 2_000;
 
 class RecoverableWebSearchError extends Error {
   constructor(readonly output: WebSearchOutput) {
@@ -126,7 +140,7 @@ class RecoverableWebSearchError extends Error {
 
 export function createWebSearchTool(config: WebSearchToolConfig): ToolDefinition<WebSearchInput, WebSearchOutput> {
   const provider = config.provider ?? 'brave';
-  if ((provider === 'brave' || provider === 'serper') && !config.apiKey) {
+  if ((provider === 'brave' || provider === 'serper' || provider === 'parallel') && !config.apiKey) {
     throw new Error(`createWebSearchTool requires apiKey when provider is ${provider}`);
   }
 
@@ -134,6 +148,7 @@ export function createWebSearchTool(config: WebSearchToolConfig): ToolDefinition
   const baseUrl = config.baseUrl ?? getDefaultWebSearchBaseUrl(provider);
   const timeoutMs = config.timeoutMs ?? DEFAULT_WEB_TOOL_TIMEOUT_MS;
   const maxResponseBodyBytes = config.maxResponseBodyBytes ?? DEFAULT_MAX_RESPONSE_BODY_BYTES;
+  const estimatedCostPerRequestUSD = config.estimatedCostPerRequestUSD;
   const cache = new Map<string, WebSearchOutput>();
 
   return {
@@ -208,10 +223,11 @@ export function createWebSearchTool(config: WebSearchToolConfig): ToolDefinition
       } = input as unknown as WebSearchInput;
       const count = perCallMax ?? maxResults;
       const effectiveQuery = buildEffectiveSearchQuery(query, { domainHints, excludeDomains, exactPhrases });
+      const providerQuery = provider === 'parallel' ? query.trim() : effectiveQuery;
       const cacheKey = JSON.stringify({
         runId: context.runId,
         provider,
-        effectiveQuery,
+        query: providerQuery,
         count,
         purpose,
         expectedUse,
@@ -223,7 +239,7 @@ export function createWebSearchTool(config: WebSearchToolConfig): ToolDefinition
       });
       const cached = cache.get(cacheKey);
       if (cached) {
-        return cached;
+        return cloneWebSearchOutputWithCachedDiagnostics(cached);
       }
 
       try {
@@ -242,6 +258,16 @@ export function createWebSearchTool(config: WebSearchToolConfig): ToolDefinition
             apiKey: config.apiKey!,
             query: effectiveQuery,
             count,
+            baseUrl,
+            maxResponseBodyBytes,
+            signal: context.signal,
+          });
+        } else if (provider === 'parallel') {
+          execution = await searchParallel({
+            apiKey: config.apiKey!,
+            input: { query, purpose, expectedUse, freshnessRequired, domainHints, excludeDomains, exactPhrases, answerType },
+            count,
+            runId: context.runId,
             baseUrl,
             maxResponseBodyBytes,
             signal: context.signal,
@@ -304,6 +330,9 @@ export function createWebSearchTool(config: WebSearchToolConfig): ToolDefinition
     formatResultForModel(output) {
       return formatWebSearchOutputForModel(output);
     },
+    getAccounting(output) {
+      return getWebSearchAccounting(output, provider, estimatedCostPerRequestUSD);
+    },
   };
 }
 
@@ -314,6 +343,10 @@ function getDefaultWebSearchBaseUrl(provider: WebSearchProvider): string {
 
   if (provider === 'serper') {
     return SERPER_BASE_URL;
+  }
+
+  if (provider === 'parallel') {
+    return PARALLEL_BASE_URL;
   }
 
   return DUCKDUCKGO_BASE_URL;
@@ -521,6 +554,128 @@ async function searchSerper({
   };
 }
 
+async function searchParallel({
+  apiKey,
+  input,
+  count,
+  runId,
+  baseUrl,
+  maxResponseBodyBytes,
+  signal,
+}: {
+  apiKey: string;
+  input: WebSearchInput;
+  count: number;
+  runId: string;
+  baseUrl: string;
+  maxResponseBodyBytes: number;
+  signal: AbortSignal;
+}): Promise<WebSearchExecutionResult> {
+  const url = new URL(`${baseUrl.replace(/\/$/, '')}/search`);
+  const excludeDomains = (input.excludeDomains ?? []).flatMap((domain) => {
+    const normalized = normalizeDomainHint(domain);
+    return normalized ? [normalized] : [];
+  });
+  const body = {
+    objective: buildParallelSearchObjective(input),
+    search_queries: [buildParallelSearchQuery(input)],
+    max_chars_total: DEFAULT_PARALLEL_SEARCH_MAX_CHARS_TOTAL,
+    session_id: runId,
+    advanced_settings: {
+      max_results: count,
+      excerpt_settings: {
+        max_chars_per_result: DEFAULT_PARALLEL_SEARCH_MAX_CHARS_PER_RESULT,
+      },
+      ...(excludeDomains.length === 0
+        ? {}
+        : {
+            source_policy: {
+              exclude_domains: excludeDomains,
+            },
+          }),
+    },
+  };
+
+  const response = await fetch(url.toString(), {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+
+  if (!response.ok) {
+    const errorText = await readResponseTextWithinLimit(response, maxResponseBodyBytes, signal).catch(() => 'unknown error');
+    throw createRecoverableWebSearchError({
+      query: input.query,
+      provider: 'parallel',
+      kind: 'http_error',
+      message: `Parallel Search API returned ${response.status}: ${errorText}`,
+      status: response.status,
+    });
+  }
+
+  const data = (await response.json()) as ParallelSearchResponse;
+  return {
+    results: (data.results ?? [])
+      .flatMap((result) => {
+        const resultUrl = result.url?.trim();
+        if (!resultUrl) {
+          return [];
+        }
+        return [
+          {
+            title: result.title?.trim() || resultUrl,
+            url: resultUrl,
+            snippet: truncateParallelSnippet((result.excerpts ?? []).join('\n\n')),
+          },
+        ];
+      })
+      .slice(0, count),
+    diagnostics: {
+      provider: 'parallel',
+      providerPath: 'api',
+    },
+  };
+}
+
+function buildParallelSearchQuery(input: WebSearchInput): string {
+  const terms = [input.query.trim()];
+  for (const phrase of input.exactPhrases ?? []) {
+    const trimmed = phrase.trim();
+    if (trimmed) {
+      terms.push(`"${trimmed.replace(/"/g, '')}"`);
+    }
+  }
+  return terms.filter(Boolean).join(' ');
+}
+
+function buildParallelSearchObjective(input: WebSearchInput): string {
+  const parts = [input.purpose?.trim() || input.query.trim()];
+  if (input.expectedUse) parts.push(`Expected use: ${input.expectedUse}.`);
+  if (input.freshnessRequired) parts.push('Prefer current and recently updated sources.');
+  if (input.answerType) parts.push(`Expected answer type: ${input.answerType}.`);
+  const domainHints = (input.domainHints ?? []).flatMap((domain) => {
+    const normalized = normalizeDomainHint(domain);
+    return normalized ? [normalized] : [];
+  });
+  if (domainHints.length > 0) {
+    parts.push(`Prefer sources from these domains when relevant, but do not restrict recall to them: ${domainHints.join(', ')}.`);
+  }
+  return parts.filter(Boolean).join(' ');
+}
+
+function truncateParallelSnippet(snippet: string): string {
+  const trimmed = snippet.trim();
+  if (trimmed.length <= DEFAULT_PARALLEL_SEARCH_MAX_CHARS_PER_RESULT) {
+    return trimmed;
+  }
+  return `${trimmed.slice(0, DEFAULT_PARALLEL_SEARCH_MAX_CHARS_PER_RESULT)}[truncated]`;
+}
+
 async function searchDuckDuckGo({
   query,
   count,
@@ -677,6 +832,44 @@ function attachWebSearchDiagnostics(output: WebSearchOutput, diagnostics: WebSea
   });
 
   return output;
+}
+
+function cloneWebSearchOutputWithCachedDiagnostics(output: WebSearchOutput): WebSearchOutput {
+  const diagnostics = getWebSearchDiagnostics(output);
+  if (!diagnostics) {
+    return output;
+  }
+  return attachWebSearchDiagnostics({ ...output }, { ...diagnostics, cached: true });
+}
+
+function getWebSearchAccounting(
+  output: WebSearchOutput,
+  configuredProvider: WebSearchProvider,
+  estimatedCostPerRequestUSD: number | undefined,
+): ToolAccounting | undefined {
+  if (!Array.isArray(output.results) && !output.error) {
+    return undefined;
+  }
+
+  const diagnostics = getWebSearchDiagnostics(output);
+  const provider = diagnostics?.provider ?? output.error?.provider ?? configuredProvider;
+  const cached = diagnostics?.cached === true;
+  const requests = cached ? 0 : 1;
+  const defaultCost = provider === 'duckduckgo' ? 0 : undefined;
+  const perRequestCost = estimatedCostPerRequestUSD ?? defaultCost;
+
+  return {
+    provider,
+    operation: 'web_search',
+    billable: provider !== 'duckduckgo',
+    ...(cached ? { cached } : {}),
+    units: { requests },
+    ...(perRequestCost === undefined ? {} : { estimatedCostUSD: requests * perRequestCost }),
+    pricingSource:
+      estimatedCostPerRequestUSD === undefined
+        ? provider === 'duckduckgo' ? 'default_zero' : 'unpriced'
+        : 'configured',
+  };
 }
 
 function summarizeWebSearchOutput(output: WebSearchOutput): JsonValue {

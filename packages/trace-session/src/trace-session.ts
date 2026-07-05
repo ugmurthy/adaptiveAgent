@@ -42,6 +42,7 @@ export type {
   SessionUsageSummary,
   SessionlessRunListItem,
   TimelineEntry,
+  ToolAccountingSummary,
   TopRunUsage,
   TopToolMetric,
   TopToolSpan,

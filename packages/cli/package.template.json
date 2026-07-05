@@ -1,0 +1,25 @@
+{
+  "name": "__CLI_PACKAGE_NAME__",
+  "version": "0.0.0",
+  "description": "Adaptive Agent CLI",
+  "license": "MIT",
+  "homepage": "https://github.com/ugmurthy/adaptiveAgent",
+  "bugs": {
+    "url": "https://github.com/ugmurthy/adaptiveAgent/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ugmurthy/adaptiveAgent.git"
+  },
+  "bin": {
+    "adaptive-agent": "./bin/adaptive-agent.js",
+    "trace-session": "./bin/trace-session.js"
+  },
+  "optionalDependencies": {
+    "__DARWIN_ARM64_PACKAGE_NAME__": "0.0.0",
+    "__DARWIN_X64_PACKAGE_NAME__": "0.0.0",
+    "__LINUX_ARM64_PACKAGE_NAME__": "0.0.0",
+    "__LINUX_X64_PACKAGE_NAME__": "0.0.0",
+    "__WIN32_X64_PACKAGE_NAME__": "0.0.0"
+  }
+}

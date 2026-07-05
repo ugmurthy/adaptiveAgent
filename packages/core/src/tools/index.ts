@@ -20,4 +20,4 @@ export { createWebSearchTool } from './web-search.js';
 export type { WebSearchProvider, WebSearchToolConfig } from './web-search.js';
 
 export { createReadWebPageTool } from './read-web-page.js';
-export type { ReadWebPageToolConfig } from './read-web-page.js';
+export type { ReadWebPageProvider, ReadWebPageToolConfig } from './read-web-page.js';

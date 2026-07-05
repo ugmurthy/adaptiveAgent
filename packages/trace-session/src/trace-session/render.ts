@@ -24,6 +24,7 @@ import type {
   SessionUsageSummary,
   SessionlessRunListItem,
   TimelineEntry,
+  ToolAccountingSummary,
   TraceDiagnostics,
   TraceFinding,
   TraceMessage,
@@ -316,7 +317,17 @@ export function renderUsageReport(usage: SessionUsageSummary, options: Pick<CliO
     return JSON.stringify(usage, null, 2);
   }
 
-  const lines = [formatUsageSummary(usage.total)];
+  const modelTotal = sumProviderModelUsage(usage.byProviderModel ?? []);
+  const toolOutputTotal = sumProviderModelUsage(usage.toolOutputByProviderModel ?? []);
+  const toolAccounting = usage.toolAccounting;
+  const grandTotalCostUSD = usage.total.estimatedCostUSD + (toolAccounting?.estimatedCostUSD ?? 0);
+  const lines = [
+    `${chalk.cyan('model')} ${formatUsageSummary(modelTotal)}`,
+    `${chalk.cyan('tool output')} ${formatUsageSummary(toolOutputTotal)}`,
+    `${chalk.cyan('tool providers')} requests=${formatNumber(toolAccounting?.totalRequests ?? 0)} billable=${formatNumber(toolAccounting?.billableRequests ?? 0)} cached=${formatNumber(toolAccounting?.cachedToolCalls ?? 0)} unpriced=${formatNumber(toolAccounting?.unpricedRequests ?? 0)} cost=${formatCost(toolAccounting?.estimatedCostUSD ?? 0)}`,
+    `${chalk.cyan('combined model/tool-output')} ${formatUsageSummary(usage.total)}`,
+    `${chalk.cyan('estimated grand total')} cost=${formatCost(grandTotalCostUSD)}`,
+  ];
   if (usage.byRootRun.length > 0) {
     lines.push('');
     lines.push('Run usage by root run');
@@ -324,6 +335,7 @@ export function renderUsageReport(usage: SessionUsageSummary, options: Pick<CliO
   }
   appendProviderModelUsageLines(lines, 'Model usage by provider/model', usage.byProviderModel ?? [], 'runs');
   appendProviderModelUsageLines(lines, 'Tool-output usage by provider/model', usage.toolOutputByProviderModel ?? [], 'tool calls');
+  appendToolAccountingUsageLines(lines, usage.toolAccounting);
   return lines.join('\n');
 }
 
@@ -615,9 +627,23 @@ function renderHtmlPerformance(report: TraceReport, diagnostics: TraceDiagnostic
         ['Model / tools / snapshots', `${formatDuration(digest.cumulativeModelDurationMs)} / ${formatDuration(digest.cumulativeToolDurationMs)} / ${formatDuration(digest.cumulativeSnapshotSaveMs)}`, 'Main measured duration buckets.'],
         ['Other wall time', formatDuration(digest.otherDurationMs), 'Wall time not explained by measured buckets.'],
         ['Parallelism factor', formatRatio(digest.parallelismFactor), 'Cumulative measured time divided by wall time.'],
+        ['Tool provider cost', formatCost(digest.toolAccounting.estimatedCostUSD), `${formatNumber(digest.toolAccounting.totalRequests)} requests, ${formatNumber(digest.toolAccounting.unpricedRequests)} unpriced.`],
         ['Duration split', `total=${formatDuration(split.totalDurationMs)}`, `model=${formatDuration(split.modelDurationMs)}, tools=${formatDuration(split.toolDurationMs)}, snapshot=${formatDuration(split.snapshotSaveMs)}, other=${formatDuration(split.otherDurationMs)}`],
       ]),
       renderHtmlUsageBreakdown(report.usage),
+      htmlSubsection('Tool provider accounting', digest.toolAccounting.byProviderOperation.length === 0 ? '<p class="empty">No tool accounting payloads were available.</p>' : htmlTable(
+        ['Provider', 'Operation', 'Tool calls', 'Requests', 'Billable', 'Cached', 'Unpriced', 'Cost'],
+        digest.toolAccounting.byProviderOperation.map((row) => [
+          row.provider,
+          row.operation,
+          formatNumber(row.toolCalls),
+          formatNumber(row.requests),
+          formatNumber(row.billableRequests),
+          formatNumber(row.cachedToolCalls),
+          formatNumber(row.unpricedRequests),
+          formatCost(row.estimatedCostUSD),
+        ]),
+      )),
       renderHtmlPerformanceNotes(digest),
       htmlSubsection('Model metrics', htmlTable(['Metric', 'Value', 'Meaning'], [
         ['Calls', `started=${formatNumber(performance.model.started)} completed=${formatNumber(performance.model.completed)} failed=${formatNumber(performance.model.failed)}`, 'Model lifecycle counts.'],
@@ -1395,6 +1421,48 @@ function appendProviderModelUsageLines(
   lines.push(renderProviderModelUsageTable(rows, countLabel));
 }
 
+function appendToolAccountingUsageLines(lines: string[], accounting: ToolAccountingSummary | undefined): void {
+  if (!accounting || accounting.byProviderOperation.length === 0) {
+    return;
+  }
+
+  lines.push('');
+  lines.push('Tool provider usage by provider/operation');
+  lines.push(renderToolAccountingUsageTable(accounting));
+}
+
+function renderToolAccountingUsageTable(accounting: ToolAccountingSummary): string {
+  return renderTable(
+    ['provider', 'operation', 'tool calls', 'requests', 'billable', 'cached', 'unpriced', 'cost'],
+    accounting.byProviderOperation.map((row) => [
+      row.provider,
+      row.operation,
+      formatNumber(row.toolCalls),
+      formatNumber(row.requests),
+      formatNumber(row.billableRequests),
+      formatNumber(row.cachedToolCalls),
+      formatNumber(row.unpricedRequests),
+      formatCost(row.estimatedCostUSD),
+    ]),
+  );
+}
+
+function sumProviderModelUsage(rows: ProviderModelUsageSummary[]): UsageSummary {
+  return rows.reduce<UsageSummary>(
+    (acc, row) => {
+      const reasoningTokens = (acc.reasoningTokens ?? 0) + (row.usage.reasoningTokens ?? 0);
+      return {
+        promptTokens: acc.promptTokens + row.usage.promptTokens,
+        completionTokens: acc.completionTokens + row.usage.completionTokens,
+        reasoningTokens: reasoningTokens > 0 ? reasoningTokens : undefined,
+        totalTokens: acc.totalTokens + row.usage.totalTokens,
+        estimatedCostUSD: acc.estimatedCostUSD + row.usage.estimatedCostUSD,
+      };
+    },
+    { promptTokens: 0, completionTokens: 0, totalTokens: 0, estimatedCostUSD: 0 },
+  );
+}
+
 function renderProviderModelUsageSections(usage: SessionUsageSummary): string | null {
   const sections: string[] = [];
   const modelUsageRows = usage.byProviderModel ?? [];
@@ -1564,7 +1632,26 @@ function renderPerformanceDigest(digest: PerformanceDigest, includeTimelineSpans
     ['model / tools / snapshots', `${formatDuration(digest.cumulativeModelDurationMs)} / ${formatDuration(digest.cumulativeToolDurationMs)} / ${formatDuration(digest.cumulativeSnapshotSaveMs)}`, 'Main cumulative duration buckets.'],
     ['other wall time', formatDuration(digest.otherDurationMs), 'Wall time not explained by measured model/tool/snapshot buckets.'],
     ['parallelism factor', formatRatio(digest.parallelismFactor), 'Cumulative measured time divided by wall time.'],
+    ['tool provider cost', `${formatCost(digest.toolAccounting.estimatedCostUSD)} estimated / ${formatNumber(digest.toolAccounting.totalRequests)} requests`, 'Call-count based tool provider cost from event accounting payloads.'],
   ]));
+
+  if (digest.toolAccounting.byProviderOperation.length > 0) {
+    lines.push('');
+    lines.push(markdownBlock('### Tool Provider Accounting'));
+    lines.push(renderTable(
+      ['provider', 'operation', 'tool calls', 'requests', 'billable', 'cached', 'unpriced', 'cost'],
+      digest.toolAccounting.byProviderOperation.map((row) => [
+        row.provider,
+        row.operation,
+        formatNumber(row.toolCalls),
+        formatNumber(row.requests),
+        formatNumber(row.billableRequests),
+        formatNumber(row.cachedToolCalls),
+        formatNumber(row.unpricedRequests),
+        formatCost(row.estimatedCostUSD),
+      ]),
+    ));
+  }
 
   if (digest.topRunsByUsage.length > 0) {
     lines.push('');

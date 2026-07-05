@@ -415,6 +415,18 @@ export interface ToolResultFormatContext {
   maxBytes: number;
 }
 
+export interface ToolAccounting {
+  provider: string;
+  operation: string;
+  billable: boolean;
+  cached?: boolean;
+  units: {
+    requests: number;
+  };
+  estimatedCostUSD?: number;
+  pricingSource?: 'configured' | 'default_zero' | 'unpriced';
+}
+
 export interface ToolDefinition<I extends JsonValue = JsonValue, O extends JsonValue = JsonValue> {
   name: string;
   description: string;
@@ -428,6 +440,7 @@ export interface ToolDefinition<I extends JsonValue = JsonValue, O extends JsonV
   budgetGroup?: string;
   summarizeResult?: (output: O) => JsonValue;
   formatResultForModel?: (output: O, context: ToolResultFormatContext) => JsonValue;
+  getAccounting?: (output: O, input: I, context: ToolContext) => ToolAccounting | undefined;
   maxModelResultBytes?: number;
   recoverError?: (error: unknown, input: I) => O | undefined;
   execute(input: I, context: ToolContext): Promise<O>;

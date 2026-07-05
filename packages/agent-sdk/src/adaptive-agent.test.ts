@@ -698,17 +698,23 @@ describe('adaptive-agent catalog command', () => {
 describe('adaptive-agent config command', () => {
   let tempDir: string;
   let originalWebSearchProvider: string | undefined;
+  let originalWebReadPageProvider: string | undefined;
   let originalBraveApiKey: string | undefined;
   let originalSerperApiKey: string | undefined;
+  let originalParallelApiKey: string | undefined;
 
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'adaptive-agent-config-'));
     originalWebSearchProvider = process.env.WEB_SEARCH_PROVIDER;
+    originalWebReadPageProvider = process.env.WEB_READ_PAGE_PROVIDER;
     originalBraveApiKey = process.env.BRAVE_SEARCH_API_KEY;
     originalSerperApiKey = process.env.SERPER_API_KEY;
+    originalParallelApiKey = process.env.PARALLEL_API_KEY;
     delete process.env.WEB_SEARCH_PROVIDER;
+    delete process.env.WEB_READ_PAGE_PROVIDER;
     delete process.env.BRAVE_SEARCH_API_KEY;
     delete process.env.SERPER_API_KEY;
+    delete process.env.PARALLEL_API_KEY;
     await writeAgentConfig(join(tempDir, 'agent.json'));
   });
 
@@ -717,6 +723,11 @@ describe('adaptive-agent config command', () => {
       delete process.env.WEB_SEARCH_PROVIDER;
     } else {
       process.env.WEB_SEARCH_PROVIDER = originalWebSearchProvider;
+    }
+    if (originalWebReadPageProvider === undefined) {
+      delete process.env.WEB_READ_PAGE_PROVIDER;
+    } else {
+      process.env.WEB_READ_PAGE_PROVIDER = originalWebReadPageProvider;
     }
     if (originalBraveApiKey === undefined) {
       delete process.env.BRAVE_SEARCH_API_KEY;
@@ -727,6 +738,11 @@ describe('adaptive-agent config command', () => {
       delete process.env.SERPER_API_KEY;
     } else {
       process.env.SERPER_API_KEY = originalSerperApiKey;
+    }
+    if (originalParallelApiKey === undefined) {
+      delete process.env.PARALLEL_API_KEY;
+    } else {
+      process.env.PARALLEL_API_KEY = originalParallelApiKey;
     }
     await rm(tempDir, { recursive: true, force: true });
   });
@@ -741,6 +757,7 @@ describe('adaptive-agent config command', () => {
       expect(exitCode).toBe(0);
       expect(rendered).toContain('model: ollama/qwen3.5');
       expect(rendered).toContain('webSearchProvider: duckduckgo');
+      expect(rendered).toContain('readWebPageProvider: direct');
     } finally {
       log.mockRestore();
     }
@@ -753,10 +770,46 @@ describe('adaptive-agent config command', () => {
 
     try {
       const exitCode = await main(['config', '--cwd', tempDir, '--output', 'json']);
-      const output = JSON.parse(String(log.mock.calls[0]?.[0])) as { webSearch?: { provider?: string } };
+      const output = JSON.parse(String(log.mock.calls[0]?.[0])) as { webSearch?: { provider?: string }; readWebPage?: { provider?: string } };
 
       expect(exitCode).toBe(0);
       expect(output.webSearch?.provider).toBe('brave');
+      expect(output.readWebPage?.provider).toBe('direct');
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('reports Parallel providers when configured independently', async () => {
+    process.env.WEB_SEARCH_PROVIDER = 'parallel';
+    process.env.WEB_READ_PAGE_PROVIDER = 'parallel';
+    process.env.PARALLEL_API_KEY = 'parallel-key';
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      const exitCode = await main(['config', '--cwd', tempDir, '--output', 'json']);
+      const output = JSON.parse(String(log.mock.calls[0]?.[0])) as { webSearch?: { provider?: string }; readWebPage?: { provider?: string } };
+
+      expect(exitCode).toBe(0);
+      expect(output.webSearch?.provider).toBe('parallel');
+      expect(output.readWebPage?.provider).toBe('parallel');
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('falls back when Parallel providers are configured without an API key', async () => {
+    process.env.WEB_SEARCH_PROVIDER = 'parallel';
+    process.env.WEB_READ_PAGE_PROVIDER = 'parallel';
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      const exitCode = await main(['config', '--cwd', tempDir, '--output', 'json']);
+      const output = JSON.parse(String(log.mock.calls[0]?.[0])) as { webSearch?: { provider?: string }; readWebPage?: { provider?: string } };
+
+      expect(exitCode).toBe(0);
+      expect(output.webSearch?.provider).toBe('duckduckgo');
+      expect(output.readWebPage?.provider).toBe('direct');
     } finally {
       log.mockRestore();
     }
@@ -772,6 +825,8 @@ describe('adaptive-agent config command', () => {
       expect(exitCode).toBe(0);
       expect(rendered).toContain('webSearchProvider');
       expect(rendered).toContain('duckduckgo');
+      expect(rendered).toContain('readWebPageProvider');
+      expect(rendered).toContain('direct');
     } finally {
       log.mockRestore();
     }
@@ -784,10 +839,11 @@ describe('adaptive-agent config command', () => {
 
     try {
       const exitCode = await main(['run', '--dry-run', '--cwd', tempDir, '--output', 'json', 'hello']);
-      const output = JSON.parse(String(log.mock.calls[0]?.[0])) as { webSearch?: { provider?: string } };
+      const output = JSON.parse(String(log.mock.calls[0]?.[0])) as { webSearch?: { provider?: string }; readWebPage?: { provider?: string } };
 
       expect(exitCode).toBe(0);
       expect(output.webSearch?.provider).toBe('brave');
+      expect(output.readWebPage?.provider).toBe('direct');
     } finally {
       log.mockRestore();
     }

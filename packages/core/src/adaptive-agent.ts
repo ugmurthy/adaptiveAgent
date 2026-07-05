@@ -74,6 +74,7 @@ import type {
   RunSnapshot,
   RunStatus,
   ToolBudget,
+  ToolAccounting,
   ToolContext,
   ToolDefinition,
   UsageSummary,
@@ -2536,6 +2537,7 @@ export class AdaptiveAgent {
       const modelOutput = this.formatToolOutputForModel(run, pendingToolCall, tool, output);
 
       const durationMs = Date.now() - toolStartedAt;
+      const accounting = this.getToolAccounting(tool, output, pendingToolCall.input, toolContext);
       if (!emitsToolLifecycle) {
         const eventInput = captureToolInputForLog(tool, pendingToolCall.input, this.defaultCaptureMode);
         const eventOutput = tool.summarizeResult ? tool.summarizeResult(output) : output;
@@ -2575,6 +2577,7 @@ export class AdaptiveAgent {
         ...(pendingToolCall.assistantContent === undefined ? {} : { assistantContent: pendingToolCall.assistantContent }),
         ...(eventInput === undefined ? {} : { input: eventInput }),
         output: eventOutput,
+        ...(accounting === undefined ? {} : { accounting: accounting as unknown as JsonValue }),
         performance: completionPerformance,
       };
 
@@ -2626,6 +2629,10 @@ export class AdaptiveAgent {
           timeoutMs: toolTimeoutMs,
           recovered: recoveredOutput !== undefined,
         });
+        const accounting =
+          recoveredOutput === undefined
+            ? undefined
+            : this.getToolAccounting(tool, recoveredOutput, pendingToolCall.input, toolContext);
         this.logToolFailed(
           run,
           pendingToolCall.stepId,
@@ -2655,6 +2662,7 @@ export class AdaptiveAgent {
             error: error instanceof Error ? error.message : String(error),
             recoverable: recoveredOutput !== undefined,
             ...(recoveredEventOutput === undefined ? {} : { output: recoveredEventOutput }),
+            ...(accounting === undefined ? {} : { accounting: accounting as unknown as JsonValue }),
             performance,
           },
         };
@@ -2713,6 +2721,7 @@ export class AdaptiveAgent {
     const eventInput = captureToolInputForLog(tool, pendingToolCall.input, this.defaultCaptureMode);
     const budgetOutput = output ?? createBudgetExhaustedToolOutput(tool.name, budgetGroup!, budget?.onExhausted);
     const modelOutput = this.formatToolOutputForModel(run, pendingToolCall, tool, budgetOutput);
+    const accounting = this.getToolAccounting(tool, budgetOutput, pendingToolCall.input, toolContext);
     const performance = toolCompletionPerformanceMetrics({
       input: pendingToolCall.input,
       eventInput,
@@ -2750,6 +2759,7 @@ export class AdaptiveAgent {
             ...(pendingToolCall.assistantContent === undefined ? {} : { assistantContent: pendingToolCall.assistantContent }),
             ...(eventInput === undefined ? {} : { input: eventInput }),
             output: budgetOutput,
+            ...(accounting === undefined ? {} : { accounting: accounting as unknown as JsonValue }),
             ...(budgetGroup === undefined ? {} : { budgetGroup }),
             skipped: true,
             performance,
@@ -3031,6 +3041,15 @@ export class AdaptiveAgent {
       abort: (reason?: unknown) => controller.abort(reason),
       emit: (event) => Promise.resolve(this.emit(event)),
     };
+  }
+
+  private getToolAccounting<I extends JsonValue, O extends JsonValue>(
+    tool: ToolDefinition<I, O>,
+    output: O,
+    input: JsonValue,
+    context: ToolContext,
+  ): ToolAccounting | undefined {
+    return tool.getAccounting?.(output, input as I, context);
   }
 
   private resolveAvailableToolNamesForRun(run: AgentRun): Set<string> | undefined {

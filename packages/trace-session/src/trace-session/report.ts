@@ -13,6 +13,7 @@ import type {
   RunSnapshotSummary,
   RunTreeEntry,
   SessionOverview,
+  ToolAccountingSummary,
   TopRunUsage,
   TopToolMetric,
   TimelineEntry,
@@ -103,6 +104,7 @@ export function buildTimeline(rows: TraceRow[], options: { onlyDelegates?: boole
       outcome,
       childRunId,
       eventSeq: row.event_seq,
+      accounting: payloadValue(row.payload, 'accounting') ?? existing?.accounting,
     });
 
     if (output !== null && output !== undefined) {
@@ -542,6 +544,7 @@ function buildPerformanceDigest(
   const topToolsByDuration = topToolMetrics(performance.tools.byTool, (tool) => tool.durationMs.total);
   const topToolsByModelOutput = topToolMetrics(performance.tools.byTool, (tool) => tool.modelOutputBytes.total);
   const topRunsByUsage = buildTopRunsByUsage(report);
+  const toolAccounting = buildToolAccountingSummary(report.timeline);
   const notes: string[] = [];
 
   if (parallelismFactor !== null && parallelismFactor > 1.25) {
@@ -552,6 +555,9 @@ function buildPerformanceDigest(
   }
   if (performance.tools.rawOutputBytes.total > performance.tools.modelOutputBytes.total) {
     notes.push('Tool raw output is larger than model-visible output; tool summarization/compression is reducing context load.');
+  }
+  if (toolAccounting.unpricedRequests > 0) {
+    notes.push(`${toolAccounting.unpricedRequests} provider request(s) did not have configured per-request pricing, so tool cost is under-estimated.`);
   }
 
   return {
@@ -566,7 +572,72 @@ function buildPerformanceDigest(
     topToolsByDuration,
     topToolsByModelOutput,
     topRunsByUsage,
+    toolAccounting,
     notes,
+  };
+}
+
+function buildToolAccountingSummary(timeline: TimelineEntry[]): ToolAccountingSummary {
+  const groups = new Map<string, ToolAccountingSummary['byProviderOperation'][number]>();
+  let totalRequests = 0;
+  let billableRequests = 0;
+  let cachedToolCalls = 0;
+  let unpricedRequests = 0;
+  let estimatedCostUSD = 0;
+
+  for (const entry of timeline) {
+    const accounting = readToolAccounting(entry.accounting);
+    if (!accounting) {
+      continue;
+    }
+
+    const key = `${accounting.provider}\n${accounting.operation}`;
+    const group = groups.get(key) ?? {
+      provider: accounting.provider,
+      operation: accounting.operation,
+      toolCalls: 0,
+      requests: 0,
+      billableRequests: 0,
+      cachedToolCalls: 0,
+      unpricedRequests: 0,
+      estimatedCostUSD: 0,
+    };
+
+    group.toolCalls += 1;
+    group.requests += accounting.requests;
+    totalRequests += accounting.requests;
+
+    if (accounting.billable) {
+      group.billableRequests += accounting.requests;
+      billableRequests += accounting.requests;
+    }
+    if (accounting.cached) {
+      group.cachedToolCalls += 1;
+      cachedToolCalls += 1;
+    }
+    if (accounting.estimatedCostUSD === undefined && accounting.requests > 0) {
+      group.unpricedRequests += accounting.requests;
+      unpricedRequests += accounting.requests;
+    } else if (accounting.estimatedCostUSD !== undefined) {
+      group.estimatedCostUSD += accounting.estimatedCostUSD;
+      estimatedCostUSD += accounting.estimatedCostUSD;
+    }
+
+    groups.set(key, group);
+  }
+
+  return {
+    totalRequests,
+    billableRequests,
+    cachedToolCalls,
+    unpricedRequests,
+    estimatedCostUSD,
+    byProviderOperation: [...groups.values()].sort((left, right) =>
+      right.estimatedCostUSD - left.estimatedCostUSD
+      || right.requests - left.requests
+      || left.provider.localeCompare(right.provider)
+      || left.operation.localeCompare(right.operation),
+    ),
   };
 }
 
@@ -1414,6 +1485,37 @@ function finishBucket(bucket: PerformanceBucketAccumulator): PerformanceBucketSu
 
 function payloadPerformance(payload: unknown): Record<string, unknown> | null {
   return asRecord(payloadValue(payload, 'performance'));
+}
+
+function readToolAccounting(value: unknown): {
+  provider: string;
+  operation: string;
+  billable: boolean;
+  cached: boolean;
+  requests: number;
+  estimatedCostUSD?: number;
+} | null {
+  const record = asRecord(value);
+  if (!record) {
+    return null;
+  }
+
+  const provider = typeof record.provider === 'string' && record.provider ? record.provider : undefined;
+  const operation = typeof record.operation === 'string' && record.operation ? record.operation : undefined;
+  const units = asRecord(record.units);
+  const requests = units ? readNumber(units, 'requests') : undefined;
+  if (!provider || !operation || requests === undefined || requests < 0) {
+    return null;
+  }
+
+  return {
+    provider,
+    operation,
+    billable: record.billable === true,
+    cached: record.cached === true,
+    requests,
+    estimatedCostUSD: readNumber(record, 'estimatedCostUSD'),
+  };
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

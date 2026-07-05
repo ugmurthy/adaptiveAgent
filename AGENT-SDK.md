@@ -582,7 +582,7 @@ Resolution behavior:
 - file tools use resolved `workspaceRoot` as `allowedRoot`
 - `shell_exec` uses resolved `shellCwd`
 - `web_search` should follow the same local provider conventions as current CLI logic
-- `read_web_page` should be enabled without special config beyond timeout env if needed
+- `read_web_page` should use direct HTTP fetch by default, or Parallel Extract when `WEB_READ_PAGE_PROVIDER=parallel` and `PARALLEL_API_KEY` are set
 
 If an agent references an unknown tool, fail during SDK creation with a clear error listing the missing and available tool names.
 
@@ -1113,6 +1113,8 @@ If later desired, the CLI may converge toward the SDK config model, but the SDK 
   },
   "env": {
     "WEB_SEARCH_PROVIDER": "brave",
+    "WEB_READ_PAGE_PROVIDER": "parallel",
+    "PARALLEL_API_KEY": "${PARALLEL_API_KEY}",
     "WEB_TOOL_TIMEOUT_MS": "15000"
   }
 }

@@ -794,6 +794,46 @@ describe('createWebSearchTool', () => {
     expect(JSON.parse(init.body as string)).toEqual({ q: 'test query', num: 5 });
   });
 
+  it('reports configured provider accounting and zero incremental cost for cache hits', async () => {
+    const tool = createWebSearchTool({
+      provider: 'serper',
+      apiKey: 'serper-key',
+      estimatedCostPerRequestUSD: 0.002,
+    });
+
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          organic: [{ title: 'Result 1', link: 'https://example.com/1', snippet: 'First result' }],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    const context = stubToolContext({ runId: 'run-accounting' });
+    const first = (await tool.execute({ query: 'test query' } as any, context)) as any;
+    const cached = (await tool.execute({ query: 'test query' } as any, context)) as any;
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(tool.getAccounting?.(first, { query: 'test query' } as any, context)).toEqual({
+      provider: 'serper',
+      operation: 'web_search',
+      billable: true,
+      units: { requests: 1 },
+      estimatedCostUSD: 0.002,
+      pricingSource: 'configured',
+    });
+    expect(tool.getAccounting?.(cached, { query: 'test query' } as any, context)).toEqual({
+      provider: 'serper',
+      operation: 'web_search',
+      billable: true,
+      cached: true,
+      units: { requests: 0 },
+      estimatedCostUSD: 0,
+      pricingSource: 'configured',
+    });
+  });
+
   it('passes Serper maxResults as num and applies structured search hints', async () => {
     const tool = createWebSearchTool({ provider: 'serper', apiKey: 'serper-key', maxResults: 1 });
 
@@ -825,6 +865,89 @@ describe('createWebSearchTool', () => {
     expect(JSON.parse(init.body as string)).toEqual({
       q: 'test "quoted fact" site:example.org -site:spam.example',
       num: 1,
+    });
+  });
+
+  it('sends a Parallel Search request and normalizes results', async () => {
+    const tool = createWebSearchTool({ provider: 'parallel', apiKey: 'parallel-key' });
+
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          results: [
+            { title: 'Result 1', url: 'https://example.com/1', excerpts: ['First result', 'More context'] },
+            { title: null, url: 'https://example.com/2', excerpts: ['Second result'] },
+            { title: 'Malformed', excerpts: ['Missing URL'] },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    const result = (await tool.execute(
+      {
+        query: 'test query',
+        maxResults: 2,
+        purpose: 'verify a claim',
+        expectedUse: 'verify',
+        freshnessRequired: true,
+        exactPhrases: ['quoted fact'],
+        domainHints: ['https://www.example.org/path'],
+        excludeDomains: ['spam.example'],
+        answerType: 'date',
+      } as any,
+      stubToolContext({ runId: 'full-run-id-123' }),
+    )) as any;
+
+    expect(result.results).toEqual([
+      { title: 'Result 1', url: 'https://example.com/1', snippet: 'First result\n\nMore context' },
+      { title: 'https://example.com/2', url: 'https://example.com/2', snippet: 'Second result' },
+    ]);
+    expect(tool.summarizeResult?.(result)).toMatchObject({
+      provider: 'parallel',
+      providerPath: 'api',
+      resultCount: 2,
+    });
+
+    const [url, init] = fetchSpy.mock.calls[0];
+    expect(url).toBe('https://api.parallel.ai/v1/search');
+    expect(init.method).toBe('POST');
+    expect(init.headers['x-api-key']).toBe('parallel-key');
+    const body = JSON.parse(init.body as string);
+    expect(body).toMatchObject({
+      search_queries: ['test query "quoted fact"'],
+      max_chars_total: 8000,
+      session_id: 'full-run-id-123',
+      advanced_settings: {
+        max_results: 2,
+        excerpt_settings: { max_chars_per_result: 2000 },
+        source_policy: { exclude_domains: ['spam.example'] },
+      },
+    });
+    expect(body.objective).toContain('verify a claim');
+    expect(body.objective).toContain('example.org');
+    expect(body.search_queries[0]).not.toContain('site:example.org');
+  });
+
+  it('requires an apiKey for Parallel Search', () => {
+    expect(() => createWebSearchTool({ provider: 'parallel' })).toThrow('requires apiKey');
+  });
+
+  it('returns a recoverable error on Parallel Search non-OK response', async () => {
+    const tool = createWebSearchTool({ provider: 'parallel', apiKey: 'key' });
+
+    fetchSpy.mockResolvedValueOnce(new Response('forbidden', { status: 403 }));
+
+    const result = (await executeRecoverableTool(tool, { query: 'test' })) as any;
+
+    expect(result).toMatchObject({
+      query: 'test',
+      results: [],
+      error: {
+        kind: 'http_error',
+        status: 403,
+        provider: 'parallel',
+      },
     });
   });
 
@@ -1230,6 +1353,91 @@ describe('createReadWebPageTool', () => {
     )) as any;
 
     expect(result.relevantExcerpts).toEqual(['The Apollo 11 landing date was July 20, 1969.']);
+  });
+
+  it('sends a Parallel Extract request and uses full content', async () => {
+    const tool = createReadWebPageTool({ provider: 'parallel', apiKey: 'parallel-key', maxTextLength: 50 });
+
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          results: [
+            {
+              url: 'https://example.com/page',
+              title: 'Parallel Page',
+              full_content: 'Full page content from Parallel',
+              excerpts: ['Relevant Parallel excerpt'],
+            },
+          ],
+          errors: [],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    const result = (await tool.execute(
+      { url: 'https://example.com/page', objective: 'specific fact' } as any,
+      stubToolContext({ runId: 'full-run-id-123' }),
+    )) as any;
+
+    expect(result).toMatchObject({
+      url: 'https://example.com/page',
+      title: 'Parallel Page',
+      text: 'Full page content from Parallel',
+      relevantExcerpts: ['Relevant Parallel excerpt'],
+      textLength: 'Full page content from Parallel'.length,
+      truncated: false,
+    });
+    expect(result.bytesFetched).toBe(Buffer.byteLength('Full page content from Parallel', 'utf8'));
+
+    const [url, init] = fetchSpy.mock.calls[0];
+    expect(url).toBe('https://api.parallel.ai/v1/extract');
+    expect(init.method).toBe('POST');
+    expect(init.headers['x-api-key']).toBe('parallel-key');
+    expect(JSON.parse(init.body as string)).toMatchObject({
+      urls: ['https://example.com/page'],
+      objective: 'specific fact',
+      max_chars_total: 100000,
+      session_id: 'full-run-id-123',
+      advanced_settings: {
+        excerpt_settings: { max_chars_per_result: 50 },
+        full_content: { max_chars_per_result: 100 },
+      },
+    });
+  });
+
+  it('falls back to Parallel Extract excerpts and maps per-URL errors', async () => {
+    const tool = createReadWebPageTool({ provider: 'parallel', apiKey: 'parallel-key' });
+
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ results: [{ url: 'https://example.com/page', title: null, excerpts: ['Only excerpt'] }], errors: [] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    const result = (await tool.execute({ url: 'https://example.com/page' } as any, stubToolContext())) as any;
+    expect(result).toMatchObject({ title: '', text: 'Only excerpt' });
+
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          results: [],
+          errors: [{ url: 'https://example.com/fail', error_type: 'fetch_error', http_status_code: 500, content: 'fetch failed' }],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    const errorResult = (await executeRecoverableTool(tool, { url: 'https://example.com/fail' })) as any;
+    expect(errorResult).toMatchObject({
+      url: 'https://example.com/fail',
+      error: { kind: 'http_error', status: 500, message: 'fetch failed' },
+    });
+  });
+
+  it('requires an apiKey for Parallel Extract', () => {
+    expect(() => createReadWebPageTool({ provider: 'parallel' })).toThrow('requires apiKey');
   });
 
   it('extracts text from PDFs', async () => {
