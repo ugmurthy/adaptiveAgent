@@ -2,6 +2,16 @@
   "name": "__CLI_PACKAGE_NAME__",
   "version": "0.0.0",
   "description": "Adaptive Agent CLI",
+  "keywords": [
+    "adaptive-agent",
+    "agent",
+    "ai-agent",
+    "cli",
+    "trace-session",
+    "llm",
+    "postgres",
+    "observability"
+  ],
   "license": "MIT",
   "homepage": "https://github.com/ugmurthy/adaptiveAgent",
   "bugs": {

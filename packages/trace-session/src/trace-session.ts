@@ -1,6 +1,8 @@
 #!/usr/bin/env bun
 
 export { main, parseArgs } from './trace-session/cli.js';
+export { createTracePostgresPool, resolveTracePostgresConfig } from './db.js';
+export type { TraceConfigOptions, TracePostgresConfig, TracePostgresPool } from './db.js';
 export { listSessionlessRuns, listSessionPerformance, listSessions, loadUsageForTraceTarget, traceSession } from './trace-session/data.js';
 export {
   buildTraceDiagnostics,

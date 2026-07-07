@@ -78,6 +78,7 @@ This monorepo is intentionally small:
 - `@adaptive-agent/core` in `packages/core`: runtime semantics, durable stores, events, snapshots, tools, delegation, retry, and continuation.
 - `@adaptive-agent/agent-sdk` in `packages/agent-sdk`: user-facing `adaptive-agent` CLI, config loading, built-in tool registration, install/update flows, and evaluation helpers.
 - `@adaptive-agent/trace-session` in `packages/trace-session`: standalone Postgres trace reporter for core runtime runs and optional legacy gateway session tables.
+- `@adaptive-agent/trace-workbench` in `packages/trace-workbench`: Bun + Svelte trace workbench for choosing persisted sessions/runs, exploring timelines, resource spend, messages, diagnostics, and exporting markdown/PDF reports.
 
 Useful local commands:
 
@@ -85,4 +86,5 @@ Useful local commands:
 bun run core:test
 bun run agent:build
 bun run trace-session --run <run-id>
+bun run trace-workbench:dev
 ```

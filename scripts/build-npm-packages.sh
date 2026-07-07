@@ -7,6 +7,7 @@ NPM_OUT_DIR="${ADAPTIVE_AGENT_NPM_DIR:-$ROOT_DIR/dist/npm}"
 NPM_SCOPE="${ADAPTIVE_AGENT_NPM_SCOPE:-@adaptive-agent}"
 CLI_TEMPLATE="$ROOT_DIR/packages/cli/package.template.json"
 CLI_BIN_DIR="$ROOT_DIR/packages/cli/bin"
+CLI_README="$ROOT_DIR/packages/cli/README.md"
 
 fail() {
   printf 'build-npm-packages: %s\n' "$1" >&2
@@ -129,6 +130,7 @@ write_wrapper_package() {
   rm -rf "$package_dir"
   mkdir -p "$package_dir/bin"
   replace_tokens "$CLI_TEMPLATE" "$package_dir/package.json"
+  cp "$CLI_README" "$package_dir/README.md"
   replace_tokens "$CLI_BIN_DIR/adaptive-agent.js" "$package_dir/bin/adaptive-agent.js"
   replace_tokens "$CLI_BIN_DIR/trace-session.js" "$package_dir/bin/trace-session.js"
   chmod 755 "$package_dir/bin/adaptive-agent.js" "$package_dir/bin/trace-session.js"
@@ -143,6 +145,7 @@ esac
 VERSION=${TAG#v}
 
 [ -f "$CLI_TEMPLATE" ] || fail "missing CLI package template: $CLI_TEMPLATE"
+[ -f "$CLI_README" ] || fail "missing CLI README: $CLI_README"
 [ -f "$CLI_BIN_DIR/adaptive-agent.js" ] || fail "missing wrapper bin script: $CLI_BIN_DIR/adaptive-agent.js"
 [ -f "$CLI_BIN_DIR/trace-session.js" ] || fail "missing wrapper bin script: $CLI_BIN_DIR/trace-session.js"
 
