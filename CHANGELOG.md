@@ -4,10 +4,47 @@ All notable changes to this project will be documented in this file.
 
 This project follows semantic versioning for release notes.
 
-## [Unreleased]
+## [0.1.34] - 2026-07-09
+
+### Added
+
+- Added a new context-reference spec.
+- Added context references so run outputs can be reused as evidence in later runs.
+
+## [0.1.33] - 2026-07-07
+
+### Added
+
+- Added trace workbench CLI documentation.
+
+## [0.1.32] - 2026-07-04
+
+### Added
+
+- Added Parallel as a search provider.
+- Added ambient agent cron and file support.
+
+## [0.1.31] - 2026-07-01
+
+### Added
+
+- Added recovery planner support.
+- Added `search_files` and `edit_file` tools.
+- Added ground-truth time context.
 
 ### Fixed
 
+- Improved rendering progress and HTML output.
+- Fixed usage rollups and provider/model summaries.
+- Cleaned up trace-session output formatting.
+- Captured failed `outputSchema` responses for debugging.
+- Improved retry, interrupt, inspect, and replay behavior.
+
+## [0.1.30] - 2026-06-25
+
+### Fixed
+
+- Hardened model output and tool input normalization, delegate-call handling, hidden-budget exhaustion, and oversized readable-page responses.
 - Allowed `--image` inputs to use local file paths as well as URLs.
 - Improved tool schema handling and command help readability.
 
