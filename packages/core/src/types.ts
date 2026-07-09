@@ -80,6 +80,7 @@ export type EventType =
   | 'run.failed'
   | 'recovery.analyzed'
   | 'run.continuation_created'
+  | 'context.refs.resolved'
   | 'plan.created'
   | 'plan.execution_started'
   | 'step.started'
@@ -109,6 +110,83 @@ export interface UsageSummary {
   provider?: string;
   model?: string;
 }
+
+export type ContextRef =
+  | {
+      kind: 'run';
+      id: UUID;
+      view?: 'result';
+      maxBytes?: number;
+      allowStatuses?: RunStatus[];
+    }
+  | {
+      kind: 'session';
+      id: string;
+      view?: 'run_summaries';
+      rootRunsOnly?: boolean;
+      maxRuns?: number;
+      maxBytes?: number;
+      allowStatuses?: RunStatus[];
+    };
+
+export interface ResolvedRunSummary {
+  runId: UUID;
+  sessionId?: string;
+  role?: string;
+  goal: string;
+  status: RunStatus;
+  result?: JsonValue;
+  resultPreview?: string;
+  errorCode?: string;
+  errorMessage?: string;
+  usage?: UsageSummary;
+}
+
+export interface ResolvedContextRef {
+  ref: ContextRef;
+  kind: ContextRef['kind'];
+  id: string;
+  view: string;
+  status?: RunStatus;
+  goal?: string;
+  result?: JsonValue;
+  resultPreview?: string;
+  errorCode?: string;
+  errorMessage?: string;
+  runs?: ResolvedRunSummary[];
+  warnings?: string[];
+  truncated: boolean;
+  bytes: number;
+}
+
+export interface ContextRefResolutionSummary {
+  kind: ContextRef['kind'];
+  id: string;
+  view: string;
+  status?: string;
+  runCount?: number;
+  bytes: number;
+  truncated: boolean;
+  warnings?: string[];
+}
+
+export interface ContextRefResolution {
+  refs: ContextRef[];
+  resolved: ResolvedContextRef[];
+  summary: {
+    refs: ContextRefResolutionSummary[];
+    totalBytes: number;
+  };
+}
+
+export interface ContextRefAuthorizationContext {
+  ref: ContextRef;
+  targetRun?: AgentRun;
+  requestSessionId?: string;
+  requestMetadata?: Record<string, JsonValue>;
+}
+
+export type ContextRefAuthorizer = (context: ContextRefAuthorizationContext) => boolean | Promise<boolean>;
 
 export interface ModelCapabilities {
   toolCalling: boolean;
@@ -270,6 +348,7 @@ export interface RunRequest {
   input?: JsonValue;
   images?: ImageInput[];
   contentParts?: ModelContentPart[];
+  contextRefs?: ContextRef[];
   context?: Record<string, JsonValue>;
   allowedTools?: string[];
   forbiddenTools?: string[];
@@ -286,6 +365,7 @@ export interface ChatMessage {
 export interface ChatRequest {
   sessionId?: string;
   messages: ChatMessage[];
+  contextRefs?: ContextRef[];
   context?: Record<string, JsonValue>;
   outputSchema?: JsonSchema;
   metadata?: Record<string, JsonValue>;
@@ -383,6 +463,8 @@ export interface AdaptiveAgentOptions {
   materializeFileInput?: (file: FileInput, context: { workspaceRoot: string; signal?: AbortSignal }) => Promise<PathInputSource>;
   /** Optional system instructions injected into the system prompt. Used by delegate/skill child runs. */
   systemInstructions?: string;
+  /** Optional host/gateway authorization hook for cross-run and cross-session context references. */
+  contextRefAuthorizer?: ContextRefAuthorizer;
 }
 
 export interface ToolContext {

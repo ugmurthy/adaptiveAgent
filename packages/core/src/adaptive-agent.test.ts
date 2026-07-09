@@ -156,6 +156,99 @@ describe('AdaptiveAgent', () => {
     });
   });
 
+  it('resolves run context refs into model-visible reserved context and audit events', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const source = await runStore.createRun({
+      id: 'source-run-1',
+      goal: 'Research migration options',
+      status: 'queued',
+    });
+    await runStore.updateRun(source.id, { status: 'succeeded', result: { finding: 'Use durable run refs' } }, source.version);
+    const model = new SequenceModel([{ finishReason: 'stop', text: 'done' }]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore: new InMemorySnapshotStore(),
+    });
+
+    const result = await agent.run({ goal: 'Write final brief', contextRefs: [{ kind: 'run', id: source.id }] });
+
+    const storedRun = await runStore.getRun(result.runId);
+    expect(storedRun?.metadata?.contextRefs).toMatchObject({
+      source: [{ kind: 'run', id: source.id }],
+      resolution: {
+        refs: [expect.objectContaining({ kind: 'run', id: source.id, view: 'result', status: 'succeeded' })],
+      },
+    });
+    expect(storedRun?.context?.__adaptiveAgent).toMatchObject({
+      resolvedContextRefs: [
+        expect.objectContaining({
+          kind: 'run',
+          id: source.id,
+          result: { finding: 'Use durable run refs' },
+        }),
+      ],
+    });
+    expect(model.receivedRequests[0]?.messages.some((message) =>
+      message.role === 'system' && typeof message.content === 'string' && message.content.includes('Referenced Runtime Context')
+    )).toBe(true);
+    const events = await eventStore.listByRun(result.runId);
+    expect(events.some((event) => event.type === 'context.refs.resolved')).toBe(true);
+  });
+
+  it('resolves session context refs as deterministic root-run summaries', async () => {
+    const runStore = new InMemoryRunStore();
+    const first = await runStore.createRun({ id: 'session-run-a', sessionId: 'session-ref-1', goal: 'First root', status: 'queued' });
+    await runStore.updateRun(first.id, { status: 'succeeded', result: 'first' }, first.version);
+    const parent = await runStore.createRun({ id: 'session-run-b', sessionId: 'session-ref-1', goal: 'Second root', status: 'queued' });
+    await runStore.updateRun(parent.id, { status: 'succeeded', result: 'second' }, parent.version);
+    const child = await runStore.createRun({
+      id: 'session-run-child',
+      sessionId: 'session-ref-1',
+      rootRunId: parent.id,
+      parentRunId: parent.id,
+      parentStepId: 'step-1',
+      delegateName: 'worker',
+      delegationDepth: 1,
+      goal: 'Child internal',
+      status: 'queued',
+    });
+    await runStore.updateRun(child.id, { status: 'succeeded', result: 'child' }, child.version);
+    const model = new SequenceModel([{ finishReason: 'stop', text: 'done' }]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore,
+      eventStore: new InMemoryEventStore(),
+      snapshotStore: new InMemorySnapshotStore(),
+    });
+
+    const result = await agent.run({ goal: 'Use session', contextRefs: [{ kind: 'session', id: 'session-ref-1' }] });
+
+    const storedRun = await runStore.getRun(result.runId);
+    const resolved = storedRun?.context?.__adaptiveAgent as { resolvedContextRefs?: Array<{ runs?: Array<{ runId: string }> }> } | undefined;
+    expect(resolved?.resolvedContextRefs?.[0]?.runs?.map((run) => run.runId)).toEqual(['session-run-a', 'session-run-b']);
+  });
+
+  it('rejects reserved context collisions and non-terminal refs before creating a run', async () => {
+    const runStore = new InMemoryRunStore();
+    const source = await runStore.createRun({ id: 'running-source', goal: 'Still running', status: 'running' });
+    const agent = new AdaptiveAgent({
+      model: new SequenceModel([{ finishReason: 'stop', text: 'done' }]),
+      tools: [],
+      runStore,
+      eventStore: new InMemoryEventStore(),
+      snapshotStore: new InMemorySnapshotStore(),
+    });
+
+    await expect(agent.run({ goal: 'bad context', context: { __adaptiveAgent: {} } })).rejects.toThrow('reserved');
+    await expect(agent.run({ goal: 'bad ref', contextRefs: [{ kind: 'run', id: source.id }] })).rejects.toThrow('allowed statuses');
+    expect((await runStore.listBySession('unused')).length).toBe(0);
+  });
+
   it('rewrites file content parts to read_file instructions when native file input is unavailable', async () => {
     const tempDir = await mkdtemp(join(tmpdir(), 'agent-file-policy-'));
     try {

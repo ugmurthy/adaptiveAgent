@@ -206,6 +206,7 @@ describe('adaptive-agent cli parsing', () => {
       command: 'spec',
       specPath: './tmp/spec.json',
       goalArgs: [],
+      contextRefs: [],
       imagePaths: [],
       audioPaths: [],
       fileAttachmentPaths: [],
@@ -244,6 +245,18 @@ describe('adaptive-agent cli parsing', () => {
       output: 'json',
       help: false,
     });
+  });
+
+  it('parses explicit context refs and rejects ambiguous shorthand', () => {
+    expect(parseCliArgs(['run', '--context-ref', 'run:run-123', '--context-ref', 'session:session-456', 'summarize'])).toMatchObject({
+      command: 'run',
+      goalArgs: ['summarize'],
+      contextRefs: [
+        { kind: 'run', id: 'run-123' },
+        { kind: 'session', id: 'session-456' },
+      ],
+    });
+    expect(() => parseCliArgs(['run', '--context-ref', '@run-123', 'summarize'])).toThrow('shorthand @id is not supported yet');
   });
 
   it('prints concise top-level help and focused command help', async () => {

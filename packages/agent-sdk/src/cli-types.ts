@@ -1,5 +1,6 @@
 import type {
   ChatMessage,
+  ContextRef,
   ImageInput,
   JsonSchema,
   JsonValue,
@@ -17,6 +18,7 @@ export interface ManualTestCliOptions {
   ambientConfigPath?: string;
   promptFilePath?: string;
   inputJson?: JsonValue;
+  contextRefs: ContextRef[];
   imagePaths: string[];
   audioPaths: string[];
   fileAttachmentPaths: string[];
@@ -84,6 +86,7 @@ export interface ManualTestCliOptions {
 export interface ManualChatSpec {
   mode: 'chat';
   messages: ChatMessage[];
+  contextRefs?: ContextRef[];
   context?: Record<string, JsonValue>;
   outputSchema?: JsonSchema;
   metadata?: Record<string, JsonValue>;
@@ -95,6 +98,7 @@ export interface ManualRunSpec {
   input?: JsonValue;
   images?: ImageInput[];
   contentParts?: ModelContentPart[];
+  contextRefs?: ContextRef[];
   context?: Record<string, JsonValue>;
   outputSchema?: JsonSchema;
   metadata?: Record<string, JsonValue>;

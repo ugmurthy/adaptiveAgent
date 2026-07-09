@@ -138,6 +138,7 @@ export function summarizeCli(cli: ManualTestCliOptions): Record<string, JsonValu
     command: cli.command,
     ...(cli.specPath ? { specPath: resolve(cli.specPath) } : {}),
     ...(cli.promptFilePath ? { promptFilePath: resolve(cli.promptFilePath) } : {}),
+    ...(cli.contextRefs.length > 0 ? { contextRefs: cli.contextRefs as unknown as JsonValue } : {}),
     ...(cli.imagePaths.length > 0 ? { imagePaths: cli.imagePaths.map(resolvePathUnlessUrl) } : {}),
     ...(cli.audioPaths.length > 0 ? { audioPaths: cli.audioPaths.map((path) => resolve(path)) } : {}),
     ...(cli.fileAttachmentPaths.length > 0 ? { fileAttachmentPaths: cli.fileAttachmentPaths.map((path) => resolve(path)) } : {}),
@@ -1111,6 +1112,9 @@ export function formatDryRunMarkdown(
     '## Request',
     '',
     `- \`mode\`: \`${spec.mode}\``,
+    ...(spec.contextRefs && spec.contextRefs.length > 0
+      ? [`- \`contextRefs\`: ${spec.contextRefs.map((ref) => `\`${ref.kind}:${ref.id}\``).join(', ')}`]
+      : ['- `contextRefs`: `none`']),
     ...(spec.mode === 'run'
       ? [
           `- \`goalLength\`: \`${spec.goal.length}\``,

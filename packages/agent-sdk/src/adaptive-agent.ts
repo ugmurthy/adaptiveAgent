@@ -10,6 +10,7 @@ import type {
   AgentEvent,
   ChatMessage,
   ChatResult,
+  ContextRef,
   ImageInput,
   JsonObject,
   JsonSchema,
@@ -216,6 +217,7 @@ Examples:
 Run options:
   --file <path>           Read run prompt from a file.
   --input-json <json>     JSON input passed to run requests.
+  --context-ref <ref>     Add prior context: run:<id> or session:<id>. Repeatable.
   --image <path-or-url>   Add an image attachment to a run request. Repeatable.
   --audio <path>          Add an audio attachment to a run request. Repeatable.
   --file-attachment <path>
@@ -244,6 +246,7 @@ Examples:
 
 Chat options:
   --file <path>           Read chat message from a file.
+  --context-ref <ref>     Add prior context: run:<id> or session:<id>. Repeatable.
 
 ${COMMON_AGENT_OPTIONS_TEXT}
 
@@ -992,12 +995,13 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
         mode: 'run',
         goal,
         ...(cli.inputJson === undefined ? {} : { input: cli.inputJson }),
+        ...(cli.contextRefs.length > 0 ? { contextRefs: cli.contextRefs } : {}),
         ...(cli.imagePaths.length > 0 ? { images: cli.imagePaths.map((value) => buildInlineImageInput(value, resolvedCwd)) } : {}),
         ...(cli.audioPaths.length > 0 || cli.fileAttachmentPaths.length > 0
           ? { contentParts: buildInlineContentParts(cli, resolvedCwd, { includeImages: false }) }
           : {}),
       }
-    : { mode: 'chat', messages: [{ role: 'user', content: goal }] };
+    : { mode: 'chat', messages: [{ role: 'user', content: goal }], ...(cli.contextRefs.length > 0 ? { contextRefs: cli.contextRefs } : {}) };
   await validateLocalPaths(spec);
 
   const sdkOptions = buildSdkOptions(cli, resolvedCwd);
@@ -1881,6 +1885,7 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
     command: 'spec',
     specPath: '',
     goalArgs: [],
+    contextRefs: [],
     imagePaths: [],
     audioPaths: [],
     fileAttachmentPaths: [],
@@ -2009,6 +2014,9 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
         break;
       case '--input-json':
         options.inputJson = parseJsonFlag(requireOptionValue(arg, argv[++index]), arg);
+        break;
+      case '--context-ref':
+        options.contextRefs.push(parseContextRefFlag(requireOptionValue(arg, argv[++index]), arg));
         break;
       case '--input':
         options.evalInputPath = requireOptionValue(arg, argv[++index]);
@@ -2391,6 +2399,7 @@ function summarizeAmbientStartResult(result: AmbientStartResult): JsonValue {
 
 function buildChatOptions(spec: ManualChatSpec): AgentSdkChatOptions {
   return {
+    contextRefs: spec.contextRefs,
     context: spec.context,
     outputSchema: spec.outputSchema,
     metadata: spec.metadata,
@@ -2402,6 +2411,7 @@ function buildRunOptions(spec: ManualRunSpec): AgentSdkRunOptions {
     input: spec.input,
     images: spec.images,
     contentParts: spec.contentParts,
+    contextRefs: spec.contextRefs,
     context: spec.context,
     outputSchema: spec.outputSchema,
     metadata: spec.metadata,
@@ -2484,6 +2494,7 @@ function parseManualChatSpec(raw: JsonObject, specPath: string): ManualChatSpec 
   return {
     mode: 'chat',
     messages,
+    contextRefs: parseOptionalContextRefs(raw.contextRefs, 'contextRefs'),
     context: parseOptionalRecord(raw.context, 'context'),
     outputSchema: parseOptionalSchema(raw.outputSchema),
     metadata: parseOptionalRecord(raw.metadata, 'metadata'),
@@ -2505,6 +2516,7 @@ function parseManualRunSpec(raw: JsonObject, specPath: string): ManualRunSpec {
     ...(raw.input === undefined ? {} : { input: raw.input as JsonValue }),
     ...(images ? { images } : {}),
     ...(contentParts ? { contentParts } : {}),
+    contextRefs: parseOptionalContextRefs(raw.contextRefs, 'contextRefs'),
     context: parseOptionalRecord(raw.context, 'context'),
     outputSchema: parseOptionalSchema(raw.outputSchema),
     metadata: parseOptionalRecord(raw.metadata, 'metadata'),
@@ -2629,6 +2641,32 @@ function parseOptionalRecord(value: unknown, label: string): Record<string, Json
   return ensureObject(value, label) as Record<string, JsonValue>;
 }
 
+function parseOptionalContextRefs(value: unknown, label: string): ContextRef[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value)) {
+    throw new Error(`${label} must be an array`);
+  }
+  return value.map((entry, index) => parseContextRefObject(entry, `${label}[${index}]`));
+}
+
+function parseContextRefObject(value: unknown, label: string): ContextRef {
+  const raw = ensureObject(value, label);
+  const kind = parseEnumField(raw.kind, `${label}.kind`, ['run', 'session']);
+  const id = requireString(raw.id, `${label}.id`);
+  const maxBytes = raw.maxBytes === undefined ? undefined : parsePositiveIntegerValue(raw.maxBytes, `${label}.maxBytes`);
+  const allowStatuses = raw.allowStatuses === undefined ? undefined : parseStringArray(raw.allowStatuses, `${label}.allowStatuses`);
+  if (kind === 'run') {
+    const view = raw.view === undefined ? undefined : parseEnumField(raw.view, `${label}.view`, ['result']);
+    return { kind, id, ...(view ? { view } : {}), ...(maxBytes ? { maxBytes } : {}), ...(allowStatuses ? { allowStatuses: allowStatuses as ContextRef['allowStatuses'] } : {}) };
+  }
+  const view = raw.view === undefined ? undefined : parseEnumField(raw.view, `${label}.view`, ['run_summaries']);
+  const rootRunsOnly = raw.rootRunsOnly === undefined ? undefined : parseBoolean(raw.rootRunsOnly, `${label}.rootRunsOnly`);
+  const maxRuns = raw.maxRuns === undefined ? undefined : parsePositiveIntegerValue(raw.maxRuns, `${label}.maxRuns`);
+  return { kind, id, ...(view ? { view } : {}), ...(rootRunsOnly === undefined ? {} : { rootRunsOnly }), ...(maxRuns ? { maxRuns } : {}), ...(maxBytes ? { maxBytes } : {}), ...(allowStatuses ? { allowStatuses: allowStatuses as ContextRef['allowStatuses'] } : {}) };
+}
+
 function parseOptionalSchema(value: unknown): JsonSchema | undefined {
   if (value === undefined) {
     return undefined;
@@ -2683,6 +2721,27 @@ function parseNonNegativeIntegerOption(flag: string, value: string): number {
   return parsed;
 }
 
+function parsePositiveIntegerValue(value: unknown, label: string): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
+    throw new Error(`${label} must be a positive integer`);
+  }
+  return value;
+}
+
+function parseBoolean(value: unknown, label: string): boolean {
+  if (typeof value !== 'boolean') {
+    throw new Error(`${label} must be a boolean`);
+  }
+  return value;
+}
+
+function parseStringArray(value: unknown, label: string): string[] {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string')) {
+    throw new Error(`${label} must be an array of strings`);
+  }
+  return value;
+}
+
 function requireOptionValue(flag: string, value: string | undefined): string {
   if (!value || value.startsWith('--')) {
     throw new Error(`Missing value for ${flag}`);
@@ -2696,6 +2755,29 @@ function parseJsonFlag(value: string, flag: string): JsonValue {
   } catch (error) {
     throw new Error(`${flag} must be valid JSON: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+function parseContextRefFlag(value: string, flag: string): ContextRef {
+  if (value.startsWith('@')) {
+    throw new Error(`${flag} shorthand @id is not supported yet; use run:<id> or session:<id>`);
+  }
+  const separatorIndex = value.indexOf(':');
+  if (separatorIndex <= 0 || separatorIndex === value.length - 1) {
+    throw new Error(`${flag} must be run:<id> or session:<id>`);
+  }
+
+  const kind = value.slice(0, separatorIndex);
+  const id = value.slice(separatorIndex + 1).trim();
+  if (!id) {
+    throw new Error(`${flag} requires a non-empty id`);
+  }
+  if (kind === 'run') {
+    return { kind: 'run', id };
+  }
+  if (kind === 'session') {
+    return { kind: 'session', id };
+  }
+  throw new Error(`${flag} kind must be run or session`);
 }
 
 async function readInlinePrompt(cli: ManualTestCliOptions, label: string): Promise<string> {
