@@ -169,14 +169,17 @@ export interface ChatRequest {
 - `run` refs default to `view: 'result'`.
 - `session` refs default to `view: 'run_summaries'`.
 - Default allowed statuses are `['succeeded']`.
-- Failed refs are rejected unless `allowStatuses` explicitly includes
-  `'failed'`.
-- Non-terminal refs are rejected unless explicitly allowed by `allowStatuses`.
+- Run refs with a disallowed status are rejected. Failed and non-terminal run
+  refs therefore require explicit opt-in through `allowStatuses`.
+- For session refs, `allowStatuses` is an inclusion filter. Runs with a
+  disallowed status are omitted with a warning, and resolution fails only when
+  the session contains runs but none match the allowed statuses.
 - Session refs require `RunStore.listBySession`; otherwise fail with a clear
   unsupported error.
 - Session refs default to root runs only: no `parentRunId` and
   `delegationDepth === 0`.
-- Session runs are sorted by `createdAt asc, id asc` before truncation.
+- Session runs are sorted by `createdAt asc, id asc`, filtered by status, and
+  then truncated to `maxRuns`.
 - Session refs have both `maxRuns` and `maxBytes` controls.
 - Truncation must be deterministic and visible in `warnings`, metadata, and
   events.
@@ -259,7 +262,9 @@ interface ContextRefsResolvedPayload {
 - Missing run: reject before run creation.
 - Missing session support: reject before run creation.
 - Unsupported view: reject before run creation.
-- Disallowed status: reject before run creation.
+- Disallowed run-ref status: reject before run creation.
+- Session ref with runs but no allowed statuses: reject before run creation.
+- Disallowed runs within an otherwise eligible session ref: omit and warn.
 - Oversized successful refs: truncate deterministically and warn.
 
 ## CLI Shape for MVP

@@ -7,6 +7,7 @@ import pino from 'pino';
 import { describe, expect, it, vi } from 'vitest';
 
 import { AdaptiveAgent } from './adaptive-agent.js';
+import { resolveContextRefs } from './context-ref-resolver.js';
 import { InMemoryContinuationStore } from './in-memory-continuation-store.js';
 import { InMemoryEventStore } from './in-memory-event-store.js';
 import { InMemoryPlanStore } from './in-memory-plan-store.js';
@@ -199,8 +200,9 @@ describe('AdaptiveAgent', () => {
     expect(events.some((event) => event.type === 'context.refs.resolved')).toBe(true);
   });
 
-  it('resolves session context refs as deterministic root-run summaries', async () => {
+  it('resolves eligible session root runs and records omitted statuses in audit data', async () => {
     const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
     const first = await runStore.createRun({ id: 'session-run-a', sessionId: 'session-ref-1', goal: 'First root', status: 'queued' });
     await runStore.updateRun(first.id, { status: 'succeeded', result: 'first' }, first.version);
     const parent = await runStore.createRun({ id: 'session-run-b', sessionId: 'session-ref-1', goal: 'Second root', status: 'queued' });
@@ -217,7 +219,88 @@ describe('AdaptiveAgent', () => {
       status: 'queued',
     });
     await runStore.updateRun(child.id, { status: 'succeeded', result: 'child' }, child.version);
+    await runStore.createRun({ id: 'session-run-c', sessionId: 'session-ref-1', goal: 'Failed root', status: 'failed' });
+    await runStore.createRun({ id: 'session-run-d', sessionId: 'session-ref-1', goal: 'Cancelled root', status: 'cancelled' });
     const model = new SequenceModel([{ finishReason: 'stop', text: 'done' }]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore: new InMemorySnapshotStore(),
+    });
+
+    const result = await agent.run({ goal: 'Use session', contextRefs: [{ kind: 'session', id: 'session-ref-1' }] });
+
+    const storedRun = await runStore.getRun(result.runId);
+    const resolved = storedRun?.context?.__adaptiveAgent as {
+      resolvedContextRefs?: Array<{ runs?: Array<{ runId: string }>; warnings?: string[] }>;
+    } | undefined;
+    expect(resolved?.resolvedContextRefs?.[0]?.runs?.map((run) => run.runId)).toEqual(['session-run-a', 'session-run-b']);
+    expect(resolved?.resolvedContextRefs?.[0]?.warnings).toEqual(['omitted 1 failed run and 1 cancelled run']);
+    expect(storedRun?.metadata?.contextRefs).toMatchObject({
+      resolution: {
+        refs: [{
+          kind: 'session',
+          id: 'session-ref-1',
+          runCount: 2,
+          bytes: expect.any(Number),
+          truncated: true,
+          warnings: ['omitted 1 failed run and 1 cancelled run'],
+        }],
+      },
+    });
+    const resolutionEvent = (await eventStore.listByRun(result.runId))
+      .find((event) => event.type === 'context.refs.resolved');
+    expect(resolutionEvent?.payload).toMatchObject({
+      resolved: [{
+        kind: 'session',
+        id: 'session-ref-1',
+        runCount: 2,
+        bytes: expect.any(Number),
+        truncated: true,
+        warnings: ['omitted 1 failed run and 1 cancelled run'],
+      }],
+      totalBytes: expect.any(Number),
+    });
+  });
+
+  it('filters session statuses before maxRuns and includes explicitly allowed failures', async () => {
+    const runStore = new InMemoryRunStore();
+    await runStore.createRun({ id: 'filter-a', sessionId: 'filter-session', goal: 'Failed first', status: 'failed' });
+    await runStore.createRun({ id: 'filter-b', sessionId: 'filter-session', goal: 'Succeeded first', status: 'succeeded' });
+    await runStore.createRun({ id: 'filter-c', sessionId: 'filter-session', goal: 'Failed second', status: 'failed' });
+    await runStore.createRun({ id: 'filter-d', sessionId: 'filter-session', goal: 'Succeeded second', status: 'succeeded' });
+    await runStore.createRun({ id: 'filter-e', sessionId: 'filter-session', goal: 'Succeeded third', status: 'succeeded' });
+
+    const filtered = await resolveContextRefs({
+      runStore,
+      refs: [{ kind: 'session', id: 'filter-session', maxRuns: 2 }],
+    });
+    expect(filtered?.resolved[0]?.runs?.map((run) => run.runId)).toEqual(['filter-b', 'filter-d']);
+    expect(filtered?.resolved[0]?.warnings).toEqual([
+      'omitted 2 failed runs',
+      'session contained 3 matching runs; included first 2',
+    ]);
+
+    const withFailures = await resolveContextRefs({
+      runStore,
+      refs: [{ kind: 'session', id: 'filter-session', allowStatuses: ['succeeded', 'failed'] }],
+    });
+    expect(withFailures?.resolved[0]?.runs?.map((run) => run.runId)).toEqual([
+      'filter-a',
+      'filter-b',
+      'filter-c',
+      'filter-d',
+      'filter-e',
+    ]);
+    expect(withFailures?.resolved[0]?.warnings).toEqual([]);
+  });
+
+  it('rejects a non-empty session when no runs match its allowed statuses', async () => {
+    const runStore = new InMemoryRunStore();
+    await runStore.createRun({ id: 'failed-session-run', sessionId: 'failed-session', goal: 'Failed work', status: 'failed' });
+    const model = new SequenceModel([{ finishReason: 'stop', text: 'unused' }]);
     const agent = new AdaptiveAgent({
       model,
       tools: [],
@@ -226,16 +309,16 @@ describe('AdaptiveAgent', () => {
       snapshotStore: new InMemorySnapshotStore(),
     });
 
-    const result = await agent.run({ goal: 'Use session', contextRefs: [{ kind: 'session', id: 'session-ref-1' }] });
-
-    const storedRun = await runStore.getRun(result.runId);
-    const resolved = storedRun?.context?.__adaptiveAgent as { resolvedContextRefs?: Array<{ runs?: Array<{ runId: string }> }> } | undefined;
-    expect(resolved?.resolvedContextRefs?.[0]?.runs?.map((run) => run.runId)).toEqual(['session-run-a', 'session-run-b']);
+    await expect(agent.run({
+      goal: 'Use failed session',
+      contextRefs: [{ kind: 'session', id: 'failed-session' }],
+    })).rejects.toThrow('Context ref session failed-session has no runs matching allowed statuses [succeeded]');
+    expect(model.receivedRequests).toHaveLength(0);
   });
 
-  it('rejects reserved context collisions and non-terminal refs before creating a run', async () => {
+  it('rejects reserved context collisions and failed run refs before creating a run', async () => {
     const runStore = new InMemoryRunStore();
-    const source = await runStore.createRun({ id: 'running-source', goal: 'Still running', status: 'running' });
+    const source = await runStore.createRun({ id: 'failed-source', goal: 'Failed source', status: 'failed' });
     const agent = new AdaptiveAgent({
       model: new SequenceModel([{ finishReason: 'stop', text: 'done' }]),
       tools: [],

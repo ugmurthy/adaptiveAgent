@@ -204,16 +204,30 @@ async function resolveSessionRef(
     .sort(compareRunChronology);
 
   const warnings: string[] = [];
-  if (orderedRuns.length > maxRuns) {
-    warnings.push(`session contained ${orderedRuns.length} matching runs; included first ${maxRuns}`);
+  const allowedStatuses = ref.allowStatuses ?? ['succeeded'];
+  const omittedByStatus = new Map<RunStatus, number>();
+  const eligibleRuns = orderedRuns.filter((run) => {
+    if (allowedStatuses.includes(run.status)) {
+      return true;
+    }
+    omittedByStatus.set(run.status, (omittedByStatus.get(run.status) ?? 0) + 1);
+    return false;
+  });
+
+  if (omittedByStatus.size > 0) {
+    const omitted = [...omittedByStatus]
+      .map(([status, count]) => `${count} ${status} ${count === 1 ? 'run' : 'runs'}`)
+      .join(' and ');
+    warnings.push(`omitted ${omitted}`);
+  }
+  if (orderedRuns.length > 0 && eligibleRuns.length === 0) {
+    throw new Error(`Context ref session ${ref.id} has no runs matching allowed statuses [${allowedStatuses.join(', ')}]`);
+  }
+  if (eligibleRuns.length > maxRuns) {
+    warnings.push(`session contained ${eligibleRuns.length} matching runs; included first ${maxRuns}`);
   }
 
-  const selectedRuns = orderedRuns.slice(0, maxRuns);
-  const runs: ResolvedRunSummary[] = [];
-  for (const run of selectedRuns) {
-    assertAllowedStatus(ref, run.status, `Context ref session ${ref.id} run ${run.id}`);
-    runs.push(runToSummary(run));
-  }
+  const runs = eligibleRuns.slice(0, maxRuns).map(runToSummary);
 
   let resolved: ResolvedContextRef = removeUndefined({
     ref: cloneJson(ref) as ContextRef,
