@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 This project follows semantic versioning for release notes.
 
+## [0.1.35] 2026-07-10
+
+### Added
+
+- Added basic `--context-ref` CLI support.
+
+### Changed
+
+- Hardened the next-step context-reference spec.
+
 ## [0.1.34] - 2026-07-09
 
 ### Added
