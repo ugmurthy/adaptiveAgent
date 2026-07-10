@@ -1,3 +1,5 @@
+> Explore the AdaptiveAgent Showcase: https://ugmurthy.github.io/showcase.html
+
 # Adaptive Agent CLI
 
 Installable command-line tools for running Adaptive Agent profiles and inspecting their durable execution traces.
@@ -239,5 +241,6 @@ trace-session <sessionId> --html <path>
 ## Links
 
 - Source: https://github.com/ugmurthy/adaptiveAgent
+- Changelog: https://github.com/ugmurthy/adaptiveAgent/blob/main/CHANGELOG.md
 - Issues: https://github.com/ugmurthy/adaptiveAgent/issues
 - License: MIT
