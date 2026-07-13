@@ -276,6 +276,9 @@ export class OrchestrationSdk {
   }
 
   private async execute(goal: string, options: OrchestratedRunOptions): Promise<OrchestratedRunResult> {
+    if (options.contextRefs && options.contextRefs.length > 0) {
+      throw new Error('Context refs are not supported for orchestration until stage propagation semantics are defined.');
+    }
     const sessionId = options.sessionId ?? this.sessionIdFactory();
     const requestedAgentId = options.requestedAgentId ?? this.defaultRequestedAgentId;
     const plan = buildOrchestrationPlan({ sessionId, requestedAgentId, goal, options, catalog: this.catalog, finalizeWithRequestedAgent: options.finalizeWithRequestedAgent ?? true });

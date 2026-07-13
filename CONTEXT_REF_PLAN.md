@@ -5,14 +5,14 @@
 Add a durable, inspectable way for a new run to use prior `run` and
 `sessionId` outputs as explicit context references.
 
-Implementation Milestone 1 is intentionally narrow and is now implemented:
-typed `run` and `session` refs only. The recommended next step is Context Ref
-1.1, which hardens deterministic session selection, authorization, provenance,
-and CLI visibility before adding another ref abstraction.
+Implementation Milestone 1, Context Ref 1.1, and named context bundles are now
+implemented. The runtime supports typed `run` and `session` refs, deterministic
+session selection, per-run session authorization, source provenance, and CLI
+visibility. Agent SDK adds project-scoped named bundles without adding another
+core ref abstraction.
 
-Named context bundles are the first recommended feature after Context Ref 1.1.
 Memory tools, evaluation loops, and hard budget envelopes remain later designs
-that build on a stable primitive.
+that build on the stable context-ref and bundle primitives.
 
 ## Position
 
@@ -109,8 +109,10 @@ export type ContextRef =
       kind: 'session';
       id: string;
       view?: 'run_summaries';
+      selection?: 'latest' | 'earliest';
       rootRunsOnly?: boolean;
       maxRuns?: number;
+      maxScanRuns?: number;
       maxBytes?: number;
       allowStatuses?: RunStatus[];
     };
@@ -125,7 +127,12 @@ export interface ResolvedContextRef {
   id: string;
   view: string;
   status?: RunStatus;
+  selection?: 'latest' | 'earliest';
+  scannedRunCount?: number;
   goal?: string;
+  sourceRunVersion?: number;
+  sourceUpdatedAt?: string;
+  sourceCompletedAt?: string;
   result?: JsonValue;
   resultPreview?: string;
   runs?: ResolvedRunSummary[];
@@ -136,6 +143,9 @@ export interface ResolvedContextRef {
 
 export interface ResolvedRunSummary {
   runId: UUID;
+  sourceRunVersion: number;
+  sourceUpdatedAt: string;
+  sourceCompletedAt?: string;
   sessionId?: string;
   role?: string;
   goal: string;
@@ -182,9 +192,14 @@ export interface ChatRequest {
   unsupported error.
 - Session refs default to root runs only: no `parentRunId` and
   `delegationDepth === 0`.
-- Session runs are sorted by `createdAt asc, id asc`, filtered by status, and
-  then truncated to `maxRuns`.
-- Session refs have both `maxRuns` and `maxBytes` controls.
+- Session refs default to `selection: 'latest'`; `earliest` is available
+  explicitly.
+- Core pages from the selected chronological end, applies root-run,
+  authorization, and status filters, and then truncates to `maxRuns`.
+- Selected runs are rendered in `createdAt asc, id asc` presentation order.
+- Session refs have `maxRuns`, `maxScanRuns`, and `maxBytes` controls.
+- Each candidate session run is authorized with `targetRun` before any of its
+  content enters resolved material.
 - Truncation must be deterministic and visible in `warnings`, metadata, and
   events.
 
@@ -228,7 +243,15 @@ metadata: {
         id: string,
         view: string,
         status?: string,
+        selection?: 'latest' | 'earliest',
         runCount?: number,
+        scannedRunCount?: number,
+        sources?: Array<{
+          runId: UUID,
+          sourceRunVersion: number,
+          sourceUpdatedAt: string,
+          sourceCompletedAt?: string
+        }>,
         bytes: number,
         truncated: boolean,
         warnings?: string[]
@@ -250,7 +273,15 @@ interface ContextRefsResolvedPayload {
     id: string;
     view: string;
     status?: string;
+    selection?: 'latest' | 'earliest';
     runCount?: number;
+    scannedRunCount?: number;
+    sources?: Array<{
+      runId: UUID;
+      sourceRunVersion: number;
+      sourceUpdatedAt: string;
+      sourceCompletedAt?: string;
+    }>;
     bytes: number;
     truncated: boolean;
     warnings?: string[];
@@ -275,7 +306,7 @@ interface ContextRefsResolvedPayload {
 
 ```bash
 adaptive-agent run \
-  --context-ref run:run_123 \
+  --context-ref run:550e8400-e29b-41d4-a716-446655440000 \
   "Use the prior research and write a final brief"
 
 adaptive-agent run \
@@ -283,7 +314,7 @@ adaptive-agent run \
   "Continue from the prior session evidence"
 
 adaptive-agent chat \
-  --context-ref run:run_123 \
+  --context-ref run:550e8400-e29b-41d4-a716-446655440000 \
   "What should we do next?"
 ```
 
@@ -297,9 +328,9 @@ Bundles need a separate namespace, identity, authorization, and persistence
 contract. Agent SDK should initially own name/namespace resolution. Core may
 later resolve id-only bundle refs if provided with a store and authorizer.
 
-The initial bundle milestone is specified below. It expands an SDK-owned bundle
-to existing `run` and `session` refs before calling core; it does not add a
-`bundle` variant to core's `ContextRef` union.
+The initial bundle milestone is specified below and implemented. It expands an
+SDK-owned bundle to existing `run` and `session` refs before calling core; it
+does not add a `bundle` variant to core's `ContextRef` union.
 
 ### Agentic memory tools
 
@@ -350,7 +381,7 @@ Explicitly do not ship:
 - hard budget enforcement;
 - ambiguous `@id` shorthand.
 
-## Current Implementation Review
+## Context Ref 1.1 Rationale
 
 Milestone 1 is implemented end to end:
 
@@ -361,39 +392,41 @@ Milestone 1 is implemented end to end:
 - core emits `context.refs.resolved`;
 - Agent SDK parses and forwards explicit `run:<id>` and `session:<id>` refs.
 
-The following issues should be addressed before named bundles, memory, or loops
-build on the primitive.
+The Milestone 1 implementation review identified the following issues that
+Context Ref 1.1 addresses before named bundles, memory, or loops build on the
+primitive.
 
-### Session selection is not yet cross-store deterministic
+### Cross-store session determinism
 
-The resolver currently calls `RunStore.listBySession` without explicit paging.
-The Postgres store applies a default limit while the in-memory store can return
-the complete session. The resolver then re-sorts the returned subset and keeps
-the first matching runs. Large sessions can therefore resolve to different run
-sets in different stores.
+Before Context Ref 1.1, the resolver called `RunStore.listBySession` without
+explicit paging. The Postgres store applied a default limit while the in-memory
+store could return the complete session. The resolver then re-sorted the
+returned subset and kept the first matching runs, so large sessions could
+resolve to different run sets in different stores.
 
-The current oldest-first selection is also a weak default for the main session
+The prior oldest-first selection was also a weak default for the main session
 ref use case: continuing from recent session evidence normally needs the latest
 successful root runs.
 
-### Session authorization is too coarse
+### Per-run session authorization
 
-The current authorization hook can authorize the session ref, but it is not
-invoked with each candidate `targetRun`. A `sessionId` remains a correlation
+The Milestone 1 authorization hook could authorize the session ref, but it was
+not invoked with each candidate `targetRun`. A `sessionId` remains a correlation
 key, not proof that every run returned for that id is visible to the caller.
 
-### Source provenance is incomplete
+### Resolution-time source provenance
 
-Resolved material records source ids and results but not the source run version
-or resolution-time timestamps. Runtime operations such as retry can change a
-run record in place. The consuming run keeps its bounded resolved payload, but
-an inspector cannot prove which source record version produced that payload.
+Milestone 1 resolved material recorded source ids and results but not the source
+run version or resolution-time timestamps. Runtime operations such as retry can
+change a run record in place. The consuming run kept its bounded resolved
+payload, but an inspector could not prove which source record version produced
+that payload.
 
-### CLI and orchestration behavior needs a single rule
+### CLI and orchestration consistency
 
-Interactive chat must preserve command-line context refs when constructing each
-chat request. Event and inspection output should also make ref resolution and
-truncation visible without requiring raw metadata inspection.
+Context Ref 1.1 requires interactive chat to preserve command-line context refs
+when constructing each chat request. Event and inspection output also make ref
+resolution and truncation visible without requiring raw metadata inspection.
 
 Context refs remain direct `run` and `chat` request inputs in Context Ref 1.1.
 They must not be partially or accidentally propagated across orchestration
@@ -401,7 +434,7 @@ stages. Orchestration requests should reject context refs clearly until a later
 design defines which stages receive them and whether they are resolved once or
 once per stage.
 
-## Recommended Next Step: Context Ref 1.1
+## Context Ref 1.1 (Implemented)
 
 Context Ref 1.1 is a hardening milestone plus one small capability: explicit
 session selection. It does not introduce a new ref kind or a new autonomous
@@ -427,6 +460,7 @@ export type ContextRef =
       selection?: 'latest' | 'earliest';
       rootRunsOnly?: boolean;
       maxRuns?: number;
+      maxScanRuns?: number;
       maxBytes?: number;
       allowStatuses?: RunStatus[];
     };
@@ -439,6 +473,8 @@ Rules:
 - `latest` returns the newest matching runs in chronological presentation order.
 - `earliest` returns the oldest matching runs in chronological presentation
   order.
+- `maxScanRuns` defaults to `500` and bounds candidate discovery from the
+  selected end of the session chronology.
 - Ordering uses `createdAt` and then `id` as a stable tie-breaker.
 - Truncation warnings state which end was retained, for example
   `included latest 10 of 37 matching runs`.
@@ -511,7 +547,7 @@ the exact source record generation that was consumed.
   request.
 - Orchestration does not silently propagate context refs to only some stages.
 
-## Implementation Milestone 2: Named Context Bundles
+## Implementation Milestone 2: Named Context Bundles (Implemented)
 
 After Context Ref 1.1, add Agent SDK-owned named bundles as the first new
 feature. Bundles solve the immediate usability problem of repeatedly supplying
@@ -562,11 +598,16 @@ Core continues to own:
 
 Core does not add a `bundle` ref kind in this milestone.
 
+The local project registry is stored at
+`<cwd>/.adaptiveAgent/context-bundles/<name>.json`. Bundle digests are lowercase
+SHA-256 values over canonical JSON: object keys are sorted recursively and array
+order, including ref declaration order, is preserved.
+
 ### CLI shape
 
 ```bash
 adaptive-agent context create migration-research \
-  --ref run:run_123 \
+  --ref run:550e8400-e29b-41d4-a716-446655440000 \
   --ref session:session_456
 
 adaptive-agent context show migration-research
@@ -591,7 +632,7 @@ metadata: {
       scope: 'project',
       digest: '<canonical-content-digest>',
       expandedRefs: [
-        { kind: 'run', id: 'run_123' },
+        { kind: 'run', id: '550e8400-e29b-41d4-a716-446655440000' },
         { kind: 'session', id: 'session_456' }
       ]
     }

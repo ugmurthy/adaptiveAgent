@@ -41,6 +41,7 @@ import { mergeMetadata, normalizeRecovery, promptText, promptYesNo } from './sdk
 export * from './config-types.js';
 export * from './errors.js';
 export * from './ambient.js';
+export * from './context-bundles.js';
 export { buildGroundTruthContext, mergeGroundTruthContext } from './ground-truth-context.js';
 export { expandEnvironmentVariables } from './sdk-utils.js';
 export { createOrchestrationSdk, OrchestrationSdk } from './orchestration.js';

@@ -161,11 +161,11 @@ describe('AdaptiveAgent', () => {
     const runStore = new InMemoryRunStore();
     const eventStore = new InMemoryEventStore();
     const source = await runStore.createRun({
-      id: 'source-run-1',
+      id: '11111111-1111-4111-8111-111111111111',
       goal: 'Research migration options',
       status: 'queued',
     });
-    await runStore.updateRun(source.id, { status: 'succeeded', result: { finding: 'Use durable run refs' } }, source.version);
+    const completedSource = await runStore.updateRun(source.id, { status: 'succeeded', result: { finding: 'Use durable run refs' } }, source.version);
     const model = new SequenceModel([{ finishReason: 'stop', text: 'done' }]);
     const agent = new AdaptiveAgent({
       model,
@@ -181,7 +181,17 @@ describe('AdaptiveAgent', () => {
     expect(storedRun?.metadata?.contextRefs).toMatchObject({
       source: [{ kind: 'run', id: source.id }],
       resolution: {
-        refs: [expect.objectContaining({ kind: 'run', id: source.id, view: 'result', status: 'succeeded' })],
+        refs: [expect.objectContaining({
+          kind: 'run',
+          id: source.id,
+          view: 'result',
+          status: 'succeeded',
+          sources: [expect.objectContaining({
+            runId: source.id,
+            sourceRunVersion: completedSource.version,
+            sourceUpdatedAt: completedSource.updatedAt,
+          })],
+        })],
       },
     });
     expect(storedRun?.context?.__adaptiveAgent).toMatchObject({
@@ -189,6 +199,9 @@ describe('AdaptiveAgent', () => {
         expect.objectContaining({
           kind: 'run',
           id: source.id,
+          sourceRunVersion: completedSource.version,
+          sourceUpdatedAt: completedSource.updatedAt,
+          sourceCompletedAt: completedSource.completedAt,
           result: { finding: 'Use durable run refs' },
         }),
       ],
@@ -198,6 +211,15 @@ describe('AdaptiveAgent', () => {
     )).toBe(true);
     const events = await eventStore.listByRun(result.runId);
     expect(events.some((event) => event.type === 'context.refs.resolved')).toBe(true);
+
+    await runStore.updateRun(source.id, { result: { finding: 'A later source generation' } }, completedSource.version);
+    const persistedConsumer = await runStore.getRun(result.runId);
+    expect(persistedConsumer?.context?.__adaptiveAgent).toMatchObject({
+      resolvedContextRefs: [expect.objectContaining({
+        sourceRunVersion: completedSource.version,
+        result: { finding: 'Use durable run refs' },
+      })],
+    });
   });
 
   it('resolves eligible session root runs and records omitted statuses in audit data', async () => {
@@ -277,10 +299,20 @@ describe('AdaptiveAgent', () => {
       runStore,
       refs: [{ kind: 'session', id: 'filter-session', maxRuns: 2 }],
     });
-    expect(filtered?.resolved[0]?.runs?.map((run) => run.runId)).toEqual(['filter-b', 'filter-d']);
+    expect(filtered?.resolved[0]?.runs?.map((run) => run.runId)).toEqual(['filter-d', 'filter-e']);
     expect(filtered?.resolved[0]?.warnings).toEqual([
       'omitted 2 failed runs',
-      'session contained 3 matching runs; included first 2',
+      'session contained 3 matching runs; included latest 2',
+    ]);
+
+    const earliest = await resolveContextRefs({
+      runStore,
+      refs: [{ kind: 'session', id: 'filter-session', selection: 'earliest', maxRuns: 2 }],
+    });
+    expect(earliest?.resolved[0]?.runs?.map((run) => run.runId)).toEqual(['filter-b', 'filter-d']);
+    expect(earliest?.resolved[0]?.warnings).toEqual([
+      'omitted 2 failed runs',
+      'session contained 3 matching runs; included earliest 2',
     ]);
 
     const withFailures = await resolveContextRefs({
@@ -295,6 +327,65 @@ describe('AdaptiveAgent', () => {
       'filter-e',
     ]);
     expect(withFailures?.resolved[0]?.warnings).toEqual([]);
+  });
+
+  it('pages large sessions and applies deterministic latest and earliest tie-breakers', async () => {
+    const runStore = new InMemoryRunStore();
+    const createdAt = '2026-07-10T12:00:00.000Z';
+    for (let index = 0; index < 105; index += 1) {
+      const id = `paged-${String(index).padStart(3, '0')}`;
+      const run = await runStore.createRun({ id, sessionId: 'paged-session', goal: id, status: 'succeeded' });
+      await runStore.updateRun(id, { createdAt }, run.version);
+    }
+    const listBySession = vi.spyOn(runStore, 'listBySession');
+
+    const latest = await resolveContextRefs({
+      runStore,
+      refs: [{ kind: 'session', id: 'paged-session', maxRuns: 3 }],
+    });
+    expect(latest?.resolved[0]?.runs?.map((run) => run.runId)).toEqual(['paged-102', 'paged-103', 'paged-104']);
+    expect(listBySession).toHaveBeenNthCalledWith(1, 'paged-session', { limit: 100, offset: 0, order: 'desc' });
+    expect(listBySession).toHaveBeenNthCalledWith(2, 'paged-session', { limit: 100, offset: 100, order: 'desc' });
+
+    listBySession.mockClear();
+    const earliest = await resolveContextRefs({
+      runStore,
+      refs: [{ kind: 'session', id: 'paged-session', selection: 'earliest', maxRuns: 3 }],
+    });
+    expect(earliest?.resolved[0]?.runs?.map((run) => run.runId)).toEqual(['paged-000', 'paged-001', 'paged-002']);
+    expect(listBySession).toHaveBeenNthCalledWith(1, 'paged-session', { limit: 100, offset: 0, order: 'asc' });
+    expect(listBySession).toHaveBeenNthCalledWith(2, 'paged-session', { limit: 100, offset: 100, order: 'asc' });
+  });
+
+  it('bounds session scans and authorizes every candidate run before exposing it', async () => {
+    const runStore = new InMemoryRunStore();
+    await runStore.createRun({ id: 'auth-a', sessionId: 'auth-session', goal: 'Visible A', status: 'succeeded' });
+    await runStore.createRun({ id: 'auth-b', sessionId: 'auth-session', goal: 'Secret B', status: 'succeeded' });
+    await runStore.createRun({ id: 'auth-c', sessionId: 'auth-session', goal: 'Visible C', status: 'succeeded' });
+    const authorizationTargets: Array<string | undefined> = [];
+
+    const resolution = await resolveContextRefs({
+      runStore,
+      refs: [{ kind: 'session', id: 'auth-session', maxScanRuns: 2 }],
+      authorizer: ({ targetRun }) => {
+        authorizationTargets.push(targetRun?.id);
+        return targetRun?.id !== 'auth-b';
+      },
+    });
+
+    expect(authorizationTargets).toEqual([undefined, 'auth-c', 'auth-b']);
+    expect(resolution?.resolved[0]?.runs?.map((run) => run.runId)).toEqual(['auth-c']);
+    expect(resolution?.resolved[0]?.warnings).toEqual([
+      'session scan exceeded 2 runs; selected from latest 2 runs',
+      'omitted 1 unauthorized run',
+    ]);
+    expect(JSON.stringify(resolution)).not.toContain('Secret B');
+
+    await expect(resolveContextRefs({
+      runStore,
+      refs: [{ kind: 'session', id: 'auth-session' }],
+      authorizer: ({ targetRun }) => targetRun === undefined,
+    })).rejects.toThrow('Context ref session auth-session has no authorized runs');
   });
 
   it('rejects a non-empty session when no runs match its allowed statuses', async () => {
@@ -318,7 +409,7 @@ describe('AdaptiveAgent', () => {
 
   it('rejects reserved context collisions and failed run refs before creating a run', async () => {
     const runStore = new InMemoryRunStore();
-    const source = await runStore.createRun({ id: 'failed-source', goal: 'Failed source', status: 'failed' });
+    const source = await runStore.createRun({ id: '22222222-2222-4222-8222-222222222222', goal: 'Failed source', status: 'failed' });
     const agent = new AdaptiveAgent({
       model: new SequenceModel([{ finishReason: 'stop', text: 'done' }]),
       tools: [],
@@ -329,6 +420,22 @@ describe('AdaptiveAgent', () => {
 
     await expect(agent.run({ goal: 'bad context', context: { __adaptiveAgent: {} } })).rejects.toThrow('reserved');
     await expect(agent.run({ goal: 'bad ref', contextRefs: [{ kind: 'run', id: source.id }] })).rejects.toThrow('allowed statuses');
+    const getRun = vi.spyOn(runStore, 'getRun');
+    getRun.mockClear();
+    await expect(resolveContextRefs({
+      runStore,
+      refs: [{ kind: 'run', id: 'c453e5947-6e7e-4cde-a488-cb133288e29c' }],
+    })).rejects.toThrow('must be a valid UUID');
+    expect(getRun).not.toHaveBeenCalled();
+    await expect(resolveContextRefs({
+      runStore,
+      refs: [{ kind: 'run', id: '33333333-3333-4333-8333-333333333333' }],
+    })).rejects.toThrow('Context ref run 33333333-3333-4333-8333-333333333333 is unavailable');
+    await expect(resolveContextRefs({
+      runStore,
+      refs: [{ kind: 'run', id: source.id, allowStatuses: ['failed'] }],
+      authorizer: () => false,
+    })).rejects.toThrow(`Context ref run ${source.id} is unavailable`);
     expect((await runStore.listBySession('unused')).length).toBe(0);
   });
 

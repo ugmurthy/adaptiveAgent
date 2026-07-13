@@ -11,6 +11,7 @@ import type {
   ResolvedRunSummary,
   RunStatus,
   RunStore,
+  UUID,
 } from './types.js';
 
 export const RESERVED_CONTEXT_KEY = '__adaptiveAgent';
@@ -18,7 +19,23 @@ export const RESERVED_CONTEXT_KEY = '__adaptiveAgent';
 const DEFAULT_REF_MAX_BYTES = 32 * 1024;
 const DEFAULT_TOTAL_MAX_BYTES = 64 * 1024;
 const DEFAULT_SESSION_MAX_RUNS = 25;
+const DEFAULT_SESSION_MAX_SCAN_RUNS = 500;
+const SESSION_PAGE_SIZE = 100;
 const PREVIEW_MAX_CHARS = 4_000;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const RUN_STATUS_ORDER: RunStatus[] = [
+  'queued',
+  'planning',
+  'awaiting_approval',
+  'awaiting_subagent',
+  'running',
+  'interrupted',
+  'succeeded',
+  'failed',
+  'clarification_requested',
+  'replan_required',
+  'cancelled',
+];
 const textEncoder = new TextEncoder();
 
 export interface ResolveContextRefsOptions {
@@ -36,6 +53,10 @@ export function assertNoReservedContextCollision(context: Record<string, JsonVal
   if (context && Object.prototype.hasOwnProperty.call(context, RESERVED_CONTEXT_KEY)) {
     throw new Error(`context.${RESERVED_CONTEXT_KEY} is reserved for Adaptive Agent runtime context`);
   }
+}
+
+export function isUuid(value: unknown): value is UUID {
+  return typeof value === 'string' && UUID_PATTERN.test(value);
 }
 
 export async function resolveContextRefs(options: ResolveContextRefsOptions): Promise<ContextRefResolution | undefined> {
@@ -114,12 +135,30 @@ export function contextRefsResolvedEventPayload(resolution: ContextRefResolution
 }
 
 function summarizeResolvedContextRef(ref: ResolvedContextRef): ContextRefResolutionSummary {
+  const sources = ref.kind === 'run'
+    ? ref.sourceRunVersion === undefined || ref.sourceUpdatedAt === undefined
+      ? undefined
+      : [removeUndefined({
+          runId: ref.id,
+          sourceRunVersion: ref.sourceRunVersion,
+          sourceUpdatedAt: ref.sourceUpdatedAt,
+          sourceCompletedAt: ref.sourceCompletedAt,
+        })]
+    : ref.runs?.map((run) => removeUndefined({
+        runId: run.runId,
+        sourceRunVersion: run.sourceRunVersion,
+        sourceUpdatedAt: run.sourceUpdatedAt,
+        sourceCompletedAt: run.sourceCompletedAt,
+      }));
   return removeUndefined({
     kind: ref.kind,
     id: ref.id,
     view: ref.view,
     status: ref.status,
+    selection: ref.selection,
     runCount: ref.runs?.length,
+    scannedRunCount: ref.scannedRunCount,
+    sources,
     bytes: ref.bytes,
     truncated: ref.truncated,
     warnings: ref.warnings && ref.warnings.length > 0 ? ref.warnings : undefined,
@@ -149,9 +188,17 @@ async function resolveRunRef(
 
   const run = await options.runStore.getRun(ref.id);
   if (!run) {
-    throw new Error(`Context ref run ${ref.id} does not exist`);
+    throw new Error(`Context ref run ${ref.id} is unavailable`);
   }
-  await authorize(options.authorizer, { ref, targetRun: run, requestSessionId: options.requestSessionId, requestMetadata: options.requestMetadata });
+  const allowed = await isAuthorized(options.authorizer, {
+    ref,
+    targetRun: run,
+    requestSessionId: options.requestSessionId,
+    requestMetadata: options.requestMetadata,
+  });
+  if (!allowed) {
+    throw new Error(`Context ref run ${ref.id} is unavailable`);
+  }
   assertAllowedStatus(ref, run.status, `Context ref run ${ref.id}`);
 
   const warnings: string[] = [];
@@ -162,9 +209,12 @@ async function resolveRunRef(
     view,
     status: run.status,
     goal: run.goal,
+    sourceRunVersion: run.version,
+    sourceUpdatedAt: run.updatedAt,
+    sourceCompletedAt: run.completedAt,
     result: run.result,
-    errorCode: ref.allowStatuses?.includes('failed') ? run.errorCode : undefined,
-    errorMessage: ref.allowStatuses?.includes('failed') ? run.errorMessage : undefined,
+    errorCode: run.status === 'succeeded' ? undefined : run.errorCode,
+    errorMessage: run.status === 'succeeded' ? undefined : run.errorMessage,
     warnings,
     truncated: false,
     bytes: 0,
@@ -196,17 +246,43 @@ async function resolveSessionRef(
   }
 
   await authorize(options.authorizer, { ref, requestSessionId: options.requestSessionId, requestMetadata: options.requestMetadata });
+  const selection = ref.selection ?? 'latest';
   const maxRuns = normalizePositiveInteger(ref.maxRuns, DEFAULT_SESSION_MAX_RUNS, 'contextRefs[].maxRuns');
+  const maxScanRuns = normalizePositiveInteger(ref.maxScanRuns, DEFAULT_SESSION_MAX_SCAN_RUNS, 'contextRefs[].maxScanRuns');
   const rootRunsOnly = ref.rootRunsOnly !== false;
-  const allRuns = await options.runStore.listBySession(ref.id);
-  const orderedRuns = allRuns
-    .filter((run) => !rootRunsOnly || (!run.parentRunId && run.delegationDepth === 0))
-    .sort(compareRunChronology);
+  const scan = await listSessionRuns(options.runStore, ref.id, selection, maxScanRuns);
+  const candidateRuns = scan.runs.filter((run) => !rootRunsOnly || (!run.parentRunId && run.delegationDepth === 0));
 
   const warnings: string[] = [];
+  if (scan.truncated) {
+    warnings.push(`session scan exceeded ${maxScanRuns} runs; selected from ${selection} ${maxScanRuns} runs`);
+  }
+
+  const authorizedRuns: AgentRun[] = [];
+  let unauthorizedCount = 0;
+  for (const run of candidateRuns) {
+    const allowed = await isAuthorized(options.authorizer, {
+      ref,
+      targetRun: run,
+      requestSessionId: options.requestSessionId,
+      requestMetadata: options.requestMetadata,
+    });
+    if (allowed) {
+      authorizedRuns.push(run);
+    } else {
+      unauthorizedCount += 1;
+    }
+  }
+  if (unauthorizedCount > 0) {
+    warnings.push(`omitted ${unauthorizedCount} unauthorized ${unauthorizedCount === 1 ? 'run' : 'runs'}`);
+  }
+  if (candidateRuns.length > 0 && authorizedRuns.length === 0) {
+    throw new Error(`Context ref session ${ref.id} has no authorized runs`);
+  }
+
   const allowedStatuses = ref.allowStatuses ?? ['succeeded'];
   const omittedByStatus = new Map<RunStatus, number>();
-  const eligibleRuns = orderedRuns.filter((run) => {
+  const eligibleRuns = authorizedRuns.filter((run) => {
     if (allowedStatuses.includes(run.status)) {
       return true;
     }
@@ -216,24 +292,30 @@ async function resolveSessionRef(
 
   if (omittedByStatus.size > 0) {
     const omitted = [...omittedByStatus]
+      .sort(([left], [right]) => runStatusRank(left) - runStatusRank(right))
       .map(([status, count]) => `${count} ${status} ${count === 1 ? 'run' : 'runs'}`)
       .join(' and ');
     warnings.push(`omitted ${omitted}`);
   }
-  if (orderedRuns.length > 0 && eligibleRuns.length === 0) {
+  if (authorizedRuns.length > 0 && eligibleRuns.length === 0) {
     throw new Error(`Context ref session ${ref.id} has no runs matching allowed statuses [${allowedStatuses.join(', ')}]`);
   }
   if (eligibleRuns.length > maxRuns) {
-    warnings.push(`session contained ${eligibleRuns.length} matching runs; included first ${maxRuns}`);
+    warnings.push(`session contained ${eligibleRuns.length} matching runs; included ${selection} ${maxRuns}`);
   }
 
-  const runs = eligibleRuns.slice(0, maxRuns).map(runToSummary);
+  const runs = eligibleRuns
+    .slice(0, maxRuns)
+    .sort(compareRunChronology)
+    .map(runToSummary);
 
   let resolved: ResolvedContextRef = removeUndefined({
     ref: cloneJson(ref) as ContextRef,
     kind: 'session' as const,
     id: ref.id,
     view,
+    selection,
+    scannedRunCount: scan.runs.length,
     runs,
     warnings,
     truncated: warnings.length > 0,
@@ -262,6 +344,9 @@ function runToSummary(run: AgentRun): ResolvedRunSummary {
   const orchestration = readOrchestrationMetadata(run);
   return removeUndefined({
     runId: run.id,
+    sourceRunVersion: run.version,
+    sourceUpdatedAt: run.updatedAt,
+    sourceCompletedAt: run.completedAt,
     sessionId: run.sessionId,
     role: orchestration?.role,
     goal: run.goal,
@@ -283,6 +368,9 @@ function validateContextRef(ref: ContextRef): void {
   if (!ref.id || typeof ref.id !== 'string') {
     throw new Error(`contextRefs ${ref.kind} ref requires a non-empty string id`);
   }
+  if (ref.kind === 'run' && !isUuid(ref.id)) {
+    throw new Error(`contextRefs run ref id "${ref.id}" must be a valid UUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)`);
+  }
   if (ref.maxBytes !== undefined) {
     normalizePositiveInteger(ref.maxBytes, DEFAULT_REF_MAX_BYTES, 'contextRefs[].maxBytes');
   }
@@ -291,8 +379,16 @@ function validateContextRef(ref: ContextRef): void {
       throw new Error('contextRefs[].allowStatuses must be an array of RunStatus values');
     }
   }
-  if (ref.kind === 'session' && ref.maxRuns !== undefined) {
-    normalizePositiveInteger(ref.maxRuns, DEFAULT_SESSION_MAX_RUNS, 'contextRefs[].maxRuns');
+  if (ref.kind === 'session') {
+    if (ref.selection !== undefined && ref.selection !== 'latest' && ref.selection !== 'earliest') {
+      throw new Error('contextRefs[].selection must be "latest" or "earliest"');
+    }
+    if (ref.maxRuns !== undefined) {
+      normalizePositiveInteger(ref.maxRuns, DEFAULT_SESSION_MAX_RUNS, 'contextRefs[].maxRuns');
+    }
+    if (ref.maxScanRuns !== undefined) {
+      normalizePositiveInteger(ref.maxScanRuns, DEFAULT_SESSION_MAX_SCAN_RUNS, 'contextRefs[].maxScanRuns');
+    }
   }
 }
 
@@ -304,13 +400,47 @@ function assertAllowedStatus(ref: ContextRef, status: RunStatus, label: string):
 }
 
 async function authorize(authorizer: ContextRefAuthorizer | undefined, context: ContextRefAuthorizationContext): Promise<void> {
-  if (!authorizer) {
-    return;
-  }
-  const allowed = await authorizer(context);
+  const allowed = await isAuthorized(authorizer, context);
   if (!allowed) {
     throw new Error(`Context ref ${context.ref.kind}:${context.ref.id} is not authorized`);
   }
+}
+
+async function isAuthorized(authorizer: ContextRefAuthorizer | undefined, context: ContextRefAuthorizationContext): Promise<boolean> {
+  return authorizer ? authorizer(context) : true;
+}
+
+async function listSessionRuns(
+  runStore: RunStore,
+  sessionId: string,
+  selection: 'latest' | 'earliest',
+  maxScanRuns: number,
+): Promise<{ runs: AgentRun[]; truncated: boolean }> {
+  const listBySession = runStore.listBySession;
+  if (!listBySession) {
+    throw new Error('Session context refs require a RunStore that supports listBySession');
+  }
+
+  const runs: AgentRun[] = [];
+  const seenRunIds = new Set<string>();
+  const order = selection === 'latest' ? 'desc' : 'asc';
+  let offset = 0;
+  while (runs.length <= maxScanRuns) {
+    const limit = Math.min(SESSION_PAGE_SIZE, maxScanRuns + 1 - runs.length);
+    const page = await listBySession.call(runStore, sessionId, { limit, offset, order });
+    for (const run of page) {
+      if (!seenRunIds.has(run.id)) {
+        seenRunIds.add(run.id);
+        runs.push(run);
+      }
+    }
+    if (page.length < limit) {
+      return { runs, truncated: false };
+    }
+    offset += page.length;
+  }
+
+  return { runs: runs.slice(0, maxScanRuns), truncated: true };
 }
 
 function fitResolvedRefToBytes(
@@ -335,9 +465,17 @@ function fitResolvedRefToBytes(
     id: next.id,
     view: next.view,
     status: next.status,
+    selection: next.selection,
+    scannedRunCount: next.scannedRunCount,
     goal: next.goal,
+    sourceRunVersion: next.sourceRunVersion,
+    sourceUpdatedAt: next.sourceUpdatedAt,
+    sourceCompletedAt: next.sourceCompletedAt,
     runs: next.runs?.map((run) => removeUndefined({
       runId: run.runId,
+      sourceRunVersion: run.sourceRunVersion,
+      sourceUpdatedAt: run.sourceUpdatedAt,
+      sourceCompletedAt: run.sourceCompletedAt,
       sessionId: run.sessionId,
       role: run.role,
       goal: run.goal,
@@ -378,8 +516,16 @@ function normalizePositiveInteger(value: number | undefined, fallback: number, l
 }
 
 function compareRunChronology(left: AgentRun, right: AgentRun): number {
-  const byCreatedAt = left.createdAt.localeCompare(right.createdAt);
-  return byCreatedAt === 0 ? left.id.localeCompare(right.id) : byCreatedAt;
+  const byCreatedAt = compareStrings(left.createdAt, right.createdAt);
+  return byCreatedAt === 0 ? compareStrings(left.id, right.id) : byCreatedAt;
+}
+
+function compareStrings(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function runStatusRank(status: RunStatus): number {
+  return RUN_STATUS_ORDER.indexOf(status);
 }
 
 function previewJson(value: JsonValue | undefined): string | undefined {

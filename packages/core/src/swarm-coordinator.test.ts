@@ -56,10 +56,14 @@ describe('InMemoryRunStore session queries', () => {
 
     const firstPage = await store.listBySession('session-1', { limit: 1 });
     const secondPage = await store.listBySession('session-1', { limit: 1, offset: 1 });
+    const ascending = await store.listBySession('session-1', { order: 'asc' });
+    const descending = await store.listBySession('session-1', { order: 'desc' });
 
     expect(firstPage).toHaveLength(1);
     expect(secondPage).toHaveLength(1);
     expect(new Set([firstPage[0]?.id, secondPage[0]?.id])).toEqual(new Set(['run-a', 'run-c']));
+    expect(ascending.map((run) => run.id)).toEqual(['run-a', 'run-c']);
+    expect(descending.map((run) => run.id)).toEqual(['run-c', 'run-a']);
     expect((await store.listBySession('missing'))).toEqual([]);
   });
 });

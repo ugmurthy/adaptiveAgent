@@ -28,6 +28,10 @@ function toIsoString(date: Date): string {
   return date.toISOString();
 }
 
+function compareStrings(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 export class OptimisticConcurrencyError extends Error {
   constructor(message: string) {
     super(message);
@@ -109,14 +113,15 @@ export class InMemoryRunStore implements RunStore {
     return run ? cloneRun(run) : null;
   }
 
-  async listBySession(sessionId: string, options: { limit?: number; offset?: number } = {}): Promise<AgentRun[]> {
+  async listBySession(sessionId: string, options: { limit?: number; offset?: number; order?: 'asc' | 'desc' } = {}): Promise<AgentRun[]> {
     const offset = Math.max(0, options.offset ?? 0);
     const limit = options.limit === undefined ? undefined : Math.max(0, options.limit);
+    const direction = options.order === 'asc' ? 1 : -1;
     const runs = Array.from(this.runs.values())
       .filter((run) => run.sessionId === sessionId)
       .sort((left, right) => {
-        const createdComparison = right.createdAt.localeCompare(left.createdAt);
-        return createdComparison !== 0 ? createdComparison : right.id.localeCompare(left.id);
+        const createdComparison = compareStrings(left.createdAt, right.createdAt);
+        return direction * (createdComparison !== 0 ? createdComparison : compareStrings(left.id, right.id));
       });
     return runs.slice(offset, limit === undefined ? undefined : offset + limit).map(cloneRun);
   }

@@ -123,14 +123,26 @@ export type ContextRef =
       kind: 'session';
       id: string;
       view?: 'run_summaries';
+      selection?: 'latest' | 'earliest';
       rootRunsOnly?: boolean;
       maxRuns?: number;
+      maxScanRuns?: number;
       maxBytes?: number;
       allowStatuses?: RunStatus[];
     };
 
+export interface ContextRefSourceRunProvenance {
+  runId: UUID;
+  sourceRunVersion: number;
+  sourceUpdatedAt: string;
+  sourceCompletedAt?: string;
+}
+
 export interface ResolvedRunSummary {
   runId: UUID;
+  sourceRunVersion: number;
+  sourceUpdatedAt: string;
+  sourceCompletedAt?: string;
   sessionId?: string;
   role?: string;
   goal: string;
@@ -148,7 +160,12 @@ export interface ResolvedContextRef {
   id: string;
   view: string;
   status?: RunStatus;
+  selection?: 'latest' | 'earliest';
+  scannedRunCount?: number;
   goal?: string;
+  sourceRunVersion?: number;
+  sourceUpdatedAt?: string;
+  sourceCompletedAt?: string;
   result?: JsonValue;
   resultPreview?: string;
   errorCode?: string;
@@ -164,7 +181,10 @@ export interface ContextRefResolutionSummary {
   id: string;
   view: string;
   status?: string;
+  selection?: 'latest' | 'earliest';
   runCount?: number;
+  scannedRunCount?: number;
+  sources?: ContextRefSourceRunProvenance[];
   bytes: number;
   truncated: boolean;
   warnings?: string[];
@@ -854,9 +874,14 @@ export interface RunStore {
 
   getRun(runId: UUID): Promise<AgentRun | null>;
 
+  /**
+   * Lists session runs in deterministic `createdAt`, then `id`, order.
+   * `limit` and `offset` apply after ordering. The default order is `desc`.
+   */
   listBySession?(sessionId: string, options?: {
     limit?: number;
     offset?: number;
+    order?: 'asc' | 'desc';
   }): Promise<AgentRun[]>;
 
   updateRun(runId: UUID, patch: Partial<AgentRun>, expectedVersion?: number): Promise<AgentRun>;

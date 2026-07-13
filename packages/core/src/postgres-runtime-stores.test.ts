@@ -269,6 +269,9 @@ describe('PostgresRunStore', () => {
     expect(runs.map((run) => run.id)).toEqual(['run-newer', 'run-older']);
     expect(runs.every((run) => run.sessionId === 'session-1')).toBe(true);
     expect(client.query).toHaveBeenCalledWith(POSTGRES_RUNTIME_RUN_QUERIES.listBySession, ['session-1', 2, 1]);
+
+    await store.listBySession('session-1', { limit: 2, order: 'asc' });
+    expect(client.query).toHaveBeenLastCalledWith(POSTGRES_RUNTIME_RUN_QUERIES.listBySessionAscending, ['session-1', 2, 0]);
   });
 
   it('updates a run with optimistic versioning', async () => {

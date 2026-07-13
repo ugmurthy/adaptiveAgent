@@ -37,7 +37,7 @@ export class AgentEventLabelRegistry {
       roleLabel,
       ...(event.stepId ? { stepId: event.stepId } : {}),
       ...(event.toolCallId ? { toolCallId: event.toolCallId } : {}),
-      ...(payload ? readEventPayloadSummary(payload) : {}),
+      ...(payload ? readEventPayloadSummary(event.type, payload) : {}),
       timestamp: readEventTimestamp(event.createdAt),
     };
   }
@@ -87,7 +87,13 @@ export function agentEventColorKey(
   return (registry ?? defaultRegistry).labelFor(runId) ?? runId;
 }
 
-function readEventPayloadSummary(payload: JsonObject): Pick<AgentEventSummary, 'toolName' | 'status' | 'message'> {
+function readEventPayloadSummary(type: string, payload: JsonObject): Pick<AgentEventSummary, 'toolName' | 'status' | 'message'> {
+  if (type === 'context.refs.resolved') {
+    const resolved = Array.isArray(payload.resolved) ? payload.resolved : [];
+    const truncated = resolved.filter((entry) => asObject(entry)?.truncated === true).length;
+    const totalBytes = typeof payload.totalBytes === 'number' ? payload.totalBytes : 0;
+    return { message: `refs=${resolved.length} bytes=${totalBytes} truncated=${truncated}` };
+  }
   return {
     ...(readString(payload, 'toolName') ? { toolName: readString(payload, 'toolName') } : {}),
     ...(readString(payload, 'status') ?? readString(payload, 'toStatus') ? { status: readString(payload, 'status') ?? readString(payload, 'toStatus') } : {}),

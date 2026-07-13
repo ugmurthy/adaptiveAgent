@@ -139,6 +139,9 @@ export function summarizeCli(cli: ManualTestCliOptions): Record<string, JsonValu
     ...(cli.specPath ? { specPath: resolve(cli.specPath) } : {}),
     ...(cli.promptFilePath ? { promptFilePath: resolve(cli.promptFilePath) } : {}),
     ...(cli.contextRefs.length > 0 ? { contextRefs: cli.contextRefs as unknown as JsonValue } : {}),
+    ...(cli.contextInputs.some((input) => input.kind === 'bundle')
+      ? { contextBundles: cli.contextInputs.filter((input) => input.kind === 'bundle').map((input) => input.name) }
+      : {}),
     ...(cli.imagePaths.length > 0 ? { imagePaths: cli.imagePaths.map(resolvePathUnlessUrl) } : {}),
     ...(cli.audioPaths.length > 0 ? { audioPaths: cli.audioPaths.map((path) => resolve(path)) } : {}),
     ...(cli.fileAttachmentPaths.length > 0 ? { fileAttachmentPaths: cli.fileAttachmentPaths.map((path) => resolve(path)) } : {}),
@@ -634,6 +637,9 @@ export async function summarizeInspection(sdk: Awaited<ReturnType<typeof createA
     run: inspection.run,
     eventCount: inspection.events.length,
     eventTypes,
+    ...(inspection.run?.metadata?.contextRefs === undefined
+      ? {}
+      : { contextRefs: inspection.run.metadata.contextRefs }),
   };
 }
 
@@ -1097,6 +1103,9 @@ export function formatDryRunMarkdown(
   const webSearchProvider = resolvedWebSearchProviderForConfig(config);
   const readWebPageProvider = resolvedReadWebPageProviderForConfig(config);
   const summary = summarizeSpec(spec);
+  const contextBundles = Array.isArray(spec.metadata?.contextBundles)
+    ? spec.metadata.contextBundles.filter((bundle): bundle is JsonObject => Boolean(bundle && typeof bundle === 'object' && !Array.isArray(bundle)))
+    : [];
   const lines = [
     '# Dry run',
     '',
@@ -1115,6 +1124,9 @@ export function formatDryRunMarkdown(
     ...(spec.contextRefs && spec.contextRefs.length > 0
       ? [`- \`contextRefs\`: ${spec.contextRefs.map((ref) => `\`${ref.kind}:${ref.id}\``).join(', ')}`]
       : ['- `contextRefs`: `none`']),
+    ...(contextBundles.length > 0
+      ? [`- \`contextBundles\`: ${contextBundles.map((bundle) => `\`${String(bundle.name)}\` (${String(bundle.digest)})`).join(', ')}`]
+      : ['- `contextBundles`: `none`']),
     ...(spec.mode === 'run'
       ? [
           `- \`goalLength\`: \`${spec.goal.length}\``,
@@ -1345,6 +1357,9 @@ export function printInspection(inspection: InspectionSummary): void {
   console.log('inspection:');
   console.log(`runStatus: ${inspection.run?.status ?? 'missing'}`);
   console.log(`eventCount: ${inspection.eventCount}`);
+  if (inspection.contextRefs !== undefined) {
+    console.log(`contextRefs: ${JSON.stringify(inspection.contextRefs)}`);
+  }
   for (const [type, count] of Object.entries(inspection.eventTypes).sort(([left], [right]) => left.localeCompare(right))) {
     console.log(`  ${type}: ${count}`);
   }

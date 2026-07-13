@@ -40,6 +40,18 @@ import { renderUpdateReport, runUpdate, updateExitCode } from './install/update.
 import { getVersionInfo, renderVersion } from './install/version.js';
 import { renderAgentCreateReport, runAgentCreate } from './agent-create.js';
 import { AgentEventLabelRegistry, formatAgentEventSummary, summarizeAgentEvent } from './agent-event-rendering.js';
+import {
+  createProjectContextBundle,
+  deleteProjectContextBundle,
+  expandContextBundleInputs,
+  getProjectContextBundle,
+  listProjectContextBundles,
+  mergeContextBundleMetadata,
+  parseContextRef,
+  parseContextRefFlag,
+  projectContextBundleDirectory,
+  type ProjectContextBundle,
+} from './context-bundles.js';
 import { formatSwarmExecutionPlan, formatSwarmRunStatuses, formatSwarmSubtasks } from './swarm-format.js';
 import { createSwarmRoleAgentConfig } from './swarm-role-config.js';
 import { buildSwarmCoordinator, parseSwarmSubtasks, runSwarmDecomposition, validateSdkDecomposition } from './swarm-runner.js';
@@ -107,7 +119,7 @@ const IMAGE_FILE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp',
 const AUDIO_FILE_EXTENSIONS = new Set(['.wav', '.mp3', '.flac', '.m4a', '.ogg', '.aac', '.aiff', '.aif', '.opus', '.oga', '.weba']);
 const VIDEO_FILE_EXTENSIONS = new Set(['.mp4', '.m4v', '.mov', '.webm', '.mkv', '.avi', '.mpeg', '.mpg', '.ogv', '.wmv', '.flv', '.3gp', '.ts', '.mts', '.m2ts']);
 
-const CLI_COMMANDS = ['run', 'chat', 'spec', 'config', 'catalog', 'eval', 'swarm-run', 'ambient', 'inspect', 'resume', 'retry', 'recover', 'interrupt', 'replay', 'init', 'doctor', 'update', 'uninstall', 'agent-create'] as const;
+const CLI_COMMANDS = ['run', 'chat', 'spec', 'config', 'catalog', 'eval', 'swarm-run', 'ambient', 'inspect', 'resume', 'retry', 'recover', 'interrupt', 'replay', 'init', 'doctor', 'update', 'uninstall', 'agent-create', 'context'] as const;
 type CliCommand = (typeof CLI_COMMANDS)[number];
 const CLI_COMMAND_SET = new Set<string>(CLI_COMMANDS);
 
@@ -147,6 +159,7 @@ Setup and inspection:
   doctor                Check CLI installation and local configuration
   config                Print resolved SDK configuration
   catalog               List available agents, tools, and delegate skills
+  context               Create and manage project-scoped context bundles
 
 Other commands:
   agent-create          Generate and write a new agent config JSON file
@@ -218,6 +231,8 @@ Run options:
   --file <path>           Read run prompt from a file.
   --input-json <json>     JSON input passed to run requests.
   --context-ref <ref>     Add prior context: run:<id> or session:<id>. Repeatable.
+  --context-bundle <name>
+                          Expand a project context bundle. Repeatable.
   --image <path-or-url>   Add an image attachment to a run request. Repeatable.
   --audio <path>          Add an audio attachment to a run request. Repeatable.
   --file-attachment <path>
@@ -247,6 +262,8 @@ Examples:
 Chat options:
   --file <path>           Read chat message from a file.
   --context-ref <ref>     Add prior context: run:<id> or session:<id>. Repeatable.
+  --context-bundle <name>
+                          Expand a project context bundle. Repeatable.
 
 ${COMMON_AGENT_OPTIONS_TEXT}
 
@@ -581,6 +598,25 @@ Agent-create options:
   --force                 Overwrite an existing generated config path.
   --dry-run               Preview the config and ask before writing; Enter means no.`;
 
+const CONTEXT_HELP_TEXT = `adaptive-agent context
+
+Create and manage named, project-scoped context bundles stored under
+<cwd>/.adaptiveAgent/context-bundles.
+
+Usage:
+  adaptive-agent context create <name> --ref <ref> [--ref <ref> ...] [options]
+  adaptive-agent context list [options]
+  adaptive-agent context show <name> [options]
+  adaptive-agent context delete <name> [options]
+
+Context options:
+  --ref <ref>             Add run:<id> or session:<id> to a new bundle. Repeatable.
+  --description <text>    Optional display-only description for a new bundle.
+  --force                 Overwrite an existing bundle during create.
+  --dry-run               Preview create or delete without changing files.
+  --cwd <path>            Project root that owns the bundle registry.
+  --output <format>       Output format: pretty, json, or jsonl.`;
+
 const VERSION_HELP_TEXT = `adaptive-agent --version
 
 Print adaptive-agent version.
@@ -628,6 +664,8 @@ function getHelpText(topic?: ManualTestCliOptions['helpTopic']): string {
       return UNINSTALL_HELP_TEXT;
     case 'agent-create':
       return AGENT_CREATE_HELP_TEXT;
+    case 'context':
+      return CONTEXT_HELP_TEXT;
     case 'version':
       return VERSION_HELP_TEXT;
     default:
@@ -688,6 +726,10 @@ export async function main(argv = Bun.argv.slice(2)): Promise<number> {
 
   if (cli.command === 'agent-create') {
     return runAgentCreateCommand(cli);
+  }
+
+  if (cli.command === 'context') {
+    return runContextCommand(cli);
   }
 
   if (cli.command === 'config') {
@@ -820,6 +862,101 @@ async function runAgentCreateCommand(cli: ManualTestCliOptions): Promise<number>
   });
   console.log(renderAgentCreateReport(report, cli.output));
   return report.status === 'created' || report.status === 'overwritten' ? 0 : 1;
+}
+
+async function runContextCommand(cli: ManualTestCliOptions): Promise<number> {
+  const projectRoot = resolve(cli.cwd ?? process.cwd());
+  const action = cli.goalArgs[0] as 'create' | 'list' | 'show' | 'delete';
+  const name = cli.goalArgs[1];
+  let output: Record<string, unknown>;
+
+  if (action === 'create') {
+    const result = await createProjectContextBundle({
+      cwd: projectRoot,
+      name: name!,
+      description: cli.contextBundleDescription,
+      refs: cli.contextBundleRefs,
+      force: cli.force,
+      dryRun: cli.dryRun,
+    });
+    output = {
+      command: 'context',
+      action,
+      status: result.status,
+      dryRun: result.dryRun,
+      bundle: contextBundleOutput(result.record),
+    };
+  } else if (action === 'list') {
+    const bundles = await listProjectContextBundles(projectRoot);
+    output = {
+      command: 'context',
+      action,
+      scope: 'project',
+      projectRoot,
+      directory: projectContextBundleDirectory(projectRoot),
+      bundles: bundles.map(contextBundleOutput),
+    };
+  } else if (action === 'show') {
+    const bundle = await getProjectContextBundle(name!, projectRoot);
+    output = {
+      command: 'context',
+      action,
+      bundle: contextBundleOutput(bundle),
+    };
+  } else {
+    const result = await deleteProjectContextBundle({ cwd: projectRoot, name: name!, dryRun: cli.dryRun });
+    output = {
+      command: 'context',
+      action,
+      status: result.status,
+      dryRun: result.dryRun,
+      bundle: contextBundleOutput(result.record),
+    };
+  }
+
+  console.log(renderContextCommandOutput(output, cli.output));
+  return 0;
+}
+
+function contextBundleOutput(record: ProjectContextBundle): Record<string, unknown> {
+  return {
+    scope: record.scope,
+    projectRoot: record.projectRoot,
+    path: record.path,
+    digest: record.digest,
+    ...record.bundle,
+  };
+}
+
+function renderContextCommandOutput(output: Record<string, unknown>, format: ManualTestCliOptions['output']): string {
+  if (format === 'json') return JSON.stringify(output, null, 2);
+  if (format === 'jsonl') return JSON.stringify(output);
+
+  const action = String(output.action);
+  if (action === 'list') {
+    const bundles = output.bundles as Array<Record<string, unknown>>;
+    return [
+      `Context bundles (${bundles.length})`,
+      `directory: ${String(output.directory)}`,
+      ...(bundles.length === 0
+        ? ['  (none)']
+        : bundles.map((bundle) => `  - ${String(bundle.name)} (${(bundle.refs as unknown[]).length} refs, ${String(bundle.digest)})`)),
+    ].join('\n');
+  }
+
+  const bundle = output.bundle as Record<string, unknown>;
+  const refs = bundle.refs as Array<{ kind: string; id: string }>;
+  const status = output.status ? `${String(output.status)}${output.dryRun ? ' (dry run)' : ''}` : action;
+  return [
+    `Context bundle ${status}`,
+    `name: ${String(bundle.name)}`,
+    `scope: ${String(bundle.scope)}`,
+    `description: ${bundle.description === undefined ? '(none)' : String(bundle.description)}`,
+    `path: ${String(bundle.path)}`,
+    `digest: ${String(bundle.digest)}`,
+    'refs:',
+    ...refs.map((ref) => `  - ${ref.kind}:${ref.id}`),
+  ].join('\n');
 }
 
 async function runAmbientCommand(cli: ManualTestCliOptions): Promise<number> {
@@ -990,18 +1127,25 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
     }
     throw error;
   }
+  const preparedContext = await prepareCliContext(cli, resolvedCwd);
   const spec: ManualTestSpec = mode === 'run'
     ? {
         mode: 'run',
         goal,
         ...(cli.inputJson === undefined ? {} : { input: cli.inputJson }),
-        ...(cli.contextRefs.length > 0 ? { contextRefs: cli.contextRefs } : {}),
+        ...(preparedContext.contextRefs.length > 0 ? { contextRefs: preparedContext.contextRefs } : {}),
+        ...(preparedContext.metadata ? { metadata: preparedContext.metadata } : {}),
         ...(cli.imagePaths.length > 0 ? { images: cli.imagePaths.map((value) => buildInlineImageInput(value, resolvedCwd)) } : {}),
         ...(cli.audioPaths.length > 0 || cli.fileAttachmentPaths.length > 0
           ? { contentParts: buildInlineContentParts(cli, resolvedCwd, { includeImages: false }) }
           : {}),
       }
-    : { mode: 'chat', messages: [{ role: 'user', content: goal }], ...(cli.contextRefs.length > 0 ? { contextRefs: cli.contextRefs } : {}) };
+    : {
+        mode: 'chat',
+        messages: [{ role: 'user', content: goal }],
+        ...(preparedContext.contextRefs.length > 0 ? { contextRefs: preparedContext.contextRefs } : {}),
+        ...(preparedContext.metadata ? { metadata: preparedContext.metadata } : {}),
+      };
   await validateLocalPaths(spec);
 
   const sdkOptions = buildSdkOptions(cli, resolvedCwd);
@@ -1099,6 +1243,7 @@ function shouldRunInteractiveChat(cli: ManualTestCliOptions): boolean {
 
 async function runInteractiveChatCommand(cli: ManualTestCliOptions): Promise<number> {
   const resolvedCwd = resolve(cli.cwd ?? process.cwd());
+  const preparedContext = await prepareCliContext(cli, resolvedCwd);
   let nextUserMessage = cli.goalArgs.join(' ').trim();
 
   while (nextUserMessage.length === 0) {
@@ -1153,7 +1298,7 @@ async function runInteractiveChatCommand(cli: ManualTestCliOptions): Promise<num
       }
 
       messages.push({ role: 'user', content: userMessage });
-      const spec: ManualChatSpec = { mode: 'chat', messages };
+      const spec = buildInteractiveChatSpec(messages, preparedContext.contextRefs, preparedContext.metadata);
       const warnings = collectProviderWarnings(spec, resolvedConfig.model.provider);
 
       if (!summaryPrinted) {
@@ -1200,6 +1345,30 @@ async function runInteractiveChatCommand(cli: ManualTestCliOptions): Promise<num
   } finally {
     await sdk?.close();
   }
+}
+
+export function buildInteractiveChatSpec(
+  messages: ChatMessage[],
+  contextRefs: ContextRef[],
+  metadata?: Record<string, JsonValue>,
+): ManualChatSpec {
+  return {
+    mode: 'chat',
+    messages,
+    ...(contextRefs.length > 0 ? { contextRefs } : {}),
+    ...(metadata ? { metadata } : {}),
+  };
+}
+
+async function prepareCliContext(
+  cli: ManualTestCliOptions,
+  cwd: string,
+): Promise<{ contextRefs: ContextRef[]; metadata?: Record<string, JsonValue> }> {
+  const expansion = await expandContextBundleInputs(cli.contextInputs, cwd);
+  return {
+    contextRefs: expansion.refs,
+    metadata: mergeContextBundleMetadata(undefined, expansion.bundles),
+  };
 }
 
 async function readChatLine(): Promise<string | undefined> {
@@ -1886,6 +2055,8 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
     specPath: '',
     goalArgs: [],
     contextRefs: [],
+    contextInputs: [],
+    contextBundleRefs: [],
     imagePaths: [],
     audioPaths: [],
     fileAttachmentPaths: [],
@@ -2016,7 +2187,20 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
         options.inputJson = parseJsonFlag(requireOptionValue(arg, argv[++index]), arg);
         break;
       case '--context-ref':
-        options.contextRefs.push(parseContextRefFlag(requireOptionValue(arg, argv[++index]), arg));
+        {
+          const ref = parseContextRefFlag(requireOptionValue(arg, argv[++index]), arg);
+          options.contextRefs.push(ref);
+          options.contextInputs.push({ kind: 'ref', ref });
+        }
+        break;
+      case '--context-bundle':
+        options.contextInputs.push({ kind: 'bundle', name: requireOptionValue(arg, argv[++index]) });
+        break;
+      case '--ref':
+        options.contextBundleRefs.push(parseContextRefFlag(requireOptionValue(arg, argv[++index]), arg));
+        break;
+      case '--description':
+        options.contextBundleDescription = requireOptionValue(arg, argv[++index]);
         break;
       case '--input':
         options.evalInputPath = requireOptionValue(arg, argv[++index]);
@@ -2152,7 +2336,7 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
         options.output = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['pretty', 'json', 'jsonl']);
         break;
       default:
-        if (options.command === 'run' || options.command === 'chat' || options.command === 'swarm-run' || options.command === 'ambient' || options.command === 'inspect' || options.command === 'resume' || options.command === 'retry' || options.command === 'recover' || options.command === 'interrupt' || options.command === 'replay' || options.command === 'agent-create') {
+        if (options.command === 'run' || options.command === 'chat' || options.command === 'swarm-run' || options.command === 'ambient' || options.command === 'inspect' || options.command === 'resume' || options.command === 'retry' || options.command === 'recover' || options.command === 'interrupt' || options.command === 'replay' || options.command === 'agent-create' || options.command === 'context') {
           options.goalArgs.push(arg);
           break;
         }
@@ -2225,6 +2409,30 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
     }
   }
 
+  if (!options.help && options.command === 'context') {
+    const [action, name, ...extra] = options.goalArgs;
+    if (action !== 'create' && action !== 'list' && action !== 'show' && action !== 'delete') {
+      throw new Error('context requires one of: create, list, show, delete');
+    }
+    if (action === 'list') {
+      if (name !== undefined) throw new Error('context list does not accept a bundle name');
+    } else if (!name || extra.length > 0) {
+      throw new Error(`context ${action} requires exactly one bundle name`);
+    }
+    if (action === 'create') {
+      if (options.contextBundleRefs.length === 0) throw new Error('context create requires at least one --ref run:<id> or --ref session:<id>');
+    } else {
+      if (options.contextBundleRefs.length > 0) throw new Error('--ref is supported for context create only');
+      if (options.contextBundleDescription !== undefined) throw new Error('--description is supported for context create only');
+      if (options.force) throw new Error('--force is supported for context create only');
+    }
+  }
+
+  if (!options.help && options.command !== 'context') {
+    if (options.contextBundleRefs.length > 0) throw new Error('--ref is supported for context create only');
+    if (options.contextBundleDescription !== undefined) throw new Error('--description is supported for context create only');
+  }
+
   if (!options.help && swarmSpecified && options.command !== 'eval') {
     throw new Error('--swarm is supported for eval requests, not other command requests');
   }
@@ -2245,6 +2453,18 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
     if (options.orchestrate) {
       throw new Error('--orchestrate is not used with swarm-run; swarm-run already uses coordinated decomposition');
     }
+    if (options.contextRefs.length > 0) {
+      throw new Error('--context-ref is supported for direct run and chat requests, not swarm-run');
+    }
+  }
+
+  if (!options.help && options.contextRefs.length > 0 && options.command !== 'run' && options.command !== 'chat') {
+    throw new Error('--context-ref is supported for direct run and chat requests only');
+  }
+
+  const contextBundleInputCount = options.contextInputs.filter((input) => input.kind === 'bundle').length;
+  if (!options.help && contextBundleInputCount > 0 && options.command !== 'run' && options.command !== 'chat') {
+    throw new Error('--context-bundle is supported for direct run and chat requests only');
   }
 
   if (!options.help && options.command === 'retry') {
@@ -2293,6 +2513,14 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
 
   if (!options.help && options.command === 'chat' && options.orchestrate) {
     throw new Error('--orchestrate is supported for run requests, not chat requests');
+  }
+
+  if (!options.help && options.orchestrate && contextBundleInputCount > 0) {
+    throw new Error('--context-bundle is not supported with --orchestrate until stage propagation semantics are defined');
+  }
+
+  if (!options.help && options.orchestrate && options.contextRefs.length > 0) {
+    throw new Error('--context-ref is not supported with --orchestrate until stage propagation semantics are defined');
   }
 
   return options;
@@ -2648,23 +2876,7 @@ function parseOptionalContextRefs(value: unknown, label: string): ContextRef[] |
   if (!Array.isArray(value)) {
     throw new Error(`${label} must be an array`);
   }
-  return value.map((entry, index) => parseContextRefObject(entry, `${label}[${index}]`));
-}
-
-function parseContextRefObject(value: unknown, label: string): ContextRef {
-  const raw = ensureObject(value, label);
-  const kind = parseEnumField(raw.kind, `${label}.kind`, ['run', 'session']);
-  const id = requireString(raw.id, `${label}.id`);
-  const maxBytes = raw.maxBytes === undefined ? undefined : parsePositiveIntegerValue(raw.maxBytes, `${label}.maxBytes`);
-  const allowStatuses = raw.allowStatuses === undefined ? undefined : parseStringArray(raw.allowStatuses, `${label}.allowStatuses`);
-  if (kind === 'run') {
-    const view = raw.view === undefined ? undefined : parseEnumField(raw.view, `${label}.view`, ['result']);
-    return { kind, id, ...(view ? { view } : {}), ...(maxBytes ? { maxBytes } : {}), ...(allowStatuses ? { allowStatuses: allowStatuses as ContextRef['allowStatuses'] } : {}) };
-  }
-  const view = raw.view === undefined ? undefined : parseEnumField(raw.view, `${label}.view`, ['run_summaries']);
-  const rootRunsOnly = raw.rootRunsOnly === undefined ? undefined : parseBoolean(raw.rootRunsOnly, `${label}.rootRunsOnly`);
-  const maxRuns = raw.maxRuns === undefined ? undefined : parsePositiveIntegerValue(raw.maxRuns, `${label}.maxRuns`);
-  return { kind, id, ...(view ? { view } : {}), ...(rootRunsOnly === undefined ? {} : { rootRunsOnly }), ...(maxRuns ? { maxRuns } : {}), ...(maxBytes ? { maxBytes } : {}), ...(allowStatuses ? { allowStatuses: allowStatuses as ContextRef['allowStatuses'] } : {}) };
+  return value.map((entry, index) => parseContextRef(entry, `${label}[${index}]`));
 }
 
 function parseOptionalSchema(value: unknown): JsonSchema | undefined {
@@ -2721,27 +2933,6 @@ function parseNonNegativeIntegerOption(flag: string, value: string): number {
   return parsed;
 }
 
-function parsePositiveIntegerValue(value: unknown, label: string): number {
-  if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
-    throw new Error(`${label} must be a positive integer`);
-  }
-  return value;
-}
-
-function parseBoolean(value: unknown, label: string): boolean {
-  if (typeof value !== 'boolean') {
-    throw new Error(`${label} must be a boolean`);
-  }
-  return value;
-}
-
-function parseStringArray(value: unknown, label: string): string[] {
-  if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string')) {
-    throw new Error(`${label} must be an array of strings`);
-  }
-  return value;
-}
-
 function requireOptionValue(flag: string, value: string | undefined): string {
   if (!value || value.startsWith('--')) {
     throw new Error(`Missing value for ${flag}`);
@@ -2755,29 +2946,6 @@ function parseJsonFlag(value: string, flag: string): JsonValue {
   } catch (error) {
     throw new Error(`${flag} must be valid JSON: ${error instanceof Error ? error.message : String(error)}`);
   }
-}
-
-function parseContextRefFlag(value: string, flag: string): ContextRef {
-  if (value.startsWith('@')) {
-    throw new Error(`${flag} shorthand @id is not supported yet; use run:<id> or session:<id>`);
-  }
-  const separatorIndex = value.indexOf(':');
-  if (separatorIndex <= 0 || separatorIndex === value.length - 1) {
-    throw new Error(`${flag} must be run:<id> or session:<id>`);
-  }
-
-  const kind = value.slice(0, separatorIndex);
-  const id = value.slice(separatorIndex + 1).trim();
-  if (!id) {
-    throw new Error(`${flag} requires a non-empty id`);
-  }
-  if (kind === 'run') {
-    return { kind: 'run', id };
-  }
-  if (kind === 'session') {
-    return { kind: 'session', id };
-  }
-  throw new Error(`${flag} kind must be run or session`);
 }
 
 async function readInlinePrompt(cli: ManualTestCliOptions, label: string): Promise<string> {

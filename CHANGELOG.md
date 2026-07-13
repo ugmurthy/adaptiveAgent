@@ -9,10 +9,20 @@ This project follows semantic versioning for release notes.
 ### Added
 
 - Added basic `--context-ref` CLI support.
+- Added project-scoped named context bundles with `context create`, `list`,
+  `show`, and `delete` commands plus `--context-bundle` expansion for direct
+  run and chat requests.
 
 ### Changed
 
 - Hardened the next-step context-reference spec.
+- Session context refs now default to the latest matching runs instead of the
+  earliest matching runs, with explicit `latest` and `earliest` selection.
+- Context-ref resolution now pages sessions deterministically, records source
+  run provenance, and authorizes each candidate session run.
+- Run context-ref IDs are validated as UUIDs before bundle persistence or
+  runtime-store access, replacing database syntax errors with actionable CLI
+  validation errors.
 
 ## [0.1.34] - 2026-07-09
 

@@ -173,6 +173,19 @@ describe('orchestration sdk', () => {
     expect(events.at(-1)).toMatchObject({ type: 'orchestration.session.completed', sessionId: 'session-1', status: 'succeeded', finalRunId: 'general-run-1' });
   });
 
+  it('rejects context refs until orchestration stage propagation is defined', async () => {
+    const sdk = await createOrchestrationSdk({
+      agentCatalog: [{ agentId: 'general', agentConfig: agent('general', ['text']) }],
+      requestedAgentConfig: agent('general', ['text']),
+      agentRunnerFactory: async (agentId) => fakeRunner(agentId, []),
+    });
+
+    await expect(sdk.run('continue prior work', {
+      contextRefs: [{ kind: 'run', id: 'run-123' }],
+    })).rejects.toThrow('Context refs are not supported for orchestration');
+    await sdk.close();
+  });
+
   it('resolves catalog agent names from configured agent search dirs', async () => {
     const tempDir = await mkdtemp(join(tmpdir(), 'orchestration-catalog-'));
     const calls: Array<{ agentId: string; goal: string; options: AgentSdkRunOptions }> = [];

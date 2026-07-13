@@ -71,6 +71,28 @@ adaptive-agent run "Hello, confirm you are working"
 
 That is it. You now have a configured local agent that can run goals, use tools, and produce inspectable runtime history.
 
+### Reuse prior evidence with a named context bundle
+
+Create a project-scoped bundle of existing run and session outputs, then reuse
+it in direct run or chat requests:
+
+```bash
+adaptive-agent context create migration-research \
+  --ref run:550e8400-e29b-41d4-a716-446655440000 \
+  --ref session:session_456
+
+adaptive-agent run \
+  --context-bundle migration-research \
+  "Draft the migration plan"
+```
+
+Bundles are stored under `.adaptiveAgent/context-bundles` in the selected
+`--cwd`. Use `adaptive-agent context list`, `context show <name>`, and
+`context delete <name>` to manage them. Bundle names, canonical digests, and the
+exact expanded refs are persisted in consuming run metadata for inspection.
+Values after `run:` must be complete run UUIDs; session IDs remain free-form
+strings.
+
 ## Repository packages
 
 This monorepo is intentionally small:

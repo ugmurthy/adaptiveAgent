@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  buildInteractiveChatSpec,
   collectProviderWarnings,
   selectBenchmarkCases,
   loadBenchmarkCases,
@@ -22,7 +23,13 @@ import {
   summarizeGaiaDryRunTasks,
 } from './adaptive-agent.js';
 import type { BenchmarkAttachmentType, BenchmarkCase, ManualTestCliOptions } from './adaptive-agent.js';
+import { formatAgentEventSummary, summarizeAgentEvent } from './agent-event-rendering.js';
 import { extractToolProgressContent, printProgressEvent } from './cli-render.js';
+
+const RUN_REF_ID = '11111111-1111-4111-8111-111111111111';
+const BEFORE_RUN_ID = '22222222-2222-4222-8222-222222222222';
+const AFTER_RUN_ID = '33333333-3333-4333-8333-333333333333';
+const BUNDLE_RUN_ID = '44444444-4444-4444-8444-444444444444';
 
 describe('adaptive-agent spec loading', () => {
   let tempDir: string;
@@ -73,6 +80,31 @@ describe('adaptive-agent spec loading', () => {
     expect(content[3]).toEqual({
       type: 'audio',
       audio: { source: { kind: 'path', path: join(tempDir, 'fixtures', 'audio.mp3') }, format: 'mp3' },
+    });
+  });
+
+  it('loads session context selection and scan bounds from run specs', async () => {
+    const specPath = join(tempDir, 'context-ref-spec.json');
+    await writeFile(specPath, JSON.stringify({
+      mode: 'run',
+      goal: 'Continue the investigation',
+      contextRefs: [{
+        kind: 'session',
+        id: 'session-1',
+        selection: 'earliest',
+        maxRuns: 5,
+        maxScanRuns: 250,
+      }],
+    }));
+
+    await expect(loadManualTestSpec(specPath)).resolves.toMatchObject({
+      contextRefs: [{
+        kind: 'session',
+        id: 'session-1',
+        selection: 'earliest',
+        maxRuns: 5,
+        maxScanRuns: 250,
+      }],
     });
   });
 
@@ -158,6 +190,7 @@ describe('adaptive-agent cli parsing', () => {
     expect(parseCliArgs(['help', 'swarm-run'])).toMatchObject({ help: true, helpTopic: 'swarm-run' });
     expect(parseCliArgs(['help', 'ambient'])).toMatchObject({ help: true, helpTopic: 'ambient' });
     expect(parseCliArgs(['help', 'replay'])).toMatchObject({ help: true, helpTopic: 'replay' });
+    expect(parseCliArgs(['help', 'context'])).toMatchObject({ help: true, helpTopic: 'context' });
   });
 
   it('parses ambient start requests', () => {
@@ -207,6 +240,8 @@ describe('adaptive-agent cli parsing', () => {
       specPath: './tmp/spec.json',
       goalArgs: [],
       contextRefs: [],
+      contextInputs: [],
+      contextBundleRefs: [],
       imagePaths: [],
       audioPaths: [],
       fileAttachmentPaths: [],
@@ -248,15 +283,78 @@ describe('adaptive-agent cli parsing', () => {
   });
 
   it('parses explicit context refs and rejects ambiguous shorthand', () => {
-    expect(parseCliArgs(['run', '--context-ref', 'run:run-123', '--context-ref', 'session:session-456', 'summarize'])).toMatchObject({
+    expect(parseCliArgs(['run', '--context-ref', `run:${RUN_REF_ID}`, '--context-ref', 'session:session-456', 'summarize'])).toMatchObject({
       command: 'run',
       goalArgs: ['summarize'],
       contextRefs: [
-        { kind: 'run', id: 'run-123' },
+        { kind: 'run', id: RUN_REF_ID },
         { kind: 'session', id: 'session-456' },
       ],
     });
     expect(() => parseCliArgs(['run', '--context-ref', '@run-123', 'summarize'])).toThrow('shorthand @id is not supported yet');
+    expect(() => parseCliArgs(['chat', '--context-ref', 'run:c453e5947-6e7e-4cde-a488-cb133288e29c', 'summarize'])).toThrow(
+      '--context-ref run ref id must be a valid UUID',
+    );
+    expect(() => parseCliArgs(['run', '--orchestrate', '--context-ref', `run:${RUN_REF_ID}`, 'summarize'])).toThrow(
+      '--context-ref is not supported with --orchestrate',
+    );
+    expect(() => parseCliArgs(['inspect', '--context-ref', `run:${RUN_REF_ID}`, 'run-456'])).toThrow(
+      '--context-ref is supported for direct run and chat requests only',
+    );
+  });
+
+  it('parses named context bundle management and ordered expansion inputs', () => {
+    expect(parseCliArgs([
+      'context',
+      'create',
+      'migration-research',
+      '--description',
+      'Migration evidence',
+      '--ref',
+      `run:${RUN_REF_ID}`,
+      '--ref',
+      'session:session-456',
+    ])).toMatchObject({
+      command: 'context',
+      goalArgs: ['create', 'migration-research'],
+      contextBundleDescription: 'Migration evidence',
+      contextBundleRefs: [
+        { kind: 'run', id: RUN_REF_ID },
+        { kind: 'session', id: 'session-456' },
+      ],
+    });
+
+    expect(parseCliArgs([
+      'run',
+      '--context-ref', `run:${BEFORE_RUN_ID}`,
+      '--context-bundle', 'migration-research',
+      '--context-ref', `run:${AFTER_RUN_ID}`,
+      'draft',
+    ])).toMatchObject({
+      contextInputs: [
+        { kind: 'ref', ref: { kind: 'run', id: BEFORE_RUN_ID } },
+        { kind: 'bundle', name: 'migration-research' },
+        { kind: 'ref', ref: { kind: 'run', id: AFTER_RUN_ID } },
+      ],
+    });
+
+    expect(() => parseCliArgs(['context', 'create', 'empty'])).toThrow('at least one --ref');
+    expect(() => parseCliArgs(['context', 'show'])).toThrow('requires exactly one bundle name');
+    expect(() => parseCliArgs(['run', '--ref', `run:${RUN_REF_ID}`, 'draft'])).toThrow('context create only');
+    expect(() => parseCliArgs(['run', '--orchestrate', '--context-bundle', 'migration-research', 'draft'])).toThrow(
+      '--context-bundle is not supported with --orchestrate',
+    );
+  });
+
+  it('preserves context refs in every interactive chat request spec', () => {
+    const contextRefs = [{ kind: 'run' as const, id: RUN_REF_ID }];
+    const messages = [{ role: 'user' as const, content: 'Continue' }];
+
+    expect(buildInteractiveChatSpec(messages, contextRefs)).toEqual({
+      mode: 'chat',
+      messages,
+      contextRefs,
+    });
   });
 
   it('prints concise top-level help and focused command help', async () => {
@@ -281,6 +379,12 @@ describe('adaptive-agent cli parsing', () => {
       expect(ambientHelp).toContain('adaptive-agent ambient');
       expect(ambientHelp).toContain('Filesystem trigger layout:');
       expect(ambientHelp).toContain('--config <path>');
+
+      await expect(main(['context', '--help'])).resolves.toBe(0);
+      const contextHelp = String(log.mock.calls.at(-1)?.[0]);
+      expect(contextHelp).toContain('adaptive-agent context');
+      expect(contextHelp).toContain('context create <name>');
+      expect(contextHelp).toContain('.adaptiveAgent/context-bundles');
     } finally {
       log.mockRestore();
     }
@@ -585,6 +689,101 @@ describe('adaptive-agent cli parsing', () => {
     expect(() => parseCliArgs(['agent-create', '--file', './brief.md', 'description'])).toThrow('not both');
     expect(() => parseCliArgs(['agent-create', '--agent', 'default-agent', 'description'])).toThrow('uses --generator-agent');
     expect(() => parseCliArgs(['run', '--generator-agent', 'default-agent', 'hello'])).toThrow('--generator-agent is supported for agent-create');
+  });
+});
+
+describe('adaptive-agent context bundle command', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'adaptive-agent-context-'));
+    await writeAgentConfig(join(tempDir, 'agent.json'));
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it('manages bundles and exposes exact expansion audit data in dry-run JSON', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      await expect(main([
+        'context', 'create', 'migration-research',
+        '--description', 'Display-only migration notes',
+        '--ref', `run:${BUNDLE_RUN_ID}`,
+        '--ref', 'session:bundle-session',
+        '--cwd', tempDir,
+        '--output', 'json',
+      ])).resolves.toBe(0);
+      const created = JSON.parse(String(log.mock.calls.at(-1)?.[0])) as {
+        status: string;
+        bundle: { name: string; digest: string; path: string };
+      };
+      expect(created.status).toBe('created');
+      expect(created.bundle.name).toBe('migration-research');
+      expect(created.bundle.digest).toMatch(/^[a-f0-9]{64}$/);
+
+      log.mockClear();
+      await expect(main(['context', 'list', '--cwd', tempDir, '--output', 'json'])).resolves.toBe(0);
+      expect(JSON.parse(String(log.mock.calls.at(-1)?.[0]))).toMatchObject({
+        bundles: [{ name: 'migration-research', digest: created.bundle.digest }],
+      });
+
+      log.mockClear();
+      await expect(main([
+        'run',
+        '--context-ref', `run:${BEFORE_RUN_ID}`,
+        '--context-bundle', 'migration-research',
+        '--context-ref', `run:${AFTER_RUN_ID}`,
+        '--cwd', tempDir,
+        '--dry-run',
+        '--output', 'json',
+        'Draft the migration plan',
+      ])).resolves.toBe(0);
+      const dryRun = JSON.parse(String(log.mock.calls.at(-1)?.[0])) as {
+        cli: { contextBundles: string[] };
+        request: {
+          contextRefs: Array<{ kind: string; id: string }>;
+          metadata: { contextBundles: Array<{ name: string; scope: string; digest: string; expandedRefs: Array<{ kind: string; id: string }> }> };
+        };
+      };
+      expect(dryRun.cli.contextBundles).toEqual(['migration-research']);
+      expect(dryRun.request.contextRefs).toEqual([
+        { kind: 'run', id: BEFORE_RUN_ID },
+        { kind: 'run', id: BUNDLE_RUN_ID },
+        { kind: 'session', id: 'bundle-session' },
+        { kind: 'run', id: AFTER_RUN_ID },
+      ]);
+      expect(dryRun.request.metadata.contextBundles).toEqual([{
+        name: 'migration-research',
+        scope: 'project',
+        digest: created.bundle.digest,
+        expandedRefs: [
+          { kind: 'run', id: BUNDLE_RUN_ID },
+          { kind: 'session', id: 'bundle-session' },
+        ],
+      }]);
+      expect(JSON.stringify(dryRun.request)).not.toContain('Display-only migration notes');
+
+      log.mockClear();
+      await expect(main(['context', 'delete', 'migration-research', '--cwd', tempDir, '--dry-run', '--output', 'json'])).resolves.toBe(0);
+      expect(JSON.parse(String(log.mock.calls.at(-1)?.[0]))).toMatchObject({ action: 'delete', dryRun: true });
+      await expect(main(['context', 'show', 'migration-research', '--cwd', tempDir, '--output', 'json'])).resolves.toBe(0);
+
+      log.mockClear();
+      await expect(main(['context', 'delete', 'migration-research', '--cwd', tempDir, '--output', 'json'])).resolves.toBe(0);
+      await expect(main(['context', 'list', '--cwd', tempDir, '--output', 'json'])).resolves.toBe(0);
+      expect(JSON.parse(String(log.mock.calls.at(-1)?.[0]))).toMatchObject({ bundles: [] });
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('rejects unknown bundle names before preparing an agent request', async () => {
+    await expect(main([
+      'run', '--context-bundle', 'missing', '--cwd', tempDir, '--dry-run', 'Draft',
+    ])).rejects.toThrow('Unknown project context bundle');
   });
 });
 
@@ -1343,6 +1542,21 @@ describe('adaptive-agent pretty rendering', () => {
     expect(rendered).toContain('            │ the message column instead of spilling across the');
     expect(rendered).toContain('            │ run 524416f9 · 1 step · prompt 3747 · completion 360');
     expect(rendered).not.toContain('status: success');
+  });
+
+  it('renders compact context ref resolution event details', () => {
+    const summary = summarizeAgentEvent({
+      type: 'context.refs.resolved',
+      runId: 'run-123456789',
+      createdAt: '2026-07-10T12:00:00.000Z',
+      payload: {
+        refs: [{ kind: 'run', id: 'source-1' }],
+        resolved: [{ kind: 'run', id: 'source-1', truncated: true }],
+        totalBytes: 4096,
+      },
+    });
+
+    expect(formatAgentEventSummary(summary)).toContain('refs=1 bytes=4096 truncated=1');
   });
 
   it('formats interactive chat responses as stacked blocks on narrow terminals', () => {

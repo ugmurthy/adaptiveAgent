@@ -8,10 +8,11 @@ import type {
 } from '@adaptive-agent/core';
 
 import type { ApprovalMode, ClarificationMode, RuntimeMode, createAgentSdk } from './index.js';
+import type { ContextBundleInput } from './context-bundles.js';
 import type { InitProfile } from './install/init.js';
 
 export interface ManualTestCliOptions {
-  command: 'run' | 'chat' | 'spec' | 'config' | 'catalog' | 'eval' | 'swarm-run' | 'ambient' | 'inspect' | 'resume' | 'retry' | 'recover' | 'interrupt' | 'replay' | 'init' | 'doctor' | 'update' | 'uninstall' | 'agent-create' | 'version';
+  command: 'run' | 'chat' | 'spec' | 'config' | 'catalog' | 'eval' | 'swarm-run' | 'ambient' | 'inspect' | 'resume' | 'retry' | 'recover' | 'interrupt' | 'replay' | 'init' | 'doctor' | 'update' | 'uninstall' | 'agent-create' | 'context' | 'version';
   specPath: string;
   goalArgs: string[];
   runId?: string;
@@ -19,6 +20,9 @@ export interface ManualTestCliOptions {
   promptFilePath?: string;
   inputJson?: JsonValue;
   contextRefs: ContextRef[];
+  contextInputs: ContextBundleInput[];
+  contextBundleRefs: ContextRef[];
+  contextBundleDescription?: string;
   imagePaths: string[];
   audioPaths: string[];
   fileAttachmentPaths: string[];
@@ -119,6 +123,7 @@ export interface InspectionSummary {
   run: Awaited<ReturnType<Awaited<ReturnType<typeof createAgentSdk>>['created']['runtime']['runStore']['getRun']>>;
   eventCount: number;
   eventTypes: Record<string, number>;
+  contextRefs?: JsonValue;
 }
 
 export interface ManualTestJsonOutput {
