@@ -1,9 +1,69 @@
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-import { buildTimeline, buildTraceDiagnostics, computeDelegateReason, listSessions, loadUsageForTraceTarget, parseArgs, renderDeleteEmptyGoalSessionsSql, renderSessionList, renderSessionPerformanceList, renderSessionlessRunList, renderTraceHtml, renderTraceReport, renderUsageReport, summarizePerformance, summarizeTrace, traceSession } from './trace-session.js';
+import { buildTimeline, buildTraceDiagnostics, computeDelegateReason, listSessionPerformance, listSessions, loadUsageForTraceTarget, parseArgs, renderDeleteEmptyGoalSessionsSql, renderSessionList, renderSessionPerformanceList, renderSessionlessRunList, renderTraceHtml, renderTraceReport, renderUsageReport, summarizePerformance, summarizeTrace, traceSession } from './trace-session.js';
+import { cacheKey, databaseIdentity, effectiveCacheTtl, parseCacheDuration, readCache, writeCache } from './trace-session/cache.js';
 import type { TraceRow } from './trace-session.js';
 
 describe('trace-session CLI helpers', () => {
+  it('parses cache durations and cache CLI controls', () => {
+    expect(parseCacheDuration('0')).toBe(0);
+    expect(parseCacheDuration('250ms')).toBe(250);
+    expect(parseCacheDuration('2s')).toBe(2_000);
+    expect(parseCacheDuration('1.5m')).toBe(90_000);
+    expect(parseCacheDuration('1h')).toBe(3_600_000);
+    expect(parseCacheDuration('1d')).toBe(86_400_000);
+    expect(() => parseCacheDuration('-1s')).toThrow('non-negative duration');
+    expect(() => parseCacheDuration('five')).toThrow('non-negative duration');
+    expect(parseArgs(['trace-session', 's', '--fresh', '--no-cache', '--cache-ttl', '4m'])).toMatchObject({ fresh: true, noCache: true, cacheTtl: 240_000 });
+  });
+
+  it('keys structured cache variants without passwords or render-only flags', () => {
+    const base = parseArgs(['trace-session', 's']);
+    const config = { connectionString: 'postgres://alice:secret@DB.EXAMPLE:5432/app' };
+    const env = { PGHOST: 'db.example', PGUSER: 'alice', USER: 'local-user' };
+    expect(databaseIdentity(config.connectionString, env)).toBe(databaseIdentity('postgres://alice:different@db.example/app', env));
+    expect(databaseIdentity('postgres:///app', env)).not.toBe(databaseIdentity('postgres:///app', { ...env, PGHOST: 'other.example' }));
+    expect(databaseIdentity('postgres:///app', env)).not.toBe(databaseIdentity('postgres:///app', { ...env, PGUSER: 'bob' }));
+    expect(databaseIdentity('postgres:///app?host=%2Fsocket-a', env)).not.toBe(databaseIdentity('postgres:///app?host=%2Fsocket-b', env));
+    expect(databaseIdentity('postgres:///app?options=-c%20role%3Dtenant_a', env)).not.toBe(databaseIdentity('postgres:///app?options=-c%20role%3Dtenant_b', env));
+    expect(cacheKey(config, base, 'trace')).toBe(cacheKey(config, { ...base, json: true, view: 'summary', previewChars: 10 }, 'trace'));
+    expect(cacheKey(config, base, 'trace')).not.toBe(cacheKey(config, { ...base, messages: true }, 'trace'));
+    expect(cacheKey(config, base, 'trace')).not.toBe(cacheKey(config, { ...base, rootRunId: 'root-1' }, 'trace'));
+    expect(cacheKey(config, base, 'usage')).not.toBe(cacheKey(config, base, 'trace'));
+    expect(cacheKey(config, base, 'trace')).not.toContain('secret');
+  });
+
+  it('enforces current terminal and override cache policy on disk', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'trace-cache-'));
+    try {
+      const value = { total: { promptTokens: 0, completionTokens: 0, totalTokens: 0, estimatedCostUSD: 0 }, byRootRun: [] };
+      await writeCache('a'.repeat(64), value, false, 1_000, dir);
+      expect(await readCache('a'.repeat(64), undefined, dir)).toBeUndefined();
+      expect(await readCache('a'.repeat(64), 1_000, dir)).toEqual(value);
+      await writeCache('b'.repeat(64), value, true, undefined, dir);
+      expect(await readCache('b'.repeat(64), undefined, dir)).toEqual(value);
+      expect(effectiveCacheTtl(false)).toBe(0);
+      expect(effectiveCacheTtl(true)).toBe(300_000);
+      expect((await stat(dir)).mode & 0o777).toBe(0o700);
+      expect((await stat(join(dir, `${'b'.repeat(64)}.json`))).mode & 0o777).toBe(0o600);
+      await writeFile(join(dir, `${'c'.repeat(64)}.json`), '{bad');
+      expect(await readCache('c'.repeat(64), 1_000, dir)).toBeUndefined();
+      const entry = JSON.parse(await readFile(join(dir, `${'b'.repeat(64)}.json`), 'utf8'));
+      entry.createdAt = Date.now() - 301_000;
+      await writeFile(join(dir, `${'b'.repeat(64)}.json`), JSON.stringify(entry));
+      expect(await readCache('b'.repeat(64), undefined, dir)).toBeUndefined();
+
+      await writeCache('d'.repeat(64), value, true, 600_000, dir);
+      const overriddenEntry = JSON.parse(await readFile(join(dir, `${'d'.repeat(64)}.json`), 'utf8'));
+      overriddenEntry.createdAt = Date.now() - 301_000;
+      await writeFile(join(dir, `${'d'.repeat(64)}.json`), JSON.stringify(overriddenEntry));
+      await writeCache('e'.repeat(64), value, true, undefined, dir);
+      expect(await readCache('d'.repeat(64), 600_000, dir)).toEqual(value);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
   it('parses the primary trace-session command and flags', () => {
     expect(parseArgs(['trace-session', 'sess-1', '--json', '--root-run', 'root-1', '--include-plans', '--only-delegates'])).toEqual({
       sessionId: 'sess-1',
@@ -87,6 +147,9 @@ describe('trace-session CLI helpers', () => {
 
   it('parses diagnostic report views', () => {
     expect(parseArgs(['trace-session', 'sess-1', '--view', 'brief'])).toMatchObject({ view: 'brief' });
+    expect(parseArgs(['trace-session', 'sess-1', '--view', 'summary'])).toMatchObject({ view: 'summary' });
+    expect(parseArgs(['trace-session', 'sess-1', '--view', 'reliability'])).toMatchObject({ view: 'reliability' });
+    expect(parseArgs(['trace-session', 'sess-1', '--view', 'operations'])).toMatchObject({ view: 'operations' });
     expect(parseArgs(['trace-session', 'sess-1', '--view', 'investigate'])).toMatchObject({ view: 'investigate' });
     expect(parseArgs(['trace-session', 'sess-1', '--view', 'policy'])).toMatchObject({ view: 'policy' });
   });
@@ -152,6 +215,29 @@ describe('trace-session CLI helpers', () => {
       systemOnly: false,
       help: false,
     });
+  });
+
+  it('parses list filters and validates their combinations', () => {
+    expect(parseArgs([
+      'trace-session', '--lsp',
+      '--goal', 'market', '--goal', 'incident', '--goal-regex', 'EV|vehicle',
+      '--status', 'planning', '--status', 'replan_required',
+      '--type', 'swarm', '--type', 'swarm-run', '--swarm-role', 'worker', '--limit', '10',
+    ])).toMatchObject({
+      listPerformance: true,
+      goals: ['market', 'incident'],
+      statuses: ['planning', 'replan_required'],
+      types: ['swarm', 'swarm-run'],
+      swarmRole: 'worker',
+      limit: 10,
+    });
+    expect(parseArgs(['trace-session', '--lsp', '--goal-regex', 'worker']).goalRegex?.test('Worker')).toBe(true);
+    expect(() => parseArgs(['trace-session', '--lsp', '--has-goal', '--no-goal'])).toThrow('cannot be combined');
+    expect(() => parseArgs(['trace-session', '--lsp', '--no-goal', '--goal', 'market'])).toThrow('cannot be combined');
+    expect(() => parseArgs(['trace-session', '--lsp', '--goal-regex', '['])).toThrow('Invalid --goal-regex');
+    expect(() => parseArgs(['trace-session', '--run', 'run-1', '--type', 'run'])).toThrow('only be used with --ls or --lsp');
+    expect(() => parseArgs(['trace-session', '--lsp', '--status', 'waiting'])).toThrow('Invalid --status');
+    expect(() => parseArgs(['trace-session', '--lsp', '--type', 'swarm', '--swarm-role', 'worker'])).toThrow('requires --type swarm-run');
   });
 
   it('parses the delete flag without a session id', () => {
@@ -300,6 +386,7 @@ describe('trace-session CLI helpers', () => {
         }
 
         if (sql.includes('from agent_runs r') && sql.includes('l.root_run_id is null')) {
+          expect(sql).not.toContain("and l.invocation_kind = 'run'");
           return {
             rows: [
               {
@@ -309,6 +396,7 @@ describe('trace-session CLI helpers', () => {
                 completed_at: '2026-04-16T11:00:05.000Z',
                 status: 'succeeded',
                 goal: 'CLI swarm run',
+                metadata: { orchestration: { kind: 'swarm', coordinatorRunId: 'root-from-swarm', role: 'coordinator' } },
               },
               {
                 session_id: null,
@@ -331,7 +419,7 @@ describe('trace-session CLI helpers', () => {
     expect(sessions).toEqual([
       expect.objectContaining({
         sessionId: 'swarm-session-1',
-        goals: [expect.objectContaining({ rootRunId: 'root-from-swarm' })],
+        goals: [expect.objectContaining({ rootRunId: 'root-from-swarm', type: 'swarm', swarmRole: 'coordinator' })],
       }),
       expect.objectContaining({
         sessionId: null,
@@ -393,6 +481,78 @@ describe('trace-session CLI helpers', () => {
     ]);
   });
 
+  it('filters performance rows before trace loading and classifies swarm roles', async () => {
+    const client = {
+      query: async <TRow extends Record<string, unknown>>(sql: string, params?: unknown[]) => {
+        if (sql.includes('select to_regclass')) return { rows: [{ exists: false }] } as unknown as { rows: TRow[] };
+        if (sql.includes('from information_schema.columns')) return { rows: [{ count: '3' }] } as unknown as { rows: TRow[] };
+        if (sql.includes('from information_schema.tables')) return { rows: [{ count: '0' }] } as unknown as { rows: TRow[] };
+        if (sql.includes('from agent_runs r') && sql.includes('r.session_id is not null')) {
+          return {
+            rows: [
+              {
+                session_id: 'swarm-session-1',
+                started_at: '2026-04-16T11:00:00.000Z',
+                status: 'failed',
+                goals: [
+                  {
+                    rootRunId: 'coordinator-run', runId: 'coordinator-run', status: 'succeeded',
+                    startedAt: '2026-04-16T11:00:00.000Z', completedAt: '2026-04-16T11:00:02.000Z',
+                    goal: 'Decompose market research', linkedAt: '2026-04-16T11:00:00.000Z',
+                    metadata: { orchestration: { kind: 'swarm', coordinatorRunId: 'coordinator-run', role: 'coordinator' } },
+                  },
+                  {
+                    rootRunId: 'worker-run', runId: 'worker-run', status: 'failed',
+                    startedAt: '2026-04-16T11:00:02.000Z', completedAt: '2026-04-16T11:00:05.000Z',
+                    goal: 'Research the EV market', linkedAt: '2026-04-16T11:00:02.000Z',
+                    metadata: { orchestration: { kind: 'swarm', coordinatorRunId: 'coordinator-run', role: 'worker' } },
+                  },
+                ],
+              },
+              {
+                session_id: 'empty-session',
+                started_at: '2026-04-16T10:00:00.000Z',
+                status: 'queued',
+                goals: [],
+              },
+            ],
+          } as unknown as { rows: TRow[] };
+        }
+        if (sql.includes('from agent_runs r') && sql.includes('r.session_id is null')) {
+          return { rows: [] } as unknown as { rows: TRow[] };
+        }
+        if (sql.includes('with recursive root_runs as') && sql.includes('left join agent_events e')) {
+          expect([['worker-run'], ['coordinator-run', 'worker-run']]).toContainEqual(params?.[0]);
+          return { rows: [] } as unknown as { rows: TRow[] };
+        }
+        throw new Error(`Unexpected SQL in test:\n${sql}`);
+      },
+    };
+
+    const rows = await listSessionPerformance(client as never, {
+      goals: ['ev'],
+      statuses: ['failed'],
+      types: ['swarm-run'],
+      swarmRole: 'worker',
+      limit: 1,
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      sessionId: 'swarm-session-1',
+      runId: 'worker-run',
+      type: 'swarm-run',
+      swarmRole: 'worker',
+    });
+    const output = renderSessionPerformanceList(rows, { json: false });
+    expect(stripAnsi(output)).toContain('session  swarm-session-1\nrun  worker-run\nroot  worker-run\ntype  swarm-run\nrole  worker');
+
+    const allRows = await listSessionPerformance(client as never);
+    expect(allRows.map((row) => row.runId)).toEqual(['coordinator-run', 'worker-run']);
+    const sessions = await listSessions(client as never);
+    expect(sessions.some((item) => item.sessionId === 'empty-session' && item.goals.length === 0)).toBe(true);
+  });
+
   it('renders listed session performance as one line per run', () => {
     const performance = summarizePerformance([
       traceRow({
@@ -429,15 +589,15 @@ describe('trace-session CLI helpers', () => {
       { json: false },
     );
 
-    expect(output).toContain('session=session-1');
-    expect(output).toContain('run=root-1');
-    expect(output).toContain('total=2.00s');
-    expect(output).toContain('model=1.50s');
-    expect(output).toContain('tools=250ms');
-    expect(output).toContain('snapshot=50ms');
-    expect(output).toContain('other=200ms');
-    expect(output).toContain('\n  goal=Summarize the incident timeline');
-    expect(output.split('\n')).toHaveLength(2);
+    expect(output).toContain('session  session-1');
+    expect(output).toContain('run  root-1');
+    expect(output).toContain('total 2.00s');
+    expect(output).toContain('model 1.50s');
+    expect(output).toContain('tools 250ms');
+    expect(output).toContain('snapshot 50ms');
+    expect(output).toContain('other 200ms');
+    expect(output).toContain('\ngoal  Summarize the incident timeline');
+    expect(output.split('\n')).toHaveLength(8);
   });
 
   it('renders null session ids in listed session performance rows', () => {
@@ -457,8 +617,8 @@ describe('trace-session CLI helpers', () => {
       { json: false },
     );
 
-    expect(output).toContain('session=null');
-    expect(output).toContain('run=root-sessionless');
+    expect(output).toContain('session  (none)');
+    expect(output).toContain('run  root-sessionless');
   });
 
   it('parses the session-less list flag without a session id', () => {
@@ -1091,7 +1251,7 @@ describe('trace-session CLI helpers', () => {
         warnings: [],
         summary: { status: 'succeeded', reason: 'ok' },
       },
-      { json: false, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false },
+      { json: false, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false, view: 'timeline' },
     );
 
     const lines = output.split('\n');
@@ -1186,21 +1346,18 @@ describe('trace-session CLI helpers', () => {
       { json: false, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false },
     );
 
-    expect(output).toContain('session duration');
+    expect(output).toContain('Operations');
     expect(output).toContain('provider');
-    expect(output).toContain('mesh');
+    expect(output).toContain('provider / model');
     expect(output).toContain('model');
     expect(output).toContain('qwen/qwen3.5-27b');
     expect(output).toContain('10.00s');
     const lines = output.split('\n');
-    const goalLine = lines.find((line) => stripAnsi(line) === '# Goal');
+    const goalLine = lines.find((line) => stripAnsi(line) === '# Goal / Final Output');
     expect(goalLine).toBeDefined();
-    for (const title of ['Root Runs', 'Milestones']) {
-      const line = lines.find((candidate) => stripAnsi(candidate) === `# ${title}`);
-      expect(line?.replace(title, 'Goal')).toBe(goalLine);
+    for (const title of ['Identity', 'Verdict / Reliability', 'Operations', 'Findings']) {
+      expect(lines.some((candidate) => stripAnsi(candidate) === `# ${title}`)).toBe(true);
     }
-    const timelineLine = lines.find((line) => stripAnsi(line).startsWith('# Tool Timeline:'));
-    expect(timelineLine?.replace(/Tool Timeline:.*/, 'Goal')).toBe(goalLine);
   });
 
   it('renders only the final root-run result in the output view', () => {
@@ -1352,7 +1509,7 @@ describe('trace-session CLI helpers', () => {
     );
 
     expect(output).toContain('usage');
-    expect(output).toContain('prompt=1,200');
+    expect(output).toContain('model/tool-output cost');
     expect(output).toContain('completion=300');
     expect(output).toContain('reasoning=40');
     expect(output).toContain('total=1,540');
@@ -1677,6 +1834,19 @@ describe('trace-session CLI helpers', () => {
     expect(performanceOutput).toContain('Digest');
     expect(performanceOutput).toContain('Top Token Runs');
     expect(performanceOutput).toContain('Slowest Tool Spans');
+
+    const summary = renderTraceReport({ ...report, diagnostics }, { json: false, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false, view: 'summary' });
+    const overview = renderTraceReport({ ...report, diagnostics }, { json: false, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false, view: 'overview' });
+    expect(overview).toBe(summary);
+    expect(stripAnsi(summary)).toContain('session  sess-1');
+    expect(summary).toContain('model/tool-output cost');
+    expect(summary).toContain('tool-provider cost');
+    expect(summary).toContain('total cost');
+
+    const reliability = renderTraceReport({ ...report, diagnostics }, { json: false, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false, view: 'reliability' });
+    expect(reliability).toBe(investigation);
+    const operations = renderTraceReport({ ...report, diagnostics }, { json: false, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false, view: 'operations' });
+    expect(operations).toBe(performanceOutput);
   });
 
   it('renders a self-contained static HTML report with escaped trace data', () => {
@@ -2843,7 +3013,7 @@ describe('trace-session CLI helpers', () => {
       systemOnly: false,
     });
     expect(output).toContain('swarm-session-1');
-    expect(output).toContain('(agent_runs.session_id)');
+    expect(output).toContain('Data warnings');
     expect(output).not.toContain('session not found');
   });
 });

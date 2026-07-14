@@ -63,6 +63,10 @@ export function renderTraceReport(
   const previewChars = options.previewChars ?? DEFAULT_MESSAGE_PREVIEW_CHARS;
   const milestones = report.milestones ?? [];
 
+  if (effectiveView === 'summary' || effectiveView === 'overview') {
+    return renderDecisionSummary(report, diagnostics);
+  }
+
   const lines: string[] = [];
   if (shouldRenderDiagnosticLead(effectiveView, options.onlyDelegates)) {
     lines.push(markdownBlock('# Trace Brief'));
@@ -252,19 +256,18 @@ export function renderSessionPerformanceList(
     const split = durationSplitParts(item.performance, item.totalDurationMs);
     const status = statusColor(item.runStatus ?? item.sessionStatus ?? 'unknown')(item.runStatus ?? item.sessionStatus ?? 'unknown');
     const goal = normalizeGoal(item.goal);
-    const metricsLine = [
-      `session=${item.sessionId}`,
-      `run=${item.runId}`,
-      item.runId === item.rootRunId ? undefined : `root=${item.rootRunId}`,
-      `status=${status}`,
-      `total=${formatDuration(split.totalDurationMs)}`,
-      `model=${formatDuration(split.modelDurationMs)}`,
-      `tools=${formatDuration(split.toolDurationMs)}`,
-      `snapshot=${formatDuration(split.snapshotSaveMs)}`,
-      `other=${formatDuration(split.otherDurationMs)}`,
-    ].filter((part): part is string => part !== undefined).join('  ');
-    return `${metricsLine}\n  goal=${goal ? truncatePlain(oneLine(goal), previewChars) : '(none)'}`;
-  }).join('\n');
+    return [
+      `session  ${item.sessionId ?? '(none)'}`,
+      `run  ${item.runId}`,
+      `root  ${item.rootRunId}`,
+      `type  ${item.type ?? 'run'}`,
+      item.swarmRole ? `role  ${item.swarmRole}` : undefined,
+      `status  ${status}`,
+      `timestamp  ${item.startedAt ?? '(unknown)'}`,
+      `duration  total ${formatDuration(split.totalDurationMs)}  model ${formatDuration(split.modelDurationMs)}  tools ${formatDuration(split.toolDurationMs)}  snapshot ${formatDuration(split.snapshotSaveMs)}  other ${formatDuration(split.otherDurationMs)}`,
+      `goal  ${goal ? truncatePlain(oneLine(goal), previewChars) : '(none)'}`,
+    ].filter((line): line is string => line !== undefined).join('\n');
+  }).join('\n\n');
 }
 
 export function renderSessionlessRunList(runs: SessionlessRunListItem[], options: Pick<CliOptions, 'json'>): string {
@@ -1112,6 +1115,42 @@ function renderTraceBrief(diagnostics: TraceDiagnostics): string {
     lines.push(chalk.bold('Suggested next views'));
     lines.push(renderSuggestedNextViews(diagnostics, { limit: 3 }));
   }
+  return lines.join('\n');
+}
+
+function renderDecisionSummary(report: TraceReport, diagnostics: TraceDiagnostics): string {
+  const modelCost = report.usage.total.estimatedCostUSD;
+  const toolCost = diagnostics.performance.toolAccounting.estimatedCostUSD;
+  const findings = diagnostics.findings.length ? renderDiagnosticFindings(diagnostics.findings.slice(0, 5)) : chalk.gray('No diagnostic findings.');
+  const models = [...new Set(report.rootRuns.map((run) => [run.modelProvider, run.modelName].filter(Boolean).join('/')).filter(Boolean))];
+  const identityLines = [
+    `${chalk.cyan('target')} ${report.target.kind}`,
+    report.target.kind === 'session' ? `${chalk.cyan('session')}  ${report.target.requestedId}` : undefined,
+    report.target.kind === 'run' ? `${chalk.cyan('run')}  ${report.target.requestedId}` : undefined,
+    report.target.kind === 'root-run' ? `${chalk.cyan('root')}  ${report.target.requestedId}` : undefined,
+    ...report.rootRuns
+      .filter((run) => run.rootRunId !== report.target.requestedId)
+      .map((run) => `${chalk.cyan('root')}  ${run.rootRunId}`),
+  ].filter((line): line is string => line !== undefined);
+  const lines = [
+    markdownBlock('# Identity'),
+    ...identityLines,
+    `${chalk.cyan('runs')} roots=${formatNumber(diagnostics.brief.rootRunCount)} total=${formatNumber(diagnostics.brief.runCount)}`,
+    `${chalk.cyan('provider / model')} ${models.join(', ') || 'unknown'}`,
+    '', markdownBlock('# Verdict / Reliability'),
+    `${chalk.cyan('status')} ${statusColor(diagnostics.brief.status)(diagnostics.brief.status)}`,
+    `${chalk.cyan('verdict')} ${diagnostics.brief.headline}`,
+    '', markdownBlock('# Operations'),
+    `${chalk.cyan('duration')} wall=${formatDuration(diagnostics.brief.wallDurationMs)} model=${formatDuration(diagnostics.performance.cumulativeModelDurationMs)} tools=${formatDuration(diagnostics.performance.cumulativeToolDurationMs)}`,
+    `${chalk.cyan('model/tool-output cost')} ${formatCost(modelCost)}`,
+    `${chalk.cyan('tool-provider cost')} ${formatCost(toolCost)}`,
+    `${chalk.cyan('total cost')} ${formatCost(modelCost + toolCost)}`,
+    `${chalk.cyan('usage')} ${formatUsageSummary(report.usage.total)}`,
+    '', markdownBlock('# Findings'), findings,
+    '', markdownBlock('# Goal / Final Output'), renderGoal(report.rootRuns), '', renderFinalOutput(report.rootRuns),
+  ];
+  if (report.warnings.length) lines.push('', chalk.yellow.bold('Data warnings'), ...report.warnings.map((warning) => `- ${warning}`));
+  if (diagnostics.suggestedNextViews.length) lines.push('', chalk.bold('Suggested next commands'), renderSuggestedNextViews(diagnostics, { limit: 3 }));
   return lines.join('\n');
 }
 
@@ -2188,14 +2227,17 @@ function messagesEquivalent(left: TraceMessage, right: TraceMessage): boolean {
     && JSON.stringify(left.reasoningDetails ?? []) === JSON.stringify(right.reasoningDetails ?? []);
 }
 
-function resolveReportView(options: Pick<CliOptions, 'onlyDelegates'> & Partial<Pick<CliOptions, 'view'>>): ReportView {
+function resolveReportView(options: Pick<CliOptions, 'onlyDelegates'> & Partial<Pick<CliOptions, 'view' | 'messages' | 'systemOnly' | 'includePlans'>>): ReportView {
   if (options.view) {
+    if (options.view === 'overview') return 'summary';
+    if (options.view === 'performance' || options.view === 'operations') return 'performance';
+    if (options.view === 'reliability') return 'investigate';
     return options.view;
   }
   if (options.onlyDelegates) {
     return 'delegates';
   }
-  return 'all';
+  return options.messages || options.systemOnly || options.includePlans ? 'all' : 'summary';
 }
 
 function shouldRenderDiagnosticLead(view: ReportView, onlyDelegates: boolean): boolean {

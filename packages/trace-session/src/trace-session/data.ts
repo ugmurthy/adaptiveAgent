@@ -34,7 +34,11 @@ import type {
   TraceTarget,
   TraceToolCall,
   UsageSummary,
+  TraceListType,
+  SwarmRole,
 } from './types.js';
+
+type ListFilterOptions = Pick<CliOptions, 'goals' | 'goalRegex' | 'hasGoal' | 'noGoal' | 'statuses' | 'limit' | 'types' | 'swarmRole'>;
 
 export interface PostgresQueryResult<T> {
   rows: T[];
@@ -49,10 +53,8 @@ export async function traceSession(client: PostgresClient, options: CliOptions):
   const migration = await detectTraceSupport(client);
   const resolvedTarget = await resolveTraceTarget(client, options, migration.hasGatewaySessionTables);
   const { target, session, rootRunIds } = resolvedTarget;
-  const [rootRuns, usage] = await Promise.all([
-    loadRootRuns(client, rootRunIds, options.sessionId, migration.hasRunModelColumns, migration.hasGatewaySessionTables),
-    loadSessionUsage(client, rootRunIds, migration.hasToolObservabilityColumns, migration.hasRunModelColumns),
-  ]);
+  const rootRuns = await loadRootRuns(client, rootRunIds, options.sessionId, migration.hasRunModelColumns, migration.hasGatewaySessionTables);
+  const usage = await loadSessionUsage(client, rootRunIds, migration.hasToolObservabilityColumns, migration.hasRunModelColumns);
 
   const warnings: string[] = [];
   if (target.kind === 'session' && !session) {
@@ -148,14 +150,29 @@ export async function loadUsageForTraceTarget(client: PostgresClient, options: C
   return loadSessionUsage(client, rootRunIds, support.hasToolObservabilityColumns, support.hasRunModelColumns, true);
 }
 
+export async function loadUsageForTraceTargetWithTerminalState(client: PostgresClient, options: CliOptions): Promise<{ usage: SessionUsageSummary; terminal: boolean }> {
+  const support = await detectTraceSupport(client);
+  const { rootRunIds } = await resolveTraceTarget(client, options, support.hasGatewaySessionTables);
+  const statuses = rootRunIds.length
+    ? await client.query<{ status: string | null }>('select status from agent_runs where id::text = any($1::text[])', [rootRunIds])
+    : { rows: [], rowCount: 0 };
+  const usage = await loadSessionUsage(client, rootRunIds, support.hasToolObservabilityColumns, support.hasRunModelColumns, true);
+  return {
+    usage,
+    terminal: statuses.rows.length === rootRunIds.length
+      && statuses.rows.length > 0
+      && statuses.rows.every(row => ['succeeded', 'failed', 'cancelled'].includes(row.status ?? '')),
+  };
+}
+
 
 export async function listSessions(
   client: PostgresClient,
-  options: { recoverAgentRunSessionIds?: boolean } = {},
+  options: { recoverAgentRunSessionIds?: boolean } & ListFilterOptions = {},
 ): Promise<SessionListItem[]> {
   const support = await detectTraceSupport(client);
   if (!support.hasGatewaySessionTables) {
-    return listCoreSessions(client);
+    return filterSessions(await listCoreSessions(client), options);
   }
 
   const recoverAgentRunSessionIds = options.recoverAgentRunSessionIds ?? true;
@@ -186,6 +203,9 @@ export async function listSessions(
             'startedAt', r.created_at,
             'completedAt', r.completed_at,
             'goal', r.goal,
+            'metadata', r.metadata,
+            'invocationKind', l.invocation_kind,
+            'invocationMode', s.invocation_mode,
             'linkedAt', l.created_at
           )
           order by l.created_at asc, l.run_id asc
@@ -195,12 +215,11 @@ export async function listSessions(
     from gateway_sessions s
     left join gateway_session_run_links l
       on l.session_id = s.id
-      and l.invocation_kind = 'run'
     left join agent_runs r on r.id::text = l.root_run_id
-    group by s.id, s.created_at
+    group by s.id, s.created_at, s.invocation_mode
     order by s.created_at desc, s.id desc
   `),
-    listSessionlessRuns(client),
+    listSessionlessRuns(client, support),
   ]);
 
   const sessions = sessionResult.rows.map((row) => ({
@@ -222,23 +241,27 @@ export async function listSessions(
       completedAt: run.completedAt ?? null,
       goal: run.goal,
       linkedAt: run.startedAt,
+      type: run.type,
+      swarmRole: run.swarmRole,
     }],
   }));
 
-  return [...sessions, ...sessionless].sort((left, right) =>
+  return filterSessions([...sessions, ...sessionless].sort((left, right) =>
     Date.parse(right.startedAt) - Date.parse(left.startedAt)
     || (right.sessionId ?? right.goals[0]?.rootRunId ?? '').localeCompare(left.sessionId ?? left.goals[0]?.rootRunId ?? ''),
-  );
+  ), options);
 }
 
-export async function listSessionPerformance(client: PostgresClient): Promise<SessionPerformanceListItem[]> {
-  const sessions = await listSessions(client);
-  const entries = sessions.flatMap((session) =>
+export async function listSessionPerformance(client: PostgresClient, options: ListFilterOptions = {}): Promise<SessionPerformanceListItem[]> {
+  // Filtering here is deliberately completed before loading expensive trace rows.
+  const sessions = await listSessions(client, { ...options, limit: undefined });
+  const allEntries = sessions.flatMap((session) =>
     session.goals.map((goal) => ({
       session,
       goal,
     })),
   );
+  const entries = options.limit === undefined ? allEntries : allEntries.slice(0, options.limit);
   const rootRunIds = [...new Set(entries.map((entry) => entry.goal.rootRunId))];
   if (rootRunIds.length === 0) {
     return [];
@@ -262,12 +285,14 @@ export async function listSessionPerformance(client: PostgresClient): Promise<Se
     completedAt: goal.completedAt,
     totalDurationMs: durationMs(goal.startedAt, goal.completedAt),
     goal: goal.goal,
+    type: goal.type,
+    swarmRole: goal.swarmRole,
     performance: summarizePerformance(rowsByRootRun.get(goal.rootRunId) ?? []),
   }));
 }
 
-export async function listSessionlessRuns(client: PostgresClient): Promise<SessionlessRunListItem[]> {
-  const support = await detectTraceSupport(client);
+export async function listSessionlessRuns(client: PostgresClient, detectedSupport?: Awaited<ReturnType<typeof detectTraceSupport>>): Promise<SessionlessRunListItem[]> {
+  const support = detectedSupport ?? await detectTraceSupport(client);
   if (!support.hasGatewaySessionTables) {
     return listCoreSessionlessRuns(client);
   }
@@ -279,6 +304,7 @@ export async function listSessionlessRuns(client: PostgresClient): Promise<Sessi
     completed_at: string | null;
     status: string | null;
     goal: string | null;
+    metadata: unknown;
   }>(`
     select
       r.session_id,
@@ -286,11 +312,11 @@ export async function listSessionlessRuns(client: PostgresClient): Promise<Sessi
       r.created_at as started_at,
       r.completed_at,
       r.status,
-      r.goal
+      r.goal,
+      r.metadata
     from agent_runs r
     left join gateway_session_run_links l
       on l.root_run_id = r.id::text
-     and l.invocation_kind = 'run'
     where r.id = r.root_run_id
       and l.root_run_id is null
     order by r.created_at desc, r.id desc
@@ -303,6 +329,7 @@ export async function listSessionlessRuns(client: PostgresClient): Promise<Sessi
     completedAt: row.completed_at,
     status: row.status,
     goal: row.goal,
+    ...classifyListItem({ metadata: row.metadata }),
   }));
 }
 
@@ -330,6 +357,7 @@ async function listCoreSessions(client: PostgresClient): Promise<SessionListItem
             'startedAt', r.created_at,
             'completedAt', r.completed_at,
             'goal', r.goal,
+            'metadata', r.metadata,
             'linkedAt', r.created_at
           )
           order by r.created_at asc, r.id asc
@@ -361,6 +389,8 @@ async function listCoreSessions(client: PostgresClient): Promise<SessionListItem
       completedAt: run.completedAt ?? null,
       goal: run.goal,
       linkedAt: run.startedAt,
+      type: run.type,
+      swarmRole: run.swarmRole,
     }],
   }));
 
@@ -378,6 +408,7 @@ async function listCoreSessionlessRuns(client: PostgresClient): Promise<Sessionl
     completed_at: string | null;
     status: string | null;
     goal: string | null;
+    metadata: unknown;
   }>(`
     select
       r.session_id,
@@ -385,7 +416,8 @@ async function listCoreSessionlessRuns(client: PostgresClient): Promise<Sessionl
       r.created_at as started_at,
       r.completed_at,
       r.status,
-      r.goal
+      r.goal,
+      r.metadata
     from agent_runs r
     where r.id = r.root_run_id
       and r.session_id is null
@@ -399,6 +431,7 @@ async function listCoreSessionlessRuns(client: PostgresClient): Promise<Sessionl
     completedAt: row.completed_at,
     status: row.status,
     goal: row.goal,
+    ...classifyListItem({ metadata: row.metadata }),
   }));
 }
 
@@ -428,10 +461,48 @@ function parseSessionGoals(value: unknown): SessionListItem['goals'] {
       status: record.status,
       startedAt: record.startedAt,
       completedAt: record.completedAt,
+      ...classifyListItem(record),
       goal: record.goal,
       linkedAt: record.linkedAt,
     }];
   });
+}
+
+function classifyListItem(record: Record<string, unknown>): { type: TraceListType; swarmRole?: SwarmRole } {
+  const metadata = record.metadata && typeof record.metadata === 'object' ? record.metadata as Record<string, unknown> : {};
+  const orchestration = metadata.orchestration && typeof metadata.orchestration === 'object' ? metadata.orchestration as Record<string, unknown> : {};
+  const role = typeof orchestration.role === 'string' && ['coordinator', 'worker', 'quality', 'synthesizer'].includes(orchestration.role)
+    ? orchestration.role as SwarmRole : undefined;
+  if (orchestration.kind === 'swarm' && role === 'coordinator') return { type: 'swarm', swarmRole: role };
+  if (orchestration.kind === 'swarm' && role) return { type: 'swarm-run', swarmRole: role };
+  if (record.invocationMode === 'chat' || record.invocationKind === 'chat') return { type: 'chat' };
+  return { type: 'run' };
+}
+
+function filterSessions(sessions: SessionListItem[], options: ListFilterOptions): SessionListItem[] {
+  const textGoals = options.goals?.map((value) => value.toLocaleLowerCase()) ?? [];
+  const statuses = new Set(options.statuses ?? []);
+  const types = new Set(options.types ?? []);
+  const filtered = sessions.flatMap((session) => {
+    if (session.goals.length === 0) {
+      const statusMatches = statuses.size === 0 || statuses.has(session.status ?? 'unknown');
+      const requestsGoalContent = options.hasGoal || textGoals.length > 0 || options.goalRegex !== undefined;
+      const requestsRunIdentity = types.size > 0 || options.swarmRole !== undefined;
+      return statusMatches && !requestsGoalContent && !requestsRunIdentity ? [session] : [];
+    }
+    const goals = session.goals.filter((item) => {
+      const goal = typeof item.goal === 'string' && item.goal.trim() ? item.goal : null;
+      if (options.hasGoal && !goal || options.noGoal && goal) return false;
+      if (textGoals.length && (!goal || !textGoals.some((text) => goal.toLocaleLowerCase().includes(text)))) return false;
+      if (options.goalRegex && (!goal || !options.goalRegex.test(goal))) return false;
+      if (statuses.size && !statuses.has(item.status ?? session.status ?? 'unknown')) return false;
+      if (types.size && !types.has(item.type ?? 'run')) return false;
+      if (options.swarmRole && item.swarmRole !== options.swarmRole) return false;
+      return true;
+    });
+    return goals.length ? [{ ...session, goals }] : [];
+  });
+  return options.limit === undefined ? filtered : filtered.slice(0, options.limit);
 }
 
 function usageSummaryFromRow(row: {

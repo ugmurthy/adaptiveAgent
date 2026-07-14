@@ -28,6 +28,9 @@ export type EventType =
 
 export type ReportView =
   | 'brief'
+  | 'summary'
+  | 'reliability'
+  | 'operations'
   | 'overview'
   | 'output'
   | 'investigate'
@@ -60,13 +63,27 @@ export interface CliOptions {
   messagesView?: MessageView;
   focusRunId?: string;
   previewChars?: number;
+  goals?: string[];
+  goalRegex?: RegExp;
+  hasGoal?: boolean;
+  noGoal?: boolean;
+  statuses?: string[];
+  limit?: number;
+  types?: TraceListType[];
+  swarmRole?: SwarmRole;
   htmlPath?: string;
   configPath?: string;
   databaseUrl?: string;
   databaseUrlEnv?: string;
   pgssl?: boolean;
+  fresh?: boolean;
+  noCache?: boolean;
+  cacheTtl?: number;
   help: boolean;
 }
+
+export type TraceListType = 'run' | 'chat' | 'swarm' | 'swarm-run';
+export type SwarmRole = 'coordinator' | 'worker' | 'quality' | 'synthesizer';
 
 export interface SessionOverview {
   sessionId: string;
@@ -138,6 +155,8 @@ export interface SessionListItem {
     completedAt: string | null;
     goal: string | null;
     linkedAt: string;
+    type?: TraceListType;
+    swarmRole?: SwarmRole;
   }>;
 }
 
@@ -148,6 +167,8 @@ export interface SessionlessRunListItem {
   completedAt?: string | null;
   status?: string | null;
   goal: string | null;
+  type?: TraceListType;
+  swarmRole?: SwarmRole;
 }
 
 export interface SessionPerformanceListItem {
@@ -160,6 +181,8 @@ export interface SessionPerformanceListItem {
   completedAt: string | null;
   totalDurationMs: number | null;
   goal: string | null;
+  type?: TraceListType;
+  swarmRole?: SwarmRole;
   performance: PerformanceSummary;
 }
 

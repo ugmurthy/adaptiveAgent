@@ -8,7 +8,8 @@ import chalk from 'chalk';
 import { createTracePostgresPool as createPostgresPool, resolveTracePostgresConfig, type TracePostgresConfig, type TracePostgresPool } from '../db.js';
 
 import { USAGE } from './constants.js';
-import { listSessionlessRuns, listSessionPerformance, listSessions, loadUsageForTraceTarget, traceSession } from './data.js';
+import { cacheKey, isTerminalReport, parseCacheDuration, readCache, writeCache } from './cache.js';
+import { listSessionlessRuns, listSessionPerformance, listSessions, loadUsageForTraceTargetWithTerminalState, traceSession } from './data.js';
 import {
   renderDeleteEmptyGoalSessionsSql,
   renderSessionPerformanceList,
@@ -18,7 +19,7 @@ import {
   renderTraceReport,
   renderUsageReport,
 } from './render.js';
-import type { CliOptions, MessageView, ReportView, SessionListItem, SessionPerformanceListItem, SessionUsageSummary, SessionlessRunListItem, TraceReport } from './types.js';
+import type { CliOptions, MessageView, ReportView, SessionListItem, SessionPerformanceListItem, SessionUsageSummary, SessionlessRunListItem, TraceListType, TraceReport } from './types.js';
 
 export function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
@@ -67,6 +68,9 @@ export function parseArgs(args: string[]): CliOptions {
       case '--usage':
         options.usageOnly = true;
         break;
+      case '--fresh': options.fresh = true; break;
+      case '--no-cache': options.noCache = true; break;
+      case '--cache-ttl': options.cacheTtl = parseCacheDuration(requireValue(arg, args[++index])); break;
       case '--messages':
         options.messages = true;
         break;
@@ -94,6 +98,35 @@ export function parseArgs(args: string[]): CliOptions {
       case '--preview-chars':
         options.previewChars = parsePositiveInteger(requireValue(arg, args[++index]), arg);
         break;
+      case '--goal':
+        (options.goals ??= []).push(requireValue(arg, args[++index]));
+        break;
+      case '--goal-regex': {
+        const value = requireValue(arg, args[++index]);
+        try { options.goalRegex = new RegExp(value, 'i'); } catch { throw new Error(`Invalid --goal-regex value: ${value}.`); }
+        break;
+      }
+      case '--has-goal': options.hasGoal = true; break;
+      case '--no-goal': options.noGoal = true; break;
+      case '--status': {
+        const value = requireValue(arg, args[++index]);
+        if (!['queued', 'planning', 'awaiting_approval', 'awaiting_subagent', 'running', 'interrupted', 'succeeded', 'failed', 'clarification_requested', 'replan_required', 'cancelled'].includes(value)) throw new Error(`Invalid --status value: ${value}.`);
+        (options.statuses ??= []).push(value);
+        break;
+      }
+      case '--limit': options.limit = parsePositiveInteger(requireValue(arg, args[++index]), arg); break;
+      case '--type': {
+        const value = requireValue(arg, args[++index]);
+        if (!['run', 'chat', 'swarm', 'swarm-run'].includes(value)) throw new Error(`Invalid --type value: ${value}. Expected run, chat, swarm, or swarm-run.`);
+        (options.types ??= []).push(value as TraceListType);
+        break;
+      }
+      case '--swarm-role': {
+        const value = requireValue(arg, args[++index]);
+        if (!['coordinator', 'worker', 'quality', 'synthesizer'].includes(value)) throw new Error(`Invalid --swarm-role value: ${value}.`);
+        options.swarmRole = value as CliOptions['swarmRole'];
+        break;
+      }
       case '--root-run':
       case '--root-run-id':
         options.rootRunId = requireValue(arg, args[++index]);
@@ -137,6 +170,14 @@ export function parseArgs(args: string[]): CliOptions {
     throw new Error(`Expected one session id, received: ${positional.join(', ')}\n\n${USAGE}`);
   }
   options.sessionId = positional[0];
+  if (options.hasGoal && options.noGoal) throw new Error('--has-goal and --no-goal cannot be combined.');
+  if (options.noGoal && (options.goals?.length || options.goalRegex)) throw new Error('--no-goal cannot be combined with --goal or --goal-regex.');
+  if (options.swarmRole && options.types?.length) {
+    const requiredType: TraceListType = options.swarmRole === 'coordinator' ? 'swarm' : 'swarm-run';
+    if (!options.types.includes(requiredType)) throw new Error(`--swarm-role ${options.swarmRole} requires --type ${requiredType}.`);
+  }
+  const hasListFilters = options.goals?.length || options.goalRegex || options.hasGoal || options.noGoal || options.statuses?.length || options.limit || options.types?.length || options.swarmRole;
+  if (hasListFilters && !options.listSessions && !options.listPerformance) throw new Error('List filters can only be used with --ls or --lsp.');
   return options;
 }
 
@@ -147,6 +188,10 @@ export async function main(): Promise<void> {
       console.log(USAGE);
       return;
     }
+    if (options.cacheTtl === undefined && process.env.TRACE_SESSION_CACHE_TTL !== undefined) {
+      options.cacheTtl = parseCacheDuration(process.env.TRACE_SESSION_CACHE_TTL, 'TRACE_SESSION_CACHE_TTL');
+    }
+    if (process.env.TRACE_SESSION_CACHE === 'off' && options.noCache === undefined) options.noCache = true;
     if (!options.listSessions && !options.listPerformance && !options.listSessionless && !options.deleteEmptyGoalSessions && !options.sessionId && !options.rootRunId && !options.runId) {
       throw new Error(`Missing session id, --root-run, or --run.\n\n${USAGE}`);
     }
@@ -190,7 +235,7 @@ export async function main(): Promise<void> {
 
     if (options.listSessions || options.listPerformance || options.listSessionless || options.deleteEmptyGoalSessions) {
       if (options.listPerformance) {
-        const items = await runListSessionPerformanceWithPasswordRetry(postgresConfig);
+        const items = await runListSessionPerformanceWithPasswordRetry(postgresConfig, options);
         console.log(renderSessionPerformanceList(items, options));
         return;
       }
@@ -202,6 +247,7 @@ export async function main(): Promise<void> {
       }
 
       const sessions = await runListSessionsWithPasswordRetry(postgresConfig, {
+        ...options,
         recoverAgentRunSessionIds: !options.deleteEmptyGoalSessions,
       });
       console.log(options.deleteEmptyGoalSessions ? renderDeleteEmptyGoalSessionsSql(sessions, options) : renderSessionList(sessions, options));
@@ -243,11 +289,18 @@ async function runTraceSessionWithPasswordRetry(
   config: TracePostgresConfig,
   options: CliOptions,
 ): Promise<TraceReport> {
+  const key = cacheKey(config, options, 'trace');
+  if (!options.noCache && !options.fresh) {
+    const cached = await readCache(key, options.cacheTtl);
+    if (cached) return cached as TraceReport;
+  }
   let pool = await createTraceSessionPostgresPool(config);
   let shouldEndPool = true;
 
   try {
-    return await traceSession(pool, options);
+    const report = await traceSession(pool, options);
+    if (!options.noCache) await writeCache(key, report, isTerminalReport(report), options.cacheTtl).catch(() => undefined);
+    return report;
   } catch (error) {
     if (!isPostgresPasswordAuthFailure(error)) {
       throw error;
@@ -258,7 +311,9 @@ async function runTraceSessionWithPasswordRetry(
     const password = await promptHidden('Postgres password: ');
     pool = createPostgresPool(config, { password });
     try {
-      return await traceSession(pool, options);
+      const report = await traceSession(pool, options);
+      if (!options.noCache) await writeCache(key, report, isTerminalReport(report), options.cacheTtl).catch(() => undefined);
+      return report;
     } finally {
       await pool.end();
     }
@@ -299,12 +354,12 @@ async function runListSessionsWithPasswordRetry(
   }
 }
 
-async function runListSessionPerformanceWithPasswordRetry(config: TracePostgresConfig): Promise<SessionPerformanceListItem[]> {
+async function runListSessionPerformanceWithPasswordRetry(config: TracePostgresConfig, options: CliOptions): Promise<SessionPerformanceListItem[]> {
   let pool = await createTraceSessionPostgresPool(config);
   let shouldEndPool = true;
 
   try {
-    return await listSessionPerformance(pool);
+    return await listSessionPerformance(pool, options);
   } catch (error) {
     if (!isPostgresPasswordAuthFailure(error)) {
       throw error;
@@ -315,7 +370,7 @@ async function runListSessionPerformanceWithPasswordRetry(config: TracePostgresC
     const password = await promptHidden('Postgres password: ');
     pool = createPostgresPool(config, { password });
     try {
-      return await listSessionPerformance(pool);
+      return await listSessionPerformance(pool, options);
     } finally {
       await pool.end();
     }
@@ -359,11 +414,18 @@ async function runUsageWithPasswordRetry(
   config: TracePostgresConfig,
   options: CliOptions,
 ): Promise<SessionUsageSummary> {
+  const key = cacheKey(config, options, 'usage');
+  if (!options.noCache && !options.fresh) {
+    const cached = await readCache(key, options.cacheTtl);
+    if (cached) return cached as SessionUsageSummary;
+  }
   let pool = await createTraceSessionPostgresPool(config);
   let shouldEndPool = true;
 
   try {
-    return await loadUsageForTraceTarget(pool, options);
+    const loaded = await loadUsageForTraceTargetWithTerminalState(pool, options);
+    if (!options.noCache) await writeCache(key, loaded.usage, loaded.terminal, options.cacheTtl).catch(() => undefined);
+    return loaded.usage;
   } catch (error) {
     if (!isPostgresPasswordAuthFailure(error)) {
       throw error;
@@ -374,7 +436,9 @@ async function runUsageWithPasswordRetry(
     const password = await promptHidden('Postgres password: ');
     pool = createPostgresPool(config, { password });
     try {
-      return await loadUsageForTraceTarget(pool, options);
+      const loaded = await loadUsageForTraceTargetWithTerminalState(pool, options);
+      if (!options.noCache) await writeCache(key, loaded.usage, loaded.terminal, options.cacheTtl).catch(() => undefined);
+      return loaded.usage;
     } finally {
       await pool.end();
     }
@@ -472,10 +536,10 @@ function requireValue(option: string, value: string | undefined): string {
 }
 
 function parseReportView(value: string): ReportView {
-  if (value === 'brief' || value === 'overview' || value === 'output' || value === 'investigate' || value === 'policy' || value === 'performance' || value === 'milestones' || value === 'timeline' || value === 'delegates' || value === 'messages' || value === 'plans' || value === 'all') {
+  if (value === 'brief' || value === 'summary' || value === 'reliability' || value === 'operations' || value === 'overview' || value === 'output' || value === 'investigate' || value === 'policy' || value === 'performance' || value === 'milestones' || value === 'timeline' || value === 'delegates' || value === 'messages' || value === 'plans' || value === 'all') {
     return value;
   }
-  throw new Error(`Invalid --view value: ${value}. Expected one of brief, overview, output, investigate, policy, performance, milestones, timeline, delegates, messages, plans, or all.`);
+  throw new Error(`Invalid --view value: ${value}.`);
 }
 
 function parseMessageView(value: string): MessageView {
