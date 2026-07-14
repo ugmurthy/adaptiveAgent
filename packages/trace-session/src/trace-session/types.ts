@@ -2,10 +2,14 @@ export type EventType =
   | 'run.created'
   | 'run.status_changed'
   | 'run.interrupted'
+  | 'run.steered'
   | 'run.resumed'
   | 'run.retry_started'
   | 'run.completed'
   | 'run.failed'
+  | 'recovery.analyzed'
+  | 'run.continuation_created'
+  | 'context.refs.resolved'
   | 'plan.created'
   | 'plan.execution_started'
   | 'step.started'
@@ -114,6 +118,9 @@ export interface RootRun {
   errorMessage?: string | null;
   modelProvider?: string | null;
   modelName?: string | null;
+  leaseOwner?: string | null;
+  leaseExpiresAt?: string | null;
+  heartbeatAt?: string | null;
 }
 
 export interface UsageSummary {
@@ -203,6 +210,10 @@ export interface TraceRow {
   run_created_at: string | null;
   run_updated_at: string | null;
   run_completed_at: string | null;
+  run_result?: unknown;
+  run_lease_owner?: string | null;
+  run_lease_expires_at?: string | null;
+  run_heartbeat_at?: string | null;
   event_id: string | null;
   event_seq: number | null;
   event_created_at: string | null;
@@ -314,8 +325,11 @@ export interface MilestoneEntry {
   depth: number;
   eventType: EventType;
   stepId: string | null;
+  toolCallId?: string | null;
   createdAt: string | null;
   eventSeq: number | null;
+  snapshotSeq?: number | null;
+  retryDelayMs?: number | null;
   text: string;
 }
 
@@ -325,6 +339,14 @@ export interface RunTreeEntry {
   parentRunId: string | null;
   delegateName: string | null;
   depth: number;
+  status?: string | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+  completedAt?: string | null;
+  result?: unknown;
+  leaseOwner?: string | null;
+  leaseExpiresAt?: string | null;
+  heartbeatAt?: string | null;
 }
 
 export interface RunSnapshotSummary {
@@ -432,6 +454,8 @@ export type TraceFindingSeverity = 'info' | 'warning' | 'error';
 
 export type TraceFindingCategory = 'failure' | 'blocked' | 'policy' | 'performance' | 'data-quality';
 
+export type TraceFindingRole = 'primary-cause' | 'recovery' | 'consequence' | 'context';
+
 export interface EvidenceRef {
   kind: 'run' | 'root-run' | 'event' | 'tool' | 'delegate' | 'message' | 'usage' | 'snapshot';
   label: string;
@@ -441,6 +465,7 @@ export interface EvidenceRef {
   toolCallId?: string | null;
   eventSeq?: number | null;
   eventType?: string | null;
+  createdAt?: string | null;
   detail?: string;
 }
 
@@ -448,9 +473,11 @@ export interface TraceFinding {
   id: string;
   severity: TraceFindingSeverity;
   category: TraceFindingCategory;
+  role: TraceFindingRole;
   title: string;
   summary: string;
   evidence: EvidenceRef[];
+  commands: SuggestedCommand[];
 }
 
 export interface SuggestedCommand {
@@ -562,8 +589,67 @@ export interface PolicyDigest {
   warnings: string[];
 }
 
+export type ReliabilityClassification = 'healthy' | 'recovered' | 'degraded' | 'failed' | 'blocked' | 'unknown';
+
+export type ReliabilityDimensionStatus = ReliabilityClassification;
+
+export interface ReliabilityDimension {
+  status: ReliabilityDimensionStatus;
+  summary: string;
+  evidence: EvidenceRef[];
+}
+
+export type DataConfidenceLevel = 'high' | 'medium' | 'low' | 'unknown';
+
+export interface DataConfidence {
+  level: DataConfidenceLevel;
+  requiredObservabilityAvailable: boolean;
+  observedEvents: number;
+  measuredPerformanceEvents: number;
+  performanceCoverage: number | null;
+  runsWithSnapshots: number;
+  totalRuns: number;
+  snapshotCoverage: number | null;
+  pricedToolRequests: number;
+  totalToolRequests: number;
+  costCoverage: number | null;
+  warnings: string[];
+}
+
+export interface RecoveryPressure {
+  modelRetries: number;
+  modelRetryDelayMs: number;
+  runRetries: number;
+  interruptions: number;
+  resumes: number;
+  continuations: number;
+  replans: number;
+  rejectedToolCalls: number;
+  excessive: boolean;
+}
+
+export interface ReliabilityDiagnostics {
+  classification: ReliabilityClassification;
+  summary: string;
+  dimensions: {
+    outcomeIntegrity: ReliabilityDimension;
+    lifecycleIntegrity: ReliabilityDimension;
+    recoveryPressure: ReliabilityDimension;
+    liveness: ReliabilityDimension;
+    policyIntegrity: ReliabilityDimension;
+    evidenceConfidence: ReliabilityDimension;
+  };
+  recovery: RecoveryPressure;
+  dataConfidence: DataConfidence;
+  outputQuality: {
+    status: 'not-evaluated';
+    summary: string;
+  };
+}
+
 export interface TraceDiagnostics {
   brief: TraceBrief;
+  reliability: ReliabilityDiagnostics;
   findings: TraceFinding[];
   performance: PerformanceDigest;
   policy: PolicyDigest;

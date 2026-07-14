@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 
 import { buildTimeline, buildTraceDiagnostics, computeDelegateReason, listSessionPerformance, listSessions, loadUsageForTraceTarget, parseArgs, renderDeleteEmptyGoalSessionsSql, renderSessionList, renderSessionPerformanceList, renderSessionlessRunList, renderTraceHtml, renderTraceReport, renderUsageReport, summarizePerformance, summarizeTrace, traceSession } from './trace-session.js';
 import { cacheKey, databaseIdentity, effectiveCacheTtl, parseCacheDuration, readCache, writeCache } from './trace-session/cache.js';
-import type { TraceRow } from './trace-session.js';
+import type { EventType, MilestoneEntry, TraceReport, TraceRow } from './trace-session.js';
 
 describe('trace-session CLI helpers', () => {
   it('parses cache durations and cache CLI controls', () => {
@@ -1355,7 +1355,7 @@ describe('trace-session CLI helpers', () => {
     const lines = output.split('\n');
     const goalLine = lines.find((line) => stripAnsi(line) === '# Goal / Final Output');
     expect(goalLine).toBeDefined();
-    for (const title of ['Identity', 'Verdict / Reliability', 'Operations', 'Findings']) {
+    for (const title of ['Identity', 'Verdict', 'Reliability', 'Operations', 'Findings']) {
       expect(lines.some((candidate) => stripAnsi(candidate) === `# ${title}`)).toBe(true);
     }
   });
@@ -1820,7 +1820,10 @@ describe('trace-session CLI helpers', () => {
     expect(investigation).toContain('Investigation');
     expect(investigation).toContain('Delegate chain evidence');
     expect(investigation).toContain('Suggested next views');
-    expect(investigation).toContain('1. ERROR failure Trace failed');
+    expect(investigation).toContain('Primary cause');
+    expect(investigation).toContain('Recovery');
+    expect(investigation).toContain('Consequences');
+    expect(investigation).toContain('ERROR consequence failure Trace failed');
     expect(investigation).toContain('Evidence');
     expect(investigation).toContain('$ trace-session --run child-run --view messages --messages-view delta');
     expect(investigation).not.toContain('severity  category');
@@ -1844,9 +1847,300 @@ describe('trace-session CLI helpers', () => {
     expect(summary).toContain('total cost');
 
     const reliability = renderTraceReport({ ...report, diagnostics }, { json: false, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false, view: 'reliability' });
-    expect(reliability).toBe(investigation);
+    expect(reliability).toContain('Outcome integrity');
+    expect(reliability).toContain('Lifecycle integrity');
+    expect(reliability).toContain('Data confidence');
+    expect(reliability).not.toContain('Investigation');
     const operations = renderTraceReport({ ...report, diagnostics }, { json: false, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false, view: 'operations' });
     expect(operations).toBe(performanceOutput);
+  });
+
+  it('classifies healthy, recovered, degraded, failed, blocked, and unknown reliability', () => {
+    const healthy = buildTraceDiagnostics(reliabilityReport());
+    expect(healthy.reliability.classification).toBe('healthy');
+    expect(healthy.reliability.dimensions).toMatchObject({
+      outcomeIntegrity: { status: 'healthy' },
+      lifecycleIntegrity: { status: 'healthy' },
+      recoveryPressure: { status: 'healthy' },
+      liveness: { status: 'healthy' },
+      policyIntegrity: { status: 'healthy' },
+      evidenceConfidence: { status: 'healthy' },
+    });
+
+    const recoveredRows = [
+      traceRow({ event_id: 'model-start-1', event_seq: 1, event_type: 'model.started', payload: { performance: {} } }),
+      traceRow({ event_id: 'model-failed-1', event_seq: 2, event_type: 'model.failed', payload: { performance: { durationMs: 100 } } }),
+      traceRow({ event_id: 'model-retry-1', event_seq: 3, event_type: 'model.retry', payload: { retryDelayMs: 500, performance: { retryDelayMs: 500 } } }),
+      traceRow({ event_id: 'model-start-2', event_seq: 4, event_type: 'model.started', payload: { performance: {} } }),
+      traceRow({ event_id: 'model-completed-2', event_seq: 5, event_type: 'model.completed', payload: { performance: { durationMs: 200 } } }),
+      traceRow({ event_id: 'run-completed', event_seq: 6, event_type: 'run.completed' }),
+    ];
+    const recovered = buildTraceDiagnostics(reliabilityReport({
+      performance: summarizePerformance(recoveredRows),
+      milestones: [
+        milestone('model.started', 1),
+        milestone('model.failed', 2),
+        milestone('model.retry', 3, { retryDelayMs: 500 }),
+        milestone('model.started', 4),
+        milestone('model.completed', 5),
+        milestone('run.completed', 6),
+      ],
+    }));
+    expect(recovered.reliability.classification).toBe('recovered');
+    expect(recovered.reliability.recovery).toMatchObject({ modelRetries: 1, modelRetryDelayMs: 500, excessive: false });
+
+    const interruptedRows = [
+      traceRow({ event_id: 'model-start-before-interrupt', event_seq: 1, event_type: 'model.started', payload: { performance: {} } }),
+      traceRow({ event_id: 'interrupted', event_seq: 2, event_type: 'run.interrupted' }),
+      traceRow({ event_id: 'snapshot-before-resume', event_seq: 3, event_type: 'snapshot.created', payload: { snapshotSeq: 1, performance: {} } }),
+      traceRow({ event_id: 'resumed', event_seq: 4, event_type: 'run.resumed' }),
+      traceRow({ event_id: 'model-start-after-resume', event_seq: 5, event_type: 'model.started', payload: { performance: {} } }),
+      traceRow({ event_id: 'model-completed-after-resume', event_seq: 6, event_type: 'model.completed', payload: { performance: { durationMs: 200 } } }),
+      traceRow({ event_id: 'run-completed-after-resume', event_seq: 7, event_type: 'run.completed' }),
+    ];
+    const interrupted = buildTraceDiagnostics(reliabilityReport({
+      performance: summarizePerformance(interruptedRows),
+      milestones: [
+        milestone('model.started', 1),
+        milestone('run.interrupted', 2),
+        milestone('snapshot.created', 3, { snapshotSeq: 1 }),
+        milestone('run.resumed', 4),
+        milestone('model.started', 5),
+        milestone('model.completed', 6),
+        milestone('run.completed', 7),
+      ],
+    }));
+    expect(interrupted.reliability.classification).toBe('recovered');
+    expect(interrupted.findings.some((finding) => finding.title === 'Incomplete lifecycle evidence')).toBe(false);
+
+    const degraded = buildTraceDiagnostics(reliabilityReport({
+      rootRuns: [{ ...reliabilityReport().rootRuns[0]!, result: null }],
+    }));
+    expect(degraded.reliability.classification).toBe('degraded');
+    expect(degraded.findings.some((finding) => finding.title === 'Succeeded root run has no result')).toBe(true);
+
+    const failed = buildTraceDiagnostics(reliabilityReport({
+      rootRuns: [{ ...reliabilityReport().rootRuns[0]!, status: 'failed', result: null, errorMessage: 'terminal failure' }],
+      summary: { status: 'failed', reason: 'terminal failure' },
+      milestones: [milestone('run.failed', 1)],
+    }));
+    expect(failed.reliability.classification).toBe('failed');
+
+    const blockedRows = [traceRow({ event_id: 'approval', event_seq: 1, event_type: 'approval.requested' })];
+    const blocked = buildTraceDiagnostics(reliabilityReport({
+      rootRuns: [{ ...reliabilityReport().rootRuns[0]!, status: 'awaiting_approval', completedAt: null }],
+      performance: summarizePerformance(blockedRows),
+      summary: { status: 'blocked', reason: 'approval required' },
+      milestones: [milestone('approval.requested', 1)],
+    }));
+    expect(blocked.reliability.classification).toBe('blocked');
+    expect(blocked.reliability.dimensions.policyIntegrity.status).toBe('blocked');
+
+    const unknown = buildTraceDiagnostics(reliabilityReport({
+      rootRuns: [],
+      performance: summarizePerformance([]),
+      snapshotSummaries: [],
+      milestones: [],
+      summary: { status: 'unknown', reason: 'not enough data' },
+    }));
+    expect(unknown.reliability.classification).toBe('unknown');
+    expect(unknown.reliability.dataConfidence.level).toBe('unknown');
+  });
+
+  it('reports unpriced tool cost coverage without downgrading runtime reliability', () => {
+    const rows = [
+      traceRow({
+        event_id: 'tool-completed',
+        event_seq: 1,
+        event_type: 'tool.completed',
+        event_tool_name: 'web_search',
+        ledger_tool_name: 'web_search',
+        tool_call_id: 'call-1',
+        tool_execution_status: 'completed',
+        tool_started_at: '2026-04-16T10:00:00.000Z',
+        tool_completed_at: '2026-04-16T10:00:01.000Z',
+        payload: {
+          accounting: {
+            provider: 'search-provider',
+            operation: 'web_search',
+            billable: true,
+            units: { requests: 1 },
+            pricingSource: 'unpriced',
+          },
+          performance: { durationMs: 1000 },
+        },
+      }),
+      traceRow({ event_id: 'run-completed', event_seq: 2, event_type: 'run.completed' }),
+    ];
+    const report = reliabilityReport({
+      performance: summarizePerformance(rows),
+      timeline: buildTimeline(rows),
+      milestones: [milestone('tool.completed', 1, { toolCallId: 'call-1' }), milestone('run.completed', 2)],
+    });
+    const diagnostics = buildTraceDiagnostics(report);
+
+    expect(diagnostics.reliability.classification).toBe('healthy');
+    expect(diagnostics.reliability.dataConfidence).toMatchObject({
+      level: 'high',
+      pricedToolRequests: 0,
+      totalToolRequests: 1,
+      costCoverage: 0,
+    });
+    expect(diagnostics.reliability.dataConfidence.warnings).toContain('1 tool-provider request(s) are unpriced.');
+  });
+
+  it('keeps the verdict stable when message context enables additional context findings', () => {
+    const rows = [
+      traceRow({
+        event_id: 'tool-completed',
+        event_seq: 1,
+        event_type: 'tool.completed',
+        event_tool_name: 'read_file',
+        ledger_tool_name: 'read_file',
+        tool_call_id: 'call-1',
+        tool_execution_status: 'completed',
+        tool_started_at: '2026-04-16T10:00:00.000Z',
+        tool_completed_at: '2026-04-16T10:00:01.000Z',
+        tool_output: 'persisted output',
+        payload: { output: 'persisted output', performance: { durationMs: 1000 } },
+      }),
+      traceRow({ event_id: 'snapshot', event_seq: 2, event_type: 'snapshot.created', payload: { snapshotSeq: 1, performance: {} } }),
+      traceRow({ event_id: 'run-completed', event_seq: 3, event_type: 'run.completed' }),
+    ];
+    const report = reliabilityReport({
+      performance: summarizePerformance(rows),
+      timeline: buildTimeline(rows),
+      milestones: [
+        milestone('tool.completed', 1, { toolCallId: 'call-1' }),
+        milestone('snapshot.created', 2, { snapshotSeq: 1 }),
+        milestone('run.completed', 3),
+      ],
+    });
+    const withoutMessages = buildTraceDiagnostics(report);
+    const withMessages = buildTraceDiagnostics({
+      ...report,
+      llmMessages: [{
+        rootRunId: 'root-1',
+        runId: 'root-1',
+        delegateName: null,
+        depth: 0,
+        initialSnapshotSeq: 1,
+        initialSnapshotCreatedAt: now(),
+        latestSnapshotSeq: 1,
+        latestSnapshotCreatedAt: now(),
+        effectiveMessages: [{
+          position: 0,
+          persistence: 'persisted',
+          role: 'user',
+          category: 'user',
+          content: 'Read the file',
+        }],
+      }],
+    });
+
+    expect(withoutMessages.reliability.classification).toBe('healthy');
+    expect(withMessages.reliability.classification).toBe('healthy');
+    expect(withMessages.findings.find((finding) => finding.title === 'Tool output is absent from model context')).toMatchObject({
+      role: 'context',
+      category: 'data-quality',
+    });
+  });
+
+  it('detects stale runs, incomplete lifecycles, snapshot gaps, and unmatched approvals', () => {
+    const staleAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    const rows = [
+      traceRow({ event_id: 'model-start', event_seq: 1, event_type: 'model.started', payload: { performance: {} } }),
+      traceRow({ event_id: 'snapshot-1', event_seq: 2, event_type: 'snapshot.created', payload: { snapshotSeq: 1, performance: {} } }),
+      traceRow({ event_id: 'snapshot-3', event_seq: 3, event_type: 'snapshot.created', payload: { snapshotSeq: 3, performance: {} } }),
+      traceRow({ event_id: 'approval-a', event_seq: 4, event_type: 'approval.requested', run_id: 'run-a' }),
+      traceRow({ event_id: 'approval-b', event_seq: 5, event_type: 'approval.requested', run_id: 'run-b' }),
+      traceRow({ event_id: 'approval-a-done', event_seq: 6, event_type: 'approval.resolved', run_id: 'run-a' }),
+    ];
+    const report = reliabilityReport({
+      rootRuns: [{ ...reliabilityReport().rootRuns[0]!, status: 'running', completedAt: null, updatedAt: staleAt, heartbeatAt: staleAt }],
+      runTree: [{
+        rootRunId: 'root-1',
+        runId: 'root-1',
+        parentRunId: null,
+        delegateName: null,
+        depth: 0,
+        status: 'running',
+        updatedAt: staleAt,
+        heartbeatAt: staleAt,
+      }],
+      performance: summarizePerformance(rows),
+      summary: { status: 'blocked', reason: 'run is still active' },
+      milestones: [
+        milestone('model.started', 1),
+        milestone('snapshot.created', 2, { snapshotSeq: 1 }),
+        milestone('snapshot.created', 3, { snapshotSeq: 3 }),
+        milestone('approval.requested', 4, { runId: 'run-a' }),
+        milestone('approval.requested', 5, { runId: 'run-b' }),
+        milestone('approval.resolved', 6, { runId: 'run-a' }),
+      ],
+    });
+    const diagnostics = buildTraceDiagnostics(report);
+
+    expect(diagnostics.policy.unresolvedApprovalRequests).toBe(1);
+    expect(diagnostics.reliability.dimensions.liveness.status).toBe('blocked');
+    expect(diagnostics.findings.map((finding) => finding.title)).toEqual(expect.arrayContaining([
+      'Stale active run detected',
+      'Incomplete lifecycle evidence',
+      'Snapshot sequence integrity issue',
+      'Approval signal requires inspection',
+    ]));
+    const approvalFinding = diagnostics.findings.find((finding) => finding.title === 'Approval signal requires inspection');
+    expect(approvalFinding?.evidence[0]?.runId).toBe('run-b');
+  });
+
+  it('ranks causal findings and attaches complete evidence and inspection commands', () => {
+    const runId = '019abcde-1234-5678-9012-abcdefabcdef';
+    const toolCallId = '019fedcb-4321-8765-2109-fedcbafedcba';
+    const rows = [traceRow({
+      root_run_id: runId,
+      run_id: runId,
+      event_id: 'tool-failed',
+      event_seq: 42,
+      event_type: 'tool.failed',
+      event_step_id: 'research-market',
+      tool_call_id: toolCallId,
+      event_tool_name: 'web_search',
+      ledger_tool_name: 'web_search',
+      tool_execution_status: 'failed',
+      tool_started_at: '2026-07-12T10:14:20.000Z',
+      tool_completed_at: '2026-07-12T10:14:22.403Z',
+      tool_error_code: 'RATE_LIMITED',
+      payload: { performance: { durationMs: 2403 } },
+    })];
+    const report = reliabilityReport({
+      target: traceTarget('run', runId, runId),
+      rootRuns: [{ ...reliabilityReport().rootRuns[0]!, rootRunId: runId, runId, status: 'failed', result: null, errorCode: 'RATE_LIMITED' }],
+      performance: summarizePerformance(rows),
+      timeline: buildTimeline(rows),
+      milestones: [milestone('tool.failed', 42, { rootRunId: runId, runId, stepId: 'research-market', toolCallId }), milestone('run.failed', 43, { rootRunId: runId, runId })],
+      snapshotSummaries: [{ rootRunId: runId, runId, delegateName: null, depth: 0, latestSnapshotSeq: 1, latestSnapshotCreatedAt: now(), latestStepsUsed: 1 }],
+      summary: { status: 'failed', reason: 'web_search was rate limited' },
+    });
+    const diagnostics = buildTraceDiagnostics(report);
+    const primary = diagnostics.findings.find((finding) => finding.role === 'primary-cause' && finding.title === 'Tool failures observed');
+
+    expect(primary?.evidence[0]).toMatchObject({ runId, toolCallId, eventSeq: 42, eventType: 'tool.failed' });
+    expect(primary?.commands.map((command) => command.command)).toContain(`trace-session --run ${runId} --view timeline`);
+    expect(diagnostics.findings.findIndex((finding) => finding.role === 'primary-cause'))
+      .toBeLessThan(diagnostics.findings.findIndex((finding) => finding.role === 'consequence'));
+
+    const output = stripAnsi(renderTraceReport({ ...report, diagnostics }, {
+      json: false,
+      includePlans: false,
+      onlyDelegates: false,
+      messages: false,
+      systemOnly: false,
+      view: 'investigate',
+    }));
+    expect(output).toContain('event #42  tool.failed');
+    expect(output).toContain(runId);
+    expect(output).toContain(toolCallId);
+    expect(output).toContain(`$ trace-session --run ${runId} --view timeline`);
   });
 
   it('renders a self-contained static HTML report with escaped trace data', () => {
@@ -3046,6 +3340,60 @@ function traceTarget(kind: 'session' | 'root-run' | 'run', requestedId: string, 
     kind,
     requestedId,
     resolvedRootRunId,
+  };
+}
+
+function reliabilityReport(overrides: Partial<TraceReport> = {}): TraceReport {
+  const rows = [traceRow({ event_id: 'run-completed', event_seq: 1, event_type: 'run.completed' })];
+  return {
+    target: traceTarget('session', 'sess-1'),
+    session: session('succeeded'),
+    rootRuns: [{
+      rootRunId: 'root-1',
+      runId: 'root-1',
+      invocationKind: 'run',
+      turnIndex: 0,
+      linkedAt: now(),
+      startedAt: now(),
+      updatedAt: now(),
+      completedAt: now(),
+      status: 'succeeded',
+      goal: 'Verify reliability',
+      result: 'Done',
+    }],
+    usage: usage(),
+    performance: summarizePerformance(rows),
+    timeline: [],
+    milestones: [milestone('run.completed', 1)],
+    llmMessages: [],
+    snapshotSummaries: [{
+      rootRunId: 'root-1',
+      runId: 'root-1',
+      delegateName: null,
+      depth: 0,
+      latestSnapshotSeq: 1,
+      latestSnapshotCreatedAt: now(),
+      latestStepsUsed: 1,
+    }],
+    delegates: [],
+    plans: [],
+    summary: { status: 'succeeded', reason: 'completed successfully' },
+    warnings: [],
+    ...overrides,
+  };
+}
+
+function milestone(eventType: EventType, eventSeq: number, overrides: Partial<MilestoneEntry> = {}): MilestoneEntry {
+  return {
+    rootRunId: 'root-1',
+    runId: 'root-1',
+    depth: 0,
+    eventType,
+    stepId: eventType.startsWith('model.') ? 'step-1' : null,
+    createdAt: now(),
+    eventSeq,
+    text: `${eventType} event`,
+    ...overrides,
   };
 }
 

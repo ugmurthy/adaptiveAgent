@@ -5,7 +5,7 @@ import { join } from 'node:path';
 
 import type { CliOptions, SessionUsageSummary, TraceReport } from './types.js';
 
-const VERSION = 1;
+const VERSION = 2;
 const DEFAULT_TERMINAL_TTL = 5 * 60_000;
 const MAX_BYTES = 100 * 1024 * 1024;
 const TEMP_FILE_GRACE_MS = 10 * 60_000;

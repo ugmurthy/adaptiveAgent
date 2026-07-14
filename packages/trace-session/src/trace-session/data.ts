@@ -836,6 +836,9 @@ async function loadRootRuns(
       error_message: string | null;
       model_provider: string | null;
       model_name: string | null;
+      lease_owner: string | null;
+      lease_expires_at: string | null;
+      heartbeat_at: string | null;
     }>(
       `
         with requested_roots as (
@@ -856,7 +859,10 @@ async function loadRootRuns(
           r.result,
           r.error_code,
           r.error_message,
-          ${modelColumns}
+          ${modelColumns},
+          r.lease_owner,
+          r.lease_expires_at,
+          r.heartbeat_at
         from requested_roots rr
         join agent_runs r on r.id = rr.root_run_id
         order by rr.ordinality asc
@@ -882,6 +888,9 @@ async function loadRootRuns(
     error_message: string | null;
     model_provider: string | null;
     model_name: string | null;
+    lease_owner: string | null;
+    lease_expires_at: string | null;
+    heartbeat_at: string | null;
   }>(
     `
       with requested_roots as (
@@ -902,7 +911,10 @@ async function loadRootRuns(
         r.result,
         r.error_code,
         r.error_message,
-        ${modelColumns}
+        ${modelColumns},
+        r.lease_owner,
+        r.lease_expires_at,
+        r.heartbeat_at
       from requested_roots rr
       join agent_runs r on r.id = rr.root_run_id
       left join lateral (
@@ -938,6 +950,9 @@ function rootRunRowsToRootRuns(rows: Array<{
   error_message: string | null;
   model_provider: string | null;
   model_name: string | null;
+  lease_owner?: string | null;
+  lease_expires_at?: string | null;
+  heartbeat_at?: string | null;
 }>): RootRun[] {
   return rows.map((row) => ({
     rootRunId: row.root_run_id,
@@ -955,6 +970,9 @@ function rootRunRowsToRootRuns(rows: Array<{
     errorMessage: row.error_message,
     modelProvider: row.model_provider,
     modelName: row.model_name,
+    leaseOwner: row.lease_owner,
+    leaseExpiresAt: row.lease_expires_at,
+    heartbeatAt: row.heartbeat_at,
   }));
 }
 
@@ -1775,7 +1793,11 @@ async function loadTraceRows(client: PostgresClient, sessionId: string, rootRunI
           r.error_message as run_error_message,
           r.created_at as run_created_at,
           r.updated_at as run_updated_at,
-          r.completed_at as run_completed_at
+          r.completed_at as run_completed_at,
+          r.result as run_result,
+          r.lease_owner as run_lease_owner,
+          r.lease_expires_at as run_lease_expires_at,
+          r.heartbeat_at as run_heartbeat_at
         from root_runs rr
         join agent_runs r on r.id = rr.root_run_id
 
@@ -1797,7 +1819,11 @@ async function loadTraceRows(client: PostgresClient, sessionId: string, rootRunI
           c.error_message as run_error_message,
           c.created_at as run_created_at,
           c.updated_at as run_updated_at,
-          c.completed_at as run_completed_at
+          c.completed_at as run_completed_at,
+          c.result as run_result,
+          c.lease_owner as run_lease_owner,
+          c.lease_expires_at as run_lease_expires_at,
+          c.heartbeat_at as run_heartbeat_at
         from run_tree rt
         join agent_runs c on c.parent_run_id = rt.run_id
       )
@@ -1818,6 +1844,10 @@ async function loadTraceRows(client: PostgresClient, sessionId: string, rootRunI
         rt.run_created_at,
         rt.run_updated_at,
         rt.run_completed_at,
+        rt.run_result,
+        rt.run_lease_owner,
+        rt.run_lease_expires_at,
+        rt.run_heartbeat_at,
         e.id::text as event_id,
         e.seq as event_seq,
         e.created_at as event_created_at,

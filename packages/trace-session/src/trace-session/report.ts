@@ -9,6 +9,8 @@ import type {
   PerformanceDigest,
   PerformanceSummary,
   PolicyDigest,
+  RecoveryPressure,
+  ReliabilityDiagnostics,
   RootRun,
   RunSnapshotSummary,
   RunTreeEntry,
@@ -19,6 +21,8 @@ import type {
   TimelineEntry,
   TraceDiagnostics,
   TraceFinding,
+  TraceFindingRole,
+  TraceFindingSeverity,
   TraceReport,
   TraceRow,
 } from './types.js';
@@ -27,10 +31,14 @@ const CORE_EVENT_TYPES: EventType[] = [
   'run.created',
   'run.status_changed',
   'run.interrupted',
+  'run.steered',
   'run.resumed',
   'run.retry_started',
   'run.completed',
   'run.failed',
+  'recovery.analyzed',
+  'run.continuation_created',
+  'context.refs.resolved',
   'plan.created',
   'plan.execution_started',
   'step.started',
@@ -53,6 +61,20 @@ const CORE_EVENT_TYPES: EventType[] = [
 ];
 
 const CORE_EVENT_TYPE_SET = new Set<string>(CORE_EVENT_TYPES);
+const STALE_RUN_MS = 5 * 60_000;
+const TERMINAL_RUN_STATUSES = new Set(['succeeded', 'failed', 'cancelled', 'replan_required']);
+const ACTIVE_RUN_STATUSES = new Set(['queued', 'planning', 'running', 'awaiting_subagent']);
+
+type FindingDraft = Omit<TraceFinding, 'id' | 'commands'>;
+
+interface ReliabilitySignals {
+  outcomeIssues: FindingDraft[];
+  lifecycleIssues: FindingDraft[];
+  livenessIssues: FindingDraft[];
+  recoveryIssues: FindingDraft[];
+  dataIssues: FindingDraft[];
+  recovery: RecoveryPressure;
+}
 
 export function buildTimeline(rows: TraceRow[], options: { onlyDelegates?: boolean } = {}): TimelineEntry[] {
   const entries = new Map<string, TimelineEntry>();
@@ -216,7 +238,9 @@ export function buildTraceDiagnostics(report: TraceReport): TraceDiagnostics {
   const wallDurationMs = traceWallDurationMs(report.rootRuns, report.session);
   const performanceDigest = buildPerformanceDigest(report, performance, wallDurationMs);
   const policyDigest = buildPolicyDigest(report);
-  const findings = buildTraceFindings(report, performance, performanceDigest, policyDigest);
+  const signals = buildReliabilitySignals(report, performance, performanceDigest, policyDigest);
+  const reliability = buildReliabilityDiagnostics(report, performance, performanceDigest, policyDigest, signals);
+  const findings = buildTraceFindings(report, performance, performanceDigest, policyDigest, signals);
   const brief = {
     status: report.summary.status,
     headline: report.summary.reason,
@@ -240,6 +264,7 @@ export function buildTraceDiagnostics(report: TraceReport): TraceDiagnostics {
 
   return {
     brief,
+    reliability,
     findings,
     performance: performanceDigest,
     policy: policyDigest,
@@ -666,7 +691,7 @@ function buildPolicyDigest(report: TraceReport): PolicyDigest {
   const runtimePolicyMessages = report.llmMessages.reduce((total, trace) =>
     total + trace.effectiveMessages.filter((message) => isRuntimePolicyMessage(message.category, message.content)).length,
   0);
-  const unresolvedApprovalRequests = Math.max(0, approvalRequests - approvalResolved);
+  const unresolvedApprovalRequests = unresolvedApprovalEvents(report).length;
   const warnings: string[] = [];
 
   if (budgetExhaustedToolCalls > 0) {
@@ -705,41 +730,53 @@ function buildTraceFindings(
   performance: PerformanceSummary,
   performanceDigest: PerformanceDigest,
   policyDigest: PolicyDigest,
+  signals: ReliabilitySignals,
 ): TraceFinding[] {
-  const findings: TraceFinding[] = [];
-  let nextId = 1;
-  const pushFinding = (finding: Omit<TraceFinding, 'id'>): void => {
-    findings.push({ id: `finding-${nextId}`, ...finding });
-    nextId += 1;
+  const findings: FindingDraft[] = [
+    ...signals.outcomeIssues,
+    ...signals.lifecycleIssues,
+    ...signals.livenessIssues,
+    ...signals.recoveryIssues,
+    ...signals.dataIssues,
+  ];
+  const pushFinding = (finding: FindingDraft): void => {
+    findings.push(finding);
   };
+  const modelFailures = Math.max(performance.model.failed, countMilestones(report, 'model.failed'));
+  const toolFailures = Math.max(performance.tools.failed, report.timeline.filter((entry) => entry.outcome.startsWith('failed')).length);
+  const terminalSuccess = report.summary.status === 'succeeded';
 
-  if (report.summary.status === 'failed' || report.summary.status === 'blocked') {
+  if (modelFailures > 0) {
     pushFinding({
-      severity: report.summary.status === 'failed' ? 'error' : 'warning',
-      category: report.summary.status === 'failed' ? 'failure' : 'blocked',
-      title: report.summary.status === 'failed' ? 'Trace failed' : 'Trace is blocked',
-      summary: report.summary.reason,
-      evidence: primaryOutcomeEvidence(report),
-    });
-  }
-
-  if (performance.model.failed > 0) {
-    pushFinding({
-      severity: 'error',
+      severity: terminalSuccess ? 'warning' : 'error',
       category: 'failure',
+      role: terminalSuccess ? 'recovery' : 'primary-cause',
       title: 'Model failures observed',
-      summary: `${performance.model.failed} model lifecycle events ended in failure.`,
+      summary: `${modelFailures} model lifecycle events ended in failure${terminalSuccess ? ' before the trace ultimately succeeded' : ''}.`,
       evidence: modelFailureEvidence(report),
     });
   }
 
-  if (performance.tools.failed > 0) {
+  if (toolFailures > 0) {
     pushFinding({
-      severity: 'error',
+      severity: terminalSuccess ? 'warning' : 'error',
       category: 'failure',
+      role: terminalSuccess ? 'recovery' : 'primary-cause',
       title: 'Tool failures observed',
-      summary: `${performance.tools.failed} tool executions ended in failure.`,
+      summary: `${toolFailures} tool executions ended in failure${terminalSuccess ? ' before the trace ultimately succeeded' : ''}.`,
       evidence: failedToolEvidence(report),
+    });
+  }
+
+  if (report.summary.status === 'failed' || report.summary.status === 'blocked') {
+    const hasSpecificCause = findings.some((finding) => finding.role === 'primary-cause' && finding.category !== 'data-quality');
+    pushFinding({
+      severity: report.summary.status === 'failed' ? 'error' : 'warning',
+      category: report.summary.status === 'failed' ? 'failure' : 'blocked',
+      role: hasSpecificCause ? 'consequence' : 'primary-cause',
+      title: report.summary.status === 'failed' ? 'Trace failed' : 'Trace is blocked',
+      summary: report.summary.reason,
+      evidence: primaryOutcomeEvidence(report),
     });
   }
 
@@ -747,6 +784,7 @@ function buildTraceFindings(
     pushFinding({
       severity: performanceDigest.parallelismFactor >= 2 ? 'warning' : 'info',
       category: 'performance',
+      role: 'context',
       title: 'Cumulative work exceeds wall time',
       summary: `Measured model/tool/snapshot time is ${performanceDigest.parallelismFactor.toFixed(2)}x wall time, so totals should be read as cumulative work rather than critical-path latency.`,
       evidence: [{
@@ -764,6 +802,7 @@ function buildTraceFindings(
       pushFinding({
         severity: 'info',
         category: 'performance',
+        role: 'context',
         title: 'Token usage is concentrated in one root run',
         summary: `Root run ${shortId(topRun.rootRunId)} accounts for ${(share * 100).toFixed(1)}% of total tokens.`,
         evidence: [{
@@ -781,6 +820,9 @@ function buildTraceFindings(
     pushFinding({
       severity: 'warning',
       category: 'policy',
+      role: warning.includes('without matching approval.resolved') && report.summary.status === 'blocked'
+        ? 'primary-cause'
+        : warning.includes('runtime-injected') ? 'context' : 'consequence',
       title: policyFindingTitle(warning),
       summary: warning,
       evidence: policyEvidence(report, warning),
@@ -791,13 +833,874 @@ function buildTraceFindings(
     pushFinding({
       severity: 'warning',
       category: 'data-quality',
+      role: 'context',
       title: 'Trace data warning',
       summary: warning,
       evidence: [{ kind: 'event', label: 'trace warning', detail: warning }],
     });
   }
 
+  const roleOrder: Record<TraceFindingRole, number> = {
+    'primary-cause': 0,
+    recovery: 1,
+    consequence: 2,
+    context: 3,
+  };
+  const severityOrder: Record<TraceFindingSeverity, number> = { error: 0, warning: 1, info: 2 };
+  return findings
+    .sort((left, right) =>
+      roleOrder[left.role] - roleOrder[right.role]
+      || severityOrder[left.severity] - severityOrder[right.severity]
+      || left.title.localeCompare(right.title),
+    )
+    .map((finding, index) => ({
+      id: `finding-${index + 1}`,
+      ...finding,
+      commands: inspectionCommands(report, finding),
+    }));
+}
+
+function buildReliabilitySignals(
+  report: TraceReport,
+  performance: PerformanceSummary,
+  performanceDigest: PerformanceDigest,
+  policyDigest: PolicyDigest,
+): ReliabilitySignals {
+  const recovery = buildRecoveryPressure(report, performance, policyDigest);
+  const outcomeIssues = detectOutcomeIssues(report);
+  const lifecycleIssues = detectLifecycleIssues(report);
+  const livenessIssues = detectLivenessIssues(report);
+  const recoveryIssues = detectRecoveryIssues(report, recovery);
+  const dataConfidence = buildDataConfidence(report, performance, performanceDigest);
+  const confidenceIssues: FindingDraft[] = dataConfidence.level === 'high' || (dataConfidence.level === 'unknown' && dataConfidence.totalRuns === 0)
+    ? []
+    : [{
+        severity: dataConfidence.level === 'low' ? 'warning' : 'info',
+        category: 'data-quality',
+        role: 'context',
+        title: `${capitalize(dataConfidence.level)} evidence confidence`,
+        summary: dataConfidenceSummary(dataConfidence),
+        evidence: dataConfidenceEvidence(report, dataConfidence),
+      }];
+  const dataIssues = [...confidenceIssues, ...detectContextIssues(report)];
+
+  return { outcomeIssues, lifecycleIssues, livenessIssues, recoveryIssues, dataIssues, recovery };
+}
+
+function buildReliabilityDiagnostics(
+  report: TraceReport,
+  performance: PerformanceSummary,
+  performanceDigest: PerformanceDigest,
+  policyDigest: PolicyDigest,
+  signals: ReliabilitySignals,
+): ReliabilityDiagnostics {
+  const dataConfidence = buildDataConfidence(report, performance, performanceDigest);
+  const hasRecovery = recoveryActivityCount(signals.recovery) > 0
+    || performance.model.failed > 0
+    || performance.tools.failed > 0;
+  const lifecycleStatus = signals.lifecycleIssues.length > 0
+    ? 'degraded'
+    : dataConfidence.observedEvents === 0 && dataConfidence.totalRuns > 0 ? 'unknown' : 'healthy';
+  const policyStatus = policyDigest.unresolvedApprovalRequests > 0
+    ? 'blocked'
+    : policyDigest.budgetExhaustedToolCalls > 0 ? 'degraded'
+      : policyDigest.rejectedToolCalls > 0 ? 'recovered' : 'healthy';
+  const evidenceStatus = dataConfidence.level === 'high'
+    ? 'healthy'
+    : dataConfidence.level === 'unknown' ? 'unknown' : 'degraded';
+  const outcomeStatus = report.summary.status === 'succeeded'
+    ? signals.outcomeIssues.length > 0 ? 'degraded' : 'healthy'
+    : report.summary.status;
+  const recoveryStatus = signals.recovery.excessive
+    ? 'degraded'
+    : hasRecovery ? 'recovered' : 'healthy';
+  const livenessStatus = signals.livenessIssues.length > 0 || report.summary.status === 'blocked'
+    ? 'blocked'
+    : 'healthy';
+
+  let classification: ReliabilityDiagnostics['classification'];
+  if (report.summary.status === 'failed') {
+    classification = 'failed';
+  } else if (report.summary.status === 'blocked' || signals.livenessIssues.length > 0) {
+    classification = 'blocked';
+  } else if (report.summary.status === 'unknown') {
+    classification = 'unknown';
+  } else if (
+    signals.outcomeIssues.length > 0
+    || signals.lifecycleIssues.length > 0
+    || signals.recovery.excessive
+    || policyDigest.unresolvedApprovalRequests > 0
+    || policyDigest.budgetExhaustedToolCalls > 0
+    || dataConfidence.level !== 'high'
+  ) {
+    classification = 'degraded';
+  } else if (hasRecovery) {
+    classification = 'recovered';
+  } else {
+    classification = 'healthy';
+  }
+
+  return {
+    classification,
+    summary: reliabilityClassificationSummary(classification, report),
+    dimensions: {
+      outcomeIntegrity: {
+        status: outcomeStatus,
+        summary: outcomeDimensionSummary(report, signals.outcomeIssues),
+        evidence: findingEvidence(signals.outcomeIssues),
+      },
+      lifecycleIntegrity: {
+        status: lifecycleStatus,
+        summary: lifecycleStatus === 'healthy'
+          ? 'Observed model, tool, step, run, and snapshot lifecycle evidence is coherent.'
+          : lifecycleStatus === 'unknown' ? 'No runtime lifecycle events were available to verify operation pairing.'
+            : `${signals.lifecycleIssues.length} lifecycle integrity issue(s) require inspection.`,
+        evidence: findingEvidence(signals.lifecycleIssues),
+      },
+      recoveryPressure: {
+        status: recoveryStatus,
+        summary: recoveryPressureSummary(signals.recovery),
+        evidence: findingEvidence(signals.recoveryIssues),
+      },
+      liveness: {
+        status: livenessStatus,
+        summary: signals.livenessIssues.length > 0
+          ? `${signals.livenessIssues.length} stale or expired active-run condition(s) were detected.`
+          : report.summary.status === 'blocked' ? 'The trace has non-terminal work requiring operator or user action.'
+            : 'No stale heartbeat or expired lease evidence was detected.',
+        evidence: findingEvidence(signals.livenessIssues),
+      },
+      policyIntegrity: {
+        status: policyStatus,
+        summary: policyDimensionSummary(policyDigest),
+        evidence: policyDigest.unresolvedApprovalRequests > 0
+          ? unresolvedApprovalEvents(report).map(milestoneEvidence).slice(0, 5)
+          : [],
+      },
+      evidenceConfidence: {
+        status: evidenceStatus,
+        summary: dataConfidenceSummary(dataConfidence),
+        evidence: dataConfidenceEvidence(report, dataConfidence),
+      },
+    },
+    recovery: signals.recovery,
+    dataConfidence,
+    outputQuality: {
+      status: 'not-evaluated',
+      summary: 'Output quality was not evaluated; runtime reliability does not establish answer quality.',
+    },
+  };
+}
+
+function buildRecoveryPressure(
+  report: TraceReport,
+  performance: PerformanceSummary,
+  policyDigest: PolicyDigest,
+): RecoveryPressure {
+  const retryEvents = (report.milestones ?? []).filter((entry) => entry.eventType === 'model.retry');
+  const modelRetries = Math.max(retryEvents.length, performance.model.retries);
+  const eventRetryDelayMs = retryEvents.reduce((total, entry) => total + (entry.retryDelayMs ?? 0), 0);
+  const runRetries = countMilestones(report, 'run.retry_started');
+  const interruptions = countMilestones(report, 'run.interrupted');
+  const resumes = countMilestones(report, 'run.resumed');
+  const continuations = countMilestones(report, 'run.continuation_created');
+  const replans = countMilestones(report, 'replan.required');
+  return {
+    modelRetries,
+    modelRetryDelayMs: eventRetryDelayMs > 0 ? eventRetryDelayMs : performance.model.retryDelayMs.total,
+    runRetries,
+    interruptions,
+    resumes,
+    continuations,
+    replans,
+    rejectedToolCalls: policyDigest.rejectedToolCalls,
+    excessive: modelRetries >= 3 || runRetries >= 2 || resumes >= 3 || replans >= 2,
+  };
+}
+
+function detectOutcomeIssues(report: TraceReport): FindingDraft[] {
+  const findings: FindingDraft[] = [];
+  const missingResults = report.rootRuns.filter((run) => run.status === 'succeeded' && (run.result === null || run.result === undefined));
+  if (missingResults.length > 0) {
+    findings.push({
+      severity: 'warning',
+      category: 'data-quality',
+      role: 'consequence',
+      title: 'Succeeded root run has no result',
+      summary: `${missingResults.length} succeeded root run(s) have no persisted result.`,
+      evidence: missingResults.slice(0, 5).map(rootRunEvidence),
+    });
+  }
+
+  const conflicts = new Map<string, EvidenceRef>();
+  for (const delegate of report.delegates) {
+    if (delegate.parent_status === 'succeeded' && delegate.child_status === 'failed') {
+      conflicts.set(`${delegate.parent_run_id}:${delegate.child_run_id}`, delegateEvidence(delegate));
+    }
+  }
+  const runs = report.runTree ?? [];
+  const runsById = new Map(runs.map((run) => [run.runId, run]));
+  for (const child of runs) {
+    const parent = child.parentRunId ? runsById.get(child.parentRunId) : undefined;
+    if (child.status === 'failed' && parent?.status === 'succeeded') {
+      conflicts.set(`${parent.runId}:${child.runId}`, runTreeEvidence(child, 'failed child of succeeded parent'));
+    }
+  }
+  if (conflicts.size > 0) {
+    findings.push({
+      severity: 'error',
+      category: 'failure',
+      role: 'primary-cause',
+      title: 'Parent and child outcomes conflict',
+      summary: `${conflicts.size} failed child run(s) are attached to apparently succeeded parents.`,
+      evidence: [...conflicts.values()].slice(0, 5),
+    });
+  }
   return findings;
+}
+
+function detectLifecycleIssues(report: TraceReport): FindingDraft[] {
+  const findings: FindingDraft[] = [];
+  const incomplete: EvidenceRef[] = [];
+  const impossible: EvidenceRef[] = [];
+  const milestones = report.milestones ?? [];
+
+  detectEventPairs('model.started', new Set<EventType>(['model.completed', 'model.failed']));
+  detectEventPairs('step.started', new Set<EventType>(['step.completed']));
+
+  for (const entry of report.timeline) {
+    if (entry.startedAt && !entry.completedAt && !entry.outcome.startsWith('failed')) {
+      incomplete.push(toolEvidence(entry));
+    }
+  }
+
+  if (milestones.length > 0) {
+    for (const run of reliabilityRuns(report)) {
+      if (!run.status || !TERMINAL_RUN_STATUSES.has(run.status) || run.status === 'cancelled') {
+        continue;
+      }
+      const expectedEvent = run.status === 'succeeded' ? 'run.completed'
+        : run.status === 'failed' ? 'run.failed' : 'replan.required';
+      if (!milestones.some((entry) => entry.runId === run.runId && entry.eventType === expectedEvent)) {
+        incomplete.push(runRecordEvidence(run, `status=${run.status}; missing ${expectedEvent}`));
+      }
+    }
+  }
+
+  if (incomplete.length > 0 || impossible.length > 0) {
+    findings.push({
+      severity: 'warning',
+      category: 'data-quality',
+      role: 'context',
+      title: 'Incomplete lifecycle evidence',
+      summary: `${incomplete.length} started or terminal operations lack matching lifecycle evidence${impossible.length > 0 ? `; ${impossible.length} terminal events appeared without a matching start` : ''}.`,
+      evidence: [...incomplete, ...impossible].slice(0, 10),
+    });
+  }
+
+  const snapshotProblems = detectSnapshotSequenceProblems(report);
+  if (snapshotProblems.length > 0) {
+    findings.push({
+      severity: 'warning',
+      category: 'data-quality',
+      role: 'consequence',
+      title: 'Snapshot sequence integrity issue',
+      summary: `${snapshotProblems.length} snapshot sequence gap or regression condition(s) were detected.`,
+      evidence: snapshotProblems,
+    });
+  }
+
+  const resumedWithoutSnapshot = detectResumesWithoutSnapshots(report);
+  if (resumedWithoutSnapshot.length > 0) {
+    findings.push({
+      severity: 'warning',
+      category: 'data-quality',
+      role: 'recovery',
+      title: 'Resume lacks prior snapshot evidence',
+      summary: `${resumedWithoutSnapshot.length} resume event(s) do not have a preceding snapshot in the persisted event stream.`,
+      evidence: resumedWithoutSnapshot,
+    });
+  }
+
+  return findings;
+
+  function detectEventPairs(startType: EventType, terminalTypes: Set<EventType>): void {
+    const open = new Map<string, MilestoneEntry[]>();
+    for (const entry of milestones) {
+      const key = `${entry.runId}:${entry.stepId ?? '-'}`;
+      if (entry.eventType === startType) {
+        const pending = open.get(key) ?? [];
+        pending.push(entry);
+        open.set(key, pending);
+      } else if (terminalTypes.has(entry.eventType)) {
+        const pending = (open.get(key) ?? [])
+          .filter((started) => !operationWasSupersededByRecovery(started, milestones, entry));
+        open.set(key, pending);
+        const started = pending?.shift();
+        if (!started) {
+          impossible.push(milestoneEvidence(entry));
+        }
+      }
+    }
+    for (const pending of open.values()) {
+      incomplete.push(...pending
+        .filter((started) => !operationWasSupersededByRecovery(started, milestones))
+        .map(milestoneEvidence));
+    }
+  }
+}
+
+function detectContextIssues(report: TraceReport): FindingDraft[] {
+  const missingToolContext = detectMissingToolContext(report);
+  if (missingToolContext.length === 0) {
+    return [];
+  }
+  return [{
+    severity: 'warning',
+    category: 'data-quality',
+    role: 'context',
+    title: 'Tool output is absent from model context',
+    summary: `${missingToolContext.length} completed tool output(s) were not found in the loaded snapshot-backed model context.`,
+    evidence: missingToolContext,
+  }];
+}
+
+function detectLivenessIssues(report: TraceReport): FindingDraft[] {
+  const stale: EvidenceRef[] = [];
+  const now = Date.now();
+  for (const run of reliabilityRuns(report)) {
+    if (!run.status || TERMINAL_RUN_STATUSES.has(run.status)) {
+      continue;
+    }
+    const leaseExpiry = parseTimestamp(run.leaseExpiresAt);
+    const heartbeat = parseTimestamp(run.heartbeatAt);
+    const updatedAt = parseTimestamp(run.updatedAt);
+    const expiredLease = Boolean(run.leaseOwner && leaseExpiry !== null && leaseExpiry <= now);
+    const heartbeatReference = heartbeat ?? updatedAt;
+    const staleHeartbeat = run.status === 'running'
+      && heartbeatReference !== null
+      && now - heartbeatReference >= STALE_RUN_MS;
+    const staleActiveState = ACTIVE_RUN_STATUSES.has(run.status)
+      && updatedAt !== null
+      && now - updatedAt >= STALE_RUN_MS
+      && !run.leaseOwner;
+    if (expiredLease || staleHeartbeat || staleActiveState) {
+      stale.push(runRecordEvidence(run, expiredLease
+        ? `lease expired at ${run.leaseExpiresAt}`
+        : staleHeartbeat ? `heartbeat stale since ${run.heartbeatAt ?? run.updatedAt}`
+          : `active status unchanged since ${run.updatedAt}`));
+    }
+  }
+  if (stale.length === 0) {
+    return [];
+  }
+  return [{
+    severity: 'warning',
+    category: 'blocked',
+    role: 'primary-cause',
+    title: 'Stale active run detected',
+    summary: `${stale.length} non-terminal run(s) have an expired lease, stale heartbeat, or stale active status.`,
+    evidence: stale.slice(0, 10),
+  }];
+}
+
+function detectRecoveryIssues(report: TraceReport, recovery: RecoveryPressure): FindingDraft[] {
+  const findings: FindingDraft[] = [];
+  const recoveryEvidence = (report.milestones ?? [])
+    .filter((entry) => ['model.retry', 'run.retry_started', 'run.interrupted', 'run.resumed', 'run.continuation_created', 'replan.required', 'model.tool_call_rejected'].includes(entry.eventType))
+    .map(milestoneEvidence)
+    .slice(0, 10);
+  if (recoveryActivityCount(recovery) > 0) {
+    findings.push({
+      severity: recovery.excessive ? 'warning' : 'info',
+      category: 'failure',
+      role: 'recovery',
+      title: recovery.excessive ? 'High recovery pressure' : 'Recovery activity observed',
+      summary: recoveryPressureSummary(recovery),
+      evidence: recoveryEvidence,
+    });
+  }
+
+  const repeatedFailures = detectRepeatedFailures(report);
+  if (repeatedFailures.length > 0) {
+    findings.push({
+      severity: 'warning',
+      category: 'failure',
+      role: report.summary.status === 'failed' ? 'primary-cause' : 'recovery',
+      title: 'Repeated identical failures',
+      summary: `${repeatedFailures.length} repeated model/tool failure pattern(s) were detected.`,
+      evidence: repeatedFailures,
+    });
+  }
+
+  if (report.summary.status === 'failed' && recovery.modelRetries > 0) {
+    const latestModelEvent = [...(report.milestones ?? [])]
+      .reverse()
+      .find((entry) => entry.eventType === 'model.completed' || entry.eventType === 'model.failed');
+    if (latestModelEvent?.eventType === 'model.failed') {
+      findings.push({
+        severity: 'error',
+        category: 'failure',
+        role: 'primary-cause',
+        title: 'Model retry exhaustion',
+        summary: `${recovery.modelRetries} model retry event(s) were followed by a terminal model failure.`,
+        evidence: [milestoneEvidence(latestModelEvent), ...recoveryEvidence].slice(0, 5),
+      });
+    }
+  }
+
+  const replanGroups = groupMilestones(report, 'replan.required');
+  const replanLoops = [...replanGroups.values()].filter((events) => events.length >= 2);
+  if (replanLoops.length > 0) {
+    findings.push({
+      severity: 'warning',
+      category: 'blocked',
+      role: 'recovery',
+      title: 'Replan loop detected',
+      summary: `${replanLoops.length} run(s) emitted replan.required at least twice.`,
+      evidence: replanLoops.flat().slice(0, 10).map(milestoneEvidence),
+    });
+  }
+  return findings;
+}
+
+function buildDataConfidence(
+  report: TraceReport,
+  performance: PerformanceSummary,
+  performanceDigest: PerformanceDigest,
+): ReliabilityDiagnostics['dataConfidence'] {
+  const totalRuns = reliabilityRuns(report).length;
+  const runsWithSnapshots = new Set((report.snapshotSummaries ?? [])
+    .filter((snapshot) => snapshot.latestSnapshotSeq !== null)
+    .map((snapshot) => snapshot.runId)).size;
+  const observedEvents = performance.events.totalEvents;
+  const measuredPerformanceEvents = performance.events.measuredEvents;
+  const requiredObservabilityAvailable = !report.warnings.some((warning) =>
+    warning.includes('core:002_tool_observability') || warning.includes('pre-observability historical data'));
+  const totalToolRequests = performanceDigest.toolAccounting.totalRequests;
+  const pricedToolRequests = Math.max(0, totalToolRequests - performanceDigest.toolAccounting.unpricedRequests);
+  const warnings: string[] = [];
+  if (!requiredObservabilityAvailable) warnings.push('Required tool observability data is unavailable or historical.');
+  if (totalRuns > 0 && observedEvents === 0) warnings.push('No runtime events were available for the traced runs.');
+  if (totalRuns > 0 && runsWithSnapshots < totalRuns) warnings.push(`${totalRuns - runsWithSnapshots} run(s) have no available snapshot summary.`);
+  if (performanceDigest.toolAccounting.unpricedRequests > 0) warnings.push(`${performanceDigest.toolAccounting.unpricedRequests} tool-provider request(s) are unpriced.`);
+  warnings.push(...report.warnings.filter((warning) => !warnings.includes(warning)));
+
+  let level: ReliabilityDiagnostics['dataConfidence']['level'];
+  if (totalRuns === 0 && observedEvents === 0) {
+    level = 'unknown';
+  } else if (!requiredObservabilityAvailable || observedEvents === 0) {
+    level = 'low';
+  } else if (runsWithSnapshots < totalRuns || report.warnings.length > 0) {
+    level = 'medium';
+  } else {
+    level = 'high';
+  }
+
+  return {
+    level,
+    requiredObservabilityAvailable,
+    observedEvents,
+    measuredPerformanceEvents,
+    performanceCoverage: observedEvents > 0 ? measuredPerformanceEvents / observedEvents : null,
+    runsWithSnapshots,
+    totalRuns,
+    snapshotCoverage: totalRuns > 0 ? runsWithSnapshots / totalRuns : null,
+    pricedToolRequests,
+    totalToolRequests,
+    costCoverage: totalToolRequests > 0 ? pricedToolRequests / totalToolRequests : null,
+    warnings,
+  };
+}
+
+function unresolvedApprovalEvents(report: TraceReport): MilestoneEntry[] {
+  const pending = new Map<string, MilestoneEntry[]>();
+  for (const entry of report.milestones ?? []) {
+    if (entry.eventType !== 'approval.requested' && entry.eventType !== 'approval.resolved') {
+      continue;
+    }
+    const key = `${entry.runId}:${entry.stepId ?? '-'}`;
+    if (entry.eventType === 'approval.requested') {
+      const requests = pending.get(key) ?? [];
+      requests.push(entry);
+      pending.set(key, requests);
+      continue;
+    }
+    const requests = pending.get(key);
+    if (requests && requests.length > 0) {
+      requests.shift();
+      continue;
+    }
+    const fallback = [...pending.entries()].find(([candidate, events]) => candidate.startsWith(`${entry.runId}:`) && events.length > 0);
+    fallback?.[1].shift();
+  }
+  return [...pending.values()].flat();
+}
+
+function detectSnapshotSequenceProblems(report: TraceReport): EvidenceRef[] {
+  const byRun = new Map<string, MilestoneEntry[]>();
+  for (const entry of report.milestones ?? []) {
+    if (entry.eventType !== 'snapshot.created' || entry.snapshotSeq === null || entry.snapshotSeq === undefined) {
+      continue;
+    }
+    const snapshots = byRun.get(entry.runId) ?? [];
+    snapshots.push(entry);
+    byRun.set(entry.runId, snapshots);
+  }
+
+  const evidence: EvidenceRef[] = [];
+  for (const snapshots of byRun.values()) {
+    for (let index = 1; index < snapshots.length; index += 1) {
+      const previous = snapshots[index - 1]!;
+      const current = snapshots[index]!;
+      if (current.snapshotSeq! <= previous.snapshotSeq!) {
+        evidence.push({
+          ...milestoneEvidence(current),
+          detail: `snapshot sequence regressed from ${previous.snapshotSeq} to ${current.snapshotSeq}`,
+        });
+      } else if (current.snapshotSeq! > previous.snapshotSeq! + 1) {
+        evidence.push({
+          ...milestoneEvidence(current),
+          detail: `snapshot sequence jumped from ${previous.snapshotSeq} to ${current.snapshotSeq}`,
+        });
+      }
+    }
+  }
+  return evidence.slice(0, 10);
+}
+
+function detectResumesWithoutSnapshots(report: TraceReport): EvidenceRef[] {
+  const snapshotsByRun = groupMilestones(report, 'snapshot.created');
+  return (report.milestones ?? [])
+    .filter((entry) => entry.eventType === 'run.resumed')
+    .filter((resume) => !(snapshotsByRun.get(resume.runId) ?? []).some((snapshot) => eventPrecedes(snapshot, resume)))
+    .slice(0, 10)
+    .map(milestoneEvidence);
+}
+
+function operationWasSupersededByRecovery(
+  started: MilestoneEntry,
+  milestones: MilestoneEntry[],
+  before?: MilestoneEntry,
+): boolean {
+  const recoveryEvents = new Set<EventType>([
+    'run.interrupted',
+    'run.resumed',
+    'run.retry_started',
+    'run.continuation_created',
+    'replan.required',
+  ]);
+  return milestones.some((entry) =>
+    entry.runId === started.runId
+    && recoveryEvents.has(entry.eventType)
+    && eventPrecedes(started, entry)
+    && (!before || eventPrecedes(entry, before)),
+  );
+}
+
+function detectMissingToolContext(report: TraceReport): EvidenceRef[] {
+  if (report.llmMessages.length === 0) {
+    return [];
+  }
+  const tracesByRun = new Map(report.llmMessages.map((trace) => [trace.runId, trace]));
+  const latestSnapshotEventSeqByRun = new Map<string, number>();
+  for (const entry of report.milestones ?? []) {
+    if (entry.eventType !== 'snapshot.created' || entry.eventSeq === null) {
+      continue;
+    }
+    latestSnapshotEventSeqByRun.set(entry.runId, Math.max(latestSnapshotEventSeqByRun.get(entry.runId) ?? 0, entry.eventSeq));
+  }
+  return report.timeline
+    .filter((entry) => {
+      const latestSnapshotEventSeq = latestSnapshotEventSeqByRun.get(entry.runId);
+      return entry.toolCallId
+        && entry.completedAt
+        && entry.output !== null
+        && entry.output !== undefined
+        && entry.eventSeq !== null
+        && latestSnapshotEventSeq !== undefined
+        && entry.eventSeq <= latestSnapshotEventSeq;
+    })
+    .filter((entry) => {
+      const trace = tracesByRun.get(entry.runId);
+      return trace && !trace.effectiveMessages.some((message) => message.role === 'tool' && message.toolCallId === entry.toolCallId);
+    })
+    .slice(0, 10)
+    .map(toolEvidence);
+}
+
+function detectRepeatedFailures(report: TraceReport): EvidenceRef[] {
+  const groups = new Map<string, EvidenceRef[]>();
+  for (const entry of report.milestones ?? []) {
+    if (entry.eventType !== 'model.failed') {
+      continue;
+    }
+    const signature = oneLine(entry.text).replace(/^.*?model\.failed\s*/i, '').replace(/\b\d+(?:\.\d+)?(?:ms|s)?\b/g, '#');
+    const key = `model:${entry.runId}:${entry.stepId ?? '-'}:${signature}`;
+    const evidence = groups.get(key) ?? [];
+    evidence.push(milestoneEvidence(entry));
+    groups.set(key, evidence);
+  }
+  for (const entry of report.timeline) {
+    if (!entry.outcome.startsWith('failed')) {
+      continue;
+    }
+    const key = `tool:${entry.runId}:${entry.toolName ?? '-'}:${entry.outcome}`;
+    const evidence = groups.get(key) ?? [];
+    evidence.push(toolEvidence(entry));
+    groups.set(key, evidence);
+  }
+  return [...groups.values()]
+    .filter((evidence) => evidence.length >= 2)
+    .flatMap((evidence) => evidence.slice(0, 3))
+    .slice(0, 10);
+}
+
+function groupMilestones(report: TraceReport, eventType: EventType): Map<string, MilestoneEntry[]> {
+  const groups = new Map<string, MilestoneEntry[]>();
+  for (const entry of report.milestones ?? []) {
+    if (entry.eventType !== eventType) {
+      continue;
+    }
+    const events = groups.get(entry.runId) ?? [];
+    events.push(entry);
+    groups.set(entry.runId, events);
+  }
+  return groups;
+}
+
+function countMilestones(report: TraceReport, eventType: EventType): number {
+  return (report.milestones ?? []).filter((entry) => entry.eventType === eventType).length;
+}
+
+function eventPrecedes(left: MilestoneEntry, right: MilestoneEntry): boolean {
+  if (left.eventSeq !== null && right.eventSeq !== null) {
+    return left.eventSeq < right.eventSeq;
+  }
+  const leftTime = parseTimestamp(left.createdAt);
+  const rightTime = parseTimestamp(right.createdAt);
+  return leftTime !== null && rightTime !== null && leftTime <= rightTime;
+}
+
+interface ReliabilityRunRecord {
+  rootRunId: string;
+  runId: string;
+  parentRunId?: string | null;
+  status?: string | null;
+  updatedAt?: string | null;
+  completedAt?: string | null;
+  result?: unknown;
+  leaseOwner?: string | null;
+  leaseExpiresAt?: string | null;
+  heartbeatAt?: string | null;
+}
+
+function reliabilityRuns(report: TraceReport): ReliabilityRunRecord[] {
+  const runs = new Map<string, ReliabilityRunRecord>();
+  for (const run of report.rootRuns) {
+    runs.set(run.rootRunId, {
+      rootRunId: run.rootRunId,
+      runId: run.rootRunId,
+      status: run.status,
+      updatedAt: run.updatedAt,
+      completedAt: run.completedAt,
+      result: run.result,
+      leaseOwner: run.leaseOwner,
+      leaseExpiresAt: run.leaseExpiresAt,
+      heartbeatAt: run.heartbeatAt,
+    });
+  }
+  for (const run of report.runTree ?? []) {
+    const existing = runs.get(run.runId);
+    runs.set(run.runId, {
+      rootRunId: run.rootRunId,
+      runId: run.runId,
+      parentRunId: run.parentRunId,
+      status: run.status ?? existing?.status,
+      updatedAt: run.updatedAt ?? existing?.updatedAt,
+      completedAt: run.completedAt ?? existing?.completedAt,
+      result: run.result ?? existing?.result,
+      leaseOwner: run.leaseOwner ?? existing?.leaseOwner,
+      leaseExpiresAt: run.leaseExpiresAt ?? existing?.leaseExpiresAt,
+      heartbeatAt: run.heartbeatAt ?? existing?.heartbeatAt,
+    });
+  }
+  for (const delegate of report.delegates) {
+    if (!delegate.child_run_id || runs.has(delegate.child_run_id)) {
+      continue;
+    }
+    runs.set(delegate.child_run_id, {
+      rootRunId: delegate.root_run_id,
+      runId: delegate.child_run_id,
+      parentRunId: delegate.parent_run_id,
+      status: delegate.child_status,
+      updatedAt: delegate.child_updated_at,
+      completedAt: delegate.child_completed_at,
+      result: delegate.child_result,
+      leaseOwner: delegate.child_lease_owner,
+      leaseExpiresAt: delegate.child_lease_expires_at,
+      heartbeatAt: delegate.child_heartbeat_at,
+    });
+  }
+  return [...runs.values()];
+}
+
+function runRecordEvidence(run: ReliabilityRunRecord, detail?: string): EvidenceRef {
+  return {
+    kind: run.runId === run.rootRunId ? 'root-run' : 'run',
+    label: `${run.runId === run.rootRunId ? 'root run' : 'run'} ${run.status ?? 'unknown'}`,
+    rootRunId: run.rootRunId,
+    runId: run.runId,
+    createdAt: run.completedAt ?? run.updatedAt,
+    detail,
+  };
+}
+
+function runTreeEvidence(run: RunTreeEntry, detail?: string): EvidenceRef {
+  return runRecordEvidence({
+    rootRunId: run.rootRunId,
+    runId: run.runId,
+    parentRunId: run.parentRunId,
+    status: run.status,
+    updatedAt: run.updatedAt,
+    completedAt: run.completedAt,
+  }, detail);
+}
+
+function milestoneEvidence(entry: MilestoneEntry): EvidenceRef {
+  return {
+    kind: 'event',
+    label: `event #${entry.eventSeq ?? '?'} ${entry.eventType}`,
+    rootRunId: entry.rootRunId,
+    runId: entry.runId,
+    stepId: entry.stepId,
+    toolCallId: entry.toolCallId,
+    eventSeq: entry.eventSeq,
+    eventType: entry.eventType,
+    createdAt: entry.createdAt,
+    detail: entry.text,
+  };
+}
+
+function inspectionCommands(report: TraceReport, finding: FindingDraft): TraceFinding['commands'] {
+  const commands = new Map<string, string>();
+  const add = (reason: string, command: string): void => {
+    if (!commands.has(command)) commands.set(command, reason);
+  };
+  const runId = finding.evidence.find((evidence) => evidence.runId)?.runId;
+  if (runId) {
+    add('Inspect the referenced run lifecycle and tool activity.', `trace-session --run ${runId} --view timeline`);
+    if (finding.category === 'failure' || finding.role === 'recovery' || finding.title.includes('Tool output')) {
+      add('Inspect the referenced run model context.', `trace-session --run ${runId} --view messages --messages-view delta`);
+    }
+  }
+  if (finding.category === 'policy') {
+    add('Inspect policy and approval evidence.', `${traceTargetCommand(report)} --view policy`);
+  }
+  if (finding.category === 'data-quality' || finding.category === 'blocked') {
+    add('Inspect all reliability dimensions and data coverage.', `${traceTargetCommand(report)} --view reliability`);
+  }
+  if (commands.size === 0) {
+    add('Inspect the causal investigation report.', `${traceTargetCommand(report)} --view investigate`);
+  }
+  return [...commands.entries()].slice(0, 3).map(([command, reason]) => ({ reason, command }));
+}
+
+function findingEvidence(findings: FindingDraft[]): EvidenceRef[] {
+  return findings.flatMap((finding) => finding.evidence).slice(0, 5);
+}
+
+function recoveryActivityCount(recovery: RecoveryPressure): number {
+  return recovery.modelRetries
+    + recovery.runRetries
+    + recovery.interruptions
+    + recovery.resumes
+    + recovery.continuations
+    + recovery.replans
+    + recovery.rejectedToolCalls;
+}
+
+function recoveryPressureSummary(recovery: RecoveryPressure): string {
+  if (recoveryActivityCount(recovery) === 0) {
+    return 'No retries, interruptions, resumes, continuations, replans, or rejected tool calls were observed.';
+  }
+  const parts = [
+    recovery.modelRetries > 0 ? `${recovery.modelRetries} model retries (${recovery.modelRetryDelayMs}ms delay)` : undefined,
+    recovery.runRetries > 0 ? `${recovery.runRetries} run retries` : undefined,
+    recovery.interruptions > 0 ? `${recovery.interruptions} interruptions` : undefined,
+    recovery.resumes > 0 ? `${recovery.resumes} resumes` : undefined,
+    recovery.continuations > 0 ? `${recovery.continuations} continuations` : undefined,
+    recovery.replans > 0 ? `${recovery.replans} replans` : undefined,
+    recovery.rejectedToolCalls > 0 ? `${recovery.rejectedToolCalls} rejected tool calls` : undefined,
+  ].filter((part): part is string => part !== undefined);
+  return `${parts.join(', ')}${recovery.excessive ? '; recovery pressure is high' : ''}.`;
+}
+
+function reliabilityClassificationSummary(
+  classification: ReliabilityDiagnostics['classification'],
+  report: TraceReport,
+): string {
+  switch (classification) {
+    case 'healthy': return 'Terminal success with coherent lifecycle evidence and no material runtime or policy findings.';
+    case 'recovered': return 'Terminal success after retry, interruption, resume, replan, rejection, or transient failure activity.';
+    case 'degraded': return 'Terminal success with integrity, policy, recovery-pressure, or evidence-confidence gaps.';
+    case 'failed': return `Terminal failure: ${report.summary.reason}`;
+    case 'blocked': return `Non-terminal work requires user or operator action: ${report.summary.reason}`;
+    case 'unknown': return 'Persisted evidence is insufficient to classify runtime reliability.';
+  }
+}
+
+function outcomeDimensionSummary(report: TraceReport, issues: FindingDraft[]): string {
+  if (issues.length > 0) return `${issues.length} root/child outcome integrity issue(s) were detected.`;
+  if (report.summary.status === 'succeeded') return 'Root and child outcomes are coherent and terminal success is persisted.';
+  return report.summary.reason;
+}
+
+function policyDimensionSummary(policy: PolicyDigest): string {
+  if (policy.unresolvedApprovalRequests > 0) return `${policy.unresolvedApprovalRequests} approval request(s) remain unresolved.`;
+  if (policy.budgetExhaustedToolCalls > 0) return `${policy.budgetExhaustedToolCalls} tool call(s) were skipped after budget exhaustion.`;
+  if (policy.rejectedToolCalls > 0) return `${policy.rejectedToolCalls} rejected tool call(s) were observed and execution continued.`;
+  return 'No unresolved approvals, budget exhaustion, or rejected tool calls were detected.';
+}
+
+function dataConfidenceSummary(confidence: ReliabilityDiagnostics['dataConfidence']): string {
+  const performance = confidence.performanceCoverage === null ? 'performance unknown'
+    : `${Math.round(confidence.performanceCoverage * 100)}% performance payload coverage`;
+  const snapshots = confidence.snapshotCoverage === null ? 'snapshot coverage unknown'
+    : `${confidence.runsWithSnapshots}/${confidence.totalRuns} runs with snapshots`;
+  const cost = confidence.costCoverage === null ? 'no priced tool requests expected'
+    : `${confidence.pricedToolRequests}/${confidence.totalToolRequests} tool requests priced`;
+  return `${confidence.level} · ${confidence.observedEvents} events available · ${performance} · ${snapshots} · ${cost}.`;
+}
+
+function dataConfidenceEvidence(
+  report: TraceReport,
+  confidence: ReliabilityDiagnostics['dataConfidence'],
+): EvidenceRef[] {
+  const evidence: EvidenceRef[] = report.warnings.slice(0, 3).map((warning) => ({
+    kind: 'event',
+    label: 'trace data warning',
+    detail: warning,
+  }));
+  if (confidence.totalRuns > confidence.runsWithSnapshots) {
+    evidence.push({
+      kind: 'snapshot',
+      label: 'snapshot coverage',
+      detail: `${confidence.runsWithSnapshots}/${confidence.totalRuns} runs have snapshots`,
+    });
+  }
+  if (confidence.totalToolRequests > confidence.pricedToolRequests) {
+    evidence.push({
+      kind: 'usage',
+      label: 'tool cost coverage',
+      detail: `${confidence.pricedToolRequests}/${confidence.totalToolRequests} requests priced`,
+    });
+  }
+  return evidence.slice(0, 5);
+}
+
+function capitalize(value: string): string {
+  return value.length > 0 ? `${value[0]!.toUpperCase()}${value.slice(1)}` : value;
 }
 
 function buildSuggestedNextViews(
@@ -814,7 +1717,13 @@ function buildSuggestedNextViews(
   };
   const failingRunId = firstEvidenceRunId(findings.find((finding) => finding.severity === 'error'));
 
-  if (failingRunId) {
+  for (const finding of findings.slice(0, 3)) {
+    for (const suggestion of finding.commands) {
+      add(suggestion.reason, suggestion.command);
+    }
+  }
+
+  if (failingRunId && suggestions.size === 0) {
     add('Inspect the failed run message context.', `trace-session --run ${failingRunId} --view messages --messages-view delta`);
     add('Inspect the failed run tool timeline.', `trace-session --run ${failingRunId} --view timeline`);
   }
@@ -825,7 +1734,7 @@ function buildSuggestedNextViews(
     add('Review duration and token hotspots.', `${traceTargetCommand(report)} --view performance`);
   }
   if (suggestions.size === 0) {
-    add('Review the concise trace overview.', `${traceTargetCommand(report)} --view overview`);
+    add('Review the reliability dimensions and their evidence.', `${traceTargetCommand(report)} --view reliability`);
   }
 
   return [...suggestions.entries()].map(([command, reason]) => ({ reason, command }));
@@ -863,8 +1772,13 @@ export function buildMilestones(rows: TraceRow[]): MilestoneEntry[] {
       depth: row.delegation_depth ?? 0,
       eventType: row.event_type as EventType,
       stepId: row.event_step_id,
+      toolCallId: row.tool_call_id,
       createdAt: row.event_created_at,
       eventSeq: row.event_seq,
+      snapshotSeq: row.event_type === 'snapshot.created' ? payloadNumber(row.payload, 'snapshotSeq') : null,
+      retryDelayMs: row.event_type === 'model.retry'
+        ? payloadNumber(row.payload, 'retryDelayMs') ?? payloadNestedNumber(row.payload, 'performance', 'retryDelayMs')
+        : null,
       text: formatCompactAgentEventFrame(frame),
     });
   }
@@ -890,6 +1804,14 @@ export function buildRunTreeEntries(rows: TraceRow[]): RunTreeEntry[] {
       parentRunId: row.parent_run_id,
       delegateName: row.run_delegate_name,
       depth: row.delegation_depth ?? 0,
+      status: row.run_status,
+      createdAt: row.run_created_at,
+      updatedAt: row.run_updated_at,
+      completedAt: row.run_completed_at,
+      result: row.run_result,
+      leaseOwner: row.run_lease_owner,
+      leaseExpiresAt: row.run_lease_expires_at,
+      heartbeatAt: row.run_heartbeat_at,
     });
   }
 
@@ -1192,16 +2114,7 @@ function modelFailureEvidence(report: TraceReport): EvidenceRef[] {
   const events = (report.milestones ?? [])
     .filter((entry) => entry.eventType === 'model.failed')
     .slice(0, 5)
-    .map((entry): EvidenceRef => ({
-      kind: 'event',
-      label: `${shortId(entry.runId)} #${entry.eventSeq ?? '?'}`,
-      rootRunId: entry.rootRunId,
-      runId: entry.runId,
-      stepId: entry.stepId,
-      eventSeq: entry.eventSeq,
-      eventType: entry.eventType,
-      detail: entry.text,
-    }));
+    .map(milestoneEvidence);
   return events.length > 0 ? events : primaryOutcomeEvidence(report);
 }
 
@@ -1227,31 +2140,12 @@ function policyEvidence(report: TraceReport, warning: string): EvidenceRef[] {
     return (report.milestones ?? [])
       .filter((entry) => entry.eventType === 'model.tool_call_rejected')
       .slice(0, 5)
-      .map((entry): EvidenceRef => ({
-        kind: 'event',
-        label: `${shortId(entry.runId)} #${entry.eventSeq ?? '?'}`,
-        rootRunId: entry.rootRunId,
-        runId: entry.runId,
-        stepId: entry.stepId,
-        eventSeq: entry.eventSeq,
-        eventType: entry.eventType,
-        detail: entry.text,
-      }));
+      .map(milestoneEvidence);
   }
   if (warning.includes('approval')) {
-    return (report.milestones ?? [])
-      .filter((entry) => entry.eventType === 'approval.requested')
+    return unresolvedApprovalEvents(report)
       .slice(0, 5)
-      .map((entry): EvidenceRef => ({
-        kind: 'event',
-        label: `${shortId(entry.runId)} #${entry.eventSeq ?? '?'}`,
-        rootRunId: entry.rootRunId,
-        runId: entry.runId,
-        stepId: entry.stepId,
-        eventSeq: entry.eventSeq,
-        eventType: entry.eventType,
-        detail: entry.text,
-      }));
+      .map(milestoneEvidence);
   }
   return runtimePolicyMessageEvidence(report);
 }
@@ -1292,6 +2186,7 @@ function delegateEvidence(delegate: DelegateRow): EvidenceRef {
     rootRunId: delegate.root_run_id,
     runId: childRunId ?? delegate.parent_run_id,
     stepId: delegate.parent_step_id,
+    createdAt: delegate.child_completed_at ?? delegate.child_updated_at,
     detail: delegate.child_error_message ?? delegate.child_error_code ?? delegate.delegate_reason,
   };
 }
@@ -1299,9 +2194,10 @@ function delegateEvidence(delegate: DelegateRow): EvidenceRef {
 function rootRunEvidence(run: RootRun): EvidenceRef {
   return {
     kind: 'root-run',
-    label: `${shortId(run.rootRunId)} ${run.status ?? 'unknown'}`,
+    label: `root run ${run.status ?? 'unknown'}`,
     rootRunId: run.rootRunId,
-    runId: run.runId,
+    runId: run.rootRunId,
+    createdAt: run.completedAt ?? run.updatedAt,
     detail: run.errorMessage ?? run.errorCode ?? run.goal ?? undefined,
   };
 }
@@ -1316,6 +2212,7 @@ function toolEvidence(entry: TimelineEntry): EvidenceRef {
     toolCallId: entry.toolCallId,
     eventSeq: entry.eventSeq,
     eventType: entry.eventType,
+    createdAt: entry.completedAt ?? entry.startedAt,
     detail: entry.outcome,
   };
 }
@@ -1437,6 +2334,23 @@ function payloadValue(payload: unknown, key: string): unknown {
     return (payload as Record<string, unknown>)[key];
   }
   return undefined;
+}
+
+function payloadNumber(payload: unknown, key: string): number | null {
+  const value = payloadValue(payload, key);
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function payloadNestedNumber(payload: unknown, parentKey: string, key: string): number | null {
+  const parent = asRecord(payloadValue(payload, parentKey));
+  return parent ? readNumber(parent, key) ?? null : null;
 }
 
 interface PerformanceBucketAccumulator {

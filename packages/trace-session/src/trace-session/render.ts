@@ -81,6 +81,13 @@ export function renderTraceReport(
     return renderFinalOutput(report.rootRuns);
   }
 
+  if (effectiveView === 'reliability') {
+    lines.push('');
+    lines.push(markdownBlock('# Reliability'));
+    lines.push(renderReliabilityDiagnostics(diagnostics));
+    return lines.join('\n');
+  }
+
   if (effectiveView === 'investigate') {
     lines.push('');
     lines.push(markdownBlock('# Investigation'));
@@ -181,6 +188,7 @@ export function renderTraceHtml(report: TraceReport, options: HtmlTraceRenderOpt
     renderHtmlNav(),
     '    <main>',
     renderHtmlBrief(diagnostics),
+    renderHtmlReliability(diagnostics),
     renderHtmlFindings(diagnostics),
     renderHtmlPolicy(diagnostics),
     renderHtmlPerformance(report, diagnostics),
@@ -431,9 +439,9 @@ h3 { font-size: 17px; }
   padding: 6px 9px;
   text-transform: uppercase;
 }
-.badge.status-succeeded, .badge.status-returned-successfully { background: var(--good-soft); border-color: #abefc6; color: var(--good); }
+.badge.status-succeeded, .badge.status-returned-successfully, .badge.status-healthy, .badge.status-recovered { background: var(--good-soft); border-color: #abefc6; color: var(--good); }
 .badge.status-failed, .badge.status-error { background: var(--bad-soft); border-color: #ffb4aa; color: var(--bad); }
-.badge.status-blocked, .badge.status-running, .badge.status-awaiting-subagent, .badge.status-waiting { background: var(--warn-soft); border-color: #fedf89; color: var(--warn); }
+.badge.status-blocked, .badge.status-running, .badge.status-awaiting-subagent, .badge.status-waiting, .badge.status-degraded { background: var(--warn-soft); border-color: #fedf89; color: var(--warn); }
 .badge.severity-error { background: var(--bad-soft); border-color: #ffb4aa; color: var(--bad); }
 .badge.severity-warning { background: var(--warn-soft); border-color: #fedf89; color: var(--warn); }
 .badge.severity-info { background: var(--info-soft); border-color: #b9e6fe; color: var(--info); }
@@ -485,7 +493,7 @@ function renderHtmlHero(report: TraceReport, diagnostics: TraceDiagnostics, gene
           <p class="eyebrow">Adaptive Agent Trace Report</p>
           <h1>${escapeHtml(brief.targetLabel)}</h1>
         </div>
-        ${htmlBadge(brief.status, `status-${classToken(brief.status)}`)}
+        ${htmlBadge(diagnostics.reliability.classification, `status-${classToken(diagnostics.reliability.classification)}`)}
       </div>
       <p class="lead">${escapeHtml(brief.headline)}</p>
       <div class="hero-meta">
@@ -501,6 +509,7 @@ function renderHtmlHero(report: TraceReport, diagnostics: TraceDiagnostics, gene
 function renderHtmlNav(): string {
   const links = [
     ['#brief', 'Brief'],
+    ['#reliability', 'Reliability'],
     ['#findings', 'Findings'],
     ['#policy', 'Policy'],
     ['#performance', 'Performance'],
@@ -523,6 +532,7 @@ function renderHtmlBrief(diagnostics: TraceDiagnostics): string {
     'Trace Brief',
     'High-level outcome, scale, duration, and usage for fast triage.',
     htmlMetricGrid([
+      ['Verdict', diagnostics.reliability.classification, diagnostics.reliability.summary],
       ['Outcome', brief.status, diagnostics.brief.headline],
       ['Runs', `${formatNumber(brief.rootRunCount)} roots / ${formatNumber(brief.runCount)} total`, `steps=${brief.totalSteps === null ? 'unknown' : formatNumber(brief.totalSteps)}`],
       ['Wall duration', formatDuration(brief.wallDurationMs), 'Elapsed time across root runs.'],
@@ -535,14 +545,38 @@ function renderHtmlBrief(diagnostics: TraceDiagnostics): string {
   );
 }
 
+function renderHtmlReliability(diagnostics: TraceDiagnostics): string {
+  const reliability = diagnostics.reliability;
+  const dimensions = reliability.dimensions;
+  return htmlSection(
+    'reliability',
+    'Reliability',
+    'Explainable runtime classification across outcome, lifecycle, recovery, liveness, policy, and evidence dimensions.',
+    [
+      htmlMetricGrid([
+        ['Verdict', reliability.classification, reliability.summary],
+        ['Outcome integrity', dimensions.outcomeIntegrity.status, dimensions.outcomeIntegrity.summary],
+        ['Lifecycle integrity', dimensions.lifecycleIntegrity.status, dimensions.lifecycleIntegrity.summary],
+        ['Recovery pressure', dimensions.recoveryPressure.status, dimensions.recoveryPressure.summary],
+        ['Liveness', dimensions.liveness.status, dimensions.liveness.summary],
+        ['Policy integrity', dimensions.policyIntegrity.status, dimensions.policyIntegrity.summary],
+        ['Data confidence', reliability.dataConfidence.level, dimensions.evidenceConfidence.summary],
+        ['Output quality', reliability.outputQuality.status, reliability.outputQuality.summary],
+      ]),
+    ].join('\n'),
+  );
+}
+
 function renderHtmlFindings(diagnostics: TraceDiagnostics): string {
   const findings = diagnostics.findings.length > 0 ? diagnostics.findings : [{
     id: 'finding-0',
     severity: 'info' as const,
     category: 'data-quality' as const,
+    role: 'context' as const,
     title: 'No diagnostic findings',
     summary: 'No failure, policy, or performance findings were derived from the persisted trace.',
     evidence: [],
+    commands: [],
   }];
 
   const body = [
@@ -557,10 +591,14 @@ function renderHtmlFinding(finding: TraceFinding): string {
     ? '<p class="empty">No direct evidence rows were attached to this finding.</p>'
     : `<ul class="evidence-list">${finding.evidence.map((item) => `<li>${escapeHtml(formatEvidenceRef(item))}</li>`).join('\n')}</ul>`;
 
+  const commands = finding.commands.length === 0
+    ? ''
+    : `<details><summary>Inspect (${formatNumber(finding.commands.length)})</summary><ul class="command-list">${finding.commands.map((command) => `<li>${escapeHtml(command.reason)}<br><code>$ ${escapeHtml(command.command)}</code></li>`).join('\n')}</ul></details>`;
   return `
       <article class="finding-card ${classToken(finding.severity)}">
         <div class="finding-head">
           ${htmlBadge(finding.severity, `severity-${classToken(finding.severity)}`)}
+          ${htmlBadge(finding.role)}
           ${htmlBadge(finding.category)}
         </div>
         <h3>${escapeHtml(finding.title)}</h3>
@@ -569,6 +607,7 @@ function renderHtmlFinding(finding: TraceFinding): string {
           <summary>Evidence (${formatNumber(finding.evidence.length)})</summary>
           ${evidence}
         </details>
+        ${commands}
       </article>`;
 }
 
@@ -1137,9 +1176,12 @@ function renderDecisionSummary(report: TraceReport, diagnostics: TraceDiagnostic
     ...identityLines,
     `${chalk.cyan('runs')} roots=${formatNumber(diagnostics.brief.rootRunCount)} total=${formatNumber(diagnostics.brief.runCount)}`,
     `${chalk.cyan('provider / model')} ${models.join(', ') || 'unknown'}`,
-    '', markdownBlock('# Verdict / Reliability'),
+    '', markdownBlock('# Verdict'),
+    `${chalk.cyan('VERDICT')} ${statusColor(diagnostics.reliability.classification)(diagnostics.reliability.classification.toUpperCase())}`,
     `${chalk.cyan('status')} ${statusColor(diagnostics.brief.status)(diagnostics.brief.status)}`,
-    `${chalk.cyan('verdict')} ${diagnostics.brief.headline}`,
+    `${chalk.cyan('reason')} ${diagnostics.reliability.summary}`,
+    '', markdownBlock('# Reliability'),
+    renderReliabilityDimensionRows(diagnostics),
     '', markdownBlock('# Operations'),
     `${chalk.cyan('duration')} wall=${formatDuration(diagnostics.brief.wallDurationMs)} model=${formatDuration(diagnostics.performance.cumulativeModelDurationMs)} tools=${formatDuration(diagnostics.performance.cumulativeToolDurationMs)}`,
     `${chalk.cyan('model/tool-output cost')} ${formatCost(modelCost)}`,
@@ -1154,17 +1196,61 @@ function renderDecisionSummary(report: TraceReport, diagnostics: TraceDiagnostic
   return lines.join('\n');
 }
 
+function renderReliabilityDiagnostics(diagnostics: TraceDiagnostics): string {
+  const reliability = diagnostics.reliability;
+  const lines = [
+    `${chalk.cyan('VERDICT')} ${statusColor(reliability.classification)(reliability.classification.toUpperCase())}`,
+    ...wrapPlain(reliability.summary, 112),
+    '',
+    renderReliabilityDimensionRows(diagnostics),
+  ];
+  const dimensionEvidence = Object.values(reliability.dimensions).flatMap((dimension) => dimension.evidence);
+  if (dimensionEvidence.length > 0) {
+    lines.push('', markdownBlock('## Evidence'));
+    for (const evidence of dimensionEvidence.slice(0, 8)) {
+      const evidenceLines = renderEvidenceRefLines(evidence);
+      lines.push(`- ${evidenceLines[0] ?? '-'}`);
+      lines.push(...evidenceLines.slice(1).map((line) => `  ${line}`));
+    }
+  }
+  lines.push('', `${chalk.cyan('Output quality')} ${reliability.outputQuality.status}`);
+  lines.push(...wrapPlain(reliability.outputQuality.summary, 112));
+  if (diagnostics.suggestedNextViews.length > 0) {
+    lines.push('', markdownBlock('## Suggested next commands'), renderSuggestedNextViews(diagnostics));
+  }
+  return lines.join('\n');
+}
+
+function renderReliabilityDimensionRows(diagnostics: TraceDiagnostics): string {
+  const reliability = diagnostics.reliability;
+  const dimensions = reliability.dimensions;
+  return renderMetricTable([
+    ['Outcome integrity', statusColor(dimensions.outcomeIntegrity.status)(dimensions.outcomeIntegrity.status), dimensions.outcomeIntegrity.summary],
+    ['Lifecycle integrity', statusColor(dimensions.lifecycleIntegrity.status)(dimensions.lifecycleIntegrity.status), dimensions.lifecycleIntegrity.summary],
+    ['Recovery pressure', statusColor(dimensions.recoveryPressure.status)(dimensions.recoveryPressure.status), dimensions.recoveryPressure.summary],
+    ['Liveness', statusColor(dimensions.liveness.status)(dimensions.liveness.status), dimensions.liveness.summary],
+    ['Policy integrity', statusColor(dimensions.policyIntegrity.status)(dimensions.policyIntegrity.status), dimensions.policyIntegrity.summary],
+    ['Data confidence', statusColor(dimensions.evidenceConfidence.status)(reliability.dataConfidence.level), dimensions.evidenceConfidence.summary],
+  ]);
+}
+
 function renderInvestigation(report: TraceReport, diagnostics: TraceDiagnostics): string {
   const lines: string[] = [];
-  lines.push(markdownBlock('## Findings'));
-  lines.push(renderDiagnosticFindings(diagnostics.findings.length > 0 ? diagnostics.findings : [{
-    id: 'finding-0',
-    severity: 'info',
-    category: 'data-quality',
-    title: 'No diagnostic findings',
-    summary: 'No failure, policy, or performance findings were derived from the persisted trace.',
-    evidence: [],
-  }]));
+  lines.push(markdownBlock('## Verdict'));
+  lines.push(`${chalk.cyan('VERDICT')} ${statusColor(diagnostics.reliability.classification)(diagnostics.reliability.classification.toUpperCase())}`);
+  lines.push(...wrapPlain(diagnostics.reliability.summary, 112));
+
+  const groups: Array<[title: string, role: TraceFinding['role'], empty: string]> = [
+    ['Primary cause', 'primary-cause', 'No primary cause was attributable from persisted evidence.'],
+    ['Recovery', 'recovery', 'No retries, resumes, replans, or other recovery attempts were observed.'],
+    ['Consequences', 'consequence', 'No downstream consequences were derived.'],
+    ['Context and data gaps', 'context', 'No additional context or data-quality findings were derived.'],
+  ];
+  for (const [title, role, empty] of groups) {
+    const findings = diagnostics.findings.filter((finding) => finding.role === role);
+    lines.push('', markdownBlock(`## ${title}`));
+    lines.push(findings.length > 0 ? renderDiagnosticFindings(findings) : chalk.gray(empty));
+  }
 
   const nonSucceededRoots = report.rootRuns.filter((run) => run.status && run.status !== 'succeeded');
   if (nonSucceededRoots.length > 0) {
@@ -1240,16 +1326,16 @@ function renderDiagnosticFindings(findings: TraceFinding[]): string {
 function renderDiagnosticFinding(finding: TraceFinding, index: number): string {
   const severity = findingSeverityColor(finding.severity)(finding.severity.toUpperCase());
   const lines = [
-    `${chalk.bold(`${index + 1}.`)} ${severity} ${chalk.gray(finding.category)} ${chalk.bold(finding.title)}`,
+    `${chalk.bold(`${index + 1}.`)} ${severity} ${chalk.gray(finding.role)} ${chalk.gray(finding.category)} ${chalk.bold(finding.title)}`,
     ...wrapPlain(finding.summary, 112).map((line) => `   ${line}`),
   ];
 
   if (finding.evidence.length > 0) {
     lines.push(`   ${chalk.cyan('Evidence')}`);
     for (const evidence of finding.evidence.slice(0, 4)) {
-      const wrapped = wrapPlain(formatEvidenceRef(evidence), 108);
-      lines.push(`   - ${wrapped[0] ?? '-'}`);
-      for (const continuation of wrapped.slice(1)) {
+      const evidenceLines = renderEvidenceRefLines(evidence);
+      lines.push(`   - ${evidenceLines[0] ?? '-'}`);
+      for (const continuation of evidenceLines.slice(1)) {
         lines.push(`     ${continuation}`);
       }
     }
@@ -1258,18 +1344,40 @@ function renderDiagnosticFinding(finding: TraceFinding, index: number): string {
     }
   }
 
+  if (finding.commands.length > 0) {
+    lines.push(`   ${chalk.cyan('Inspect')}`);
+    for (const command of finding.commands) {
+      lines.push(`   ${chalk.cyan(`$ ${command.command}`)}`);
+    }
+  }
+
   return lines.join('\n');
 }
 
 function formatEvidenceRef(item: EvidenceRef): string {
   const location = [
-    item.runId ? `run=${shortId(item.runId)}` : undefined,
-    item.stepId ? `step=${item.stepId}` : undefined,
-    item.toolCallId ? `toolCall=${shortId(item.toolCallId)}` : undefined,
-    item.eventSeq !== undefined && item.eventSeq !== null ? `event=#${item.eventSeq}` : undefined,
-  ].filter((part): part is string => part !== undefined).join(' ');
+    item.runId ? `run ${item.runId}` : undefined,
+    item.stepId ? `step ${item.stepId}` : undefined,
+    item.toolCallId ? `tool call ${item.toolCallId}` : undefined,
+    item.eventSeq !== undefined && item.eventSeq !== null ? `event #${item.eventSeq} ${item.eventType ?? ''}`.trim() : undefined,
+    item.createdAt ? `at ${item.createdAt}` : undefined,
+  ].filter((part): part is string => part !== undefined).join(' · ');
   const detail = item.detail ? ` - ${oneLine(item.detail)}` : '';
   return `${item.label}${location ? ` (${location})` : ''}${detail}`;
+}
+
+function renderEvidenceRefLines(item: EvidenceRef): string[] {
+  const eventLabel = item.eventSeq !== undefined && item.eventSeq !== null
+    ? `event #${item.eventSeq}  ${item.eventType ?? item.label}`
+    : item.label;
+  const lines = [eventLabel];
+  if (item.createdAt) lines.push(`at ${item.createdAt}`);
+  if (item.rootRunId && item.rootRunId !== item.runId) lines.push('root run', `  ${item.rootRunId}`);
+  if (item.runId) lines.push('run', `  ${item.runId}`);
+  if (item.stepId) lines.push(`step ${item.stepId}`);
+  if (item.toolCallId) lines.push('tool call', `  ${item.toolCallId}`);
+  if (item.detail) lines.push(...wrapPlain(`detail ${oneLine(item.detail)}`, 104));
+  return lines;
 }
 
 function renderSuggestedNextViews(diagnostics: TraceDiagnostics, options: { limit?: number } = {}): string {
@@ -2231,7 +2339,6 @@ function resolveReportView(options: Pick<CliOptions, 'onlyDelegates'> & Partial<
   if (options.view) {
     if (options.view === 'overview') return 'summary';
     if (options.view === 'performance' || options.view === 'operations') return 'performance';
-    if (options.view === 'reliability') return 'investigate';
     return options.view;
   }
   if (options.onlyDelegates) {
@@ -2289,13 +2396,13 @@ function renderMetricTable(rows: Array<[metric: string, value: string, explanati
 }
 
 function statusColor(status: string): (value: string) => string {
-  if (['succeeded', 'returned successfully'].includes(status)) {
+  if (['succeeded', 'returned successfully', 'healthy', 'recovered', 'high'].includes(status)) {
     return chalk.green;
   }
   if (status.includes('failed') || status === 'failed') {
     return chalk.red;
   }
-  if (status.includes('blocked') || status.includes('waiting') || status.includes('awaiting') || status === 'running') {
+  if (status.includes('blocked') || status.includes('waiting') || status.includes('awaiting') || status === 'running' || status === 'degraded' || status === 'medium' || status === 'low') {
     return chalk.yellow;
   }
   return chalk.white;
