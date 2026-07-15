@@ -4,8 +4,10 @@ export const USAGE = `Usage:
   adaptive-agent-trace-session <sessionId> [options]
   adaptive-agent-trace-session --root-run <rootRunId> [options]
   adaptive-agent-trace-session --run <runId> [options]
+  trace-session --compare <baseline-run-id> <candidate-run-id> [options]
   adaptive-agent-trace-session --ls [options]
   adaptive-agent-trace-session --lsp [options]
+  adaptive-agent-trace-session --lsp --group-by <model|status|day> [--since <duration|ISO>] [--until <duration|ISO>] [options]
   adaptive-agent-trace-session --ls-sessionless [options]
   adaptive-agent-trace-session --delete [options]
   adaptive-agent-trace-session <sessionId> --usage [options]
@@ -13,6 +15,7 @@ export const USAGE = `Usage:
   bun run ./src/trace-session.ts <sessionId> [options]
 
 Options:
+  --compare <base> <candidate> Compare two focused runs; changes are candidate minus baseline.
   --ls                   List sessions and associated goals, newest first.
   --lsp                  List sessions/runs as compact performance cards.
   --goal <text>          Filter list goals by case-insensitive text (repeatable OR).
@@ -22,6 +25,9 @@ Options:
   --type <type>          Filter list type: run, chat, swarm, or swarm-run (repeatable OR).
   --swarm-role <role>    Filter swarm role: coordinator, worker, quality, or synthesizer.
   --limit <n>            Limit --ls sessions or --lsp run cards.
+  --group-by <field>     Aggregate --lsp root traces by model, terminal status, or UTC day.
+  --since <time>         Include list rows at/after a duration (24h, 7d) or ISO timestamp.
+  --until <time>         Include list rows at/before a duration (24h, 7d) or ISO timestamp.
   --ls-sessionless       List root runs that are not linked to any session.
   --delete               Print legacy gateway SQL to delete sessions whose goals are empty or null.
   --usage                Print usage totals for the session and all linked root runs.

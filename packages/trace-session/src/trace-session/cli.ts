@@ -9,17 +9,23 @@ import { createTracePostgresPool as createPostgresPool, resolveTracePostgresConf
 
 import { USAGE } from './constants.js';
 import { cacheKey, isTerminalReport, parseCacheDuration, readCache, writeCache } from './cache.js';
-import { listSessionlessRuns, listSessionPerformance, listSessions, loadUsageForTraceTargetWithTerminalState, traceSession } from './data.js';
+import { aggregateSessionPerformance, listSessionlessRuns, listSessionPerformance, listSessions, loadUsageForTraceTargetWithTerminalState, traceSession } from './data.js';
+import { buildTraceComparison } from './report.js';
 import {
   renderDeleteEmptyGoalSessionsSql,
   renderSessionPerformanceList,
   renderSessionList,
   renderSessionlessRunList,
+  renderTraceAggregate,
+  renderTraceAggregateHtml,
   renderTraceHtml,
+  renderTraceComparison,
+  renderTraceComparisonHtml,
   renderTraceReport,
   renderUsageReport,
+  traceTargetNotFoundMessage,
 } from './render.js';
-import type { CliOptions, MessageView, ReportView, SessionListItem, SessionPerformanceListItem, SessionUsageSummary, SessionlessRunListItem, TraceListType, TraceReport } from './types.js';
+import type { CliOptions, MessageView, ReportView, SessionListItem, SessionPerformanceListItem, SessionUsageSummary, SessionlessRunListItem, TraceAggregateGroupBy, TraceAggregateReport, TraceListType, TraceReport } from './types.js';
 
 export function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
@@ -49,6 +55,9 @@ export function parseArgs(args: string[]): CliOptions {
         break;
       case '--json':
         options.json = true;
+        break;
+      case '--compare':
+        options.compareRunIds = [requireValue(arg, args[++index]), requireValue(arg, args[++index])];
         break;
       case '--html':
         options.htmlPath = requireValue(arg, args[++index]);
@@ -115,6 +124,14 @@ export function parseArgs(args: string[]): CliOptions {
         break;
       }
       case '--limit': options.limit = parsePositiveInteger(requireValue(arg, args[++index]), arg); break;
+      case '--group-by': {
+        const value = requireValue(arg, args[++index]);
+        if (!['model', 'status', 'day'].includes(value)) throw new Error(`Invalid --group-by value: ${value}. Expected model, status, or day.`);
+        options.groupBy = value as TraceAggregateGroupBy;
+        break;
+      }
+      case '--since': options.since = parseListTimeBoundary(requireValue(arg, args[++index]), arg); break;
+      case '--until': options.until = parseListTimeBoundary(requireValue(arg, args[++index]), arg); break;
       case '--type': {
         const value = requireValue(arg, args[++index]);
         if (!['run', 'chat', 'swarm', 'swarm-run'].includes(value)) throw new Error(`Invalid --type value: ${value}. Expected run, chat, swarm, or swarm-run.`);
@@ -176,8 +193,20 @@ export function parseArgs(args: string[]): CliOptions {
     const requiredType: TraceListType = options.swarmRole === 'coordinator' ? 'swarm' : 'swarm-run';
     if (!options.types.includes(requiredType)) throw new Error(`--swarm-role ${options.swarmRole} requires --type ${requiredType}.`);
   }
-  const hasListFilters = options.goals?.length || options.goalRegex || options.hasGoal || options.noGoal || options.statuses?.length || options.limit || options.types?.length || options.swarmRole;
+  const hasListFilters = options.goals?.length || options.goalRegex || options.hasGoal || options.noGoal || options.statuses?.length || options.limit || options.types?.length || options.swarmRole || options.groupBy || options.since || options.until;
   if (hasListFilters && !options.listSessions && !options.listPerformance) throw new Error('List filters can only be used with --ls or --lsp.');
+  if (options.groupBy && !options.listPerformance) throw new Error('--group-by can only be used with --lsp.');
+  if (options.since && options.until) {
+    const now = Date.now();
+    if (resolveListTimeBoundary(options.since, now) > resolveListTimeBoundary(options.until, now)) {
+      throw new Error('--since must be earlier than or equal to --until.');
+    }
+  }
+  if (options.compareRunIds) {
+    if (options.compareRunIds[0] === options.compareRunIds[1]) throw new Error('--compare requires two different run IDs.');
+    const incompatible = Boolean(options.sessionId || options.runId || options.rootRunId || options.listSessions || options.listPerformance || options.listSessionless || options.deleteEmptyGoalSessions || options.usageOnly || options.focusRunId || options.messages || options.reasoning || options.systemOnly || options.includePlans || options.onlyDelegates || options.view);
+    if (incompatible) throw new Error('--compare is exclusive with trace targets, list/delete/usage, focus, message, plan, delegate, and view options.');
+  }
   return options;
 }
 
@@ -192,7 +221,7 @@ export async function main(): Promise<void> {
       options.cacheTtl = parseCacheDuration(process.env.TRACE_SESSION_CACHE_TTL, 'TRACE_SESSION_CACHE_TTL');
     }
     if (process.env.TRACE_SESSION_CACHE === 'off' && options.noCache === undefined) options.noCache = true;
-    if (!options.listSessions && !options.listPerformance && !options.listSessionless && !options.deleteEmptyGoalSessions && !options.sessionId && !options.rootRunId && !options.runId) {
+    if (!options.compareRunIds && !options.listSessions && !options.listPerformance && !options.listSessionless && !options.deleteEmptyGoalSessions && !options.sessionId && !options.rootRunId && !options.runId) {
       throw new Error(`Missing session id, --root-run, or --run.\n\n${USAGE}`);
     }
     if ((options.listSessions || options.listPerformance || options.listSessionless || options.deleteEmptyGoalSessions) && options.sessionId) {
@@ -216,7 +245,7 @@ export async function main(): Promise<void> {
     if ((options.listSessions || options.listPerformance || options.listSessionless || options.deleteEmptyGoalSessions || options.usageOnly) && (options.view || options.messagesView || options.focusRunId)) {
       throw new Error(`--view, --messages-view, and --focus-run can only be used when rendering a full trace.\n\n${USAGE}`);
     }
-    if ((options.listSessions || options.listPerformance || options.listSessionless || options.deleteEmptyGoalSessions || options.usageOnly) && options.htmlPath) {
+    if ((options.listSessions || options.listPerformance || options.listSessionless || options.deleteEmptyGoalSessions || options.usageOnly) && options.htmlPath && !(options.listPerformance && options.groupBy)) {
       throw new Error(`--html can only be used when rendering a full trace.\n\n${USAGE}`);
     }
     if ((options.listSessionless || options.deleteEmptyGoalSessions || options.usageOnly) && options.previewChars) {
@@ -233,8 +262,32 @@ export async function main(): Promise<void> {
       ssl: options.pgssl,
     });
 
+    if (options.compareRunIds) {
+      const [baselineId, candidateId] = options.compareRunIds;
+      const [baseline, candidate] = await runTraceComparisonWithPasswordRetry(postgresConfig,
+        { ...options, compareRunIds: undefined, runId: baselineId, focusRunId: baselineId },
+        { ...options, compareRunIds: undefined, runId: candidateId, focusRunId: candidateId });
+      const comparison = buildTraceComparison(baseline, candidate, baselineId, candidateId);
+      if (options.htmlPath) {
+        const path = await writeTraceHtmlReport(options.htmlPath, renderTraceComparisonHtml(comparison));
+        if (!options.json) { console.log(`Wrote trace comparison HTML report: ${path}`); return; }
+      }
+      console.log(renderTraceComparison(comparison, { json: options.json }));
+      return;
+    }
+
     if (options.listSessions || options.listPerformance || options.listSessionless || options.deleteEmptyGoalSessions) {
       if (options.listPerformance) {
+        if (options.groupBy) {
+          const aggregate = await runAggregateSessionPerformanceWithPasswordRetry(postgresConfig, options);
+          if (options.htmlPath) {
+            const path = await writeTraceHtmlReport(options.htmlPath, renderTraceAggregateHtml(aggregate));
+            if (!options.json) { console.log(`Wrote trace aggregate HTML report: ${path}`); return; }
+            console.error(chalk.gray(`Wrote trace aggregate HTML report: ${path}`));
+          }
+          console.log(renderTraceAggregate(aggregate, { json: options.json }));
+          return;
+        }
         const items = await runListSessionPerformanceWithPasswordRetry(postgresConfig, options);
         console.log(renderSessionPerformanceList(items, options));
         return;
@@ -261,6 +314,10 @@ export async function main(): Promise<void> {
     }
 
     const report = await runTraceSessionWithPasswordRetry(postgresConfig, options);
+    if (traceTargetNotFoundMessage(report)) {
+      console.log(renderTraceReport(report, options));
+      return;
+    }
     if (options.htmlPath) {
       const htmlPath = await writeTraceHtmlReport(options.htmlPath, renderTraceHtml(report, options));
       const message = `Wrote trace HTML report: ${htmlPath}`;
@@ -289,18 +346,11 @@ async function runTraceSessionWithPasswordRetry(
   config: TracePostgresConfig,
   options: CliOptions,
 ): Promise<TraceReport> {
-  const key = cacheKey(config, options, 'trace');
-  if (!options.noCache && !options.fresh) {
-    const cached = await readCache(key, options.cacheTtl);
-    if (cached) return cached as TraceReport;
-  }
   let pool = await createTraceSessionPostgresPool(config);
   let shouldEndPool = true;
 
   try {
-    const report = await traceSession(pool, options);
-    if (!options.noCache) await writeCache(key, report, isTerminalReport(report), options.cacheTtl).catch(() => undefined);
-    return report;
+    return await loadTraceReportWithCache(pool, config, options);
   } catch (error) {
     if (!isPostgresPasswordAuthFailure(error)) {
       throw error;
@@ -311,9 +361,7 @@ async function runTraceSessionWithPasswordRetry(
     const password = await promptHidden('Postgres password: ');
     pool = createPostgresPool(config, { password });
     try {
-      const report = await traceSession(pool, options);
-      if (!options.noCache) await writeCache(key, report, isTerminalReport(report), options.cacheTtl).catch(() => undefined);
-      return report;
+      return await loadTraceReportWithCache(pool, config, options);
     } finally {
       await pool.end();
     }
@@ -321,6 +369,35 @@ async function runTraceSessionWithPasswordRetry(
     if (shouldEndPool) {
       await pool.end();
     }
+  }
+}
+
+async function loadTraceReportWithCache(client: TracePostgresPool, config: TracePostgresConfig, options: CliOptions): Promise<TraceReport> {
+  const key = cacheKey(config, options, 'trace');
+  if (!options.noCache && !options.fresh) {
+    const cached = await readCache(key, options.cacheTtl);
+    if (cached) return cached as TraceReport;
+  }
+  const report = await traceSession(client, options);
+  if (!options.noCache) await writeCache(key, report, isTerminalReport(report), options.cacheTtl).catch(() => undefined);
+  return report;
+}
+
+async function runTraceComparisonWithPasswordRetry(config: TracePostgresConfig, baseline: CliOptions, candidate: CliOptions): Promise<[TraceReport, TraceReport]> {
+  let pool = await createTraceSessionPostgresPool(config);
+  let shouldEndPool = true;
+  const load = () => Promise.all([loadTraceReportWithCache(pool, config, baseline), loadTraceReportWithCache(pool, config, candidate)]) as Promise<[TraceReport, TraceReport]>;
+  try {
+    return await load();
+  } catch (error) {
+    if (!isPostgresPasswordAuthFailure(error)) throw error;
+    await pool.end();
+    shouldEndPool = false;
+    const password = await promptHidden('Postgres password: ');
+    pool = createPostgresPool(config, { password });
+    try { return await load(); } finally { await pool.end(); }
+  } finally {
+    if (shouldEndPool) await pool.end();
   }
 }
 
@@ -378,6 +455,29 @@ async function runListSessionPerformanceWithPasswordRetry(config: TracePostgresC
     if (shouldEndPool) {
       await pool.end();
     }
+  }
+}
+
+async function runAggregateSessionPerformanceWithPasswordRetry(config: TracePostgresConfig, options: CliOptions): Promise<TraceAggregateReport> {
+  let pool = await createTraceSessionPostgresPool(config);
+  let shouldEndPool = true;
+  const aggregateOptions = { ...options, groupBy: options.groupBy! };
+
+  try {
+    return await aggregateSessionPerformance(pool, aggregateOptions);
+  } catch (error) {
+    if (!isPostgresPasswordAuthFailure(error)) throw error;
+    await pool.end();
+    shouldEndPool = false;
+    const password = await promptHidden('Postgres password: ');
+    pool = createPostgresPool(config, { password });
+    try {
+      return await aggregateSessionPerformance(pool, aggregateOptions);
+    } finally {
+      await pool.end();
+    }
+  } finally {
+    if (shouldEndPool) await pool.end();
   }
 }
 
@@ -554,6 +654,36 @@ function parsePositiveInteger(value: string, option: string): number {
   if (!Number.isInteger(parsed) || parsed <= 0) {
     throw new Error(`${option} requires a positive integer.`);
   }
+  return parsed;
+}
+
+function parseListTimeBoundary(value: string, option: string): string {
+  const normalized = value.trim();
+  if (!normalized) throw new Error(`${option} requires a duration or ISO timestamp.`);
+  try {
+    resolveListTimeBoundary(normalized);
+  } catch {
+    throw new Error(`${option} requires a duration such as 24h or 7d, or a valid ISO timestamp.`);
+  }
+  return normalized;
+}
+
+function resolveListTimeBoundary(value: string, now = Date.now()): number {
+  const duration = /^(\d+(?:\.\d+)?)(ms|s|m|h|d|w)$/i.exec(value);
+  if (duration) {
+    const multipliers: Record<string, number> = {
+      ms: 1,
+      s: 1_000,
+      m: 60_000,
+      h: 3_600_000,
+      d: 86_400_000,
+      w: 604_800_000,
+    };
+    return now - Number(duration[1]) * multipliers[duration[2]!.toLowerCase()]!;
+  }
+
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) throw new Error(`Invalid time boundary: ${value}`);
   return parsed;
 }
 

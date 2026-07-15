@@ -25,20 +25,25 @@ import type {
   SessionlessRunListItem,
   TimelineEntry,
   ToolAccountingSummary,
+  TraceAggregateGroup,
+  TraceAggregateReport,
   TraceDiagnostics,
   TraceFinding,
   TraceMessage,
   TraceMessageRole,
   TraceReport,
+  TraceComparison,
   UsageSummary,
 } from './types.js';
 
+const TERMINAL_RENDERER_OPTIONS = {
+  code: chalk.gray,
+  codespan: chalk.cyan,
+  heading: chalk.bold,
+};
+
 marked.setOptions({
-  renderer: new TerminalRenderer({
-    code: chalk.gray,
-    codespan: chalk.cyan,
-    heading: chalk.bold,
-  }) as never,
+  renderer: new TerminalRenderer(TERMINAL_RENDERER_OPTIONS) as never,
 });
 
 type HtmlTraceRenderOptions = Partial<Pick<CliOptions, 'includePlans' | 'messages' | 'systemOnly' | 'previewChars'>> & {
@@ -48,11 +53,28 @@ type HtmlTraceRenderOptions = Partial<Pick<CliOptions, 'includePlans' | 'message
 type HtmlTableCell = string | { value: string | number; className?: string };
 type HtmlTableCellKind = 'numeric' | 'descriptive' | 'compact';
 
+export function traceTargetNotFoundMessage(report: TraceReport): string | undefined {
+  if (report.rootRuns.length > 0) return undefined;
+  if (report.target.kind === 'session') {
+    return report.session === null
+      ? `Session "${report.target.requestedId}" was not found in the database.`
+      : undefined;
+  }
+  return `Run "${report.target.requestedId}" was not found in the database.`;
+}
+
 export function renderTraceReport(
   report: TraceReport,
   options: Pick<CliOptions, 'json' | 'includePlans' | 'onlyDelegates' | 'messages' | 'systemOnly'>
     & Partial<Pick<CliOptions, 'view' | 'messagesView' | 'previewChars'>>,
 ): string {
+  const notFoundMessage = traceTargetNotFoundMessage(report);
+  if (notFoundMessage) {
+    return options.json
+      ? JSON.stringify({ error: notFoundMessage, target: report.target }, null, 2)
+      : chalk.yellow(notFoundMessage);
+  }
+
   const diagnostics = report.diagnostics ?? buildTraceDiagnostics(report);
   if (options.json) {
     return JSON.stringify(report.diagnostics ? report : { ...report, diagnostics }, null, 2);
@@ -122,6 +144,7 @@ export function renderTraceReport(
     lines.push('');
     lines.push(markdownBlock('# Performance'));
     lines.push(renderPerformance(report.performance ?? emptyPerformanceSummary(), traceDurationMs(report), diagnostics.performance, report.usage, report.rootRuns));
+    lines.push('', markdownBlock('## Per-run efficiency and context'), renderRunAnalysisTable(diagnostics));
   }
 
   if (shouldRenderSection(effectiveView, 'milestones')) {
@@ -165,6 +188,301 @@ export function renderTraceReport(
   }
 
   return lines.join('\n');
+}
+
+export function renderTraceComparison(comparison: TraceComparison, options: { json?: boolean } = {}): string {
+  if (options.json) {
+    return JSON.stringify(comparison, null, 2);
+  }
+
+  const baselineStatus = comparison.baseline.analysis?.status ?? 'unknown';
+  const candidateStatus = comparison.candidate.analysis?.status ?? 'unknown';
+  const sections = [
+    markdownBlock('# Trace comparison'),
+    markdownBlock('_Changes are candidate minus baseline._'),
+    renderMarkdownTable(
+      ['Side', 'Run ID', 'Status', 'Reliability (root-tree)', 'Confidence'],
+      [
+        ['Baseline', comparison.baseline.runId, baselineStatus, comparison.reliability.baseline, comparison.confidence.baseline],
+        ['Candidate', comparison.candidate.runId, candidateStatus, comparison.reliability.candidate, comparison.confidence.candidate],
+      ],
+      ['left', 'left', 'left', 'left', 'left'],
+    ),
+    '',
+    ...renderComparisonMixSection('Provider/model mix', comparison.providerModelMix),
+    '',
+    markdownBlock('## Metric changes'),
+    renderMarkdownTable(
+      ['Metric', 'Baseline', 'Candidate', 'Delta/change', '% change'],
+      comparisonMetricRows(comparison).map(({ label, kind, metric }) => [
+        label,
+        formatComparisonValue(kind, metric.baseline),
+        formatComparisonValue(kind, metric.candidate),
+        formatComparisonValue(kind, metric.delta, true),
+        formatComparisonPercentage(metric.percentageChange),
+      ]),
+      ['left', 'right', 'right', 'right', 'right'],
+    ),
+    '',
+    ...renderComparisonMixSection('Tool mix', comparison.toolMix),
+    '',
+    markdownBlock('## Data notes'),
+    comparison.notes.length > 0
+      ? markdownBlock(comparison.notes.map((note) => `- ${escapeMarkdownTableCell(note)}`).join('\n'))
+      : markdownBlock('_No comparison data warnings._'),
+  ];
+  return sections.join('\n');
+}
+
+function renderComparisonMixSection(title: string, values: TraceComparison['toolMix']): string[] {
+  return [
+    markdownBlock(`## ${title}`),
+    values.length > 0
+      ? renderMarkdownTable(
+          ['Label', 'Baseline', 'Candidate', 'Delta'],
+          values.map((row) => [row.label, formatNumber(row.baselineCount), formatNumber(row.candidateCount), formatSignedNumber(row.deltaCount)]),
+          ['left', 'right', 'right', 'right'],
+        )
+      : markdownBlock('_No measured calls._'),
+  ];
+}
+
+export function renderTraceComparisonHtml(comparison: TraceComparison): string {
+  const rows = comparisonMetricRows(comparison)
+    .map(({ label, kind, metric }) =>
+      `<tr><th>${escapeHtml(label)}</th><td>${escapeHtml(formatComparisonValue(kind, metric.baseline))}</td><td>${escapeHtml(formatComparisonValue(kind, metric.candidate))}</td><td>${escapeHtml(formatComparisonValue(kind, metric.delta, true))}</td><td>${escapeHtml(formatComparisonPercentage(metric.percentageChange))}</td></tr>`
+    )
+    .join('');
+  const mixTable = (values: TraceComparison['toolMix']) => {
+    const body = values.length
+      ? values.map((value) => `<tr><th>${escapeHtml(value.label)}</th><td>${value.baselineCount}</td><td>${value.candidateCount}</td><td>${escapeHtml(formatSignedNumber(value.deltaCount))}</td></tr>`).join('')
+      : '<tr><td colspan="4">No measured calls</td></tr>';
+    return `<table><thead><tr><th>Label</th><th>Baseline</th><th>Candidate</th><th>Delta</th></tr></thead><tbody>${body}</tbody></table>`;
+  };
+  const baselineStatus = comparison.baseline.analysis?.status ?? 'unknown';
+  const candidateStatus = comparison.candidate.analysis?.status ?? 'unknown';
+  const notes = comparison.notes.length
+    ? `<ul>${comparison.notes.map((note) => `<li>${escapeHtml(note)}</li>`).join('')}</ul>`
+    : '<p>No comparison data warnings.</p>';
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Trace comparison</title><style>body{font:14px system-ui;max-width:1000px;margin:2rem auto;padding:0 1rem}table{border-collapse:collapse;width:100%}th,td{padding:.5rem;border:1px solid #ccc;text-align:right}th:first-child{text-align:left}</style></head><body><h1>Trace comparison</h1><p>Changes are candidate minus baseline.</p><p><b>Baseline:</b> ${escapeHtml(comparison.baseline.runId)} (${escapeHtml(baselineStatus)})<br><b>Candidate:</b> ${escapeHtml(comparison.candidate.runId)} (${escapeHtml(candidateStatus)})</p><p><b>Reliability (root-tree):</b> ${escapeHtml(comparison.reliability.change)}</p><table><thead><tr><th>Metric</th><th>Baseline</th><th>Candidate</th><th>Delta/change</th><th>% change</th></tr></thead><tbody>${rows}</tbody></table><h2>Tool mix</h2>${mixTable(comparison.toolMix)}<h2>Provider/model mix</h2>${mixTable(comparison.providerModelMix)}<h2>Confidence</h2><p>${escapeHtml(comparison.confidence.baseline)} -&gt; ${escapeHtml(comparison.confidence.candidate)}</p><h2>Data notes</h2>${notes}</body></html>`;
+}
+
+export function renderTraceAggregate(report: TraceAggregateReport, options: { json?: boolean } = {}): string {
+  if (options.json) return JSON.stringify(report, null, 2);
+
+  const lines = [
+    markdownBlock(`# Trace aggregate by ${report.groupBy}`),
+    markdownBlock([
+      `- **Population:** ${formatNumber(report.population.runCount)} root traces${renderAggregateWindow(report)}`,
+      `- **Coverage gaps:** duration ${formatNumber(report.population.missingDuration)}, usage ${formatNumber(report.population.missingUsage)}, cost ${formatNumber(report.population.missingCost)}, context ${formatNumber(report.population.missingContext)}`,
+      `- **Generated:** ${report.generatedAt}`,
+    ].join('\n')),
+  ];
+
+  if (report.groups.length === 0) {
+    lines.push('', markdownBlock('_No matching root traces._'));
+  } else {
+    lines.push(
+      '',
+      markdownBlock('## Outcomes'),
+      renderMarkdownTable(
+        ['Group', 'Traces', 'Success', 'Failed', 'Recovered', 'Retry', 'Confidence'],
+        report.groups.map((group) => [
+          group.label,
+          formatNumber(group.runCount),
+          formatAggregateRate(group.outcomes.successRate),
+          formatAggregateRate(group.outcomes.failureRate),
+          formatAggregateRate(group.outcomes.recoveredSuccessRate),
+          formatAggregateRate(group.retries.runFrequency),
+          aggregateConfidenceSummary(group),
+        ]),
+        ['left', 'right', 'right', 'right', 'right', 'right', 'left'],
+      ),
+      '',
+      markdownBlock('## Efficiency'),
+      renderMarkdownTable(
+        ['Group', 'Duration p50', 'p90', 'p95', 'Avg tokens*', 'Avg cost*', 'Context growth p50', 'p95'],
+        report.groups.map((group) => [
+          group.label,
+          formatAggregateDuration(group.wallDurationMs.p50),
+          formatAggregateDuration(group.wallDurationMs.p90),
+          formatAggregateDuration(group.wallDurationMs.p95),
+          formatAggregateNumber(group.successfulRuns.averageTokens),
+          formatAggregateCost(group.successfulRuns.averageEstimatedGrandTotalUSD),
+          formatAggregateBytes(group.context.growthBytes.p50),
+          formatAggregateBytes(group.context.growthBytes.p95),
+        ]),
+        ['left', 'right', 'right', 'right', 'right', 'right', 'right', 'right'],
+      ),
+      markdownBlock('_* Token and cost averages include successful traces with measured values only._'),
+      '',
+      markdownBlock('## Operational signals'),
+      renderMarkdownTable(
+        ['Group', 'Model failures', 'Tool failures', 'Failed tools', 'Common errors'],
+        report.groups.map((group) => {
+          const failedTools = group.tools.byTool.filter((tool) => tool.failures > 0);
+          return [
+            group.label,
+            formatNumber(group.modelFailures),
+            formatNumber(group.tools.failures),
+            failedTools.length > 0
+              ? failedTools.map((tool) => `${tool.toolName} (${tool.failures})`).join(', ')
+              : 'none',
+            group.commonErrorCodes.length > 0
+              ? group.commonErrorCodes.map((error) => `${error.code} (${error.count})`).join(', ')
+              : 'none',
+          ];
+        }),
+        ['left', 'right', 'right', 'left', 'left'],
+      ),
+    );
+  }
+  if (report.notes.length > 0) {
+    lines.push(
+      '',
+      markdownBlock('## Data notes'),
+      markdownBlock(report.notes.map((note) => `- ${escapeMarkdownTableCell(note)}`).join('\n')),
+    );
+  }
+  return lines.join('\n');
+}
+
+export function renderTraceAggregateHtml(report: TraceAggregateReport): string {
+  const rows = report.groups.map((group) => `<tr><th>${escapeHtml(group.label)}</th><td>${formatNumber(group.runCount)}</td><td>${escapeHtml(formatAggregateRate(group.outcomes.successRate))}</td><td>${escapeHtml(formatAggregateRate(group.outcomes.failureRate))}</td><td>${escapeHtml(formatAggregateRate(group.outcomes.recoveredSuccessRate))}</td><td>${escapeHtml(formatAggregateRate(group.retries.runFrequency))}</td><td>${escapeHtml(formatAggregateDuration(group.wallDurationMs.p50))}</td><td>${escapeHtml(formatAggregateDuration(group.wallDurationMs.p90))}</td><td>${escapeHtml(formatAggregateDuration(group.wallDurationMs.p95))}</td><td>${escapeHtml(formatAggregateNumber(group.successfulRuns.averageTokens))}</td><td>${escapeHtml(formatAggregateCost(group.successfulRuns.averageEstimatedGrandTotalUSD))}</td><td>${escapeHtml(aggregateConfidenceSummary(group))}</td></tr>`).join('');
+  const details = report.groups.map((group) => {
+    const failedTools = group.tools.byTool.filter((tool) => tool.failures > 0);
+    const tools = failedTools.length > 0
+      ? `<ul>${failedTools.map((tool) => `<li>${escapeHtml(tool.toolName)}: ${formatNumber(tool.failures)}</li>`).join('')}</ul>`
+      : '<p>No measured tool failures.</p>';
+    const errors = group.commonErrorCodes.length > 0
+      ? `<ul>${group.commonErrorCodes.map((error) => `<li>${escapeHtml(error.code)} (${formatNumber(error.count)})</li>`).join('')}</ul>`
+      : '<p>No common persisted errors.</p>';
+    return `<section><h3>${escapeHtml(group.label)}</h3><p>Context growth p50/p95: ${escapeHtml(formatAggregateBytes(group.context.growthBytes.p50))} / ${escapeHtml(formatAggregateBytes(group.context.growthBytes.p95))}. Model/tool failures: ${formatNumber(group.modelFailures)} / ${formatNumber(group.tools.failures)}. Confidence: ${escapeHtml(aggregateConfidence(group))}.</p><h4>Tool failures</h4>${tools}<h4>Common errors</h4>${errors}</section>`;
+  }).join('');
+  const notes = report.notes.length > 0
+    ? `<ul>${report.notes.map((note) => `<li>${escapeHtml(note)}</li>`).join('')}</ul>`
+    : '<p>No aggregate data warnings.</p>';
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Trace aggregate by ${escapeHtml(report.groupBy)}</title><style>body{font:14px system-ui;max-width:1200px;margin:2rem auto;padding:0 1rem;color:#1f2937}table{border-collapse:collapse;width:100%;overflow:auto}th,td{padding:.55rem;border:1px solid #d1d5db;text-align:right;white-space:nowrap}th:first-child{text-align:left}section{border-top:1px solid #e5e7eb;margin-top:1.25rem}code{background:#f3f4f6;padding:.1rem .25rem}small{color:#6b7280}</style></head><body><h1>Trace aggregate by ${escapeHtml(report.groupBy)}</h1><p>${formatNumber(report.population.runCount)} root traces${escapeHtml(renderAggregateWindow(report))}. Generated ${escapeHtml(report.generatedAt)}.</p><p>Coverage gaps: duration ${formatNumber(report.population.missingDuration)}, usage ${formatNumber(report.population.missingUsage)}, cost ${formatNumber(report.population.missingCost)}, context ${formatNumber(report.population.missingContext)}.</p><table><thead><tr><th>Group</th><th>Traces</th><th>Success</th><th>Failed</th><th>Recovered</th><th>Retry</th><th>Duration p50</th><th>Duration p90</th><th>Duration p95</th><th>Avg tokens*</th><th>Avg cost*</th><th>Confidence</th></tr></thead><tbody>${rows || '<tr><td colspan="12">No matching root traces</td></tr>'}</tbody></table><p><small>* Token and cost averages include successful traces with measured values only.</small></p><h2>Operational signals</h2>${details || '<p>No matching groups.</p>'}<h2>Data notes</h2>${notes}</body></html>`;
+}
+
+function renderAggregateWindow(report: TraceAggregateReport): string {
+  if (!report.population.since && !report.population.until) return '';
+  return `; window ${report.population.since ?? 'unbounded'} to ${report.population.until ?? 'unbounded'}`;
+}
+
+function formatAggregateRate(value: number | null): string {
+  return value === null ? 'n/a' : `${(value * 100).toFixed(1)}%`;
+}
+
+function aggregateConfidence(group: TraceAggregateGroup): string {
+  if (group.confidence.unknown > 0) return 'unknown';
+  if (group.confidence.low > 0) return 'low';
+  if (group.confidence.medium > 0) return 'medium';
+  return group.confidence.high > 0 ? 'high' : 'unknown';
+}
+
+function aggregateConfidenceSummary(group: TraceAggregateGroup): string {
+  return `${aggregateConfidence(group)} (h${group.confidence.high}/m${group.confidence.medium}/l${group.confidence.low}/u${group.confidence.unknown})`;
+}
+
+function formatAggregateDuration(value: number | null): string {
+  return value === null ? 'n/a' : formatDuration(value);
+}
+
+function formatAggregateNumber(value: number | null): string {
+  return value === null ? 'n/a' : formatNumber(Math.round(value));
+}
+
+function formatAggregateCost(value: number | null): string {
+  return value === null ? 'n/a' : formatCost(value);
+}
+
+function formatAggregateBytes(value: number | null): string {
+  return value === null ? 'n/a' : formatBytes(value);
+}
+
+type MarkdownTableAlignment = 'left' | 'right' | 'center';
+
+function renderMarkdownTable(
+  headers: string[],
+  rows: string[][],
+  alignments: MarkdownTableAlignment[] = [],
+): string {
+  const separator = headers.map((_, index) => {
+    switch (alignments[index]) {
+      case 'right': return '---:';
+      case 'center': return ':---:';
+      default: return '---';
+    }
+  });
+  const row = (cells: string[]): string => `| ${headers.map((_, index) => escapeMarkdownTableCell(cells[index] ?? '')).join(' | ')} |`;
+  const source = [
+    row(headers),
+    row(separator),
+    ...rows.map(row),
+  ].join('\n');
+  const colWidths = fitColumnWidths(headers, rows, {
+    availableWidth: terminalWidth() - headers.length - 1,
+    cellPadding: 2,
+    minimumWidth: 5,
+  });
+  const renderer = new TerminalRenderer({
+    ...TERMINAL_RENDERER_OPTIONS,
+    tableOptions: {
+      colWidths,
+      wordWrap: true,
+      wrapOnWordBoundary: false,
+    },
+  });
+  return marked(`${source}\n`, { async: false, renderer: renderer as never }).trimEnd();
+}
+
+function escapeMarkdownTableCell(value: string): string {
+  return value
+    .replaceAll('\\', '\\\\')
+    .replaceAll('|', '\\|')
+    .replace(/\r?\n/g, ' ');
+}
+
+type ComparisonValueKind = 'duration' | 'number' | 'cost' | 'bytes';
+
+function comparisonMetricRows(comparison: TraceComparison): Array<{
+  label: string;
+  kind: ComparisonValueKind;
+  metric: TraceComparison['changes'][keyof TraceComparison['changes']];
+}> {
+  return [
+    { label: 'wall duration', kind: 'duration', metric: comparison.changes.wall },
+    { label: 'tokens', kind: 'number', metric: comparison.changes.tokens },
+    { label: 'estimated cost', kind: 'cost', metric: comparison.changes.cost },
+    { label: 'model retries', kind: 'number', metric: comparison.changes.retries },
+    { label: 'model/tool failures', kind: 'number', metric: comparison.changes.failures },
+    { label: 'context byte growth', kind: 'bytes', metric: comparison.changes.contextBytes },
+    { label: 'output size', kind: 'bytes', metric: comparison.changes.outputBytes },
+  ];
+}
+
+function formatComparisonValue(kind: ComparisonValueKind, value: number | null, signed = false): string {
+  if (value === null) return 'n/a';
+  const absolute = Math.abs(value);
+  const formatted = kind === 'duration'
+    ? formatDuration(absolute)
+    : kind === 'cost'
+      ? formatCost(absolute)
+      : kind === 'bytes'
+        ? formatBytes(absolute)
+        : formatNumber(absolute);
+  if (!signed || value === 0) return formatted;
+  return `${value > 0 ? '+' : '-'}${formatted}`;
+}
+
+function formatComparisonPercentage(value: number | null): string {
+  if (value === null) return 'n/a';
+  return `${value > 0 ? '+' : ''}${value.toFixed(2)}%`;
+}
+
+function formatSignedNumber(value: number): string {
+  return `${value > 0 ? '+' : ''}${formatNumber(value)}`;
 }
 
 export function renderTraceHtml(report: TraceReport, options: HtmlTraceRenderOptions = {}): string {
@@ -333,21 +651,121 @@ export function renderUsageReport(usage: SessionUsageSummary, options: Pick<CliO
   const toolAccounting = usage.toolAccounting;
   const grandTotalCostUSD = usage.total.estimatedCostUSD + (toolAccounting?.estimatedCostUSD ?? 0);
   const lines = [
-    `${chalk.cyan('model')} ${formatUsageSummary(modelTotal)}`,
-    `${chalk.cyan('tool output')} ${formatUsageSummary(toolOutputTotal)}`,
-    `${chalk.cyan('tool providers')} requests=${formatNumber(toolAccounting?.totalRequests ?? 0)} billable=${formatNumber(toolAccounting?.billableRequests ?? 0)} cached=${formatNumber(toolAccounting?.cachedToolCalls ?? 0)} unpriced=${formatNumber(toolAccounting?.unpricedRequests ?? 0)} cost=${formatCost(toolAccounting?.estimatedCostUSD ?? 0)}`,
-    `${chalk.cyan('combined model/tool-output')} ${formatUsageSummary(usage.total)}`,
-    `${chalk.cyan('estimated grand total')} cost=${formatCost(grandTotalCostUSD)}`,
+    markdownBlock('# Usage'),
+    markdownBlock('## Model and tool-output usage'),
+    renderMarkdownTable(
+      ['Category', 'Tokens', 'Prompt', 'Completion', 'Reasoning', 'Estimated cost'],
+      [
+        usageSummaryMarkdownRow('Model', modelTotal),
+        usageSummaryMarkdownRow('Tool output', toolOutputTotal),
+        usageSummaryMarkdownRow('Combined model/tool-output', usage.total),
+      ],
+      ['left', 'right', 'right', 'right', 'right', 'right'],
+    ),
+    '',
+    markdownBlock('## Tool-provider accounting'),
+    renderMarkdownTable(
+      ['Requests', 'Billable', 'Cached', 'Unpriced', 'Estimated cost'],
+      [[
+        formatNumber(toolAccounting?.totalRequests ?? 0),
+        formatNumber(toolAccounting?.billableRequests ?? 0),
+        formatNumber(toolAccounting?.cachedToolCalls ?? 0),
+        formatNumber(toolAccounting?.unpricedRequests ?? 0),
+        formatCost(toolAccounting?.estimatedCostUSD ?? 0),
+      ]],
+      ['right', 'right', 'right', 'right', 'right'],
+    ),
+    '',
+    markdownBlock('## Cost summary'),
+    renderMarkdownTable(
+      ['Component', 'Estimated cost'],
+      [
+        ['Model/tool-output', formatCost(usage.total.estimatedCostUSD)],
+        ['External tool providers', formatCost(toolAccounting?.estimatedCostUSD ?? 0)],
+        ['Estimated grand total', formatCost(grandTotalCostUSD)],
+      ],
+      ['left', 'right'],
+    ),
   ];
   if (usage.byRootRun.length > 0) {
-    lines.push('');
-    lines.push('Run usage by root run');
-    lines.push(renderRootRunUsageTable(usage.byRootRun));
+    lines.push(
+      '',
+      markdownBlock('## Run usage by root run'),
+      renderMarkdownTable(
+        ['Root run', 'Tokens', 'Prompt', 'Completion', 'Reasoning', 'Estimated cost'],
+        usage.byRootRun.map((item) => [
+          item.rootRunId,
+          formatNumber(item.usage.totalTokens),
+          formatNumber(item.usage.promptTokens),
+          formatNumber(item.usage.completionTokens),
+          formatNumber(item.usage.reasoningTokens ?? 0),
+          formatCost(item.usage.estimatedCostUSD),
+        ]),
+        ['left', 'right', 'right', 'right', 'right', 'right'],
+      ),
+    );
   }
-  appendProviderModelUsageLines(lines, 'Model usage by provider/model', usage.byProviderModel ?? [], 'runs');
-  appendProviderModelUsageLines(lines, 'Tool-output usage by provider/model', usage.toolOutputByProviderModel ?? [], 'tool calls');
-  appendToolAccountingUsageLines(lines, usage.toolAccounting);
+  appendMarkdownProviderModelUsage(lines, 'Model usage by provider/model', usage.byProviderModel ?? [], 'Runs');
+  appendMarkdownProviderModelUsage(lines, 'Tool-output usage by provider/model', usage.toolOutputByProviderModel ?? [], 'Tool calls');
+  if (toolAccounting?.byProviderOperation.length) {
+    lines.push(
+      '',
+      markdownBlock('## Tool-provider usage by provider/operation'),
+      renderMarkdownTable(
+        ['Provider', 'Operation', 'Tool calls', 'Requests', 'Billable', 'Cached', 'Unpriced', 'Estimated cost'],
+        toolAccounting.byProviderOperation.map((row) => [
+          row.provider,
+          row.operation,
+          formatNumber(row.toolCalls),
+          formatNumber(row.requests),
+          formatNumber(row.billableRequests),
+          formatNumber(row.cachedToolCalls),
+          formatNumber(row.unpricedRequests),
+          formatCost(row.estimatedCostUSD),
+        ]),
+        ['left', 'left', 'right', 'right', 'right', 'right', 'right', 'right'],
+      ),
+    );
+  }
   return lines.join('\n');
+}
+
+function usageSummaryMarkdownRow(label: string, usage: UsageSummary): string[] {
+  return [
+    label,
+    formatNumber(usage.totalTokens),
+    formatNumber(usage.promptTokens),
+    formatNumber(usage.completionTokens),
+    formatNumber(usage.reasoningTokens ?? 0),
+    formatCost(usage.estimatedCostUSD),
+  ];
+}
+
+function appendMarkdownProviderModelUsage(
+  lines: string[],
+  title: string,
+  rows: ProviderModelUsageSummary[],
+  countLabel: 'Runs' | 'Tool calls',
+): void {
+  if (rows.length === 0) return;
+  lines.push(
+    '',
+    markdownBlock(`## ${title}`),
+    renderMarkdownTable(
+      ['Provider', 'Model', countLabel, 'Tokens', 'Prompt', 'Completion', 'Reasoning', 'Estimated cost'],
+      rows.map((row) => [
+        row.provider,
+        row.model,
+        formatNumber(countLabel === 'Runs' ? row.runCount ?? 0 : row.toolCallCount ?? 0),
+        formatNumber(row.usage.totalTokens),
+        formatNumber(row.usage.promptTokens),
+        formatNumber(row.usage.completionTokens),
+        formatNumber(row.usage.reasoningTokens ?? 0),
+        formatCost(row.usage.estimatedCostUSD),
+      ]),
+      ['left', 'left', 'right', 'right', 'right', 'right', 'right', 'right'],
+    ),
+  );
 }
 
 function traceHtmlStyles(): string {
@@ -673,6 +1091,26 @@ function renderHtmlPerformance(report: TraceReport, diagnostics: TraceDiagnostic
         ['Duration split', `total=${formatDuration(split.totalDurationMs)}`, `model=${formatDuration(split.modelDurationMs)}, tools=${formatDuration(split.toolDurationMs)}, snapshot=${formatDuration(split.snapshotSaveMs)}, other=${formatDuration(split.otherDurationMs)}`],
       ]),
       renderHtmlUsageBreakdown(report.usage),
+      htmlSubsection('Per-run efficiency and context', htmlTable(
+        ['Run', 'Status', 'Provider/model', 'Wall', 'Measured', 'Parallelism', 'Model attempts', 'Retries', 'Tool calls', 'Tokens', 'Cost', 'Context samples', 'Context latest/peak/growth'],
+        diagnostics.analysis.runs.map((run) => [
+          shortId(run.runId),
+          run.status ?? 'unknown',
+          run.provider || run.model ? `${run.provider ?? 'unknown'}/${run.model ?? 'unknown'}` : '-',
+          formatDuration(run.durations.wallMs),
+          formatDuration(run.durations.cumulativeMeasuredMs),
+          formatRatio(run.durations.parallelism),
+          formatNumber(run.modelCalls.attempts),
+          formatNumber(run.modelCalls.retries),
+          formatNumber(run.toolCalls.starts),
+          formatNumber(run.usage.combined.totalTokens),
+          formatCost(run.costs.estimatedGrandTotalUSD),
+          `${run.contextGrowth.source}/${formatNumber(run.contextGrowth.samples)}`,
+          [run.contextGrowth.latestMessageBytes, run.contextGrowth.peakMessageBytes, run.contextGrowth.messageBytesGrowth]
+            .map((value) => value === null ? '-' : formatBytes(value))
+            .join(' / '),
+        ]),
+      )),
       htmlSubsection('Tool provider accounting', digest.toolAccounting.byProviderOperation.length === 0 ? '<p class="empty">No tool accounting payloads were available.</p>' : htmlTable(
         ['Provider', 'Operation', 'Tool calls', 'Requests', 'Billable', 'Cached', 'Unpriced', 'Cost'],
         digest.toolAccounting.byProviderOperation.map((row) => [
@@ -1553,47 +1991,6 @@ function renderRootRunUsageTable(items: SessionUsageSummary['byRootRun'], option
   );
 }
 
-function appendProviderModelUsageLines(
-  lines: string[],
-  title: string,
-  rows: ProviderModelUsageSummary[],
-  countLabel: 'runs' | 'tool calls',
-): void {
-  if (rows.length === 0) {
-    return;
-  }
-
-  lines.push('');
-  lines.push(title);
-  lines.push(renderProviderModelUsageTable(rows, countLabel));
-}
-
-function appendToolAccountingUsageLines(lines: string[], accounting: ToolAccountingSummary | undefined): void {
-  if (!accounting || accounting.byProviderOperation.length === 0) {
-    return;
-  }
-
-  lines.push('');
-  lines.push('Tool provider usage by provider/operation');
-  lines.push(renderToolAccountingUsageTable(accounting));
-}
-
-function renderToolAccountingUsageTable(accounting: ToolAccountingSummary): string {
-  return renderTable(
-    ['provider', 'operation', 'tool calls', 'requests', 'billable', 'cached', 'unpriced', 'cost'],
-    accounting.byProviderOperation.map((row) => [
-      row.provider,
-      row.operation,
-      formatNumber(row.toolCalls),
-      formatNumber(row.requests),
-      formatNumber(row.billableRequests),
-      formatNumber(row.cachedToolCalls),
-      formatNumber(row.unpricedRequests),
-      formatCost(row.estimatedCostUSD),
-    ]),
-  );
-}
-
 function sumProviderModelUsage(rows: ProviderModelUsageSummary[]): UsageSummary {
   return rows.reduce<UsageSummary>(
     (acc, row) => {
@@ -1668,6 +2065,57 @@ function renderProviderModelUsageTable(
       formatCost(row.usage.estimatedCostUSD),
     ]),
   );
+}
+
+function renderRunAnalysisTable(diagnostics: TraceDiagnostics): string {
+  if (!diagnostics.analysis.runs.length) return chalk.gray('No run analysis is available.');
+  return renderMetricTable(diagnostics.analysis.runs.flatMap((run) => {
+    const prefix = `${'  '.repeat(run.depth)}${shortId(run.runId)}`;
+    const identity = run.provider || run.model ? `${run.provider ?? 'unknown'}/${run.model ?? 'unknown'}` : 'model unknown';
+    const contextBytes = [
+      run.contextGrowth.initialMessageBytes,
+      run.contextGrowth.latestMessageBytes,
+      run.contextGrowth.peakMessageBytes,
+      run.contextGrowth.messageBytesGrowth,
+    ].map((value) => value === null ? '-' : formatBytes(value));
+    const contextCounts = [
+      run.contextGrowth.initialMessageCount,
+      run.contextGrowth.latestMessageCount,
+      run.contextGrowth.peakMessageCount,
+      run.contextGrowth.messageCountGrowth,
+    ].map((value) => value === null ? '-' : formatNumber(value));
+    const rows: Array<[string, string, string]> = [
+      [
+        prefix,
+        `status=${run.status ?? 'unknown'} ${identity}`,
+        `wall=${formatDuration(run.durations.wallMs)} model=${formatDuration(run.durations.modelMs)} tools=${formatDuration(run.durations.toolMs)} snapshot=${formatDuration(run.durations.snapshotMs)} other=${formatDuration(run.durations.otherMs)} parallel=${formatRatio(run.durations.parallelism)}`,
+      ],
+      [
+        `${prefix} calls`,
+        `model=${formatNumber(run.modelCalls.logicalCalls)} logical/${formatNumber(run.modelCalls.attempts)} attempts retries=${formatNumber(run.modelCalls.retries)} failed=${formatNumber(run.modelCalls.failures)}`,
+        `tools=${formatNumber(run.toolCalls.starts)} failed=${formatNumber(run.toolCalls.failures)} reduction=${formatOptionalPercentage(run.toolCalls.reductionPercentage)}`,
+      ],
+      [
+        `${prefix} usage`,
+        `${formatNumber(run.usage.combined.totalTokens)} tokens ${formatCost(run.costs.estimatedGrandTotalUSD)}`,
+        `model=${formatCost(run.costs.modelEstimateUSD)} tool-output=${formatCost(run.costs.toolOutputEstimateUSD)} providers=${formatCost(run.costs.externalToolProviderEstimateUSD)}`,
+      ],
+      [
+        `${prefix} context`,
+        `${run.contextGrowth.source}/${formatNumber(run.contextGrowth.samples)} samples`,
+        `bytes initial/latest/peak/growth=${contextBytes.join('/')} count=${contextCounts.join('/')}`,
+      ],
+      [
+        `${prefix} coverage`,
+        `events=${formatNumber(run.coverage.events)} performance=${formatOptionalPercentage(run.coverage.performance === null ? null : run.coverage.performance * 100)}`,
+        `snapshots=${formatNumber(run.coverage.snapshots)} provider-cost=${formatOptionalPercentage(run.coverage.cost === null ? null : run.coverage.cost * 100)} children=${formatNumber(run.directChildFanOut)} output=${formatBytes(run.outputBytes)}`,
+      ],
+    ];
+    if (run.notes.length > 0) {
+      rows.push([`${prefix} notes`, run.notes.join(' '), 'Data limitations for this run.']);
+    }
+    return rows;
+  }));
 }
 
 function renderPerformance(
@@ -2370,21 +2818,26 @@ function shouldRenderFinalOutput(view: ReportView): boolean {
 }
 
 function renderTable(headers: string[], rows: string[][], options?: { maxWidths?: number[] }): string {
-  const widths = headers.map((header, index) =>
-    Math.min(
-      Math.max(
-        header.length,
-        ...rows.map((row) => stripAnsi(row[index] ?? '').length),
-      ),
-      options?.maxWidths?.[index] ?? (index === headers.length - 1 ? 80 : 36),
-    ),
-  );
-  const line = (cells: string[]): string =>
-    cells
-      .map((cell, index) => padAnsi(truncateAnsi(cell, widths[index]!), widths[index]!))
-      .join('  ');
+  const widths = fitColumnWidths(headers, rows, {
+    availableWidth: terminalWidth() - Math.max(0, headers.length - 1) * 2,
+    maximumWidths: options?.maxWidths ?? headers.map((_, index) => index === headers.length - 1 ? 80 : 36),
+    minimumWidth: 4,
+  });
+  const renderRow = (cells: string[]): string[] => {
+    const wrapped = headers.map((_, index) => wrapAnsi(cells[index] ?? '', widths[index]!));
+    const height = Math.max(...wrapped.map((lines) => lines.length));
+    return Array.from({ length: height }, (_, lineIndex) =>
+      wrapped
+        .map((lines, index) => padAnsi(lines[lineIndex] ?? '', widths[index]!))
+        .join('  '),
+    );
+  };
 
-  return [line(headers.map((header) => chalk.bold(header))), line(widths.map((width) => '-'.repeat(width))), ...rows.map(line)].join('\n');
+  return [
+    ...renderRow(headers.map((header) => chalk.bold(header))),
+    widths.map((width) => '-'.repeat(width)).join('  '),
+    ...rows.flatMap(renderRow),
+  ].join('\n');
 }
 
 function renderMetricTable(rows: Array<[metric: string, value: string, explanation: string]>): string {
@@ -2530,6 +2983,10 @@ function formatRatio(value: number | null): string {
   return value === null ? '-' : `${value.toFixed(2)}x`;
 }
 
+function formatOptionalPercentage(value: number | null): string {
+  return value === null ? '-' : `${value.toFixed(1)}%`;
+}
+
 function formatBucketBytes(bucket: PerformanceBucketSummary): string {
   if (bucket.count === 0) {
     return '-';
@@ -2606,6 +3063,95 @@ function wrapPlain(value: string, width: number): string[] {
   if (current.length > 0) {
     lines.push(current);
   }
+  return lines;
+}
+
+function terminalWidth(): number {
+  const environmentWidth = Number.parseInt(process.env.COLUMNS ?? '', 10);
+  const width = Number.isFinite(environmentWidth) ? environmentWidth : (process.stdout.columns ?? 120);
+  return Math.max(60, width);
+}
+
+function fitColumnWidths(
+  headers: string[],
+  rows: string[][],
+  options: {
+    availableWidth: number;
+    cellPadding?: number;
+    maximumWidths?: number[];
+    minimumWidth: number;
+  },
+): number[] {
+  const padding = options.cellPadding ?? 0;
+  const natural = headers.map((header, index) => Math.min(
+    Math.max(
+      visibleLength(header) + padding,
+      ...rows.map((row) => visibleLength(row[index] ?? '') + padding),
+    ),
+    options.maximumWidths?.[index] ?? Number.POSITIVE_INFINITY,
+  ));
+  const widths = [...natural];
+  const minimums = headers.map((_, index) => Math.min(
+    natural[index]!,
+    Math.max(
+      options.minimumWidth,
+      Math.min(longestCommaSeparatedItem(rows.map((row) => row[index] ?? '')) + padding, 32),
+    ),
+  ));
+  const budget = Math.max(headers.length * options.minimumWidth, options.availableWidth);
+
+  while (widths.reduce((total, width) => total + width, 0) > budget) {
+    let candidate = -1;
+    let largestSlack = 0;
+    for (let index = 0; index < widths.length; index += 1) {
+      const slack = widths[index]! - minimums[index]!;
+      if (slack > largestSlack) {
+        candidate = index;
+        largestSlack = slack;
+      }
+    }
+    if (candidate === -1) {
+      const widest = widths.reduce((best, width, index) => width > widths[best]! ? index : best, 0);
+      if (widths[widest]! <= options.minimumWidth) break;
+      widths[widest]!--;
+    } else {
+      widths[candidate]!--;
+    }
+  }
+  return widths;
+}
+
+function longestCommaSeparatedItem(values: string[]): number {
+  return Math.max(0, ...values.flatMap((value) =>
+    value.includes(',')
+      ? stripAnsi(value).split(/,\s*/).map((item) => item.length)
+      : [0],
+  ));
+}
+
+function visibleLength(value: string): number {
+  return Math.max(...stripAnsi(value).split(/\r?\n/).map((line) => line.length));
+}
+
+function wrapAnsi(value: string, width: number): string[] {
+  const plain = stripAnsi(value);
+  if (plain.length <= width) return [value];
+  const prefix = value.match(/^(?:\u001b\[[0-9;]*m)+/)?.[0] ?? '';
+  return wrapPlainWithLongWords(plain, width).map((line) => prefix ? `${prefix}${line}\u001b[0m` : line);
+}
+
+function wrapPlainWithLongWords(value: string, width: number): string[] {
+  const lines: string[] = [];
+  let remaining = oneLine(value);
+  while (remaining.length > width) {
+    const candidate = remaining.slice(0, width + 1);
+    const comma = candidate.lastIndexOf(', ');
+    const space = candidate.lastIndexOf(' ');
+    const boundary = comma >= Math.floor(width / 3) ? comma + 1 : space >= Math.floor(width / 3) ? space : width;
+    lines.push(remaining.slice(0, boundary).trimEnd());
+    remaining = remaining.slice(boundary).trimStart();
+  }
+  lines.push(remaining);
   return lines;
 }
 

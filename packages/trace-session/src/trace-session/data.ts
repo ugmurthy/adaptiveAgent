@@ -1,9 +1,10 @@
 import { inspect } from 'node:util';
 
 import {
-  buildTraceDiagnostics,
   buildMilestones,
   buildRunTreeEntries,
+  buildTraceAggregateReport,
+  buildTraceDiagnostics,
   buildTimeline,
   collectFocusedRunIds,
   filterReportForFocusedRun,
@@ -27,6 +28,9 @@ import type {
   SessionlessRunListItem,
   SnapshotMessageRow,
   ToolAccountingSummary,
+  TraceAggregateGroupBy,
+  TraceAggregateObservation,
+  TraceAggregateReport,
   TraceMessage,
   TraceMessageRole,
   TraceReport,
@@ -38,7 +42,14 @@ import type {
   SwarmRole,
 } from './types.js';
 
-type ListFilterOptions = Pick<CliOptions, 'goals' | 'goalRegex' | 'hasGoal' | 'noGoal' | 'statuses' | 'limit' | 'types' | 'swarmRole'>;
+type ListFilterOptions = Pick<CliOptions, 'goals' | 'goalRegex' | 'hasGoal' | 'noGoal' | 'statuses' | 'limit' | 'types' | 'swarmRole' | 'since' | 'until'>;
+
+interface TraceSupport {
+  hasTraceView: boolean;
+  hasToolObservabilityColumns: boolean;
+  hasRunModelColumns: boolean;
+  hasGatewaySessionTables: boolean;
+}
 
 export interface PostgresQueryResult<T> {
   rows: T[];
@@ -87,7 +98,7 @@ export async function traceSession(client: PostgresClient, options: CliOptions):
   });
 
   const [traceRows, llmMessages, snapshotSummaries, delegates, plans] = await Promise.all([
-    migration.hasToolObservabilityColumns ? loadTraceRows(client, options.sessionId ?? target.requestedId, rootRunIds) : Promise.resolve([]),
+    migration.hasToolObservabilityColumns ? loadTraceRows(client, options.sessionId ?? target.requestedId, rootRunIds, migration.hasRunModelColumns) : Promise.resolve([]),
     llmMessagesPromise,
     snapshotSummariesPromise,
     loadDelegateDiagnostics(client, rootRunIds).catch((error: unknown) => {
@@ -127,19 +138,24 @@ export async function traceSession(client: PostgresClient, options: CliOptions):
     warnings,
   };
 
+  let focusedRunIds: Set<string> | undefined;
   if (options.focusRunId) {
-    const focusedRunIds = collectFocusedRunIds(report.runTree ?? [], options.focusRunId);
-    if (focusedRunIds.size === 0) {
+    const resolvedFocusedRunIds = collectFocusedRunIds(report.runTree ?? [], options.focusRunId);
+    focusedRunIds = resolvedFocusedRunIds;
+    if (resolvedFocusedRunIds.size === 0) {
       warnings.push(`Run "${options.focusRunId}" was not found in the traced run tree.`);
     } else {
-      report = filterReportForFocusedRun(report, focusedRunIds);
+      report = filterReportForFocusedRun(report, resolvedFocusedRunIds);
       report.summary = summarizeTrace(report.session, report.rootRuns, report.timeline, report.delegates);
       report.totalSteps = totalStepsFromSnapshotSummaries(report.snapshotSummaries ?? []);
-      report.performance = summarizePerformance(traceRows.filter((row) => focusedRunIds.has(row.run_id)));
+      report.performance = summarizePerformance(traceRows.filter((row) => resolvedFocusedRunIds.has(row.run_id)));
     }
   }
 
-  report.diagnostics = buildTraceDiagnostics(report);
+  const focusedTraceRows = focusedRunIds
+    ? traceRows.filter((row) => focusedRunIds.has(row.run_id))
+    : traceRows;
+  report.diagnostics = buildTraceDiagnostics(report, focusedTraceRows);
 
   return report;
 }
@@ -169,8 +185,9 @@ export async function loadUsageForTraceTargetWithTerminalState(client: PostgresC
 export async function listSessions(
   client: PostgresClient,
   options: { recoverAgentRunSessionIds?: boolean } & ListFilterOptions = {},
+  detectedSupport?: TraceSupport,
 ): Promise<SessionListItem[]> {
-  const support = await detectTraceSupport(client);
+  const support = detectedSupport ?? await detectTraceSupport(client);
   if (!support.hasGatewaySessionTables) {
     return filterSessions(await listCoreSessions(client), options);
   }
@@ -289,6 +306,198 @@ export async function listSessionPerformance(client: PostgresClient, options: Li
     swarmRole: goal.swarmRole,
     performance: summarizePerformance(rowsByRootRun.get(goal.rootRunId) ?? []),
   }));
+}
+
+export async function aggregateSessionPerformance(
+  client: PostgresClient,
+  options: ListFilterOptions & { groupBy: TraceAggregateGroupBy },
+): Promise<TraceAggregateReport> {
+  // Apply the population filters and limit before loading detailed trace rows.
+  const support = await detectTraceSupport(client);
+  const sessions = await listSessions(client, { ...options, limit: undefined }, support);
+  const allEntries = sessions.flatMap((session) =>
+    session.goals.map((goal) => ({ session, goal })),
+  );
+  const seenRootRunIds = new Set<string>();
+  const uniqueEntries = allEntries.filter((entry) => {
+    if (seenRootRunIds.has(entry.goal.rootRunId)) return false;
+    seenRootRunIds.add(entry.goal.rootRunId);
+    return true;
+  });
+  const entries = options.limit === undefined ? uniqueEntries : uniqueEntries.slice(0, options.limit);
+  const rootRunIds = entries.map((entry) => entry.goal.rootRunId);
+  if (rootRunIds.length === 0) {
+    return buildTraceAggregateReport([], options.groupBy, options);
+  }
+
+  let snapshotLoadWarning: string | null = null;
+  const [traceRows, usage, snapshotSummaries] = await Promise.all([
+    support.hasToolObservabilityColumns
+      ? loadTraceRows(client, 'aggregate-performance', rootRunIds, support.hasRunModelColumns)
+      : Promise.resolve([]),
+    loadSessionUsage(client, rootRunIds, support.hasToolObservabilityColumns, support.hasRunModelColumns),
+    loadRunSnapshotSummaries(client, rootRunIds).catch((error: unknown) => {
+      snapshotLoadWarning = `Snapshot coverage is unavailable: ${errorMessage(error)}`;
+      return [] as RunSnapshotSummary[];
+    }),
+  ]);
+  const rowsByRootRun = new Map<string, TraceRow[]>();
+  for (const row of traceRows) {
+    const rows = rowsByRootRun.get(row.root_run_id) ?? [];
+    rows.push(row);
+    rowsByRootRun.set(row.root_run_id, rows);
+  }
+  const usageByRootRun = new Map(usage.byRootRun.map((item) => [item.rootRunId, item.usage]));
+  const snapshotsByRootRun = new Map<string, RunSnapshotSummary[]>();
+  for (const snapshot of snapshotSummaries) {
+    const summaries = snapshotsByRootRun.get(snapshot.rootRunId) ?? [];
+    summaries.push(snapshot);
+    snapshotsByRootRun.set(snapshot.rootRunId, summaries);
+  }
+  const observations = entries.map(({ goal }) => buildAggregateObservation(
+    goal,
+    rowsByRootRun.get(goal.rootRunId) ?? [],
+    usageByRootRun.get(goal.rootRunId) ?? emptyUsageSummary(),
+    support.hasToolObservabilityColumns,
+    snapshotsByRootRun.get(goal.rootRunId) ?? [],
+  ));
+
+  const report = buildTraceAggregateReport(observations, options.groupBy, options);
+  if (snapshotLoadWarning) report.notes.push(snapshotLoadWarning);
+  return report;
+}
+
+function buildAggregateObservation(
+  goal: SessionListItem['goals'][number],
+  rows: TraceRow[],
+  rootUsage: UsageSummary,
+  hasToolObservabilityColumns: boolean,
+  snapshotSummaries: RunSnapshotSummary[],
+): TraceAggregateObservation {
+  const rootRow = rows.find((row) => row.run_id === goal.rootRunId) ?? rows[0];
+  const status = rootRow?.run_status ?? goal.status;
+  const startedAt = rootRow?.run_created_at ?? goal.startedAt;
+  const completedAt = rootRow?.run_completed_at ?? goal.completedAt;
+  const rootRun: RootRun = {
+    rootRunId: goal.rootRunId,
+    runId: goal.rootRunId,
+    invocationKind: goal.type ?? 'run',
+    turnIndex: null,
+    linkedAt: goal.linkedAt,
+    startedAt,
+    updatedAt: rootRow?.run_updated_at ?? completedAt,
+    completedAt,
+    status,
+    goal: typeof rootRow?.goal === 'string' ? rootRow.goal : goal.goal,
+    result: rootRow?.run_result ?? null,
+    errorCode: rootRow?.run_error_code ?? null,
+    errorMessage: rootRow?.run_error_message ?? null,
+    modelProvider: rootRow?.model_provider ?? null,
+    modelName: rootRow?.model_name ?? null,
+    leaseOwner: rootRow?.run_lease_owner ?? null,
+    leaseExpiresAt: rootRow?.run_lease_expires_at ?? null,
+    heartbeatAt: rootRow?.run_heartbeat_at ?? null,
+  };
+  const timeline = buildTimeline(rows);
+  const milestones = buildMilestones(rows);
+  const performance = summarizePerformance(rows);
+  const report: TraceReport = {
+    target: { kind: 'root-run', requestedId: goal.rootRunId, resolvedRootRunId: goal.rootRunId },
+    session: null,
+    rootRuns: [rootRun],
+    usage: { total: rootUsage, byRootRun: [{ rootRunId: goal.rootRunId, usage: rootUsage }] },
+    performance,
+    timeline,
+    milestones,
+    llmMessages: [],
+    runTree: buildRunTreeEntries(rows),
+    snapshotSummaries,
+    totalSteps: totalStepsFromSnapshotSummaries(snapshotSummaries),
+    delegates: [],
+    plans: [],
+    summary: summarizeTrace(null, [rootRun], timeline, []),
+    warnings: hasToolObservabilityColumns
+      ? []
+      : ['The core:002_tool_observability columns are missing. Precise aggregate diagnostics are unavailable.'],
+  };
+  const diagnostics = buildTraceDiagnostics(report, rows);
+  const rootAnalysis = diagnostics.analysis.runs.find((run) => run.runId === goal.rootRunId) ?? null;
+  const retries = diagnostics.analysis.runs.reduce((total, run) => total + run.modelCalls.retries, 0);
+  const modelFailures = diagnostics.analysis.runs.reduce((total, run) => total + run.modelCalls.failures, 0);
+  const recoveryEventTypes = new Set([
+    'model.retry',
+    'run.retry_started',
+    'run.interrupted',
+    'run.resumed',
+    'run.continuation_created',
+    'replan.required',
+    'model.tool_call_rejected',
+  ]);
+  const hadRecovery = retries > 0
+    || modelFailures > 0
+    || performance.tools.failed > 0
+    || milestones.some((milestone) => recoveryEventTypes.has(milestone.eventType));
+  const externalToolProviderCostUSD = diagnostics.performance.toolAccounting.estimatedCostUSD;
+  const modelStarts = diagnostics.analysis.runs.reduce((total, run) => total + run.modelCalls.starts, 0);
+  const usageMeasured = rootUsage.totalTokens > 0 || (rows.length > 0 && modelStarts === 0);
+  const totalTokens = usageMeasured ? rootUsage.totalTokens : null;
+  const modelAndToolOutputCostUSD = rootUsage.estimatedCostUSD > 0 || totalTokens === 0
+    ? rootUsage.estimatedCostUSD
+    : null;
+  const externalCostMeasured = hasToolObservabilityColumns
+    && (diagnostics.performance.toolAccounting.totalRequests === 0
+      || diagnostics.performance.toolAccounting.unpricedRequests === 0);
+  const measuredExternalToolProviderCostUSD = externalCostMeasured ? externalToolProviderCostUSD : null;
+  const estimatedGrandTotalUSD = modelAndToolOutputCostUSD === null || measuredExternalToolProviderCostUSD === null
+    ? null
+    : modelAndToolOutputCostUSD + measuredExternalToolProviderCostUSD;
+
+  return {
+    rootRunId: goal.rootRunId,
+    startedAt,
+    completedAt,
+    status,
+    provider: rootAnalysis?.provider ?? rootRun.modelProvider ?? null,
+    model: rootAnalysis?.model ?? rootRun.modelName ?? null,
+    wallDurationMs: status && ['succeeded', 'failed', 'cancelled'].includes(status)
+      ? durationMs(startedAt, completedAt)
+      : null,
+    totalTokens,
+    modelAndToolOutputCostUSD,
+    externalToolProviderCostUSD: measuredExternalToolProviderCostUSD,
+    estimatedGrandTotalUSD,
+    hadRecovery,
+    retries,
+    modelFailures,
+    toolCalls: performance.tools.started,
+    toolFailures: performance.tools.failed,
+    contextGrowthBytes: rootAnalysis?.contextGrowth.messageBytesGrowth ?? null,
+    peakContextBytes: rootAnalysis?.contextGrowth.peakMessageBytes ?? null,
+    dataConfidence: diagnostics.reliability.dataConfidence.level,
+    retryByProviderModel: diagnostics.analysis.runs.map((run) => ({
+      provider: normalizedProviderModelLabel(run.provider),
+      model: normalizedProviderModelLabel(run.model),
+      runs: 1,
+      runsWithRetries: run.modelCalls.retries > 0 ? 1 : 0,
+      retries: run.modelCalls.retries,
+    })),
+    tools: performance.tools.byTool.map((tool) => ({
+      toolName: tool.toolName,
+      calls: tool.started,
+      failures: tool.failed,
+    })),
+    errorCodes: [...new Set(rows.flatMap((row) => [row.run_error_code, row.tool_error_code, row.child_error_code])
+      .filter((code): code is string => Boolean(code)))],
+  };
+}
+
+function emptyUsageSummary(): UsageSummary {
+  return {
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+    estimatedCostUSD: 0,
+  };
 }
 
 export async function listSessionlessRuns(client: PostgresClient, detectedSupport?: Awaited<ReturnType<typeof detectTraceSupport>>): Promise<SessionlessRunListItem[]> {
@@ -483,15 +692,20 @@ function filterSessions(sessions: SessionListItem[], options: ListFilterOptions)
   const textGoals = options.goals?.map((value) => value.toLocaleLowerCase()) ?? [];
   const statuses = new Set(options.statuses ?? []);
   const types = new Set(options.types ?? []);
+  const now = Date.now();
+  const since = parseListTimeBoundary(options.since, now);
+  const until = parseListTimeBoundary(options.until, now);
   const filtered = sessions.flatMap((session) => {
     if (session.goals.length === 0) {
       const statusMatches = statuses.size === 0 || statuses.has(session.status ?? 'unknown');
       const requestsGoalContent = options.hasGoal || textGoals.length > 0 || options.goalRegex !== undefined;
       const requestsRunIdentity = types.size > 0 || options.swarmRole !== undefined;
-      return statusMatches && !requestsGoalContent && !requestsRunIdentity ? [session] : [];
+      const timeMatches = listTimeMatches(session.startedAt, since, until);
+      return statusMatches && timeMatches && !requestsGoalContent && !requestsRunIdentity ? [session] : [];
     }
     const goals = session.goals.filter((item) => {
       const goal = typeof item.goal === 'string' && item.goal.trim() ? item.goal : null;
+      if (!listTimeMatches(item.startedAt ?? item.linkedAt, since, until)) return false;
       if (options.hasGoal && !goal || options.noGoal && goal) return false;
       if (textGoals.length && (!goal || !textGoals.some((text) => goal.toLocaleLowerCase().includes(text)))) return false;
       if (options.goalRegex && (!goal || !options.goalRegex.test(goal))) return false;
@@ -503,6 +717,25 @@ function filterSessions(sessions: SessionListItem[], options: ListFilterOptions)
     return goals.length ? [{ ...session, goals }] : [];
   });
   return options.limit === undefined ? filtered : filtered.slice(0, options.limit);
+}
+
+function parseListTimeBoundary(value: string | undefined, now: number): number | null {
+  if (!value) return null;
+  const relative = /^(\d+(?:\.\d+)?)(ms|s|m|h|d|w)$/i.exec(value.trim());
+  if (relative) {
+    const factors: Record<string, number> = { ms: 1, s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 };
+    return now - Number(relative[1]) * factors[relative[2]!.toLowerCase()]!;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function listTimeMatches(value: string | null, since: number | null, until: number | null): boolean {
+  if (since === null && until === null) return true;
+  if (!value) return false;
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return false;
+  return (since === null || parsed >= since) && (until === null || parsed <= until);
 }
 
 function usageSummaryFromRow(row: {
@@ -571,7 +804,7 @@ function durationMs(startedAt: string | null, completedAt: string | null): numbe
 }
 
 
-async function detectTraceSupport(client: PostgresClient): Promise<{ hasTraceView: boolean; hasToolObservabilityColumns: boolean; hasRunModelColumns: boolean; hasGatewaySessionTables: boolean }> {
+async function detectTraceSupport(client: PostgresClient): Promise<TraceSupport> {
   const [viewResult, columnResult, runModelColumnResult, gatewayTablesResult] = await Promise.all([
     client.query<{ exists: boolean }>(`select to_regclass('public.session_execution_trace') is not null as exists`),
     client.query<{ count: string }>(`
@@ -1766,11 +1999,15 @@ async function loadRunSnapshotSummaries(client: PostgresClient, rootRunIds: stri
   });
 }
 
-async function loadTraceRows(client: PostgresClient, sessionId: string, rootRunIds: string[]): Promise<TraceRow[]> {
+async function loadTraceRows(client: PostgresClient, sessionId: string, rootRunIds: string[], hasRunModelColumns = false): Promise<TraceRow[]> {
   if (rootRunIds.length === 0) {
     return [];
   }
 
+  const modelColumns = hasRunModelColumns
+    ? 'r.model_provider, r.model_name,'
+    : 'null::text as model_provider, null::text as model_name,';
+  const usageColumns = 'r.total_prompt_tokens, r.total_completion_tokens, r.total_reasoning_tokens, r.estimated_cost_usd,';
   const result = await client.query<TraceRow>(
     `
       with recursive root_runs as (
@@ -1794,6 +2031,8 @@ async function loadTraceRows(client: PostgresClient, sessionId: string, rootRunI
           r.created_at as run_created_at,
           r.updated_at as run_updated_at,
           r.completed_at as run_completed_at,
+          ${usageColumns}
+          ${modelColumns}
           r.result as run_result,
           r.lease_owner as run_lease_owner,
           r.lease_expires_at as run_lease_expires_at,
@@ -1820,6 +2059,8 @@ async function loadTraceRows(client: PostgresClient, sessionId: string, rootRunI
           c.created_at as run_created_at,
           c.updated_at as run_updated_at,
           c.completed_at as run_completed_at,
+          ${usageColumns.replaceAll('r.', 'c.')}
+          ${modelColumns.replaceAll('r.', 'c.')}
           c.result as run_result,
           c.lease_owner as run_lease_owner,
           c.lease_expires_at as run_lease_expires_at,
@@ -1844,6 +2085,12 @@ async function loadTraceRows(client: PostgresClient, sessionId: string, rootRunI
         rt.run_created_at,
         rt.run_updated_at,
         rt.run_completed_at,
+        rt.total_prompt_tokens,
+        rt.total_completion_tokens,
+        rt.total_reasoning_tokens,
+        rt.estimated_cost_usd,
+        rt.model_provider,
+        rt.model_name,
         rt.run_result,
         rt.run_lease_owner,
         rt.run_lease_expires_at,

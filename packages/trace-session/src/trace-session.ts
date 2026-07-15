@@ -3,9 +3,11 @@
 export { main, parseArgs } from './trace-session/cli.js';
 export { createTracePostgresPool, resolveTracePostgresConfig } from './db.js';
 export type { TraceConfigOptions, TracePostgresConfig, TracePostgresPool } from './db.js';
-export { listSessionlessRuns, listSessionPerformance, listSessions, loadUsageForTraceTarget, traceSession } from './trace-session/data.js';
+export { aggregateSessionPerformance, listSessionlessRuns, listSessionPerformance, listSessions, loadUsageForTraceTarget, traceSession } from './trace-session/data.js';
 export {
+  buildTraceAggregateReport,
   buildTraceDiagnostics,
+  buildTraceComparison,
   buildTimeline,
   computeDelegateReason,
   summarizePerformance,
@@ -16,7 +18,11 @@ export {
   renderSessionPerformanceList,
   renderSessionList,
   renderSessionlessRunList,
+  renderTraceAggregate,
+  renderTraceAggregateHtml,
   renderTraceHtml,
+  renderTraceComparison,
+  renderTraceComparisonHtml,
   renderTraceReport,
   renderUsageReport,
 } from './trace-session/render.js';
@@ -57,7 +63,20 @@ export type {
   TopToolMetric,
   TopToolSpan,
   TraceBrief,
+  TraceAggregateDistribution,
+  TraceAggregateGroup,
+  TraceAggregateGroupBy,
+  TraceAggregateObservation,
+  TraceAggregateReport,
+  TraceAggregateRetryObservation,
+  TraceAggregateToolObservation,
   TraceDiagnostics,
+  TraceAnalysis,
+  RunAnalysis,
+  TraceComparison,
+  ComparisonMetric,
+  ComparisonMixRow,
+  ContextGrowthSource,
   TraceFinding,
   TraceFindingCategory,
   TraceFindingRole,

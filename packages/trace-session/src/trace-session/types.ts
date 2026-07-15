@@ -49,6 +49,7 @@ export type ReportView =
 export type MessageView = 'compact' | 'delta' | 'full';
 
 export interface CliOptions {
+  compareRunIds?: [string, string];
   sessionId?: string;
   rootRunId?: string;
   runId?: string;
@@ -75,6 +76,9 @@ export interface CliOptions {
   limit?: number;
   types?: TraceListType[];
   swarmRole?: SwarmRole;
+  groupBy?: TraceAggregateGroupBy;
+  since?: string;
+  until?: string;
   htmlPath?: string;
   configPath?: string;
   databaseUrl?: string;
@@ -210,6 +214,12 @@ export interface TraceRow {
   run_created_at: string | null;
   run_updated_at: string | null;
   run_completed_at: string | null;
+  total_prompt_tokens?: string | number | null;
+  total_completion_tokens?: string | number | null;
+  total_reasoning_tokens?: string | number | null;
+  estimated_cost_usd?: string | number | null;
+  model_provider?: string | null;
+  model_name?: string | null;
   run_result?: unknown;
   run_lease_owner?: string | null;
   run_lease_expires_at?: string | null;
@@ -653,7 +663,268 @@ export interface TraceDiagnostics {
   findings: TraceFinding[];
   performance: PerformanceDigest;
   policy: PolicyDigest;
+  analysis: TraceAnalysis;
   suggestedNextViews: SuggestedCommand[];
+}
+
+export type ContextGrowthSource = 'snapshot' | 'model-request' | 'unavailable';
+
+export interface RunAnalysis {
+  rootRunId: string;
+  runId: string;
+  parentRunId: string | null;
+  delegateName: string | null;
+  depth: number;
+  status: string | null;
+  provider: string | null;
+  model: string | null;
+  durations: {
+    wallMs: number | null;
+    modelMs: number;
+    toolMs: number;
+    snapshotMs: number;
+    cumulativeMeasuredMs: number;
+    otherMs: number | null;
+    unexplainedWallPercentage: number | null;
+    parallelism: number | null;
+    delegateWaitNote?: string;
+  };
+  modelCalls: {
+    starts: number;
+    runtimeRetries: number;
+    adapterRetries: number;
+    retries: number;
+    retryDelayMs: number;
+    attempts: number;
+    logicalCalls: number;
+    retryAmplification: number | null;
+    failures: number;
+    failureRate: number | null;
+    slowestSpanMs: number | null;
+  };
+  toolCalls: {
+    starts: number;
+    failures: number;
+    failureRate: number | null;
+    slowestSpanMs: number | null;
+    rawOutputBytes: number;
+    modelVisibleOutputBytes: number;
+    rawToModelRatio: number | null;
+    reductionPercentage: number | null;
+    byTool: PerformanceSummary['tools']['byTool'];
+  };
+  usage: {
+    runModel: UsageSummary;
+    nonDelegateToolOutput: UsageSummary;
+    combined: UsageSummary;
+    promptCompletionRatio: number | null;
+  };
+  costs: {
+    modelEstimateUSD: number;
+    toolOutputEstimateUSD: number;
+    externalToolProviderEstimateUSD: number;
+    estimatedGrandTotalUSD: number;
+    unpricedProviderRequests: number;
+  };
+  contextGrowth: {
+    source: ContextGrowthSource;
+    samples: number;
+    initialMessageBytes: number | null;
+    latestMessageBytes: number | null;
+    peakMessageBytes: number | null;
+    messageBytesGrowth: number | null;
+    messageBytesGrowthPercentage: number | null;
+    initialMessageCount: number | null;
+    latestMessageCount: number | null;
+    peakMessageCount: number | null;
+    messageCountGrowth: number | null;
+    messageCountGrowthPercentage: number | null;
+  };
+  replanCount: number;
+  approvalRequestCount: number;
+  approvalResolvedCount: number;
+  directChildFanOut: number;
+  cumulativeDirectChildWallMs: number;
+  outputBytes: number;
+  coverage: {
+    events: number;
+    performance: number | null;
+    snapshots: number;
+    cost: number | null;
+  };
+  notes: string[];
+}
+
+export interface TraceAnalysis {
+  runs: RunAnalysis[];
+}
+
+export interface ComparisonMetric {
+  baseline: number | null;
+  candidate: number | null;
+  delta: number | null;
+  percentageChange: number | null;
+}
+
+export interface ComparisonMixRow {
+  label: string;
+  baselineCount: number;
+  candidateCount: number;
+  deltaCount: number;
+}
+
+export interface TraceComparison {
+  baseline: {
+    runId: string;
+    analysis: RunAnalysis | null;
+  };
+  candidate: {
+    runId: string;
+    analysis: RunAnalysis | null;
+  };
+  changes: {
+    wall: ComparisonMetric;
+    tokens: ComparisonMetric;
+    cost: ComparisonMetric;
+    retries: ComparisonMetric;
+    failures: ComparisonMetric;
+    contextBytes: ComparisonMetric;
+    outputBytes: ComparisonMetric;
+  };
+  reliability: {
+    baseline: ReliabilityClassification;
+    candidate: ReliabilityClassification;
+    change: string;
+    scope: 'root-tree';
+  };
+  toolMix: ComparisonMixRow[];
+  providerModelMix: ComparisonMixRow[];
+  confidence: {
+    baseline: DataConfidenceLevel;
+    candidate: DataConfidenceLevel;
+  };
+  notes: string[];
+}
+
+export type TraceAggregateGroupBy = 'model' | 'status' | 'day';
+
+export interface TraceAggregateDistribution {
+  sampleCount: number;
+  average: number | null;
+  min: number | null;
+  p50: number | null;
+  p90: number | null;
+  p95: number | null;
+  max: number | null;
+}
+
+export interface TraceAggregateToolObservation {
+  toolName: string;
+  calls: number;
+  failures: number;
+}
+
+export interface TraceAggregateRetryObservation {
+  provider: string;
+  model: string;
+  runs: number;
+  runsWithRetries: number;
+  retries: number;
+}
+
+export interface TraceAggregateObservation {
+  rootRunId: string;
+  startedAt: string | null;
+  completedAt: string | null;
+  status: string | null;
+  provider: string | null;
+  model: string | null;
+  wallDurationMs: number | null;
+  totalTokens: number | null;
+  modelAndToolOutputCostUSD: number | null;
+  externalToolProviderCostUSD: number | null;
+  estimatedGrandTotalUSD: number | null;
+  hadRecovery: boolean;
+  retries: number;
+  modelFailures: number;
+  toolCalls: number;
+  toolFailures: number;
+  contextGrowthBytes: number | null;
+  peakContextBytes: number | null;
+  dataConfidence: DataConfidenceLevel;
+  retryByProviderModel: TraceAggregateRetryObservation[];
+  tools: TraceAggregateToolObservation[];
+  errorCodes: string[];
+}
+
+export interface TraceAggregateGroup {
+  key: string;
+  label: string;
+  runCount: number;
+  outcomes: {
+    succeeded: number;
+    recoveredSucceeded: number;
+    failed: number;
+    cancelled: number;
+    activeOrBlocked: number;
+    unknown: number;
+    successRate: number | null;
+    recoveredSuccessRate: number | null;
+    failureRate: number | null;
+  };
+  wallDurationMs: TraceAggregateDistribution;
+  successfulRuns: {
+    count: number;
+    averageTokens: number | null;
+    averageModelAndToolOutputCostUSD: number | null;
+    averageExternalToolProviderCostUSD: number | null;
+    averageEstimatedGrandTotalUSD: number | null;
+  };
+  modelFailures: number;
+  retries: {
+    total: number;
+    runsWithRetries: number;
+    runFrequency: number | null;
+    byProviderModel: TraceAggregateRetryObservation[];
+  };
+  tools: {
+    calls: number;
+    failures: number;
+    failureRate: number | null;
+    byTool: TraceAggregateToolObservation[];
+  };
+  context: {
+    growthBytes: TraceAggregateDistribution;
+    peakBytes: TraceAggregateDistribution;
+  };
+  confidence: Record<DataConfidenceLevel, number>;
+  commonErrorCodes: Array<{
+    code: string;
+    count: number;
+  }>;
+}
+
+export interface TraceAggregateReport {
+  kind: 'trace-aggregate';
+  groupBy: TraceAggregateGroupBy;
+  generatedAt: string;
+  population: {
+    runCount: number;
+    terminalRuns: number;
+    activeRuns: number;
+    missingDuration: number;
+    missingUsage: number;
+    missingCost: number;
+    missingContext: number;
+    earliestStartedAt: string | null;
+    latestStartedAt: string | null;
+    since: string | null;
+    until: string | null;
+    limit: number | null;
+  };
+  overall: TraceAggregateGroup;
+  groups: TraceAggregateGroup[];
+  notes: string[];
 }
 
 export interface SnapshotMessageRow {

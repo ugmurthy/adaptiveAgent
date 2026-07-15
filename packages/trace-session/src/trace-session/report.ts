@@ -20,11 +20,20 @@ import type {
   TopToolMetric,
   TimelineEntry,
   TraceDiagnostics,
+  TraceAggregateDistribution,
+  TraceAggregateGroup,
+  TraceAggregateGroupBy,
+  TraceAggregateObservation,
+  TraceAggregateReport,
   TraceFinding,
   TraceFindingRole,
   TraceFindingSeverity,
   TraceReport,
   TraceRow,
+  ComparisonMetric,
+  RunAnalysis,
+  TraceComparison,
+  UsageSummary,
 } from './types.js';
 
 const CORE_EVENT_TYPES: EventType[] = [
@@ -233,7 +242,7 @@ export function summarizeTrace(
   return { status: 'unknown', reason: 'not enough persisted trace data to determine the terminal reason' };
 }
 
-export function buildTraceDiagnostics(report: TraceReport): TraceDiagnostics {
+export function buildTraceDiagnostics(report: TraceReport, traceRows: TraceRow[] = []): TraceDiagnostics {
   const performance = report.performance ?? emptyPerformanceSummaryForDiagnostics();
   const wallDurationMs = traceWallDurationMs(report.rootRuns, report.session);
   const performanceDigest = buildPerformanceDigest(report, performance, wallDurationMs);
@@ -268,8 +277,776 @@ export function buildTraceDiagnostics(report: TraceReport): TraceDiagnostics {
     findings,
     performance: performanceDigest,
     policy: policyDigest,
+    analysis: { runs: buildRunAnalysis(report, traceRows) },
     suggestedNextViews: buildSuggestedNextViews(report, findings, policyDigest, performanceDigest),
   };
+}
+
+export function buildTraceComparison(
+  baselineReport: TraceReport,
+  candidateReport: TraceReport,
+  baselineRunId: string,
+  candidateRunId: string,
+): TraceComparison {
+  const baselineDiagnostics = baselineReport.diagnostics ?? buildTraceDiagnostics(baselineReport);
+  const candidateDiagnostics = candidateReport.diagnostics ?? buildTraceDiagnostics(candidateReport);
+  const notes: string[] = [];
+
+  const baseline = selectComparisonRun(baselineDiagnostics, baselineRunId, 'baseline', notes);
+  const candidate = selectComparisonRun(candidateDiagnostics, candidateRunId, 'candidate', notes);
+  const changes = {
+    wall: comparisonMetric(baseline?.durations.wallMs, candidate?.durations.wallMs),
+    tokens: comparisonMetric(baselineReport.usage.total.totalTokens, candidateReport.usage.total.totalTokens),
+    cost: comparisonMetric(
+      comparisonRootTreeCost(baselineReport, baselineDiagnostics),
+      comparisonRootTreeCost(candidateReport, candidateDiagnostics),
+    ),
+    retries: comparisonMetric(baseline?.modelCalls.retries, candidate?.modelCalls.retries),
+    failures: comparisonMetric(totalFailures(baseline), totalFailures(candidate)),
+    contextBytes: comparisonMetric(baseline?.contextGrowth.messageBytesGrowth, candidate?.contextGrowth.messageBytesGrowth),
+    outputBytes: comparisonMetric(baseline?.outputBytes, candidate?.outputBytes),
+  };
+  const toolMix = comparisonToolMix(baseline);
+  const candidateToolMix = comparisonToolMix(candidate);
+  const providerModelMix = comparisonProviderModelMix(baseline);
+  const candidateProviderModelMix = comparisonProviderModelMix(candidate);
+
+  for (const [name, metric] of Object.entries(changes)) {
+    if (metric.baseline === null || metric.candidate === null) {
+      notes.push(`${name}: comparison is unavailable because one or both runs lack the required measurement.`);
+    }
+  }
+  if (providerModelMix.size === 0 || candidateProviderModelMix.size === 0) {
+    notes.push('Provider/model mix is unavailable where persisted or event-backed model identity is absent.');
+  }
+  notes.push('Token and cost metrics use the resolved root-run tree, matching --usage; other metrics describe the requested run.');
+
+  return {
+    baseline: { runId: baselineRunId, analysis: baseline },
+    candidate: { runId: candidateRunId, analysis: candidate },
+    changes,
+    reliability: {
+      baseline: baselineDiagnostics.reliability.classification,
+      candidate: candidateDiagnostics.reliability.classification,
+      change: `${baselineDiagnostics.reliability.classification} -> ${candidateDiagnostics.reliability.classification}`,
+      scope: 'root-tree',
+    },
+    toolMix: comparisonMixRows(toolMix, candidateToolMix),
+    providerModelMix: comparisonMixRows(providerModelMix, candidateProviderModelMix),
+    confidence: {
+      baseline: baselineDiagnostics.reliability.dataConfidence.level,
+      candidate: candidateDiagnostics.reliability.dataConfidence.level,
+    },
+    notes: [...new Set(notes)],
+  };
+}
+
+function comparisonRootTreeCost(report: TraceReport, diagnostics: TraceDiagnostics): number {
+  return report.usage.total.estimatedCostUSD + diagnostics.performance.toolAccounting.estimatedCostUSD;
+}
+
+function selectComparisonRun(
+  diagnostics: TraceDiagnostics,
+  runId: string,
+  side: 'baseline' | 'candidate',
+  notes: string[],
+): RunAnalysis | null {
+  const analysis = diagnostics.analysis.runs.find((run) => run.runId === runId) ?? null;
+  if (!analysis) {
+    notes.push(`${side}: analysis is unavailable for requested run ${runId}.`);
+    return null;
+  }
+  for (const note of analysis.notes) {
+    notes.push(`${side}: ${note}`);
+  }
+  return analysis;
+}
+
+function comparisonMetric(
+  baselineValue: number | null | undefined,
+  candidateValue: number | null | undefined,
+): ComparisonMetric {
+  const baseline = baselineValue ?? null;
+  const candidate = candidateValue ?? null;
+  const delta = baseline === null || candidate === null ? null : candidate - baseline;
+  return {
+    baseline,
+    candidate,
+    delta,
+    percentageChange: delta === null || baseline === null || baseline === 0
+      ? null
+      : delta / baseline * 100,
+  };
+}
+
+function totalFailures(run: RunAnalysis | null): number | null {
+  return run ? run.modelCalls.failures + run.toolCalls.failures : null;
+}
+
+function comparisonToolMix(run: RunAnalysis | null): Map<string, number> {
+  return new Map((run?.toolCalls.byTool ?? []).map((tool) => [tool.toolName, tool.started]));
+}
+
+function comparisonProviderModelMix(run: RunAnalysis | null): Map<string, number> {
+  if (!run || (!run.provider && !run.model)) {
+    return new Map();
+  }
+  return new Map([[`${run.provider ?? 'unknown'}/${run.model ?? 'unknown'}`, run.modelCalls.starts]]);
+}
+
+function comparisonMixRows(baseline: Map<string, number>, candidate: Map<string, number>): TraceComparison['toolMix'] {
+  return [...new Set([...baseline.keys(), ...candidate.keys()])]
+    .sort()
+    .map((label) => ({
+      label,
+      baselineCount: baseline.get(label) ?? 0,
+      candidateCount: candidate.get(label) ?? 0,
+      deltaCount: (candidate.get(label) ?? 0) - (baseline.get(label) ?? 0),
+    }));
+}
+
+export function buildTraceAggregateReport(
+  observations: TraceAggregateObservation[],
+  groupBy: TraceAggregateGroupBy,
+  options: {
+    since?: string;
+    until?: string;
+    limit?: number;
+    generatedAt?: string;
+  } = {},
+): TraceAggregateReport {
+  const grouped = new Map<string, TraceAggregateObservation[]>();
+  for (const observation of observations) {
+    const key = aggregateGroupKey(observation, groupBy);
+    const group = grouped.get(key) ?? [];
+    group.push(observation);
+    grouped.set(key, group);
+  }
+
+  const groups = [...grouped.entries()]
+    .map(([key, group]) => aggregateObservationGroup(key, key, group))
+    .sort((left, right) => groupBy === 'day'
+      ? compareDayGroups(left.key, right.key)
+      : right.runCount - left.runCount || left.label.localeCompare(right.label));
+  const startedTimes = observations
+    .map((observation) => parseTimestamp(observation.startedAt))
+    .filter((value): value is number => value !== null)
+    .sort((left, right) => left - right);
+  const terminal = observations.filter((observation) => isAggregateTerminal(observation));
+
+  return {
+    kind: 'trace-aggregate',
+    groupBy,
+    generatedAt: options.generatedAt ?? new Date().toISOString(),
+    population: {
+      runCount: observations.length,
+      terminalRuns: terminal.length,
+      activeRuns: observations.length - terminal.length,
+      missingDuration: terminal.filter((observation) => observation.wallDurationMs === null).length,
+      missingUsage: observations.filter((observation) => observation.totalTokens === null).length,
+      missingCost: observations.filter((observation) => observation.estimatedGrandTotalUSD === null).length,
+      missingContext: observations.filter((observation) => observation.contextGrowthBytes === null).length,
+      earliestStartedAt: startedTimes.length ? new Date(startedTimes[0]!).toISOString() : null,
+      latestStartedAt: startedTimes.length ? new Date(startedTimes.at(-1)!).toISOString() : null,
+      since: options.since ?? null,
+      until: options.until ?? null,
+      limit: options.limit ?? null,
+    },
+    overall: aggregateObservationGroup('all', 'All selected runs', observations),
+    groups,
+    notes: [
+      'Wall-duration percentiles use nearest-rank p50/p90/p95 and include only terminal roots with completed timestamps.',
+      'Recovered success means a persisted succeeded root with retry, failure-recovery, resume, replan, or rejected-call activity; it does not evaluate answer quality.',
+      'Token and model/tool-output cost totals use the same root-tree accounting as --usage; external tool-provider cost remains separate.',
+      ...(observations.some((observation) => observation.totalTokens === null) ? ['Token averages exclude roots without persisted usage measurements.'] : []),
+      ...(observations.some((observation) => observation.estimatedGrandTotalUSD === null) ? ['Cost averages exclude roots with missing model pricing or unpriced external provider requests.'] : []),
+      ...(observations.some((observation) => observation.contextGrowthBytes === null) ? ['Context-growth distributions exclude roots without persisted context-size samples.'] : []),
+      ...(options.limit === undefined ? [] : ['Aggregates describe the filtered population after --limit was applied.']),
+      ...(groupBy === 'day' ? ['Day groups use the root start timestamp normalized to UTC.'] : []),
+    ],
+  };
+}
+
+function aggregateGroupKey(observation: TraceAggregateObservation, groupBy: TraceAggregateGroupBy): string {
+  switch (groupBy) {
+    case 'model':
+      return `${normalizedAggregateLabel(observation.provider)}/${normalizedAggregateLabel(observation.model)}`;
+    case 'status':
+      return normalizedAggregateLabel(observation.status);
+    case 'day': {
+      const startedAt = parseTimestamp(observation.startedAt);
+      return startedAt === null ? 'unknown' : new Date(startedAt).toISOString().slice(0, 10);
+    }
+  }
+}
+
+function aggregateObservationGroup(
+  key: string,
+  label: string,
+  observations: TraceAggregateObservation[],
+): TraceAggregateGroup {
+  const runCount = observations.length;
+  const succeeded = observations.filter((observation) => observation.status === 'succeeded');
+  const recoveredSucceeded = succeeded.filter((observation) => observation.hadRecovery).length;
+  const failed = observations.filter((observation) => observation.status === 'failed').length;
+  const cancelled = observations.filter((observation) => observation.status === 'cancelled').length;
+  const unknown = observations.filter((observation) => !observation.status).length;
+  const activeOrBlocked = runCount - succeeded.length - failed - cancelled - unknown;
+  const terminalDurations = observations
+    .filter((observation) => isAggregateTerminal(observation) && observation.completedAt && observation.wallDurationMs !== null)
+    .map((observation) => observation.wallDurationMs!);
+  const retryByProviderModel = mergeRetryObservations(observations.flatMap((observation) => observation.retryByProviderModel));
+  const toolsByName = mergeToolObservations(observations.flatMap((observation) => observation.tools));
+  const errorCodes = countAggregateLabels(observations.flatMap((observation) => observation.errorCodes));
+
+  return {
+    key,
+    label,
+    runCount,
+    outcomes: {
+      succeeded: succeeded.length,
+      recoveredSucceeded,
+      failed,
+      cancelled,
+      activeOrBlocked,
+      unknown,
+      successRate: aggregateRate(succeeded.length, runCount),
+      recoveredSuccessRate: aggregateRate(recoveredSucceeded, runCount),
+      failureRate: aggregateRate(failed, runCount),
+    },
+    wallDurationMs: aggregateDistribution(terminalDurations),
+    successfulRuns: {
+      count: succeeded.length,
+      averageTokens: aggregateAverage(measuredAggregateValues(succeeded.map((observation) => observation.totalTokens))),
+      averageModelAndToolOutputCostUSD: aggregateAverage(measuredAggregateValues(succeeded.map((observation) => observation.modelAndToolOutputCostUSD))),
+      averageExternalToolProviderCostUSD: aggregateAverage(measuredAggregateValues(succeeded.map((observation) => observation.externalToolProviderCostUSD))),
+      averageEstimatedGrandTotalUSD: aggregateAverage(measuredAggregateValues(succeeded.map((observation) => observation.estimatedGrandTotalUSD))),
+    },
+    modelFailures: observations.reduce((total, observation) => total + observation.modelFailures, 0),
+    retries: {
+      total: observations.reduce((total, observation) => total + observation.retries, 0),
+      runsWithRetries: observations.filter((observation) => observation.retries > 0).length,
+      runFrequency: aggregateRate(observations.filter((observation) => observation.retries > 0).length, runCount),
+      byProviderModel: retryByProviderModel,
+    },
+    tools: {
+      calls: observations.reduce((total, observation) => total + observation.toolCalls, 0),
+      failures: observations.reduce((total, observation) => total + observation.toolFailures, 0),
+      failureRate: aggregateRate(
+        observations.reduce((total, observation) => total + observation.toolFailures, 0),
+        observations.reduce((total, observation) => total + observation.toolCalls, 0),
+      ),
+      byTool: toolsByName,
+    },
+    context: {
+      growthBytes: aggregateDistribution(observations.flatMap((observation) => observation.contextGrowthBytes === null ? [] : [observation.contextGrowthBytes])),
+      peakBytes: aggregateDistribution(observations.flatMap((observation) => observation.peakContextBytes === null ? [] : [observation.peakContextBytes])),
+    },
+    confidence: {
+      high: observations.filter((observation) => observation.dataConfidence === 'high').length,
+      medium: observations.filter((observation) => observation.dataConfidence === 'medium').length,
+      low: observations.filter((observation) => observation.dataConfidence === 'low').length,
+      unknown: observations.filter((observation) => observation.dataConfidence === 'unknown').length,
+    },
+    commonErrorCodes: errorCodes.map(({ label: code, count }) => ({ code, count })),
+  };
+}
+
+function aggregateDistribution(values: number[]): TraceAggregateDistribution {
+  if (values.length === 0) {
+    return { sampleCount: 0, average: null, min: null, p50: null, p90: null, p95: null, max: null };
+  }
+  const sorted = [...values].sort((left, right) => left - right);
+  return {
+    sampleCount: sorted.length,
+    average: aggregateAverage(sorted),
+    min: sorted[0]!,
+    p50: nearestRank(sorted, 50),
+    p90: nearestRank(sorted, 90),
+    p95: nearestRank(sorted, 95),
+    max: sorted.at(-1)!,
+  };
+}
+
+function nearestRank(sorted: number[], percentile: number): number | null {
+  if (sorted.length === 0) return null;
+  const index = Math.max(0, Math.ceil(percentile / 100 * sorted.length) - 1);
+  return sorted[Math.min(index, sorted.length - 1)]!;
+}
+
+function aggregateAverage(values: number[]): number | null {
+  return values.length ? values.reduce((total, value) => total + value, 0) / values.length : null;
+}
+
+function measuredAggregateValues(values: Array<number | null>): number[] {
+  return values.filter((value): value is number => value !== null);
+}
+
+function aggregateRate(numerator: number, denominator: number): number | null {
+  return denominator > 0 ? numerator / denominator : null;
+}
+
+function mergeRetryObservations(
+  observations: TraceAggregateObservation['retryByProviderModel'],
+): TraceAggregateObservation['retryByProviderModel'] {
+  const groups = new Map<string, TraceAggregateObservation['retryByProviderModel'][number]>();
+  for (const observation of observations) {
+    const key = `${observation.provider}\n${observation.model}`;
+    const current = groups.get(key) ?? {
+      provider: observation.provider,
+      model: observation.model,
+      runs: 0,
+      runsWithRetries: 0,
+      retries: 0,
+    };
+    current.runs += observation.runs;
+    current.runsWithRetries += observation.runsWithRetries;
+    current.retries += observation.retries;
+    groups.set(key, current);
+  }
+  return [...groups.values()].sort((left, right) =>
+    right.retries - left.retries
+    || right.runsWithRetries - left.runsWithRetries
+    || left.provider.localeCompare(right.provider)
+    || left.model.localeCompare(right.model)
+  );
+}
+
+function mergeToolObservations(
+  observations: TraceAggregateObservation['tools'],
+): TraceAggregateObservation['tools'] {
+  const groups = new Map<string, TraceAggregateObservation['tools'][number]>();
+  for (const observation of observations) {
+    const current = groups.get(observation.toolName) ?? { toolName: observation.toolName, calls: 0, failures: 0 };
+    current.calls += observation.calls;
+    current.failures += observation.failures;
+    groups.set(observation.toolName, current);
+  }
+  return [...groups.values()].sort((left, right) =>
+    right.failures - left.failures
+    || right.calls - left.calls
+    || left.toolName.localeCompare(right.toolName)
+  );
+}
+
+function countAggregateLabels(labels: string[]): Array<{ label: string; count: number }> {
+  const counts = new Map<string, number>();
+  for (const label of labels) counts.set(label, (counts.get(label) ?? 0) + 1);
+  return [...counts].map(([label, count]) => ({ label, count }))
+    .sort((left, right) => right.count - left.count || left.label.localeCompare(right.label))
+    .slice(0, 10);
+}
+
+function isAggregateTerminal(observation: TraceAggregateObservation): boolean {
+  return Boolean(observation.status && TERMINAL_RUN_STATUSES.has(observation.status));
+}
+
+function normalizedAggregateLabel(value: string | null): string {
+  return value && value.trim() ? value : 'unknown';
+}
+
+function compareDayGroups(left: string, right: string): number {
+  if (left === 'unknown') return right === 'unknown' ? 0 : 1;
+  if (right === 'unknown') return -1;
+  return left.localeCompare(right);
+}
+
+function buildRunAnalysis(report: TraceReport, rows: TraceRow[]): RunAnalysis[] {
+  if (!rows.length) {
+    return report.rootRuns.map((root) => coarseRunAnalysis(root));
+  }
+
+  const groups = new Map<string, TraceRow[]>();
+  for (const row of rows) {
+    const group = groups.get(row.run_id) ?? [];
+    group.push(row);
+    groups.set(row.run_id, group);
+  }
+
+  const wallByRun = new Map([...groups].map(([runId, runRows]) => [runId, rowWall(runRows[0]!) ?? 0]));
+  return [...groups.values()].map((runRows) => {
+    const first = runRows[0]!;
+    const performance = summarizePerformance(runRows);
+    const events = dedupeEvents(runRows);
+    const wallMs = rowWall(first);
+    const modelSpans = events
+      .filter((row) => row.event_type === 'model.completed' || row.event_type === 'model.failed')
+      .map((row) =>
+        payloadNestedNumber(row.payload, 'performance', 'durationMs')
+        ?? payloadNumber(row.payload, 'durationMs')
+      )
+      .filter((value): value is number => value !== null);
+    const modelMs = modelSpans.reduce((total, duration) => total + duration, 0);
+    const toolMs = performance.tools.durationMs.total;
+    const snapshotMs = performance.snapshots.saveDurationMs.total;
+    const cumulativeMeasuredMs = modelMs + toolMs + snapshotMs;
+    const modelStarts = events.filter((row) => row.event_type === 'model.started').length;
+    const modelFailures = events.filter((row) => row.event_type === 'model.failed').length;
+    const runtimeRetries = events.filter((row) =>
+      row.event_type === 'model.retry' && payloadString(row.payload, 'phase') === 'runtime'
+    ).length;
+    const adapterRetries = events.filter((row) =>
+      row.event_type === 'model.retry' && payloadString(row.payload, 'phase') !== 'runtime'
+    ).length;
+    const retries = runtimeRetries + adapterRetries;
+    const logicalCalls = Math.max(0, modelStarts - runtimeRetries);
+    const attempts = modelStarts + adapterRetries;
+    const retryDelayMs = events
+      .filter((row) => row.event_type === 'model.retry')
+      .reduce((total, row) => total + (
+        payloadNumber(row.payload, 'retryDelayMs')
+        ?? payloadNestedNumber(row.payload, 'performance', 'retryDelayMs')
+        ?? 0
+      ), 0);
+    const persistedUsage = createUsageSummary(
+      first.total_prompt_tokens,
+      first.total_completion_tokens,
+      first.total_reasoning_tokens,
+      first.estimated_cost_usd,
+    );
+    const latestUsageEvent = [...events].reverse().find((row) => row.event_type === 'usage.updated');
+    const fallbackUsage = usageFromPayload(latestUsageEvent?.payload);
+    const runUsage = createUsageSummary(
+      persistedUsage.promptTokens || fallbackUsage.promptTokens,
+      persistedUsage.completionTokens || fallbackUsage.completionTokens,
+      persistedUsage.reasoningTokens || fallbackUsage.reasoningTokens,
+      persistedUsage.estimatedCostUSD || fallbackUsage.estimatedCostUSD,
+    );
+    const toolUsage = completedToolUsage(runRows);
+    const combined = addUsage(runUsage, toolUsage);
+    const context = contextGrowth(events);
+    const external = buildToolAccountingSummary(report.timeline.filter((entry) => entry.runId === first.run_id));
+    const children = [...groups.values()].map((group) => group[0]!).filter((row) => row.parent_run_id === first.run_id);
+    const rawOutputBytes = performance.tools.rawOutputBytes.total;
+    const modelVisibleOutputBytes = performance.tools.modelOutputBytes.total;
+    const latestModelEvent = [...events].reverse().find((row) =>
+      row.event_type === 'model.started'
+      || row.event_type === 'model.completed'
+      || row.event_type === 'model.failed'
+      || row.event_type === 'model.retry'
+    );
+    const latestUsagePayload = asRecord(payloadValue(latestUsageEvent?.payload, 'usage'));
+    const provider = nonEmptyString(first.model_provider)
+      ?? payloadString(latestModelEvent?.payload, 'provider')
+      ?? nonEmptyString(latestUsagePayload?.provider);
+    const model = nonEmptyString(first.model_name)
+      ?? payloadString(latestModelEvent?.payload, 'model')
+      ?? nonEmptyString(latestUsagePayload?.model);
+    const performanceCoverage = events.length ? performance.events.measuredEvents / events.length : null;
+    const costCoverage = external.totalRequests
+      ? (external.totalRequests - external.unpricedRequests) / external.totalRequests
+      : null;
+    const notes: string[] = [];
+    if (events.length === 0) notes.push('Per-run event analysis is unavailable; only persisted run fields are shown.');
+    if (performanceCoverage !== null && performanceCoverage < 1) notes.push(`Performance payload coverage is ${Math.round(performanceCoverage * 100)}%.`);
+    if (context.source === 'unavailable') notes.push('Context growth is unavailable because no message size/count samples were persisted.');
+    if (!provider && !model) notes.push('Provider/model identity is unavailable.');
+    if (external.unpricedRequests > 0) notes.push(`${external.unpricedRequests} external provider request(s) are unpriced.`);
+
+    return {
+      rootRunId: first.root_run_id,
+      runId: first.run_id,
+      parentRunId: first.parent_run_id,
+      delegateName: first.run_delegate_name,
+      depth: first.delegation_depth ?? 0,
+      status: first.run_status,
+      provider,
+      model,
+      durations: {
+        wallMs,
+        modelMs,
+        toolMs,
+        snapshotMs,
+        cumulativeMeasuredMs,
+        otherMs: wallMs === null ? null : Math.max(0, wallMs - cumulativeMeasuredMs),
+        unexplainedWallPercentage: wallMs && wallMs > 0
+          ? Math.max(0, wallMs - cumulativeMeasuredMs) / wallMs * 100
+          : null,
+        parallelism: wallMs && wallMs > 0 ? cumulativeMeasuredMs / wallMs : null,
+        ...(first.run_status === 'awaiting_subagent'
+          ? { delegateWaitNote: 'Wall time may include awaiting_subagent delegate wait; child work is reported separately.' }
+          : {}),
+      },
+      modelCalls: {
+        starts: modelStarts,
+        runtimeRetries,
+        adapterRetries,
+        retries,
+        retryDelayMs,
+        attempts,
+        logicalCalls,
+        retryAmplification: logicalCalls > 0 ? attempts / logicalCalls : null,
+        failures: modelFailures,
+        failureRate: modelStarts ? modelFailures / modelStarts : null,
+        slowestSpanMs: modelSpans.length ? Math.max(...modelSpans) : null,
+      },
+      toolCalls: {
+        starts: performance.tools.started,
+        failures: performance.tools.failed,
+        failureRate: performance.tools.started ? performance.tools.failed / performance.tools.started : null,
+        slowestSpanMs: performance.tools.durationMs.count ? performance.tools.durationMs.max : null,
+        rawOutputBytes,
+        modelVisibleOutputBytes,
+        rawToModelRatio: modelVisibleOutputBytes ? rawOutputBytes / modelVisibleOutputBytes : null,
+        reductionPercentage: rawOutputBytes ? (rawOutputBytes - modelVisibleOutputBytes) / rawOutputBytes * 100 : null,
+        byTool: performance.tools.byTool,
+      },
+      usage: {
+        runModel: runUsage,
+        nonDelegateToolOutput: toolUsage,
+        combined,
+        promptCompletionRatio: combined.completionTokens ? combined.promptTokens / combined.completionTokens : null,
+      },
+      costs: {
+        modelEstimateUSD: runUsage.estimatedCostUSD,
+        toolOutputEstimateUSD: toolUsage.estimatedCostUSD,
+        externalToolProviderEstimateUSD: external.estimatedCostUSD,
+        estimatedGrandTotalUSD: combined.estimatedCostUSD + external.estimatedCostUSD,
+        unpricedProviderRequests: external.unpricedRequests,
+      },
+      contextGrowth: context,
+      replanCount: events.filter((row) => row.event_type === 'replan.required').length,
+      approvalRequestCount: events.filter((row) => row.event_type === 'approval.requested').length,
+      approvalResolvedCount: events.filter((row) => row.event_type === 'approval.resolved').length,
+      directChildFanOut: children.length,
+      cumulativeDirectChildWallMs: children.reduce((total, child) => total + (wallByRun.get(child.run_id) ?? 0), 0),
+      outputBytes: byteLength(first.run_result),
+      coverage: {
+        events: events.length,
+        performance: performanceCoverage,
+        snapshots: performance.snapshots.created,
+        cost: costCoverage,
+      },
+      notes,
+    };
+  }).sort((left, right) => left.depth - right.depth || left.runId.localeCompare(right.runId));
+}
+
+function dedupeEvents(rows: TraceRow[]): TraceRow[] {
+  const seen = new Set<string>();
+  return rows
+    .filter((row, index) => {
+      if (!row.event_type) return false;
+      const key = row.event_id ?? `${row.run_id}:${row.event_seq ?? row.event_created_at ?? index}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((left, right) =>
+      (left.event_seq ?? Infinity) - (right.event_seq ?? Infinity)
+      || compareTime(left.event_created_at, right.event_created_at)
+    );
+}
+
+function rowWall(row: TraceRow): number | null {
+  return durationMs(row.run_created_at, row.run_completed_at ?? row.run_updated_at);
+}
+
+function byteLength(value: unknown): number {
+  if (value === null || value === undefined) return 0;
+  try {
+    const text = typeof value === 'string' ? value : JSON.stringify(value);
+    return text === undefined ? 0 : Buffer.byteLength(text);
+  } catch {
+    return 0;
+  }
+}
+
+function createUsageSummary(prompt: unknown, completion: unknown, reasoning: unknown, cost: unknown): UsageSummary {
+  const promptTokens = finiteNumber(prompt) ?? 0;
+  const completionTokens = finiteNumber(completion) ?? 0;
+  const reasoningTokens = finiteNumber(reasoning) ?? 0;
+  return {
+    promptTokens,
+    completionTokens,
+    reasoningTokens,
+    totalTokens: promptTokens + completionTokens + reasoningTokens,
+    estimatedCostUSD: finiteNumber(cost) ?? 0,
+  };
+}
+
+function usageFromPayload(payload: unknown): UsageSummary {
+  const outer = asRecord(payload) ?? {};
+  const usagePayload = asRecord(outer.usage) ?? outer;
+  const completionDetails = asRecord(usagePayload.completionTokensDetails)
+    ?? asRecord(usagePayload.completion_tokens_details);
+  const costDetails = asRecord(usagePayload.costDetails) ?? asRecord(usagePayload.cost_details);
+  const costBreakdown = asRecord(usagePayload.costBreakdown) ?? asRecord(usagePayload.cost_breakdown);
+  const splitCost = sumFiniteNumbers(
+    firstFiniteNumber(costDetails?.upstream_inference_prompt_cost, costBreakdown?.prompt_cost),
+    firstFiniteNumber(
+      costDetails?.upstream_inference_completions_cost,
+      costBreakdown?.completion_cost,
+      costBreakdown?.completions_cost,
+    ),
+  );
+  const cost = firstNonZeroFiniteNumber(
+    usagePayload.estimatedCostUSD,
+    usagePayload.estimated_cost_usd,
+    usagePayload.costUSD,
+    usagePayload.cost_usd,
+    usagePayload.totalCostUSD,
+    usagePayload.total_cost_usd,
+    usagePayload.cost,
+    usagePayload.total_cost,
+    costDetails?.upstream_inference_cost,
+    splitCost,
+    outer.estimatedCostUSD,
+    outer.estimated_cost_usd,
+    outer.costUSD,
+    outer.cost_usd,
+    outer.totalCostUSD,
+    outer.total_cost_usd,
+    outer.cost,
+    outer.total_cost,
+  );
+  return createUsageSummary(
+    usagePayload.promptTokens ?? usagePayload.prompt_tokens ?? usagePayload.inputTokens ?? usagePayload.input_tokens,
+    usagePayload.completionTokens ?? usagePayload.completion_tokens ?? usagePayload.outputTokens ?? usagePayload.output_tokens,
+    usagePayload.reasoningTokens ?? usagePayload.reasoning_tokens
+      ?? completionDetails?.reasoningTokens ?? completionDetails?.reasoning_tokens,
+    cost,
+  );
+}
+
+function addUsage(left: UsageSummary, right: UsageSummary): UsageSummary {
+  return createUsageSummary(
+    left.promptTokens + right.promptTokens,
+    left.completionTokens + right.completionTokens,
+    (left.reasoningTokens ?? 0) + (right.reasoningTokens ?? 0),
+    left.estimatedCostUSD + right.estimatedCostUSD,
+  );
+}
+
+function completedToolUsage(rows: TraceRow[]): UsageSummary {
+  const seen = new Set<string>();
+  let total = createUsageSummary(0, 0, 0, 0);
+  for (const row of rows) {
+    const key = `${row.run_id}:${row.tool_call_id}`;
+    if (
+      !row.tool_call_id
+      || seen.has(key)
+      || row.child_run_id
+      || row.tool_execution_status !== 'completed'
+    ) {
+      continue;
+    }
+    seen.add(key);
+    total = addUsage(total, usageFromPayload(row.tool_output));
+  }
+  return total;
+}
+
+function contextGrowth(events: TraceRow[]): RunAnalysis['contextGrowth'] {
+  const snapshots = events.filter((event) =>
+    event.event_type === 'snapshot.created' && asRecord(payloadValue(event.payload, 'performance'))
+  );
+  const selected = snapshots.length > 0
+    ? snapshots
+    : events.filter((event) =>
+        event.event_type === 'model.started' && asRecord(payloadValue(event.payload, 'performance'))
+      );
+  const samples = selected
+    .map((event) => {
+      const performance = asRecord(payloadValue(event.payload, 'performance'))!;
+      return {
+        bytes: nullableFiniteNumber(performance.messageBytes ?? performance.message_bytes),
+        count: nullableFiniteNumber(performance.messageCount ?? performance.message_count),
+      };
+    })
+    .filter((sample) => sample.bytes !== null || sample.count !== null);
+  const bytes = samples.flatMap((sample) => sample.bytes === null ? [] : [sample.bytes]);
+  const counts = samples.flatMap((sample) => sample.count === null ? [] : [sample.count]);
+  const initialBytes = bytes[0] ?? null;
+  const latestBytes = bytes.at(-1) ?? null;
+  const initialCount = counts[0] ?? null;
+  const latestCount = counts.at(-1) ?? null;
+
+  return {
+    source: samples.length > 0 ? (snapshots.length > 0 ? 'snapshot' : 'model-request') : 'unavailable',
+    samples: samples.length,
+    initialMessageBytes: initialBytes,
+    latestMessageBytes: latestBytes,
+    peakMessageBytes: bytes.length ? Math.max(...bytes) : null,
+    messageBytesGrowth: growth(initialBytes, latestBytes),
+    messageBytesGrowthPercentage: growthPercentage(initialBytes, latestBytes),
+    initialMessageCount: initialCount,
+    latestMessageCount: latestCount,
+    peakMessageCount: counts.length ? Math.max(...counts) : null,
+    messageCountGrowth: growth(initialCount, latestCount),
+    messageCountGrowthPercentage: growthPercentage(initialCount, latestCount),
+  };
+}
+
+function growth(initial: number | null | undefined, latest: number | null | undefined): number | null {
+  return initial === null || initial === undefined || latest === null || latest === undefined
+    ? null
+    : latest - initial;
+}
+
+function growthPercentage(initial: number | null | undefined, latest: number | null | undefined): number | null {
+  const delta = growth(initial, latest);
+  return delta === null || !initial ? null : delta / initial * 100;
+}
+
+function nullableFiniteNumber(value: unknown): number | null {
+  return value === null || value === undefined || value === '' ? null : finiteNumber(value);
+}
+
+function finiteNumber(value: unknown): number | null {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function firstFiniteNumber(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    if (value === null || value === undefined || value === '') continue;
+    const parsed = finiteNumber(value);
+    if (parsed !== null) return parsed;
+  }
+  return undefined;
+}
+
+function firstNonZeroFiniteNumber(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    const parsed = finiteNumber(value);
+    if (parsed !== null && parsed !== 0) return parsed;
+  }
+  return undefined;
+}
+
+function sumFiniteNumbers(...values: unknown[]): number | undefined {
+  let total = 0;
+  let found = false;
+  for (const value of values) {
+    const parsed = finiteNumber(value);
+    if (parsed === null) continue;
+    total += parsed;
+    found = true;
+  }
+  return found ? total : undefined;
+}
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value : null;
+}
+
+function coarseRunAnalysis(root: RootRun): RunAnalysis {
+  const row = {
+    root_run_id: root.rootRunId,
+    run_id: root.runId,
+    parent_run_id: null,
+    run_delegate_name: null,
+    delegation_depth: 0,
+    run_status: root.status,
+    run_created_at: root.startedAt ?? null,
+    run_updated_at: root.updatedAt ?? null,
+    run_completed_at: root.completedAt ?? null,
+    run_result: root.result,
+    model_provider: root.modelProvider,
+    model_name: root.modelName,
+  } as TraceRow;
+  return buildRunAnalysis({ rootRuns: [], timeline: [] } as unknown as TraceReport, [row])[0]!;
 }
 
 export function summarizePerformance(rows: TraceRow[]): PerformanceSummary {

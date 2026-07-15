@@ -3,11 +3,244 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-import { buildTimeline, buildTraceDiagnostics, computeDelegateReason, listSessionPerformance, listSessions, loadUsageForTraceTarget, parseArgs, renderDeleteEmptyGoalSessionsSql, renderSessionList, renderSessionPerformanceList, renderSessionlessRunList, renderTraceHtml, renderTraceReport, renderUsageReport, summarizePerformance, summarizeTrace, traceSession } from './trace-session.js';
+import { aggregateSessionPerformance, buildTimeline, buildTraceAggregateReport, buildTraceComparison, buildTraceDiagnostics, computeDelegateReason, listSessionPerformance, listSessions, loadUsageForTraceTarget, parseArgs, renderDeleteEmptyGoalSessionsSql, renderSessionList, renderSessionPerformanceList, renderSessionlessRunList, renderTraceAggregate, renderTraceAggregateHtml, renderTraceComparison, renderTraceComparisonHtml, renderTraceHtml, renderTraceReport, renderUsageReport, summarizePerformance, summarizeTrace, traceSession } from './trace-session.js';
 import { cacheKey, databaseIdentity, effectiveCacheTtl, parseCacheDuration, readCache, writeCache } from './trace-session/cache.js';
-import type { EventType, MilestoneEntry, TraceReport, TraceRow } from './trace-session.js';
+import type { EventType, MilestoneEntry, TraceAggregateObservation, TraceReport, TraceRow } from './trace-session.js';
 
 describe('trace-session CLI helpers', () => {
+  it('parses comparison mode and rejects incomplete, identical, and incompatible targets', () => {
+    expect(parseArgs(['trace-session', '--compare', 'base', 'candidate'])).toMatchObject({ compareRunIds: ['base', 'candidate'] });
+    expect(() => parseArgs(['trace-session', '--compare', 'base'])).toThrow('requires a value');
+    expect(() => parseArgs(['trace-session', '--compare', 'same', 'same'])).toThrow('different run IDs');
+    for (const args of [['target'], ['--run', 'run'], ['--messages'], ['--ls'], ['--view', 'summary']]) {
+      expect(() => parseArgs(['trace-session', '--compare', 'base', 'candidate', ...args])).toThrow('exclusive');
+    }
+  });
+
+  it('renders a concise message instead of an empty report for missing sessions and runs', () => {
+    const sessionReport = reliabilityReport({
+      target: traceTarget('session', 'missing-session'),
+      session: null,
+      rootRuns: [],
+    });
+    const runReport = reliabilityReport({
+      target: traceTarget('run', 'missing-run'),
+      session: null,
+      rootRuns: [],
+    });
+    const options = { json: false, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false };
+
+    expect(stripAnsi(renderTraceReport(sessionReport, options))).toBe('Session "missing-session" was not found in the database.');
+    expect(stripAnsi(renderTraceReport(runReport, options))).toBe('Run "missing-run" was not found in the database.');
+    expect(JSON.parse(renderTraceReport(runReport, { ...options, json: true }))).toEqual({
+      error: 'Run "missing-run" was not found in the database.',
+      target: { kind: 'run', requestedId: 'missing-run' },
+    });
+  });
+
+  it('dedupes joined event rows and resolves persisted usage per field', () => {
+    const usageEvent = traceRow({ event_id: 'usage', event_seq: 2, event_type: 'usage.updated', payload: { usage: { prompt_tokens: 99, completionTokens: 7, reasoning_tokens: 3 }, costUSD: 0.4 }, total_prompt_tokens: '11', total_completion_tokens: 0, total_reasoning_tokens: null, estimated_cost_usd: 0 });
+    const rows = [usageEvent, { ...usageEvent }, traceRow({ event_id: 'start', event_seq: 1, event_type: 'model.started', payload: { performance: {} }, total_prompt_tokens: '11', total_completion_tokens: 0 })];
+    const run = buildTraceDiagnostics(reliabilityReport(), rows).analysis.runs[0]!;
+    expect(run.coverage.events).toBe(2);
+    expect(run.usage.runModel).toMatchObject({ promptTokens: 11, completionTokens: 7, reasoningTokens: 3, estimatedCostUSD: 0.4, totalTokens: 21 });
+  });
+
+  it('separates retry phases, avoids retry-duration duplication, and reads completed non-delegate tool output', () => {
+    const rows = [
+      traceRow({ event_id: 'start', event_seq: 1, event_type: 'model.started', payload: { performance: { messageCount: 2 } } }),
+      traceRow({ event_id: 'runtime', event_seq: 2, event_type: 'model.retry', payload: { phase: 'runtime', retryDelayMs: 5, performance: { durationMs: 10 } } }),
+      traceRow({ event_id: 'start-2', event_seq: 3, event_type: 'model.started', payload: { provider: 'event-provider', model: 'event-model', performance: { messageCount: 3 } } }),
+      traceRow({ event_id: 'adapter', event_seq: 4, event_type: 'model.retry', payload: { phase: 'http_status', retryDelayMs: 7, performance: { durationMs: 20 } } }),
+      traceRow({ event_id: 'completed', event_seq: 5, event_type: 'model.completed', payload: { provider: 'event-provider', model: 'event-model', performance: { durationMs: 30 } } }),
+      traceRow({ event_id: 'snap', event_seq: 6, event_type: 'snapshot.created', payload: { performance: { messageCount: 4 } } }),
+      traceRow({
+        event_id: 'tool',
+        event_seq: 7,
+        event_type: 'tool.completed',
+        tool_call_id: 'call',
+        tool_execution_status: 'completed',
+        tool_output: {
+          usage: {
+            promptTokens: 5,
+            completionTokens: 2,
+            completion_tokens_details: { reasoning_tokens: 1 },
+            cost_details: { upstream_inference_cost: 0.25 },
+          },
+        },
+        payload: { accounting: { usage: { promptTokens: 500 } } },
+      }),
+      traceRow({ event_id: 'delegate', event_seq: 8, event_type: 'tool.completed', tool_call_id: 'delegate', child_run_id: 'child', tool_execution_status: 'completed', tool_output: { usage: { promptTokens: 100 } } }),
+    ];
+    const run = buildTraceDiagnostics(reliabilityReport(), rows).analysis.runs[0]!;
+    expect(run.modelCalls).toMatchObject({ runtimeRetries: 1, adapterRetries: 1, retries: 2, retryDelayMs: 12, attempts: 3, logicalCalls: 1, retryAmplification: 3 });
+    expect(run.durations.modelMs).toBe(30);
+    expect(run).toMatchObject({ provider: 'event-provider', model: 'event-model' });
+    expect(run.contextGrowth).toMatchObject({ source: 'snapshot', initialMessageBytes: null, peakMessageBytes: null, messageBytesGrowth: null, initialMessageCount: 4 });
+    expect(run.usage.nonDelegateToolOutput).toMatchObject({ promptTokens: 5, completionTokens: 2, reasoningTokens: 1, totalTokens: 8, estimatedCostUSD: 0.25 });
+  });
+
+  it('compares exact analyses in candidate-minus-baseline direction and renders escaped tables', () => {
+    const baselineReport = reliabilityReport({ usage: usage({ total: { promptTokens: 10, completionTokens: 0, totalTokens: 10, estimatedCostUSD: 0.1 } }) });
+    baselineReport.diagnostics = buildTraceDiagnostics(baselineReport, [traceRow({ total_prompt_tokens: 10, model_provider: 'p', model_name: 'm', event_type: 'tool.started', event_tool_name: '<search>', tool_call_id: 'a' })]);
+    const candidateReport = reliabilityReport({ usage: usage({ total: { promptTokens: 15, completionTokens: 0, totalTokens: 15, estimatedCostUSD: 0.2 } }) });
+    candidateReport.diagnostics = buildTraceDiagnostics(candidateReport, [traceRow({ total_prompt_tokens: 15, model_provider: 'q', model_name: 'n', event_type: 'tool.started', event_tool_name: '<search>', tool_call_id: 'b' })]);
+    const comparison = buildTraceComparison(baselineReport, candidateReport, 'root-1', 'root-1');
+    expect(comparison.changes.tokens).toMatchObject({ baseline: 10, candidate: 15, delta: 5, percentageChange: 50 });
+    expect(comparison.changes.cost).toMatchObject({ baseline: 0.1, candidate: 0.2, delta: 0.1, percentageChange: 100 });
+    expect(comparison.toolMix[0]).toMatchObject({ baselineCount: 1, candidateCount: 1, deltaCount: 0 });
+    expect(comparison.providerModelMix.map(row => row.label)).toEqual(['p/m', 'q/n']);
+    const terminal = stripAnsi(renderTraceComparison(comparison));
+    expect(terminal).toContain('# Trace comparison');
+    expect(terminal).toContain('## Metric changes');
+    expect(terminal).toContain('## Tool mix');
+    expect(terminal).toContain('## Provider/model mix');
+    expect(terminal).toContain('┌');
+    expect(terminal).toMatch(/│ tokens\s+│ 10\s+│ 15\s+│ \+5\s+│ \+50\.00%/);
+    expect(terminal).toContain('│ <search>');
+    expect(terminal).not.toContain('label  baseline  candidate  delta');
+    expect(terminal.indexOf('## Provider/model mix')).toBeLessThan(terminal.indexOf('## Metric changes'));
+    expect(JSON.parse(renderTraceComparison(comparison, { json: true })).changes.tokens.delta).toBe(5);
+    const html = renderTraceComparisonHtml(comparison);
+    expect(html).toContain('<table>');
+    expect(html).toContain('&lt;search&gt;');
+  });
+
+  it('compares requested child operations while keeping usage consistent with the resolved root tree', () => {
+    const baselineReport = reliabilityReport({ usage: usage({ total: { promptTokens: 200, completionTokens: 0, totalTokens: 200, estimatedCostUSD: 2 } }) });
+    baselineReport.diagnostics = buildTraceDiagnostics(baselineReport, [traceRow({
+      root_run_id: 'root-a',
+      run_id: 'child-a',
+      parent_run_id: 'root-a',
+      event_id: 'child-a-usage',
+      event_type: 'usage.updated',
+      total_prompt_tokens: 20,
+      payload: { usage: { promptTokens: 200 } },
+    })]);
+    const candidateReport = reliabilityReport({ usage: usage({ total: { promptTokens: 120, completionTokens: 0, totalTokens: 120, estimatedCostUSD: 1.2 } }) });
+    candidateReport.diagnostics = buildTraceDiagnostics(candidateReport, [traceRow({
+      root_run_id: 'root-b',
+      run_id: 'child-b',
+      parent_run_id: 'root-b',
+      event_id: 'child-b-usage',
+      event_type: 'usage.updated',
+      total_prompt_tokens: 12,
+      payload: { usage: { promptTokens: 120 } },
+    })]);
+
+    const comparison = buildTraceComparison(baselineReport, candidateReport, 'child-a', 'child-b');
+
+    expect(comparison.baseline.analysis?.runId).toBe('child-a');
+    expect(comparison.candidate.analysis?.runId).toBe('child-b');
+    expect(comparison.changes.tokens).toMatchObject({ baseline: 200, candidate: 120, delta: -80, percentageChange: -40 });
+    expect(comparison.changes.cost).toMatchObject({ baseline: 2, candidate: 1.2, delta: -0.8, percentageChange: -40 });
+    expect(comparison.notes).toContain('Token and cost metrics use the resolved root-run tree, matching --usage; other metrics describe the requested run.');
+    expect(comparison.notes).toContain('contextBytes: comparison is unavailable because one or both runs lack the required measurement.');
+    expect(stripAnsi(renderTraceComparison(comparison))).toContain('No measured calls.');
+  });
+
+  it('parses aggregate grouping and bounded list windows', () => {
+    expect(parseArgs(['trace-session', '--lsp', '--group-by', 'model', '--since', '7d', '--until', '1h', '--html', 'trend.html'])).toMatchObject({
+      listPerformance: true,
+      groupBy: 'model',
+      since: '7d',
+      until: '1h',
+      htmlPath: 'trend.html',
+    });
+    expect(parseArgs(['trace-session', '--ls', '--since', '2026-07-01T00:00:00Z'])).toMatchObject({ since: '2026-07-01T00:00:00Z' });
+    expect(() => parseArgs(['trace-session', '--ls', '--group-by', 'day'])).toThrow('only be used with --lsp');
+    expect(() => parseArgs(['trace-session', '--lsp', '--group-by', 'provider'])).toThrow('Invalid --group-by');
+    expect(() => parseArgs(['trace-session', '--lsp', '--since', 'recently'])).toThrow('duration');
+    expect(() => parseArgs(['trace-session', '--lsp', '--since', '1h', '--until', '7d'])).toThrow('--since must be earlier');
+  });
+
+  it('aggregates one-root observations with outcome semantics, percentiles, and missing-data coverage', () => {
+    const observations = [
+      aggregateObservation({ rootRunId: 'a', model: '<model>', wallDurationMs: 100, totalTokens: 100, modelAndToolOutputCostUSD: 1, externalToolProviderCostUSD: 0, estimatedGrandTotalUSD: 1, contextGrowthBytes: 10, peakContextBytes: 100 }),
+      aggregateObservation({ rootRunId: 'b', model: '<model>', wallDurationMs: 300, totalTokens: null, modelAndToolOutputCostUSD: null, externalToolProviderCostUSD: 0, estimatedGrandTotalUSD: null, hadRecovery: true, retries: 2, contextGrowthBytes: null, peakContextBytes: null, dataConfidence: 'medium' }),
+      aggregateObservation({ rootRunId: 'c', startedAt: '2026-07-02T10:00:00.000Z', completedAt: '2026-07-02T10:00:00.200Z', status: 'failed', model: 'other', wallDurationMs: 200, totalTokens: 900, modelAndToolOutputCostUSD: 9, externalToolProviderCostUSD: 0, estimatedGrandTotalUSD: 9, modelFailures: 1, toolCalls: 2, toolFailures: 1, tools: [{ toolName: '<search>', calls: 2, failures: 1 }], errorCodes: ['<fatal>'], dataConfidence: 'low' }),
+    ];
+    const aggregate = buildTraceAggregateReport(observations, 'model', { generatedAt: '2026-07-03T00:00:00.000Z', since: '7d' });
+    const model = aggregate.groups.find((group) => group.key === 'provider/<model>')!;
+
+    expect(aggregate.population).toMatchObject({ runCount: 3, terminalRuns: 3, missingUsage: 1, missingCost: 1, missingContext: 1 });
+    expect(aggregate.overall.outcomes).toMatchObject({ succeeded: 2, failed: 1, successRate: 2 / 3, failureRate: 1 / 3 });
+    expect(model.outcomes).toMatchObject({ succeeded: 2, recoveredSucceeded: 1, successRate: 1, recoveredSuccessRate: 0.5 });
+    expect(model.wallDurationMs).toMatchObject({ sampleCount: 2, p50: 100, p90: 300, p95: 300 });
+    expect(model.successfulRuns).toMatchObject({ count: 2, averageTokens: 100, averageEstimatedGrandTotalUSD: 1 });
+    expect(model.retries).toMatchObject({ total: 2, runsWithRetries: 1, runFrequency: 0.5 });
+    expect(model.confidence).toMatchObject({ high: 1, medium: 1 });
+    expect(aggregate.notes).toContain('Token averages exclude roots without persisted usage measurements.');
+
+    const terminal = stripAnsi(renderTraceAggregate(aggregate));
+    expect(terminal).toContain('## Outcomes');
+    expect(terminal).toContain('## Efficiency');
+    expect(terminal).toContain('## Operational signals');
+    expect(terminal).toContain('┌');
+    expect(terminal).toMatch(/│ provider\/<model>\s+│ 2\s+│ 100\.0%\s+│ 0\.0%\s+│ 50\.0%\s+│ 50\.0%/);
+    expect(terminal).toContain('│ <search> (1)');
+    expect(terminal).not.toContain('group | traces');
+    expect(JSON.parse(renderTraceAggregate(aggregate, { json: true })).population.missingUsage).toBe(1);
+    const html = renderTraceAggregateHtml(aggregate);
+    expect(html).toContain('Trace aggregate by model');
+    expect(html).toContain('provider/&lt;model&gt;');
+    expect(html).toContain('&lt;search&gt;');
+    expect(html).toContain('&lt;fatal&gt;');
+  });
+
+  it('renders an empty aggregate without empty markdown tables', () => {
+    const terminal = stripAnsi(renderTraceAggregate(buildTraceAggregateReport([], 'day', { generatedAt: '2026-07-03T00:00:00.000Z' })));
+    expect(terminal).toContain('No matching root traces.');
+    expect(terminal).not.toContain('## Outcomes');
+    expect(terminal).not.toContain('┌');
+  });
+
+  it('wraps wide aggregate tables to the terminal width at comma boundaries', () => {
+    const previousColumns = process.env.COLUMNS;
+    process.env.COLUMNS = '80';
+    try {
+      const aggregate = buildTraceAggregateReport([
+        aggregateObservation({
+          status: 'failed',
+          model: 'model-with-a-long-descriptive-name',
+          modelFailures: 3,
+          toolFailures: 6,
+          tools: [
+            { toolName: 'read_file', calls: 2, failures: 2 },
+            { toolName: 'delegate.researcher', calls: 2, failures: 2 },
+            { toolName: 'generate_mesh_image', calls: 2, failures: 2 },
+          ],
+          errorCodes: ['TOOL_ERROR', 'MODEL_ERROR', 'MAX_STEPS'],
+        }),
+      ], 'model');
+
+      const terminal = stripAnsi(renderTraceAggregate(aggregate));
+      const tableLines = terminal.split('\n').filter((line) => /^[┌┬┐├┼┤│└┴┘]/u.test(line));
+      expect(Math.max(...tableLines.map((line) => line.length))).toBeLessThanOrEqual(80);
+      const operationalRows = terminal
+        .slice(terminal.indexOf('## Operational signals'), terminal.indexOf('## Data notes'))
+        .split('\n')
+        .filter((line) => line.startsWith('│'))
+        .map((line) => line.split('│'));
+      const failedTools = operationalRows.map((cells) => cells[4]?.replace(/\s/g, '') ?? '').join('');
+      const commonErrors = operationalRows.map((cells) => cells[5]?.replace(/\s/g, '') ?? '').join('');
+      expect(failedTools).toContain('delegate.researcher(2),generate_mesh_image(2),read_file(2)');
+      expect(commonErrors).toContain('MAX_STEPS(1),MODEL_ERROR(1),TOOL_ERROR(1)');
+    } finally {
+      if (previousColumns === undefined) delete process.env.COLUMNS;
+      else process.env.COLUMNS = previousColumns;
+    }
+  });
+
+  it('orders UTC day trend groups chronologically and preserves unknown timestamps', () => {
+    const aggregate = buildTraceAggregateReport([
+      aggregateObservation({ rootRunId: 'later', startedAt: '2026-07-02T23:30:00-02:00' }),
+      aggregateObservation({ rootRunId: 'earlier', startedAt: '2026-07-01T23:30:00Z' }),
+      aggregateObservation({ rootRunId: 'unknown', startedAt: null }),
+    ], 'day');
+    expect(aggregate.groups.map((group) => group.key)).toEqual(['2026-07-01', '2026-07-03', 'unknown']);
+  });
+
   it('parses cache durations and cache CLI controls', () => {
     expect(parseCacheDuration('0')).toBe(0);
     expect(parseCacheDuration('250ms')).toBe(250);
@@ -553,6 +786,46 @@ describe('trace-session CLI helpers', () => {
     expect(sessions.some((item) => item.sessionId === 'empty-session' && item.goals.length === 0)).toBe(true);
   });
 
+  it('dedupes and limits aggregate roots before batch detail loading', async () => {
+    const usageQueryRoots: string[][] = [];
+    const client = {
+      query: async <TRow extends Record<string, unknown>>(sql: string, params?: unknown[]) => {
+        if (sql.includes('select to_regclass')) return { rows: [{ exists: false }] } as unknown as { rows: TRow[] };
+        if (sql.includes('from information_schema.columns') && sql.includes('tool_call_id')) return { rows: [{ count: '0' }] } as unknown as { rows: TRow[] };
+        if (sql.includes('from information_schema.columns') && sql.includes('model_provider')) return { rows: [{ count: '2' }] } as unknown as { rows: TRow[] };
+        if (sql.includes('from information_schema.tables')) return { rows: [{ count: '0' }] } as unknown as { rows: TRow[] };
+        if (sql.includes('from agent_runs r') && sql.includes('r.session_id is not null')) {
+          const goal = (rootRunId: string, runId: string, startedAt: string) => ({
+            rootRunId, runId, status: 'succeeded', startedAt,
+            completedAt: startedAt.replace('00.000Z', '01.000Z'), goal: `Goal ${rootRunId}`, linkedAt: startedAt,
+          });
+          return { rows: [{
+            session_id: 'aggregate-session', started_at: '2026-07-03T10:00:00.000Z', status: 'succeeded',
+            goals: [
+              goal('root-a', 'root-a', '2026-07-03T10:00:00.000Z'),
+              goal('root-a', 'child-a', '2026-07-03T10:00:00.000Z'),
+              goal('root-b', 'root-b', '2026-07-02T10:00:00.000Z'),
+              goal('root-c', 'root-c', '2026-07-01T10:00:00.000Z'),
+            ],
+          }] } as unknown as { rows: TRow[] };
+        }
+        if (sql.includes('from agent_runs r') && sql.includes('r.session_id is null')) return { rows: [] } as unknown as { rows: TRow[] };
+        if (sql.includes('run_usage_by_root as')) {
+          const roots = params?.[0] as string[];
+          usageQueryRoots.push(roots);
+          return { rows: roots.map((rootRunId) => ({ root_run_id: rootRunId, total_prompt_tokens: '10', total_completion_tokens: '2', total_reasoning_tokens: '0', estimated_cost_usd: '0.1' })) } as unknown as { rows: TRow[] };
+        }
+        if (sql.includes('attributed_usage as')) return { rows: [] } as unknown as { rows: TRow[] };
+        throw new Error(`Unexpected SQL in test:\n${sql}`);
+      },
+    };
+
+    const aggregate = await aggregateSessionPerformance(client as never, { groupBy: 'status', since: '2026-07-01T00:00:00Z', limit: 2 });
+    expect(usageQueryRoots).toEqual([['root-a', 'root-b']]);
+    expect(aggregate.population).toMatchObject({ runCount: 2, limit: 2 });
+    expect(aggregate.groups).toEqual([expect.objectContaining({ key: 'succeeded', runCount: 2 })]);
+  });
+
   it('renders listed session performance as one line per run', () => {
     const performance = summarizePerformance([
       traceRow({
@@ -783,28 +1056,24 @@ describe('trace-session CLI helpers', () => {
       { json: false },
     );
 
-    expect(output).toContain('model');
-    expect(output).toContain('tool providers');
-    expect(output).toContain('requests=3');
-    expect(output).toContain('cost=$0.007000');
-    expect(output).toContain('combined model/tool-output');
-    expect(output).toContain('estimated grand total');
-    expect(output).toContain('cost=$0.017000');
-    expect(output).toContain('prompt=1,000');
-    expect(output).toContain('completion=250');
-    expect(output).toContain('reasoning=25');
-    expect(output).toContain('Run usage by root run');
-    expect(output).toContain('root run');
-    expect(output).toContain('tokens');
-    expect(output).toContain('root-1');
-    expect(output).toContain('900');
-    expect(output).toContain('700');
-    expect(output).toContain('root-2');
-    expect(output).toContain('375');
-    expect(output).toContain('300');
-    expect(output).toContain('Tool provider usage by provider/operation');
-    expect(output).toContain('serper');
-    expect(output).toContain('web_search');
+    const terminal = stripAnsi(output);
+    expect(terminal).toContain('# Usage');
+    expect(terminal).toContain('## Model and tool-output usage');
+    expect(terminal).toContain('## Tool-provider accounting');
+    expect(terminal).toContain('## Cost summary');
+    expect(terminal).toContain('## Run usage by root run');
+    expect(terminal).toContain('## Model usage by provider/model');
+    expect(terminal).toContain('## Tool-provider usage by provider/operation');
+    expect(terminal).toContain('┌');
+    expect(terminal).toMatch(/│ Combined model\/tool-output\s+│ 1,275\s+│ 1,000\s+│ 250\s+│ 25\s+│ \$0\.010000/);
+    expect(terminal).toMatch(/│ 3\s+│ 2\s+│ 1\s+│ 0\s+│ \$0\.007000/);
+    expect(terminal).toMatch(/│ Estimated grand total\s+│ \$0\.017000/);
+    expect(terminal).toMatch(/│ root-1\s+│ 900\s+│ 700\s+│ 200/);
+    expect(terminal).toMatch(/│ root-2\s+│ 375\s+│ 300\s+│ 50\s+│ 25/);
+    expect(terminal).toContain('openrouter');
+    expect(terminal).toContain('openai/gpt-4.1');
+    expect(terminal).toContain('serper');
+    expect(terminal).toContain('web_search');
   });
 
   it('includes completed non-delegate tool output usage in trace target totals', async () => {
@@ -3314,6 +3583,34 @@ describe('trace-session CLI helpers', () => {
 
 function now(): string {
   return '2026-04-16T10:00:00.000Z';
+}
+
+function aggregateObservation(overrides: Partial<TraceAggregateObservation> = {}): TraceAggregateObservation {
+  return {
+    rootRunId: 'root',
+    startedAt: '2026-07-01T10:00:00.000Z',
+    completedAt: '2026-07-01T10:00:00.100Z',
+    status: 'succeeded',
+    provider: 'provider',
+    model: 'model',
+    wallDurationMs: 100,
+    totalTokens: 10,
+    modelAndToolOutputCostUSD: 0.1,
+    externalToolProviderCostUSD: 0,
+    estimatedGrandTotalUSD: 0.1,
+    hadRecovery: false,
+    retries: 0,
+    modelFailures: 0,
+    toolCalls: 0,
+    toolFailures: 0,
+    contextGrowthBytes: 0,
+    peakContextBytes: 10,
+    dataConfidence: 'high',
+    retryByProviderModel: [],
+    tools: [],
+    errorCodes: [],
+    ...overrides,
+  };
 }
 
 function stripAnsi(value: string): string {
