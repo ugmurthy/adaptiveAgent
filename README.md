@@ -107,6 +107,6 @@ Useful local commands:
 ```bash
 bun run core:test
 bun run agent:build
-bun run trace-session --run <run-id>
+bun run trace-session view run <run-id>
 bun run trace-workbench:dev
 ```

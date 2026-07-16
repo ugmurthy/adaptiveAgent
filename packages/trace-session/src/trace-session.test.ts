@@ -1,20 +1,37 @@
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import chalk from 'chalk';
+import stringWidth from 'string-width';
 import { describe, expect, it } from 'vitest';
 
 import { aggregateSessionPerformance, buildTimeline, buildTraceAggregateReport, buildTraceComparison, buildTraceDiagnostics, computeDelegateReason, listSessionPerformance, listSessions, loadUsageForTraceTarget, parseArgs, renderDeleteEmptyGoalSessionsSql, renderSessionList, renderSessionPerformanceList, renderSessionlessRunList, renderTraceAggregate, renderTraceAggregateHtml, renderTraceComparison, renderTraceComparisonHtml, renderTraceHtml, renderTraceReport, renderUsageReport, summarizePerformance, summarizeTrace, traceSession } from './trace-session.js';
 import { cacheKey, databaseIdentity, effectiveCacheTtl, parseCacheDuration, readCache, writeCache } from './trace-session/cache.js';
+import { usageForArgs } from './trace-session/constants.js';
 import type { EventType, MilestoneEntry, TraceAggregateObservation, TraceReport, TraceRow } from './trace-session.js';
 
 describe('trace-session CLI helpers', () => {
   it('parses comparison mode and rejects incomplete, identical, and incompatible targets', () => {
-    expect(parseArgs(['trace-session', '--compare', 'base', 'candidate'])).toMatchObject({ compareRunIds: ['base', 'candidate'] });
-    expect(() => parseArgs(['trace-session', '--compare', 'base'])).toThrow('requires a value');
-    expect(() => parseArgs(['trace-session', '--compare', 'same', 'same'])).toThrow('different run IDs');
-    for (const args of [['target'], ['--run', 'run'], ['--messages'], ['--ls'], ['--view', 'summary']]) {
-      expect(() => parseArgs(['trace-session', '--compare', 'base', 'candidate', ...args])).toThrow('exclusive');
+    expect(parseArgs(['trace-session', 'compare', 'base', 'candidate'])).toMatchObject({ compareRunIds: ['base', 'candidate'] });
+    expect(() => parseArgs(['trace-session', 'compare', 'base'])).toThrow('candidate run id is required');
+    expect(() => parseArgs(['trace-session', 'compare', 'same', 'same'])).toThrow('different run IDs');
+    for (const args of [['target'], ['--messages'], ['--report', 'summary']]) {
+      expect(() => parseArgs(['trace-session', 'compare', 'base', 'candidate', ...args])).toThrow();
     }
+  });
+
+  it('uses command-specific help and rejects the removed beta switch grammar', () => {
+    expect(usageForArgs(['view', '--help'])).toContain('--report <name>');
+    expect(usageForArgs(['view', '--help'])).not.toContain('--goal <text>');
+    expect(usageForArgs(['list', '--help'])).toContain('--goal <text>');
+    expect(usageForArgs(['list', '--help'])).not.toContain('--messages');
+    expect(() => parseArgs(['trace-session', '--lsp'])).toThrow('Unknown command: --lsp');
+    expect(() => parseArgs(['trace-session', 'view', 'run', 'run-1', '--view', 'summary'])).toThrow('--view is not available');
+  });
+
+  it('accepts explicit usage targets', () => {
+    expect(parseArgs(['trace-session', 'usage', 'root-run', 'root-1'])).toMatchObject({ usageOnly: true, rootRunId: 'root-1' });
+    expect(parseArgs(['trace-session', 'usage', 'run', 'run-1'])).toMatchObject({ usageOnly: true, runId: 'run-1' });
   });
 
   it('renders a concise message instead of an empty report for missing sessions and runs', () => {
@@ -96,7 +113,7 @@ describe('trace-session CLI helpers', () => {
     expect(terminal).toContain('## Tool mix');
     expect(terminal).toContain('## Provider/model mix');
     expect(terminal).toContain('┌');
-    expect(terminal).toMatch(/│ tokens\s+│ 10\s+│ 15\s+│ \+5\s+│ \+50\.00%/);
+    expect(terminal).toMatch(/│ tokens\s+│\s+10\s+│\s+15\s+│\s+\+5\s+│\s+\+50\.00%/);
     expect(terminal).toContain('│ <search>');
     expect(terminal).not.toContain('label  baseline  candidate  delta');
     expect(terminal.indexOf('## Provider/model mix')).toBeLessThan(terminal.indexOf('## Metric changes'));
@@ -134,24 +151,23 @@ describe('trace-session CLI helpers', () => {
     expect(comparison.candidate.analysis?.runId).toBe('child-b');
     expect(comparison.changes.tokens).toMatchObject({ baseline: 200, candidate: 120, delta: -80, percentageChange: -40 });
     expect(comparison.changes.cost).toMatchObject({ baseline: 2, candidate: 1.2, delta: -0.8, percentageChange: -40 });
-    expect(comparison.notes).toContain('Token and cost metrics use the resolved root-run tree, matching --usage; other metrics describe the requested run.');
+    expect(comparison.notes).toContain('Token and cost metrics use the resolved root-run tree, matching the usage command; other metrics describe the requested run.');
     expect(comparison.notes).toContain('contextBytes: comparison is unavailable because one or both runs lack the required measurement.');
     expect(stripAnsi(renderTraceComparison(comparison))).toContain('No measured calls.');
   });
 
   it('parses aggregate grouping and bounded list windows', () => {
-    expect(parseArgs(['trace-session', '--lsp', '--group-by', 'model', '--since', '7d', '--until', '1h', '--html', 'trend.html'])).toMatchObject({
+    expect(parseArgs(['trace-session', 'aggregate', 'model', '--since', '7d', '--until', '1h', '--html', 'trend.html'])).toMatchObject({
       listPerformance: true,
       groupBy: 'model',
       since: '7d',
       until: '1h',
       htmlPath: 'trend.html',
     });
-    expect(parseArgs(['trace-session', '--ls', '--since', '2026-07-01T00:00:00Z'])).toMatchObject({ since: '2026-07-01T00:00:00Z' });
-    expect(() => parseArgs(['trace-session', '--ls', '--group-by', 'day'])).toThrow('only be used with --lsp');
-    expect(() => parseArgs(['trace-session', '--lsp', '--group-by', 'provider'])).toThrow('Invalid --group-by');
-    expect(() => parseArgs(['trace-session', '--lsp', '--since', 'recently'])).toThrow('duration');
-    expect(() => parseArgs(['trace-session', '--lsp', '--since', '1h', '--until', '7d'])).toThrow('--since must be earlier');
+    expect(parseArgs(['trace-session', 'list', 'sessions', '--since', '2026-07-01T00:00:00Z'])).toMatchObject({ since: '2026-07-01T00:00:00Z' });
+    expect(() => parseArgs(['trace-session', 'aggregate', 'provider'])).toThrow('Invalid aggregate dimension');
+    expect(() => parseArgs(['trace-session', 'aggregate', 'day', '--since', 'recently'])).toThrow('duration');
+    expect(() => parseArgs(['trace-session', 'aggregate', 'day', '--since', '1h', '--until', '7d'])).toThrow('--since must be earlier');
   });
 
   it('aggregates one-root observations with outcome semantics, percentiles, and missing-data coverage', () => {
@@ -177,7 +193,7 @@ describe('trace-session CLI helpers', () => {
     expect(terminal).toContain('## Efficiency');
     expect(terminal).toContain('## Operational signals');
     expect(terminal).toContain('┌');
-    expect(terminal).toMatch(/│ provider\/<model>\s+│ 2\s+│ 100\.0%\s+│ 0\.0%\s+│ 50\.0%\s+│ 50\.0%/);
+    expect(terminal).toMatch(/│ provider\/<model>\s+│\s+2\s+│\s+100\.0%\s+│\s+0\.0%\s+│\s+50\.0%\s+│\s+50\.0%/);
     expect(terminal).toContain('│ <search> (1)');
     expect(terminal).not.toContain('group | traces');
     expect(JSON.parse(renderTraceAggregate(aggregate, { json: true })).population.missingUsage).toBe(1);
@@ -232,6 +248,208 @@ describe('trace-session CLI helpers', () => {
     }
   });
 
+  it('renders boxed tables within terminal widths without losing literal or Unicode cell content', () => {
+    const previousColumns = process.env.COLUMNS;
+    try {
+      const aggregate = buildTraceAggregateReport([
+        aggregateObservation({
+          model: '模型😀|tier\\v2-with-a-long-name',
+          tools: [
+            { toolName: 'read_file', calls: 2, failures: 1 },
+            { toolName: 'delegate.researcher', calls: 1, failures: 1 },
+          ],
+          errorCodes: ['MODEL_ERROR', 'TOOL_ERROR'],
+        }),
+      ], 'model');
+
+      for (const width of [60, 80, 120]) {
+        process.env.COLUMNS = String(width);
+        const terminal = stripAnsi(renderTraceAggregate(aggregate));
+        const tableLines = terminal.split('\n').filter((line) => /^[┌┬┐├┼┤│└┴┘]/u.test(line));
+        expect(Math.max(...tableLines.map((line) => stringWidth(line)))).toBeLessThanOrEqual(width);
+        expect(terminal).not.toContain('�');
+        expect(terminal).not.toContain('…');
+        const outcomeRows = terminal
+          .slice(terminal.indexOf('## Outcomes'), terminal.indexOf('## Efficiency'))
+          .split('\n')
+          .filter((line) => line.startsWith('│'))
+          .map((line) => line.split('│'));
+        expect(outcomeRows.map((cells) => cells[1]?.trim() ?? '').join('')).toContain('provider/模型😀|tier\\v2-with-a-long-name');
+        const operationalRows = terminal
+          .slice(terminal.indexOf('## Operational signals'), terminal.indexOf('## Data notes'))
+          .split('\n')
+          .filter((line) => line.startsWith('│'))
+          .map((line) => line.split('│'));
+        expect(operationalRows.map((cells) => cells[4]?.replace(/\s/g, '') ?? '').join('')).toContain('read_file(1),delegate.researcher(1)');
+        expect(operationalRows.map((cells) => cells[5]?.replace(/\s/g, '') ?? '').join('')).toContain('MODEL_ERROR(1),TOOL_ERROR(1)');
+      }
+    } finally {
+      if (previousColumns === undefined) delete process.env.COLUMNS;
+      else process.env.COLUMNS = previousColumns;
+    }
+  });
+
+  it('renders compact tables within terminal widths while preserving wrapped values', () => {
+    const previousColumns = process.env.COLUMNS;
+    try {
+      const report = reliabilityReport();
+      const diagnostics = buildTraceDiagnostics(report, []);
+
+      for (const width of [60, 80, 120]) {
+        process.env.COLUMNS = String(width);
+        const terminal = stripAnsi(renderTraceReport({ ...report, diagnostics }, {
+          json: false,
+          includePlans: false,
+          onlyDelegates: false,
+          messages: false,
+          systemOnly: false,
+          view: 'performance',
+        }));
+        const lines = terminal.split('\n');
+        const separators = lines
+          .map((line, index) => (/^-+(?: +-+)+\s*$/.test(line) ? index : -1))
+          .filter((index) => index >= 0);
+        expect(separators.length).toBeGreaterThan(0);
+        for (const separator of separators) {
+          let end = separator + 1;
+          while (end < lines.length && lines[end] !== '') end += 1;
+          const tableLines = lines.slice(separator - 1, end);
+          expect(Math.max(...tableLines.map((line) => stringWidth(line)))).toBeLessThanOrEqual(width);
+        }
+        expect(terminal).not.toContain('�');
+        if (width === 120) {
+          expect(terminal).toContain('Events carrying `payload.performance`.');
+          expect(terminal).toContain('Model + tool + snapshot save time.');
+        }
+      }
+    } finally {
+      if (previousColumns === undefined) delete process.env.COLUMNS;
+      else process.env.COLUMNS = previousColumns;
+    }
+  });
+
+  it('uses available width before folding compact identifier and value columns', () => {
+    const previousColumns = process.env.COLUMNS;
+    process.env.COLUMNS = '240';
+    try {
+      const rows = [traceRow({
+        event_id: 'wide-tool',
+        event_type: 'tool.completed',
+        event_tool_name: 'delegate.researcher',
+        payload: {
+          toolName: 'delegate.researcher',
+          performance: {
+            durationMs: 1_000,
+            rawOutputBytes: 1_024,
+            modelOutputBytes: 512,
+          },
+        },
+      })];
+      const report = reliabilityReport({ performance: summarizePerformance(rows) });
+      const diagnostics = buildTraceDiagnostics(report, rows);
+      const terminal = stripAnsi(renderTraceReport({ ...report, diagnostics }, {
+        json: false,
+        includePlans: false,
+        onlyDelegates: false,
+        messages: false,
+        systemOnly: false,
+        view: 'performance',
+      }));
+
+      const toolLine = terminal.split('\n').find((line) => line.startsWith('delegate.researcher') && line.includes('1.00s'));
+      expect(toolLine).toContain('1.00s total/1.00s max/1.00s avg');
+      expect(toolLine).toContain('1.0KiB total/1.0KiB max/1.0KiB avg');
+      expect(toolLine).toContain('512B total/512B max/512B avg');
+      expect(terminal.split('\n').find((line) => line.startsWith('pending tool bytes'))).toContain('Serialized pending tool call state.');
+    } finally {
+      if (previousColumns === undefined) delete process.env.COLUMNS;
+      else process.env.COLUMNS = previousColumns;
+    }
+  });
+
+  it('does not leak ANSI reset codes when colored compact cells are wrapped', () => {
+    const previousColumns = process.env.COLUMNS;
+    const previousChalkLevel = chalk.level;
+    process.env.COLUMNS = '60';
+    chalk.level = 3;
+    try {
+      const report = reliabilityReport();
+      const diagnostics = buildTraceDiagnostics(report, []);
+      const terminal = stripAnsi(renderTraceReport({ ...report, diagnostics }, {
+        json: false,
+        includePlans: false,
+        onlyDelegates: false,
+        messages: false,
+        systemOnly: false,
+        view: 'performance',
+      }));
+
+      expect(terminal).not.toMatch(/(^|\s)(?:22m|39m)(?=\s|$)/m);
+      expect(terminal).toContain('pending tool');
+      expect(terminal).toContain('bytes');
+    } finally {
+      chalk.level = previousChalkLevel;
+      if (previousColumns === undefined) delete process.env.COLUMNS;
+      else process.env.COLUMNS = previousColumns;
+    }
+  });
+
+  it('applies preview chars to semantic table text without truncating exact fields or JSON', () => {
+    const previousColumns = process.env.COLUMNS;
+    process.env.COLUMNS = '240';
+    try {
+      const report = reliabilityReport({
+        plans: [{
+          root_run_id: 'root-1',
+          run_id: 'exact-run-id',
+          plan_execution_id: 'exact-plan-execution-id',
+          plan_execution_status: 'running',
+          attempt: 1,
+          current_step_id: 'step-1',
+          current_step_index: 0,
+          replan_reason: 'Need substantially more evidence before continuing execution',
+          plan_id: 'plan-1',
+          plan_goal: 'Investigate workflow',
+          plan_summary: null,
+          step_index: 0,
+          step_key: 'inspect',
+          title: 'Inspect the complete repository for relevant implementation evidence',
+          tool_name: 'read_file',
+          failure_policy: null,
+          requires_approval: false,
+        }],
+      });
+      const options = {
+        json: false,
+        includePlans: true,
+        onlyDelegates: false,
+        messages: false,
+        systemOnly: false,
+        previewChars: 20,
+      } as const;
+
+      const operations = stripAnsi(renderTraceReport(report, { ...options, view: 'operations' }));
+      expect(operations).toContain('Elapsed time across…');
+      expect(operations).toContain('$0.000000 estimated / 0 requests');
+      expect(operations).toContain('model=$0.000000 tool-output=$0.000000 providers=$0.000000');
+      expect(operations).toContain('root-1');
+
+      const plans = stripAnsi(renderTraceReport(report, { ...options, view: 'plans' }));
+      expect(plans).toContain('Inspect the complet…');
+      expect(plans).toContain('Need substantially…');
+      expect(plans).toContain('exact-run-id');
+      expect(plans).toContain('running');
+      expect(plans).toContain('read_file');
+
+      const json = JSON.parse(renderTraceReport(report, { ...options, json: true, view: 'plans' }));
+      expect(json.plans[0].title).toBe('Inspect the complete repository for relevant implementation evidence');
+      expect(json.plans[0].replan_reason).toBe('Need substantially more evidence before continuing execution');
+    } finally {
+      if (previousColumns === undefined) delete process.env.COLUMNS;
+      else process.env.COLUMNS = previousColumns;
+    }
+  });
+
   it('orders UTC day trend groups chronologically and preserves unknown timestamps', () => {
     const aggregate = buildTraceAggregateReport([
       aggregateObservation({ rootRunId: 'later', startedAt: '2026-07-02T23:30:00-02:00' }),
@@ -250,11 +468,11 @@ describe('trace-session CLI helpers', () => {
     expect(parseCacheDuration('1d')).toBe(86_400_000);
     expect(() => parseCacheDuration('-1s')).toThrow('non-negative duration');
     expect(() => parseCacheDuration('five')).toThrow('non-negative duration');
-    expect(parseArgs(['trace-session', 's', '--fresh', '--no-cache', '--cache-ttl', '4m'])).toMatchObject({ fresh: true, noCache: true, cacheTtl: 240_000 });
+    expect(parseArgs(['trace-session', 'view', 'session', 's', '--fresh', '--no-cache', '--cache-ttl', '4m'])).toMatchObject({ fresh: true, noCache: true, cacheTtl: 240_000 });
   });
 
   it('keys structured cache variants without passwords or render-only flags', () => {
-    const base = parseArgs(['trace-session', 's']);
+    const base = parseArgs(['trace-session', 'view', 'session', 's']);
     const config = { connectionString: 'postgres://alice:secret@DB.EXAMPLE:5432/app' };
     const env = { PGHOST: 'db.example', PGUSER: 'alice', USER: 'local-user' };
     expect(databaseIdentity(config.connectionString, env)).toBe(databaseIdentity('postgres://alice:different@db.example/app', env));
@@ -298,7 +516,7 @@ describe('trace-session CLI helpers', () => {
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
   it('parses the primary trace-session command and flags', () => {
-    expect(parseArgs(['trace-session', 'sess-1', '--json', '--root-run', 'root-1', '--include-plans', '--only-delegates'])).toEqual({
+    expect(parseArgs(['trace-session', 'view', 'session', 'sess-1', '--json', '--root-run', 'root-1', '--include-plans', '--only-delegates'])).toEqual({
       sessionId: 'sess-1',
       json: true,
       listSessions: false,
@@ -317,7 +535,7 @@ describe('trace-session CLI helpers', () => {
   });
 
   it('parses message inspection flags for session tracing', () => {
-    expect(parseArgs(['trace-session', 'sess-1', '--messages', '--system-only'])).toEqual({
+    expect(parseArgs(['trace-session', 'view', 'session', 'sess-1', '--messages', '--system-only'])).toEqual({
       sessionId: 'sess-1',
       json: false,
       listSessions: false,
@@ -335,7 +553,7 @@ describe('trace-session CLI helpers', () => {
   });
 
   it('parses reasoning as an explicit message-inspection opt-in', () => {
-    expect(parseArgs(['trace-session', 'sess-1', '--reasoning'])).toMatchObject({
+    expect(parseArgs(['trace-session', 'view', 'session', 'sess-1', '--reasoning'])).toMatchObject({
       sessionId: 'sess-1',
       messages: true,
       reasoning: true,
@@ -343,7 +561,7 @@ describe('trace-session CLI helpers', () => {
   });
 
   it('parses view, message view, focus run, and preview width flags', () => {
-    expect(parseArgs(['trace-session', 'sess-1', '--view', 'messages', '--messages-view', 'delta', '--focus-run', 'run-2', '--preview-chars', '80'])).toEqual({
+    expect(parseArgs(['trace-session', 'view', 'session', 'sess-1', '--report', 'messages', '--messages-view', 'delta', '--focus-run', 'run-2', '--preview-chars', '80'])).toEqual({
       sessionId: 'sess-1',
       json: false,
       listSessions: false,
@@ -365,37 +583,37 @@ describe('trace-session CLI helpers', () => {
   });
 
   it('parses the performance report view', () => {
-    expect(parseArgs(['trace-session', 'sess-1', '--view', 'performance'])).toMatchObject({
+    expect(parseArgs(['trace-session', 'view', 'session', 'sess-1', '--report', 'performance'])).toMatchObject({
       sessionId: 'sess-1',
       view: 'performance',
     });
   });
 
   it('parses the final output report view', () => {
-    expect(parseArgs(['trace-session', 'sess-1', '--view', 'output'])).toMatchObject({
+    expect(parseArgs(['trace-session', 'view', 'session', 'sess-1', '--report', 'output'])).toMatchObject({
       sessionId: 'sess-1',
       view: 'output',
     });
   });
 
   it('parses diagnostic report views', () => {
-    expect(parseArgs(['trace-session', 'sess-1', '--view', 'brief'])).toMatchObject({ view: 'brief' });
-    expect(parseArgs(['trace-session', 'sess-1', '--view', 'summary'])).toMatchObject({ view: 'summary' });
-    expect(parseArgs(['trace-session', 'sess-1', '--view', 'reliability'])).toMatchObject({ view: 'reliability' });
-    expect(parseArgs(['trace-session', 'sess-1', '--view', 'operations'])).toMatchObject({ view: 'operations' });
-    expect(parseArgs(['trace-session', 'sess-1', '--view', 'investigate'])).toMatchObject({ view: 'investigate' });
-    expect(parseArgs(['trace-session', 'sess-1', '--view', 'policy'])).toMatchObject({ view: 'policy' });
+    expect(parseArgs(['trace-session', 'view', 'session', 'sess-1', '--report', 'brief'])).toMatchObject({ view: 'brief' });
+    expect(parseArgs(['trace-session', 'view', 'session', 'sess-1', '--report', 'summary'])).toMatchObject({ view: 'summary' });
+    expect(parseArgs(['trace-session', 'view', 'session', 'sess-1', '--report', 'reliability'])).toMatchObject({ view: 'reliability' });
+    expect(parseArgs(['trace-session', 'view', 'session', 'sess-1', '--report', 'operations'])).toMatchObject({ view: 'operations' });
+    expect(parseArgs(['trace-session', 'view', 'session', 'sess-1', '--report', 'investigate'])).toMatchObject({ view: 'investigate' });
+    expect(parseArgs(['trace-session', 'view', 'session', 'sess-1', '--report', 'policy'])).toMatchObject({ view: 'policy' });
   });
 
   it('parses the static HTML report path', () => {
-    expect(parseArgs(['trace-session', 'sess-1', '--html', 'artifacts/trace.html'])).toMatchObject({
+    expect(parseArgs(['trace-session', 'view', 'session', 'sess-1', '--html', 'artifacts/trace.html'])).toMatchObject({
       sessionId: 'sess-1',
       htmlPath: 'artifacts/trace.html',
     });
   });
 
   it('parses direct run tracing flags without a session id', () => {
-    expect(parseArgs(['trace-session', '--run', 'run-1', '--messages'])).toEqual({
+    expect(parseArgs(['trace-session', 'view', 'run', 'run-1', '--messages'])).toEqual({
       json: false,
       listSessions: false,
       listPerformance: false,
@@ -413,8 +631,7 @@ describe('trace-session CLI helpers', () => {
   });
 
   it('parses the session list flag without a session id', () => {
-    expect(parseArgs(['trace-session', '--ls', '--json', '--preview-chars', '40'])).toEqual({
-      sessionId: undefined,
+    expect(parseArgs(['trace-session', 'list', 'sessions', '--json', '--preview-chars', '40'])).toEqual({
       json: true,
       listSessions: true,
       listPerformance: false,
@@ -432,8 +649,7 @@ describe('trace-session CLI helpers', () => {
   });
 
   it('parses the session performance list flag without a session id', () => {
-    expect(parseArgs(['trace-session', '--lsp', '--json', '--preview-chars', '40'])).toEqual({
-      sessionId: undefined,
+    expect(parseArgs(['trace-session', 'list', 'traces', '--json', '--preview-chars', '40'])).toEqual({
       json: true,
       listSessions: false,
       listPerformance: true,
@@ -452,7 +668,7 @@ describe('trace-session CLI helpers', () => {
 
   it('parses list filters and validates their combinations', () => {
     expect(parseArgs([
-      'trace-session', '--lsp',
+      'trace-session', 'list', 'traces',
       '--goal', 'market', '--goal', 'incident', '--goal-regex', 'EV|vehicle',
       '--status', 'planning', '--status', 'replan_required',
       '--type', 'swarm', '--type', 'swarm-run', '--swarm-role', 'worker', '--limit', '10',
@@ -464,18 +680,17 @@ describe('trace-session CLI helpers', () => {
       swarmRole: 'worker',
       limit: 10,
     });
-    expect(parseArgs(['trace-session', '--lsp', '--goal-regex', 'worker']).goalRegex?.test('Worker')).toBe(true);
-    expect(() => parseArgs(['trace-session', '--lsp', '--has-goal', '--no-goal'])).toThrow('cannot be combined');
-    expect(() => parseArgs(['trace-session', '--lsp', '--no-goal', '--goal', 'market'])).toThrow('cannot be combined');
-    expect(() => parseArgs(['trace-session', '--lsp', '--goal-regex', '['])).toThrow('Invalid --goal-regex');
-    expect(() => parseArgs(['trace-session', '--run', 'run-1', '--type', 'run'])).toThrow('only be used with --ls or --lsp');
-    expect(() => parseArgs(['trace-session', '--lsp', '--status', 'waiting'])).toThrow('Invalid --status');
-    expect(() => parseArgs(['trace-session', '--lsp', '--type', 'swarm', '--swarm-role', 'worker'])).toThrow('requires --type swarm-run');
+    expect(parseArgs(['trace-session', 'list', 'traces', '--goal-regex', 'worker']).goalRegex?.test('Worker')).toBe(true);
+    expect(() => parseArgs(['trace-session', 'list', 'traces', '--has-goal', '--no-goal'])).toThrow('cannot be combined');
+    expect(() => parseArgs(['trace-session', 'list', 'traces', '--no-goal', '--goal', 'market'])).toThrow('cannot be combined');
+    expect(() => parseArgs(['trace-session', 'list', 'traces', '--goal-regex', '['])).toThrow('Invalid --goal-regex');
+    expect(() => parseArgs(['trace-session', 'view', 'run', 'run-1', '--type', 'run'])).toThrow('not available');
+    expect(() => parseArgs(['trace-session', 'list', 'traces', '--status', 'waiting'])).toThrow('Invalid --status');
+    expect(() => parseArgs(['trace-session', 'list', 'traces', '--type', 'swarm', '--swarm-role', 'worker'])).toThrow('requires --type swarm-run');
   });
 
   it('parses the delete flag without a session id', () => {
-    expect(parseArgs(['trace-session', '--delete'])).toEqual({
-      sessionId: undefined,
+    expect(parseArgs(['trace-session', 'maintenance', 'empty-goal-sql'])).toEqual({
       json: false,
       listSessions: false,
       listPerformance: false,
@@ -492,7 +707,7 @@ describe('trace-session CLI helpers', () => {
   });
 
   it('parses the usage flag with a session id', () => {
-    expect(parseArgs(['trace-session', 'sess-1', '--usage', '--json'])).toEqual({
+    expect(parseArgs(['trace-session', 'usage', 'session', 'sess-1', '--json'])).toEqual({
       sessionId: 'sess-1',
       json: true,
       listSessions: false,
@@ -895,8 +1110,7 @@ describe('trace-session CLI helpers', () => {
   });
 
   it('parses the session-less list flag without a session id', () => {
-    expect(parseArgs(['trace-session', '--ls-sessionless', '--json'])).toEqual({
-      sessionId: undefined,
+    expect(parseArgs(['trace-session', 'list', 'sessionless-runs', '--json'])).toEqual({
       json: true,
       listSessions: false,
       listPerformance: false,
@@ -1065,11 +1279,11 @@ describe('trace-session CLI helpers', () => {
     expect(terminal).toContain('## Model usage by provider/model');
     expect(terminal).toContain('## Tool-provider usage by provider/operation');
     expect(terminal).toContain('┌');
-    expect(terminal).toMatch(/│ Combined model\/tool-output\s+│ 1,275\s+│ 1,000\s+│ 250\s+│ 25\s+│ \$0\.010000/);
-    expect(terminal).toMatch(/│ 3\s+│ 2\s+│ 1\s+│ 0\s+│ \$0\.007000/);
-    expect(terminal).toMatch(/│ Estimated grand total\s+│ \$0\.017000/);
-    expect(terminal).toMatch(/│ root-1\s+│ 900\s+│ 700\s+│ 200/);
-    expect(terminal).toMatch(/│ root-2\s+│ 375\s+│ 300\s+│ 50\s+│ 25/);
+    expect(terminal).toMatch(/│ Combined model\/tool-output\s+│\s+1,275\s+│\s+1,000\s+│\s+250\s+│\s+25\s+│\s+\$0\.010000/);
+    expect(terminal).toMatch(/│\s+3\s+│\s+2\s+│\s+1\s+│\s+0\s+│\s+\$0\.007000/);
+    expect(terminal).toMatch(/│ Estimated grand total\s+│\s+\$0\.017000/);
+    expect(terminal).toMatch(/│ root-1\s+│\s+900\s+│\s+700\s+│\s+200/);
+    expect(terminal).toMatch(/│ root-2\s+│\s+375\s+│\s+300\s+│\s+50\s+│\s+25/);
     expect(terminal).toContain('openrouter');
     expect(terminal).toContain('openai/gpt-4.1');
     expect(terminal).toContain('serper');
@@ -1507,19 +1721,20 @@ describe('trace-session CLI helpers', () => {
       },
     ]);
 
+    const report: TraceReport = {
+      target: traceTarget('session', 'sess-1'),
+      session: { ...session('succeeded'), createdAt: '2026-04-01T00:00:00.000Z' },
+      rootRuns: [],
+      usage: usage(),
+      timeline,
+      llmMessages: [],
+      delegates: [],
+      plans: [],
+      warnings: [],
+      summary: { status: 'succeeded', reason: 'ok' },
+    };
     const output = renderTraceReport(
-      {
-        target: traceTarget('session', 'sess-1'),
-        session: { ...session('succeeded'), createdAt: '2026-04-01T00:00:00.000Z' },
-        rootRuns: [],
-        usage: usage(),
-        timeline,
-        llmMessages: [],
-        delegates: [],
-        plans: [],
-        warnings: [],
-        summary: { status: 'succeeded', reason: 'ok' },
-      },
+      report,
       { json: false, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false, view: 'timeline' },
     );
 
@@ -1530,6 +1745,20 @@ describe('trace-session CLI helpers', () => {
     expect(lines[titleIndex + 1]).toContain('duration');
     expect(lines.find((line) => line.includes('read_file'))).toContain('02:37:42.662');
     expect(lines.find((line) => line.includes('step.completed'))).toContain('{ "lines": 42 }');
+
+    const preview = renderTraceReport(report, {
+      json: false,
+      includePlans: false,
+      onlyDelegates: false,
+      messages: false,
+      systemOnly: false,
+      view: 'timeline',
+      previewChars: 12,
+    });
+    expect(preview).toContain('{ "lines":…');
+    expect(preview).not.toContain('{ "lines": 42 }');
+    expect(preview).toContain('step-1');
+    expect(preview).toContain('step.completed');
   });
 
   it('renders session duration and markdown-style section headers in the human report', () => {
@@ -2094,7 +2323,7 @@ describe('trace-session CLI helpers', () => {
     expect(investigation).toContain('Consequences');
     expect(investigation).toContain('ERROR consequence failure Trace failed');
     expect(investigation).toContain('Evidence');
-    expect(investigation).toContain('$ trace-session --run child-run --view messages --messages-view delta');
+    expect(investigation).toContain('$ trace-session view run child-run --report messages --messages-view delta');
     expect(investigation).not.toContain('severity  category');
 
     const policy = renderTraceReport({ ...report, diagnostics }, { json: false, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false, view: 'policy' });
@@ -2394,7 +2623,7 @@ describe('trace-session CLI helpers', () => {
     const primary = diagnostics.findings.find((finding) => finding.role === 'primary-cause' && finding.title === 'Tool failures observed');
 
     expect(primary?.evidence[0]).toMatchObject({ runId, toolCallId, eventSeq: 42, eventType: 'tool.failed' });
-    expect(primary?.commands.map((command) => command.command)).toContain(`trace-session --run ${runId} --view timeline`);
+    expect(primary?.commands.map((command) => command.command)).toContain(`trace-session view run ${runId} --report timeline`);
     expect(diagnostics.findings.findIndex((finding) => finding.role === 'primary-cause'))
       .toBeLessThan(diagnostics.findings.findIndex((finding) => finding.role === 'consequence'));
 
@@ -2409,7 +2638,7 @@ describe('trace-session CLI helpers', () => {
     expect(output).toContain('event #42  tool.failed');
     expect(output).toContain(runId);
     expect(output).toContain(toolCallId);
-    expect(output).toContain(`$ trace-session --run ${runId} --view timeline`);
+    expect(output).toContain(`$ trace-session view run ${runId} --report timeline`);
   });
 
   it('renders a self-contained static HTML report with escaped trace data', () => {

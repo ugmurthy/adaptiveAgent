@@ -7,7 +7,7 @@ import chalk from 'chalk';
 
 import { createTracePostgresPool as createPostgresPool, resolveTracePostgresConfig, type TracePostgresConfig, type TracePostgresPool } from '../db.js';
 
-import { USAGE } from './constants.js';
+import { USAGE, usageForArgs } from './constants.js';
 import { cacheKey, isTerminalReport, parseCacheDuration, readCache, writeCache } from './cache.js';
 import { aggregateSessionPerformance, listSessionlessRuns, listSessionPerformance, listSessions, loadUsageForTraceTargetWithTerminalState, traceSession } from './data.js';
 import { buildTraceComparison } from './report.js';
@@ -42,44 +42,90 @@ export function parseArgs(args: string[]): CliOptions {
     systemOnly: false,
     help: false,
   };
-  const positional: string[] = [];
+  const originalArgs = args;
+  const normalizedArgs = args[0] === 'trace-session' ? args.slice(1) : [...args];
+  const command = normalizedArgs.shift();
+  const helpRequested = normalizedArgs.includes('--help') || normalizedArgs.includes('-h');
 
-  for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index]!;
+  if (!command) {
+    throw new Error(`Missing command.\n\n${USAGE}`);
+  }
+  if (command === '--help' || command === '-h') {
+    options.help = true;
+    return options;
+  }
+
+  switch (command) {
+    case 'view': {
+      if (helpRequested && normalizedArgs[0]?.startsWith('-')) break;
+      const target = requireCommandArgument('view target', normalizedArgs.shift());
+      const id = requireCommandArgument(`${target} id`, normalizedArgs.shift());
+      if (target === 'session') options.sessionId = id;
+      else if (target === 'root-run') options.rootRunId = id;
+      else if (target === 'run') options.runId = id;
+      else throw new Error(`Invalid view target: ${target}. Expected session, root-run, or run.`);
+      break;
+    }
+    case 'compare':
+      if (!helpRequested) {
+        options.compareRunIds = [
+          requireCommandArgument('baseline run id', normalizedArgs.shift()),
+          requireCommandArgument('candidate run id', normalizedArgs.shift()),
+        ];
+      }
+      break;
+    case 'list': {
+      if (helpRequested && normalizedArgs[0]?.startsWith('-')) break;
+      const target = requireCommandArgument('list target', normalizedArgs.shift());
+      if (target === 'sessions') options.listSessions = true;
+      else if (target === 'traces') options.listPerformance = true;
+      else if (target === 'sessionless-runs') options.listSessionless = true;
+      else throw new Error(`Invalid list target: ${target}. Expected sessions, traces, or sessionless-runs.`);
+      break;
+    }
+    case 'aggregate': {
+      if (helpRequested && normalizedArgs[0]?.startsWith('-')) break;
+      const groupBy = requireCommandArgument('aggregate dimension', normalizedArgs.shift());
+      if (!['model', 'status', 'day'].includes(groupBy)) throw new Error(`Invalid aggregate dimension: ${groupBy}. Expected model, status, or day.`);
+      options.listPerformance = true;
+      options.groupBy = groupBy as TraceAggregateGroupBy;
+      break;
+    }
+    case 'usage': {
+      options.usageOnly = true;
+      if (helpRequested && normalizedArgs[0]?.startsWith('-')) break;
+      const target = requireCommandArgument('usage target', normalizedArgs.shift());
+      const id = requireCommandArgument(`${target} id`, normalizedArgs.shift());
+      if (target === 'session') options.sessionId = id;
+      else if (target === 'root-run') options.rootRunId = id;
+      else if (target === 'run') options.runId = id;
+      else throw new Error(`Invalid usage target: ${target}. Expected session, root-run, or run.`);
+      break;
+    }
+    case 'maintenance': {
+      if (helpRequested && normalizedArgs[0]?.startsWith('-')) break;
+      const operation = requireCommandArgument('maintenance operation', normalizedArgs.shift());
+      if (operation !== 'empty-goal-sql') throw new Error(`Invalid maintenance operation: ${operation}. Expected empty-goal-sql.`);
+      options.deleteEmptyGoalSessions = true;
+      break;
+    }
+    default:
+      throw new Error(`Unknown command: ${command}\n\n${USAGE}`);
+  }
+
+  for (let index = 0; index < normalizedArgs.length; index += 1) {
+    const arg = normalizedArgs[index]!;
+    assertOptionApplies(command, arg, options);
     switch (arg) {
-      case 'trace-session':
-        if (positional.length === 0) {
-          break;
-        }
-        positional.push(arg);
-        break;
       case '--json':
         options.json = true;
         break;
-      case '--compare':
-        options.compareRunIds = [requireValue(arg, args[++index]), requireValue(arg, args[++index])];
-        break;
       case '--html':
-        options.htmlPath = requireValue(arg, args[++index]);
-        break;
-      case '--ls':
-        options.listSessions = true;
-        break;
-      case '--lsp':
-        options.listPerformance = true;
-        break;
-      case '--ls-sessionless':
-        options.listSessionless = true;
-        break;
-      case '--delete':
-        options.deleteEmptyGoalSessions = true;
-        break;
-      case '--usage':
-        options.usageOnly = true;
+        options.htmlPath = requireValue(arg, normalizedArgs[++index]);
         break;
       case '--fresh': options.fresh = true; break;
       case '--no-cache': options.noCache = true; break;
-      case '--cache-ttl': options.cacheTtl = parseCacheDuration(requireValue(arg, args[++index])); break;
+      case '--cache-ttl': options.cacheTtl = parseCacheDuration(requireValue(arg, normalizedArgs[++index])); break;
       case '--messages':
         options.messages = true;
         break;
@@ -88,69 +134,58 @@ export function parseArgs(args: string[]): CliOptions {
         options.messages = true;
         break;
       case '--messages-view':
-        options.messagesView = parseMessageView(requireValue(arg, args[++index]));
+        options.messagesView = parseMessageView(requireValue(arg, normalizedArgs[++index]));
         options.messages = true;
         break;
       case '--system-only':
         options.systemOnly = true;
         options.messages = true;
         break;
-      case '--view':
-        options.view = parseReportView(requireValue(arg, args[++index]));
+      case '--report':
+        options.view = parseReportView(requireValue(arg, normalizedArgs[++index]));
         if (options.view === 'messages') {
           options.messages = true;
         }
         break;
       case '--focus-run':
-        options.focusRunId = requireValue(arg, args[++index]);
+        options.focusRunId = requireValue(arg, normalizedArgs[++index]);
         break;
       case '--preview-chars':
-        options.previewChars = parsePositiveInteger(requireValue(arg, args[++index]), arg);
+        options.previewChars = parsePositiveInteger(requireValue(arg, normalizedArgs[++index]), arg);
         break;
       case '--goal':
-        (options.goals ??= []).push(requireValue(arg, args[++index]));
+        (options.goals ??= []).push(requireValue(arg, normalizedArgs[++index]));
         break;
       case '--goal-regex': {
-        const value = requireValue(arg, args[++index]);
+        const value = requireValue(arg, normalizedArgs[++index]);
         try { options.goalRegex = new RegExp(value, 'i'); } catch { throw new Error(`Invalid --goal-regex value: ${value}.`); }
         break;
       }
       case '--has-goal': options.hasGoal = true; break;
       case '--no-goal': options.noGoal = true; break;
       case '--status': {
-        const value = requireValue(arg, args[++index]);
+        const value = requireValue(arg, normalizedArgs[++index]);
         if (!['queued', 'planning', 'awaiting_approval', 'awaiting_subagent', 'running', 'interrupted', 'succeeded', 'failed', 'clarification_requested', 'replan_required', 'cancelled'].includes(value)) throw new Error(`Invalid --status value: ${value}.`);
         (options.statuses ??= []).push(value);
         break;
       }
-      case '--limit': options.limit = parsePositiveInteger(requireValue(arg, args[++index]), arg); break;
-      case '--group-by': {
-        const value = requireValue(arg, args[++index]);
-        if (!['model', 'status', 'day'].includes(value)) throw new Error(`Invalid --group-by value: ${value}. Expected model, status, or day.`);
-        options.groupBy = value as TraceAggregateGroupBy;
-        break;
-      }
-      case '--since': options.since = parseListTimeBoundary(requireValue(arg, args[++index]), arg); break;
-      case '--until': options.until = parseListTimeBoundary(requireValue(arg, args[++index]), arg); break;
+      case '--limit': options.limit = parsePositiveInteger(requireValue(arg, normalizedArgs[++index]), arg); break;
+      case '--since': options.since = parseListTimeBoundary(requireValue(arg, normalizedArgs[++index]), arg); break;
+      case '--until': options.until = parseListTimeBoundary(requireValue(arg, normalizedArgs[++index]), arg); break;
       case '--type': {
-        const value = requireValue(arg, args[++index]);
+        const value = requireValue(arg, normalizedArgs[++index]);
         if (!['run', 'chat', 'swarm', 'swarm-run'].includes(value)) throw new Error(`Invalid --type value: ${value}. Expected run, chat, swarm, or swarm-run.`);
         (options.types ??= []).push(value as TraceListType);
         break;
       }
       case '--swarm-role': {
-        const value = requireValue(arg, args[++index]);
+        const value = requireValue(arg, normalizedArgs[++index]);
         if (!['coordinator', 'worker', 'quality', 'synthesizer'].includes(value)) throw new Error(`Invalid --swarm-role value: ${value}.`);
         options.swarmRole = value as CliOptions['swarmRole'];
         break;
       }
       case '--root-run':
-      case '--root-run-id':
-        options.rootRunId = requireValue(arg, args[++index]);
-        break;
-      case '--run':
-      case '--run-id':
-        options.runId = requireValue(arg, args[++index]);
+        options.rootRunId = requireValue(arg, normalizedArgs[++index]);
         break;
       case '--include-plans':
         options.includePlans = true;
@@ -159,14 +194,13 @@ export function parseArgs(args: string[]): CliOptions {
         options.onlyDelegates = true;
         break;
       case '--config':
-      case '--config-path':
-        options.configPath = requireValue(arg, args[++index]);
+        options.configPath = requireValue(arg, normalizedArgs[++index]);
         break;
       case '--database-url':
-        options.databaseUrl = requireValue(arg, args[++index]);
+        options.databaseUrl = requireValue(arg, normalizedArgs[++index]);
         break;
       case '--database-url-env':
-        options.databaseUrlEnv = requireValue(arg, args[++index]);
+        options.databaseUrlEnv = requireValue(arg, normalizedArgs[++index]);
         break;
       case '--pgssl':
         options.pgssl = true;
@@ -176,37 +210,26 @@ export function parseArgs(args: string[]): CliOptions {
         options.help = true;
         break;
       default:
-        if (arg.startsWith('-')) {
-          throw new Error(`Unknown option: ${arg}\n\n${USAGE}`);
-        }
-        positional.push(arg);
+        throw new Error(`Unexpected argument: ${arg}\n\n${usageForArgs(originalArgs)}`);
     }
   }
 
-  if (positional.length > 1) {
-    throw new Error(`Expected one session id, received: ${positional.join(', ')}\n\n${USAGE}`);
-  }
-  options.sessionId = positional[0];
+  if (options.help) return options;
+  if (command === 'view' && options.sessionId === undefined && options.rootRunId === undefined && options.runId === undefined) throw new Error('View requires a target.');
+  if (command === 'view' && options.rootRunId && !options.sessionId && normalizedArgs.includes('--root-run')) throw new Error('--root-run can only restrict a view session target.');
   if (options.hasGoal && options.noGoal) throw new Error('--has-goal and --no-goal cannot be combined.');
   if (options.noGoal && (options.goals?.length || options.goalRegex)) throw new Error('--no-goal cannot be combined with --goal or --goal-regex.');
   if (options.swarmRole && options.types?.length) {
     const requiredType: TraceListType = options.swarmRole === 'coordinator' ? 'swarm' : 'swarm-run';
     if (!options.types.includes(requiredType)) throw new Error(`--swarm-role ${options.swarmRole} requires --type ${requiredType}.`);
   }
-  const hasListFilters = options.goals?.length || options.goalRegex || options.hasGoal || options.noGoal || options.statuses?.length || options.limit || options.types?.length || options.swarmRole || options.groupBy || options.since || options.until;
-  if (hasListFilters && !options.listSessions && !options.listPerformance) throw new Error('List filters can only be used with --ls or --lsp.');
-  if (options.groupBy && !options.listPerformance) throw new Error('--group-by can only be used with --lsp.');
   if (options.since && options.until) {
     const now = Date.now();
     if (resolveListTimeBoundary(options.since, now) > resolveListTimeBoundary(options.until, now)) {
       throw new Error('--since must be earlier than or equal to --until.');
     }
   }
-  if (options.compareRunIds) {
-    if (options.compareRunIds[0] === options.compareRunIds[1]) throw new Error('--compare requires two different run IDs.');
-    const incompatible = Boolean(options.sessionId || options.runId || options.rootRunId || options.listSessions || options.listPerformance || options.listSessionless || options.deleteEmptyGoalSessions || options.usageOnly || options.focusRunId || options.messages || options.reasoning || options.systemOnly || options.includePlans || options.onlyDelegates || options.view);
-    if (incompatible) throw new Error('--compare is exclusive with trace targets, list/delete/usage, focus, message, plan, delegate, and view options.');
-  }
+  if (options.compareRunIds && options.compareRunIds[0] === options.compareRunIds[1]) throw new Error('compare requires two different run IDs.');
   return options;
 }
 
@@ -214,46 +237,13 @@ export async function main(): Promise<void> {
   try {
     const options = parseArgs(process.argv.slice(2));
     if (options.help) {
-      console.log(USAGE);
+      console.log(usageForArgs(process.argv.slice(2)));
       return;
     }
     if (options.cacheTtl === undefined && process.env.TRACE_SESSION_CACHE_TTL !== undefined) {
       options.cacheTtl = parseCacheDuration(process.env.TRACE_SESSION_CACHE_TTL, 'TRACE_SESSION_CACHE_TTL');
     }
     if (process.env.TRACE_SESSION_CACHE === 'off' && options.noCache === undefined) options.noCache = true;
-    if (!options.compareRunIds && !options.listSessions && !options.listPerformance && !options.listSessionless && !options.deleteEmptyGoalSessions && !options.sessionId && !options.rootRunId && !options.runId) {
-      throw new Error(`Missing session id, --root-run, or --run.\n\n${USAGE}`);
-    }
-    if ((options.listSessions || options.listPerformance || options.listSessionless || options.deleteEmptyGoalSessions) && options.sessionId) {
-      throw new Error(`--ls, --lsp, --ls-sessionless, and --delete do not accept a session id.\n\n${USAGE}`);
-    }
-    if ((options.listSessions || options.listPerformance || options.listSessionless || options.deleteEmptyGoalSessions) && (options.rootRunId || options.runId)) {
-      throw new Error(`--ls, --lsp, --ls-sessionless, and --delete do not accept --root-run or --run.\n\n${USAGE}`);
-    }
-    if ([options.listSessions, options.listPerformance, options.listSessionless, options.deleteEmptyGoalSessions].filter(Boolean).length > 1) {
-      throw new Error(`Choose only one of --ls, --lsp, --ls-sessionless, or --delete.\n\n${USAGE}`);
-    }
-    if (options.sessionId && options.runId) {
-      throw new Error(`--run cannot be combined with a session id. Use --root-run to restrict a session trace.\n\n${USAGE}`);
-    }
-    if (options.rootRunId && options.runId) {
-      throw new Error(`Choose either --root-run or --run, not both.\n\n${USAGE}`);
-    }
-    if ((options.listSessions || options.listPerformance || options.listSessionless || options.deleteEmptyGoalSessions || options.usageOnly) && (options.messages || options.systemOnly || options.reasoning)) {
-      throw new Error(`--messages, --reasoning, and --system-only can only be used when rendering a full trace.\n\n${USAGE}`);
-    }
-    if ((options.listSessions || options.listPerformance || options.listSessionless || options.deleteEmptyGoalSessions || options.usageOnly) && (options.view || options.messagesView || options.focusRunId)) {
-      throw new Error(`--view, --messages-view, and --focus-run can only be used when rendering a full trace.\n\n${USAGE}`);
-    }
-    if ((options.listSessions || options.listPerformance || options.listSessionless || options.deleteEmptyGoalSessions || options.usageOnly) && options.htmlPath && !(options.listPerformance && options.groupBy)) {
-      throw new Error(`--html can only be used when rendering a full trace.\n\n${USAGE}`);
-    }
-    if ((options.listSessionless || options.deleteEmptyGoalSessions || options.usageOnly) && options.previewChars) {
-      throw new Error(`--preview-chars can only be used with --ls, --lsp, or when rendering a full trace.\n\n${USAGE}`);
-    }
-    if (options.usageOnly && options.sessionId && options.rootRunId) {
-      throw new Error(`--usage prints all linked root runs for a session and does not accept --root-run.\n\n${USAGE}`);
-    }
 
     const postgresConfig = await resolveTracePostgresConfig({
       configPath: options.configPath,
@@ -628,6 +618,30 @@ async function promptHidden(prompt: string): Promise<string> {
   });
 }
 
+function assertOptionApplies(command: string, option: string, options: CliOptions): void {
+  const globalOptions = ['--database-url', '--database-url-env', '--config', '--pgssl', '--help', '-h'];
+  const optionsByCommand: Record<string, string[]> = {
+    view: ['--root-run', '--report', '--focus-run', '--messages', '--reasoning', '--messages-view', '--system-only', '--include-plans', '--only-delegates', '--preview-chars', '--json', '--html', '--fresh', '--no-cache', '--cache-ttl'],
+    compare: ['--json', '--html', '--fresh', '--no-cache', '--cache-ttl'],
+    list: options.listSessionless
+      ? ['--json']
+      : ['--goal', '--goal-regex', '--has-goal', '--no-goal', '--status', '--type', '--swarm-role', '--since', '--until', '--limit', '--preview-chars', '--json'],
+    aggregate: ['--since', '--until', '--json', '--html'],
+    usage: ['--json', '--fresh', '--no-cache', '--cache-ttl'],
+    maintenance: ['--json'],
+  };
+  if (!globalOptions.includes(option) && !optionsByCommand[command]?.includes(option)) {
+    throw new Error(`${option} is not available for the ${command} command.`);
+  }
+}
+
+function requireCommandArgument(name: string, value: string | undefined): string {
+  if (!value || value.startsWith('-')) {
+    throw new Error(`${name} is required.`);
+  }
+  return value;
+}
+
 function requireValue(option: string, value: string | undefined): string {
   if (!value || value.startsWith('--')) {
     throw new Error(`${option} requires a value.`);
@@ -639,7 +653,7 @@ function parseReportView(value: string): ReportView {
   if (value === 'brief' || value === 'summary' || value === 'reliability' || value === 'operations' || value === 'overview' || value === 'output' || value === 'investigate' || value === 'policy' || value === 'performance' || value === 'milestones' || value === 'timeline' || value === 'delegates' || value === 'messages' || value === 'plans' || value === 'all') {
     return value;
   }
-  throw new Error(`Invalid --view value: ${value}.`);
+  throw new Error(`Invalid --report value: ${value}.`);
 }
 
 function parseMessageView(value: string): MessageView {

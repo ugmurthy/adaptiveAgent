@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 This project follows semantic versioning for release notes.
 
+## Unreleased
+
+### Changed
+
+- **Breaking (beta):** replaced the `trace-session` mode switches with the
+  positional `view`, `compare`, `list`, `aggregate`, `usage`, and `maintenance`
+  command grammar. Report selection now uses `--report` instead of `--view`.
+
 ## [0.1.35] 2026-07-10
 
 ### Added

@@ -8,7 +8,7 @@ execution can be trusted, what it consumed, and what to inspect next.
 The package reads the core runtime tables directly. Gateway session tables are
 optional, so reports continue to work for core-only runs.
 
-Reporting is read-only. The legacy `--delete` mode prints reviewable SQL for
+Reporting is read-only. `maintenance empty-goal-sql` prints reviewable SQL for
 empty-goal gateway sessions; it does not execute that SQL.
 
 ## Principle: decision-oriented trace reporting
@@ -49,11 +49,11 @@ From the monorepo root:
 export DATABASE_URL="postgres://postgres:postgres@localhost:5432/adaptive_agent"
 
 # Find a run and copy its complete ID.
-bun run trace-session --lsp --limit 20
+bun run trace-session list traces --limit 20
 
 # The decision-oriented summary is the default.
 RUN_ID=019abcde-1234-5678-9012-abcdefabcdef
-bun run trace-session --run "$RUN_ID"
+bun run trace-session view run "$RUN_ID"
 ```
 
 The short `trace-session` executable and the
@@ -67,9 +67,9 @@ SESSION_ID=incident-review-2026-07-12
 ROOT_RUN_ID=019abcde-1234-5678-9012-abcdefabcdef
 RUN_ID=019fedcb-4321-8765-2109-fedcbafedcba
 
-trace-session "$SESSION_ID"
-trace-session --root-run "$ROOT_RUN_ID"
-trace-session --run "$RUN_ID"
+trace-session view session "$SESSION_ID"
+trace-session view root-run "$ROOT_RUN_ID"
+trace-session view run "$RUN_ID"
 ```
 
 Use `--database-url`, `--database-url-env <name>`, or `--pgssl` when the default
@@ -94,10 +94,8 @@ Compatibility views remain available:
 - `performance` maps to `operations`.
 - `brief`, `policy`, `milestones`, `delegates`, and `plans` retain their focused
   behavior.
-- `--usage` remains the fast usage-only report.
+- `usage` provides the fast usage-only report.
 - `--only-delegates` remains an investigation filter.
-- `--root-run-id`, `--run-id`, and `--config-path` remain aliases for their
-  shorter forms.
 
 ## Release 1: presentation and usability
 
@@ -107,23 +105,23 @@ It shipped:
 
 - stable Identity, Reliability, Operations, Findings, and Coverage concepts;
 - `summary` as the default report;
-- copy-friendly `--lsp` cards;
+- copy-friendly `list traces` cards;
 - goal, status, type, role, and limit filters applied before trace expansion;
 - explicit model/tool-output, tool-provider, and estimated total cost
   semantics; and
-- compatibility aliases for existing commands, views, and flags.
+- compatibility aliases for the focused report views.
 
 ### Summary by default
 
-Running `trace-session` without `--view` produces the decision-oriented
+Running `trace-session view` without `--report` produces the decision-oriented
 summary. Identity, runtime verdict, reliability, operations, findings, and
 coverage retain the same meaning in terminal, JSON, and HTML output.
 
 ```bash
-trace-session --run "$RUN_ID"
-trace-session --run "$RUN_ID" --view summary
-trace-session --run "$RUN_ID" --json
-trace-session --run "$RUN_ID" --html ./trace-report.html
+trace-session view run "$RUN_ID"
+trace-session view run "$RUN_ID" --report summary
+trace-session view run "$RUN_ID" --json
+trace-session view run "$RUN_ID" --html ./trace-report.html
 ```
 
 Use `--messages` when the HTML or JSON report should include snapshot-backed
@@ -132,9 +130,9 @@ explicitly supplied.
 
 ### Copy-friendly discovery
 
-`--lsp` produces cards with full session, run, and root IDs on dedicated lines.
-Only descriptive text such as the goal is truncated, making IDs safe to copy
-into the next command.
+`list traces` produces cards with full session, run, and root IDs on dedicated
+lines. Only descriptive text such as the goal is truncated, making IDs safe to
+copy into the next command.
 
 Representative card:
 
@@ -154,19 +152,19 @@ List filters are applied before rendering. Repeated `--goal`, `--status`, and
 
 ```bash
 # Case-insensitive goal matching.
-trace-session --lsp --goal "market entry" --limit 20
+trace-session list traces --goal "market entry" --limit 20
 
 # Repeat --goal for OR matching, or use a regular expression.
-trace-session --lsp --goal "incident review" --goal "postmortem"
-trace-session --lsp --goal-regex 'incident|outage|recovery'
+trace-session list traces --goal "incident review" --goal "postmortem"
+trace-session list traces --goal-regex 'incident|outage|recovery'
 
 # Presence and status filters.
-trace-session --lsp --has-goal --status failed --status replan_required
-trace-session --ls --no-goal --limit 50
+trace-session list traces --has-goal --status failed --status replan_required
+trace-session list sessions --no-goal --limit 50
 
 # Inspect individual swarm members by role.
-trace-session --lsp --type swarm-run --swarm-role worker
-trace-session --lsp --type swarm-run --swarm-role quality
+trace-session list traces --type swarm-run --swarm-role worker
+trace-session list traces --type swarm-run --swarm-role quality
 ```
 
 The displayed identity types are:
@@ -193,8 +191,8 @@ Operations output distinguishes:
 - unpriced tool-provider requests, which are not silently treated as priced.
 
 ```bash
-trace-session "$SESSION_ID" --usage
-trace-session --run "$RUN_ID" --view operations
+trace-session usage session "$SESSION_ID"
+trace-session view run "$RUN_ID" --report operations
 ```
 
 ## Release 2: reliability and investigation
@@ -245,7 +243,7 @@ Every reliability report explains six dimensions:
   coverage, snapshot coverage, and tool-pricing coverage.
 
 ```bash
-trace-session --run "$RUN_ID" --view reliability
+trace-session view run "$RUN_ID" --report reliability
 ```
 
 Representative output:
@@ -296,7 +294,7 @@ Each finding can carry complete root/run IDs, step IDs, tool-call IDs, event
 sequence/type, timestamp, detail, and ready-to-run inspection commands.
 
 ```bash
-trace-session --run "$RUN_ID" --view investigate
+trace-session view run "$RUN_ID" --report investigate
 ```
 
 Representative finding:
@@ -314,8 +312,8 @@ Primary cause
      tool call
        019fedcb-4321-8765-2109-fedcbafedcba
    Inspect
-   $ trace-session --run 019abcde-1234-5678-9012-abcdefabcdef --view timeline
-   $ trace-session --run 019abcde-1234-5678-9012-abcdefabcdef --view messages --messages-view delta
+   $ trace-session view run 019abcde-1234-5678-9012-abcdefabcdef --report timeline
+   $ trace-session view run 019abcde-1234-5678-9012-abcdefabcdef --report messages --messages-view delta
 ```
 
 ### Data confidence
@@ -337,7 +335,7 @@ runtime evidence.
 Inspect the structured diagnostics directly:
 
 ```bash
-trace-session --run "$RUN_ID" --json \
+trace-session view run "$RUN_ID" --json \
   | jq '.diagnostics | {reliability, findings, suggestedNextViews}'
 ```
 
@@ -347,21 +345,21 @@ A typical investigation starts broad and narrows using the generated commands:
 
 ```bash
 # 1. Discover and copy the complete run ID.
-trace-session --lsp --status failed --limit 10
+trace-session list traces --status failed --limit 10
 
 # 2. Read the decision summary.
-trace-session --run "$RUN_ID"
+trace-session view run "$RUN_ID"
 
 # 3. Explain reliability or follow the causal findings.
-trace-session --run "$RUN_ID" --view reliability
-trace-session --run "$RUN_ID" --view investigate
+trace-session view run "$RUN_ID" --report reliability
+trace-session view run "$RUN_ID" --report investigate
 
 # 4. Inspect the referenced event/tool lifecycle and effective context.
-trace-session --run "$RUN_ID" --view timeline
-trace-session --run "$RUN_ID" --view messages --messages-view delta
+trace-session view run "$RUN_ID" --report timeline
+trace-session view run "$RUN_ID" --report messages --messages-view delta
 
 # 5. Preserve a shareable report.
-trace-session --run "$RUN_ID" --messages --html ./trace-report.html
+trace-session view run "$RUN_ID" --messages --html ./trace-report.html
 ```
 
 Use `--focus-run "$RUN_ID"` to restrict a report to one run subtree and
@@ -374,9 +372,9 @@ active reports are not cached by default. Cache entries are scoped by database,
 target, and data-affecting options.
 
 ```bash
-trace-session --run "$RUN_ID" --fresh
-trace-session --run "$RUN_ID" --no-cache
-trace-session --run "$RUN_ID" --cache-ttl 30s
+trace-session view run "$RUN_ID" --fresh
+trace-session view run "$RUN_ID" --no-cache
+trace-session view run "$RUN_ID" --cache-ttl 30s
 ```
 
 Environment controls:
@@ -408,7 +406,7 @@ Usage keeps run-model and non-delegate tool-output usage separate and also
 reports their combined total. External provider accounting remains separate;
 the grand estimate adds run-model, tool-output, and external provider
 estimates, while provider request cost coverage excludes unpriced requests.
-Use `--view operations` for the human-readable per-run tables or `--json` for
+Use `--report operations` for the human-readable per-run tables or `--json` for
 the complete structured metrics.
 
 Context growth uses ordered snapshot performance samples exclusively when any
@@ -419,14 +417,14 @@ measurements are `null`, not inferred as zero.
 Compare two exact runs in terminal, JSON, or self-contained HTML form:
 
 ```bash
-trace-session --compare "$BASELINE_RUN_ID" "$CANDIDATE_RUN_ID"
-trace-session --compare "$BASELINE_RUN_ID" "$CANDIDATE_RUN_ID" --json
-trace-session --compare "$BASELINE_RUN_ID" "$CANDIDATE_RUN_ID" --html comparison.html
+trace-session compare "$BASELINE_RUN_ID" "$CANDIDATE_RUN_ID"
+trace-session compare "$BASELINE_RUN_ID" "$CANDIDATE_RUN_ID" --json
+trace-session compare "$BASELINE_RUN_ID" "$CANDIDATE_RUN_ID" --html comparison.html
 ```
 
 Each side selects the requested run's own operational analysis. Token and cost
 metrics use the requested run's resolved root-run tree, matching
-`--run-id <id> --usage`; this includes child-run model usage without counting
+`usage run <id>`; this includes child-run model usage without counting
 delegate tool output twice. Other metrics, including wall time, retries,
 failures, context growth, and output bytes, describe the requested run. All
 deltas and percentage changes are candidate minus baseline. Runtime status is
@@ -438,25 +436,25 @@ intended outcome.
 
 ### Aggregate trends and grouping
 
-Add `--group-by` to `--lsp` to turn the filtered list population into one
-observation per root trace and group those observations by root model, root
-terminal status, or UTC start day:
+Use `aggregate` to turn the selected time window into one observation per root
+trace and group those observations by root model, root terminal status, or UTC
+start day:
 
 ```bash
 # Compare models over the last seven days.
-trace-session --lsp --group-by model --since 7d
+trace-session aggregate model --since 7d
 
 # Follow daily trends within a bounded ISO window.
-trace-session --lsp --group-by day \
+trace-session aggregate day \
   --since 2026-07-01T00:00:00Z \
   --until 2026-07-15T23:59:59Z
 
-# Group an already-filtered population by actual terminal outcome.
-trace-session --lsp --group-by status --goal-regex 'incident|outage' --limit 100
+# Group by actual terminal outcome.
+trace-session aggregate status --since 7d
 
 # Preserve the same structured aggregate as JSON or self-contained HTML.
-trace-session --lsp --group-by model --since 24h --json
-trace-session --lsp --group-by day --since 30d --html trend-report.html
+trace-session aggregate model --since 24h --json
+trace-session aggregate day --since 30d --html trend-report.html
 ```
 
 Durations include nearest-rank p50, p90, and p95 distributions. Outcome rates
@@ -469,10 +467,8 @@ measured; missing values never become zero.
 The aggregate also exposes retry frequency, model and tool failures, context
 growth distributions, common persisted errors, and per-group confidence.
 Confidence is the least complete observation in the group, and notes identify
-missing duration, usage, cost, or context samples. Existing `--goal`,
-`--goal-regex`, goal-presence, `--status`, `--type`, `--swarm-role`, and
-`--limit` filters are applied before detailed trace rows are loaded, so the
-reported population and cost of inspection stay explicit.
+missing duration, usage, cost, or context samples. `--since` and `--until`
+bound the population before detailed trace rows are loaded.
 
 Grouping and comparison reuse the same derived run observations as normal
 reports. They do not automatically label changes as regressions: changes in

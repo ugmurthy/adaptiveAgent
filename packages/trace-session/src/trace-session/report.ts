@@ -319,7 +319,7 @@ export function buildTraceComparison(
   if (providerModelMix.size === 0 || candidateProviderModelMix.size === 0) {
     notes.push('Provider/model mix is unavailable where persisted or event-backed model identity is absent.');
   }
-  notes.push('Token and cost metrics use the resolved root-run tree, matching --usage; other metrics describe the requested run.');
+  notes.push('Token and cost metrics use the resolved root-run tree, matching the usage command; other metrics describe the requested run.');
 
   return {
     baseline: { runId: baselineRunId, analysis: baseline },
@@ -457,7 +457,7 @@ export function buildTraceAggregateReport(
     notes: [
       'Wall-duration percentiles use nearest-rank p50/p90/p95 and include only terminal roots with completed timestamps.',
       'Recovered success means a persisted succeeded root with retry, failure-recovery, resume, replan, or rejected-call activity; it does not evaluate answer quality.',
-      'Token and model/tool-output cost totals use the same root-tree accounting as --usage; external tool-provider cost remains separate.',
+      'Token and model/tool-output cost totals use the same root-tree accounting as the usage command; external tool-provider cost remains separate.',
       ...(observations.some((observation) => observation.totalTokens === null) ? ['Token averages exclude roots without persisted usage measurements.'] : []),
       ...(observations.some((observation) => observation.estimatedGrandTotalUSD === null) ? ['Cost averages exclude roots with missing model pricing or unpriced external provider requests.'] : []),
       ...(observations.some((observation) => observation.contextGrowthBytes === null) ? ['Context-growth distributions exclude roots without persisted context-size samples.'] : []),
@@ -2366,19 +2366,19 @@ function inspectionCommands(report: TraceReport, finding: FindingDraft): TraceFi
   };
   const runId = finding.evidence.find((evidence) => evidence.runId)?.runId;
   if (runId) {
-    add('Inspect the referenced run lifecycle and tool activity.', `trace-session --run ${runId} --view timeline`);
+    add('Inspect the referenced run lifecycle and tool activity.', `trace-session view run ${runId} --report timeline`);
     if (finding.category === 'failure' || finding.role === 'recovery' || finding.title.includes('Tool output')) {
-      add('Inspect the referenced run model context.', `trace-session --run ${runId} --view messages --messages-view delta`);
+      add('Inspect the referenced run model context.', `trace-session view run ${runId} --report messages --messages-view delta`);
     }
   }
   if (finding.category === 'policy') {
-    add('Inspect policy and approval evidence.', `${traceTargetCommand(report)} --view policy`);
+    add('Inspect policy and approval evidence.', `${traceTargetCommand(report)} --report policy`);
   }
   if (finding.category === 'data-quality' || finding.category === 'blocked') {
-    add('Inspect all reliability dimensions and data coverage.', `${traceTargetCommand(report)} --view reliability`);
+    add('Inspect all reliability dimensions and data coverage.', `${traceTargetCommand(report)} --report reliability`);
   }
   if (commands.size === 0) {
-    add('Inspect the causal investigation report.', `${traceTargetCommand(report)} --view investigate`);
+    add('Inspect the causal investigation report.', `${traceTargetCommand(report)} --report investigate`);
   }
   return [...commands.entries()].slice(0, 3).map(([command, reason]) => ({ reason, command }));
 }
@@ -2501,17 +2501,17 @@ function buildSuggestedNextViews(
   }
 
   if (failingRunId && suggestions.size === 0) {
-    add('Inspect the failed run message context.', `trace-session --run ${failingRunId} --view messages --messages-view delta`);
-    add('Inspect the failed run tool timeline.', `trace-session --run ${failingRunId} --view timeline`);
+    add('Inspect the failed run message context.', `trace-session view run ${failingRunId} --report messages --messages-view delta`);
+    add('Inspect the failed run tool timeline.', `trace-session view run ${failingRunId} --report timeline`);
   }
   if (policyDigest.warnings.length > 0) {
-    add('Review budget, rejected-call, and approval adherence.', `${traceTargetCommand(report)} --view policy`);
+    add('Review budget, rejected-call, and approval adherence.', `${traceTargetCommand(report)} --report policy`);
   }
   if (performanceDigest.topToolSpans.length > 0 || performanceDigest.topRunsByUsage.length > 0) {
-    add('Review duration and token hotspots.', `${traceTargetCommand(report)} --view performance`);
+    add('Review duration and token hotspots.', `${traceTargetCommand(report)} --report performance`);
   }
   if (suggestions.size === 0) {
-    add('Review the reliability dimensions and their evidence.', `${traceTargetCommand(report)} --view reliability`);
+    add('Review the reliability dimensions and their evidence.', `${traceTargetCommand(report)} --report reliability`);
   }
 
   return [...suggestions.entries()].map(([command, reason]) => ({ reason, command }));
@@ -2748,11 +2748,11 @@ function traceTargetLabel(report: TraceReport): string {
 function traceTargetCommand(report: TraceReport): string {
   switch (report.target.kind) {
     case 'session':
-      return `trace-session ${report.target.requestedId}`;
+      return `trace-session view session ${report.target.requestedId}`;
     case 'root-run':
-      return `trace-session --root-run ${report.target.requestedId}`;
+      return `trace-session view root-run ${report.target.requestedId}`;
     case 'run':
-      return `trace-session --run ${report.target.requestedId}`;
+      return `trace-session view run ${report.target.requestedId}`;
   }
 }
 

@@ -1,6 +1,9 @@
 import chalk from 'chalk';
+import Table from 'cli-table3';
 import { marked } from 'marked';
 import TerminalRenderer from 'marked-terminal';
+import stringWidth from 'string-width';
+import wrapAnsi from 'wrap-ansi';
 
 import { buildTraceDiagnostics, shortId } from './report.js';
 import { DEFAULT_MESSAGE_PREVIEW_CHARS } from './constants.js';
@@ -41,6 +44,7 @@ const TERMINAL_RENDERER_OPTIONS = {
   codespan: chalk.cyan,
   heading: chalk.bold,
 };
+const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 
 marked.setOptions({
   renderer: new TerminalRenderer(TERMINAL_RENDERER_OPTIONS) as never,
@@ -86,7 +90,7 @@ export function renderTraceReport(
   const milestones = report.milestones ?? [];
 
   if (effectiveView === 'summary' || effectiveView === 'overview') {
-    return renderDecisionSummary(report, diagnostics);
+    return renderDecisionSummary(report, diagnostics, previewChars);
   }
 
   const lines: string[] = [];
@@ -106,21 +110,21 @@ export function renderTraceReport(
   if (effectiveView === 'reliability') {
     lines.push('');
     lines.push(markdownBlock('# Reliability'));
-    lines.push(renderReliabilityDiagnostics(diagnostics));
+    lines.push(renderReliabilityDiagnostics(diagnostics, previewChars));
     return lines.join('\n');
   }
 
   if (effectiveView === 'investigate') {
     lines.push('');
     lines.push(markdownBlock('# Investigation'));
-    lines.push(renderInvestigation(report, diagnostics));
+    lines.push(renderInvestigation(report, diagnostics, previewChars));
     return lines.join('\n');
   }
 
   if (effectiveView === 'policy') {
     lines.push('');
     lines.push(markdownBlock('# Policy Adherence'));
-    lines.push(renderPolicyDiagnostics(diagnostics));
+    lines.push(renderPolicyDiagnostics(diagnostics, previewChars));
     return lines.join('\n');
   }
 
@@ -143,8 +147,8 @@ export function renderTraceReport(
   if (shouldRenderSection(effectiveView, 'performance')) {
     lines.push('');
     lines.push(markdownBlock('# Performance'));
-    lines.push(renderPerformance(report.performance ?? emptyPerformanceSummary(), traceDurationMs(report), diagnostics.performance, report.usage, report.rootRuns));
-    lines.push('', markdownBlock('## Per-run efficiency and context'), renderRunAnalysisTable(diagnostics));
+    lines.push(renderPerformance(report.performance ?? emptyPerformanceSummary(), traceDurationMs(report), diagnostics.performance, report.usage, report.rootRuns, previewChars));
+    lines.push('', markdownBlock('## Per-run efficiency and context'), renderRunAnalysisTable(diagnostics, previewChars));
   }
 
   if (shouldRenderSection(effectiveView, 'milestones')) {
@@ -156,7 +160,7 @@ export function renderTraceReport(
   if (shouldRenderSection(effectiveView, 'timeline')) {
     lines.push('');
     lines.push(markdownBlock(`# ${formatTimelineTitle(report.timeline, report.session)}`));
-    lines.push(renderTimeline(report.timeline));
+    lines.push(renderTimeline(report.timeline, previewChars));
   }
 
   if ((options.messages || options.systemOnly || effectiveView === 'messages') && shouldRenderSection(effectiveView, 'messages')) {
@@ -178,7 +182,7 @@ export function renderTraceReport(
   if (options.includePlans && shouldRenderSection(effectiveView, 'plans')) {
     lines.push('');
     lines.push(chalk.bold('Plans'));
-    lines.push(renderPlans(report.plans));
+    lines.push(renderPlans(report.plans, previewChars));
   }
 
   if (shouldRenderFinalOutput(effectiveView)) {
@@ -402,39 +406,35 @@ function formatAggregateBytes(value: number | null): string {
 }
 
 type MarkdownTableAlignment = 'left' | 'right' | 'center';
+type TerminalTableProfile = 'boxed' | 'compact';
+
+const COMPACT_TABLE_CHARS = {
+  top: '',
+  'top-mid': '',
+  'top-left': '',
+  'top-right': '',
+  bottom: '',
+  'bottom-mid': '',
+  'bottom-left': '',
+  'bottom-right': '',
+  left: '',
+  'left-mid': '',
+  mid: '-',
+  'mid-mid': ' ',
+  right: '',
+  'right-mid': '',
+  middle: ' ',
+} as const;
 
 function renderMarkdownTable(
   headers: string[],
   rows: string[][],
   alignments: MarkdownTableAlignment[] = [],
 ): string {
-  const separator = headers.map((_, index) => {
-    switch (alignments[index]) {
-      case 'right': return '---:';
-      case 'center': return ':---:';
-      default: return '---';
-    }
+  return renderTerminalTable(headers, rows, {
+    profile: 'boxed',
+    alignments,
   });
-  const row = (cells: string[]): string => `| ${headers.map((_, index) => escapeMarkdownTableCell(cells[index] ?? '')).join(' | ')} |`;
-  const source = [
-    row(headers),
-    row(separator),
-    ...rows.map(row),
-  ].join('\n');
-  const colWidths = fitColumnWidths(headers, rows, {
-    availableWidth: terminalWidth() - headers.length - 1,
-    cellPadding: 2,
-    minimumWidth: 5,
-  });
-  const renderer = new TerminalRenderer({
-    ...TERMINAL_RENDERER_OPTIONS,
-    tableOptions: {
-      colWidths,
-      wordWrap: true,
-      wrapOnWordBoundary: false,
-    },
-  });
-  return marked(`${source}\n`, { async: false, renderer: renderer as never }).trimEnd();
 }
 
 function escapeMarkdownTableCell(value: string): string {
@@ -1595,7 +1595,7 @@ function renderTraceBrief(diagnostics: TraceDiagnostics): string {
   return lines.join('\n');
 }
 
-function renderDecisionSummary(report: TraceReport, diagnostics: TraceDiagnostics): string {
+function renderDecisionSummary(report: TraceReport, diagnostics: TraceDiagnostics, previewChars: number): string {
   const modelCost = report.usage.total.estimatedCostUSD;
   const toolCost = diagnostics.performance.toolAccounting.estimatedCostUSD;
   const findings = diagnostics.findings.length ? renderDiagnosticFindings(diagnostics.findings.slice(0, 5)) : chalk.gray('No diagnostic findings.');
@@ -1619,7 +1619,7 @@ function renderDecisionSummary(report: TraceReport, diagnostics: TraceDiagnostic
     `${chalk.cyan('status')} ${statusColor(diagnostics.brief.status)(diagnostics.brief.status)}`,
     `${chalk.cyan('reason')} ${diagnostics.reliability.summary}`,
     '', markdownBlock('# Reliability'),
-    renderReliabilityDimensionRows(diagnostics),
+    renderReliabilityDimensionRows(diagnostics, previewChars),
     '', markdownBlock('# Operations'),
     `${chalk.cyan('duration')} wall=${formatDuration(diagnostics.brief.wallDurationMs)} model=${formatDuration(diagnostics.performance.cumulativeModelDurationMs)} tools=${formatDuration(diagnostics.performance.cumulativeToolDurationMs)}`,
     `${chalk.cyan('model/tool-output cost')} ${formatCost(modelCost)}`,
@@ -1634,13 +1634,13 @@ function renderDecisionSummary(report: TraceReport, diagnostics: TraceDiagnostic
   return lines.join('\n');
 }
 
-function renderReliabilityDiagnostics(diagnostics: TraceDiagnostics): string {
+function renderReliabilityDiagnostics(diagnostics: TraceDiagnostics, previewChars: number): string {
   const reliability = diagnostics.reliability;
   const lines = [
     `${chalk.cyan('VERDICT')} ${statusColor(reliability.classification)(reliability.classification.toUpperCase())}`,
     ...wrapPlain(reliability.summary, 112),
     '',
-    renderReliabilityDimensionRows(diagnostics),
+    renderReliabilityDimensionRows(diagnostics, previewChars),
   ];
   const dimensionEvidence = Object.values(reliability.dimensions).flatMap((dimension) => dimension.evidence);
   if (dimensionEvidence.length > 0) {
@@ -1659,7 +1659,7 @@ function renderReliabilityDiagnostics(diagnostics: TraceDiagnostics): string {
   return lines.join('\n');
 }
 
-function renderReliabilityDimensionRows(diagnostics: TraceDiagnostics): string {
+function renderReliabilityDimensionRows(diagnostics: TraceDiagnostics, previewChars: number): string {
   const reliability = diagnostics.reliability;
   const dimensions = reliability.dimensions;
   return renderMetricTable([
@@ -1669,10 +1669,10 @@ function renderReliabilityDimensionRows(diagnostics: TraceDiagnostics): string {
     ['Liveness', statusColor(dimensions.liveness.status)(dimensions.liveness.status), dimensions.liveness.summary],
     ['Policy integrity', statusColor(dimensions.policyIntegrity.status)(dimensions.policyIntegrity.status), dimensions.policyIntegrity.summary],
     ['Data confidence', statusColor(dimensions.evidenceConfidence.status)(reliability.dataConfidence.level), dimensions.evidenceConfidence.summary],
-  ]);
+  ], previewChars);
 }
 
-function renderInvestigation(report: TraceReport, diagnostics: TraceDiagnostics): string {
+function renderInvestigation(report: TraceReport, diagnostics: TraceDiagnostics, previewChars: number): string {
   const lines: string[] = [];
   lines.push(markdownBlock('## Verdict'));
   lines.push(`${chalk.cyan('VERDICT')} ${statusColor(diagnostics.reliability.classification)(diagnostics.reliability.classification.toUpperCase())}`);
@@ -1699,7 +1699,9 @@ function renderInvestigation(report: TraceReport, diagnostics: TraceDiagnostics)
       nonSucceededRoots.map((run) => [
         shortId(run.rootRunId),
         statusColor(run.status ?? 'unknown')(run.status ?? 'unknown'),
-        truncatePlain(oneLine(run.errorMessage ?? run.errorCode ?? run.goal ?? '-'), 96),
+        run.errorMessage
+          ? previewText(run.errorMessage, previewChars)
+          : run.errorCode ?? (run.goal ? previewText(run.goal, previewChars) : '-'),
       ]),
     ));
   }
@@ -1717,7 +1719,7 @@ function renderInvestigation(report: TraceReport, diagnostics: TraceDiagnostics)
   return lines.join('\n');
 }
 
-function renderPolicyDiagnostics(diagnostics: TraceDiagnostics): string {
+function renderPolicyDiagnostics(diagnostics: TraceDiagnostics, previewChars: number): string {
   const policy = diagnostics.policy;
   const lines: string[] = [];
   lines.push(markdownBlock('## Summary'));
@@ -1726,7 +1728,7 @@ function renderPolicyDiagnostics(diagnostics: TraceDiagnostics): string {
     ['rejected tool calls', formatNumber(policy.rejectedToolCalls), '`model.tool_call_rejected` events emitted by core.'],
     ['approval requests', `${formatNumber(policy.approvalRequests)} requested / ${formatNumber(policy.approvalResolved)} resolved`, 'Approval lifecycle events observed in the trace.'],
     ['runtime policy messages', formatNumber(policy.runtimePolicyMessages), 'Runtime-injected budget/policy guidance found in LLM messages.'],
-  ]));
+  ], previewChars));
 
   if (policy.budgetGroups.length > 0) {
     lines.push('');
@@ -2067,7 +2069,7 @@ function renderProviderModelUsageTable(
   );
 }
 
-function renderRunAnalysisTable(diagnostics: TraceDiagnostics): string {
+function renderRunAnalysisTable(diagnostics: TraceDiagnostics, previewChars: number): string {
   if (!diagnostics.analysis.runs.length) return chalk.gray('No run analysis is available.');
   return renderMetricTable(diagnostics.analysis.runs.flatMap((run) => {
     const prefix = `${'  '.repeat(run.depth)}${shortId(run.runId)}`;
@@ -2112,7 +2114,7 @@ function renderRunAnalysisTable(diagnostics: TraceDiagnostics): string {
       ],
     ];
     if (run.notes.length > 0) {
-      rows.push([`${prefix} notes`, run.notes.join(' '), 'Data limitations for this run.']);
+      rows.push([`${prefix} notes`, previewText(run.notes.join(' '), previewChars), 'Data limitations for this run.']);
     }
     return rows;
   }));
@@ -2124,6 +2126,7 @@ function renderPerformance(
   digest: PerformanceDigest,
   usage: SessionUsageSummary,
   rootRuns: RootRun[],
+  previewChars: number,
 ): string {
   const lines: string[] = [];
   const statusCodes = Object.entries(performance.model.adapterStatusCodes)
@@ -2136,7 +2139,7 @@ function renderPerformance(
   }
 
   lines.push(markdownBlock('## Digest'));
-  lines.push(renderPerformanceDigest(digest, performance.events.totalEvents > 0));
+  lines.push(renderPerformanceDigest(digest, performance.events.totalEvents > 0, previewChars));
 
   lines.push('');
   lines.push(renderPerformanceUsageSections(usage, rootRuns));
@@ -2147,7 +2150,7 @@ function renderPerformance(
     ['events', `${formatNumber(performance.events.measuredEvents)} measured / ${formatNumber(performance.events.totalEvents)} total`, 'Events carrying `payload.performance`.'],
     ['event payload bytes', formatBucketBytes(performance.events.payloadBytes), 'Persisted runtime event payload size.'],
     ['event emit time', formatBucketDuration(performance.events.emitDurationMs), 'Time spent appending or forwarding measured events.'],
-  ]));
+  ], previewChars));
 
   lines.push('');
   lines.push(markdownBlock('## Model'));
@@ -2163,7 +2166,7 @@ function renderPerformance(
     ['adapter attempts', formatBucketNumber(performance.model.adapterAttemptCount), 'Attempts reported by adapters.'],
     ['adapter bytes', `request ${formatBucketBytes(performance.model.adapterRequestBytes)} / response ${formatBucketBytes(performance.model.adapterResponseBytes)}`, 'Serialized provider-specific request and response sizes.'],
     ['adapter status', statusCodes, 'HTTP status codes observed by adapters.'],
-  ]));
+  ], previewChars));
 
   lines.push('');
   lines.push(markdownBlock('## Tools'));
@@ -2176,7 +2179,7 @@ function renderPerformance(
     ['raw output bytes', formatBucketBytes(performance.tools.rawOutputBytes), 'Raw tool output size.'],
     ['event output bytes', formatBucketBytes(performance.tools.eventOutputBytes), 'Output size persisted in lifecycle events.'],
     ['model output bytes', formatBucketBytes(performance.tools.modelOutputBytes), 'Tool output size visible to the model.'],
-  ]));
+  ], previewChars));
 
   const visibleTools = performance.tools.byTool
     .filter((tool) => tool.durationMs.count > 0 || tool.rawOutputBytes.count > 0 || tool.started > 0)
@@ -2208,7 +2211,7 @@ function renderPerformance(
     ['message count', formatBucketNumber(performance.snapshots.messageCount), 'Messages persisted in snapshots.'],
     ['pending tool bytes', formatBucketBytes(performance.snapshots.pendingToolCallBytes), 'Serialized pending tool call state.'],
     ['save time', formatBucketDuration(performance.snapshots.saveDurationMs), 'Snapshot store write time when measured.'],
-  ]));
+  ], previewChars));
 
   lines.push('');
   lines.push(markdownBlock('## Notes'));
@@ -2219,7 +2222,7 @@ function renderPerformance(
   return lines.join('\n');
 }
 
-function renderPerformanceDigest(digest: PerformanceDigest, includeTimelineSpans: boolean): string {
+function renderPerformanceDigest(digest: PerformanceDigest, includeTimelineSpans: boolean, previewChars: number): string {
   const lines: string[] = [];
   lines.push(renderMetricTable([
     ['wall time', formatDuration(digest.wallDurationMs), 'Elapsed time across root runs; falls back to session duration when run timing is unavailable.'],
@@ -2228,7 +2231,7 @@ function renderPerformanceDigest(digest: PerformanceDigest, includeTimelineSpans
     ['other wall time', formatDuration(digest.otherDurationMs), 'Wall time not explained by measured model/tool/snapshot buckets.'],
     ['parallelism factor', formatRatio(digest.parallelismFactor), 'Cumulative measured time divided by wall time.'],
     ['tool provider cost', `${formatCost(digest.toolAccounting.estimatedCostUSD)} estimated / ${formatNumber(digest.toolAccounting.totalRequests)} requests`, 'Call-count based tool provider cost from event accounting payloads.'],
-  ]));
+  ], previewChars));
 
   if (digest.toolAccounting.byProviderOperation.length > 0) {
     lines.push('');
@@ -2259,7 +2262,7 @@ function renderPerformanceDigest(digest: PerformanceDigest, includeTimelineSpans
         formatNumber(run.promptTokens),
         formatNumber(run.completionTokens),
         formatCost(run.estimatedCostUSD),
-        run.goal ? truncatePlain(oneLine(run.goal), 80) : '-',
+        run.goal ? previewText(run.goal, previewChars) : '-',
       ]),
     ));
   }
@@ -2430,7 +2433,7 @@ function formatUsageSummary(usage: UsageSummary): string {
   return parts.join('  ');
 }
 
-function renderTimeline(entries: TimelineEntry[]): string {
+function renderTimeline(entries: TimelineEntry[], previewChars: number): string {
   if (entries.length === 0) {
     return chalk.gray('No migrated tool timeline rows were found.');
   }
@@ -2441,7 +2444,7 @@ function renderTimeline(entries: TimelineEntry[]): string {
     `${shortId(entry.rootRunId)}/${shortId(entry.runId)} d${entry.depth}`,
     entry.stepId ?? '-',
     toolColor(entry.toolName)(entry.toolName ?? entry.eventType ?? 'tool'),
-    compactValue(entry.params ?? entry.output),
+    compactValue(entry.params ?? entry.output, previewChars),
     statusColor(entry.outcome)(entry.outcome),
   ]);
   return renderTable(['started-time', 'duration', 'run/depth', 'step', 'tool', 'params', 'outcome'], rows);
@@ -2634,7 +2637,7 @@ function renderDelegates(delegates: DelegateRow[]): string {
   return renderTable(['parent', 'delegate', 'child', 'child status', 'heartbeat', 'lease expiry', 'last event', 'reason'], rows);
 }
 
-function renderPlans(plans: PlanRow[]): string {
+function renderPlans(plans: PlanRow[], previewChars: number): string {
   if (plans.length === 0) {
     return chalk.gray('No plan rows were found.');
   }
@@ -2643,9 +2646,9 @@ function renderPlans(plans: PlanRow[]): string {
     plan.plan_execution_id ? shortId(plan.plan_execution_id) : '-',
     statusColor(plan.plan_execution_status ?? 'unknown')(plan.plan_execution_status ?? 'unknown'),
     plan.step_index === null ? '-' : String(plan.step_index),
-    plan.title ?? plan.step_key ?? '-',
+    plan.title ? previewText(plan.title, previewChars) : plan.step_key ?? '-',
     plan.tool_name ?? '-',
-    plan.replan_reason ?? '-',
+    plan.replan_reason ? previewText(plan.replan_reason, previewChars) : '-',
   ]);
   return renderTable(['run', 'execution', 'status', 'step', 'title', 'tool', 'replan'], rows);
 }
@@ -2818,34 +2821,71 @@ function shouldRenderFinalOutput(view: ReportView): boolean {
 }
 
 function renderTable(headers: string[], rows: string[][], options?: { maxWidths?: number[] }): string {
-  const widths = fitColumnWidths(headers, rows, {
-    availableWidth: terminalWidth() - Math.max(0, headers.length - 1) * 2,
-    maximumWidths: options?.maxWidths ?? headers.map((_, index) => index === headers.length - 1 ? 80 : 36),
-    minimumWidth: 4,
+  return renderTerminalTable(headers, rows, {
+    profile: 'compact',
+    maximumWidths: options?.maxWidths,
   });
-  const renderRow = (cells: string[]): string[] => {
-    const wrapped = headers.map((_, index) => wrapAnsi(cells[index] ?? '', widths[index]!));
-    const height = Math.max(...wrapped.map((lines) => lines.length));
-    return Array.from({ length: height }, (_, lineIndex) =>
-      wrapped
-        .map((lines, index) => padAnsi(lines[lineIndex] ?? '', widths[index]!))
-        .join('  '),
-    );
-  };
-
-  return [
-    ...renderRow(headers.map((header) => chalk.bold(header))),
-    widths.map((width) => '-'.repeat(width)).join('  '),
-    ...rows.flatMap(renderRow),
-  ].join('\n');
 }
 
-function renderMetricTable(rows: Array<[metric: string, value: string, explanation: string]>): string {
+function renderTerminalTable(
+  headers: string[],
+  rows: string[][],
+  options: {
+    profile: TerminalTableProfile;
+    alignments?: MarkdownTableAlignment[];
+    maximumWidths?: number[];
+  },
+): string {
+  const boxed = options.profile === 'boxed';
+  const cellPadding = boxed ? 2 : 1;
+  const separatorWidth = boxed ? headers.length + 1 : Math.max(0, headers.length - 1);
+  const widths = fitColumnWidths(headers, rows, {
+    availableWidth: terminalWidth() - separatorWidth,
+    cellPadding,
+    maximumWidths: options.maximumWidths?.map((width) => width + cellPadding),
+    minimumWidth: boxed ? 5 : 4,
+  });
+  const table = new Table({
+    head: headers.map((header, index) => wrapAnsi(
+      boxed ? header : chalk.bold(header),
+      Math.max(1, widths[index]! - cellPadding),
+      { hard: true, wordWrap: false, trim: false },
+    )),
+    colWidths: widths,
+    colAligns: headers.map((_, index) => boxed ? options.alignments?.[index] ?? 'left' : 'left'),
+    // Cells are pre-wrapped with wrap-ansi. cli-table3's hard-wrap path counts
+    // raw ANSI bytes and can split escape sequences into visible text.
+    wordWrap: false,
+    ...(boxed
+      ? {}
+      : {
+          chars: COMPACT_TABLE_CHARS,
+          style: {
+            'padding-left': 0,
+            'padding-right': 1,
+            head: [],
+            border: [],
+            compact: true,
+          },
+        }),
+  });
+  table.push(...rows.map((row) => headers.map((_, index) => wrapAnsi(
+    row[index] ?? '',
+    Math.max(1, widths[index]! - cellPadding),
+    { hard: true, wordWrap: false, trim: false },
+  ))));
+  return table.toString();
+}
+
+function renderMetricTable(
+  rows: Array<[metric: string, value: string, explanation: string]>,
+  previewChars?: number,
+): string {
   return renderTable(['metric', 'value', 'meaning'], rows.map(([metric, value, explanation]) => [
     chalk.cyan(metric),
     value,
-    explanation,
-  ]), { maxWidths: [24, 52, 72] });
+    previewChars === undefined ? explanation : previewText(explanation, previewChars),
+  ]));
 }
 
 function statusColor(status: string): (value: string) => string {
@@ -3018,14 +3058,12 @@ function formatBytes(value: number): string {
   return `${(value / (1024 * 1024)).toFixed(2)}MiB`;
 }
 
-function compactValue(value: unknown): string {
+function compactValue(value: unknown, previewChars: number): string {
   if (value === null || value === undefined) {
     return '-';
   }
-  if (typeof value === 'string') {
-    return markdownInline(value);
-  }
-  return markdownInline(`\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``).replace(/\s+/g, ' ').trim();
+  const source = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+  return markdownInline(previewText(source, previewChars));
 }
 
 function markdownInline(source: string): string {
@@ -3038,6 +3076,10 @@ function markdownBlock(source: string): string {
 
 function oneLine(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
+}
+
+function previewText(value: string, previewChars: number): string {
+  return truncatePlain(oneLine(value), previewChars);
 }
 
 function wrapPlain(value: string, width: number): string[] {
@@ -3095,6 +3137,9 @@ function fitColumnWidths(
     natural[index]!,
     Math.max(
       options.minimumWidth,
+      index === 0 ? 32 : 0,
+      headers[index]?.toLowerCase() === 'value' ? 40 : 0,
+      ['meaning', 'params', 'preview', 'goal', 'title', 'replan', 'detail'].includes(headers[index]?.toLowerCase() ?? '') ? 24 : 0,
       Math.min(longestCommaSeparatedItem(rows.map((row) => row[index] ?? '')) + padding, 32),
     ),
   ));
@@ -3124,55 +3169,23 @@ function fitColumnWidths(
 function longestCommaSeparatedItem(values: string[]): number {
   return Math.max(0, ...values.flatMap((value) =>
     value.includes(',')
-      ? stripAnsi(value).split(/,\s*/).map((item) => item.length)
+      ? stripAnsi(value).split(/,\s*/).map((item) => stringWidth(item))
       : [0],
   ));
 }
 
 function visibleLength(value: string): number {
-  return Math.max(...stripAnsi(value).split(/\r?\n/).map((line) => line.length));
-}
-
-function wrapAnsi(value: string, width: number): string[] {
-  const plain = stripAnsi(value);
-  if (plain.length <= width) return [value];
-  const prefix = value.match(/^(?:\u001b\[[0-9;]*m)+/)?.[0] ?? '';
-  return wrapPlainWithLongWords(plain, width).map((line) => prefix ? `${prefix}${line}\u001b[0m` : line);
-}
-
-function wrapPlainWithLongWords(value: string, width: number): string[] {
-  const lines: string[] = [];
-  let remaining = oneLine(value);
-  while (remaining.length > width) {
-    const candidate = remaining.slice(0, width + 1);
-    const comma = candidate.lastIndexOf(', ');
-    const space = candidate.lastIndexOf(' ');
-    const boundary = comma >= Math.floor(width / 3) ? comma + 1 : space >= Math.floor(width / 3) ? space : width;
-    lines.push(remaining.slice(0, boundary).trimEnd());
-    remaining = remaining.slice(boundary).trimStart();
-  }
-  lines.push(remaining);
-  return lines;
+  return Math.max(...stripAnsi(value).split(/\r?\n/).map((line) => stringWidth(line)));
 }
 
 function truncatePlain(value: string, width: number): string {
-  return value.length > width ? `${value.slice(0, Math.max(0, width - 1))}…` : value;
+  const graphemes = [...GRAPHEME_SEGMENTER.segment(value)]
+    .map((part) => part.segment);
+  return graphemes.length > width
+    ? `${graphemes.slice(0, Math.max(0, width - 1)).join('').trimEnd()}…`
+    : value;
 }
 
 function stripAnsi(value: string): string {
   return value.replace(/\u001b\[[0-9;]*m/g, '');
-}
-
-function truncateAnsi(value: string, width: number): string {
-  const plain = stripAnsi(value);
-  if (plain.length <= width) {
-    return value;
-  }
-  const prefix = value.match(/^(?:\u001b\[[0-9;]*m)+/)?.[0] ?? '';
-  const truncated = `${plain.slice(0, Math.max(0, width - 1))}…`;
-  return prefix ? `${prefix}${truncated}\u001b[0m` : truncated;
-}
-
-function padAnsi(value: string, width: number): string {
-  return value + ' '.repeat(Math.max(0, width - stripAnsi(value).length));
 }
