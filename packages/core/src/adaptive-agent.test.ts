@@ -3288,6 +3288,14 @@ describe('AdaptiveAgent', () => {
       'run.created',
     ]);
     expect(transactionEventGroups).toContainEqual(['run.status_changed', 'tool.completed']);
+    const parentEvents = await eventStore.listByRun(result.runId);
+    expect(parentEvents.find((event) =>
+      event.type === 'snapshot.created'
+      && typeof event.payload === 'object'
+      && event.payload !== null
+      && !Array.isArray(event.payload)
+      && event.payload.status === 'awaiting_subagent',
+    )?.payload).toMatchObject({ snapshotSeq: 3 });
   });
 
   it('emits structured lifecycle logs with model, tool, and delegation context', async () => {

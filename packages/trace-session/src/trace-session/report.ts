@@ -90,6 +90,11 @@ export function buildTimeline(rows: TraceRow[], options: { onlyDelegates?: boole
   const latestOutputsByStep = new Map<string, unknown>();
 
   for (const row of rows) {
+    // delegate.spawned links an already-started delegate tool call to its child
+    // run. It is a milestone, not a second tool operation.
+    if (row.event_type === 'delegate.spawned') {
+      continue;
+    }
     const toolName = row.ledger_tool_name ?? row.event_tool_name ?? payloadString(row.payload, 'toolName');
     const childRunId = row.child_run_id ?? payloadString(row.payload, 'childRunId');
     const stepId = row.event_step_id ?? row.current_step_id;
@@ -2117,7 +2122,7 @@ function unresolvedApprovalEvents(report: TraceReport): MilestoneEntry[] {
 function detectSnapshotSequenceProblems(report: TraceReport): EvidenceRef[] {
   const byRun = new Map<string, MilestoneEntry[]>();
   for (const entry of report.milestones ?? []) {
-    if (entry.eventType !== 'snapshot.created' || entry.snapshotSeq === null || entry.snapshotSeq === undefined) {
+    if (entry.eventType !== 'snapshot.created') {
       continue;
     }
     const snapshots = byRun.get(entry.runId) ?? [];
@@ -2127,20 +2132,31 @@ function detectSnapshotSequenceProblems(report: TraceReport): EvidenceRef[] {
 
   const evidence: EvidenceRef[] = [];
   for (const snapshots of byRun.values()) {
-    for (let index = 1; index < snapshots.length; index += 1) {
-      const previous = snapshots[index - 1]!;
-      const current = snapshots[index]!;
+    let previous: MilestoneEntry | undefined;
+    let interveningUnnumbered = 0;
+    for (const current of snapshots) {
+      if (current.snapshotSeq === null || current.snapshotSeq === undefined) {
+        if (previous) interveningUnnumbered += 1;
+        continue;
+      }
+      if (!previous) {
+        previous = current;
+        interveningUnnumbered = 0;
+        continue;
+      }
       if (current.snapshotSeq! <= previous.snapshotSeq!) {
         evidence.push({
           ...milestoneEvidence(current),
           detail: `snapshot sequence regressed from ${previous.snapshotSeq} to ${current.snapshotSeq}`,
         });
-      } else if (current.snapshotSeq! > previous.snapshotSeq! + 1) {
+      } else if (current.snapshotSeq! > previous.snapshotSeq! + interveningUnnumbered + 1) {
         evidence.push({
           ...milestoneEvidence(current),
           detail: `snapshot sequence jumped from ${previous.snapshotSeq} to ${current.snapshotSeq}`,
         });
       }
+      previous = current;
+      interveningUnnumbered = 0;
     }
   }
   return evidence.slice(0, 10);

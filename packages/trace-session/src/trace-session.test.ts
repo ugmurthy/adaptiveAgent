@@ -1600,6 +1600,64 @@ describe('trace-session CLI helpers', () => {
     expect(timeline[0]?.params).toEqual({ path: 'README.md' });
   });
 
+  it('keeps delegate spawn milestones out of tool lifecycles and accepts historical unnumbered snapshots', () => {
+    const timeline = buildTimeline([
+      traceRow({
+        event_id: 'delegate-started',
+        event_seq: 18,
+        event_type: 'tool.started',
+        event_step_id: 'step-2',
+        tool_call_id: 'delegate-call',
+        event_tool_name: 'delegate.researcher',
+        ledger_tool_name: 'delegate.researcher',
+        tool_execution_status: 'completed',
+        tool_started_at: '2026-07-15T03:09:52.000Z',
+        tool_completed_at: '2026-07-15T03:11:29.000Z',
+      }),
+      traceRow({
+        event_id: 'delegate-spawned',
+        event_seq: 21,
+        event_type: 'delegate.spawned',
+        event_step_id: 'step-2',
+        payload: { toolName: 'delegate.researcher', childRunId: 'child-run' },
+        event_tool_name: 'delegate.researcher',
+        child_run_id: 'child-run',
+        child_run_status: 'succeeded',
+      }),
+      traceRow({
+        event_id: 'delegate-completed',
+        event_seq: 23,
+        event_type: 'tool.completed',
+        event_step_id: 'step-2',
+        tool_call_id: 'delegate-call',
+        event_tool_name: 'delegate.researcher',
+        ledger_tool_name: 'delegate.researcher',
+        tool_execution_status: 'completed',
+        tool_started_at: '2026-07-15T03:09:52.000Z',
+        tool_completed_at: '2026-07-15T03:11:29.000Z',
+      }),
+    ]);
+
+    expect(timeline).toHaveLength(1);
+    expect(timeline[0]).toMatchObject({
+      toolName: 'delegate.researcher',
+      toolCallId: 'delegate-call',
+      outcome: 'completed',
+    });
+
+    const diagnostics = buildTraceDiagnostics(reliabilityReport({
+      milestones: [
+        milestone('snapshot.created', 20, { snapshotSeq: 4 }),
+        milestone('snapshot.created', 22, { snapshotSeq: null }),
+        milestone('snapshot.created', 25, { snapshotSeq: 6 }),
+        milestone('run.completed', 26),
+      ],
+    }));
+
+    expect(diagnostics.reliability.classification).toBe('healthy');
+    expect(diagnostics.findings.some((finding) => finding.title === 'Snapshot sequence integrity issue')).toBe(false);
+  });
+
   it('renders timeline titles with the earliest tool start and falls back to output previews when params are missing', () => {
     const timeline = buildTimeline([
       {

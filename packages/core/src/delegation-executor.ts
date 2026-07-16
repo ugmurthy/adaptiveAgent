@@ -802,7 +802,7 @@ export class DelegationExecutor {
       parentStepId: parentRun.currentStepId ?? null,
     };
     const snapshotSaveStartedAt = Date.now();
-    await stores.snapshotStore.save({
+    const snapshot = await stores.snapshotStore.save({
       runId: parentRun.id,
       snapshotSeq: (latestSnapshot?.snapshotSeq ?? 0) + 1,
       status: 'awaiting_subagent',
@@ -824,6 +824,7 @@ export class DelegationExecutor {
       stepId: parentRun.currentStepId,
       schemaVersion: 1,
       payload: {
+        snapshotSeq: snapshot.snapshotSeq,
         status: 'awaiting_subagent',
         waitingOnChildRunId: childRunId,
         waitingOnDelegateName: delegateName,
