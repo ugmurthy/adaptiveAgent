@@ -81,7 +81,7 @@ The recovery verbs are intentionally distinct:
 
 A terminal failure is a failed run that is not safe or useful to retry in place. Examples include rejected approval, policy blocks, non-retryable tool errors after possible side effects, missing or incompatible snapshots, and failures that require `replan.required` instead of repeating the same boundary.
 
-[^recovery-commands]: Current implementation status: the programmatic `AgentSdk` exposes `resume`, `retry`, `getRecoveryPlan`, `recover`, `continueRun`, `createContinuationRun`, `interrupt`, `steer`, and `inspect`; the TUI exposes `/retry`, `/interrupt`, `/replay`, `/steer`, and `/inspect`; the non-TUI `adaptive-agent` CLI exposes `resume`, `retry`, `recover`, `interrupt`, and `replay`. A top-level `continue` command is still not exposed.
+[^recovery-commands]: Current implementation status: the programmatic `AgentSdk` exposes `resume`, `retry`, `getRecoveryPlan`, `recover`, `continueRun`, `createContinuationRun`, `interrupt`, `steer`, and `inspect`; the TUI exposes `/retry`, `/interrupt`, `/replay`, `/steer`, and `/inspect`; the non-TUI `adaptive-agent` CLI exposes `resume`, `retry`, `recover`, `continue`, `interrupt`, and `replay`.
 
 ## Global Options
 

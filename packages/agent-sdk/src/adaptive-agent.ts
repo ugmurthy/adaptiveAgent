@@ -119,7 +119,7 @@ const IMAGE_FILE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp',
 const AUDIO_FILE_EXTENSIONS = new Set(['.wav', '.mp3', '.flac', '.m4a', '.ogg', '.aac', '.aiff', '.aif', '.opus', '.oga', '.weba']);
 const VIDEO_FILE_EXTENSIONS = new Set(['.mp4', '.m4v', '.mov', '.webm', '.mkv', '.avi', '.mpeg', '.mpg', '.ogv', '.wmv', '.flv', '.3gp', '.ts', '.mts', '.m2ts']);
 
-const CLI_COMMANDS = ['run', 'chat', 'spec', 'config', 'catalog', 'eval', 'swarm-run', 'ambient', 'inspect', 'resume', 'retry', 'recover', 'interrupt', 'replay', 'init', 'doctor', 'update', 'uninstall', 'agent-create', 'context'] as const;
+const CLI_COMMANDS = ['run', 'chat', 'spec', 'config', 'catalog', 'eval', 'swarm-run', 'ambient', 'inspect', 'resume', 'retry', 'recover', 'continue', 'interrupt', 'replay', 'init', 'doctor', 'update', 'uninstall', 'agent-create', 'context'] as const;
 type CliCommand = (typeof CLI_COMMANDS)[number];
 const CLI_COMMAND_SET = new Set<string>(CLI_COMMANDS);
 
@@ -127,8 +127,8 @@ function isCliCommand(value: string): value is CliCommand {
   return CLI_COMMAND_SET.has(value);
 }
 
-function isSingleRunCommand(command: ManualTestCliOptions['command']): command is 'inspect' | 'resume' | 'recover' | 'interrupt' | 'replay' {
-  return command === 'inspect' || command === 'resume' || command === 'recover' || command === 'interrupt' || command === 'replay';
+function isSingleRunCommand(command: ManualTestCliOptions['command']): command is 'inspect' | 'resume' | 'recover' | 'continue' | 'interrupt' | 'replay' {
+  return command === 'inspect' || command === 'resume' || command === 'recover' || command === 'continue' || command === 'interrupt' || command === 'replay';
 }
 
 const TOP_LEVEL_HELP_TEXT = `adaptive-agent
@@ -151,6 +151,7 @@ Common commands:
 Recovery and inspection:
   inspect               Inspect a stored run and event summary
   resume                Resume an interrupted or waiting run in place
+  continue              Start a new continuation run from a failed run
   interrupt             Request interruption for an active run
   replay                Render stored run events without re-executing
 
@@ -373,6 +374,23 @@ Examples:
 Recover options:
   --strategy <mode>       Recovery mode: auto, resume, retry, or continue. Default: auto.
   --dry-run               Print the selected recovery plan without executing it.
+
+${COMMON_AGENT_OPTIONS_TEXT}
+
+${RUN_OUTPUT_OPTIONS_TEXT}`;
+
+const CONTINUE_HELP_TEXT = `adaptive-agent continue
+
+Create and execute a new continuation run from a failed persisted run. The
+source run remains failed and the new run is linked to it for auditability.
+
+Usage:
+  adaptive-agent continue <runId> [options]
+  adaptive-agent continue --run-id <runId> [options]
+
+Examples:
+  adaptive-agent continue run_123
+  adaptive-agent continue --run-id run_123 --runtime postgres --progress
 
 ${COMMON_AGENT_OPTIONS_TEXT}
 
@@ -642,6 +660,8 @@ function getHelpText(topic?: ManualTestCliOptions['helpTopic']): string {
       return RETRY_HELP_TEXT;
     case 'recover':
       return RECOVER_HELP_TEXT;
+    case 'continue':
+      return CONTINUE_HELP_TEXT;
     case 'interrupt':
       return INTERRUPT_HELP_TEXT;
     case 'replay':
@@ -766,6 +786,10 @@ export async function main(argv = Bun.argv.slice(2)): Promise<number> {
 
   if (cli.command === 'recover') {
     return runRecoverCommand(cli);
+  }
+
+  if (cli.command === 'continue') {
+    return runContinueCommand(cli);
   }
 
   if (cli.command === 'interrupt') {
@@ -1711,6 +1735,69 @@ async function runRecoverCommand(cli: ManualTestCliOptions): Promise<number> {
   }
 }
 
+async function runContinueCommand(cli: ManualTestCliOptions): Promise<number> {
+  const runId = readRunIdArgument(cli);
+  const resolvedCwd = resolve(cli.cwd ?? process.cwd());
+  const sdkOptions = buildSdkOptions(cli, resolvedCwd);
+  const eventLog: Array<Record<string, JsonValue>> = [];
+  const resolvedConfig = await loadAgentSdkConfig(sdkOptions);
+  const lastProgressContentByRun = new Map<string, string>();
+  const continuationColors = cli.output === 'pretty' ? new RunColorRegistry() : undefined;
+  const eventListener = shouldListenForCliEvents(cli) && !cli.dryRun ? (event: AgentEvent) => {
+    const entry = summarizeEvent(event);
+    eventLog.push(entry);
+    if (continuationColors && cli.progress) {
+      printRunBoundaryEvent(event, resolvedConfig.tui, continuationColors, cli.wrapWidth);
+    }
+    if (cli.events && cli.output === 'pretty') {
+      printEvent(entry, resolvedConfig.tui, continuationColors);
+    } else if (cli.progress && cli.output === 'pretty') {
+      printProgressEvent(event, lastProgressContentByRun, resolvedConfig.tui, cli.showLines, cli.wrapWidth, continuationColors);
+    }
+  } : undefined;
+
+  const initialSdk = await createAgentSdk({ ...sdkOptions, eventListener });
+  let sdk = initialSdk;
+  try {
+    sdk = await resolveSdkForRunAgent(initialSdk, sdkOptions, runId, cli.agentConfigPath, eventListener);
+
+    if (cli.dryRun) {
+      const recovery = await sdk.getRecoveryOptions(runId);
+      if (cli.output === 'json') {
+        console.log(JSON.stringify({ command: 'continue', sourceRunId: runId, dryRun: true, recovery }, null, 2));
+      } else if (cli.output === 'jsonl') {
+        console.log(JSON.stringify({ command: 'continue', sourceRunId: runId, dryRun: true, recovery }));
+      } else {
+        console.log(`continue ${runId}: ${recovery.decision}`);
+        console.log(`continuable: ${recovery.continuable ? 'yes' : 'no'}`);
+        console.log(`reason: ${recovery.reason}`);
+        if (recovery.recommendedStrategy) console.log(`strategy: ${recovery.recommendedStrategy}`);
+        if (recovery.lastCompletedStepId) console.log(`last completed step: ${recovery.lastCompletedStepId}`);
+        if (recovery.nextStepId) console.log(`next step: ${recovery.nextStepId}`);
+        if (recovery.unsafeReason) console.log(`unsafe reason: ${recovery.unsafeReason}`);
+      }
+      return recovery.continuable && !recovery.requiresReconciliation ? 0 : 1;
+    }
+
+    const result = await sdk.continueRun({ fromRunId: runId });
+
+    if (cli.output === 'json') {
+      console.log(JSON.stringify({ command: 'continue', sourceRunId: runId, result: summarizeResult(result) }, null, 2));
+    } else if (cli.output === 'jsonl') {
+      console.log(JSON.stringify({ command: 'continue', sourceRunId: runId, result: summarizeResult(result) }));
+    } else {
+      console.log(`continue: source=${runId} run=${result.runId}`);
+      printResult(result, 'run', resolvedConfig.tui);
+      if (cli.events && eventLog.length > 0) console.error(`event log captured: ${eventLog.length}`);
+    }
+
+    return isSuccessfulResult(result) ? 0 : 1;
+  } finally {
+    if (sdk !== initialSdk) await sdk.close();
+    await initialSdk.close();
+  }
+}
+
 function printRecoveryPlan(plan: RunRecoveryPlan): void {
   console.log(`recover ${plan.runId}: ${plan.action}`);
   console.log(`status: ${plan.status}`);
@@ -2336,7 +2423,7 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
         options.output = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['pretty', 'json', 'jsonl']);
         break;
       default:
-        if (options.command === 'run' || options.command === 'chat' || options.command === 'swarm-run' || options.command === 'ambient' || options.command === 'inspect' || options.command === 'resume' || options.command === 'retry' || options.command === 'recover' || options.command === 'interrupt' || options.command === 'replay' || options.command === 'agent-create' || options.command === 'context') {
+        if (options.command === 'run' || options.command === 'chat' || options.command === 'swarm-run' || options.command === 'ambient' || options.command === 'inspect' || options.command === 'resume' || options.command === 'retry' || options.command === 'recover' || options.command === 'continue' || options.command === 'interrupt' || options.command === 'replay' || options.command === 'agent-create' || options.command === 'context') {
           options.goalArgs.push(arg);
           break;
         }

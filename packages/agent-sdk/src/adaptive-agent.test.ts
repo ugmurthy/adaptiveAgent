@@ -461,6 +461,12 @@ describe('adaptive-agent cli parsing', () => {
       recoveryStrategy: 'continue',
       dryRun: true,
     });
+    expect(parseCliArgs(['continue', '--run-id', 'run-1', '--progress', '--dry-run'])).toMatchObject({
+      command: 'continue',
+      runId: 'run-1',
+      progress: true,
+      dryRun: true,
+    });
     expect(parseCliArgs(['interrupt', 'run-1', '--output', 'json'])).toMatchObject({
       command: 'interrupt',
       goalArgs: ['run-1'],
@@ -472,6 +478,7 @@ describe('adaptive-agent cli parsing', () => {
     });
     expect(() => parseCliArgs(['inspect'])).toThrow('inspect requires --run-id <runId> or exactly one positional <runId>');
     expect(() => parseCliArgs(['resume', '--run-id', 'run-1', 'run-2'])).toThrow('resume accepts --run-id <runId> or one positional <runId>, but not both');
+    expect(() => parseCliArgs(['continue'])).toThrow('continue requires --run-id <runId> or exactly one positional <runId>');
   });
 
   it('parses eval cases benchmark flags', () => {
