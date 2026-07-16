@@ -7,11 +7,17 @@ Trace Workbench is a Bun-hosted Svelte 5 application for inspecting persisted Ad
 - searchable session/run selector backed by the database
 - outcome narrative explaining why the run succeeded, failed, blocked, or remained unknown
 - resource ledger for wall time, model time, tool time, tokens, and estimated cost
+- canonical per-run efficiency, retry, tool-output, context-growth, and evidence-coverage diagnostics from `report.diagnostics.analysis`
 - ECharts visualizations for measured runtime split and slowest tools
 - tool timeline with raw per-step payload inspection
 - snapshot-backed LLM message context
 - diagnostic findings and suggested next `trace-session` inspections
-- markdown download and browser print-to-PDF export
+- markdown download and browser print-to-PDF export using the same attached diagnostics as the UI
+
+The Workbench is a presentation consumer of `@adaptive-agent/trace-session`.
+It does not derive a second set of analytics in the browser or API server:
+session/run endpoints return the canonical `TraceReport`, and the diagnostic
+tables and exports read `report.diagnostics.analysis.runs` directly.
 
 ## Run locally
 

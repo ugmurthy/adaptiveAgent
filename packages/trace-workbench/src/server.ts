@@ -9,8 +9,8 @@ import {
   type CliOptions,
   type SessionListItem,
   type TracePostgresPool,
-  type TraceReport,
 } from '@adaptive-agent/trace-session';
+import { buildTraceMarkdown } from './trace-format.js';
 
 const port = Number(Bun.env.TRACE_WORKBENCH_PORT ?? Bun.env.PORT ?? 4767);
 const host = Bun.env.TRACE_WORKBENCH_HOST ?? '0.0.0.0';
@@ -212,75 +212,6 @@ function readPositiveInteger(value: string | null): number | null {
   return Math.min(parsed, 500);
 }
 
-function buildTraceMarkdown(report: TraceReport): string {
-  const brief = report.diagnostics?.brief;
-  const usage = report.usage.total;
-  const toolAccounting = report.usage.toolAccounting ?? report.diagnostics?.performance.toolAccounting;
-  const toolCostUSD = toolAccounting?.estimatedCostUSD ?? 0;
-  const totalCostUSD = usage.estimatedCostUSD + toolCostUSD;
-  const findings = report.diagnostics?.findings ?? [];
-  const topTools = report.diagnostics?.performance.topToolsByDuration ?? [];
-  const rootRun = report.rootRuns[0];
-  const finalOutputLines = formatFinalOutputs(report.rootRuns);
-
-  const lines = [
-    `# AdaptiveAgent trace: ${brief?.targetLabel ?? rootRun?.rootRunId ?? report.target.requestedId}`,
-    '',
-    `**Outcome:** ${report.summary.status}`,
-    '',
-    report.summary.reason,
-    '',
-    '## Goal',
-    '',
-    stringifyGoal(rootRun?.goal),
-    '',
-    '## Final output',
-    '',
-    ...finalOutputLines,
-    '',
-    '## Resource ledger',
-    '',
-    `- Wall time: ${formatDuration(brief?.wallDurationMs ?? null)}`,
-    `- Model time: ${formatDuration(brief?.cumulativeModelDurationMs ?? null)}`,
-    `- Tool time: ${formatDuration(brief?.cumulativeToolDurationMs ?? null)}`,
-    `- Tokens: ${usage.totalTokens.toLocaleString()} total (${usage.promptTokens.toLocaleString()} prompt / ${usage.completionTokens.toLocaleString()} completion${usage.reasoningTokens ? ` / ${usage.reasoningTokens.toLocaleString()} reasoning` : ''})`,
-    `- Estimated model cost: $${usage.estimatedCostUSD.toFixed(6)}`,
-    `- Estimated tool provider cost: $${toolCostUSD.toFixed(6)}`,
-    `- Estimated total cost: $${totalCostUSD.toFixed(6)}`,
-    `- Tool provider requests: ${(toolAccounting?.totalRequests ?? 0).toLocaleString()} total / ${(toolAccounting?.billableRequests ?? 0).toLocaleString()} billable / ${(toolAccounting?.cachedToolCalls ?? 0).toLocaleString()} cached / ${(toolAccounting?.unpricedRequests ?? 0).toLocaleString()} unpriced`,
-    '',
-    '## Tool provider accounting',
-    '',
-    ...(toolAccounting?.byProviderOperation.length
-      ? [
-          '| Provider | Operation | Tool calls | Requests | Billable | Cached | Unpriced | Cost |',
-          '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |',
-          ...toolAccounting.byProviderOperation.map((row) => `| ${row.provider} | ${row.operation} | ${row.toolCalls.toLocaleString()} | ${row.requests.toLocaleString()} | ${row.billableRequests.toLocaleString()} | ${row.cachedToolCalls.toLocaleString()} | ${row.unpricedRequests.toLocaleString()} | $${row.estimatedCostUSD.toFixed(6)} |`),
-        ]
-      : ['No tool accounting payloads were available for this trace.']),
-    '',
-    '## What happened',
-    '',
-    ...report.timeline.slice(0, 40).map((entry, index) =>
-      `${index + 1}. ${entry.toolName ?? entry.eventType ?? 'step'} - ${entry.outcome} - ${formatDuration(entry.durationMs)}`,
-    ),
-    '',
-    '## Findings',
-    '',
-    ...(findings.length > 0 ? findings.map((finding) => `- **${finding.severity}: ${finding.title}** - ${finding.summary}`) : ['- No diagnostic findings were derived from this trace.']),
-    '',
-    '## Top tools by duration',
-    '',
-    ...(topTools.length > 0 ? topTools.map((tool) => `- ${tool.toolName}: ${formatDuration(tool.durationMs.total)} across ${tool.started} calls`) : ['- No measured tool spans found.']),
-    '',
-    '## Warnings',
-    '',
-    ...(report.warnings.length > 0 ? report.warnings.map((warning) => `- ${warning}`) : ['- None']),
-    '',
-  ];
-  return lines.join('\n');
-}
-
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -297,32 +228,6 @@ function contentType(filePath: string): string {
     case '.json': return 'application/json; charset=utf-8';
     default: return 'application/octet-stream';
   }
-}
-
-function formatDuration(value: number | null): string {
-  if (value === null || !Number.isFinite(value)) return 'unknown';
-  if (value < 1_000) return `${Math.round(value)}ms`;
-  if (value < 60_000) return `${(value / 1_000).toFixed(1)}s`;
-  return `${(value / 60_000).toFixed(1)}m`;
-}
-
-function stringifyGoal(goal: unknown): string {
-  if (goal === null || goal === undefined) return '_No goal persisted._';
-  return typeof goal === 'string' ? goal : `\`\`\`json\n${JSON.stringify(goal, null, 2)}\n\`\`\``;
-}
-
-function formatFinalOutputs(rootRuns: TraceReport['rootRuns']): string[] {
-  const outputs = rootRuns.filter((rootRun) => rootRun.result !== null && rootRun.result !== undefined);
-  if (outputs.length === 0) return ['_No final output was persisted for this trace._'];
-  return outputs.flatMap((rootRun) => [
-    outputs.length > 1 ? `### Run ${rootRun.rootRunId}` : '',
-    stringifyResult(rootRun.result),
-  ]).filter((line) => line !== '');
-}
-
-function stringifyResult(result: unknown): string {
-  if (typeof result === 'string') return result;
-  return `\`\`\`json\n${JSON.stringify(result, null, 2)}\n\`\`\``;
 }
 
 function safeFilename(value: string): string {

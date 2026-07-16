@@ -12,6 +12,23 @@ export function formatCost(value: number | null | undefined): string {
   return `$${value.toFixed(value >= 1 ? 2 : 6)}`;
 }
 
+export function formatBytes(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return 'n/a';
+  if (Math.abs(value) < 1_024) return `${Math.round(value)} B`;
+  if (Math.abs(value) < 1_048_576) return `${(value / 1_024).toFixed(1)} KiB`;
+  return `${(value / 1_048_576).toFixed(1)} MiB`;
+}
+
+export function formatRatio(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return 'n/a';
+  return `${value.toFixed(2)}x`;
+}
+
+export function formatPercentage(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return 'n/a';
+  return `${value.toFixed(1)}%`;
+}
+
 export function compactId(value: string | null | undefined): string {
   if (!value) return 'unknown';
   return value.length <= 12 ? value : `${value.slice(0, 8)}…${value.slice(-4)}`;
@@ -33,6 +50,7 @@ export function buildTraceMarkdown(report: TraceReport | null): string {
   const rootRun = report.rootRuns[0];
   const findings = report.diagnostics?.findings ?? [];
   const topTools = report.diagnostics?.performance.topToolsByDuration ?? [];
+  const runAnalysis = report.diagnostics?.analysis?.runs ?? [];
   const finalOutputLines = formatFinalOutputs(report.rootRuns);
 
   return [
@@ -71,6 +89,10 @@ export function buildTraceMarkdown(report: TraceReport | null): string {
         ]
       : ['No tool accounting payloads were available for this trace.']),
     '',
+    '## Per-run efficiency and context',
+    '',
+    ...formatRunAnalysis(runAnalysis),
+    '',
     '## Steps the agent took',
     '',
     ...(report.timeline.length > 0
@@ -90,6 +112,78 @@ export function buildTraceMarkdown(report: TraceReport | null): string {
     ...(report.warnings.length > 0 ? report.warnings.map((warning) => `- ${warning}`) : ['- None']),
     '',
   ].join('\n');
+}
+
+function formatRunAnalysis(runs: NonNullable<TraceReport['diagnostics']>['analysis']['runs']): string[] {
+  if (runs.length === 0) return ['_No per-run analysis was attached to this report._'];
+  const executionRows = runs.map((run) => [
+    run.runId,
+    run.status ?? 'unknown',
+    run.provider || run.model ? `${run.provider ?? 'unknown'}/${run.model ?? 'unknown'}` : 'unknown',
+    formatDuration(run.durations.wallMs),
+    formatDuration(run.durations.cumulativeMeasuredMs),
+    formatRatio(run.durations.parallelism),
+    `${run.modelCalls.logicalCalls}/${run.modelCalls.attempts}`,
+    run.modelCalls.retries.toLocaleString(),
+    formatRatio(run.modelCalls.retryAmplification),
+    run.modelCalls.failures.toLocaleString(),
+    `${run.toolCalls.starts}/${run.toolCalls.failures}`,
+    formatPercentage(run.toolCalls.reductionPercentage),
+    run.usage.combined.totalTokens.toLocaleString(),
+    formatCost(run.costs.estimatedGrandTotalUSD),
+  ]);
+  const contextRows = runs.map((run) => [
+    run.runId,
+    `${run.contextGrowth.source}/${run.contextGrowth.samples}`,
+    [run.contextGrowth.initialMessageBytes, run.contextGrowth.latestMessageBytes, run.contextGrowth.peakMessageBytes, run.contextGrowth.messageBytesGrowth].map(formatBytes).join(' / '),
+    [run.contextGrowth.initialMessageCount, run.contextGrowth.latestMessageCount, run.contextGrowth.peakMessageCount, run.contextGrowth.messageCountGrowth].map((value) => value === null ? 'n/a' : value.toLocaleString()).join(' / '),
+    run.directChildFanOut.toLocaleString(),
+    formatDuration(run.cumulativeDirectChildWallMs),
+    formatBytes(run.outputBytes),
+    run.coverage.events.toLocaleString(),
+    formatCoverage(run.coverage.performance),
+    run.coverage.snapshots.toLocaleString(),
+    formatCoverage(run.coverage.cost),
+  ]);
+  const notes = runs.flatMap((run) => run.notes.map((note) => `- **${escapeMarkdownCell(run.runId)}:** ${escapeMarkdownCell(note)}`));
+  return [
+    '### Execution efficiency',
+    '',
+    markdownTable(
+      ['Run', 'Status', 'Provider/model', 'Wall', 'Measured', 'Parallelism', 'Model logical/attempts', 'Retries', 'Amplification', 'Model failures', 'Tools/failed', 'Output reduction', 'Tokens', 'Grand cost'],
+      executionRows,
+    ),
+    '',
+    '### Context growth and evidence coverage',
+    '',
+    markdownTable(
+      ['Run', 'Context source/samples', 'Bytes initial/latest/peak/growth', 'Messages initial/latest/peak/growth', 'Children', 'Child wall', 'Output', 'Events', 'Performance', 'Snapshots', 'Provider cost'],
+      contextRows,
+    ),
+    ...(notes.length > 0 ? ['', '### Data notes', '', ...notes] : []),
+  ];
+}
+
+function markdownTable(headers: string[], rows: string[][]): string {
+  return [
+    `| ${headers.map(escapeMarkdownCell).join(' | ')} |`,
+    `| ${headers.map(() => '---').join(' | ')} |`,
+    ...rows.map((row) => `| ${row.map(escapeMarkdownCell).join(' | ')} |`),
+  ].join('\n');
+}
+
+function escapeMarkdownCell(value: string): string {
+  return value
+    .replaceAll('\\', '\\\\')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('|', '\\|')
+    .replace(/\r?\n/g, ' ');
+}
+
+function formatCoverage(value: number | null): string {
+  return value === null ? 'n/a' : formatPercentage(value * 100);
 }
 
 function stringifyGoal(goal: unknown): string {

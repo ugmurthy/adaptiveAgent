@@ -12,9 +12,10 @@
     UsageSummary,
   } from '@adaptive-agent/trace-session';
 
+  import RunAnalysisPanel from './components/RunAnalysisPanel.svelte';
   import TraceCharts from './components/TraceCharts.svelte';
   import { fetchRun, fetchSessionReport, fetchSessions } from './lib/api';
-  import { buildTraceMarkdown, compactId, formatCost, formatDuration, oneLine } from './lib/format';
+  import { buildTraceMarkdown, compactId, formatCost, formatDuration, oneLine } from '../trace-format';
 
   type Tab = 'story' | 'timeline' | 'messages' | 'raw';
   type SelectionKind = 'session' | 'run';
@@ -92,6 +93,7 @@
   const toolOutputProviderModelUsage = $derived(report?.usage.toolOutputByProviderModel ?? []);
   const visibleToolOutputProviderModelUsage = $derived(providerUsageRows(toolOutputProviderModelUsage));
   const finalOutputs = $derived(buildFinalOutputs(report?.rootRuns ?? []));
+  const runAnalysis = $derived(report?.diagnostics?.analysis?.runs ?? []);
 
   onMount(async () => {
     await loadSessions();
@@ -754,6 +756,8 @@
               {/if}
             </div>
           </section>
+
+          <RunAnalysisPanel runs={runAnalysis} />
 
           <TraceCharts {report} />
 

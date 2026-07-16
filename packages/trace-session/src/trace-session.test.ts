@@ -2831,6 +2831,44 @@ describe('trace-session CLI helpers', () => {
     expect(html).not.toContain('<script>alert(1)</script>');
   });
 
+  it('renders attached per-run diagnostics in HTML without recomputing or zero-filling them', () => {
+    const report = reliabilityReport();
+    const diagnostics = buildTraceDiagnostics(report);
+    const run = diagnostics.analysis.runs[0]!;
+    report.diagnostics = {
+      ...diagnostics,
+      analysis: {
+        runs: [{
+          ...run,
+          provider: '<derived-provider>',
+          model: 'derived-model',
+          durations: { ...run.durations, wallMs: 1_234_567 },
+          costs: { ...run.costs, estimatedGrandTotalUSD: 9.876543 },
+          contextGrowth: {
+            ...run.contextGrowth,
+            initialMessageBytes: null,
+            latestMessageBytes: null,
+            peakMessageBytes: null,
+            messageBytesGrowth: null,
+          },
+          notes: ['Derived note <not-raw-data>.'],
+        }],
+      },
+    };
+
+    const html = renderTraceHtml(report, { generatedAt: '2026-07-16T10:00:00.000Z' });
+
+    expect(html).toContain('Per-run efficiency and context');
+    expect(html).toContain('Execution efficiency');
+    expect(html).toContain('Context growth and evidence coverage');
+    expect(html).toContain('&lt;derived-provider&gt;');
+    expect(html).toContain('1234.57s');
+    expect(html).toContain('$9.876543');
+    expect(html).toContain('- / - / - / -');
+    expect(html).toContain('Derived note &lt;not-raw-data&gt;.');
+    expect(html).not.toContain('Derived note <not-raw-data>.');
+  });
+
   it('counts tool calls by durable execution status instead of terminal lifecycle events', () => {
     const performance = summarizePerformance([
       traceRow({

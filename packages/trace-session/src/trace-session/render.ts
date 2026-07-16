@@ -1091,26 +1091,7 @@ function renderHtmlPerformance(report: TraceReport, diagnostics: TraceDiagnostic
         ['Duration split', `total=${formatDuration(split.totalDurationMs)}`, `model=${formatDuration(split.modelDurationMs)}, tools=${formatDuration(split.toolDurationMs)}, snapshot=${formatDuration(split.snapshotSaveMs)}, other=${formatDuration(split.otherDurationMs)}`],
       ]),
       renderHtmlUsageBreakdown(report.usage),
-      htmlSubsection('Per-run efficiency and context', htmlTable(
-        ['Run', 'Status', 'Provider/model', 'Wall', 'Measured', 'Parallelism', 'Model attempts', 'Retries', 'Tool calls', 'Tokens', 'Cost', 'Context samples', 'Context latest/peak/growth'],
-        diagnostics.analysis.runs.map((run) => [
-          shortId(run.runId),
-          run.status ?? 'unknown',
-          run.provider || run.model ? `${run.provider ?? 'unknown'}/${run.model ?? 'unknown'}` : '-',
-          formatDuration(run.durations.wallMs),
-          formatDuration(run.durations.cumulativeMeasuredMs),
-          formatRatio(run.durations.parallelism),
-          formatNumber(run.modelCalls.attempts),
-          formatNumber(run.modelCalls.retries),
-          formatNumber(run.toolCalls.starts),
-          formatNumber(run.usage.combined.totalTokens),
-          formatCost(run.costs.estimatedGrandTotalUSD),
-          `${run.contextGrowth.source}/${formatNumber(run.contextGrowth.samples)}`,
-          [run.contextGrowth.latestMessageBytes, run.contextGrowth.peakMessageBytes, run.contextGrowth.messageBytesGrowth]
-            .map((value) => value === null ? '-' : formatBytes(value))
-            .join(' / '),
-        ]),
-      )),
+      htmlSubsection('Per-run efficiency and context', renderHtmlRunAnalysis(diagnostics)),
       htmlSubsection('Tool provider accounting', digest.toolAccounting.byProviderOperation.length === 0 ? '<p class="empty">No tool accounting payloads were available.</p>' : htmlTable(
         ['Provider', 'Operation', 'Tool calls', 'Requests', 'Billable', 'Cached', 'Unpriced', 'Cost'],
         digest.toolAccounting.byProviderOperation.map((row) => [
@@ -1193,6 +1174,59 @@ function renderHtmlPerformance(report: TraceReport, diagnostics: TraceDiagnostic
       )),
     ].join('\n'),
   );
+}
+
+function renderHtmlRunAnalysis(diagnostics: TraceDiagnostics): string {
+  const runs = diagnostics.analysis.runs;
+  if (runs.length === 0) {
+    return '<p class="empty">No per-run analysis was attached to this report.</p>';
+  }
+  const notes = runs.flatMap((run) => run.notes.map((note) => ({ runId: run.runId, note })));
+  return [
+    htmlSubsection('Execution efficiency', htmlTable(
+      ['Run', 'Status', 'Provider/model', 'Wall', 'Measured', 'Parallelism', 'Model logical/attempts', 'Retries', 'Amplification', 'Model failures', 'Tools/failures', 'Output reduction', 'Tokens', 'Grand cost'],
+      runs.map((run) => [
+        shortId(run.runId),
+        statusCell(run.status ?? 'unknown'),
+        run.provider || run.model ? `${run.provider ?? 'unknown'}/${run.model ?? 'unknown'}` : '-',
+        formatDuration(run.durations.wallMs),
+        formatDuration(run.durations.cumulativeMeasuredMs),
+        formatRatio(run.durations.parallelism),
+        `${formatNumber(run.modelCalls.logicalCalls)}/${formatNumber(run.modelCalls.attempts)}`,
+        formatNumber(run.modelCalls.retries),
+        formatRatio(run.modelCalls.retryAmplification),
+        formatNumber(run.modelCalls.failures),
+        `${formatNumber(run.toolCalls.starts)}/${formatNumber(run.toolCalls.failures)}`,
+        formatOptionalPercentage(run.toolCalls.reductionPercentage),
+        formatNumber(run.usage.combined.totalTokens),
+        formatCost(run.costs.estimatedGrandTotalUSD),
+      ]),
+    )),
+    htmlSubsection('Context growth and evidence coverage', htmlTable(
+      ['Run', 'Context source/samples', 'Bytes initial/latest/peak/growth', 'Messages initial/latest/peak/growth', 'Children', 'Child wall', 'Output', 'Events', 'Performance', 'Snapshots', 'Provider cost'],
+      runs.map((run) => [
+        shortId(run.runId),
+        `${run.contextGrowth.source}/${formatNumber(run.contextGrowth.samples)}`,
+        [run.contextGrowth.initialMessageBytes, run.contextGrowth.latestMessageBytes, run.contextGrowth.peakMessageBytes, run.contextGrowth.messageBytesGrowth]
+          .map((value) => value === null ? '-' : formatBytes(value))
+          .join(' / '),
+        [run.contextGrowth.initialMessageCount, run.contextGrowth.latestMessageCount, run.contextGrowth.peakMessageCount, run.contextGrowth.messageCountGrowth]
+          .map((value) => value === null ? '-' : formatNumber(value))
+          .join(' / '),
+        formatNumber(run.directChildFanOut),
+        formatDuration(run.cumulativeDirectChildWallMs),
+        formatBytes(run.outputBytes),
+        formatNumber(run.coverage.events),
+        formatCoverageRatio(run.coverage.performance),
+        formatNumber(run.coverage.snapshots),
+        formatCoverageRatio(run.coverage.cost),
+      ]),
+    )),
+    ...(notes.length > 0 ? [htmlSubsection(
+      'Data notes',
+      `<ul class="warning-list">${notes.map(({ runId, note }) => `<li><strong>${escapeHtml(shortId(runId))}:</strong> ${escapeHtml(note)}</li>`).join('\n')}</ul>`,
+    )] : []),
+  ].join('\n');
 }
 
 function renderHtmlPerformanceNotes(digest: PerformanceDigest): string {
@@ -3025,6 +3059,10 @@ function formatRatio(value: number | null): string {
 
 function formatOptionalPercentage(value: number | null): string {
   return value === null ? '-' : `${value.toFixed(1)}%`;
+}
+
+function formatCoverageRatio(value: number | null): string {
+  return value === null ? '-' : formatOptionalPercentage(value * 100);
 }
 
 function formatBucketBytes(bucket: PerformanceBucketSummary): string {

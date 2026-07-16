@@ -486,6 +486,22 @@ Grouping and comparison reuse the same derived run observations as normal
 reports. They do not automatically label changes as regressions: changes in
 latency, cost, retries, or context growth require workload and outcome context.
 
+### Shared diagnostics in Workbench and exports
+
+`traceSession()` attaches the canonical `diagnostics.analysis` payload once.
+Trace Workbench, terminal reports, JSON, self-contained HTML, Markdown downloads,
+and browser print/PDF reports consume those attached values; presentation code
+only applies labels and units. It does not independently calculate duration,
+retry, tool-output, usage, cost, child-run, context-growth, or coverage metrics.
+
+In Trace Workbench, **Per-run efficiency and context** shows execution
+efficiency, context growth, and evidence coverage for every persisted run in the
+selected root tree or session. The Markdown download contains the same two
+tables. HTML exports expose the tables under **Performance**, while JSON keeps
+the complete machine-readable payload at `diagnostics.analysis.runs`. Missing
+measurements render as `n/a` or `-` and remain `null` in structured output; they
+are never presented as measured zeroes.
+
 ## Development
 
 ```bash

@@ -140,6 +140,28 @@ button, input, select {
   background: rgba(0, 0, 0, .42);
   padding: 1rem;
 }
+.markdown-body table {
+  width: 100%;
+  min-width: 58rem;
+  border-collapse: collapse;
+  display: block;
+  font-size: .78rem;
+  overflow-x: auto;
+}
+.markdown-body th,
+.markdown-body td {
+  border-bottom: 1px solid rgba(255, 255, 255, .08);
+  padding: .65rem .75rem;
+  text-align: left;
+  white-space: nowrap;
+}
+.markdown-body th {
+  color: #8bd3ff;
+  font-size: .68rem;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.markdown-body td { color: #ccd8e8; }
 
 @media print {
   body { background: white; color: #111827; }
