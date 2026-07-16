@@ -99,7 +99,7 @@ This monorepo is intentionally small:
 
 - `@adaptive-agent/core` in `packages/core`: runtime semantics, durable stores, events, snapshots, tools, delegation, retry, and continuation.
 - `@adaptive-agent/agent-sdk` in `packages/agent-sdk`: user-facing `adaptive-agent` CLI, config loading, built-in tool registration, install/update flows, and evaluation helpers.
-- `@adaptive-agent/trace-session` in `packages/trace-session`: standalone Postgres trace reporter for core runtime runs and optional legacy gateway session tables.
+- `@adaptive-agent/trace-session` in `packages/trace-session`: decision-oriented Postgres trace reporter for core runtime runs and optional legacy gateway session tables. It provides reliability and causal findings, per-run operations analysis, exact-run comparisons, aggregate trends, and terminal, JSON, or self-contained HTML output.
 - `@adaptive-agent/trace-workbench` in `packages/trace-workbench`: Bun + Svelte trace workbench for choosing persisted sessions/runs, exploring timelines, resource spend, messages, diagnostics, and exporting markdown/PDF reports.
 
 Useful local commands:
@@ -107,6 +107,17 @@ Useful local commands:
 ```bash
 bun run core:test
 bun run agent:build
+bun run trace-session list traces --limit 20
 bun run trace-session view run <run-id>
+bun run trace-session compare <baseline-run-id> <candidate-run-id>
+bun run trace-session aggregate model --since 7d
 bun run trace-workbench:dev
 ```
+
+`trace-session` reads core runtime tables directly; gateway session tables are
+optional. Its default `summary` report separates runtime reliability from
+answer quality, reports missing evidence as uncertainty, and keeps model/tool
+output cost separate from external tool-provider cost. See
+[`packages/trace-session/README.md`](packages/trace-session/README.md) for the
+report model, investigation workflow, cache controls, and complete command
+examples.

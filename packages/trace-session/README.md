@@ -281,6 +281,14 @@ scanner. Some checks require optional data: message-context checks run only
 when messages are loaded, and missing historical observability is reported as
 lower confidence instead of fabricated attribution.
 
+Snapshot sequence checks tolerate historical `snapshot.created` events that do
+not carry a sequence number. A gap is reported only when the available numbered
+and unnumbered evidence cannot account for it. Likewise, `delegate.spawned` is
+treated as the link between an existing delegate tool call and its child run,
+not as a second tool operation. This keeps reliability and operation counts
+aligned with the runtime lifecycle instead of double-counting delegation or
+degrading traces because older evidence is sparse.
+
 ### Causal investigation
 
 Findings are sorted by causal role and then severity:
@@ -397,6 +405,10 @@ model duration + tool duration + snapshot save duration; other duration is
 `max(0, wall - measured)`, and parallelism is measured / wall. Model duration
 sums terminal `model.completed` and `model.failed` spans so the elapsed spans
 repeated on `model.retry` evidence are not counted twice.
+
+Tool-call analysis follows the same logical-operation rule: delegation lifecycle
+milestones enrich the originating tool call and do not add another call to the
+operations totals.
 
 Runtime retries are events with `phase === "runtime"`; all other model retry
 events are adapter retries. Retry amplification is `(model starts + adapter

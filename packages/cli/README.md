@@ -172,41 +172,81 @@ adaptive-agent retry --runtime postgres --agent agents/market.json --run-id <fai
 
 ## Trace sessions
 
-`trace-session` reads the same Postgres runtime store used by `adaptive-agent --runtime postgres`. Use it to inspect what happened after a run: session list, run tree, message snapshots, tool timeline, usage, costs, and HTML reports.
+`trace-session` reads the same Postgres runtime store used by
+`adaptive-agent --runtime postgres`. It reads core runtime tables directly;
+legacy gateway session tables are optional. Use it to discover traces, assess
+runtime reliability, investigate causal findings, inspect operations and model
+context, compare exact runs, or aggregate trends. Reports can be rendered for
+the terminal, as JSON, or as self-contained HTML.
 
-List recent sessions:
-
-```bash
-trace-session --ls
-trace-session --lsp
-```
-
-Inspect one session:
+Discover recent traces and copy a complete run ID:
 
 ```bash
-trace-session ev-market-entry-2027 --view overview
-trace-session ev-market-entry-2027 --view timeline --include-plans
-trace-session ev-market-entry-2027 --messages --messages-view delta
-trace-session ev-market-entry-2027 --usage
+trace-session list traces --limit 20
+trace-session list sessions --since 24h
+trace-session list sessionless-runs
 ```
 
-Inspect by run id instead of session id:
+The default report is a decision-oriented summary. Targets can be a session, a
+root run, or any child run:
 
 ```bash
-trace-session --run <run-id> --view investigate
-trace-session --root-run <root-run-id> --view performance
+trace-session view session ev-market-entry-2027
+trace-session view root-run <root-run-id>
+trace-session view run <run-id>
 ```
 
-Write a portable HTML trace report:
+Use focused reports to explain reliability, follow the primary cause and
+recovery evidence, inspect operations, or load snapshot-backed model context:
 
 ```bash
-trace-session ev-market-entry-2027 --view all --html artifacts/ev-market-entry-2027.html
+trace-session view run <run-id> --report reliability
+trace-session view run <run-id> --report investigate
+trace-session view run <run-id> --report operations
+trace-session view run <run-id> --report timeline --include-plans
+trace-session view run <run-id> --report messages --messages-view delta
+trace-session usage session ev-market-entry-2027
 ```
+
+Runtime reliability and answer quality are separate: without a persisted
+evaluator result, the report says that output quality was not evaluated.
+Missing evidence lowers data confidence rather than being guessed. Cost output
+also keeps model/tool-output cost and external tool-provider cost separate.
+
+Write a portable HTML report or consume the same structured diagnostics as
+JSON:
+
+```bash
+trace-session view session ev-market-entry-2027 \
+  --report all \
+  --messages \
+  --html artifacts/ev-market-entry-2027.html
+
+trace-session view run <run-id> --json
+```
+
+Compare the operational analysis of two exact runs, or group root-trace trends
+by model, terminal status, or UTC start day:
+
+```bash
+trace-session compare <baseline-run-id> <candidate-run-id>
+trace-session compare <baseline-run-id> <candidate-run-id> \
+  --html artifacts/comparison.html
+
+trace-session aggregate model --since 7d
+trace-session aggregate status --since 24h --json
+trace-session aggregate day --since 30d --html artifacts/trends.html
+```
+
+Comparison deltas are candidate minus baseline. Aggregate duration
+distributions include p50, p90, and p95; missing usage, cost, or context values
+remain missing instead of becoming zero.
 
 If your trace database is not in `DATABASE_URL`, pass it explicitly:
 
 ```bash
-trace-session --ls --database-url "postgres://localhost:5432/adaptive_agent"
+trace-session list traces \
+  --database-url "postgres://localhost:5432/adaptive_agent"
 
 cat > trace-session.json <<'JSON'
 {
@@ -216,7 +256,16 @@ cat > trace-session.json <<'JSON'
 JSON
 
 export TRACE_DATABASE_URL="postgres://localhost:5432/adaptive_agent"
-trace-session --ls --config trace-session.json
+trace-session list traces --config trace-session.json
+```
+
+Terminal trace and usage reports are cached for five minutes by default.
+Bypass or disable the persistent cache when inspecting changing data:
+
+```bash
+trace-session view run <run-id> --fresh
+trace-session view run <run-id> --no-cache
+trace-session view run <run-id> --cache-ttl 30s
 ```
 
 ## Common commands
@@ -231,11 +280,19 @@ adaptive-agent chat [options] [message...]
 adaptive-agent swarm-run --agent <agent> --worker-catalog <agents> <objective...>
 adaptive-agent retry --run-id <runId>
 
-trace-session --ls
-trace-session <sessionId> --view overview|timeline|messages|performance|all
-trace-session <sessionId> --usage
-trace-session --run <runId> --view investigate
-trace-session <sessionId> --html <path>
+trace-session list sessions
+trace-session list traces
+trace-session list sessionless-runs
+trace-session view session <sessionId> [--report <name>]
+trace-session view root-run <rootRunId> [--report <name>]
+trace-session view run <runId> [--report <name>]
+trace-session usage session <sessionId>
+trace-session usage root-run <rootRunId>
+trace-session usage run <runId>
+trace-session compare <baselineRunId> <candidateRunId>
+trace-session aggregate model [--since <time>] [--until <time>]
+trace-session aggregate status [--since <time>] [--until <time>]
+trace-session aggregate day [--since <time>] [--until <time>]
 ```
 
 ## Links
