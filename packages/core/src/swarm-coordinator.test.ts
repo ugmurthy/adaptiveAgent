@@ -331,6 +331,86 @@ describe('SwarmCoordinator', () => {
     expect(coordinatorRun?.result).toMatchObject({ output: { answer: 'Recovered answer.' } });
   });
 
+  it('resumes finalizers when workers completed before the coordinator result was finalized', async () => {
+    const runStore = new InMemoryRunStore();
+    const qualityModel = new SequenceModel('quality', [{
+      finishReason: 'stop',
+      structuredOutput: {
+        assessments: [{
+          subtaskId: 'subtask-1',
+          runId: 'worker-run-pending-finalizers',
+          usable: true,
+          score: 1,
+          issues: [],
+          recommendation: 'use',
+        }],
+      },
+    }]);
+    const synthesizerModel = new SequenceModel('synthesizer', [
+      { finishReason: 'stop', structuredOutput: { answer: 'Recovered after worker completion.' } },
+    ]);
+    const swarm = new SwarmCoordinator({
+      runStore,
+      coordinatorAgent: createAgent(new SequenceModel('coordinator', []), runStore),
+      coordinatorAgentId: 'coordinator',
+      workerAgents: { researcher: createAgent(new SequenceModel('researcher', []), runStore) },
+      qualityAgent: createAgent(qualityModel, runStore),
+      qualityAgentId: 'quality',
+      synthesizerAgent: createAgent(synthesizerModel, runStore),
+      synthesizerAgentId: 'synthesizer',
+    });
+    let coordinator = await runStore.createRun({
+      id: 'coordinator-pending-finalizers',
+      sessionId: 'session-pending-finalizers',
+      goal: 'Decompose the objective.',
+      status: 'succeeded',
+      metadata: {
+        orchestration: { kind: 'swarm', coordinatorRunId: 'coordinator-pending-finalizers', role: 'coordinator' },
+        swarmExecution: {
+          schemaVersion: 1,
+          sessionId: 'session-pending-finalizers',
+          coordinatorRunId: 'coordinator-pending-finalizers',
+          topLevelObjective: 'Finish this swarm.',
+          maxWorkers: 1,
+          subtasks: [{ id: 'subtask-1', subObjective: 'Research.', targetAgentId: 'researcher' }],
+          agents: { workerAgentIds: { 'subtask-1': 'researcher' } },
+        },
+      },
+    });
+    coordinator = await runStore.updateRun(coordinator.id, {
+      result: { subtasks: [{ id: 'subtask-1', subObjective: 'Research.', targetAgentId: 'researcher' }] },
+    }, coordinator.version);
+    let worker = await runStore.createRun({
+      id: 'worker-run-pending-finalizers',
+      sessionId: 'session-pending-finalizers',
+      goal: 'Research.',
+      status: 'succeeded',
+      metadata: {
+        orchestration: {
+          kind: 'swarm',
+          coordinatorRunId: coordinator.id,
+          role: 'worker',
+          subtaskId: 'subtask-1',
+          agentId: 'researcher',
+        },
+      },
+    });
+    worker = await runStore.updateRun(worker.id, { result: { finding: 'worker completed' } }, worker.version);
+
+    const retried = await swarm.retrySession({ sessionId: 'session-pending-finalizers' });
+
+    expect(retried).toMatchObject({
+      coordinatorRunId: coordinator.id,
+      retriedWorkerRunIds: [],
+      status: 'succeeded',
+      output: { answer: 'Recovered after worker completion.' },
+      subtaskResults: [{ subtaskId: 'subtask-1', runId: worker.id, status: 'succeeded' }],
+    });
+    await expect(runStore.getRun(coordinator.id)).resolves.toMatchObject({
+      result: { status: 'succeeded', output: { answer: 'Recovered after worker completion.' } },
+    });
+  });
+
   it('rejects unknown targetAgentId before launching workers quality or synthesis', async () => {
     const runStore = new InMemoryRunStore();
     const qualityModel = new SequenceModel('quality', []);

@@ -4,11 +4,12 @@ import { readFile } from 'node:fs/promises';
 import { stdout } from 'node:process';
 import { extname, resolve } from 'node:path';
 import chalk from 'chalk';
-import { type AgentEvent, type AgentRun, type AudioInput, type ChatMessage, type JsonObject, type JsonValue, type ModelAdapterConfig, type ModelContentPart, type RunResult, type RunStatus, type SwarmCoordinator, type SwarmRetryResult, type SwarmRunResult, type SwarmSubtask, type UsageSummary } from '@adaptive-agent/core';
+import { type AgentEvent, type AgentRun, type AudioInput, type ChatMessage, type JsonObject, type JsonValue, type ModelAdapterConfig, type ModelContentPart, type RunResult, type RunStatus, type SwarmRetryResult, type SwarmRunResult, type SwarmSubtask, type UsageSummary } from '@adaptive-agent/core';
 import { Editor, matchesKey, ProcessTerminal, TUI, type OverlayHandle } from '@earendil-works/pi-tui';
 
 import {
   createAgentSdk,
+  createSwarmSdk,
   createOrchestrationSdk,
   inspectAgentSdkResolution,
   loadAgentSdkConfig,
@@ -24,7 +25,6 @@ import {
 import { AgentEventLabelRegistry, formatAgentEventSummary, summarizeAgentEvent } from './agent-event-rendering.js';
 import { formatSwarmExecutionPlan, formatSwarmRunStatuses } from './swarm-format.js';
 import { createSwarmRoleAgentConfig } from './swarm-role-config.js';
-import { buildSwarmCoordinator, parseSwarmSubtasks, runSwarmDecomposition, validateSdkDecomposition } from './swarm-runner.js';
 import {
   MessageLog,
   StatusBar,
@@ -657,41 +657,13 @@ async function runTui(sdkOptions: AgentSdkOptions, state: TuiClientState, cli: T
     try {
       const sessionId = state.sessionId;
       addSystem(`swarm-run decomposing task for workers: ${context.workerIds.join(', ')}`);
-      const decompositionResult = await runSwarmDecomposition({
-        coordinatorSdk: sdk!,
-        sessionId,
-        topLevelObjective: command.objective,
-        inputJson: command.inputJson,
-        workerAgents: context.workerSdks.map((workerSdk) => workerSdk.config.agent),
-        workerIds: context.workerIds,
-        contentParts: command.contentParts,
-      });
-      state.currentRunId = decompositionResult.runId;
-      state.currentCoordinatorRunId = decompositionResult.runId;
-
-      if (decompositionResult.status !== 'success') {
-        throw new Error(formatCoordinatorFailure(decompositionResult));
-      }
-
-      const subtasks = parseSwarmSubtasks(decompositionResult.output);
-      validateSdkDecomposition(subtasks, context.workerIds);
-      messageLog.addMessage({ type: 'event', content: formatSwarmExecutionPlan(sessionId, decompositionResult.runId, subtasks, terminal.columns), timestamp: new Date() });
+      const sdkResult = await context.swarm.run({ sessionId, topLevelObjective: command.objective, input: command.inputJson, contentParts: command.contentParts, maxWorkers: command.maxWorkers });
+      state.currentRunId = sdkResult.coordinatorRunId;
+      state.currentCoordinatorRunId = sdkResult.coordinatorRunId;
+      if (sdkResult.state !== 'completed') throw new Error(formatCoordinatorFailure(sdkResult.decompositionResult));
+      const { subtasks, executionResult: result } = sdkResult;
+      messageLog.addMessage({ type: 'event', content: formatSwarmExecutionPlan(sessionId, sdkResult.coordinatorRunId, subtasks, terminal.columns), timestamp: new Date() });
       addSystem(`swarm-run launching ${subtasks.length} worker run(s) with maxWorkers=${command.maxWorkers ?? 'default'}`);
-      const result = await context.swarm.execute({
-        sessionId,
-        coordinatorRunId: decompositionResult.runId,
-        topLevelObjective: command.objective,
-        input: command.inputJson,
-        contentParts: command.contentParts.length > 0 ? command.contentParts : undefined,
-        maxWorkers: command.maxWorkers,
-        metadata: {
-          defaultsUsed: {
-            qualityAgent: command.qualityAgentPath ? 'explicit' : 'coordinator_with_quality_instructions',
-            synthesizerAgent: command.synthesizerAgentPath ? 'explicit' : 'coordinator_with_synthesis_instructions',
-          },
-        },
-        subtasks,
-      });
       return { kind: 'run', result, workerIds: context.workerIds, subtasks };
     } finally {
       await context.close();
@@ -702,7 +674,7 @@ async function runTui(sdkOptions: AgentSdkOptions, state: TuiClientState, cli: T
     const command = lastSwarmCommandConfig;
     const context = await createSwarmExecutionContext(command);
     try {
-      const result = await context.swarm.retrySession({ sessionId, maxWorkers: command.maxWorkers });
+      const result = await context.swarm.retrySession(sessionId, { maxWorkers: command.maxWorkers });
       return { kind: 'retry', result };
     } finally {
       await context.close();
@@ -711,46 +683,8 @@ async function runTui(sdkOptions: AgentSdkOptions, state: TuiClientState, cli: T
 
   async function createSwarmExecutionContext(command: Pick<ParsedSwarmRunCommand, 'workerCatalogPaths' | 'qualityAgentPath' | 'synthesizerAgentPath' | 'maxWorkers'>): Promise<TuiSwarmExecutionContext> {
     const workerCatalogPaths = requireSwarmWorkerCatalog(command.workerCatalogPaths);
-    const createdSdks: AgentSdk[] = [];
-    try {
-      const workerSdks: AgentSdk[] = [];
-      for (const agentConfigPath of workerCatalogPaths) {
-        const workerSdk = await createAgentSdk({ ...sdkOptions, agentConfigPath, runtime: sdk!.created.runtime, eventListener: handleEvent });
-        workerSdks.push(workerSdk);
-        createdSdks.push(workerSdk);
-      }
-      const workerIds = workerSdks.map((workerSdk) => workerSdk.config.agent.id);
-      const duplicateWorkerId = workerIds.find((id, index) => workerIds.indexOf(id) !== index);
-      if (duplicateWorkerId) throw new Error(`swarm-run worker catalog contains duplicate agent id: ${duplicateWorkerId}`);
-      const qualitySdk = command.qualityAgentPath
-        ? await createAgentSdk({ ...sdkOptions, agentConfigPath: command.qualityAgentPath, runtime: sdk!.created.runtime, eventListener: handleEvent })
-        : await createAgentSdk({ ...sdkOptions, agentConfig: createSwarmRoleAgentConfig(sdk!.config.agent, 'quality'), runtime: sdk!.created.runtime, eventListener: handleEvent });
-      createdSdks.push(qualitySdk);
-      const synthesizerSdk = command.synthesizerAgentPath
-        ? await createAgentSdk({ ...sdkOptions, agentConfigPath: command.synthesizerAgentPath, runtime: sdk!.created.runtime, eventListener: handleEvent })
-        : await createAgentSdk({ ...sdkOptions, agentConfig: createSwarmRoleAgentConfig(sdk!.config.agent, 'synthesizer'), runtime: sdk!.created.runtime, eventListener: handleEvent });
-      createdSdks.push(synthesizerSdk);
-      const swarm = buildSwarmCoordinator({
-        coordinatorSdk: sdk!,
-        workerSdks,
-        qualitySdk,
-        synthesizerSdk,
-        defaultMaxWorkers: command.maxWorkers,
-      });
-      return {
-        workerSdks,
-        workerIds,
-        qualitySdk,
-        synthesizerSdk,
-        swarm,
-        close: async () => {
-          await Promise.allSettled(createdSdks.map((createdSdk) => createdSdk.close()));
-        },
-      };
-    } catch (error) {
-      await Promise.allSettled(createdSdks.map((createdSdk) => createdSdk.close()));
-      throw error;
-    }
+    const swarm = await createSwarmSdk({ ...sdkOptions, coordinatorSdk: sdk!, workerConfigPaths: workerCatalogPaths, qualityConfigPath: command.qualityAgentPath, synthesizerConfigPath: command.synthesizerAgentPath, maxWorkers: command.maxWorkers, eventListener: handleEvent });
+    return { workerIds: swarm.config.workerIds, swarm, close: () => swarm.close() };
   }
 
   function handleSwarmRunResult(taskResult: TuiSwarmRunTaskResult): void {
@@ -911,11 +845,8 @@ interface TuiSwarmRetryTaskResult {
 type TuiSwarmTaskResult = TuiSwarmRunTaskResult | TuiSwarmRetryTaskResult;
 
 interface TuiSwarmExecutionContext {
-  workerSdks: AgentSdk[];
   workerIds: string[];
-  qualitySdk: AgentSdk;
-  synthesizerSdk: AgentSdk;
-  swarm: SwarmCoordinator;
+  swarm: import('./index.js').SwarmSdk;
   close: () => Promise<void>;
 }
 

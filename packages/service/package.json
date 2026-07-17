@@ -1,0 +1,26 @@
+{
+  "name": "@adaptive-agent/service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "build": "bun build src/index.ts src/agent-worker-main.ts src/dispatcher-main.ts src/reconciler-main.ts --outdir dist --target bun",
+    "test": "bunx vitest run",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "dependencies": {
+    "@adaptive-agent/agent-sdk": "workspace:*",
+    "@adaptive-agent/core": "workspace:*",
+    "@adaptive-agent/service-sdk": "workspace:*",
+    "bullmq": "^5.56.8",
+    "pg": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.2",
+    "@types/pg": "^8.20.0",
+    "bun-types": "^1.3.5",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.1"
+  }
+}

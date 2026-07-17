@@ -21,6 +21,8 @@ import type {
 
 import {
   createAgentSdk,
+  createSwarmSdk,
+  SwarmSdk,
   createOrchestrationSdk,
   inspectAgentSdkCatalog,
   inspectAgentSdkResolution,
@@ -53,8 +55,6 @@ import {
   type ProjectContextBundle,
 } from './context-bundles.js';
 import { formatSwarmExecutionPlan, formatSwarmRunStatuses, formatSwarmSubtasks } from './swarm-format.js';
-import { createSwarmRoleAgentConfig } from './swarm-role-config.js';
-import { buildSwarmCoordinator, parseSwarmSubtasks, runSwarmDecomposition, validateSdkDecomposition } from './swarm-runner.js';
 import { resolveReadWebPageProvider, resolveWebSearchProvider } from './tool-registry.js';
 import type {
   BenchmarkAttachmentType,
@@ -1455,17 +1455,8 @@ async function runSwarmCommand(cli: ManualTestCliOptions): Promise<number> {
   const topLevelObjective = await readInlinePrompt(cli, 'swarm task');
   const sdkOptions = buildSdkOptions(cli, resolvedCwd);
   const eventLog: Array<Record<string, JsonValue>> = [];
-  const coordinatorConfig = await loadFlaggedAgentSdkConfig(sdkOptions, '--agent', cli.agentConfigPath ?? 'agent.json');
-  const workerConfigs = await Promise.all(cli.workerCatalogPaths.map((agentConfigPath) => loadFlaggedAgentSdkConfig(sdkOptions, '--worker-catalog', agentConfigPath)));
-  const qualityConfig = cli.qualityAgentPath
-    ? await loadFlaggedAgentSdkConfig(sdkOptions, '--quality-agent', cli.qualityAgentPath)
-    : await loadAgentSdkConfig({ ...sdkOptions, agentConfig: createSwarmRoleAgentConfig(coordinatorConfig.agent, 'quality') });
-  const synthesizerConfig = cli.synthesizerAgentPath
-    ? await loadFlaggedAgentSdkConfig(sdkOptions, '--synthesizer-agent', cli.synthesizerAgentPath)
-    : await loadAgentSdkConfig({ ...sdkOptions, agentConfig: createSwarmRoleAgentConfig(coordinatorConfig.agent, 'synthesizer') });
-  const workerIds = workerConfigs.map((config) => config.agent.id);
-  const duplicateWorkerId = workerIds.find((id, index) => workerIds.indexOf(id) !== index);
-  if (duplicateWorkerId) throw new Error(`swarm-run worker catalog contains duplicate agent id: ${duplicateWorkerId}`);
+  const resolvedSwarm = await SwarmSdk.resolveConfig({ ...sdkOptions, coordinatorConfigPath: cli.agentConfigPath ?? 'agent.json', workerConfigPaths: cli.workerCatalogPaths, qualityConfigPath: cli.qualityAgentPath, synthesizerConfigPath: cli.synthesizerAgentPath });
+  const { coordinator: coordinatorConfig, workers: workerConfigs, quality: qualityConfig, synthesizer: synthesizerConfig, workerIds } = resolvedSwarm;
 
   if (cli.dryRun) {
     printSwarmDryRun(cli, coordinatorConfig, workerConfigs, qualityConfig, synthesizerConfig);
@@ -1487,59 +1478,17 @@ async function runSwarmCommand(cli: ManualTestCliOptions): Promise<number> {
     }
   } : undefined;
 
-  const coordinatorSdk = await createFlaggedAgentSdk({ ...sdkOptions, eventListener }, '--agent', cli.agentConfigPath ?? 'agent.json');
-  const workerSdks = await Promise.all(cli.workerCatalogPaths.map((agentConfigPath) => createFlaggedAgentSdk({ ...sdkOptions, agentConfigPath, runtime: coordinatorSdk.created.runtime, eventListener }, '--worker-catalog', agentConfigPath)));
-  const qualitySdk = cli.qualityAgentPath
-    ? await createFlaggedAgentSdk({ ...sdkOptions, agentConfigPath: cli.qualityAgentPath, runtime: coordinatorSdk.created.runtime, eventListener }, '--quality-agent', cli.qualityAgentPath)
-    : await createAgentSdk({ ...sdkOptions, agentConfig: createSwarmRoleAgentConfig(coordinatorSdk.config.agent, 'quality'), runtime: coordinatorSdk.created.runtime, eventListener });
-  const synthesizerSdk = cli.synthesizerAgentPath
-    ? await createFlaggedAgentSdk({ ...sdkOptions, agentConfigPath: cli.synthesizerAgentPath, runtime: coordinatorSdk.created.runtime, eventListener }, '--synthesizer-agent', cli.synthesizerAgentPath)
-    : await createAgentSdk({ ...sdkOptions, agentConfig: createSwarmRoleAgentConfig(coordinatorSdk.config.agent, 'synthesizer'), runtime: coordinatorSdk.created.runtime, eventListener });
+  const swarmSdk = await createSwarmSdk({ ...sdkOptions, eventListener, coordinatorConfig: coordinatorConfig, workerConfigs, qualityConfig, synthesizerConfig, maxWorkers: cli.maxWorkers });
 
   try {
     const sessionId = cli.sessionId ?? crypto.randomUUID();
     const contentParts = buildInlineContentParts(cli, resolvedCwd, { includeImages: true });
-    const decompositionResult = await runSwarmDecomposition({
-      coordinatorSdk,
-      sessionId,
-      topLevelObjective,
-      inputJson: cli.inputJson,
-      workerAgents: workerConfigs.map((config) => config.agent),
-      workerIds,
-      contentParts,
-    });
-
-    if (decompositionResult.status !== 'success') {
-      throw new Error(formatCoordinatorDecompositionFailure(decompositionResult));
-    }
-
-    const subtasks = parseSwarmSubtasks(decompositionResult.output);
-    validateSdkDecomposition(subtasks, workerIds);
+    const sdkResult = await swarmSdk.run({ sessionId, topLevelObjective, input: cli.inputJson, contentParts, maxWorkers: cli.maxWorkers });
+    if (sdkResult.state !== 'completed') throw new Error(formatCoordinatorDecompositionFailure(sdkResult.decompositionResult));
+    const { subtasks, executionResult: result } = sdkResult;
     if (cli.output === 'pretty') {
-      printSwarmExecutionPlan(sessionId, decompositionResult.runId, subtasks, cli.wrapWidth);
+      printSwarmExecutionPlan(sessionId, sdkResult.coordinatorRunId, subtasks, cli.wrapWidth);
     }
-    const swarm = buildSwarmCoordinator({
-      coordinatorSdk,
-      workerSdks,
-      qualitySdk,
-      synthesizerSdk,
-      defaultMaxWorkers: cli.maxWorkers,
-    });
-    const result = await swarm.execute({
-      sessionId,
-      coordinatorRunId: decompositionResult.runId,
-      topLevelObjective,
-      input: cli.inputJson,
-      contentParts: contentParts.length > 0 ? contentParts : undefined,
-      maxWorkers: cli.maxWorkers,
-      metadata: {
-        defaultsUsed: {
-          qualityAgent: cli.qualityAgentPath ? 'explicit' : 'coordinator_with_quality_instructions',
-          synthesizerAgent: cli.synthesizerAgentPath ? 'explicit' : 'coordinator_with_synthesis_instructions',
-        },
-      },
-      subtasks,
-    });
 
     if (cli.output === 'json') {
       console.log(JSON.stringify(summarizeSwarmRun(result, workerIds, cli, subtasks), null, 2));
@@ -1551,12 +1500,7 @@ async function runSwarmCommand(cli: ManualTestCliOptions): Promise<number> {
     }
     return result.status === 'succeeded' ? 0 : 1;
   } finally {
-    await Promise.allSettled([
-      ...workerSdks.map((sdk) => sdk.close()),
-      qualitySdk.close(),
-      synthesizerSdk.close(),
-      coordinatorSdk.close(),
-    ]);
+    await swarmSdk.close();
   }
 }
 
@@ -1916,28 +1860,10 @@ async function runRetryCommand(cli: ManualTestCliOptions): Promise<number> {
   }
 
   const sessionId = cli.goalArgs[0]!;
-  const workerConfigs = await Promise.all(cli.workerCatalogPaths.map((agentConfigPath) => loadFlaggedAgentSdkConfig(sdkOptions, '--worker-catalog', agentConfigPath)));
-  const workerIds = workerConfigs.map((config) => config.agent.id);
-  const duplicateWorkerId = workerIds.find((id, index) => workerIds.indexOf(id) !== index);
-  if (duplicateWorkerId) throw new Error(`retry worker catalog contains duplicate agent id: ${duplicateWorkerId}`);
-
-  const qualitySdk = cli.qualityAgentPath
-    ? await createFlaggedAgentSdk({ ...sdkOptions, agentConfigPath: cli.qualityAgentPath, runtime: coordinatorSdk.created.runtime, eventListener }, '--quality-agent', cli.qualityAgentPath)
-    : await createAgentSdk({ ...sdkOptions, agentConfig: createSwarmRoleAgentConfig(coordinatorSdk.config.agent, 'quality'), runtime: coordinatorSdk.created.runtime, eventListener });
-  const synthesizerSdk = cli.synthesizerAgentPath
-    ? await createFlaggedAgentSdk({ ...sdkOptions, agentConfigPath: cli.synthesizerAgentPath, runtime: coordinatorSdk.created.runtime, eventListener }, '--synthesizer-agent', cli.synthesizerAgentPath)
-    : await createAgentSdk({ ...sdkOptions, agentConfig: createSwarmRoleAgentConfig(coordinatorSdk.config.agent, 'synthesizer'), runtime: coordinatorSdk.created.runtime, eventListener });
-  const workerSdks = await Promise.all(cli.workerCatalogPaths.map((agentConfigPath) => createFlaggedAgentSdk({ ...sdkOptions, agentConfigPath, runtime: coordinatorSdk.created.runtime, eventListener }, '--worker-catalog', agentConfigPath)));
+  const swarmSdk = await createSwarmSdk({ ...sdkOptions, coordinatorSdk, workerConfigPaths: cli.workerCatalogPaths, qualityConfigPath: cli.qualityAgentPath, synthesizerConfigPath: cli.synthesizerAgentPath, eventListener, maxWorkers: cli.maxWorkers });
 
   try {
-    const swarm = buildSwarmCoordinator({
-      coordinatorSdk,
-      workerSdks,
-      qualitySdk,
-      synthesizerSdk,
-      defaultMaxWorkers: cli.maxWorkers,
-    });
-    const result = await swarm.retrySession({ sessionId, dryRun: cli.dryRun, maxWorkers: cli.maxWorkers });
+    const result = await swarmSdk.retrySession(sessionId, { dryRun: cli.dryRun, maxWorkers: cli.maxWorkers });
     if (cli.output === 'json') {
       console.log(JSON.stringify(summarizeSwarmRetry(result), null, 2));
     } else if (cli.output === 'jsonl') {
@@ -1948,12 +1874,8 @@ async function runRetryCommand(cli: ManualTestCliOptions): Promise<number> {
     }
     return result.status === 'succeeded' ? 0 : 1;
   } finally {
-    await Promise.allSettled([
-      ...workerSdks.map((sdk) => sdk.close()),
-      qualitySdk.close(),
-      synthesizerSdk.close(),
-      coordinatorSdk.close(),
-    ]);
+    await swarmSdk.close();
+    await coordinatorSdk.close();
   }
 }
 

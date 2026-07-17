@@ -233,10 +233,13 @@ export class SwarmCoordinator {
 
       const latestQuality = latestRunByRole(refreshedSwarmRuns, 'quality');
       const latestSynthesizer = latestRunByRole(refreshedSwarmRuns, 'synthesizer');
+      const refreshedCoordinator = refreshedSwarmRuns.find((run) => run.id === coordinatorRunId) ?? coordinatorRun;
+      const finalizersPending = !isFinalizedSwarmResult(refreshedCoordinator.result);
       const shouldRunFinalizers = failedWorkers.length > skippedWorkerRunIds.length
         || latestQuality?.status === 'failed'
         || latestSynthesizer?.status === 'failed'
-        || coordinatorRun.status === 'failed';
+        || refreshedCoordinator.status === 'failed'
+        || finalizersPending;
       if (!shouldRunFinalizers) {
         throw new Error(`Swarm session ${request.sessionId} has no failed worker, quality, or synthesizer runs to retry`);
       }
@@ -840,6 +843,10 @@ function readRecommendation(value: unknown): SwarmQualityAssessment['recommendat
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isFinalizedSwarmResult(value: unknown): boolean {
+  return isRecord(value) && (value.status === 'succeeded' || value.status === 'failed');
 }
 
 function isJsonRecord(value: unknown): value is Record<string, JsonValue> {
