@@ -84,6 +84,9 @@ fi
   echo "ssl = off"
   echo "listen_addresses = '127.0.0.1'"
   echo "port = 5432"
+  # /var/run/postgresql is not writable by the orb user; put the Unix socket
+  # lock in /tmp instead. All our connections use TCP anyway.
+  echo "unix_socket_directories = '/tmp'"
 } >> "$PGDATA/postgresql.conf"
 
 # Start (or restart) the local cluster as this user. Not root, no systemd.
