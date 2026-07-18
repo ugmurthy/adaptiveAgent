@@ -87,6 +87,30 @@ describe('AgentWorker redelivery handling', () => {
     expect(store.defer).toHaveBeenCalledWith(claim, 'running');
     expect(store.complete).not.toHaveBeenCalled();
   });
+
+  it('never persists raw executor error details in public job errors', async () => {
+    const claim = sampleClaim();
+    const store = workerStore({ action: 'process', claim });
+    const executor = workloadExecutor({
+      state: 'failed',
+      error: {
+        schemaVersion: 1,
+        code: 'provider_failed',
+        message: 'Bearer secret-token postgres://user:password@private/database',
+        retryable: true,
+      },
+    });
+    const worker = new AgentWorker(store, executor);
+
+    await worker.process({ jobId: claim.job.id });
+
+    expect(store.complete).toHaveBeenCalledWith(claim, 'failed', undefined, {
+      schemaVersion: 1,
+      code: 'provider_failed',
+      message: 'Agent execution failed.',
+      retryable: true,
+    });
+  });
 });
 
 function dispatchPool() {

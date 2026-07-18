@@ -109,17 +109,24 @@ create table if not exists plan_executions (
 create index if not exists plan_executions_run_idx on plan_executions (run_id, created_at desc);
 create index if not exists plan_executions_plan_idx on plan_executions (plan_id, created_at desc);
 
-alter table agent_runs
-  add constraint agent_runs_root_run_fk
-  foreign key (root_run_id) references agent_runs(id) on delete restrict;
-
-alter table agent_runs
-  add constraint agent_runs_current_plan_fk
-  foreign key (current_plan_id) references plans(id) on delete set null;
-
-alter table agent_runs
-  add constraint agent_runs_current_plan_execution_fk
-  foreign key (current_plan_execution_id) references plan_executions(id) on delete set null;
+do $$
+begin
+  if not exists (select 1 from pg_constraint where conname = 'agent_runs_root_run_fk' and conrelid = 'agent_runs'::regclass) then
+    alter table agent_runs
+      add constraint agent_runs_root_run_fk
+      foreign key (root_run_id) references agent_runs(id) on delete restrict;
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'agent_runs_current_plan_fk' and conrelid = 'agent_runs'::regclass) then
+    alter table agent_runs
+      add constraint agent_runs_current_plan_fk
+      foreign key (current_plan_id) references plans(id) on delete set null;
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'agent_runs_current_plan_execution_fk' and conrelid = 'agent_runs'::regclass) then
+    alter table agent_runs
+      add constraint agent_runs_current_plan_execution_fk
+      foreign key (current_plan_execution_id) references plan_executions(id) on delete set null;
+  end if;
+end $$;
 
 create table if not exists agent_events (
   id bigserial primary key,

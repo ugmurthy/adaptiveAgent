@@ -20,6 +20,7 @@ marketing/
 data/
 artifacts/
 .desiAgent/
+.amp/portals/
 
 # IDE
 .vscode/

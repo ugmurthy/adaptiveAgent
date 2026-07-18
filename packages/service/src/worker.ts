@@ -49,20 +49,23 @@ export class AgentWorker {
         await this.store.defer(claimed.claim, outcome.state);
         return;
       }
-      await this.store.complete(claimed.claim, outcome.state, outcome.result, outcome.error);
+      await this.store.complete(claimed.claim, outcome.state, outcome.result, outcome.error ? toPublicServiceError(outcome.error) : undefined);
     } catch (error) {
-      await this.store.complete(claimed.claim, 'failed', undefined, {
-        schemaVersion: 1, code: 'worker_execution_failed', message: safeMessage(error), retryable: true,
-      });
+      await this.store.complete(claimed.claim, 'failed', undefined, toPublicServiceError(error));
       throw error;
     }
   }
 }
 
-function safeMessage(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.replace(/(?:postgres(?:ql)?:\/\/)[^@\s]+@/gi, 'postgres://[redacted]@').slice(0, 2_000);
+export function toPublicServiceError(error: unknown): ServiceError {
+  if (isServiceError(error)) {
+    return { schemaVersion: 1, code: safeCode(error.code), message: 'Agent execution failed.', retryable: error.retryable };
+  }
+  return { schemaVersion: 1, code: 'worker_execution_failed', message: 'Agent execution failed.', retryable: true };
 }
+
+function isServiceError(error: unknown): error is ServiceError { return Boolean(error && typeof error === 'object' && 'code' in error && 'retryable' in error); }
+function safeCode(code: string): string { return /^[a-z0-9][a-z0-9_.-]{0,99}$/i.test(code) ? code : 'agent_execution_failed'; }
 
 export function serviceResult(value: JsonValue): ServiceResult {
   return { schemaVersion: 1, value, completedAt: new Date().toISOString() };
