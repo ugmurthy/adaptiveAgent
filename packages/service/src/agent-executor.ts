@@ -183,6 +183,9 @@ export class AgentSdkWorkloadExecutor implements WorkloadExecutor {
 
   private async control(claim: ClaimedJob, workspaceRoot: string): Promise<ExecutionOutcome> {
     const runs = await this.runsBySession(claim.job.sessionId);
+    if (runs.length === 0 && claim.command.kind === 'retry') {
+      return this.start(claim, workspaceRoot);
+    }
     if (runs.length === 0) throw new Error(`No run exists for session ${claim.job.sessionId}`);
 
     if (claim.command.kind === 'cancel') {

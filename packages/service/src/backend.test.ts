@@ -1,6 +1,7 @@
 import type { ServiceJob } from '@adaptive-agent/service-sdk';
 import { describe, expect, it, vi } from 'vitest';
 
+import { AgentSdkWorkloadExecutor } from './agent-executor.js';
 import { ServiceBackendStore, type ClaimedJob } from './postgres.js';
 import { queueJobId, type ServiceQueuePayload } from './queue.js';
 import { AgentWorker, type AgentWorkerStore, type WorkloadExecutor } from './worker.js';
@@ -110,6 +111,31 @@ describe('AgentWorker redelivery handling', () => {
       message: 'Agent execution failed.',
       retryable: true,
     });
+  });
+});
+
+describe('workload retry handling', () => {
+  it('starts a new run when initialization failed before a core run was created', async () => {
+    const claim = sampleClaim();
+    claim.job.state = 'failed';
+    claim.commandVersion = 2;
+    claim.command = { kind: 'retry', version: 2, requestedAt: '2026-01-01T00:01:00.000Z' };
+    const workspace = { root: '/tmp/job-1', artifacts: '/tmp/job-1/artifacts' };
+    const workspaces = {
+      create: vi.fn(async () => workspace),
+      close: vi.fn(async () => undefined),
+    };
+    const bootstrap = {
+      created: { runtime: { runStore: { listBySession: vi.fn(async () => []) } } },
+    };
+    const executor = new AgentSdkWorkloadExecutor(bootstrap as never, {} as never, workspaces, 4);
+    const outcome = { state: 'succeeded' as const };
+    const start = vi.spyOn(executor as never, 'start').mockResolvedValue(outcome);
+
+    await expect(executor.execute(claim)).resolves.toEqual(outcome);
+
+    expect(start).toHaveBeenCalledWith(claim, workspace.root);
+    expect(workspaces.close).toHaveBeenCalledWith(claim.job, workspace);
   });
 });
 

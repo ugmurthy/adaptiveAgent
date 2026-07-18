@@ -14,7 +14,7 @@ export async function agentWorkerMain(): Promise<void> {
   const registry = await AllowlistedAgentRegistry.load(process.env.AGENT_REGISTRY_PATH);
   const bootstrapId = process.env.BOOTSTRAP_AGENT_ID ?? registry.firstAgentId();
   const bootstrapConfig = await registry.resolveBootstrap(bootstrapId);
-  const bootstrap = await AgentSdk.create({ agentConfig: bootstrapConfig.config.agent, env: process.env });
+  const bootstrap = await AgentSdk.create({ agentConfig: bootstrapConfig.config.agent, env: process.env, runtimeMode: 'postgres' });
   const executor = new AgentSdkWorkloadExecutor(bootstrap, registry, new LocalWorkspaceManager(process.env.JOB_WORKSPACE_ROOT ?? './var/jobs'), positiveInt(process.env.MAX_SUBTASKS, 4));
   const worker = new AgentWorker(new ServiceBackendStore(pool, positiveInt(process.env.STALE_JOB_MS, 60_000)), executor);
   const bullWorkers = createBullMqWorkers(redisConnection(), queueRoutesFromEnv(), (payload) => worker.process(payload));
