@@ -6,14 +6,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# Ensure Postgres is up. Setup tuned and started it; on wake it is usually
-# still running. If not, start it and wait briefly within the resume window.
-if command -v pg_isready >/dev/null 2>&1; then
-  if ! pg_isready -q -h 127.0.0.1 -p 5432; then
-    PGVERSION="$(ls /etc/postgresql 2>/dev/null | sort -V | tail -1 || true)"
-    if [ -n "${PGVERSION:-}" ]; then
-      pg_ctlcluster "${PGVERSION}" main start 2>/dev/null || true
-    fi
+# Postgres is a user-owned local cluster (initdb + pg_ctl), not systemd. On wake
+# it is usually still running; if not, restart it quickly within the window.
+PGVERSION="$(ls /usr/lib/postgresql 2>/dev/null | sort -V | tail -1 || true)"
+PGBIN="/usr/lib/postgresql/${PGVERSION}/bin"
+PGDATA="${PGDATA:-$HOME/.local/pgdata}"
+PGLOG="${PGLOG:-$HOME/.local/pg.log}"
+
+if [ -x "$PGBIN/pg_ctl" ] && [ -d "$PGDATA" ]; then
+  if ! "$PGBIN/pg_ctl" -D "$PGDATA" status >/dev/null 2>&1; then
+    "$PGBIN/pg_ctl" -D "$PGDATA" -l "$PGLOG" start -w 2>/dev/null || true
     for _ in 1 2 3 4 5 6 7 8 9 10; do
       pg_isready -q -h 127.0.0.1 -p 5432 && break
       sleep 0.5
