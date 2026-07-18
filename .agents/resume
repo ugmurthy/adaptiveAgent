@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Orb resume for AdaptiveAgent. Runs every time an existing orb wakes.
+# Must be fast and idempotent; Amp stops waiting after ~10s and leaves it
+# running. Never install dependencies here. See https://ampcode.com/manual/orbs
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+# Ensure Postgres is up. Setup tuned and started it; on wake it is usually
+# still running. If not, start it and wait briefly within the resume window.
+if command -v pg_isready >/dev/null 2>&1; then
+  if ! pg_isready -q -h 127.0.0.1 -p 5432; then
+    PGVERSION="$(ls /etc/postgresql 2>/dev/null | sort -V | tail -1 || true)"
+    if [ -n "${PGVERSION:-}" ]; then
+      pg_ctlcluster "${PGVERSION}" main start 2>/dev/null || true
+    fi
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      pg_isready -q -h 127.0.0.1 -p 5432 && break
+      sleep 0.5
+    done
+  fi
+fi
+
+# Surface DATABASE_URL for shells that pick up env from .env.local.
+if [ -f .env.local ]; then
+  # shellcheck disable=SC1091
+  set -a; . .env.local; set +a
+fi
+
+exit 0

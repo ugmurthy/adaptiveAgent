@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# Orb setup for the AdaptiveAgent Bun + TypeScript monorepo.
+# Runs once in a fresh orb before Amp starts working. Must be non-interactive
+# and safe to rerun. See https://ampcode.com/manual/orbs
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+log() { printf '>>> %s\n' "$*"; }
+
+# ─── Bun ────────────────────────────────────────────────────────────────────
+# Bun ships in orbs, but install it if missing so this also works elsewhere.
+if ! command -v bun >/dev/null 2>&1; then
+  log "Installing Bun"
+  curl -fsSL https://bun.sh/install | bash
+  export BUN_INSTALL="${BUN_INSTALL:-$HOME/.bun}"
+  export PATH="$BUN_INSTALL/bin:$PATH"
+fi
+log "Bun $(bun --version) at $(command -v bun)"
+
+# ─── Dependencies ───────────────────────────────────────────────────────────
+# Lockfile + patchedDependencies (patches/@openrouter/sdk) apply automatically.
+log "Installing dependencies (frozen lockfile)"
+bun install --frozen-lockfile
+
+# ─── Postgres ───────────────────────────────────────────────────────────────
+# Orbs are Debian 12. The agent runtime, trace-session, and trace-workbench all
+# read DATABASE_URL. Tests use injected clients and do not need a live server,
+# but the runtime does. Tune for speed over durability (ephemeral sandbox).
+export DEBIAN_FRONTEND=noninteractive
+if ! command -v psql >/dev/null 2>&1; then
+  log "Installing postgresql via apt-get"
+  apt-get update -y
+  apt-get install -y postgresql postgresql-contrib
+fi
+
+PG_BIN="$(command -v pg_ctlcluster || true)"
+if [ -z "$PG_BIN" ]; then
+  echo "pg_ctlcluster not found after install; aborting Postgres setup" >&2
+  exit 1
+fi
+
+PGVERSION="$(ls /etc/postgresql | sort -V | tail -1)"
+PG_CLUSTER="${PG_CLUSTER:-main}"
+if [ ! -d "/etc/postgresql/${PGVERSION}/${PG_CLUSTER}" ]; then
+  log "Creating postgres cluster ${PGVERSION}/${PG_CLUSTER}"
+  pg_createcluster "${PGVERSION}" "${PG_CLUSTER}"
+fi
+
+# Tune for speed over durability (ephemeral orb).
+PG_CONF="/etc/postgresql/${PGVERSION}/${PG_CLUSTER}/postgresql.conf"
+for setting in "fsync = off" "synchronous_commit = off" "full_page_writes = off"; do
+  if ! grep -q "^${setting%% *}" "$PG_CONF"; then
+    echo "$setting" >> "$PG_CONF"
+  fi
+done
+
+log "Starting postgres cluster ${PGVERSION}/${PG_CLUSTER}"
+pg_ctlcluster "${PGVERSION}" "${PG_CLUSTER}" start || \
+  pg_ctlcluster "${PGVERSION}" "${PG_CLUSTER}" restart
+
+# Wait for readiness (max ~15s).
+for _ in $(seq 1 30); do
+  if pg_isready -q -h 127.0.0.1 -p 5432; then break; fi
+  sleep 0.5
+done
+pg_isready -h 127.0.0.1 -p 5432
+
+# ─── Database / role ────────────────────────────────────────────────────────
+# Match postgres.sh: user=adaptive, password=adaptive, db=adaptive_agent.
+su - postgres -c "psql -v ON_ERROR_STOP=1 <<'SQL'
+DO \$\$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'adaptive') THEN
+    CREATE ROLE adaptive LOGIN PASSWORD 'adaptive';
+  END IF;
+END \$\$;
+SELECT 'CREATE DATABASE adaptive_agent OWNER adaptive'
+  WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'adaptive_agent')\gexec
+GRANT ALL PRIVILEGES ON DATABASE adaptive_agent TO adaptive;
+SQL"
+
+DATABASE_URL="postgres://adaptive:adaptive@127.0.0.1:5432/adaptive_agent"
+export DATABASE_URL
+
+# Apply core runtime migrations. Idempotent (all statements use IF NOT EXISTS).
+log "Applying core runtime migrations"
+for migration in packages/core/migrations/*.sql; do
+  log "  applying $migration"
+  PGPASSWORD=adaptive psql -v ON_ERROR_STOP=1 \
+    -h 127.0.0.1 -U adaptive -d adaptive_agent -f "$migration"
+done
+
+# ─── Env file ───────────────────────────────────────────────────────────────
+# Copy template without clobbering an existing local env, then ensure
+# DATABASE_URL is present so the runtime defaults to postgres mode.
+if [ ! -f .env.local ]; then
+  log "Copying .env.example -> .env.local"
+  cp -- .env.example .env.local
+fi
+if ! grep -q '^DATABASE_URL=' .env.local; then
+  log "Appending DATABASE_URL to .env.local"
+  echo "DATABASE_URL=${DATABASE_URL}" >> .env.local
+fi
+
+# ─── Orb-scoped agent guidance ──────────────────────────────────────────────
+# Notes the agent needs inside the orb: how to run things, where the DB lives.
+mkdir -p "$HOME/.config/amp"
+cat > "$HOME/.config/amp/AGENTS.md" <<'MD'
+# AdaptiveAgent orb notes
+
+## Runtime
+- Bun + TypeScript monorepo. Workspaces live in `packages/*`.
+- Install is already done (`.agents/setup`). Do not re-run `bun install` unless
+  `bun.lock` changes.
+- Postgres is running locally on 127.0.0.1:5432, tuned for speed (fsync off).
+  - `DATABASE_URL=postgres://adaptive:adaptive@127.0.0.1:5432/adaptive_agent`
+  - It is also written to `.env.local`.
+  - Core runtime migrations in `packages/core/migrations/*.sql` are applied.
+
+## Verification commands (Bun-native)
+- Core tests:        `bun run core:test`  (or `bunx vitest run` from packages/core)
+- Agent SDK tests:   `bun run agent:test`
+- Trace tests:       `bun run trace-session:test`
+- Trace workbench:   `bun run trace-workbench:typecheck`
+- Typecheck a pkg:   `cd packages/<pkg> && bunx tsc --noEmit`
+- Run the CLI:        `bun run ./packages/agent-sdk/src/adaptive-agent.ts`
+
+## Boundaries (from repo AGENTS.md)
+- `@adaptive-agent/core` owns durable runtime semantics; must not import
+  `@adaptive-agent/agent-sdk`.
+- Agent SDK owns CLI workflows, spec loading, coordinator prompts.
+- Preserve terminology from agen-spec-v1.5.md / agen-contracts-v1.5.md.
+MD
+
+log "Setup complete."
+log "DATABASE_URL=${DATABASE_URL}"
+log "Run tests with: bun run core:test && bun run agent:test && bun run trace-session:test"
+*** End Patch
