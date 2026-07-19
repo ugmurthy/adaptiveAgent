@@ -13,6 +13,7 @@
     "@adaptive-agent/agent-sdk": "workspace:*",
     "@adaptive-agent/core": "workspace:*",
     "@adaptive-agent/service-sdk": "workspace:*",
+    "@aws-sdk/client-s3": "^3.848.0",
     "@fastify/rate-limit": "^11.1.0",
     "@fastify/swagger": "^9.8.1",
     "@fastify/swagger-ui": "^6.1.0",

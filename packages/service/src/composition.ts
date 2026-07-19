@@ -1,6 +1,7 @@
 import { POSTGRES_RUNTIME_MIGRATIONS } from '@adaptive-agent/core';
 import { runServicePostgresMigrations } from '@adaptive-agent/service-sdk';
 import { Pool } from 'pg';
+import { ArtifactManager, PostgresArtifactRepository, S3ArtifactStorage } from './artifacts.js';
 import type { QueueRoutes } from './queue.js';
 
 export function createPoolFromEnv(env: NodeJS.ProcessEnv = process.env): Pool {
@@ -45,4 +46,23 @@ export function positiveInt(value: string | undefined, fallback: number): number
   const parsed = Number(value ?? fallback);
   if (!Number.isInteger(parsed) || parsed <= 0) throw new Error(`Expected positive integer, received ${value}`);
   return parsed;
+}
+
+export function createArtifactManagerFromEnv(pool: Pool, env: NodeJS.ProcessEnv = process.env): { manager:ArtifactManager; storage:S3ArtifactStorage } {
+  const bucket=env.ARTIFACT_S3_BUCKET;
+  if(!bucket)throw new Error('ARTIFACT_S3_BUCKET is required');
+  if(Boolean(env.ARTIFACT_S3_ACCESS_KEY_ID)!==Boolean(env.ARTIFACT_S3_SECRET_ACCESS_KEY))throw new Error('Both artifact S3 credentials must be configured together');
+  const storage=new S3ArtifactStorage(bucket,{
+    region:env.ARTIFACT_S3_REGION??'us-east-1',endpoint:env.ARTIFACT_S3_ENDPOINT,
+    accessKeyId:env.ARTIFACT_S3_ACCESS_KEY_ID,secretAccessKey:env.ARTIFACT_S3_SECRET_ACCESS_KEY,
+    forcePathStyle:env.ARTIFACT_S3_FORCE_PATH_STYLE==='true',
+  });
+  const quotas={
+    maxFiles:positiveInt(env.ARTIFACT_MAX_FILES,20),
+    maxFileBytes:positiveInt(env.ARTIFACT_MAX_FILE_BYTES,50*1024*1024),
+    maxTotalBytes:positiveInt(env.ARTIFACT_MAX_TOTAL_BYTES,100*1024*1024),
+  };
+  return {storage,manager:new ArtifactManager(new PostgresArtifactRepository(pool),storage,undefined,quotas,
+    positiveInt(env.ARTIFACT_RETENTION_DAYS,7)*24*60*60*1000,
+    positiveInt(env.ARTIFACT_QUARANTINE_RETENTION_DAYS,30)*24*60*60*1000)};
 }

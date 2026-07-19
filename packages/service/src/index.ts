@@ -1,4 +1,5 @@
 export * from './agent-executor.js';
+export * from './artifacts.js';
 export * from './composition.js';
 export * from './dispatcher.js';
 export * from './event-bus.js';

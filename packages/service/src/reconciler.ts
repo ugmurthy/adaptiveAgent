@@ -4,10 +4,11 @@ import { ServiceBackendStore } from './postgres.js';
 export class StaleJobReconciler {
   private stopped = true;
   private loopPromise?: Promise<void>;
-  constructor(private readonly store: ServiceBackendStore, private readonly publisher: QueuePublisher, private readonly intervalMs = 10_000, private readonly batchSize = 100) {}
+  constructor(private readonly store: ServiceBackendStore, private readonly publisher: QueuePublisher, private readonly intervalMs = 10_000, private readonly batchSize = 100, private readonly maintenance?:()=>Promise<void>) {}
   async reconcile(): Promise<number> {
     const jobs = await this.store.findStale(this.batchSize);
     for (const job of jobs) await this.publisher.publish(job.kind, job.jobId, job.commandVersion);
+    await this.maintenance?.();
     return jobs.length;
   }
   async start(): Promise<void> {

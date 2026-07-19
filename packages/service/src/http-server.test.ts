@@ -9,7 +9,7 @@ import {
 } from '@adaptive-agent/service-sdk';
 
 import { createJwtAuthenticator } from './http-auth.js';
-import { buildHttpServer } from './http-server.js';
+import { buildHttpServer, type ArtifactDownloader } from './http-server.js';
 import { InMemoryEventBus } from './event-bus.js';
 
 const actor: ServiceActor = { tenantId: 'tenant-1', userId: 'alice' };
@@ -114,6 +114,22 @@ describe('Phase 4 HTTP API', () => {
     expect(artifacts.json()).toMatchObject([{ filename: 'result.txt', status: 'available' }]);
   });
 
+  it('proxies private downloads with safe attachment headers and authoritative actor identity',async()=>{
+    let received:unknown;
+    const artifactDownloader:ArtifactDownloader={download:async(inputActor,jobId,artifactId)=>{
+      received={inputActor,jobId,artifactId};
+      return {metadata:{filename:'private report.txt',mediaType:'text/plain',byteSize:6},data:new TextEncoder().encode('secret')};
+    }};
+    const {app,sdk}=await fixture({artifactDownloader});
+    const job=await sdk.submitRun(actor,{schemaVersion:1,agentId:'agent',goal:'artifact'});
+    const response=await app.inject({method:'GET',url:`/v1/jobs/${job.id}/artifacts/artifact-1/download`,headers:auth()});
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toBe('secret');
+    expect(response.headers['content-disposition']).toContain('attachment; filename="private_report.txt"');
+    expect(response.headers['cache-control']).toBe('private, no-store');
+    expect(received).toEqual({inputActor:actor,jobId:job.id,artifactId:'artifact-1'});
+  });
+
   it('reports liveness and failed readiness without authentication', async () => {
     const { app } = await fixture({ ready: async () => false });
     expect((await app.inject({ method: 'GET', url: '/health/live' })).json()).toEqual({ status: 'ok' });
@@ -205,7 +221,7 @@ describe('Phase 5 WebSocket API', () => {
 
 const now = '2026-01-01T00:00:00.000Z';
 
-async function fixture(options: { ready?: () => Promise<boolean>; registryError?: Error; authenticate?: (request: Parameters<ReturnType<typeof createJwtAuthenticator>>[0]) => Promise<ServiceActor>; bodyLimit?: number; rateLimit?: number } = {}) {
+async function fixture(options: { ready?: () => Promise<boolean>; registryError?: Error; authenticate?: (request: Parameters<ReturnType<typeof createJwtAuthenticator>>[0]) => Promise<ServiceActor>; artifactDownloader?:ArtifactDownloader; bodyLimit?: number; rateLimit?: number } = {}) {
   const store = new InMemoryServiceStore();
   const eventBus=new InMemoryEventBus();
   let nextId = 0;
@@ -228,7 +244,7 @@ async function fixture(options: { ready?: () => Promise<boolean>; registryError?
     if (!authorization?.startsWith('Bearer ')) throw new Error('unauthorized');
     return { tenantId: 'tenant-1', userId: authorization.slice(7) };
   });
-  const app = await buildHttpServer({ sdk, authenticate, eventBus, ready: options.ready, logger: false, bodyLimit: options.bodyLimit, rateLimit: options.rateLimit ?? 10_000 });
+  const app = await buildHttpServer({ sdk, authenticate, artifacts:options.artifactDownloader, eventBus, ready: options.ready, logger: false, bodyLimit: options.bodyLimit, rateLimit: options.rateLimit ?? 10_000 });
   await app.ready();
   apps.push(app);
   return { app, sdk, store, eventBus };

@@ -6,13 +6,16 @@ import websocket from '@fastify/websocket';
 import { IdempotencyConflictError, InvalidJobStateError, ServiceNotFoundError, type ServiceActor, type ServiceSdk } from '@adaptive-agent/service-sdk';
 import type { HttpAuthenticator } from './http-auth.js';
 import type { EventBus } from './event-bus.js';
+import { safeContentDisposition } from './artifacts.js';
 
-export interface HttpServerOptions { sdk: ServiceSdk; authenticate: HttpAuthenticator; eventBus?:EventBus; ready?: () => Promise<boolean>; ensureActor?: (actor: ServiceActor) => Promise<void>; logger?: boolean | object; bodyLimit?: number; rateLimit?: number; ws?:{maxConnections?:number;maxConnectionsPerUser?:number;maxMessageBytes?:number;maxBufferedBytes?:number;heartbeatMs?:number} }
+export interface ArtifactDownloader { download(actor:ServiceActor,jobId:string,artifactId:string):Promise<{metadata:{filename:string;mediaType:string;byteSize:number};data:Uint8Array}> }
+export interface HttpServerOptions { sdk: ServiceSdk; authenticate: HttpAuthenticator; artifacts?:ArtifactDownloader; eventBus?:EventBus; ready?: () => Promise<boolean>; ensureActor?: (actor: ServiceActor) => Promise<void>; logger?: boolean | object; bodyLimit?: number; rateLimit?: number; ws?:{maxConnections?:number;maxConnectionsPerUser?:number;maxMessageBytes?:number;maxBufferedBytes?:number;heartbeatMs?:number} }
 const text = { type:'string', minLength:1, maxLength:10_000 } as const;
 const id = { type:'string', minLength:1, maxLength:200 } as const;
 const version = { type:'integer', const:1 } as const;
 const empty = { type:'object', additionalProperties:false, properties:{} } as const;
 const params = { type:'object', additionalProperties:false, required:['jobId'], properties:{ jobId:id } } as const;
+const artifactParams = { type:'object', additionalProperties:false, required:['jobId','artifactId'], properties:{ jobId:id,artifactId:id } } as const;
 const headers = { type:'object', properties:{ authorization:{type:'string',minLength:8,maxLength:16_384}, 'idempotency-key':{type:'string',minLength:1,maxLength:200} } } as const;
 const run = { type:'object', additionalProperties:false, required:['schemaVersion','agentId','goal'], properties:{schemaVersion:version,agentId:id,goal:text,input:{}} } as const;
 const chat = { type:'object', additionalProperties:false, required:['schemaVersion','agentId','message'], properties:{schemaVersion:version,agentId:id,message:text,conversationId:id} } as const;
@@ -66,6 +69,17 @@ export async function buildHttpServer(options: HttpServerOptions): Promise<Fasti
   }
   app.get('/v1/jobs/:jobId/events',{schema:{params,headers,querystring:{type:'object',additionalProperties:false,properties:{afterSequence:{type:'integer',minimum:0,maximum:Number.MAX_SAFE_INTEGER,default:0},limit:{type:'integer',minimum:1,maximum:500,default:100}}},response:{200:{type:'array',items:publicEvent},...errors},security:[{bearerAuth:[]}]}},r=>{const q=r.query as any;return options.sdk.listEvents(actor(r),(r.params as any).jobId,q.afterSequence,q.limit)});
   app.get('/v1/jobs/:jobId/artifacts',{schema:{params,headers,querystring:empty,response:{200:{type:'array',items:artifact},...errors},security:[{bearerAuth:[]}]}},r=>options.sdk.listArtifacts(actor(r),(r.params as any).jobId));
+  app.get('/v1/jobs/:jobId/artifacts/:artifactId/download',{schema:{params:artifactParams,headers,response:{401:errorResponse,404:errorResponse,429:errorResponse,500:errorResponse},security:[{bearerAuth:[]}]}},async(r,reply)=>{
+    if(!options.artifacts)throw new ServiceNotFoundError();
+    const p=r.params as {jobId:string;artifactId:string};
+    const downloaded=await options.artifacts.download(actor(r),p.jobId,p.artifactId);
+    return reply.header('content-type',downloaded.metadata.mediaType)
+      .header('content-disposition',safeContentDisposition(downloaded.metadata.filename))
+      .header('content-length',String(downloaded.metadata.byteSize))
+      .header('cache-control','private, no-store')
+      .header('x-content-type-options','nosniff')
+      .send(Buffer.from(downloaded.data));
+  });
   app.setErrorHandler((error,request,reply)=>{
     if ((error as any).validation) return reply.code(400).send(httpError('invalid_request','Invalid request.',false));
     if(error instanceof ServiceNotFoundError)return reply.code(404).send(httpError('not_found','Resource not found.',false));

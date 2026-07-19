@@ -1,6 +1,6 @@
-import type { ServiceTransaction, TransactionalServiceStore } from './ports.js';
+import type { ArtifactMetadataStore, ServiceTransaction, TransactionalServiceStore } from './ports.js';
 import type { ServicePostgresClient, ServicePostgresPool } from './postgres-migrations.js';
-import type { AuditRecord, IdempotencyOperation, IdempotencyRecord, JobRunLink, OutboxRecord, PublicEventEnvelope, ServiceActor, ServiceJob } from './types.js';
+import type { ArtifactMetadata, AuditRecord, IdempotencyOperation, IdempotencyRecord, JobRunLink, OutboxRecord, PublicEventEnvelope, ServiceActor, ServiceJob } from './types.js';
 
 const OWNED_JOB = `select * from service_jobs where id=$1 and tenant_id=$2 and owner_user_id=$3`;
 interface JobRow { id:string; tenant_id:string; owner_user_id:string; kind:ServiceJob['kind']; state:ServiceJob['state']; session_id:string; coordinator_run_id:string|null; request:ServiceJob['request']; profile_refs:ServiceJob['profiles']; command_version:number; processed_command_version:number; pending_command:ServiceJob['pendingCommand']; result:ServiceJob['result']|null; error:ServiceJob['error']|null; created_at:string; updated_at:string }
@@ -22,4 +22,24 @@ export class PostgresTransactionStore implements ServiceTransaction {
   async createIdempotency(r:IdempotencyRecord) { await this.db.query(`insert into service_idempotency_keys(tenant_id,user_id,operation,idempotency_key,request_hash,job_id,created_at) values($1,$2,$3,$4,$5,$6,$7)`,[r.tenantId,r.userId,r.operation,r.key,r.requestHash,r.jobId,r.createdAt]); }
   async appendOutbox(r:OutboxRecord) { await this.db.query(`insert into service_outbox(id,job_id,command_version,command,created_at) values($1,$2,$3,$4::jsonb,$5)`,[r.id,r.jobId,r.commandVersion,JSON.stringify(r.command),r.createdAt]); }
   async appendAudit(r:AuditRecord) { await this.db.query(`insert into service_audit_records(id,tenant_id,user_id,job_id,action,data,occurred_at) values($1,$2,$3,$4,$5,$6::jsonb,$7)`,[r.id,r.tenantId,r.userId,r.jobId,r.action,r.data?JSON.stringify(r.data):null,r.occurredAt]); }
+}
+
+interface ArtifactRow { id:string; tenant_id:string; owner_user_id:string; job_id:string; run_id:string|null; tool_execution_id:string|null; original_filename:string; media_type:string; byte_size:string|number; content_hash:string; status:ArtifactMetadata['status']; created_at:string|Date; available_at:string|Date|null; expires_at:string|Date|null; deleted_at:string|Date|null }
+const iso = (value:string|Date):string => value instanceof Date ? value.toISOString() : value;
+export const mapArtifactRow = (r:ArtifactRow):ArtifactMetadata => ({
+  schemaVersion:1,id:r.id,tenantId:r.tenant_id,ownerUserId:r.owner_user_id,jobId:r.job_id,
+  runId:r.run_id??undefined,toolExecutionId:r.tool_execution_id??undefined,filename:r.original_filename,
+  mediaType:r.media_type,byteSize:Number(r.byte_size),contentHash:r.content_hash,status:r.status,
+  createdAt:iso(r.created_at),availableAt:r.available_at?iso(r.available_at):undefined,
+  expiresAt:r.expires_at?iso(r.expires_at):undefined,deletedAt:r.deleted_at?iso(r.deleted_at):undefined,
+});
+
+export class PostgresArtifactMetadataStore implements ArtifactMetadataStore {
+  constructor(private readonly db:ServicePostgresClient) {}
+  async listOwned(actor:ServiceActor,jobId:string):Promise<ArtifactMetadata[]|undefined> {
+    const owner=await this.db.query(`select 1 from service_jobs where id=$1 and tenant_id=$2 and owner_user_id=$3`,[jobId,actor.tenantId,actor.userId]);
+    if(!owner.rowCount)return undefined;
+    const rows=await this.db.query<ArtifactRow>(`select a.* from service_artifacts a join service_jobs j on j.id=a.job_id where a.job_id=$1 and j.tenant_id=$2 and j.owner_user_id=$3 and a.status <> 'deleted' and (a.expires_at is null or a.expires_at>now()) order by a.created_at,a.id`,[jobId,actor.tenantId,actor.userId]);
+    return rows.rows.map(mapArtifactRow);
+  }
 }

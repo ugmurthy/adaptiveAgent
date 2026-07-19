@@ -1,4 +1,5 @@
 import { lstat, mkdir, realpath } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { join, resolve, sep } from 'node:path';
 import type { ServiceJob } from '@adaptive-agent/service-sdk';
 
@@ -18,7 +19,7 @@ export class LocalWorkspaceManager implements WorkspaceManager {
   async create(job: ServiceJob): Promise<JobWorkspace> {
     const base = resolve(this.configuredRoot);
     await mkdir(base, { recursive: true, mode: 0o700 });
-    const normalizedId = job.id.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const normalizedId = `${job.id.replace(/[^a-zA-Z0-9_-]/g, '_')}-${randomUUID()}`;
     const root = resolve(join(base, normalizedId));
     if (root !== base && !root.startsWith(`${base}${sep}`)) throw new Error('Job workspace escapes configured root');
     const artifacts = join(root, 'artifacts');

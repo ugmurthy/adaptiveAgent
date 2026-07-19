@@ -33,6 +33,48 @@ create index if not exists service_outbox_processing_idx
 create index if not exists service_outbox_lease_idx
   on service_outbox(lease_expires_at)
   where processed_at is null;
+` }, { name: 'service:004_artifacts', sql: `
+create unique index if not exists service_jobs_authoritative_owner_idx
+  on service_jobs(id,tenant_id,owner_user_id);
+create table if not exists service_artifacts (
+ id uuid primary key,
+ tenant_id text not null,
+ owner_user_id text not null,
+ job_id uuid not null,
+ run_id uuid,
+ tool_execution_id text,
+ storage_key text not null unique,
+ original_filename text not null,
+ media_type text not null,
+ byte_size bigint not null,
+ content_hash text not null,
+ status text not null,
+ created_at timestamptz not null,
+ updated_at timestamptz not null,
+ available_at timestamptz,
+ expires_at timestamptz,
+ deleted_at timestamptz,
+ foreign key (job_id,tenant_id,owner_user_id)
+   references service_jobs(id,tenant_id,owner_user_id) on delete cascade,
+ check (byte_size >= 0),
+ check (status in ('uploading','scanning','available','quarantined','deleted'))
+);
+create index if not exists service_artifacts_owner_idx
+  on service_artifacts(job_id,tenant_id,owner_user_id,created_at);
+create index if not exists service_artifacts_reconcile_idx
+  on service_artifacts(status,expires_at,updated_at);
+create table if not exists service_access_audit_records (
+ id uuid primary key,
+ tenant_id text not null,
+ user_id text not null,
+ action text not null,
+ target_job_id text not null,
+ target_artifact_id text,
+ allowed boolean not null,
+ occurred_at timestamptz not null
+);
+create index if not exists service_access_audit_actor_idx
+  on service_access_audit_records(tenant_id,user_id,occurred_at desc);
 ` }];
 export interface ServicePostgresClient { query<T = Record<string,unknown>>(sql: string, params?: unknown[]): Promise<{ rows: T[]; rowCount: number }> }
 export interface ServicePostgresTransactionClient extends ServicePostgresClient { release(): void }
