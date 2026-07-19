@@ -10,6 +10,7 @@ import {
 
 import { createJwtAuthenticator } from './http-auth.js';
 import { buildHttpServer } from './http-server.js';
+import { InMemoryEventBus } from './event-bus.js';
 
 const actor: ServiceActor = { tenantId: 'tenant-1', userId: 'alice' };
 const apps: Awaited<ReturnType<typeof buildHttpServer>>[] = [];
@@ -165,10 +166,48 @@ describe('JWT authentication', () => {
   });
 });
 
+describe('Phase 5 WebSocket API', () => {
+  it('replays from a cursor, receives live wakeups, and rejects cross-user subscriptions', async () => {
+    const { app, sdk, store, eventBus } = await fixture();
+    const job=await sdk.submitRun(actor,{schemaVersion:1,agentId:'agent',goal:'events'});
+    store.eventRows.push(
+      {schemaVersion:1,id:uuid(910),jobId:job.id,sequence:1,type:'run.created',data:{},occurredAt:now},
+      {schemaVersion:1,id:uuid(911),jobId:job.id,sequence:2,type:'step.started',data:{stepId:'one'},occurredAt:now},
+    );
+    const ws=await app.injectWS('/v1/ws',{headers:auth()});
+    const replay=receiveMessages(ws,2);
+    ws.send(JSON.stringify({operation:'subscribe',requestId:'sub-1',jobId:job.id,afterSequence:1}));
+    expect(await replay).toMatchObject([
+      {type:'response',requestId:'sub-1',data:{subscribed:true}},
+      {type:'event',event:{sequence:2,type:'step.started'}},
+    ]);
+
+    store.eventRows.push({schemaVersion:1,id:uuid(912),jobId:job.id,sequence:3,type:'step.completed',data:{stepId:'one'},occurredAt:now});
+    const live=receiveMessages(ws,1);await eventBus.publish({jobId:job.id,sequence:3});
+    expect(await live).toMatchObject([{type:'event',event:{sequence:3,type:'step.completed'}}]);
+    ws.terminate();
+
+    const other=await app.injectWS('/v1/ws',{headers:auth('bob')});
+    const denied=receiveMessages(other,1);
+    other.send(JSON.stringify({operation:'subscribe',requestId:'private',jobId:job.id,afterSequence:0}));
+    expect(await denied).toMatchObject([{type:'error',requestId:'private',error:{code:'not_found'}}]);
+    other.terminate();
+  });
+
+  it('uses the shared submission path and rejects server-owned overrides',async()=>{
+    const {app,store}=await fixture();const ws=await app.injectWS('/v1/ws',{headers:auth()});
+    const invalid=receiveMessages(ws,1);ws.send(JSON.stringify({operation:'submit',requestId:'bad',kind:'run',request:{schemaVersion:1,agentId:'agent',goal:'run',model:'unsafe'}}));
+    expect(await invalid).toMatchObject([{type:'error',requestId:'bad',error:{code:'invalid_request'}}]);expect(store.jobRows.size).toBe(0);
+    const accepted=receiveMessages(ws,1);ws.send(JSON.stringify({operation:'submit',requestId:'good',kind:'run',request:{schemaVersion:1,agentId:'agent',goal:'run'}}));
+    expect(await accepted).toMatchObject([{type:'response',requestId:'good',data:{schemaVersion:1}}]);expect(store.jobRows.size).toBe(1);ws.terminate();
+  });
+});
+
 const now = '2026-01-01T00:00:00.000Z';
 
 async function fixture(options: { ready?: () => Promise<boolean>; registryError?: Error; authenticate?: (request: Parameters<ReturnType<typeof createJwtAuthenticator>>[0]) => Promise<ServiceActor>; bodyLimit?: number; rateLimit?: number } = {}) {
   const store = new InMemoryServiceStore();
+  const eventBus=new InMemoryEventBus();
   let nextId = 0;
   const registry: AgentRegistry = {
     async resolve(agentId, workload) {
@@ -189,9 +228,10 @@ async function fixture(options: { ready?: () => Promise<boolean>; registryError?
     if (!authorization?.startsWith('Bearer ')) throw new Error('unauthorized');
     return { tenantId: 'tenant-1', userId: authorization.slice(7) };
   });
-  const app = await buildHttpServer({ sdk, authenticate, ready: options.ready, logger: false, bodyLimit: options.bodyLimit, rateLimit: options.rateLimit ?? 10_000 });
+  const app = await buildHttpServer({ sdk, authenticate, eventBus, ready: options.ready, logger: false, bodyLimit: options.bodyLimit, rateLimit: options.rateLimit ?? 10_000 });
+  await app.ready();
   apps.push(app);
-  return { app, sdk, store };
+  return { app, sdk, store, eventBus };
 }
 
 function auth(user = 'alice', extra: Record<string, string> = {}): Record<string, string> {
@@ -204,4 +244,8 @@ function uuid(value: number): string {
 
 function publicError(code: string, message: string, retryable: boolean) {
   return { error: { schemaVersion: 1, code, message, retryable } };
+}
+
+function receiveMessages(socket:{once(event:'message',listener:(data:unknown)=>void):unknown},count:number):Promise<any[]> {
+  return new Promise((resolve,reject)=>{const messages:any[]=[];const read=()=>socket.once('message',data=>{try{messages.push(JSON.parse(String(data)));if(messages.length===count)resolve(messages);else read();}catch(error){reject(error);}});read();setTimeout(()=>reject(new Error('Timed out waiting for WebSocket messages')),2000).unref();});
 }

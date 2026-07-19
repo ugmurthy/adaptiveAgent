@@ -2,10 +2,12 @@ import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import swagger from '@fastify/swagger';
 import swaggerUi from '@fastify/swagger-ui';
 import rateLimit from '@fastify/rate-limit';
+import websocket from '@fastify/websocket';
 import { IdempotencyConflictError, InvalidJobStateError, ServiceNotFoundError, type ServiceActor, type ServiceSdk } from '@adaptive-agent/service-sdk';
 import type { HttpAuthenticator } from './http-auth.js';
+import type { EventBus } from './event-bus.js';
 
-export interface HttpServerOptions { sdk: ServiceSdk; authenticate: HttpAuthenticator; ready?: () => Promise<boolean>; ensureActor?: (actor: ServiceActor) => Promise<void>; logger?: boolean | object; bodyLimit?: number; rateLimit?: number }
+export interface HttpServerOptions { sdk: ServiceSdk; authenticate: HttpAuthenticator; eventBus?:EventBus; ready?: () => Promise<boolean>; ensureActor?: (actor: ServiceActor) => Promise<void>; logger?: boolean | object; bodyLimit?: number; rateLimit?: number; ws?:{maxConnections?:number;maxConnectionsPerUser?:number;maxMessageBytes?:number;maxBufferedBytes?:number;heartbeatMs?:number} }
 const text = { type:'string', minLength:1, maxLength:10_000 } as const;
 const id = { type:'string', minLength:1, maxLength:200 } as const;
 const version = { type:'integer', const:1 } as const;
@@ -33,12 +35,13 @@ export async function buildHttpServer(options: HttpServerOptions): Promise<Fasti
   await app.register(swagger, { openapi:{ info:{title:'Adaptive Agent Service',version:'1.0.0'}, components:{securitySchemes:{bearerAuth:{type:'http',scheme:'bearer',bearerFormat:'JWT'}}} } });
   await app.register(swaggerUi, { routePrefix:'/docs' });
   await app.register(rateLimit, { global:true, max:options.rateLimit ?? 100, timeWindow:'1 minute', allowList:(request)=>request.url.startsWith('/health/') });
+  await app.register(websocket,{options:{maxPayload:options.ws?.maxMessageBytes??64*1024}});
   app.get('/', async () => ({service:'adaptive-agent',schemaVersion:1,docs:'/docs'}));
   app.get('/health/live', async () => ({status:'ok'}));
   app.get('/health/ready', async (_req, reply) => (await (options.ready?.() ?? true)) ? {status:'ready'} : reply.code(503).send(httpError('not_ready','Service is not ready.',true)));
   app.addHook('onRequest', async (request, reply) => {
     if (!request.url.startsWith('/v1/')) return;
-    let verified: ServiceActor;
+    let verified:ServiceActor;
     try { verified=await options.authenticate(request); }
     catch { return reply.code(401).send(httpError('unauthorized','Unauthorized.',false)); }
     await options.ensureActor?.(verified);
@@ -74,7 +77,39 @@ export async function buildHttpServer(options: HttpServerOptions): Promise<Fasti
     request.log.error({errorType:error instanceof Error?error.name:'UnknownError',requestId:request.id},'request failed');
     return reply.code(500).send(httpError('internal_error','Internal server error.',true));
   });
+  installWebSocket(app,options,actor);
   return app;
 }
 
 function httpError(code:string,message:string,retryable:boolean) { return {error:{schemaVersion:1 as const,code,message,retryable}}; }
+
+function installWebSocket(app:FastifyInstance,options:HttpServerOptions,getActor:(r:FastifyRequest)=>ServiceActor) {
+  let total=0;const perUser=new Map<string,number>();const config={maxConnections:1000,maxConnectionsPerUser:10,maxMessageBytes:64*1024,maxBufferedBytes:1024*1024,heartbeatMs:30_000,...options.ws};
+  app.get('/v1/ws',{websocket:true},(socket,request)=>{
+    const actor=getActor(request);const key=`${actor.tenantId}:${actor.userId}`,old=perUser.get(key)??0;
+    if(total>=config.maxConnections||old>=config.maxConnectionsPerUser){socket.close(1013,'Connection limit');return;}total++;perUser.set(key,old+1);
+    const cursors=new Map<string,number>(),draining=new Set<string>(),pending=new Set<string>();let alive=true,closed=false,unsubscribe:undefined|(()=>Promise<void>);
+    const send=(value:unknown)=>{if(socket.bufferedAmount>config.maxBufferedBytes){socket.close(1013,'Slow client');return false;}socket.send(JSON.stringify(value));return true;};
+    const drain=async(jobId:string)=>{if(draining.has(jobId)){pending.add(jobId);return;}draining.add(jobId);try{do{pending.delete(jobId);let after=cursors.get(jobId);if(after===undefined)return;for(;;){const events=await options.sdk.listEvents(actor,jobId,after,200);for(const event of events){if(!send({type:'event',event}))return;after=event.sequence;cursors.set(jobId,after);}if(events.length<200)break;}const job=await options.sdk.getJob(actor,jobId);if(['succeeded','failed','cancelled'].includes(job.state))send({type:'job',job});}while(pending.has(jobId));}catch{send({type:'error',error:publicWsError('not_found')});cursors.delete(jobId);}finally{draining.delete(jobId);}};
+    const busReady=options.eventBus?.subscribe(w=>{if(cursors.has(w.jobId))void drain(w.jobId);}).then(value=>{unsubscribe=value;}).catch(()=>{})??Promise.resolve();
+    socket.on('pong',()=>{alive=true;});const heartbeat=setInterval(()=>{if(!alive){socket.terminate();return;}alive=false;socket.ping();},config.heartbeatMs);
+    socket.on('message',async raw=>{let message:any;let requestId:unknown;try{if(Buffer.byteLength(raw as any)>config.maxMessageBytes)throw new Error();message=JSON.parse(raw.toString());requestId=message.requestId;if(!message||typeof message.operation!=='string'||(requestId!==undefined&&typeof requestId!=='string'))throw new Error();const done=(data:unknown)=>send({type:'response',requestId,data});const idem=typeof message.idempotencyKey==='string'?{idempotencyKey:message.idempotencyKey}:undefined;
+        switch(message.operation){case'submit':{const r=validateWsSubmission(message.kind,message.request);const job=message.kind==='run'?await options.sdk.submitRun(actor,r as any,idem):message.kind==='chat'?await options.sdk.submitChat(actor,r as any,idem):message.kind==='swarm'?await options.sdk.submitSwarmRun(actor,r as any,idem):await options.sdk.submitOrchestratedRun(actor,r as any,idem);done({schemaVersion:1,jobId:job.id});break;}case'subscribe':if(typeof message.jobId!=='string'||!Number.isSafeInteger(message.afterSequence??0)||(message.afterSequence??0)<0)throw new Error();await busReady;await options.sdk.getJob(actor,message.jobId);cursors.set(message.jobId,message.afterSequence??0);done({jobId:message.jobId,subscribed:true});await drain(message.jobId);break;case'unsubscribe':if(typeof message.jobId!=='string')throw new Error();cursors.delete(message.jobId);done({jobId:message.jobId,subscribed:false});break;case'cancel':done(await options.sdk.cancelJob(actor,requiredString(message.jobId),idem));break;case'steer':done(await options.sdk.steerJob(actor,requiredString(message.jobId),requiredString(message.guidance),idem));break;case'approve':if(typeof message.approved!=='boolean')throw new Error();done(await options.sdk.resolveApproval(actor,requiredString(message.jobId),message.approved,idem));break;case'clarify':done(await options.sdk.resolveClarification(actor,requiredString(message.jobId),requiredString(message.answer),idem));break;default:throw new Error();}}
+      catch(error){const code=error instanceof ServiceNotFoundError?'not_found':error instanceof InvalidJobStateError||error instanceof IdempotencyConflictError?'conflict':'invalid_request';send({type:'error',requestId,error:publicWsError(code)});}});
+    socket.on('close',()=>{if(closed)return;closed=true;clearInterval(heartbeat);void unsubscribe?.();total--;const count=(perUser.get(key)??1)-1;if(count)perUser.set(key,count);else perUser.delete(key);cursors.clear();pending.clear();});
+  });
+}
+function requiredString(value:unknown):string {if(typeof value!=='string'||!value||value.length>10_000)throw new Error();return value;}
+function publicWsError(code:string){return {schemaVersion:1,code,message:code==='not_found'?'Resource not found.':code==='conflict'?'Request conflicts with current state.':'Invalid request.',retryable:false};}
+function validateWsSubmission(kind:unknown,value:unknown):Record<string,unknown> {
+  if(!value||typeof value!=='object'||Array.isArray(value)||!['run','chat','swarm','orchestration'].includes(String(kind)))throw new Error();
+  const body=value as Record<string,unknown>;
+  const allowed=kind==='run'?['schemaVersion','agentId','goal','input']:kind==='chat'?['schemaVersion','agentId','message','conversationId']:kind==='swarm'?['schemaVersion','coordinatorAgentId','workerAgentIds','objective']:['schemaVersion','orchestratorAgentId','agentIds','objective'];
+  if(Object.keys(body).some(key=>!allowed.includes(key))||body.schemaVersion!==1)throw new Error();
+  const strings=kind==='run'?['agentId','goal']:kind==='chat'?['agentId','message']:kind==='swarm'?['coordinatorAgentId','objective']:['orchestratorAgentId','objective'];
+  for(const key of strings)requiredString(body[key]);
+  if(kind==='chat'&&body.conversationId!==undefined)requiredString(body.conversationId);
+  if(kind==='swarm')requiredStringArray(body.workerAgentIds);if(kind==='orchestration')requiredStringArray(body.agentIds);
+  return body;
+}
+function requiredStringArray(value:unknown):void {if(!Array.isArray(value)||value.length<1||value.length>100||new Set(value).size!==value.length)throw new Error();for(const item of value)requiredString(item);}
