@@ -4,6 +4,7 @@ import {
   IdempotencyConflictError,
   InMemoryArtifactStore,
   InMemoryServiceStore,
+  ServiceForbiddenError,
   ServiceNotFoundError,
   ServiceSdk,
   type AgentRegistry,
@@ -84,6 +85,36 @@ describe('ServiceSdk', () => {
     ]) {
       await expect(call()).rejects.toBeInstanceOf(ServiceNotFoundError);
     }
+  });
+
+  it('lists only the current user jobs with filters and pagination metadata', async () => {
+    const { sdk } = fixture();
+    await sdk.submitRun(actor, { schemaVersion: 1, agentId: 'a', goal: 'mine' });
+    await sdk.submitChat({ tenantId: 'tenant', userId: 'bob' }, { schemaVersion: 1, agentId: 'a', message: 'private' });
+
+    const page = await sdk.listJobs(actor, { kind: 'run', limit: 10, offset: 0 });
+
+    expect(page).toMatchObject({ total: 1, limit: 10, offset: 0 });
+    expect(page.items.map(job => job.ownerUserId)).toEqual(['alice']);
+  });
+
+  it('requires platform admin and audits cross-tenant inspection and idempotent control', async () => {
+    const { sdk, store } = fixture();
+    const job = await sdk.submitRun(actor, { schemaVersion: 1, agentId: 'a', goal: 'inspect' });
+    store.jobRows.set(job.id, { ...job, state: 'running' });
+    await expect(sdk.adminGetJob(actor, job.id)).rejects.toBeInstanceOf(ServiceForbiddenError);
+
+    const admin: ServiceActor = { tenantId: 'operations', userId: 'root', roles: ['platform_admin'] };
+    expect((await sdk.adminGetJob(admin, job.id)).ownerUserId).toBe('alice');
+    const first = await sdk.adminCancelJob(admin, job.id, { idempotencyKey: 'cancel-once' });
+    const second = await sdk.adminCancelJob(admin, job.id, { idempotencyKey: 'cancel-once' });
+
+    expect(second.commandVersion).toBe(first.commandVersion);
+    expect(store.outboxRows.filter(row => row.jobId === job.id)).toHaveLength(2);
+    expect(store.auditRows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ userId: 'root', jobId: job.id, action: 'admin:get_job' }),
+      expect.objectContaining({ userId: 'root', jobId: job.id, action: 'admin:cancel' }),
+    ]));
   });
 
   it('rolls back job creation when the transaction fails', async () => {

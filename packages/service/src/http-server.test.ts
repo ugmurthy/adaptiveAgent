@@ -75,6 +75,34 @@ describe('Phase 4 HTTP API', () => {
     expect(read.json()).toEqual(publicError('not_found', 'Resource not found.', false));
   });
 
+  it('lists safe agents and protects platform admin routes', async () => {
+    const authenticate = async (request: Parameters<ReturnType<typeof createJwtAuthenticator>>[0]): Promise<ServiceActor> => {
+      const name = request.headers.authorization?.slice(7) ?? '';
+      return name === 'admin'
+        ? { tenantId: 'operations', userId: 'root', roles: ['platform_admin'] }
+        : { tenantId: 'tenant-1', userId: name };
+    };
+    const { app, sdk, store } = await fixture({
+      authenticate,
+      catalog: { list: () => [{ id: 'agent', version: '1', allowedWorkloads: ['run'] }] },
+    });
+    const job = await sdk.submitRun(actor, { schemaVersion: 1, agentId: 'agent', goal: 'admin view' });
+    store.jobRows.set(job.id, { ...job, state: 'running' });
+
+    const catalog = await app.inject({ method: 'GET', url: '/v1/agents', headers: auth() });
+    expect(catalog.json()).toEqual({ items: [{ id: 'agent', version: '1', allowedWorkloads: ['run'] }] });
+    expect(catalog.body).not.toContain('configPath');
+    expect(catalog.body).not.toContain('contentHash');
+    expect((await app.inject({ method: 'GET', url: '/v1/admin/jobs', headers: auth() })).statusCode).toBe(403);
+
+    const listed = await app.inject({ method: 'GET', url: '/v1/admin/jobs?tenantId=tenant-1', headers: auth('admin') });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.json()).toMatchObject({ total: 1, limit: 50, offset: 0, items: [{ id: job.id, ownerUserId: 'alice' }] });
+    const cancelled = await app.inject({ method: 'POST', url: `/v1/admin/jobs/${job.id}/cancel`, headers: auth('admin', { 'idempotency-key': 'admin-cancel' }), payload: {} });
+    expect(cancelled.statusCode).toBe(200);
+    expect(store.auditRows).toContainEqual(expect.objectContaining({ userId: 'root', jobId: job.id, action: 'admin:cancel' }));
+  });
+
   it('rejects attempts to supply server-owned execution configuration', async () => {
     const { app, store } = await fixture();
     for (const override of [{ model: 'unsafe' }, { tools: ['shell'] }, { configPath: '/tmp/agent.json' }, { workspace: '/tmp' }]) {
@@ -180,6 +208,21 @@ describe('JWT authentication', () => {
     const noExpiration = await new SignJWT({ tenant_id: 'tenant-1' }).setProtectedHeader({ alg: 'HS256' }).setIssuer('https://issuer.example').setAudience('adaptive-agent').setSubject('alice').sign(new TextEncoder().encode(secret));
     expect((await app.inject({ method: 'GET', url: '/v1/jobs/unknown', headers: { authorization: `Bearer ${noExpiration}` } })).statusCode).toBe(401);
   });
+
+  it('maps a configured admin role and accepts browser WebSocket subprotocol credentials only on the WS route', async () => {
+    const secret = 'a-test-secret-that-is-long-enough-for-hs256';
+    const authenticate = createJwtAuthenticator({ issuer: 'https://issuer.example', audience: 'adaptive-agent', hmacSecret: secret, adminRole: 'service-admin' });
+    const { app } = await fixture({ authenticate });
+    const token = await new SignJWT({ tenant_id: 'tenant-1', roles: ['service-admin'] }).setProtectedHeader({ alg: 'HS256' }).setIssuer('https://issuer.example').setAudience('adaptive-agent').setSubject('alice').setExpirationTime('5m').sign(new TextEncoder().encode(secret));
+
+    const admin = await app.inject({ method: 'GET', url: '/v1/admin/overview', headers: { authorization: `Bearer ${token}` } });
+    expect(admin.statusCode).toBe(200);
+    const rejectedHttp = await app.inject({ method: 'GET', url: '/v1/agents', headers: { 'sec-websocket-protocol': `adaptive-agent, bearer.${token}` } });
+    expect(rejectedHttp.statusCode).toBe(401);
+    const ws = await app.injectWS('/v1/ws', { headers: { 'sec-websocket-protocol': `adaptive-agent, bearer.${token}` } });
+    expect(ws.readyState).toBe(ws.OPEN);
+    ws.terminate();
+  });
 });
 
 describe('Phase 5 WebSocket API', () => {
@@ -221,7 +264,7 @@ describe('Phase 5 WebSocket API', () => {
 
 const now = '2026-01-01T00:00:00.000Z';
 
-async function fixture(options: { ready?: () => Promise<boolean>; registryError?: Error; authenticate?: (request: Parameters<ReturnType<typeof createJwtAuthenticator>>[0]) => Promise<ServiceActor>; artifactDownloader?:ArtifactDownloader; bodyLimit?: number; rateLimit?: number } = {}) {
+async function fixture(options: { ready?: () => Promise<boolean>; registryError?: Error; authenticate?: (request: Parameters<ReturnType<typeof createJwtAuthenticator>>[0]) => Promise<ServiceActor>; catalog?:{list():Array<{id:string;version:string;allowedWorkloads:readonly string[]}>}; artifactDownloader?:ArtifactDownloader; bodyLimit?: number; rateLimit?: number } = {}) {
   const store = new InMemoryServiceStore();
   const eventBus=new InMemoryEventBus();
   let nextId = 0;
@@ -244,7 +287,7 @@ async function fixture(options: { ready?: () => Promise<boolean>; registryError?
     if (!authorization?.startsWith('Bearer ')) throw new Error('unauthorized');
     return { tenantId: 'tenant-1', userId: authorization.slice(7) };
   });
-  const app = await buildHttpServer({ sdk, authenticate, artifacts:options.artifactDownloader, eventBus, ready: options.ready, logger: false, bodyLimit: options.bodyLimit, rateLimit: options.rateLimit ?? 10_000 });
+  const app = await buildHttpServer({ sdk, authenticate, catalog:options.catalog, artifacts:options.artifactDownloader, eventBus, ready: options.ready, logger: false, bodyLimit: options.bodyLimit, rateLimit: options.rateLimit ?? 10_000 });
   await app.ready();
   apps.push(app);
   return { app, sdk, store, eventBus };

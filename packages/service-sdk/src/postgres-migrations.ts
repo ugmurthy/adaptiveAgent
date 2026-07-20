@@ -75,6 +75,9 @@ create table if not exists service_access_audit_records (
 );
 create index if not exists service_access_audit_actor_idx
   on service_access_audit_records(tenant_id,user_id,occurred_at desc);
+` }, { name: 'service:005_admin_audit', sql: `
+alter table service_audit_records alter column job_id drop not null;
+create index if not exists service_jobs_admin_filter_idx on service_jobs(tenant_id,owner_user_id,kind,state,created_at desc);
 ` }];
 export interface ServicePostgresClient { query<T = Record<string,unknown>>(sql: string, params?: unknown[]): Promise<{ rows: T[]; rowCount: number }> }
 export interface ServicePostgresTransactionClient extends ServicePostgresClient { release(): void }

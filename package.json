@@ -19,7 +19,10 @@
     "trace-workbench:dev": "bun run --cwd ./packages/trace-workbench dev",
     "trace-workbench:build": "bun run --cwd ./packages/trace-workbench build",
     "trace-workbench:start": "bun run --cwd ./packages/trace-workbench start",
-    "trace-workbench:typecheck": "bun run --cwd ./packages/trace-workbench typecheck"
+    "trace-workbench:typecheck": "bun run --cwd ./packages/trace-workbench typecheck",
+    "service-console:dev": "bun run --cwd ./packages/service-console dev",
+    "service-console:build": "bun run --cwd ./packages/service-console build",
+    "service-console:typecheck": "bun run --cwd ./packages/service-console typecheck"
   },
   "dependencies": {
     "@e2b/code-interpreter": "^2.4.0",

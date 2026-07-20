@@ -34,6 +34,8 @@ export class AllowlistedAgentRegistry {
     return id;
   }
 
+  list():Array<{id:string;version:string;allowedWorkloads:JobKind[]}> { return [...this.entries.values()].map(({id,version,allowedWorkloads})=>({id,version,allowedWorkloads:[...allowedWorkloads]})); }
+
   async resolve(id: string, workload: JobKind): Promise<{ entry: AgentManifestEntry; config: ResolvedAgentSdkConfig }> {
     const entry = this.entries.get(id);
     if (!entry || !entry.allowedWorkloads.includes(workload)) throw new Error(`Agent ${id} is not allowed for ${workload}`);

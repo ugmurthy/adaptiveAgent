@@ -1,6 +1,6 @@
 export const SERVICE_API_VERSION = 1 as const;
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
-export interface ServiceActor { tenantId: string; userId: string }
+export interface ServiceActor { tenantId: string; userId: string; roles?: readonly string[] }
 export type JobKind = 'run' | 'chat' | 'swarm' | 'orchestration';
 export type JobState = 'accepted' | 'queued' | 'running' | 'waiting_approval' | 'waiting_clarification' | 'cancelling' | 'succeeded' | 'failed' | 'cancelled';
 export type WorkloadClass = JobKind;
@@ -24,8 +24,15 @@ export interface PublicEventEnvelope { schemaVersion: 1; id: string; jobId: stri
 export type ArtifactStatus = 'uploading' | 'scanning' | 'available' | 'quarantined' | 'deleted';
 export interface ArtifactMetadata { schemaVersion: 1; id: string; tenantId: string; ownerUserId: string; jobId: string; runId?: string; toolExecutionId?: string; filename: string; mediaType: string; byteSize: number; contentHash: string; status: ArtifactStatus; createdAt: string; availableAt?: string; expiresAt?: string; deletedAt?: string }
 export interface OutboxRecord { id: string; jobId: string; commandVersion: number; command: PendingCommand; createdAt: string; publishedAt?: string; processedAt?: string; leaseOwner?: string; leaseExpiresAt?: string }
-export interface AuditRecord { id: string; tenantId: string; userId: string; jobId: string; action: string; occurredAt: string; data?: JsonValue }
+export interface AuditRecord { id: string; tenantId: string; userId: string; jobId?: string; action: string; occurredAt: string; data?: JsonValue }
+export interface Page<T> { items: T[]; total: number; limit: number; offset: number }
+export interface JobListOptions { kind?: JobKind; state?: JobState; limit?: number; offset?: number }
+export interface AdminJobListOptions extends JobListOptions { tenantId?: string; ownerUserId?: string }
+export interface TenantSummary { tenantId: string; jobCount: number }
+export interface UserSummary { tenantId: string; userId: string; jobCount: number }
+export interface AdminOverview { totalJobs: number; totalTenants: number; totalUsers: number; jobsByState: Partial<Record<JobState, number>> }
 export interface IdempotencyRecord { tenantId: string; userId: string; operation: IdempotencyOperation; key: string; requestHash: string; jobId: string; createdAt: string }
 export class ServiceNotFoundError extends Error { constructor() { super('Resource not found.'); this.name = 'ServiceNotFoundError'; } }
+export class ServiceForbiddenError extends Error { constructor() { super('Forbidden.'); this.name = 'ServiceForbiddenError'; } }
 export class IdempotencyConflictError extends Error { constructor() { super('Idempotency key was already used with a different request.'); this.name = 'IdempotencyConflictError'; } }
 export class InvalidJobStateError extends Error { constructor(state: JobState, command: CommandKind) { super(`Command ${command} is not valid while job is ${state}.`); this.name = 'InvalidJobStateError'; } }

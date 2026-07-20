@@ -3,13 +3,13 @@ import swagger from '@fastify/swagger';
 import swaggerUi from '@fastify/swagger-ui';
 import rateLimit from '@fastify/rate-limit';
 import websocket from '@fastify/websocket';
-import { IdempotencyConflictError, InvalidJobStateError, ServiceNotFoundError, type ServiceActor, type ServiceSdk } from '@adaptive-agent/service-sdk';
+import { IdempotencyConflictError, InvalidJobStateError, ServiceForbiddenError, ServiceNotFoundError, type ServiceActor, type ServiceSdk } from '@adaptive-agent/service-sdk';
 import type { HttpAuthenticator } from './http-auth.js';
 import type { EventBus } from './event-bus.js';
 import { safeContentDisposition } from './artifacts.js';
 
 export interface ArtifactDownloader { download(actor:ServiceActor,jobId:string,artifactId:string):Promise<{metadata:{filename:string;mediaType:string;byteSize:number};data:Uint8Array}> }
-export interface HttpServerOptions { sdk: ServiceSdk; authenticate: HttpAuthenticator; artifacts?:ArtifactDownloader; eventBus?:EventBus; ready?: () => Promise<boolean>; ensureActor?: (actor: ServiceActor) => Promise<void>; logger?: boolean | object; bodyLimit?: number; rateLimit?: number; ws?:{maxConnections?:number;maxConnectionsPerUser?:number;maxMessageBytes?:number;maxBufferedBytes?:number;heartbeatMs?:number} }
+export interface HttpServerOptions { sdk: ServiceSdk; authenticate: HttpAuthenticator; catalog?:{list():Array<{id:string;version:string;allowedWorkloads:readonly string[]}>}; artifacts?:ArtifactDownloader; eventBus?:EventBus; ready?: () => Promise<boolean>; ensureActor?: (actor: ServiceActor) => Promise<void>; logger?: boolean | object; bodyLimit?: number; rateLimit?: number; ws?:{maxConnections?:number;maxConnectionsPerUser?:number;maxMessageBytes?:number;maxBufferedBytes?:number;heartbeatMs?:number} }
 const text = { type:'string', minLength:1, maxLength:10_000 } as const;
 const id = { type:'string', minLength:1, maxLength:200 } as const;
 const version = { type:'integer', const:1 } as const;
@@ -30,7 +30,7 @@ const job = { type:'object', additionalProperties:false, required:['schemaVersio
 const publicEvent = { type:'object', additionalProperties:false, required:['schemaVersion','id','jobId','sequence','type','data','occurredAt'], properties:{schemaVersion:version,id,jobId:id,sequence:{type:'integer',minimum:1},type:id,data:{},occurredAt:{type:'string',format:'date-time'}} } as const;
 const artifact = { type:'object', additionalProperties:false, required:['schemaVersion','id','tenantId','ownerUserId','jobId','filename','mediaType','byteSize','contentHash','status','createdAt'], properties:{schemaVersion:version,id,tenantId:id,ownerUserId:id,jobId:id,runId:id,toolExecutionId:id,filename:id,mediaType:id,byteSize:{type:'integer',minimum:0},contentHash:id,status:{type:'string',enum:['uploading','scanning','available','quarantined','deleted']},createdAt:{type:'string',format:'date-time'},availableAt:{type:'string',format:'date-time'},expiresAt:{type:'string',format:'date-time'},deletedAt:{type:'string',format:'date-time'}} } as const;
 const errorResponse = { type:'object', additionalProperties:false, required:['error'], properties:{error:serviceError} } as const;
-const errors = { 400:errorResponse,401:errorResponse,404:errorResponse,409:errorResponse,413:errorResponse,415:errorResponse,429:errorResponse,500:errorResponse } as const;
+const errors = { 400:errorResponse,401:errorResponse,403:errorResponse,404:errorResponse,409:errorResponse,413:errorResponse,415:errorResponse,429:errorResponse,500:errorResponse } as const;
 
 export async function buildHttpServer(options: HttpServerOptions): Promise<FastifyInstance> {
   const app = Fastify({ logger: options.logger ?? true, bodyLimit: options.bodyLimit ?? 1024*1024, requestIdHeader:'x-request-id', ajv:{customOptions:{removeAdditional:false}} });
@@ -38,7 +38,7 @@ export async function buildHttpServer(options: HttpServerOptions): Promise<Fasti
   await app.register(swagger, { openapi:{ info:{title:'Adaptive Agent Service',version:'1.0.0'}, components:{securitySchemes:{bearerAuth:{type:'http',scheme:'bearer',bearerFormat:'JWT'}}} } });
   await app.register(swaggerUi, { routePrefix:'/docs' });
   await app.register(rateLimit, { global:true, max:options.rateLimit ?? 100, timeWindow:'1 minute', allowList:(request)=>request.url.startsWith('/health/') });
-  await app.register(websocket,{options:{maxPayload:options.ws?.maxMessageBytes??64*1024}});
+  await app.register(websocket,{options:{maxPayload:options.ws?.maxMessageBytes??64*1024,handleProtocols:(protocols:Set<string>)=>protocols.has('adaptive-agent')?'adaptive-agent':false}});
   app.get('/', async () => ({service:'adaptive-agent',schemaVersion:1,docs:'/docs'}));
   app.get('/health/live', async () => ({status:'ok'}));
   app.get('/health/ready', async (_req, reply) => (await (options.ready?.() ?? true)) ? {status:'ready'} : reply.code(503).send(httpError('not_ready','Service is not ready.',true)));
@@ -53,6 +53,8 @@ export async function buildHttpServer(options: HttpServerOptions): Promise<Fasti
   const actor=(r:FastifyRequest)=>actors.get(r)!;
   const idem=(r:FastifyRequest)=>({idempotencyKey:r.headers['idempotency-key'] as string|undefined});
   const submissionResponse=(job:{id:string})=>({schemaVersion:1,jobId:job.id});
+  app.get('/v1/agents',async()=>({items:options.catalog?.list()??[]}));
+  app.get('/v1/jobs',{schema:{querystring:{type:'object',additionalProperties:false,properties:{kind:{type:'string',enum:['run','chat','swarm','orchestration']},state:{type:'string'},limit:{type:'integer',minimum:1,maximum:200,default:50},offset:{type:'integer',minimum:0,default:0}}}}},r=>options.sdk.listJobs(actor(r),r.query as any));
   const submit = (path:string, body:object, invoke:(a:ServiceActor,b:any,o:any)=>Promise<any>) => app.post(path,{schema:{body,headers,response:{202:accepted,...errors},security:[{bearerAuth:[]}]}},async(r,reply)=>reply.code(202).send(submissionResponse(await invoke(actor(r),r.body,idem(r)))));
   submit('/v1/jobs/run',run,(a,b,o)=>options.sdk.submitRun(a,b,o));
   submit('/v1/jobs/chat',chat,(a,b,o)=>options.sdk.submitChat(a,b,o));
@@ -69,6 +71,17 @@ export async function buildHttpServer(options: HttpServerOptions): Promise<Fasti
   }
   app.get('/v1/jobs/:jobId/events',{schema:{params,headers,querystring:{type:'object',additionalProperties:false,properties:{afterSequence:{type:'integer',minimum:0,maximum:Number.MAX_SAFE_INTEGER,default:0},limit:{type:'integer',minimum:1,maximum:500,default:100}}},response:{200:{type:'array',items:publicEvent},...errors},security:[{bearerAuth:[]}]}},r=>{const q=r.query as any;return options.sdk.listEvents(actor(r),(r.params as any).jobId,q.afterSequence,q.limit)});
   app.get('/v1/jobs/:jobId/artifacts',{schema:{params,headers,querystring:empty,response:{200:{type:'array',items:artifact},...errors},security:[{bearerAuth:[]}]}},r=>options.sdk.listArtifacts(actor(r),(r.params as any).jobId));
+  app.get('/v1/admin/overview',r=>options.sdk.adminOverview(actor(r)));
+  app.get('/v1/admin/tenants',r=>options.sdk.adminListTenants(actor(r)));
+  app.get('/v1/admin/users',{schema:{querystring:{type:'object',additionalProperties:false,properties:{tenantId:id,limit:{type:'integer',minimum:1,maximum:200,default:50},offset:{type:'integer',minimum:0,default:0}}}}},r=>{const q=r.query as any;return options.sdk.adminListUsers(actor(r),q.tenantId,q.limit,q.offset)});
+  app.get('/v1/admin/jobs',{schema:{querystring:{type:'object',additionalProperties:false,properties:{tenantId:id,ownerUserId:id,kind:{type:'string'},state:{type:'string'},limit:{type:'integer',minimum:1,maximum:200,default:50},offset:{type:'integer',minimum:0,default:0}}}}},r=>options.sdk.adminListJobs(actor(r),r.query as any));
+  app.get('/v1/admin/jobs/:jobId',{schema:{params}},r=>options.sdk.adminGetJob(actor(r),(r.params as any).jobId));
+  app.get('/v1/admin/jobs/:jobId/events',{schema:{params,querystring:{type:'object',additionalProperties:false,properties:{afterSequence:{type:'integer',minimum:0,maximum:Number.MAX_SAFE_INTEGER,default:0},limit:{type:'integer',minimum:1,maximum:500,default:100}}}}},r=>{const q=r.query as any;return options.sdk.adminListEvents(actor(r),(r.params as any).jobId,q.afterSequence,q.limit)});
+  app.get('/v1/admin/jobs/:jobId/artifacts',{schema:{params}},r=>options.sdk.adminListArtifacts(actor(r),(r.params as any).jobId));
+  app.get('/v1/admin/jobs/:jobId/run-links',{schema:{params}},r=>options.sdk.adminListRunLinks(actor(r),(r.params as any).jobId));
+  app.get('/v1/admin/jobs/:jobId/audit',{schema:{params}},r=>options.sdk.adminListAudit(actor(r),(r.params as any).jobId));
+  const adminControls:Record<string,(a:ServiceActor,j:string,b:any,o:any)=>Promise<any>>={cancel:(a,j,_b,o)=>options.sdk.adminCancelJob(a,j,o),retry:(a,j,_b,o)=>options.sdk.adminRetryJob(a,j,o),recover:(a,j,_b,o)=>options.sdk.adminRecoverJob(a,j,o),resume:(a,j,_b,o)=>options.sdk.adminResumeJob(a,j,o),continue:(a,j,_b,o)=>options.sdk.adminContinueJob(a,j,o),steer:(a,j,b,o)=>options.sdk.adminSteerJob(a,j,b.guidance,o),approval:(a,j,b,o)=>options.sdk.adminResolveApproval(a,j,b.approved,o),clarification:(a,j,b,o)=>options.sdk.adminResolveClarification(a,j,b.answer,o)};
+  for(const [name,invoke] of Object.entries(adminControls)){const body=name==='steer'?{type:'object',required:['guidance'],properties:{guidance:text}}:name==='approval'?{type:'object',required:['approved'],properties:{approved:{type:'boolean'}}}:name==='clarification'?{type:'object',required:['answer'],properties:{answer:text}}:empty;app.post(`/v1/admin/jobs/:jobId/${name}`,{schema:{params,body}},r=>invoke(actor(r),(r.params as any).jobId,r.body,idem(r)));}
   app.get('/v1/jobs/:jobId/artifacts/:artifactId/download',{schema:{params:artifactParams,headers,response:{401:errorResponse,404:errorResponse,429:errorResponse,500:errorResponse},security:[{bearerAuth:[]}]}},async(r,reply)=>{
     if(!options.artifacts)throw new ServiceNotFoundError();
     const p=r.params as {jobId:string;artifactId:string};
@@ -83,6 +96,7 @@ export async function buildHttpServer(options: HttpServerOptions): Promise<Fasti
   app.setErrorHandler((error,request,reply)=>{
     if ((error as any).validation) return reply.code(400).send(httpError('invalid_request','Invalid request.',false));
     if(error instanceof ServiceNotFoundError)return reply.code(404).send(httpError('not_found','Resource not found.',false));
+    if(error instanceof ServiceForbiddenError)return reply.code(403).send(httpError('forbidden','Forbidden.',false));
     if(error instanceof IdempotencyConflictError||error instanceof InvalidJobStateError)return reply.code(409).send(httpError('conflict','Request conflicts with current state.',false));
     const status=(error as {statusCode?:number}).statusCode;
     if(status===400||status===415)return reply.code(status).send(httpError('invalid_request','Invalid request.',false));
@@ -107,7 +121,7 @@ function installWebSocket(app:FastifyInstance,options:HttpServerOptions,getActor
     const drain=async(jobId:string)=>{if(draining.has(jobId)){pending.add(jobId);return;}draining.add(jobId);try{do{pending.delete(jobId);let after=cursors.get(jobId);if(after===undefined)return;for(;;){const events=await options.sdk.listEvents(actor,jobId,after,200);for(const event of events){if(!send({type:'event',event}))return;after=event.sequence;cursors.set(jobId,after);}if(events.length<200)break;}const job=await options.sdk.getJob(actor,jobId);if(['succeeded','failed','cancelled'].includes(job.state))send({type:'job',job});}while(pending.has(jobId));}catch{send({type:'error',error:publicWsError('not_found')});cursors.delete(jobId);}finally{draining.delete(jobId);}};
     const busReady=options.eventBus?.subscribe(w=>{if(cursors.has(w.jobId))void drain(w.jobId);}).then(value=>{unsubscribe=value;}).catch(()=>{})??Promise.resolve();
     socket.on('pong',()=>{alive=true;});const heartbeat=setInterval(()=>{if(!alive){socket.terminate();return;}alive=false;socket.ping();},config.heartbeatMs);
-    socket.on('message',async raw=>{let message:any;let requestId:unknown;try{if(Buffer.byteLength(raw as any)>config.maxMessageBytes)throw new Error();message=JSON.parse(raw.toString());requestId=message.requestId;if(!message||typeof message.operation!=='string'||(requestId!==undefined&&typeof requestId!=='string'))throw new Error();const done=(data:unknown)=>send({type:'response',requestId,data});const idem=typeof message.idempotencyKey==='string'?{idempotencyKey:message.idempotencyKey}:undefined;
+    socket.on('message',async (raw:any)=>{let message:any;let requestId:unknown;try{if(Buffer.byteLength(raw as any)>config.maxMessageBytes)throw new Error();message=JSON.parse(raw.toString());requestId=message.requestId;if(!message||typeof message.operation!=='string'||(requestId!==undefined&&typeof requestId!=='string'))throw new Error();const done=(data:unknown)=>send({type:'response',requestId,data});const idem=typeof message.idempotencyKey==='string'?{idempotencyKey:message.idempotencyKey}:undefined;
         switch(message.operation){case'submit':{const r=validateWsSubmission(message.kind,message.request);const job=message.kind==='run'?await options.sdk.submitRun(actor,r as any,idem):message.kind==='chat'?await options.sdk.submitChat(actor,r as any,idem):message.kind==='swarm'?await options.sdk.submitSwarmRun(actor,r as any,idem):await options.sdk.submitOrchestratedRun(actor,r as any,idem);done({schemaVersion:1,jobId:job.id});break;}case'subscribe':if(typeof message.jobId!=='string'||!Number.isSafeInteger(message.afterSequence??0)||(message.afterSequence??0)<0)throw new Error();await busReady;await options.sdk.getJob(actor,message.jobId);cursors.set(message.jobId,message.afterSequence??0);done({jobId:message.jobId,subscribed:true});await drain(message.jobId);break;case'unsubscribe':if(typeof message.jobId!=='string')throw new Error();cursors.delete(message.jobId);done({jobId:message.jobId,subscribed:false});break;case'cancel':done(await options.sdk.cancelJob(actor,requiredString(message.jobId),idem));break;case'steer':done(await options.sdk.steerJob(actor,requiredString(message.jobId),requiredString(message.guidance),idem));break;case'approve':if(typeof message.approved!=='boolean')throw new Error();done(await options.sdk.resolveApproval(actor,requiredString(message.jobId),message.approved,idem));break;case'clarify':done(await options.sdk.resolveClarification(actor,requiredString(message.jobId),requiredString(message.answer),idem));break;default:throw new Error();}}
       catch(error){const code=error instanceof ServiceNotFoundError?'not_found':error instanceof InvalidJobStateError||error instanceof IdempotencyConflictError?'conflict':'invalid_request';send({type:'error',requestId,error:publicWsError(code)});}});
     socket.on('close',()=>{if(closed)return;closed=true;clearInterval(heartbeat);void unsubscribe?.();total--;const count=(perUser.get(key)??1)-1;if(count)perUser.set(key,count);else perUser.delete(key);cursors.clear();pending.clear();});
