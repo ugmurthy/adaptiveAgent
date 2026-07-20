@@ -1,0 +1,9 @@
+echo verifying POSTGRES on docker is running...
+docker exec adaptive-agent-postgres pg_isready -U adaptive
+echo
+echo verifying REDIS on docker is running...
+docker exec adaptive-redis redis-cli ping
+echo
+echo verifying MINIO on docker is running...
+curl -I http://127.0.0.1:9000/minio/health/live
+
