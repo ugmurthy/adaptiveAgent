@@ -52,10 +52,12 @@ export function createArtifactManagerFromEnv(pool: Pool, env: NodeJS.ProcessEnv 
   const bucket=env.ARTIFACT_S3_BUCKET;
   if(!bucket)throw new Error('ARTIFACT_S3_BUCKET is required');
   if(Boolean(env.ARTIFACT_S3_ACCESS_KEY_ID)!==Boolean(env.ARTIFACT_S3_SECRET_ACCESS_KEY))throw new Error('Both artifact S3 credentials must be configured together');
+  const encryption=env.ARTIFACT_S3_SERVER_SIDE_ENCRYPTION??'AES256';
+  if(encryption!=='AES256'&&encryption!=='none')throw new Error('ARTIFACT_S3_SERVER_SIDE_ENCRYPTION must be AES256 or none');
   const storage=new S3ArtifactStorage(bucket,{
     region:env.ARTIFACT_S3_REGION??'us-east-1',endpoint:env.ARTIFACT_S3_ENDPOINT,
     accessKeyId:env.ARTIFACT_S3_ACCESS_KEY_ID,secretAccessKey:env.ARTIFACT_S3_SECRET_ACCESS_KEY,
-    forcePathStyle:env.ARTIFACT_S3_FORCE_PATH_STYLE==='true',
+    forcePathStyle:env.ARTIFACT_S3_FORCE_PATH_STYLE==='true',serverSideEncryption:encryption==='AES256'?'AES256':undefined,
   });
   const quotas={
     maxFiles:positiveInt(env.ARTIFACT_MAX_FILES,20),

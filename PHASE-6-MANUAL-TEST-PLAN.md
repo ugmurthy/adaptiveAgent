@@ -174,6 +174,7 @@ export ARTIFACT_S3_ENDPOINT='http://127.0.0.1:9000'
 export ARTIFACT_S3_ACCESS_KEY_ID='minioadmin'
 export ARTIFACT_S3_SECRET_ACCESS_KEY="$LOCAL_MINIO_SECRET"
 export ARTIFACT_S3_FORCE_PATH_STYLE='true'
+export ARTIFACT_S3_SERVER_SIDE_ENCRYPTION='none'
 
 export ARTIFACT_MAX_FILES='20'
 export ARTIFACT_MAX_FILE_BYTES='52428800'
@@ -182,6 +183,7 @@ export ARTIFACT_RETENTION_DAYS='7'
 export ARTIFACT_QUARANTINE_RETENTION_DAYS='30'
 export ARTIFACT_ABANDONED_UPLOAD_MS='5000'
 export JOB_WORKSPACE_ROOT="$PWD/var/jobs"
+export HTTP_LOG_LEVEL='info'
 
 export RECONCILE_INTERVAL_MS='1000'
 export PROJECTOR_INTERVAL_MS='250'
@@ -415,7 +417,7 @@ docker run --rm \
   '
 ```
 
-Expected: object exists with `text/plain`, SHA-256 metadata, and server-side encryption where reported by the installed MinIO version.
+Expected: object exists with `text/plain` and SHA-256 metadata. This local MinIO setup disables server-side encryption because it does not configure a KMS; production keeps `AES256` as the default.
 
 ## 12. Workspace Cleanup
 

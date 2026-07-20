@@ -98,16 +98,18 @@ export class PostgresArtifactRepository implements ArtifactRepository {
 
 export class S3ArtifactStorage implements PrivateObjectStorage {
   private readonly client:S3Client;
-  constructor(private readonly bucket:string, options:{region:string;endpoint?:string;accessKeyId?:string;secretAccessKey?:string;forcePathStyle?:boolean}) {
+  private readonly serverSideEncryption:'AES256'|undefined;
+  constructor(private readonly bucket:string, options:{region:string;endpoint?:string;accessKeyId?:string;secretAccessKey?:string;forcePathStyle?:boolean;serverSideEncryption?:'AES256'}) {
     if(options.endpoint) {
       const endpoint=new URL(options.endpoint);
       if(endpoint.protocol!=='https:' && !['localhost','127.0.0.1','::1'].includes(endpoint.hostname)) throw new Error('Artifact storage endpoint must use TLS');
     }
+    this.serverSideEncryption=options.serverSideEncryption;
     this.client=new S3Client({region:options.region,endpoint:options.endpoint,forcePathStyle:options.forcePathStyle,
       credentials:options.accessKeyId&&options.secretAccessKey?{accessKeyId:options.accessKeyId,secretAccessKey:options.secretAccessKey}:undefined});
   }
   async put(key:string,data:Uint8Array,mediaType:string,contentHash:string):Promise<void> {
-    await this.client.send(new PutObjectCommand({Bucket:this.bucket,Key:key,Body:data,ContentType:mediaType,Metadata:{sha256:contentHash},ServerSideEncryption:'AES256'}));
+    await this.client.send(new PutObjectCommand({Bucket:this.bucket,Key:key,Body:data,ContentType:mediaType,Metadata:{sha256:contentHash},ServerSideEncryption:this.serverSideEncryption}));
   }
   async get(key:string):Promise<Uint8Array|undefined> {
     try {
