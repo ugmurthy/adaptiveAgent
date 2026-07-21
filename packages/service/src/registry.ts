@@ -11,13 +11,24 @@ export interface AgentManifestEntry {
   contentHash: string;
   allowedWorkloads: JobKind[];
   participantIds?: string[];
+  resumeCompatibleWith?: Array<{ version: string; contentHash: string }>;
 }
 export interface AgentManifest { agents: AgentManifestEntry[] }
+export type AgentProfileResolutionPolicy = 'exact' | 'compatible' | 'latest';
+
+export function agentProfileResolutionPolicy(value: string | undefined): AgentProfileResolutionPolicy {
+  if (value === undefined || value === '' || value === 'exact') return 'exact';
+  if (value === 'compatible' || value === 'latest') return value;
+  throw new Error(`AGENT_PROFILE_RESOLUTION_POLICY must be exact, compatible, or latest; received ${value}`);
+}
 
 export class AllowlistedAgentRegistry {
-  private constructor(private readonly entries: Map<string, AgentManifestEntry>) {}
+  private constructor(
+    private readonly entries: Map<string, AgentManifestEntry>,
+    private readonly profileResolutionPolicy: AgentProfileResolutionPolicy,
+  ) {}
 
-  static async load(path: string): Promise<AllowlistedAgentRegistry> {
+  static async load(path: string, profileResolutionPolicy: AgentProfileResolutionPolicy = 'exact'): Promise<AllowlistedAgentRegistry> {
     const manifestPath = resolve(path);
     const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as AgentManifest;
     const entries = new Map<string, AgentManifestEntry>();
@@ -25,7 +36,7 @@ export class AllowlistedAgentRegistry {
       if (entries.has(entry.id)) throw new Error(`Duplicate registry agent ${entry.id}`);
       entries.set(entry.id, { ...entry, configPath: resolve(dirname(manifestPath), entry.configPath) });
     }
-    return new AllowlistedAgentRegistry(entries);
+    return new AllowlistedAgentRegistry(entries, profileResolutionPolicy);
   }
 
   firstAgentId(): string {
@@ -44,10 +55,10 @@ export class AllowlistedAgentRegistry {
 
   async resolvePinned(profile: AgentProfileRef, workload: JobKind): Promise<{ entry: AgentManifestEntry; config: ResolvedAgentSdkConfig }> {
     const resolved = await this.resolve(profile.agentId, workload);
-    if (resolved.entry.version !== profile.version || resolved.entry.contentHash !== profile.contentHash) {
-      throw new Error(`Agent ${profile.agentId} no longer matches the profile pinned by the service job`);
-    }
-    return resolved;
+    if (matchesProfile(resolved.entry, profile)) return resolved;
+    if (this.profileResolutionPolicy === 'latest') return resolved;
+    if (this.profileResolutionPolicy === 'compatible' && resolved.entry.resumeCompatibleWith?.some(candidate => matchesProfile(candidate, profile))) return resolved;
+    throw new Error(`Agent ${profile.agentId} no longer matches the profile pinned by the service job under ${this.profileResolutionPolicy} resolution policy`);
   }
 
   async resolveBootstrap(id: string): Promise<{ entry: AgentManifestEntry; config: ResolvedAgentSdkConfig }> {
@@ -64,4 +75,8 @@ export class AllowlistedAgentRegistry {
     if (config.agent.id !== entry.id) throw new Error(`Agent config ID ${config.agent.id} does not match registry ID ${entry.id}`);
     return { entry, config };
   }
+}
+
+function matchesProfile(candidate: { version: string; contentHash: string }, profile: AgentProfileRef): boolean {
+  return candidate.version === profile.version && candidate.contentHash === profile.contentHash;
 }

@@ -47,8 +47,8 @@ interface InternalArtifact extends ArtifactMetadata { storageKey: string }
 interface ArtifactRepository {
   createFromJob(jobId:string,input:{id:string;storageKey:string;filename:string;mediaType:string;byteSize:number;contentHash:string;createdAt:string;runId?:string;toolExecutionId?:string}):Promise<void>;
   transition(id:string,expected:readonly ArtifactStatus[],status:ArtifactStatus,now:string,expiresAt?:string):Promise<boolean>;
-  getAvailableOwned(actor:ServiceActor,jobId:string,artifactId:string):Promise<InternalArtifact|undefined>;
-  auditDownload(actor:ServiceActor,jobId:string,artifactId:string,allowed:boolean):Promise<void>;
+  getOwned(actor:ServiceActor,jobId:string,artifactId:string,status:'available'|'quarantined'):Promise<InternalArtifact|undefined>;
+  auditDownload(actor:ServiceActor,jobId:string,artifactId:string,status:'available'|'quarantined',allowed:boolean):Promise<void>;
   reconciliationCandidates(now:string,abandonedBefore:string):Promise<InternalArtifact[]>;
   knownStorageKeys():Promise<Set<string>>;
 }
@@ -74,15 +74,16 @@ export class PostgresArtifactRepository implements ArtifactRepository {
     return result.rowCount===1;
   }
 
-  async getAvailableOwned(actor:ServiceActor,jobId:string,artifactId:string):Promise<InternalArtifact|undefined> {
-    const result=await this.db.query<ArtifactRow>(`select a.* from service_artifacts a join service_jobs j on j.id=a.job_id where a.id=$1 and a.job_id=$2 and j.tenant_id=$3 and j.owner_user_id=$4 and a.status='available' and (a.expires_at is null or a.expires_at>now())`,[artifactId,jobId,actor.tenantId,actor.userId]);
+  async getOwned(actor:ServiceActor,jobId:string,artifactId:string,status:'available'|'quarantined'):Promise<InternalArtifact|undefined> {
+    const result=await this.db.query<ArtifactRow>(`select a.* from service_artifacts a join service_jobs j on j.id=a.job_id where a.id=$1 and a.job_id=$2 and j.tenant_id=$3 and j.owner_user_id=$4 and a.status=$5 and (a.expires_at is null or a.expires_at>now())`,[artifactId,jobId,actor.tenantId,actor.userId,status]);
     const row=result.rows[0];
     return row ? {...mapArtifactRow(row),storageKey:row.storage_key} : undefined;
   }
 
-  async auditDownload(actor:ServiceActor,jobId:string,artifactId:string,allowed:boolean):Promise<void> {
-    await this.db.query(`insert into service_access_audit_records(id,tenant_id,user_id,action,target_job_id,target_artifact_id,allowed,occurred_at) values($1,$2,$3,'artifact:download',$4,$5,$6,now())`,
-      [randomUUID(),actor.tenantId,actor.userId,jobId,artifactId,allowed]);
+  async auditDownload(actor:ServiceActor,jobId:string,artifactId:string,status:'available'|'quarantined',allowed:boolean):Promise<void> {
+    const action=status==='quarantined'?'artifact:download_quarantined':'artifact:download';
+    await this.db.query(`insert into service_access_audit_records(id,tenant_id,user_id,action,target_job_id,target_artifact_id,allowed,occurred_at) values($1,$2,$3,$4,$5,$6,$7,now())`,
+      [randomUUID(),actor.tenantId,actor.userId,action,jobId,artifactId,allowed]);
   }
 
   async reconciliationCandidates(now:string,abandonedBefore:string):Promise<InternalArtifact[]> {
@@ -179,9 +180,17 @@ export class ArtifactManager {
   }
 
   async download(actor:ServiceActor,jobId:string,artifactId:string):Promise<{metadata:ArtifactMetadata;data:Uint8Array}> {
+    return this.downloadOwned(actor,jobId,artifactId,'available');
+  }
+
+  async downloadQuarantined(actor:ServiceActor,jobId:string,artifactId:string):Promise<{metadata:ArtifactMetadata;data:Uint8Array}> {
+    return this.downloadOwned(actor,jobId,artifactId,'quarantined');
+  }
+
+  private async downloadOwned(actor:ServiceActor,jobId:string,artifactId:string,status:'available'|'quarantined'):Promise<{metadata:ArtifactMetadata;data:Uint8Array}> {
     let allowed=false;
     try {
-      const artifact=await this.repository.getAvailableOwned(actor,jobId,artifactId);
+      const artifact=await this.repository.getOwned(actor,jobId,artifactId,status);
       if(!artifact)throw new ServiceNotFoundError();
       const data=await this.storage.get(artifact.storageKey);
       if(!data)throw new ServiceNotFoundError();
@@ -189,7 +198,7 @@ export class ArtifactManager {
       const {storageKey:_,...metadata}=artifact;
       return {metadata,data};
     } finally {
-      await this.repository.auditDownload(actor,jobId,artifactId,allowed);
+      await this.repository.auditDownload(actor,jobId,artifactId,status,allowed);
     }
   }
 

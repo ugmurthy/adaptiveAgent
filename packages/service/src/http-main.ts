@@ -1,17 +1,18 @@
 import { PostgresArtifactMetadataStore, PostgresServiceStore, ServiceSdk, type AgentRegistry, type ServiceActor } from '@adaptive-agent/service-sdk';
-import { AllowlistedAgentRegistry } from './registry.js';
-import { createArtifactManagerFromEnv, createPoolFromEnv, positiveInt, runBackendMigrations } from './composition.js';
+import { agentProfileResolutionPolicy, AllowlistedAgentRegistry } from './registry.js';
+import { createArtifactManagerFromEnv, createPoolFromEnv, positiveInt, printEnvironmentIfRequested, runBackendMigrations } from './composition.js';
 import { createJwtAuthenticator } from './http-auth.js';
 import { buildHttpServer } from './http-server.js';
 import { RedisEventBus } from './event-bus.js';
 
 async function main(): Promise<void> {
   const env=process.env;
+  printEnvironmentIfRequested('http',env);
   if (!env.AGENT_REGISTRY_PATH) throw new Error('AGENT_REGISTRY_PATH is required');
   const pool=createPoolFromEnv(env);
   await runBackendMigrations(pool);
   const store=new PostgresServiceStore(pool);
-  const registry=await AllowlistedAgentRegistry.load(env.AGENT_REGISTRY_PATH);
+  const registry=await AllowlistedAgentRegistry.load(env.AGENT_REGISTRY_PATH,agentProfileResolutionPolicy(env.AGENT_PROFILE_RESOLUTION_POLICY));
   const registryAdapter:AgentRegistry={resolve:async(id,kind)=>{try{const {entry}=await registry.resolve(id,kind);return {profile:{agentId:entry.id,version:entry.version,contentHash:entry.contentHash},allowedWorkloads:entry.allowedWorkloads};}catch{return undefined;}}};
   const artifactRuntime=createArtifactManagerFromEnv(pool,env);
   const artifacts=new PostgresArtifactMetadataStore(pool);

@@ -36,8 +36,9 @@ export const api = {
   auxiliary: <T>(id: string, resource: 'run-links' | 'audit') => request<T>(`/v1/admin/jobs/${encodeURIComponent(id)}/${resource}`),
   control: (id: string, action: string, body: Json = {}, admin = false, key?: string) => request<ServiceJob>(`/v1/${admin ? 'admin/' : ''}jobs/${encodeURIComponent(id)}/${action}`, { method: 'POST', body: JSON.stringify(body), headers: headers(true, key) }),
   admin: <T>(resource: 'overview' | 'tenants' | 'users', values: Record<string, string | number | undefined> = {}) => request<T>(`/v1/admin/${resource}?${query(values)}`),
-  async download(jobId: string, artifact: Artifact) {
-    const response = await fetch(`/v1/jobs/${encodeURIComponent(jobId)}/artifacts/${encodeURIComponent(artifact.id)}/download`, { headers: headers() });
+  async download(jobId: string, artifact: Artifact, quarantined = false) {
+    const operation = quarantined ? 'download-quarantined' : 'download';
+    const response = await fetch(`/v1/jobs/${encodeURIComponent(jobId)}/artifacts/${encodeURIComponent(artifact.id)}/${operation}`, { headers: headers() });
     if (!response.ok) throw new Error(`Download failed (${response.status})`);
     const url = URL.createObjectURL(await response.blob()); const anchor = document.createElement('a');
     anchor.href = url; anchor.download = artifact.filename; anchor.click(); URL.revokeObjectURL(url);

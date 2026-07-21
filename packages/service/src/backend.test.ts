@@ -134,7 +134,7 @@ describe('workload retry handling', () => {
 
     await expect(executor.execute(claim)).resolves.toEqual(outcome);
 
-    expect(start).toHaveBeenCalledWith(claim, workspace.root);
+    expect(start).toHaveBeenCalledWith(claim, workspace.artifacts);
     expect(workspaces.close).toHaveBeenCalledWith(claim.job, workspace);
   });
 });

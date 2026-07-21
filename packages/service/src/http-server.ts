@@ -8,7 +8,10 @@ import type { HttpAuthenticator } from './http-auth.js';
 import type { EventBus } from './event-bus.js';
 import { safeContentDisposition } from './artifacts.js';
 
-export interface ArtifactDownloader { download(actor:ServiceActor,jobId:string,artifactId:string):Promise<{metadata:{filename:string;mediaType:string;byteSize:number};data:Uint8Array}> }
+export interface ArtifactDownloader {
+  download(actor:ServiceActor,jobId:string,artifactId:string):Promise<{metadata:{filename:string;mediaType:string;byteSize:number};data:Uint8Array}>;
+  downloadQuarantined(actor:ServiceActor,jobId:string,artifactId:string):Promise<{metadata:{filename:string;mediaType:string;byteSize:number};data:Uint8Array}>;
+}
 export interface HttpServerOptions { sdk: ServiceSdk; authenticate: HttpAuthenticator; catalog?:{list():Array<{id:string;version:string;allowedWorkloads:readonly string[]}>}; artifacts?:ArtifactDownloader; eventBus?:EventBus; ready?: () => Promise<boolean>; ensureActor?: (actor: ServiceActor) => Promise<void>; logger?: boolean | object; bodyLimit?: number; rateLimit?: number; ws?:{maxConnections?:number;maxConnectionsPerUser?:number;maxMessageBytes?:number;maxBufferedBytes?:number;heartbeatMs?:number} }
 const text = { type:'string', minLength:1, maxLength:10_000 } as const;
 const id = { type:'string', minLength:1, maxLength:200 } as const;
@@ -87,6 +90,17 @@ export async function buildHttpServer(options: HttpServerOptions): Promise<Fasti
     const p=r.params as {jobId:string;artifactId:string};
     const downloaded=await options.artifacts.download(actor(r),p.jobId,p.artifactId);
     return reply.header('content-type',downloaded.metadata.mediaType)
+      .header('content-disposition',safeContentDisposition(downloaded.metadata.filename))
+      .header('content-length',String(downloaded.metadata.byteSize))
+      .header('cache-control','private, no-store')
+      .header('x-content-type-options','nosniff')
+      .send(Buffer.from(downloaded.data));
+  });
+  app.get('/v1/jobs/:jobId/artifacts/:artifactId/download-quarantined',{schema:{params:artifactParams,headers,response:{401:errorResponse,404:errorResponse,429:errorResponse,500:errorResponse},security:[{bearerAuth:[]}]}},async(r,reply)=>{
+    if(!options.artifacts)throw new ServiceNotFoundError();
+    const p=r.params as {jobId:string;artifactId:string};
+    const downloaded=await options.artifacts.downloadQuarantined(actor(r),p.jobId,p.artifactId);
+    return reply.header('content-type','application/octet-stream')
       .header('content-disposition',safeContentDisposition(downloaded.metadata.filename))
       .header('content-length',String(downloaded.metadata.byteSize))
       .header('cache-control','private, no-store')

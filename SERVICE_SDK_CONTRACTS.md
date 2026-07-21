@@ -206,7 +206,7 @@ interface PublicEventEnvelopeV1 {
 
 Artifact metadata includes `artifactId`, exact tenant and owner, `jobId`, optional `runId` and tool execution ID, filename, media type, byte size, content hash, lifecycle status, and timestamps.
 
-Lifecycle states are `uploading`, `scanning`, `available`, `quarantined`, and `deleted`. Listing and download authorization is always derived from the authoritative owning job. Phase 6 defines upload, scanning, and download adapters; Phase 0 freezes the metadata and ownership behavior only.
+Lifecycle states are `uploading`, `scanning`, `available`, `quarantined`, and `deleted`. Listing and download authorization is always derived from the authoritative owning job. Available artifacts use the normal owner-only download operation. Quarantined artifacts require a separate, explicit owner-only download operation that is audited distinctly and always returns a forced `application/octet-stream` attachment. Quarantined content is never rendered inline, and administrators cannot download it through admin APIs. Unauthorized access and status mismatches return the same not-found response. Phase 6 defines upload, scanning, and download adapters; Phase 0 freezes the metadata and ownership behavior only.
 
 ## Retention defaults
 

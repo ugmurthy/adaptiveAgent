@@ -32,14 +32,14 @@ export class AgentSdkWorkloadExecutor implements WorkloadExecutor {
     const workspace = await this.workspaces.create(claim.job);
     try {
       if (claim.command.kind !== 'execute') {
-        return await this.control(claim, workspace.root);
+        return await this.control(claim, workspace.artifacts);
       }
 
       const existingRuns = await this.runsBySession(claim.job.sessionId);
       if (existingRuns.length > 0) {
-        return await this.recoverExisting(claim, existingRuns, workspace.root);
+        return await this.recoverExisting(claim, existingRuns, workspace.artifacts);
       }
-      return await this.start(claim, workspace.root);
+      return await this.start(claim, workspace.artifacts);
     } finally {
       await this.workspaces.close(claim.job, workspace);
     }

@@ -12,6 +12,7 @@
     "agent:build": "bun run --cwd ./packages/agent-sdk build",
     "agent:test": "bun run --cwd ./packages/agent-sdk test",
     "agent:tui": "bun run ./packages/agent-sdk/src/adaptive-agent-tui.ts",
+    "service:generate-registry": "bun run ./scripts/generate-agent-registry.ts",
     "trace-session": "bun run ./packages/trace-session/src/trace-session.ts",
     "trace-session:build": "bun run --cwd ./packages/trace-session build",
     "trace-session:test": "bun run --cwd ./packages/trace-session test",

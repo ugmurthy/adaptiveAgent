@@ -143,19 +143,28 @@ describe('Phase 4 HTTP API', () => {
   });
 
   it('proxies private downloads with safe attachment headers and authoritative actor identity',async()=>{
-    let received:unknown;
-    const artifactDownloader:ArtifactDownloader={download:async(inputActor,jobId,artifactId)=>{
-      received={inputActor,jobId,artifactId};
-      return {metadata:{filename:'private report.txt',mediaType:'text/plain',byteSize:6},data:new TextEncoder().encode('secret')};
-    }};
+    const received:unknown[]=[];
+    const result={metadata:{filename:'private report.txt',mediaType:'text/html',byteSize:6},data:new TextEncoder().encode('secret')};
+    const artifactDownloader:ArtifactDownloader={
+      download:async(inputActor,jobId,artifactId)=>{received.push({operation:'available',inputActor,jobId,artifactId});return result;},
+      downloadQuarantined:async(inputActor,jobId,artifactId)=>{received.push({operation:'quarantined',inputActor,jobId,artifactId});return result;},
+    };
     const {app,sdk}=await fixture({artifactDownloader});
     const job=await sdk.submitRun(actor,{schemaVersion:1,agentId:'agent',goal:'artifact'});
     const response=await app.inject({method:'GET',url:`/v1/jobs/${job.id}/artifacts/artifact-1/download`,headers:auth()});
     expect(response.statusCode).toBe(200);
     expect(response.body).toBe('secret');
+    expect(response.headers['content-type']).toContain('text/html');
     expect(response.headers['content-disposition']).toContain('attachment; filename="private_report.txt"');
     expect(response.headers['cache-control']).toBe('private, no-store');
-    expect(received).toEqual({inputActor:actor,jobId:job.id,artifactId:'artifact-1'});
+    const quarantined=await app.inject({method:'GET',url:`/v1/jobs/${job.id}/artifacts/artifact-1/download-quarantined`,headers:auth()});
+    expect(quarantined.statusCode).toBe(200);
+    expect(quarantined.headers['content-type']).toContain('application/octet-stream');
+    expect(quarantined.headers['content-disposition']).toContain('attachment; filename="private_report.txt"');
+    expect(received).toEqual([
+      {operation:'available',inputActor:actor,jobId:job.id,artifactId:'artifact-1'},
+      {operation:'quarantined',inputActor:actor,jobId:job.id,artifactId:'artifact-1'},
+    ]);
   });
 
   it('reports liveness and failed readiness without authentication', async () => {

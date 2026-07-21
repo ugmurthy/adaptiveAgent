@@ -52,17 +52,19 @@ describe('private artifact management',()=>{
     await expect(manager.ingest(job(),artifacts,workspace)).rejects.toThrow('private directory');
   });
 
-  it('downloads only available owner-scoped metadata and audits allowed and denied attempts',async()=>{
+  it('downloads available and explicitly quarantined owner-scoped artifacts with distinct audits',async()=>{
     const repository=new MemoryArtifactRepository(),storage=new MemoryStorage();
     const manager=new ArtifactManager(repository as never,storage);
     const metadata=artifact();
-    repository.available={...metadata,storageKey:'artifacts/job-1/a1'};
+    repository.owned={...metadata,storageKey:'artifacts/job-1/a1'};
     storage.objects.set('artifacts/job-1/a1',new TextEncoder().encode('data'));
 
     await expect(manager.download(actor,'job-1','a1')).resolves.toMatchObject({metadata:{id:'a1',filename:'result.txt'}});
-    repository.available=undefined;
+    repository.owned={...metadata,status:'quarantined',storageKey:'artifacts/job-1/a1'};
+    await expect(manager.downloadQuarantined(actor,'job-1','a1')).resolves.toMatchObject({metadata:{id:'a1',status:'quarantined'}});
+    repository.owned=undefined;
     await expect(manager.download({...actor,userId:'bob'},'job-1','a1')).rejects.toBeInstanceOf(ServiceNotFoundError);
-    expect(repository.audits.map(row=>row.allowed)).toEqual([true,false]);
+    expect(repository.audits.map(row=>[row.status,row.allowed])).toEqual([['available',true],['quarantined',true],['available',false]]);
   });
 
   it('uploads before removing the isolated worker workspace',async()=>{
@@ -93,12 +95,12 @@ class MemoryStorage implements PrivateObjectStorage {
 class MemoryArtifactRepository {
   created:Array<{jobId:string;input:Record<string,unknown>}>=[];
   statuses:Array<{id:string;status:ArtifactStatus}>=[];
-  audits:Array<{actor:ServiceActor;allowed:boolean}>=[];
-  available:(ArtifactMetadata&{storageKey:string})|undefined;
+  audits:Array<{actor:ServiceActor;status:'available'|'quarantined';allowed:boolean}>=[];
+  owned:(ArtifactMetadata&{storageKey:string})|undefined;
   async createFromJob(jobId:string,input:Record<string,unknown>):Promise<void>{this.created.push({jobId,input});}
   async transition(id:string,_expected:readonly ArtifactStatus[],status:ArtifactStatus):Promise<boolean>{this.statuses.push({id,status});return true;}
-  async getAvailableOwned(inputActor:ServiceActor):Promise<(ArtifactMetadata&{storageKey:string})|undefined>{return inputActor===actor||inputActor.userId===actor.userId?this.available:undefined;}
-  async auditDownload(inputActor:ServiceActor,_jobId:string,_artifactId:string,allowed:boolean):Promise<void>{this.audits.push({actor:inputActor,allowed});}
+  async getOwned(inputActor:ServiceActor,_jobId:string,_artifactId:string,status:'available'|'quarantined'):Promise<(ArtifactMetadata&{storageKey:string})|undefined>{return (inputActor===actor||inputActor.userId===actor.userId)&&this.owned?.status===status?this.owned:undefined;}
+  async auditDownload(inputActor:ServiceActor,_jobId:string,_artifactId:string,status:'available'|'quarantined',allowed:boolean):Promise<void>{this.audits.push({actor:inputActor,status,allowed});}
   async reconciliationCandidates():Promise<[]> {return [];}
   async knownStorageKeys():Promise<Set<string>> {return new Set();}
 }

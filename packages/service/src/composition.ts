@@ -4,6 +4,29 @@ import { Pool } from 'pg';
 import { ArtifactManager, PostgresArtifactRepository, S3ArtifactStorage } from './artifacts.js';
 import type { QueueRoutes } from './queue.js';
 
+const SENSITIVE_ENV_NAME = /(?:^|_)(?:API_KEY|ACCESS_KEY(?:_ID)?|SECRET(?:_ACCESS_KEY)?|PASSWORD|PASSWD|TOKEN|PRIVATE_KEY|CREDENTIALS?|AUTHORIZATION|COOKIE)(?:_|$)/i;
+
+export function printEnvironmentIfRequested(program: string, env: NodeJS.ProcessEnv = process.env): void {
+  if (env.PRINT_ENV_VARS !== '1') return;
+  const variables = Object.fromEntries(Object.entries(env).sort(([left], [right]) => left.localeCompare(right)).map(([name, value]) => [name, printableEnvValue(name, value ?? '')]));
+  console.info(JSON.stringify({ type: 'service.environment', program, variables }));
+}
+
+function printableEnvValue(name: string, value: string): string {
+  if (SENSITIVE_ENV_NAME.test(name)) return '[REDACTED]';
+  if (!name.endsWith('_URL')) return value;
+  try {
+    const url = new URL(value);
+    if (url.password) url.password = '[REDACTED]';
+    for (const key of url.searchParams.keys()) {
+      if (SENSITIVE_ENV_NAME.test(key)) url.searchParams.set(key, '[REDACTED]');
+    }
+    return url.toString();
+  } catch {
+    return value.replace(/:\/\/([^:/?#]+):([^@/?#]+)@/, '://$1:[REDACTED]@');
+  }
+}
+
 export function createPoolFromEnv(env: NodeJS.ProcessEnv = process.env): Pool {
   if (!env.DATABASE_URL) throw new Error('DATABASE_URL is required');
   return new Pool({ connectionString: env.DATABASE_URL, max: positiveInt(env.PG_POOL_SIZE, 10) });
