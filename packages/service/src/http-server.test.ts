@@ -63,6 +63,37 @@ describe('Phase 4 HTTP API', () => {
     expect(store.outboxRows).toHaveLength(1);
   });
 
+  it('lists only owned available artifacts and accepts explicit run file references',async()=>{
+    const {app,store}=await fixture();
+    const first=uuid(801),second=uuid(802);
+    store.artifactRows.push(
+      {schemaVersion:1,id:first,tenantId:'tenant-1',ownerUserId:'alice',jobId:uuid(701),filename:'report.md',mediaType:'text/markdown',byteSize:4,contentHash:'one',status:'available',createdAt:now},
+      {schemaVersion:1,id:second,tenantId:'tenant-1',ownerUserId:'alice',jobId:uuid(702),filename:'report.md',mediaType:'text/markdown',byteSize:5,contentHash:'two',status:'available',createdAt:now},
+      {schemaVersion:1,id:uuid(803),tenantId:'tenant-1',ownerUserId:'bob',jobId:uuid(703),filename:'private.md',mediaType:'text/markdown',byteSize:6,contentHash:'three',status:'available',createdAt:now},
+      {schemaVersion:1,id:uuid(804),tenantId:'tenant-1',ownerUserId:'alice',jobId:uuid(704),filename:'unsafe.bin',mediaType:'application/octet-stream',byteSize:7,contentHash:'four',status:'quarantined',createdAt:now},
+    );
+
+    const listed=await app.inject({method:'GET',url:'/v1/artifacts',headers:auth()});
+    expect(listed.statusCode).toBe(200);
+    expect(listed.json()).toMatchObject({total:2,limit:50,offset:0,items:[{id:first},{id:second}]});
+
+    const submitted=await app.inject({method:'POST',url:'/v1/jobs/run',headers:auth(),payload:{schemaVersion:1,agentId:'agent',goal:'Compare the selected reports',fileRefs:[{artifactId:first},{artifactId:second}]}});
+    expect(submitted.statusCode).toBe(202);
+    const job=store.jobRows.get(submitted.json<{jobId:string}>().jobId)!;
+    expect(job.request).toMatchObject({fileRefs:[{artifactId:first},{artifactId:second}]});
+
+    for(const fileRefs of [[],[{artifactId:'not-a-uuid'}],[{artifactId:'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA'}],[{artifactId:first,storageKey:'secret'}],[{artifactId:first},{artifactId:first}]]) {
+      const invalid=await app.inject({method:'POST',url:'/v1/jobs/run',headers:auth(),payload:{schemaVersion:1,agentId:'agent',goal:'invalid',fileRefs}});
+      expect(invalid.statusCode).toBe(400);
+    }
+
+    for(const [url,payload] of [
+      ['/v1/jobs/chat',{schemaVersion:1,agentId:'agent',message:'Review the selected file',fileRefs:[{artifactId:first}]}],
+      ['/v1/jobs/swarm',{schemaVersion:1,coordinatorAgentId:'agent',workerAgentIds:['worker'],objective:'Review the selected file',fileRefs:[{artifactId:first}]}],
+      ['/v1/jobs/orchestration',{schemaVersion:1,orchestratorAgentId:'agent',agentIds:['worker'],objective:'Review the selected file',fileRefs:[{artifactId:first}]}],
+    ] as const)expect((await app.inject({method:'POST',url,headers:auth(),payload})).statusCode).toBe(202);
+  });
+
   it('authenticates every v1 route and does not enumerate another user job', async () => {
     const { app, sdk } = await fixture();
     const job = await sdk.submitRun(actor, { schemaVersion: 1, agentId: 'agent', goal: 'private' });
@@ -266,8 +297,8 @@ describe('Phase 5 WebSocket API', () => {
     const {app,store}=await fixture();const ws=await app.injectWS('/v1/ws',{headers:auth()});
     const invalid=receiveMessages(ws,1);ws.send(JSON.stringify({operation:'submit',requestId:'bad',kind:'run',request:{schemaVersion:1,agentId:'agent',goal:'run',model:'unsafe'}}));
     expect(await invalid).toMatchObject([{type:'error',requestId:'bad',error:{code:'invalid_request'}}]);expect(store.jobRows.size).toBe(0);
-    const accepted=receiveMessages(ws,1);ws.send(JSON.stringify({operation:'submit',requestId:'good',kind:'run',request:{schemaVersion:1,agentId:'agent',goal:'run'}}));
-    expect(await accepted).toMatchObject([{type:'response',requestId:'good',data:{schemaVersion:1}}]);expect(store.jobRows.size).toBe(1);ws.terminate();
+    const artifactId=uuid(950);const accepted=receiveMessages(ws,1);ws.send(JSON.stringify({operation:'submit',requestId:'good',kind:'run',request:{schemaVersion:1,agentId:'agent',goal:'run',fileRefs:[{artifactId}]}}));
+    expect(await accepted).toMatchObject([{type:'response',requestId:'good',data:{schemaVersion:1}}]);expect([...store.jobRows.values()][0]?.request).toMatchObject({fileRefs:[{artifactId}]});ws.terminate();
   });
 });
 

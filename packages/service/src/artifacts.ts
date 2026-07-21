@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { lstat, open, readdir, realpath, rm } from 'node:fs/promises';
+import { chmod, lstat, mkdir, open, readdir, realpath, rm } from 'node:fs/promises';
 import { constants } from 'node:fs';
-import { basename, dirname, extname, resolve, sep } from 'node:path';
+import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import {
   DeleteObjectCommand,
   DeleteObjectsCommand,
@@ -15,6 +15,8 @@ import {
   mapArtifactRow,
   type ArtifactMetadata,
   type ArtifactStatus,
+  type RunRequest,
+  type ServiceJobRequest,
   type ServiceActor,
   type ServiceJob,
   type ServicePostgresClient,
@@ -38,7 +40,7 @@ export interface StoredObject {
 
 export interface PrivateObjectStorage {
   put(key: string, data: Uint8Array, mediaType: string, contentHash: string): Promise<void>;
-  get(key: string): Promise<Uint8Array | undefined>;
+  get(key: string, maxBytes?: number): Promise<Uint8Array | undefined>;
   delete(key: string): Promise<void>;
   list(prefix: string): Promise<StoredObject[]>;
 }
@@ -49,7 +51,11 @@ interface ArtifactRepository {
   transition(id:string,expected:readonly ArtifactStatus[],status:ArtifactStatus,now:string,expiresAt?:string):Promise<boolean>;
   getOwned(actor:ServiceActor,jobId:string,artifactId:string,status:'available'|'quarantined'):Promise<InternalArtifact|undefined>;
   auditDownload(actor:ServiceActor,jobId:string,artifactId:string,status:'available'|'quarantined',allowed:boolean):Promise<void>;
+  resolveJobFile(job:ServiceJob,requestedName:string):Promise<InternalArtifact>;
+  resolveJobArtifact(job:ServiceJob,artifactId:string):Promise<InternalArtifact>;
+  auditMaterialization(job:ServiceJob,artifactId:string|undefined,allowed:boolean):Promise<void>;
   reconciliationCandidates(now:string,abandonedBefore:string):Promise<InternalArtifact[]>;
+  deleteReconciliationCandidate(id:string,status:ArtifactStatus,now:string,abandonedBefore:string):Promise<boolean>;
   knownStorageKeys():Promise<Set<string>>;
 }
 interface ArtifactRow {
@@ -60,7 +66,7 @@ interface ArtifactRow {
 }
 
 export class PostgresArtifactRepository implements ArtifactRepository {
-  constructor(private readonly db:ServicePostgresClient) {}
+  constructor(private readonly db:ServicePostgresClient, private readonly fileReferenceRetentionMs=7*24*60*60*1000) {}
 
   async createFromJob(jobId:string, input:{id:string;storageKey:string;filename:string;mediaType:string;byteSize:number;contentHash:string;createdAt:string;runId?:string;toolExecutionId?:string}):Promise<void> {
     const result=await this.db.query(`insert into service_artifacts(id,tenant_id,owner_user_id,job_id,run_id,tool_execution_id,storage_key,original_filename,media_type,byte_size,content_hash,status,created_at,updated_at)
@@ -86,9 +92,104 @@ export class PostgresArtifactRepository implements ArtifactRepository {
       [randomUUID(),actor.tenantId,actor.userId,action,jobId,artifactId,allowed]);
   }
 
+  async resolveJobFile(job:ServiceJob,requestedName:string):Promise<InternalArtifact> {
+    for(let attempt=0;attempt<2;attempt++) {
+      const existing=await this.db.query<ArtifactRow&{current_artifact_id:string}>(`select a.*,r.current_artifact_id from service_job_file_refs r join service_jobs j on j.id=r.job_id join service_artifacts a on a.id=r.current_artifact_id
+        where r.job_id=$1 and r.requested_name=$2 and j.tenant_id=$3 and j.owner_user_id=$4`,
+        [job.id,requestedName,job.tenantId,job.ownerUserId]);
+      const existingRow=existing.rows[0];
+      if(existingRow) {
+        if(existingRow.status!=='available'||existingRow.tenant_id!==job.tenantId||existingRow.owner_user_id!==job.ownerUserId)throw new InputFileError('INPUT_FILE_UNAVAILABLE',requestedName);
+        return {...mapArtifactRow(existingRow),storageKey:existingRow.storage_key};
+      }
+
+      const nowDate=new Date(),now=nowDate.toISOString(),retainUntil=new Date(nowDate.getTime()+this.fileReferenceRetentionMs).toISOString();
+      const resolved=await this.db.query<ArtifactRow&{current_artifact_id:string|null;candidate_count:string|number}>(`with candidates as materialized (
+          select a.* from service_artifacts a join service_jobs source_job on source_job.id=a.job_id
+          where a.tenant_id=$1 and a.owner_user_id=$2 and a.original_filename=$3 and a.status='available' and (a.expires_at is null or a.expires_at>now())
+          order by a.created_at desc,a.id limit 2
+        ), candidate_count as (select count(*)::integer as value from candidates), selected as (select * from candidates where (select value from candidate_count)=1),
+        retained as (
+          update service_artifacts a set expires_at=case when a.expires_at is null then null else greatest(a.expires_at,$6::timestamptz) end,updated_at=$5
+          from selected s where a.id=s.id and a.status='available' and (a.expires_at is null or a.expires_at>now()) returning a.*
+        ),
+        inserted as (
+          insert into service_job_file_refs(job_id,requested_name,source_artifact_id,current_artifact_id,access_mode,source_content_hash,created_at,updated_at)
+          select $4,$3,s.id,s.id,'read',s.content_hash,$5,$5 from retained s
+          on conflict do nothing returning current_artifact_id
+        ), binding as (
+          select current_artifact_id from inserted union all
+          select r.current_artifact_id from service_job_file_refs r where r.job_id=$4 and r.requested_name=$3 and not exists(select 1 from inserted)
+        )
+        select c.value as candidate_count,b.current_artifact_id,a.* from candidate_count c left join binding b on true left join service_artifacts a on a.id=b.current_artifact_id`,
+        [job.tenantId,job.ownerUserId,requestedName,job.id,now,retainUntil]);
+      const row=resolved.rows[0];
+      const count=Number(row?.candidate_count??0);
+      if(row?.id) {
+        if(row.status!=='available'||row.tenant_id!==job.tenantId||row.owner_user_id!==job.ownerUserId)throw new InputFileError('INPUT_FILE_UNAVAILABLE',requestedName);
+        return {...mapArtifactRow(row),storageKey:row.storage_key};
+      }
+      if(attempt===0)continue;
+      if(count===0)throw new InputFileError('INPUT_FILE_NOT_FOUND',requestedName);
+      if(count!==1)throw new InputFileError('INPUT_FILE_AMBIGUOUS',requestedName);
+    }
+    throw new InputFileError('INPUT_FILE_UNAVAILABLE',requestedName);
+  }
+
+  async resolveJobArtifact(job:ServiceJob,artifactId:string):Promise<InternalArtifact> {
+    for(let attempt=0;attempt<2;attempt++) {
+      const existing=await this.db.query<ArtifactRow>(`select a.* from service_job_file_refs r join service_jobs j on j.id=r.job_id join service_artifacts a on a.id=r.current_artifact_id
+        where r.job_id=$1 and r.source_artifact_id=$2 and j.tenant_id=$3 and j.owner_user_id=$4`,[job.id,artifactId,job.tenantId,job.ownerUserId]);
+      const existingRow=existing.rows[0];
+      if(existingRow) {
+        if(existingRow.status!=='available'||existingRow.tenant_id!==job.tenantId||existingRow.owner_user_id!==job.ownerUserId)throw new InputFileError('INPUT_FILE_UNAVAILABLE',artifactId);
+        return {...mapArtifactRow(existingRow),storageKey:existingRow.storage_key};
+      }
+
+      const nowDate=new Date(),now=nowDate.toISOString(),retainUntil=new Date(nowDate.getTime()+this.fileReferenceRetentionMs).toISOString();
+      const resolved=await this.db.query<ArtifactRow>(`with selected as materialized (
+          select a.* from service_artifacts a where a.id=$2 and a.tenant_id=$3 and a.owner_user_id=$4 and a.status='available' and (a.expires_at is null or a.expires_at>now())
+        ), retained as (
+          update service_artifacts a set expires_at=case when a.expires_at is null then null else greatest(a.expires_at,$6::timestamptz) end,updated_at=$5
+          from selected s where a.id=s.id and a.status='available' and (a.expires_at is null or a.expires_at>now()) returning a.*
+        ), inserted as (
+          insert into service_job_file_refs(job_id,requested_name,source_artifact_id,current_artifact_id,access_mode,source_content_hash,created_at,updated_at)
+          select $1,$2,s.id,s.id,'read',s.content_hash,$5,$5 from retained s
+          on conflict do nothing returning current_artifact_id
+        ), binding as (
+          select current_artifact_id from inserted union all
+          select r.current_artifact_id from service_job_file_refs r where r.job_id=$1 and r.source_artifact_id=$2 and not exists(select 1 from inserted)
+        )
+        select a.* from binding b join service_artifacts a on a.id=b.current_artifact_id`,[job.id,artifactId,job.tenantId,job.ownerUserId,now,retainUntil]);
+      const row=resolved.rows[0];
+      if(row) {
+        if(row.status!=='available'||row.tenant_id!==job.tenantId||row.owner_user_id!==job.ownerUserId)throw new InputFileError('INPUT_FILE_UNAVAILABLE',artifactId);
+        return {...mapArtifactRow(row),storageKey:row.storage_key};
+      }
+      if(attempt===0)continue;
+    }
+    throw new InputFileError('INPUT_FILE_NOT_FOUND',artifactId);
+  }
+
+  async auditMaterialization(job:ServiceJob,artifactId:string|undefined,allowed:boolean):Promise<void> {
+    await this.db.query(`insert into service_access_audit_records(id,tenant_id,user_id,action,target_job_id,target_artifact_id,allowed,occurred_at) values($1,$2,$3,'artifact:materialize',$4,$5,$6,now())`,
+      [randomUUID(),job.tenantId,job.ownerUserId,job.id,artifactId??null,allowed]);
+  }
+
   async reconciliationCandidates(now:string,abandonedBefore:string):Promise<InternalArtifact[]> {
-    const result=await this.db.query<ArtifactRow>(`select * from service_artifacts where (status in ('uploading','scanning') and updated_at<$2) or (status in ('available','quarantined') and expires_at is not null and expires_at<$1)`,[now,abandonedBefore]);
+    const retainAfter=new Date(new Date(now).getTime()-this.fileReferenceRetentionMs).toISOString();
+    const result=await this.db.query<ArtifactRow>(`select a.* from service_artifacts a where ((a.status in ('uploading','scanning') and a.updated_at<$2) or (a.status in ('available','quarantined') and a.expires_at is not null and a.expires_at<$1))
+      and not exists(select 1 from service_job_file_refs r where (r.source_artifact_id=a.id or r.current_artifact_id=a.id) and r.updated_at>$3)`,[now,abandonedBefore,retainAfter]);
     return result.rows.map(row=>({...mapArtifactRow(row),storageKey:row.storage_key}));
+  }
+
+  async deleteReconciliationCandidate(id:string,status:ArtifactStatus,now:string,abandonedBefore:string):Promise<boolean> {
+    const retainAfter=new Date(new Date(now).getTime()-this.fileReferenceRetentionMs).toISOString();
+    const result=await this.db.query(`update service_artifacts a set status='deleted',updated_at=$3,deleted_at=$3 where a.id=$1 and a.status=$2
+      and ((a.status in ('uploading','scanning') and a.updated_at<$4) or (a.status in ('available','quarantined') and a.expires_at is not null and a.expires_at<$3))
+      and not exists(select 1 from service_job_file_refs r where (r.source_artifact_id=a.id or r.current_artifact_id=a.id) and r.updated_at>$5)`,
+      [id,status,now,abandonedBefore,retainAfter]);
+    return result.rowCount===1;
   }
 
   async knownStorageKeys():Promise<Set<string>> {
@@ -112,10 +213,19 @@ export class S3ArtifactStorage implements PrivateObjectStorage {
   async put(key:string,data:Uint8Array,mediaType:string,contentHash:string):Promise<void> {
     await this.client.send(new PutObjectCommand({Bucket:this.bucket,Key:key,Body:data,ContentType:mediaType,Metadata:{sha256:contentHash},ServerSideEncryption:this.serverSideEncryption}));
   }
-  async get(key:string):Promise<Uint8Array|undefined> {
+  async get(key:string,maxBytes?:number):Promise<Uint8Array|undefined> {
     try {
       const response=await this.client.send(new GetObjectCommand({Bucket:this.bucket,Key:key}));
-      return response.Body ? await response.Body.transformToByteArray() : undefined;
+      if(!response.Body)return undefined;
+      if(maxBytes===undefined)return response.Body.transformToByteArray();
+      if(response.ContentLength!==undefined&&response.ContentLength>maxBytes)throw new ArtifactObjectSizeError();
+      const chunks:Uint8Array[]=[];let size=0;
+      for await(const chunk of response.Body as AsyncIterable<Uint8Array>) {
+        size+=chunk.byteLength;if(size>maxBytes)throw new ArtifactObjectSizeError();chunks.push(chunk);
+      }
+      const data=new Uint8Array(size);let offset=0;
+      for(const chunk of chunks) { data.set(chunk,offset);offset+=chunk.byteLength; }
+      return data;
     } catch(error) {
       const status=(error as {$metadata?:{httpStatusCode?:number}}).$metadata?.httpStatusCode;
       if(status===404)return undefined;
@@ -179,6 +289,71 @@ export class ArtifactManager {
     return uploaded;
   }
 
+  async prepareInputs(job:ServiceJob,workspace:JobWorkspace):Promise<PreparedJobFiles> {
+    const request=job.request as ServiceJobRequest;
+    const references=request.fileRefs?.length
+      ? [...new Set(request.fileRefs.map(reference=>reference.artifactId.toLowerCase()))].map(artifactId=>({artifactId}))
+      : job.kind==='run'?extractTaskFilenameReferences((request as RunRequest).goal).map(requestedName=>({requestedName})):[];
+    if(references.length===0)return {files:[]};
+    if(references.length>this.quotas.maxFiles) {
+      await this.repository.auditMaterialization(job,undefined,false);
+      throw new InputFileError('INPUT_FILE_COUNT_EXCEEDED');
+    }
+
+    const pending:Array<{requestedName:string;artifact:InternalArtifact;data:Uint8Array}>=[];
+    let totalBytes=0;
+    for(const reference of references) {
+      let artifact:InternalArtifact|undefined;
+      try {
+        artifact='artifactId' in reference
+          ? await this.repository.resolveJobArtifact(job,reference.artifactId)
+          : await this.repository.resolveJobFile(job,reference.requestedName);
+        const requestedName='requestedName' in reference?reference.requestedName:artifact.filename;
+        if(artifact.tenantId!==job.tenantId||artifact.ownerUserId!==job.ownerUserId)throw new InputFileError('INPUT_FILE_UNAVAILABLE',requestedName);
+        if(artifact.byteSize>this.quotas.maxFileBytes)throw new InputFileError('INPUT_FILE_TOO_LARGE',requestedName);
+        totalBytes+=artifact.byteSize;
+        if(totalBytes>this.quotas.maxTotalBytes)throw new InputFileError('INPUT_FILE_TOTAL_BYTES_EXCEEDED');
+        let data:Uint8Array|undefined;
+        try { data=await this.storage.get(artifact.storageKey,artifact.byteSize); }
+        catch(error) { if(error instanceof ArtifactObjectSizeError)throw new InputFileError('INPUT_FILE_INTEGRITY_ERROR',requestedName);throw error; }
+        if(!data)throw new InputFileError('INPUT_FILE_UNAVAILABLE',requestedName);
+        if(data.byteLength!==artifact.byteSize||createHash('sha256').update(data).digest('hex')!==artifact.contentHash)throw new InputFileError('INPUT_FILE_INTEGRITY_ERROR',requestedName);
+        pending.push({requestedName,artifact,data});
+      } catch(error) {
+        await this.repository.auditMaterialization(job,artifact?.id,false);
+        throw error;
+      }
+    }
+
+    const inputs=resolve(workspace.root,'inputs');
+    try { await mkdir(inputs,{recursive:false,mode:0o700}); }
+    catch(error) { await this.repository.auditMaterialization(job,undefined,false);throw error; }
+    const files:PreparedJobFile[]=[];
+    for(const item of pending) {
+      try {
+        const directory=resolve(inputs,item.artifact.id);
+        if(!directory.startsWith(`${inputs}${sep}`))throw new InputFileError('INPUT_FILE_UNAVAILABLE',item.requestedName);
+        await mkdir(directory,{recursive:false,mode:0o700});
+        const filename=sanitizeLocalFilename(item.artifact.filename);
+        const destination=resolve(join(directory,filename));
+        if(!destination.startsWith(`${directory}${sep}`))throw new InputFileError('INPUT_FILE_UNAVAILABLE',item.requestedName);
+        const handle=await open(destination,constants.O_CREAT|constants.O_EXCL|constants.O_WRONLY|constants.O_NOFOLLOW,0o400);
+        try { await handle.writeFile(item.data); } finally { await handle.close(); }
+        await chmod(destination,0o400);await chmod(directory,0o500);
+        const relativePath=`inputs/${item.artifact.id}/${filename}`;
+        files.push({artifactId:item.artifact.id,filename:item.requestedName,relativePath,mediaType:item.artifact.mediaType,byteSize:item.artifact.byteSize,contentHash:item.artifact.contentHash});
+        await this.repository.auditMaterialization(job,item.artifact.id,true);
+      } catch(error) {
+        await this.repository.auditMaterialization(job,item.artifact.id,false);
+        throw error;
+      }
+    }
+    try { await chmod(inputs,0o500); }
+    catch(error) { await this.repository.auditMaterialization(job,undefined,false);throw error; }
+    files.sort((left,right)=>left.filename.localeCompare(right.filename)||left.artifactId.localeCompare(right.artifactId));
+    return {files,modelContext:buildFileManifest(files)};
+  }
+
   async download(actor:ServiceActor,jobId:string,artifactId:string):Promise<{metadata:ArtifactMetadata;data:Uint8Array}> {
     return this.downloadOwned(actor,jobId,artifactId,'available');
   }
@@ -207,7 +382,7 @@ export class ArtifactManager {
     const rows=await this.repository.reconciliationCandidates(now.toISOString(),options.abandonedBefore.toISOString());
     let deleted=0;
     for(const row of rows) {
-      if(!await this.repository.transition(row.id,[row.status],'deleted',now.toISOString()))continue;
+      if(!await this.repository.deleteReconciliationCandidate(row.id,row.status,now.toISOString(),options.abandonedBefore.toISOString()))continue;
       await this.storage.delete(row.storageKey);deleted++;
     }
     const known=await this.repository.knownStorageKeys();let orphans=0;
@@ -220,7 +395,10 @@ export class ArtifactManager {
 
 export class ArtifactWorkspacePolicy implements SandboxPolicy {
   constructor(private readonly artifacts:ArtifactManager) {}
-  async prepare():Promise<void> {}
+  async prepare(job:ServiceJob,workspace:JobWorkspace):Promise<void> {
+    const prepared=await this.artifacts.prepareInputs(job,workspace);
+    workspace.modelContext=prepared.modelContext??(job.kind==='run'?OUTPUT_WORKSPACE_INSTRUCTION:undefined);
+  }
   async close(job:ServiceJob,workspace:JobWorkspace):Promise<void> {
     try { await this.artifacts.ingest(job,workspace.artifacts,workspace.root); }
     finally { await rm(workspace.root,{recursive:true,force:true}); }
@@ -235,6 +413,40 @@ export class SafeMediaArtifactScanner implements ArtifactScanner {
 
 const SAFE_MEDIA_TYPES=new Set(['text/plain','text/csv','text/markdown','application/json']);
 const MEDIA_TYPES:Record<string,string>={'.txt':'text/plain','.md':'text/markdown','.csv':'text/csv','.json':'application/json','.pdf':'application/pdf','.zip':'application/zip','.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.gif':'image/gif','.webp':'image/webp'};
+const INPUT_VERB=/\b(?:read|open|review|evaluate|summarize|summarise|search|inspect|analyze|analyse)\s+(?:`([^`]+)`|"([^"]+)"|'([^']+)'|([^\s,;:!?]+))/gi;
+const OUTPUT_WORKSPACE_INSTRUCTION='The job workspace root is available to file tools. Write any new output artifacts under the artifacts directory.';
+
+export interface PreparedJobFile { artifactId:string;filename:string;relativePath:string;mediaType:string;byteSize:number;contentHash:string }
+export interface PreparedJobFiles { files:PreparedJobFile[];modelContext?:string }
+
+export class InputFileError extends Error {
+  readonly schemaVersion=1 as const;
+  readonly retryable=false;
+  constructor(readonly code:'INPUT_FILE_NOT_FOUND'|'INPUT_FILE_AMBIGUOUS'|'INPUT_FILE_UNAVAILABLE'|'INPUT_FILE_INTEGRITY_ERROR'|'INPUT_FILE_TOO_LARGE'|'INPUT_FILE_COUNT_EXCEEDED'|'INPUT_FILE_TOTAL_BYTES_EXCEEDED',requestedName?:string) {
+    super(requestedName?`${code}: ${requestedName}`:code);this.name='InputFileError';
+  }
+}
+
+class ArtifactObjectSizeError extends Error {}
+
+export function extractTaskFilenameReferences(goal:string,maxFilenameLength=255):string[] {
+  const names=new Set<string>();
+  for(const match of goal.matchAll(INPUT_VERB)) {
+    const name=(match[1]??match[2]??match[3]??match[4]??'').trim();
+    if(!name||name.length>maxFilenameLength||name==='.'||name==='..'||name.includes('/')||name.includes('\\')||/[\u0000-\u001f\u007f]/.test(name))continue;
+    if(!MEDIA_TYPES[extname(name).toLowerCase()])continue;
+    names.add(name);
+  }
+  return [...names];
+}
+
+function sanitizeLocalFilename(filename:string):string {
+  return filename.replace(/[^a-zA-Z0-9._ -]/g,'_').slice(0,180)||'input';
+}
+
+function buildFileManifest(files:PreparedJobFile[]):string {
+  return `${OUTPUT_WORKSPACE_INSTRUCTION}\n\nFiles referenced by the task have been materialized in the job workspace.\nUse read_file when file contents are needed. Use search_files with path "inputs" when searching across the referenced files. Do not infer contents from filenames.\n\n${files.map(file=>`- ${file.filename} (${file.artifactId}): ${file.relativePath}`).join('\n')}`;
+}
 function validatedMediaType(filename:string,data:Uint8Array):string {
   const expected=MEDIA_TYPES[extname(filename).toLowerCase()]??'application/octet-stream';
   const starts=(...bytes:number[])=>bytes.every((byte,index)=>data[index]===byte);

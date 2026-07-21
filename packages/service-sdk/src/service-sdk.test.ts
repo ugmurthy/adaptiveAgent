@@ -59,6 +59,16 @@ describe('ServiceSdk', () => {
       .rejects.toBeInstanceOf(IdempotencyConflictError);
   });
 
+  it('persists explicit file references and includes them in idempotency identity',async()=>{
+    const {sdk}=fixture();
+    const artifactId='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const job=await sdk.submitRun(actor,{schemaVersion:1,agentId:'a',goal:'summarize selected input',fileRefs:[{artifactId:artifactId.toUpperCase()}]},{idempotencyKey:'files'});
+    expect(job.request).toMatchObject({fileRefs:[{artifactId}]});
+    await expect(sdk.submitRun(actor,{schemaVersion:1,agentId:'a',goal:'summarize selected input',fileRefs:[{artifactId}]},{idempotencyKey:'files'})).resolves.toMatchObject({id:job.id});
+    await expect(sdk.submitRun(actor,{schemaVersion:1,agentId:'a',goal:'summarize selected input',fileRefs:[{artifactId:'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'}]},{idempotencyKey:'files'}))
+      .rejects.toBeInstanceOf(IdempotencyConflictError);
+  });
+
   it('deduplicates control commands with an idempotency key', async () => {
     const { sdk, store } = fixture();
     const job = await sdk.submitRun(actor, { schemaVersion: 1, agentId: 'a', goal: 'g' });

@@ -11,7 +11,7 @@ export interface TransactionalServiceStore { transaction<T>(operation: (tx: Serv
 export interface QueuePublisher { publish(payload: { jobId: string }): Promise<void> }
 export interface AgentRegistry { resolve(agentId: string, workload: WorkloadClass): Promise<{ profile: AgentProfileRef; allowedWorkloads: readonly WorkloadClass[] } | undefined> }
 export interface AuthorizationPolicy { authorize(actor: ServiceActor, operation: string): Promise<boolean> }
-export interface ArtifactMetadataStore { listOwned(actor: ServiceActor, jobId: string): Promise<ArtifactMetadata[] | undefined>; listAny(jobId:string):Promise<ArtifactMetadata[]> }
+export interface ArtifactMetadataStore { listOwned(actor: ServiceActor, jobId: string): Promise<ArtifactMetadata[] | undefined>; listAvailableOwned(actor:ServiceActor,limit:number,offset:number):Promise<Page<ArtifactMetadata>>; listAny(jobId:string):Promise<ArtifactMetadata[]> }
 export interface ArtifactStorage { put(storageKey: string, data: Uint8Array): Promise<void>; get(storageKey: string): Promise<Uint8Array | undefined>; delete(storageKey: string): Promise<void> }
 export interface Clock { now(): Date }
 export interface IdGenerator { generate(): string }

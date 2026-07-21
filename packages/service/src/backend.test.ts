@@ -115,6 +115,39 @@ describe('AgentWorker redelivery handling', () => {
 });
 
 describe('workload retry handling', () => {
+  it('uses the workspace root and injects the generated file manifest into the first run', async () => {
+    const claim = sampleClaim();
+    const workspace = { root: '/tmp/job-1', artifacts: '/tmp/job-1/artifacts', modelContext: 'Files: report.md -> inputs/a1/report.md' };
+    const workspaces = { create: vi.fn(async () => workspace), close: vi.fn(async () => undefined) };
+    const bootstrap = { created: { runtime: { runStore: { listBySession: vi.fn(async () => []) } } } };
+    const executor = new AgentSdkWorkloadExecutor(bootstrap as never, {} as never, workspaces, 4);
+    const sdk = { runRaw: vi.fn(async () => ({ status: 'success', output: 'summary', runId: 'run-1' })), close: vi.fn(async () => undefined) };
+    const createSdk = vi.spyOn(executor as never, 'createSdk').mockResolvedValue(sdk);
+
+    await executor.execute(claim);
+
+    expect(createSdk).toHaveBeenCalledWith(claim.job, 'agent-1', workspace.root);
+    expect(sdk.runRaw).toHaveBeenCalledWith('test', expect.objectContaining({
+      context: { serviceFileManifest: workspace.modelContext },
+    }));
+    expect(workspaces.close).toHaveBeenCalledWith(claim.job, workspace);
+  });
+
+  it('injects explicit file context for chat and gives its tools the job root',async()=>{
+    const claim=sampleClaim();claim.job.kind='chat';claim.job.request={schemaVersion:1,agentId:'agent-1',message:'review it',fileRefs:[{artifactId:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'}]};
+    const workspace={root:'/tmp/job-1',artifacts:'/tmp/job-1/artifacts',modelContext:'Files: report.md -> inputs/a1/report.md'};
+    const workspaces={create:vi.fn(async()=>workspace),prepare:vi.fn(async()=>undefined),close:vi.fn(async()=>undefined)};
+    const bootstrap={created:{runtime:{runStore:{listBySession:vi.fn(async()=>[])}}}};
+    const executor=new AgentSdkWorkloadExecutor(bootstrap as never,{} as never,workspaces,4);
+    const sdk={chatRaw:vi.fn(async()=>({status:'success',output:'summary',runId:'run-1'})),close:vi.fn(async()=>undefined)};
+    const createSdk=vi.spyOn(executor as never,'createSdk').mockResolvedValue(sdk);
+
+    await executor.execute(claim);
+
+    expect(createSdk).toHaveBeenCalledWith(claim.job,'agent-1',workspace.root);
+    expect(sdk.chatRaw).toHaveBeenCalledWith('review it',expect.objectContaining({context:{serviceFileManifest:workspace.modelContext}}));
+  });
+
   it('starts a new run when initialization failed before a core run was created', async () => {
     const claim = sampleClaim();
     claim.job.state = 'failed';
@@ -134,7 +167,7 @@ describe('workload retry handling', () => {
 
     await expect(executor.execute(claim)).resolves.toEqual(outcome);
 
-    expect(start).toHaveBeenCalledWith(claim, workspace.artifacts);
+    expect(start).toHaveBeenCalledWith(claim, workspace.root, undefined);
     expect(workspaces.close).toHaveBeenCalledWith(claim.job, workspace);
   });
 });

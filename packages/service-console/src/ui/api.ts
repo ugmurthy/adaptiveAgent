@@ -32,6 +32,7 @@ export const api = {
   job: (id: string, admin = false) => request<ServiceJob>(`/v1/${admin ? 'admin/' : ''}jobs/${encodeURIComponent(id)}`),
   submit: (kind: JobKind, body: Json, key?: string) => request<{ jobId: string }>(`/v1/jobs/${kind}`, { method: 'POST', body: JSON.stringify(body), headers: headers(true, key) }),
   events: (id: string, after = 0, admin = false) => request<EventEnvelope[]>(`/v1/${admin ? 'admin/' : ''}jobs/${encodeURIComponent(id)}/events?afterSequence=${after}&limit=500`),
+  availableArtifacts: (limit = 50, offset = 0) => request<Page<Artifact>>(`/v1/artifacts?${query({limit,offset})}`),
   artifacts: (id: string, admin = false) => request<Artifact[]>(`/v1/${admin ? 'admin/' : ''}jobs/${encodeURIComponent(id)}/artifacts`),
   auxiliary: <T>(id: string, resource: 'run-links' | 'audit') => request<T>(`/v1/admin/jobs/${encodeURIComponent(id)}/${resource}`),
   control: (id: string, action: string, body: Json = {}, admin = false, key?: string) => request<ServiceJob>(`/v1/${admin ? 'admin/' : ''}jobs/${encodeURIComponent(id)}/${action}`, { method: 'POST', body: JSON.stringify(body), headers: headers(true, key) }),

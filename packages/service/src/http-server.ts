@@ -20,10 +20,11 @@ const empty = { type:'object', additionalProperties:false, properties:{} } as co
 const params = { type:'object', additionalProperties:false, required:['jobId'], properties:{ jobId:id } } as const;
 const artifactParams = { type:'object', additionalProperties:false, required:['jobId','artifactId'], properties:{ jobId:id,artifactId:id } } as const;
 const headers = { type:'object', properties:{ authorization:{type:'string',minLength:8,maxLength:16_384}, 'idempotency-key':{type:'string',minLength:1,maxLength:200} } } as const;
-const run = { type:'object', additionalProperties:false, required:['schemaVersion','agentId','goal'], properties:{schemaVersion:version,agentId:id,goal:text,input:{}} } as const;
-const chat = { type:'object', additionalProperties:false, required:['schemaVersion','agentId','message'], properties:{schemaVersion:version,agentId:id,message:text,conversationId:id} } as const;
-const swarm = { type:'object', additionalProperties:false, required:['schemaVersion','coordinatorAgentId','workerAgentIds','objective'], properties:{schemaVersion:version,coordinatorAgentId:id,workerAgentIds:{type:'array',minItems:1,maxItems:100,uniqueItems:true,items:id},objective:text} } as const;
-const orchestration = { type:'object', additionalProperties:false, required:['schemaVersion','orchestratorAgentId','agentIds','objective'], properties:{schemaVersion:version,orchestratorAgentId:id,agentIds:{type:'array',minItems:1,maxItems:100,uniqueItems:true,items:id},objective:text} } as const;
+const fileRef = { type:'object', additionalProperties:false, required:['artifactId'], properties:{artifactId:{type:'string',format:'uuid',pattern:'^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'}} } as const;
+const run = { type:'object', additionalProperties:false, required:['schemaVersion','agentId','goal'], properties:{schemaVersion:version,agentId:id,goal:text,input:{},fileRefs:{type:'array',minItems:1,maxItems:100,uniqueItems:true,items:fileRef}} } as const;
+const chat = { type:'object', additionalProperties:false, required:['schemaVersion','agentId','message'], properties:{schemaVersion:version,agentId:id,message:text,conversationId:id,fileRefs:{type:'array',minItems:1,maxItems:100,uniqueItems:true,items:fileRef}} } as const;
+const swarm = { type:'object', additionalProperties:false, required:['schemaVersion','coordinatorAgentId','workerAgentIds','objective'], properties:{schemaVersion:version,coordinatorAgentId:id,workerAgentIds:{type:'array',minItems:1,maxItems:100,uniqueItems:true,items:id},objective:text,fileRefs:{type:'array',minItems:1,maxItems:100,uniqueItems:true,items:fileRef}} } as const;
+const orchestration = { type:'object', additionalProperties:false, required:['schemaVersion','orchestratorAgentId','agentIds','objective'], properties:{schemaVersion:version,orchestratorAgentId:id,agentIds:{type:'array',minItems:1,maxItems:100,uniqueItems:true,items:id},objective:text,fileRefs:{type:'array',minItems:1,maxItems:100,uniqueItems:true,items:fileRef}} } as const;
 const accepted = { type:'object', additionalProperties:false, required:['schemaVersion','jobId'], properties:{schemaVersion:version,jobId:id} } as const;
 const profile = { type:'object', additionalProperties:false, required:['agentId','version','contentHash'], properties:{agentId:id,version:id,contentHash:id} } as const;
 const command = { type:'object', additionalProperties:false, required:['kind','version','requestedAt'], properties:{kind:{type:'string',enum:['execute','cancel','retry','recover','resume','continue','steer','resolve_approval','resolve_clarification']},version:{type:'integer',minimum:1},payload:{},requestedAt:{type:'string',format:'date-time'}} } as const;
@@ -73,6 +74,7 @@ export async function buildHttpServer(options: HttpServerOptions): Promise<Fasti
     app.post(`/v1/jobs/:jobId/${name}`,{schema:{params,headers,body,response:{200:job,...errors},security:[{bearerAuth:[]}]}},r=>invoke(actor(r),(r.params as any).jobId,r.body,idem(r)));
   }
   app.get('/v1/jobs/:jobId/events',{schema:{params,headers,querystring:{type:'object',additionalProperties:false,properties:{afterSequence:{type:'integer',minimum:0,maximum:Number.MAX_SAFE_INTEGER,default:0},limit:{type:'integer',minimum:1,maximum:500,default:100}}},response:{200:{type:'array',items:publicEvent},...errors},security:[{bearerAuth:[]}]}},r=>{const q=r.query as any;return options.sdk.listEvents(actor(r),(r.params as any).jobId,q.afterSequence,q.limit)});
+  app.get('/v1/artifacts',{schema:{headers,querystring:{type:'object',additionalProperties:false,properties:{limit:{type:'integer',minimum:1,maximum:200,default:50},offset:{type:'integer',minimum:0,default:0}}},response:{200:{type:'object',additionalProperties:false,required:['items','total','limit','offset'],properties:{items:{type:'array',items:artifact},total:{type:'integer',minimum:0},limit:{type:'integer',minimum:1},offset:{type:'integer',minimum:0}}},...errors},security:[{bearerAuth:[]}]}},r=>{const q=r.query as {limit:number;offset:number};return options.sdk.listAvailableArtifacts(actor(r),q.limit,q.offset)});
   app.get('/v1/jobs/:jobId/artifacts',{schema:{params,headers,querystring:empty,response:{200:{type:'array',items:artifact},...errors},security:[{bearerAuth:[]}]}},r=>options.sdk.listArtifacts(actor(r),(r.params as any).jobId));
   app.get('/v1/admin/overview',r=>options.sdk.adminOverview(actor(r)));
   app.get('/v1/admin/tenants',r=>options.sdk.adminListTenants(actor(r)));
@@ -146,12 +148,23 @@ function publicWsError(code:string){return {schemaVersion:1,code,message:code===
 function validateWsSubmission(kind:unknown,value:unknown):Record<string,unknown> {
   if(!value||typeof value!=='object'||Array.isArray(value)||!['run','chat','swarm','orchestration'].includes(String(kind)))throw new Error();
   const body=value as Record<string,unknown>;
-  const allowed=kind==='run'?['schemaVersion','agentId','goal','input']:kind==='chat'?['schemaVersion','agentId','message','conversationId']:kind==='swarm'?['schemaVersion','coordinatorAgentId','workerAgentIds','objective']:['schemaVersion','orchestratorAgentId','agentIds','objective'];
+  const allowed=kind==='run'?['schemaVersion','agentId','goal','input','fileRefs']:kind==='chat'?['schemaVersion','agentId','message','conversationId','fileRefs']:kind==='swarm'?['schemaVersion','coordinatorAgentId','workerAgentIds','objective','fileRefs']:['schemaVersion','orchestratorAgentId','agentIds','objective','fileRefs'];
   if(Object.keys(body).some(key=>!allowed.includes(key))||body.schemaVersion!==1)throw new Error();
   const strings=kind==='run'?['agentId','goal']:kind==='chat'?['agentId','message']:kind==='swarm'?['coordinatorAgentId','objective']:['orchestratorAgentId','objective'];
   for(const key of strings)requiredString(body[key]);
+  if(body.fileRefs!==undefined)requiredFileRefs(body.fileRefs);
   if(kind==='chat'&&body.conversationId!==undefined)requiredString(body.conversationId);
   if(kind==='swarm')requiredStringArray(body.workerAgentIds);if(kind==='orchestration')requiredStringArray(body.agentIds);
   return body;
 }
 function requiredStringArray(value:unknown):void {if(!Array.isArray(value)||value.length<1||value.length>100||new Set(value).size!==value.length)throw new Error();for(const item of value)requiredString(item);}
+function requiredFileRefs(value:unknown):void {
+  if(!Array.isArray(value)||value.length<1||value.length>100)throw new Error();
+  const ids=new Set<string>();
+  for(const item of value) {
+    if(!item||typeof item!=='object'||Array.isArray(item)||Object.keys(item).some(key=>key!=='artifactId'))throw new Error();
+    const artifactId=(item as {artifactId?:unknown}).artifactId;
+    if(typeof artifactId!=='string'||!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(artifactId)||ids.has(artifactId))throw new Error();
+    ids.add(artifactId);
+  }
+}

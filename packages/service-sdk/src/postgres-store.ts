@@ -1,6 +1,6 @@
 import type { ArtifactMetadataStore, ServiceTransaction, TransactionalServiceStore } from './ports.js';
 import type { ServicePostgresClient, ServicePostgresPool } from './postgres-migrations.js';
-import type { AdminJobListOptions, ArtifactMetadata, AuditRecord, IdempotencyOperation, IdempotencyRecord, JobListOptions, JobRunLink, OutboxRecord, PublicEventEnvelope, ServiceActor, ServiceJob } from './types.js';
+import type { AdminJobListOptions, ArtifactMetadata, AuditRecord, IdempotencyOperation, IdempotencyRecord, JobListOptions, JobRunLink, OutboxRecord, Page, PublicEventEnvelope, ServiceActor, ServiceJob } from './types.js';
 
 const OWNED_JOB = `select * from service_jobs where id=$1 and tenant_id=$2 and owner_user_id=$3`;
 interface JobRow { id:string; tenant_id:string; owner_user_id:string; kind:ServiceJob['kind']; state:ServiceJob['state']; session_id:string; coordinator_run_id:string|null; request:ServiceJob['request']; profile_refs:ServiceJob['profiles']; command_version:number; processed_command_version:number; pending_command:ServiceJob['pendingCommand']; result:ServiceJob['result']|null; error:ServiceJob['error']|null; created_at:string; updated_at:string }
@@ -52,6 +52,11 @@ export class PostgresArtifactMetadataStore implements ArtifactMetadataStore {
     if(!owner.rowCount)return undefined;
     const rows=await this.db.query<ArtifactRow>(`select a.* from service_artifacts a join service_jobs j on j.id=a.job_id where a.job_id=$1 and j.tenant_id=$2 and j.owner_user_id=$3 and a.status <> 'deleted' and (a.expires_at is null or a.expires_at>now()) order by a.created_at,a.id`,[jobId,actor.tenantId,actor.userId]);
     return rows.rows.map(mapArtifactRow);
+  }
+  async listAvailableOwned(actor:ServiceActor,limit:number,offset:number):Promise<Page<ArtifactMetadata>> {
+    const count=await this.db.query<{count:string}>(`select count(*)::text count from service_artifacts where tenant_id=$1 and owner_user_id=$2 and status='available' and (expires_at is null or expires_at>now())`,[actor.tenantId,actor.userId]);
+    const rows=await this.db.query<ArtifactRow>(`select * from service_artifacts where tenant_id=$1 and owner_user_id=$2 and status='available' and (expires_at is null or expires_at>now()) order by created_at desc,id limit $3 offset $4`,[actor.tenantId,actor.userId,limit,offset]);
+    return {items:rows.rows.map(mapArtifactRow),total:Number(count.rows[0]?.count??0),limit,offset};
   }
   async listAny(jobId:string):Promise<ArtifactMetadata[]> { const q=await this.db.query<ArtifactRow>(`select * from service_artifacts where job_id=$1 and status <> 'deleted' and (expires_at is null or expires_at>now()) order by created_at,id`,[jobId]);return q.rows.map(mapArtifactRow); }
 }

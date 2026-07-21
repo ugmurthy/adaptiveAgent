@@ -87,7 +87,8 @@ export function createArtifactManagerFromEnv(pool: Pool, env: NodeJS.ProcessEnv 
     maxFileBytes:positiveInt(env.ARTIFACT_MAX_FILE_BYTES,50*1024*1024),
     maxTotalBytes:positiveInt(env.ARTIFACT_MAX_TOTAL_BYTES,100*1024*1024),
   };
-  return {storage,manager:new ArtifactManager(new PostgresArtifactRepository(pool),storage,undefined,quotas,
+  const fileReferenceRetentionMs=positiveInt(env.INPUT_FILE_RETENTION_DAYS,7)*24*60*60*1000;
+  return {storage,manager:new ArtifactManager(new PostgresArtifactRepository(pool,fileReferenceRetentionMs),storage,undefined,quotas,
     positiveInt(env.ARTIFACT_RETENTION_DAYS,7)*24*60*60*1000,
     positiveInt(env.ARTIFACT_QUARANTINE_RETENTION_DAYS,30)*24*60*60*1000)};
 }

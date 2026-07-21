@@ -34,5 +34,6 @@ export class InMemoryServiceStore implements TransactionalServiceStore, ServiceT
 export class InMemoryArtifactStore implements ArtifactMetadataStore {
   constructor(private readonly service: InMemoryServiceStore) {}
   async listOwned(actor: ServiceActor, jobId: string) { return this.service.listArtifactsOwned(actor, jobId); }
+  async listAvailableOwned(actor:ServiceActor,limit:number,offset:number) { const rows=this.service.artifactRows.filter(x=>x.tenantId===actor.tenantId&&x.ownerUserId===actor.userId&&x.status==='available'&&(!x.expiresAt||x.expiresAt>new Date().toISOString())).sort((a,b)=>b.createdAt.localeCompare(a.createdAt));return {items:rows.slice(offset,offset+limit),total:rows.length,limit,offset}; }
   async listAny(jobId:string) { return this.service.artifactRows.filter(x=>x.jobId===jobId); }
 }

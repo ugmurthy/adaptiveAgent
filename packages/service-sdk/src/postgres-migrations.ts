@@ -78,6 +78,23 @@ create index if not exists service_access_audit_actor_idx
 ` }, { name: 'service:005_admin_audit', sql: `
 alter table service_audit_records alter column job_id drop not null;
 create index if not exists service_jobs_admin_filter_idx on service_jobs(tenant_id,owner_user_id,kind,state,created_at desc);
+` }, { name: 'service:006_job_file_refs', sql: `
+create table if not exists service_job_file_refs (
+ job_id uuid not null references service_jobs(id) on delete cascade,
+ requested_name text not null,
+ source_artifact_id uuid not null references service_artifacts(id),
+ current_artifact_id uuid not null references service_artifacts(id),
+ access_mode text not null default 'read',
+ source_content_hash text not null,
+ created_at timestamptz not null,
+ updated_at timestamptz not null,
+ primary key (job_id,requested_name),
+ check (access_mode in ('read','editable'))
+);
+create index if not exists service_job_file_refs_source_idx on service_job_file_refs(source_artifact_id);
+create index if not exists service_job_file_refs_current_idx on service_job_file_refs(current_artifact_id);
+` }, { name: 'service:007_job_file_ref_identity', sql: `
+create unique index if not exists service_job_file_refs_job_source_idx on service_job_file_refs(job_id,source_artifact_id);
 ` }];
 export interface ServicePostgresClient { query<T = Record<string,unknown>>(sql: string, params?: unknown[]): Promise<{ rows: T[]; rowCount: number }> }
 export interface ServicePostgresTransactionClient extends ServicePostgresClient { release(): void }

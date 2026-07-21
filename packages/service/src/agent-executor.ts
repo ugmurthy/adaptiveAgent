@@ -18,7 +18,7 @@ import type {
 import type { ClaimedJob } from './postgres.js';
 import { AllowlistedAgentRegistry } from './registry.js';
 import { serviceResult, type ExecutionOutcome, type WorkloadExecutor } from './worker.js';
-import type { WorkspaceManager } from './workspace.js';
+import type { JobWorkspace, WorkspaceManager } from './workspace.js';
 
 export class AgentSdkWorkloadExecutor implements WorkloadExecutor {
   constructor(
@@ -29,17 +29,20 @@ export class AgentSdkWorkloadExecutor implements WorkloadExecutor {
   ) {}
 
   async execute(claim: ClaimedJob): Promise<ExecutionOutcome> {
-    const workspace = await this.workspaces.create(claim.job);
+    const workspace = await this.workspaces.create(claim.job, { prepare: false });
     try {
+      const workspaceRoot = claim.job.kind === 'run' || hasExplicitFileRefs(claim.job) ? workspace.root : workspace.artifacts;
       if (claim.command.kind !== 'execute') {
-        return await this.control(claim, workspace.artifacts);
+        return await this.control(claim, workspace, workspaceRoot);
       }
 
       const existingRuns = await this.runsBySession(claim.job.sessionId);
       if (existingRuns.length > 0) {
-        return await this.recoverExisting(claim, existingRuns, workspace.artifacts);
+        if ((claim.job.kind === 'run' || hasExplicitFileRefs(claim.job)) && existingRunNeedsExecution(existingRuns, claim.job)) await this.prepareWorkspace(claim.job, workspace);
+        return await this.recoverExisting(claim, existingRuns, workspaceRoot);
       }
-      return await this.start(claim, workspace.artifacts);
+      await this.prepareWorkspace(claim.job, workspace);
+      return await this.start(claim, workspaceRoot, workspace.modelContext);
     } finally {
       await this.workspaces.close(claim.job, workspace);
     }
@@ -49,7 +52,11 @@ export class AgentSdkWorkloadExecutor implements WorkloadExecutor {
     await this.bootstrap.close();
   }
 
-  private async start(claim: ClaimedJob, workspaceRoot: string): Promise<ExecutionOutcome> {
+  private async prepareWorkspace(job: ServiceJob, workspace: JobWorkspace): Promise<void> {
+    await this.workspaces.prepare?.(job, workspace);
+  }
+
+  private async start(claim: ClaimedJob, workspaceRoot: string, modelContext?: JobWorkspace['modelContext']): Promise<ExecutionOutcome> {
     const { job } = claim;
     const primarySdk = await this.createSdk(job, primaryAgentId(job), workspaceRoot);
     try {
@@ -58,6 +65,7 @@ export class AgentSdkWorkloadExecutor implements WorkloadExecutor {
         return fromRun(await primarySdk.runRaw(request.goal, {
           sessionId: job.sessionId,
           input: request.input as CoreJsonValue,
+          context: modelContext ? { serviceFileManifest: modelContext } : undefined,
           metadata: serviceMetadata(job),
         }), 'root');
       }
@@ -65,6 +73,7 @@ export class AgentSdkWorkloadExecutor implements WorkloadExecutor {
         const request = job.request as ChatRequest;
         return fromRun(await primarySdk.chatRaw(request.message, {
           sessionId: job.sessionId,
+          context: modelContext ? { serviceFileManifest: modelContext } : undefined,
           metadata: serviceMetadata(job),
         }), 'root');
       }
@@ -75,6 +84,7 @@ export class AgentSdkWorkloadExecutor implements WorkloadExecutor {
           const result = await swarm.run({
             sessionId: job.sessionId,
             topLevelObjective: request.objective,
+            contentParts: modelContext ? [{ type: 'text', text: modelContext }] : undefined,
             maxWorkers: this.maxSubtasks,
           });
           const runs = await this.runsBySession(job.sessionId);
@@ -99,6 +109,7 @@ export class AgentSdkWorkloadExecutor implements WorkloadExecutor {
         const result = await orchestration.runRaw(request.objective, {
           sessionId: job.sessionId,
           requestedAgentId: request.orchestratorAgentId,
+          context: modelContext ? { serviceFileManifest: modelContext } : undefined,
           orchestrationMetadata: serviceMetadata(job),
         });
         return {
@@ -181,10 +192,11 @@ export class AgentSdkWorkloadExecutor implements WorkloadExecutor {
     }
   }
 
-  private async control(claim: ClaimedJob, workspaceRoot: string): Promise<ExecutionOutcome> {
+  private async control(claim: ClaimedJob, workspace: JobWorkspace, workspaceRoot: string): Promise<ExecutionOutcome> {
     const runs = await this.runsBySession(claim.job.sessionId);
     if (runs.length === 0 && claim.command.kind === 'retry') {
-      return this.start(claim, workspaceRoot);
+      await this.prepareWorkspace(claim.job, workspace);
+      return this.start(claim, workspaceRoot, workspace.modelContext);
     }
     if (runs.length === 0) throw new Error(`No run exists for session ${claim.job.sessionId}`);
 
@@ -201,6 +213,7 @@ export class AgentSdkWorkloadExecutor implements WorkloadExecutor {
     }
 
     if (claim.job.kind === 'swarm' && (claim.command.kind === 'retry' || claim.command.kind === 'recover')) {
+      await this.prepareWorkspace(claim.job, workspace);
       return this.recoverSwarm(claim.job, workspaceRoot);
     }
 
@@ -213,6 +226,11 @@ export class AgentSdkWorkloadExecutor implements WorkloadExecutor {
     const sdk = await this.createSdkForRun(claim.job, target, workspaceRoot);
     try {
       const payload = claim.command.payload as Record<string, unknown> | undefined;
+      if (claim.command.kind === 'steer') {
+        await sdk.steer(target.id, { role: 'user', message: requiredString(payload?.message, 'steer message') });
+        return { state: 'running', runs: runs.map(linkRun) };
+      }
+      await this.prepareWorkspace(claim.job, workspace);
       let result: RunResult;
       switch (claim.command.kind) {
         case 'retry':
@@ -230,9 +248,6 @@ export class AgentSdkWorkloadExecutor implements WorkloadExecutor {
         case 'continue':
           result = await sdk.continueRunRaw({ fromRunId: target.id });
           break;
-        case 'steer':
-          await sdk.steer(target.id, { role: 'user', message: requiredString(payload?.message, 'steer message') });
-          return { state: 'running', runs: runs.map(linkRun) };
         case 'resolve_approval':
           await sdk.agent.resolveApproval(target.id, payload?.approved === true);
           result = await sdk.resumeRaw(target.id);
@@ -282,6 +297,7 @@ export class AgentSdkWorkloadExecutor implements WorkloadExecutor {
     const profile = job.profiles.find((candidate) => candidate.agentId === id);
     if (!profile) throw new Error(`Agent ${id} is not pinned to service job ${job.id}`);
     const { config } = await this.registry.resolvePinned(profile, job.kind);
+    if (config.agent.tools.includes('shell_exec')) throw new Error(`Agent ${id} cannot use shell_exec in the shared service worker`);
     return { ...config, agent: { ...config.agent, workspaceRoot } };
   }
 
@@ -297,6 +313,15 @@ function primaryAgentId(job: ServiceJob): string {
   const id = request.agentId ?? request.coordinatorAgentId ?? request.orchestratorAgentId;
   if (typeof id !== 'string') throw new Error('Job has no authoritative primary agent ID');
   return id;
+}
+
+function existingRunNeedsExecution(runs: AgentRun[],job:ServiceJob):boolean {
+  const root=latestPrimaryRoot(runs,primaryAgentId(job));
+  return Boolean(root&&!((isActive(root.status)&&hasLiveLease(root))||root.status==='awaiting_approval'||root.status==='clarification_requested'||root.status==='succeeded'));
+}
+
+function hasExplicitFileRefs(job:ServiceJob):boolean {
+  return Boolean(job.request.fileRefs?.length);
 }
 
 function serviceMetadata(job: ServiceJob): Record<string, CoreJsonValue> {

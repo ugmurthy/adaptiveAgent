@@ -8,10 +8,10 @@ const CONTROL_STATES: Record<Exclude<CommandKind, 'execute'>, readonly JobState[
 };
 export class ServiceSdk {
   constructor(private readonly deps: ServiceSdkDependencies) {}
-  submitRun(actor: ServiceActor, request: RunRequest, options?: SubmissionOptions) { return this.submit(actor, 'run', request, [request.agentId], options); }
-  submitChat(actor: ServiceActor, request: ChatRequest, options?: SubmissionOptions) { return this.submit(actor, 'chat', request, [request.agentId], options); }
-  submitSwarmRun(actor: ServiceActor, request: SwarmRunRequest, options?: SubmissionOptions) { return this.submit(actor, 'swarm', request, [request.coordinatorAgentId, ...request.workerAgentIds], options); }
-  submitOrchestratedRun(actor: ServiceActor, request: OrchestratedRunRequest, options?: SubmissionOptions) { return this.submit(actor, 'orchestration', request, [request.orchestratorAgentId, ...request.agentIds], options); }
+  submitRun(actor: ServiceActor, request: RunRequest, options?: SubmissionOptions) { return this.submit(actor, 'run', normalizeFileRefs(request), [request.agentId], options); }
+  submitChat(actor: ServiceActor, request: ChatRequest, options?: SubmissionOptions) { return this.submit(actor, 'chat', normalizeFileRefs(request), [request.agentId], options); }
+  submitSwarmRun(actor: ServiceActor, request: SwarmRunRequest, options?: SubmissionOptions) { return this.submit(actor, 'swarm', normalizeFileRefs(request), [request.coordinatorAgentId, ...request.workerAgentIds], options); }
+  submitOrchestratedRun(actor: ServiceActor, request: OrchestratedRunRequest, options?: SubmissionOptions) { return this.submit(actor, 'orchestration', normalizeFileRefs(request), [request.orchestratorAgentId, ...request.agentIds], options); }
   async getJob(actor: ServiceActor, jobId: string) { await this.authorize(actor, 'get'); return this.owned(actor, jobId); }
   async listJobs(actor:ServiceActor,options:JobListOptions={}) { await this.authorize(actor,'list');return this.deps.persistence.jobs.listOwned(actor,bounds(options)); }
   cancelJob(actor: ServiceActor, jobId: string, options?: ControlOptions) { return this.control(actor, jobId, 'cancel', undefined, options); }
@@ -24,6 +24,7 @@ export class ServiceSdk {
   resolveClarification(actor: ServiceActor, jobId: string, answer: string, options?: ControlOptions) { return this.control(actor, jobId, 'resolve_clarification', { answer }, options); }
   async listEvents(actor: ServiceActor, jobId: string, afterSequence = 0, limit = 100) { await this.authorize(actor, 'listEvents'); const rows = await this.deps.persistence.events.listEventsOwned(actor, jobId, afterSequence, limit); if (!rows) throw new ServiceNotFoundError(); return rows; }
   async listArtifacts(actor: ServiceActor, jobId: string) { await this.authorize(actor, 'listArtifacts'); const rows = await this.deps.artifacts.listOwned(actor, jobId); if (!rows) throw new ServiceNotFoundError(); return rows; }
+  async listAvailableArtifacts(actor:ServiceActor,limit=50,offset=0) { await this.authorize(actor,'listArtifacts');return this.deps.artifacts.listAvailableOwned(actor,clamp(limit),Math.max(0,offset)); }
   async adminOverview(actor:ServiceActor) { this.admin(actor);const value=await this.deps.persistence.admin.overview();await this.adminAudit(actor,'admin:overview');return value; }
   async adminListTenants(actor:ServiceActor) { this.admin(actor);const value=await this.deps.persistence.admin.listTenants();await this.adminAudit(actor,'admin:list_tenants');return value; }
   async adminListUsers(actor:ServiceActor,tenantId?:string,limit=50,offset=0) { this.admin(actor);const value=await this.deps.persistence.admin.listUsers(tenantId,clamp(limit),Math.max(0,offset));await this.adminAudit(actor,'admin:list_users',undefined,{tenantId:tenantId??null});return value; }
@@ -63,3 +64,4 @@ function clamp(limit=50,max=200){return Math.max(1,Math.min(max,limit));}
 function bounds<T extends JobListOptions>(o:T):T{return {...o,limit:clamp(o.limit),offset:Math.max(0,o.offset??0)};}
 function stableHash(value: unknown): string { return createHash('sha256').update(JSON.stringify(sort(value))).digest('hex'); }
 function sort(value: unknown): unknown { if (Array.isArray(value)) return value.map(sort); if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).sort(([a],[b]) => a.localeCompare(b)).map(([k,v]) => [k, sort(v)])); return value; }
+function normalizeFileRefs<T extends ServiceJobRequest>(request:T):T { const {fileRefs,...rest}=request;return (fileRefs?.length?{...rest,fileRefs:[...new Map(fileRefs.map(ref=>[ref.artifactId.toLowerCase(),{artifactId:ref.artifactId.toLowerCase()}])).values()]}:rest) as T; }
