@@ -26,6 +26,8 @@ esac
 
 asset=$(find "$RELEASE_DIR" -maxdepth 1 -type f -name "adaptive-agent-v*-$platform-$cpu.tar.gz" | sort | tail -n 1)
 [ -n "$asset" ] || fail "no release asset found for $platform-$cpu in $RELEASE_DIR"
+runtime_asset=$(find "$RELEASE_DIR" -maxdepth 1 -type f -name "adaptive-agent-runtime-v*-$platform-$cpu.tar.gz" | sort | tail -n 1)
+[ -n "$runtime_asset" ] || fail "no runtime release asset found for $platform-$cpu in $RELEASE_DIR"
 
 tmp_dir=$(mktemp -d 2>/dev/null || mktemp -d -t adaptive-agent-smoke)
 trap 'rm -rf "$tmp_dir"' EXIT INT TERM
@@ -35,6 +37,8 @@ binary="$tmp_dir/adaptive-agent"
 [ -x "$binary" ] || fail "extracted binary is not executable: $binary"
 trace_binary="$tmp_dir/trace-session"
 [ -x "$trace_binary" ] || fail "extracted trace-session binary is not executable: $trace_binary"
+runtime_binary="$tmp_dir/agent-runtime"
+[ -x "$runtime_binary" ] || fail "extracted agent-runtime binary is not executable: $runtime_binary"
 
 home_dir="$tmp_dir/home"
 cwd_dir="$tmp_dir/workspace"
@@ -43,6 +47,11 @@ mkdir -p "$home_dir" "$cwd_dir"
 "$binary" --version
 "$binary" --help >/dev/null
 "$trace_binary" --help >/dev/null
+printf '%s\n' '{"version":1,"id":"smoke-hello","type":"hello"}' | "$runtime_binary" | grep '"id":"smoke-hello"' >/dev/null
+rm -f "$runtime_binary"
+tar -xzf "$runtime_asset" -C "$tmp_dir"
+[ -x "$runtime_binary" ] || fail "runtime-only asset does not contain executable agent-runtime"
+printf '%s\n' '{"version":1,"id":"runtime-smoke-hello","type":"hello"}' | "$runtime_binary" | grep '"id":"runtime-smoke-hello"' >/dev/null
 ADAPTIVE_AGENT_HOME="$home_dir" "$binary" init --dry-run --yes --cwd "$cwd_dir" >/dev/null
 ADAPTIVE_AGENT_HOME="$home_dir" "$binary" init --yes --cwd "$cwd_dir" >/dev/null
 ADAPTIVE_AGENT_HOME="$home_dir" "$binary" doctor --cwd "$cwd_dir" --output json >/dev/null || true

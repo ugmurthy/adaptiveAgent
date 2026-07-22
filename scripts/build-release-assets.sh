@@ -5,6 +5,7 @@ ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 OUT_DIR="${ADAPTIVE_AGENT_RELEASE_DIR:-$ROOT_DIR/dist/release}"
 ADAPTIVE_AGENT_ENTRYPOINT="$ROOT_DIR/packages/agent-sdk/src/adaptive-agent.ts"
 TRACE_SESSION_ENTRYPOINT="$ROOT_DIR/packages/trace-session/src/trace-session.ts"
+DESKTOP_BRIDGE_ENTRYPOINT="$ROOT_DIR/packages/desktop-bridge/src/main.ts"
 BUILD_INFO="$ROOT_DIR/packages/agent-sdk/src/install/build-info.generated.ts"
 BUNDLED_ASSETS="$ROOT_DIR/packages/agent-sdk/src/install/bundled-assets.generated.ts"
 REPOSITORY="${ADAPTIVE_AGENT_REPOSITORY:-https://github.com/ugmurthy/adaptiveAgent}"
@@ -157,7 +158,9 @@ compile_target() {
   bun_target="$2"
   adaptive_agent_exe_name="$3"
   trace_session_exe_name="$4"
-  asset_name="$5"
+  desktop_bridge_exe_name="$5"
+  asset_name="$6"
+  runtime_asset_name="$7"
 
   work_dir="$OUT_DIR/work/$target"
   rm -rf "$work_dir"
@@ -175,16 +178,27 @@ compile_target() {
     --target="$bun_target" \
     --outfile="$work_dir/$trace_session_exe_name"
 
+  bun build "$DESKTOP_BRIDGE_ENTRYPOINT" \
+    --compile \
+    --target="$bun_target" \
+    --outfile="$work_dir/$desktop_bridge_exe_name"
+
   if [ "${asset_name##*.}" = "zip" ]; then
     if command -v zip >/dev/null 2>&1; then
-      (cd "$work_dir" && zip -q "$OUT_DIR/$asset_name" "$adaptive_agent_exe_name" "$trace_session_exe_name")
+      (cd "$work_dir" && zip -q "$OUT_DIR/$asset_name" "$adaptive_agent_exe_name" "$trace_session_exe_name" "$desktop_bridge_exe_name")
+      (cd "$work_dir" && zip -q "$OUT_DIR/$runtime_asset_name" "$desktop_bridge_exe_name")
     elif command -v ditto >/dev/null 2>&1; then
       (cd "$work_dir" && ditto -c -k --sequesterRsrc . "$OUT_DIR/$asset_name")
+      runtime_work_dir="$work_dir/runtime-only"
+      mkdir -p "$runtime_work_dir"
+      cp "$work_dir/$desktop_bridge_exe_name" "$runtime_work_dir/$desktop_bridge_exe_name"
+      (cd "$runtime_work_dir" && ditto -c -k --sequesterRsrc . "$OUT_DIR/$runtime_asset_name")
     else
       fail 'zip or ditto is required to package Windows assets'
     fi
   else
-    tar -czf "$OUT_DIR/$asset_name" -C "$work_dir" "$adaptive_agent_exe_name" "$trace_session_exe_name"
+    tar -czf "$OUT_DIR/$asset_name" -C "$work_dir" "$adaptive_agent_exe_name" "$trace_session_exe_name" "$desktop_bridge_exe_name"
+    tar -czf "$OUT_DIR/$runtime_asset_name" -C "$work_dir" "$desktop_bridge_exe_name"
   fi
 }
 
@@ -192,11 +206,11 @@ rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 write_bundled_assets
 
-compile_target darwin-arm64 bun-darwin-arm64 adaptive-agent trace-session "adaptive-agent-$TAG-darwin-arm64.tar.gz"
-compile_target darwin-x64 bun-darwin-x64 adaptive-agent trace-session "adaptive-agent-$TAG-darwin-x64.tar.gz"
-compile_target linux-arm64 bun-linux-arm64 adaptive-agent trace-session "adaptive-agent-$TAG-linux-arm64.tar.gz"
-compile_target linux-x64 bun-linux-x64 adaptive-agent trace-session "adaptive-agent-$TAG-linux-x64.tar.gz"
-compile_target windows-x64 bun-windows-x64 adaptive-agent.exe trace-session.exe "adaptive-agent-$TAG-windows-x64.zip"
+compile_target darwin-arm64 bun-darwin-arm64 adaptive-agent trace-session agent-runtime "adaptive-agent-$TAG-darwin-arm64.tar.gz" "adaptive-agent-runtime-$TAG-darwin-arm64.tar.gz"
+compile_target darwin-x64 bun-darwin-x64 adaptive-agent trace-session agent-runtime "adaptive-agent-$TAG-darwin-x64.tar.gz" "adaptive-agent-runtime-$TAG-darwin-x64.tar.gz"
+compile_target linux-arm64 bun-linux-arm64 adaptive-agent trace-session agent-runtime "adaptive-agent-$TAG-linux-arm64.tar.gz" "adaptive-agent-runtime-$TAG-linux-arm64.tar.gz"
+compile_target linux-x64 bun-linux-x64 adaptive-agent trace-session agent-runtime "adaptive-agent-$TAG-linux-x64.tar.gz" "adaptive-agent-runtime-$TAG-linux-x64.tar.gz"
+compile_target windows-x64 bun-windows-x64 adaptive-agent.exe trace-session.exe agent-runtime.exe "adaptive-agent-$TAG-windows-x64.zip" "adaptive-agent-runtime-$TAG-windows-x64.zip"
 
 cp "$ROOT_DIR/scripts/install.sh" "$OUT_DIR/install.sh"
 cp "$ROOT_DIR/scripts/install.ps1" "$OUT_DIR/install.ps1"
