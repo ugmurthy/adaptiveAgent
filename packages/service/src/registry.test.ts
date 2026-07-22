@@ -48,6 +48,40 @@ describe('allowlisted agent profile resolution', () => {
     await expect(registry.resolvePinned(profile('1', 'old-hash'), 'run')).resolves.toMatchObject({ entry: { version: '2', contentHash: configHash } });
   });
 
+  it('validates profile content hashes eagerly', async () => {
+    const registry = await loadRegistry();
+    await writeFile(join(directory, 'agent.json'), '{"id":"agent","changed":true}');
+
+    const failures = await registry.validationFailures();
+    expect(failures).toHaveLength(1);
+    expect(failures[0]?.entry.id).toBe('agent');
+    expect(failures[0]?.error).toEqual(expect.objectContaining({ message: 'Agent agent content hash does not match registry' }));
+    await expect(registry.validate()).rejects.toThrow(
+      /Agent registry validation failed for 1 profile\(s\):[\s\S]*Agent agent content hash does not match registry/,
+    );
+  });
+
+  it('does not advertise or resolve agents that require shell_exec', async () => {
+    const config = JSON.stringify({
+      id: 'agent',
+      name: 'Agent',
+      invocationModes: ['run'],
+      defaultInvocationMode: 'run',
+      model: { provider: 'ollama', model: 'qwen3.5' },
+      tools: ['read_file', 'shell_exec'],
+    });
+    configHash = createHash('sha256').update(config).digest('hex');
+    await writeFile(join(directory, 'agent.json'), config);
+    const registry = await loadRegistry();
+    const rejected: Array<{ id: string; error: unknown }> = [];
+
+    await expect(registry.resolve('agent', 'run')).rejects.toThrow('cannot use shell_exec');
+    await expect(registry.list((entry, error) => rejected.push({ id: entry.id, error }))).resolves.toEqual([]);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]?.id).toBe('agent');
+    expect(rejected[0]?.error).toEqual(expect.objectContaining({ message: 'Agent agent cannot use shell_exec in the shared service worker' }));
+  });
+
   it('parses the configured policy and rejects unsafe typos', () => {
     expect(agentProfileResolutionPolicy(undefined)).toBe('exact');
     expect(agentProfileResolutionPolicy('compatible')).toBe('compatible');

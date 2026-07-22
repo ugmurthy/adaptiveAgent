@@ -1,4 +1,5 @@
 import type { Pool } from 'pg';
+import type { ServiceLogger } from './composition.js';
 import type { EventBus,EventWakeup } from './event-bus.js';
 
 const SAFE_SCALARS=new Set(['state','status','phase','stepId','step_id','toolId','tool_id','toolName','tool_name','toolExecutionId','tool_execution_id','planId','plan_id','planStepId','plan_step_id','attempt','progress','percent','role']);
@@ -10,14 +11,17 @@ export function publicCoreData(row:{run_id:string;seq:number;step_id?:string|nul
 }
 
 export class DurableEventProjector {
-  constructor(private readonly pool:Pool,private readonly bus?:EventBus) {}
+  constructor(private readonly pool:Pool,private readonly bus?:EventBus,private readonly logger?:ServiceLogger) {}
   async projectBatch(limit=100):Promise<number> {
-    const candidates=await this.pool.query<any>(`select l.job_id,e.id,e.run_id,e.seq,e.step_id,e.event_type,e.payload,e.created_at from service_job_run_links l join agent_events e on e.run_id=l.run_id left join service_public_events p on p.job_id=l.job_id and p.source_event_id='core:'||e.id::text where p.id is null order by e.id limit $1`,[limit]);
-    const jobs=await this.pool.query<any>(`select j.id,j.state,j.command_version,j.processed_command_version,j.result,j.error,j.updated_at,('job:'||j.updated_at::text||':'||j.state||':'||j.command_version::text||':'||j.processed_command_version::text) as source_event_id from service_jobs j left join service_public_events p on p.job_id=j.id and p.source_event_id=('job:'||j.updated_at::text||':'||j.state||':'||j.command_version::text||':'||j.processed_command_version::text) where p.id is null order by j.updated_at limit $1`,[limit]);
-    const artifacts=await this.pool.query<any>(`select 'artifact' as projection_kind,a.id,a.job_id,a.run_id,a.tool_execution_id,a.original_filename,a.media_type,a.byte_size,a.content_hash,a.status,a.created_at,a.available_at,a.expires_at,a.updated_at,('artifact:'||a.id::text||':'||a.status) as source_event_id from service_artifacts a left join service_public_events p on p.job_id=a.job_id and p.source_event_id=('artifact:'||a.id::text||':'||a.status) where a.status in ('available','quarantined') and p.id is null order by a.updated_at limit $1`,[limit]);
-    let count=0;
-    for(const row of [...candidates.rows,...jobs.rows,...artifacts.rows]) { const wake=await this.insert(row);if(wake){count++;await this.bus?.publish(wake);} }
-    return count;
+    try {
+      const candidates=await this.pool.query<any>(`select l.job_id,e.id,e.run_id,e.seq,e.step_id,e.event_type,e.payload,e.created_at from service_job_run_links l join agent_events e on e.run_id=l.run_id left join service_public_events p on p.job_id=l.job_id and p.source_event_id='core:'||e.id::text where p.id is null order by e.id limit $1`,[limit]);
+      const jobs=await this.pool.query<any>(`select j.id,j.state,j.command_version,j.processed_command_version,j.result,j.error,j.updated_at,('job:'||j.updated_at::text||':'||j.state||':'||j.command_version::text||':'||j.processed_command_version::text) as source_event_id from service_jobs j left join service_public_events p on p.job_id=j.id and p.source_event_id=('job:'||j.updated_at::text||':'||j.state||':'||j.command_version::text||':'||j.processed_command_version::text) where p.id is null order by j.updated_at limit $1`,[limit]);
+      const artifacts=await this.pool.query<any>(`select 'artifact' as projection_kind,a.id,a.job_id,a.run_id,a.tool_execution_id,a.original_filename,a.media_type,a.byte_size,a.content_hash,a.status,a.created_at,a.available_at,a.expires_at,a.updated_at,('artifact:'||a.id::text||':'||a.status) as source_event_id from service_artifacts a left join service_public_events p on p.job_id=a.job_id and p.source_event_id=('artifact:'||a.id::text||':'||a.status) where a.status in ('available','quarantined') and p.id is null order by a.updated_at limit $1`,[limit]);
+      let count=0;
+      for(const row of [...candidates.rows,...jobs.rows,...artifacts.rows]) { const wake=await this.insert(row);if(wake){count++;await this.bus?.publish(wake);} }
+      if(count>0)this.logger?.debug('projection_batch_completed',{count});
+      return count;
+    } catch(error){this.logger?.error('projection_batch_failed',{batchSize:limit},error);throw error;}
   }
   private async insert(row:any):Promise<EventWakeup|undefined> {
     const client=await this.pool.connect();

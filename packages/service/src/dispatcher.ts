@@ -1,13 +1,21 @@
 import type { QueuePublisher } from './queue.js';
+import type { ServiceLogger } from './composition.js';
 import { ServiceBackendStore } from './postgres.js';
 
 export class OutboxDispatcher {
   private stopped = true;
   private loopPromise?: Promise<void>;
-  constructor(private readonly store: ServiceBackendStore, private readonly publisher: QueuePublisher, private readonly intervalMs = 500, private readonly batchSize = 50) {}
+  constructor(private readonly store: ServiceBackendStore, private readonly publisher: QueuePublisher, private readonly intervalMs = 500, private readonly batchSize = 50, private readonly logger?: ServiceLogger) {}
 
   async poll(): Promise<number> {
-    return this.store.dispatchBatch(this.batchSize, (record) => this.publisher.publish(record.kind, record.jobId, record.commandVersion));
+    try {
+      const count = await this.store.dispatchBatch(this.batchSize, (record) => this.publisher.publish(record.kind, record.jobId, record.commandVersion));
+      if (count > 0) this.logger?.debug('dispatch_batch_completed', { count });
+      return count;
+    } catch (error) {
+      this.logger?.error('dispatch_batch_failed', { batchSize: this.batchSize }, error);
+      throw error;
+    }
   }
 
   async start(): Promise<void> {

@@ -401,7 +401,10 @@ export class ArtifactWorkspacePolicy implements SandboxPolicy {
   }
   async close(job:ServiceJob,workspace:JobWorkspace):Promise<void> {
     try { await this.artifacts.ingest(job,workspace.artifacts,workspace.root); }
-    finally { await rm(workspace.root,{recursive:true,force:true}); }
+    finally {
+      await makeInputsRemovable(workspace.root);
+      await rm(workspace.root,{recursive:true,force:true});
+    }
   }
 }
 
@@ -446,6 +449,15 @@ function sanitizeLocalFilename(filename:string):string {
 
 function buildFileManifest(files:PreparedJobFile[]):string {
   return `${OUTPUT_WORKSPACE_INSTRUCTION}\n\nFiles referenced by the task have been materialized in the job workspace.\nUse read_file when file contents are needed. Use search_files with path "inputs" when searching across the referenced files. Do not infer contents from filenames.\n\n${files.map(file=>`- ${file.filename} (${file.artifactId}): ${file.relativePath}`).join('\n')}`;
+}
+async function makeInputsRemovable(workspaceRoot:string):Promise<void> {
+  const inputs=join(workspaceRoot,'inputs');
+  try {
+    for(const entry of await readdir(inputs,{withFileTypes:true}))if(entry.isDirectory())await chmod(join(inputs,entry.name),0o700);
+    await chmod(inputs,0o700);
+  } catch(error) {
+    if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;
+  }
 }
 function validatedMediaType(filename:string,data:Uint8Array):string {
   const expected=MEDIA_TYPES[extname(filename).toLowerCase()]??'application/octet-stream';

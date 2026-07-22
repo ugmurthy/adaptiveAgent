@@ -27,7 +27,8 @@ Usage:
 
 Arguments:
   agent-profiles-folder  Folder containing agent profile JSON files
-  output-path            Registry destination (default: <folder>/agent-registry.json)
+  output-path            Registry file or existing output folder
+                         (default: <folder>/agent-registry.json)
 
 Options:
   --absolute             Store absolute profile paths instead of relative paths
@@ -53,7 +54,14 @@ async function main(): Promise<void> {
     throw new Error(`Agent profiles folder does not exist or is not a directory: ${profilesDirectory}`);
   }
 
-  const outputPath = resolve(outputArgument ?? profilesDirectory, outputArgument ? '' : 'agent-registry.json');
+  const outputTarget = resolve(outputArgument ?? profilesDirectory);
+  const outputTargetStats = await stat(outputTarget).catch((error: unknown) => {
+    if (isNodeError(error) && error.code === 'ENOENT') return undefined;
+    throw error;
+  });
+  const outputPath = outputTargetStats?.isDirectory()
+    ? resolve(outputTarget, 'agent-registry.json')
+    : outputTarget;
   const outputDirectory = dirname(outputPath);
   const existingEntries = await loadExistingEntries(outputPath);
   const entries = await readdir(profilesDirectory, { withFileTypes: true });

@@ -45,12 +45,44 @@ export class AllowlistedAgentRegistry {
     return id;
   }
 
-  list():Array<{id:string;version:string;allowedWorkloads:JobKind[]}> { return [...this.entries.values()].map(({id,version,allowedWorkloads})=>({id,version,allowedWorkloads:[...allowedWorkloads]})); }
+  async validationFailures(): Promise<Array<{entry:AgentManifestEntry;error:unknown}>> {
+    return (await Promise.all([...this.entries.values()].map(async entry => {
+      try {
+        await this.resolve(entry.id, entry.allowedWorkloads[0]!);
+        return undefined;
+      } catch (error) {
+        return { entry, error };
+      }
+    }))).filter(failure => failure !== undefined);
+  }
+
+  async validate(): Promise<void> {
+    const failures = await this.validationFailures();
+    if (failures.length === 0) return;
+    const details = failures.map(({entry,error}) => `- ${entry.id} (${entry.configPath}): ${error instanceof Error?error.message:String(error)}`).join('\n');
+    throw new AggregateError(failures.map(failure => failure.error), `Agent registry validation failed for ${failures.length} profile(s):\n${details}`);
+  }
+
+  async list(onRejected?: (entry: AgentManifestEntry, error: unknown) => void):Promise<Array<{id:string;version:string;allowedWorkloads:JobKind[]}>> {
+    const agents = await Promise.all([...this.entries.values()].map(async entry => {
+      const {id,version,allowedWorkloads}=entry;
+      try {
+        await this.resolve(id, allowedWorkloads[0]!);
+        return {id,version,allowedWorkloads:[...allowedWorkloads]};
+      } catch (error) {
+        onRejected?.(entry, error);
+        return undefined;
+      }
+    }));
+    return agents.filter(agent => agent !== undefined);
+  }
 
   async resolve(id: string, workload: JobKind): Promise<{ entry: AgentManifestEntry; config: ResolvedAgentSdkConfig }> {
     const entry = this.entries.get(id);
     if (!entry || !entry.allowedWorkloads.includes(workload)) throw new Error(`Agent ${id} is not allowed for ${workload}`);
-    return this.loadEntry(entry);
+    const resolved = await this.loadEntry(entry);
+    if (resolved.config.agent.tools.includes('shell_exec')) throw new Error(`Agent ${id} cannot use shell_exec in the shared service worker`);
+    return resolved;
   }
 
   async resolvePinned(profile: AgentProfileRef, workload: JobKind): Promise<{ entry: AgentManifestEntry; config: ResolvedAgentSdkConfig }> {

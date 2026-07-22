@@ -1,6 +1,6 @@
 import { PostgresArtifactMetadataStore, PostgresServiceStore, ServiceSdk, type AgentRegistry, type ServiceActor } from '@adaptive-agent/service-sdk';
 import { agentProfileResolutionPolicy, AllowlistedAgentRegistry } from './registry.js';
-import { createArtifactManagerFromEnv, createPoolFromEnv, positiveInt, printEnvironmentIfRequested, runBackendMigrations } from './composition.js';
+import { createArtifactManagerFromEnv, createPoolFromEnv, positiveInt, printEnvironmentIfRequested, reportAgentProfileWarning, reportStartupError, runBackendMigrations } from './composition.js';
 import { createJwtAuthenticator } from './http-auth.js';
 import { buildHttpServer } from './http-server.js';
 import { RedisEventBus } from './event-bus.js';
@@ -9,10 +9,11 @@ async function main(): Promise<void> {
   const env=process.env;
   printEnvironmentIfRequested('http',env);
   if (!env.AGENT_REGISTRY_PATH) throw new Error('AGENT_REGISTRY_PATH is required');
+  const registry=await AllowlistedAgentRegistry.load(env.AGENT_REGISTRY_PATH,agentProfileResolutionPolicy(env.AGENT_PROFILE_RESOLUTION_POLICY));
+  for(const {entry,error} of await registry.validationFailures())reportAgentProfileWarning('http',entry,error);
   const pool=createPoolFromEnv(env);
   await runBackendMigrations(pool);
   const store=new PostgresServiceStore(pool);
-  const registry=await AllowlistedAgentRegistry.load(env.AGENT_REGISTRY_PATH,agentProfileResolutionPolicy(env.AGENT_PROFILE_RESOLUTION_POLICY));
   const registryAdapter:AgentRegistry={resolve:async(id,kind)=>{try{const {entry}=await registry.resolve(id,kind);return {profile:{agentId:entry.id,version:entry.version,contentHash:entry.contentHash},allowedWorkloads:entry.allowedWorkloads};}catch{return undefined;}}};
   const artifactRuntime=createArtifactManagerFromEnv(pool,env);
   const artifacts=new PostgresArtifactMetadataStore(pool);
@@ -26,4 +27,4 @@ async function main(): Promise<void> {
   await app.listen({host:env.HTTP_HOST??'0.0.0.0',port:positiveInt(env.PORT,3000)});
 }
 function required(value:string|undefined,name:string):string { if(!value)throw new Error(`${name} is required`);return value; }
-if (import.meta.main) await main();
+if (import.meta.main) main().catch(error=>{reportStartupError('http',error);process.exitCode=1;});

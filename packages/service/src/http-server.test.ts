@@ -25,7 +25,7 @@ describe('Phase 4 HTTP API', () => {
     const submissions = [
       ['/v1/jobs/run', { schemaVersion: 1, agentId: 'agent', goal: 'run' }, 'run'],
       ['/v1/jobs/chat', { schemaVersion: 1, agentId: 'agent', message: 'chat' }, 'chat'],
-      ['/v1/jobs/swarm', { schemaVersion: 1, coordinatorAgentId: 'agent', workerAgentIds: ['worker'], objective: 'swarm' }, 'swarm'],
+      ['/v1/jobs/swarm', { schemaVersion: 1, coordinatorAgentId: 'agent', workerAgentIds: ['worker'], qualityAgentId: 'quality', synthesizerAgentId: 'synthesizer', objective: 'swarm' }, 'swarm'],
       ['/v1/jobs/orchestration', { schemaVersion: 1, orchestratorAgentId: 'agent', agentIds: ['worker'], objective: 'orchestrate' }, 'orchestration'],
     ] as const;
 
@@ -37,6 +37,18 @@ describe('Phase 4 HTTP API', () => {
       expect(polled.statusCode).toBe(200);
       expect(polled.json()).toMatchObject({ id: jobId, kind, ownerUserId: 'alice' });
     }
+  });
+
+  it('requires explicit quality and synthesizer agents for swarm submissions', async () => {
+    const { app } = await fixture();
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/jobs/swarm',
+      headers: auth(),
+      payload: { schemaVersion: 1, coordinatorAgentId: 'agent', workerAgentIds: ['worker'], objective: 'swarm' },
+    });
+
+    expect(response.statusCode).toBe(400);
   });
 
   it('preserves typed requests, results, and errors while polling', async () => {
@@ -89,7 +101,7 @@ describe('Phase 4 HTTP API', () => {
 
     for(const [url,payload] of [
       ['/v1/jobs/chat',{schemaVersion:1,agentId:'agent',message:'Review the selected file',fileRefs:[{artifactId:first}]}],
-      ['/v1/jobs/swarm',{schemaVersion:1,coordinatorAgentId:'agent',workerAgentIds:['worker'],objective:'Review the selected file',fileRefs:[{artifactId:first}]}],
+      ['/v1/jobs/swarm',{schemaVersion:1,coordinatorAgentId:'agent',workerAgentIds:['worker'],qualityAgentId:'quality',synthesizerAgentId:'synthesizer',objective:'Review the selected file',fileRefs:[{artifactId:first}]}],
       ['/v1/jobs/orchestration',{schemaVersion:1,orchestratorAgentId:'agent',agentIds:['worker'],objective:'Review the selected file',fileRefs:[{artifactId:first}]}],
     ] as const)expect((await app.inject({method:'POST',url,headers:auth(),payload})).statusCode).toBe(202);
   });
@@ -115,7 +127,7 @@ describe('Phase 4 HTTP API', () => {
     };
     const { app, sdk, store } = await fixture({
       authenticate,
-      catalog: { list: () => [{ id: 'agent', version: '1', allowedWorkloads: ['run'] }] },
+      catalog: { list: async () => [{ id: 'agent', version: '1', allowedWorkloads: ['run'] }] },
     });
     const job = await sdk.submitRun(actor, { schemaVersion: 1, agentId: 'agent', goal: 'admin view' });
     store.jobRows.set(job.id, { ...job, state: 'running' });
@@ -204,6 +216,18 @@ describe('Phase 4 HTTP API', () => {
     const readiness = await app.inject({ method: 'GET', url: '/health/ready' });
     expect(readiness.statusCode).toBe(503);
     expect(readiness.json()).toEqual(publicError('not_ready', 'Service is not ready.', true));
+  });
+
+  it('documents bearer authentication for protected routes only', async () => {
+    const { app } = await fixture();
+    const response = await app.inject({ method: 'GET', url: '/docs/json' });
+    expect(response.statusCode).toBe(200);
+    const document = response.json<{ security: unknown; paths: Record<string, Record<string, { security?: unknown }>> }>();
+    expect(document.security).toEqual([{ bearerAuth: [] }]);
+    expect(document.paths['/v1/agents']?.get?.security).toBeUndefined();
+    expect(document.paths['/v1/jobs']?.get?.security).toBeUndefined();
+    expect(document.paths['/health/live']?.get?.security).toEqual([]);
+    expect(document.paths['/health/ready']?.get?.security).toEqual([]);
   });
 
   it('preserves sanitized framework status codes for parsing, payload, and rate limits', async () => {

@@ -10,7 +10,7 @@ export class ServiceSdk {
   constructor(private readonly deps: ServiceSdkDependencies) {}
   submitRun(actor: ServiceActor, request: RunRequest, options?: SubmissionOptions) { return this.submit(actor, 'run', normalizeFileRefs(request), [request.agentId], options); }
   submitChat(actor: ServiceActor, request: ChatRequest, options?: SubmissionOptions) { return this.submit(actor, 'chat', normalizeFileRefs(request), [request.agentId], options); }
-  submitSwarmRun(actor: ServiceActor, request: SwarmRunRequest, options?: SubmissionOptions) { return this.submit(actor, 'swarm', normalizeFileRefs(request), [request.coordinatorAgentId, ...request.workerAgentIds], options); }
+  submitSwarmRun(actor: ServiceActor, request: SwarmRunRequest, options?: SubmissionOptions) { return this.submit(actor, 'swarm', normalizeFileRefs(request), [request.coordinatorAgentId, ...request.workerAgentIds, request.qualityAgentId, request.synthesizerAgentId], options); }
   submitOrchestratedRun(actor: ServiceActor, request: OrchestratedRunRequest, options?: SubmissionOptions) { return this.submit(actor, 'orchestration', normalizeFileRefs(request), [request.orchestratorAgentId, ...request.agentIds], options); }
   async getJob(actor: ServiceActor, jobId: string) { await this.authorize(actor, 'get'); return this.owned(actor, jobId); }
   async listJobs(actor:ServiceActor,options:JobListOptions={}) { await this.authorize(actor,'list');return this.deps.persistence.jobs.listOwned(actor,bounds(options)); }

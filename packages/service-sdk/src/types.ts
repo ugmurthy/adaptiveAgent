@@ -8,7 +8,7 @@ export interface AgentProfileRef { agentId: string; version: string; contentHash
 export interface ServiceFileRef { artifactId: string }
 export interface RunRequest { schemaVersion: 1; agentId: string; goal: string; input?: JsonValue; fileRefs?: ServiceFileRef[] }
 export interface ChatRequest { schemaVersion: 1; agentId: string; message: string; conversationId?: string; fileRefs?: ServiceFileRef[] }
-export interface SwarmRunRequest { schemaVersion: 1; coordinatorAgentId: string; workerAgentIds: string[]; objective: string; fileRefs?: ServiceFileRef[] }
+export interface SwarmRunRequest { schemaVersion: 1; coordinatorAgentId: string; workerAgentIds: string[]; qualityAgentId: string; synthesizerAgentId: string; objective: string; fileRefs?: ServiceFileRef[] }
 export interface OrchestratedRunRequest { schemaVersion: 1; orchestratorAgentId: string; agentIds: string[]; objective: string; fileRefs?: ServiceFileRef[] }
 export type ServiceJobRequest = RunRequest | ChatRequest | SwarmRunRequest | OrchestratedRunRequest;
 export interface SubmissionOptions { idempotencyKey?: string }

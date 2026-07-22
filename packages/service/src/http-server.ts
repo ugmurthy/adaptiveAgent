@@ -12,7 +12,7 @@ export interface ArtifactDownloader {
   download(actor:ServiceActor,jobId:string,artifactId:string):Promise<{metadata:{filename:string;mediaType:string;byteSize:number};data:Uint8Array}>;
   downloadQuarantined(actor:ServiceActor,jobId:string,artifactId:string):Promise<{metadata:{filename:string;mediaType:string;byteSize:number};data:Uint8Array}>;
 }
-export interface HttpServerOptions { sdk: ServiceSdk; authenticate: HttpAuthenticator; catalog?:{list():Array<{id:string;version:string;allowedWorkloads:readonly string[]}>}; artifacts?:ArtifactDownloader; eventBus?:EventBus; ready?: () => Promise<boolean>; ensureActor?: (actor: ServiceActor) => Promise<void>; logger?: boolean | object; bodyLimit?: number; rateLimit?: number; ws?:{maxConnections?:number;maxConnectionsPerUser?:number;maxMessageBytes?:number;maxBufferedBytes?:number;heartbeatMs?:number} }
+export interface HttpServerOptions { sdk: ServiceSdk; authenticate: HttpAuthenticator; catalog?:{list(onRejected?: (entry:{id:string;version:string;configPath:string;allowedWorkloads:readonly string[]},error:unknown)=>void):Promise<Array<{id:string;version:string;allowedWorkloads:readonly string[]}>>|Array<{id:string;version:string;allowedWorkloads:readonly string[]}>}; artifacts?:ArtifactDownloader; eventBus?:EventBus; ready?: () => Promise<boolean>; ensureActor?: (actor: ServiceActor) => Promise<void>; logger?: boolean | object; bodyLimit?: number; rateLimit?: number; ws?:{maxConnections?:number;maxConnectionsPerUser?:number;maxMessageBytes?:number;maxBufferedBytes?:number;heartbeatMs?:number} }
 const text = { type:'string', minLength:1, maxLength:10_000 } as const;
 const id = { type:'string', minLength:1, maxLength:200 } as const;
 const version = { type:'integer', const:1 } as const;
@@ -23,7 +23,7 @@ const headers = { type:'object', properties:{ authorization:{type:'string',minLe
 const fileRef = { type:'object', additionalProperties:false, required:['artifactId'], properties:{artifactId:{type:'string',format:'uuid',pattern:'^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'}} } as const;
 const run = { type:'object', additionalProperties:false, required:['schemaVersion','agentId','goal'], properties:{schemaVersion:version,agentId:id,goal:text,input:{},fileRefs:{type:'array',minItems:1,maxItems:100,uniqueItems:true,items:fileRef}} } as const;
 const chat = { type:'object', additionalProperties:false, required:['schemaVersion','agentId','message'], properties:{schemaVersion:version,agentId:id,message:text,conversationId:id,fileRefs:{type:'array',minItems:1,maxItems:100,uniqueItems:true,items:fileRef}} } as const;
-const swarm = { type:'object', additionalProperties:false, required:['schemaVersion','coordinatorAgentId','workerAgentIds','objective'], properties:{schemaVersion:version,coordinatorAgentId:id,workerAgentIds:{type:'array',minItems:1,maxItems:100,uniqueItems:true,items:id},objective:text,fileRefs:{type:'array',minItems:1,maxItems:100,uniqueItems:true,items:fileRef}} } as const;
+const swarm = { type:'object', additionalProperties:false, required:['schemaVersion','coordinatorAgentId','workerAgentIds','qualityAgentId','synthesizerAgentId','objective'], properties:{schemaVersion:version,coordinatorAgentId:id,workerAgentIds:{type:'array',minItems:1,maxItems:100,uniqueItems:true,items:id},qualityAgentId:id,synthesizerAgentId:id,objective:text,fileRefs:{type:'array',minItems:1,maxItems:100,uniqueItems:true,items:fileRef}} } as const;
 const orchestration = { type:'object', additionalProperties:false, required:['schemaVersion','orchestratorAgentId','agentIds','objective'], properties:{schemaVersion:version,orchestratorAgentId:id,agentIds:{type:'array',minItems:1,maxItems:100,uniqueItems:true,items:id},objective:text,fileRefs:{type:'array',minItems:1,maxItems:100,uniqueItems:true,items:fileRef}} } as const;
 const accepted = { type:'object', additionalProperties:false, required:['schemaVersion','jobId'], properties:{schemaVersion:version,jobId:id} } as const;
 const profile = { type:'object', additionalProperties:false, required:['agentId','version','contentHash'], properties:{agentId:id,version:id,contentHash:id} } as const;
@@ -39,13 +39,13 @@ const errors = { 400:errorResponse,401:errorResponse,403:errorResponse,404:error
 export async function buildHttpServer(options: HttpServerOptions): Promise<FastifyInstance> {
   const app = Fastify({ logger: options.logger ?? true, bodyLimit: options.bodyLimit ?? 1024*1024, requestIdHeader:'x-request-id', ajv:{customOptions:{removeAdditional:false}} });
   const actors = new WeakMap<FastifyRequest,ServiceActor>();
-  await app.register(swagger, { openapi:{ info:{title:'Adaptive Agent Service',version:'1.0.0'}, components:{securitySchemes:{bearerAuth:{type:'http',scheme:'bearer',bearerFormat:'JWT'}}} } });
+  await app.register(swagger, { openapi:{ info:{title:'Adaptive Agent Service',version:'1.0.0'}, security:[{bearerAuth:[]}], components:{securitySchemes:{bearerAuth:{type:'http',scheme:'bearer',bearerFormat:'JWT'}}} } });
   await app.register(swaggerUi, { routePrefix:'/docs' });
   await app.register(rateLimit, { global:true, max:options.rateLimit ?? 100, timeWindow:'1 minute', allowList:(request)=>request.url.startsWith('/health/') });
   await app.register(websocket,{options:{maxPayload:options.ws?.maxMessageBytes??64*1024,handleProtocols:(protocols:Set<string>)=>protocols.has('adaptive-agent')?'adaptive-agent':false}});
-  app.get('/', async () => ({service:'adaptive-agent',schemaVersion:1,docs:'/docs'}));
-  app.get('/health/live', async () => ({status:'ok'}));
-  app.get('/health/ready', async (_req, reply) => (await (options.ready?.() ?? true)) ? {status:'ready'} : reply.code(503).send(httpError('not_ready','Service is not ready.',true)));
+  app.get('/', {schema:{security:[]}}, async () => ({service:'adaptive-agent',schemaVersion:1,docs:'/docs'}));
+  app.get('/health/live', {schema:{security:[]}}, async () => ({status:'ok'}));
+  app.get('/health/ready', {schema:{security:[]}}, async (_req, reply) => (await (options.ready?.() ?? true)) ? {status:'ready'} : reply.code(503).send(httpError('not_ready','Service is not ready.',true)));
   app.addHook('onRequest', async (request, reply) => {
     if (!request.url.startsWith('/v1/')) return;
     let verified:ServiceActor;
@@ -57,7 +57,18 @@ export async function buildHttpServer(options: HttpServerOptions): Promise<Fasti
   const actor=(r:FastifyRequest)=>actors.get(r)!;
   const idem=(r:FastifyRequest)=>({idempotencyKey:r.headers['idempotency-key'] as string|undefined});
   const submissionResponse=(job:{id:string})=>({schemaVersion:1,jobId:job.id});
-  app.get('/v1/agents',async()=>({items:options.catalog?.list()??[]}));
+  app.get('/v1/agents',async request=>{
+    const items=options.catalog?await options.catalog.list((entry,error)=>request.log.warn({
+      agentId:entry.id,
+      agentVersion:entry.version,
+      allowedWorkloads:entry.allowedWorkloads,
+      configPath:entry.configPath,
+      errorType:error instanceof Error?error.name:'UnknownError',
+      errorMessage:error instanceof Error?error.message:String(error),
+    },'agent profile omitted from GET /v1/agents response')):[];
+    if(items.length===0)request.log.warn({catalogConfigured:Boolean(options.catalog)},'GET /v1/agents returned no selectable agent profiles');
+    return {items};
+  });
   app.get('/v1/jobs',{schema:{querystring:{type:'object',additionalProperties:false,properties:{kind:{type:'string',enum:['run','chat','swarm','orchestration']},state:{type:'string'},limit:{type:'integer',minimum:1,maximum:200,default:50},offset:{type:'integer',minimum:0,default:0}}}}},r=>options.sdk.listJobs(actor(r),r.query as any));
   const submit = (path:string, body:object, invoke:(a:ServiceActor,b:any,o:any)=>Promise<any>) => app.post(path,{schema:{body,headers,response:{202:accepted,...errors},security:[{bearerAuth:[]}]}},async(r,reply)=>reply.code(202).send(submissionResponse(await invoke(actor(r),r.body,idem(r)))));
   submit('/v1/jobs/run',run,(a,b,o)=>options.sdk.submitRun(a,b,o));
@@ -148,9 +159,9 @@ function publicWsError(code:string){return {schemaVersion:1,code,message:code===
 function validateWsSubmission(kind:unknown,value:unknown):Record<string,unknown> {
   if(!value||typeof value!=='object'||Array.isArray(value)||!['run','chat','swarm','orchestration'].includes(String(kind)))throw new Error();
   const body=value as Record<string,unknown>;
-  const allowed=kind==='run'?['schemaVersion','agentId','goal','input','fileRefs']:kind==='chat'?['schemaVersion','agentId','message','conversationId','fileRefs']:kind==='swarm'?['schemaVersion','coordinatorAgentId','workerAgentIds','objective','fileRefs']:['schemaVersion','orchestratorAgentId','agentIds','objective','fileRefs'];
+  const allowed=kind==='run'?['schemaVersion','agentId','goal','input','fileRefs']:kind==='chat'?['schemaVersion','agentId','message','conversationId','fileRefs']:kind==='swarm'?['schemaVersion','coordinatorAgentId','workerAgentIds','qualityAgentId','synthesizerAgentId','objective','fileRefs']:['schemaVersion','orchestratorAgentId','agentIds','objective','fileRefs'];
   if(Object.keys(body).some(key=>!allowed.includes(key))||body.schemaVersion!==1)throw new Error();
-  const strings=kind==='run'?['agentId','goal']:kind==='chat'?['agentId','message']:kind==='swarm'?['coordinatorAgentId','objective']:['orchestratorAgentId','objective'];
+  const strings=kind==='run'?['agentId','goal']:kind==='chat'?['agentId','message']:kind==='swarm'?['coordinatorAgentId','qualityAgentId','synthesizerAgentId','objective']:['orchestratorAgentId','objective'];
   for(const key of strings)requiredString(body[key]);
   if(body.fileRefs!==undefined)requiredFileRefs(body.fileRefs);
   if(kind==='chat'&&body.conversationId!==undefined)requiredString(body.conversationId);

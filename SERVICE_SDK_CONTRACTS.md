@@ -96,6 +96,8 @@ interface SwarmRunRequestV1 {
   schemaVersion: 1;
   coordinatorAgentId: string;
   workerAgentIds: string[];
+  qualityAgentId: string;
+  synthesizerAgentId: string;
   objective: string;
 }
 
@@ -106,6 +108,8 @@ interface OrchestratedRunRequestV1 {
   objective: string;
 }
 ```
+
+Swarm submissions require all four execution roles to be assigned explicitly: one coordinator, one or more workers, one quality agent, and one synthesizer agent. Omitting either finalizer role is a breaking request-validation error.
 
 Agent IDs are allowlisted public IDs. Clients cannot provide config paths, model credentials, model overrides, instructions, tool lists, delegates, workspace roots, runtime modes, or approval defaults. Jobs persist only agent IDs, profile versions, and content hashes; the agent spec remains the source of truth.
 

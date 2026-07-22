@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -123,6 +123,9 @@ describe('private artifact management',()=>{
     expect(prepared.modelContext).toContain('- report.md (a1): inputs/a1/report.md');
     expect(prepared.modelContext).not.toContain('private report');
     expect(repository.materializationAudits).toEqual([{artifactId:'a1',allowed:true}]);
+
+    await new ArtifactWorkspacePolicy(manager).close(inputJob,{root,artifacts});
+    await expect(lstat(root)).rejects.toMatchObject({code:'ENOENT'});
   });
 
   it('rejects corrupt bound bytes as a deterministic input failure',async()=>{

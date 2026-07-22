@@ -6,10 +6,67 @@ import type { QueueRoutes } from './queue.js';
 
 const SENSITIVE_ENV_NAME = /(?:^|_)(?:API_KEY|ACCESS_KEY(?:_ID)?|SECRET(?:_ACCESS_KEY)?|PASSWORD|PASSWD|TOKEN|PRIVATE_KEY|CREDENTIALS?|AUTHORIZATION|COOKIE)(?:_|$)/i;
 
+export type ServiceLogFields = Record<string, unknown>;
+export interface ServiceLogger {
+  debug(event: string, fields?: ServiceLogFields): void;
+  info(event: string, fields?: ServiceLogFields): void;
+  warn(event: string, fields?: ServiceLogFields): void;
+  error(event: string, fields?: ServiceLogFields, error?: unknown): void;
+}
+
+export function createServiceLogger(program: string, env: NodeJS.ProcessEnv = process.env): ServiceLogger {
+  const configuredLevel = env.SERVICE_LOG_LEVEL ?? env.HTTP_LOG_LEVEL ?? 'info';
+  const levels = ['debug', 'info', 'warn', 'error', 'silent'] as const;
+  const threshold = levels.includes(configuredLevel as typeof levels[number]) ? levels.indexOf(configuredLevel as typeof levels[number]) : levels.indexOf('info');
+  const write = (level: Exclude<typeof levels[number], 'silent'>, event: string, fields: ServiceLogFields = {}, error?: unknown) => {
+    if (levels.indexOf(level) < threshold) return;
+    const errorFields = error === undefined ? {} : {
+      errorType: error instanceof Error ? error.name : 'UnknownError',
+      message: error instanceof Error ? error.message : String(error),
+      ...(configuredLevel === 'debug' && error instanceof Error && error.stack ? { stack: error.stack } : {}),
+    };
+    const record = JSON.stringify({ ...fields, timestamp: new Date().toISOString(), level, type: `service.${event}`, program, ...errorFields });
+    if (level === 'error') console.error(record);
+    else if (level === 'warn') console.warn(record);
+    else console.info(record);
+  };
+  return {
+    debug: (event, fields) => write('debug', event, fields),
+    info: (event, fields) => write('info', event, fields),
+    warn: (event, fields) => write('warn', event, fields),
+    error: (event, fields, error) => write('error', event, fields, error),
+  };
+}
+
 export function printEnvironmentIfRequested(program: string, env: NodeJS.ProcessEnv = process.env): void {
   if (env.PRINT_ENV_VARS !== '1') return;
   const variables = Object.fromEntries(Object.entries(env).sort(([left], [right]) => left.localeCompare(right)).map(([name, value]) => [name, printableEnvValue(name, value ?? '')]));
   console.info(JSON.stringify({ type: 'service.environment', program, variables }));
+}
+
+export function reportStartupError(program: string, error: unknown): void {
+  const errors = error instanceof AggregateError && error.errors.length > 0 ? error.errors : [error];
+  for (const item of errors) {
+    console.error(JSON.stringify({
+      type: 'service.startup_error',
+      program,
+      errorType: item instanceof Error ? item.name : 'UnknownError',
+      message: item instanceof Error ? item.message : String(item),
+    }));
+  }
+}
+
+export function reportAgentProfileWarning(program: string, entry: {id:string;version:string;configPath:string}, error: unknown): void {
+  console.warn(JSON.stringify({
+    type: 'service.agent_profile_warning',
+    level: 'warning',
+    program,
+    agentId: entry.id,
+    agentVersion: entry.version,
+    configPath: entry.configPath,
+    errorType: error instanceof Error ? error.name : 'UnknownError',
+    message: error instanceof Error ? error.message : String(error),
+  }));
 }
 
 function printableEnvValue(name: string, value: string): string {

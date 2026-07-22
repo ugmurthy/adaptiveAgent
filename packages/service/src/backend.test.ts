@@ -2,6 +2,7 @@ import type { ServiceJob } from '@adaptive-agent/service-sdk';
 import { describe, expect, it, vi } from 'vitest';
 
 import { AgentSdkWorkloadExecutor } from './agent-executor.js';
+import { createServiceLogger, type ServiceLogger } from './composition.js';
 import { ServiceBackendStore, type ClaimedJob } from './postgres.js';
 import { queueJobId, type ServiceQueuePayload } from './queue.js';
 import { AgentWorker, type AgentWorkerStore, type WorkloadExecutor } from './worker.js';
@@ -12,6 +13,26 @@ describe('queue contract', () => {
     expect(queueJobId('job:unsafe', 7)).not.toContain(':');
     const payload: ServiceQueuePayload = { jobId: 'job-1' };
     expect(Object.keys(payload)).toEqual(['jobId']);
+  });
+});
+
+describe('service logging', () => {
+  it('emits structured info and errors while keeping batch details at debug', () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const logger = createServiceLogger('agent-worker', { SERVICE_LOG_LEVEL: 'info' });
+      logger.debug('batch_completed', { count: 2 });
+      logger.info('process_ready');
+      logger.error('job_failed', { jobId: 'job-1' }, new Error('provider timed out'));
+
+      expect(info).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(String(info.mock.calls[0][0]))).toMatchObject({ level: 'info', type: 'service.process_ready', program: 'agent-worker' });
+      expect(JSON.parse(String(error.mock.calls[0][0]))).toMatchObject({ level: 'error', type: 'service.job_failed', program: 'agent-worker', jobId: 'job-1', errorType: 'Error', message: 'provider timed out' });
+    } finally {
+      info.mockRestore();
+      error.mockRestore();
+    }
   });
 });
 
@@ -111,6 +132,46 @@ describe('AgentWorker redelivery handling', () => {
       message: 'Agent execution failed.',
       retryable: true,
     });
+  });
+
+  it('logs failed execution context and run correlation without request payloads', async () => {
+    const claim = sampleClaim();
+    const store = workerStore({ action: 'process', claim });
+    const executor = workloadExecutor({
+      state: 'failed',
+      error: { schemaVersion: 1, code: 'provider_failed', message: 'provider timed out', retryable: true },
+      runs: [{ runId: 'run-1', role: 'root' }],
+    });
+    const logger = testLogger();
+    const worker = new AgentWorker(store, executor, logger);
+
+    await worker.process({ jobId: claim.job.id });
+
+    expect(logger.error).toHaveBeenCalledWith('job_failed', expect.objectContaining({
+      jobId: claim.job.id,
+      sessionId: claim.job.sessionId,
+      errorCode: 'provider_failed',
+      runs: [{ runId: 'run-1', role: 'root' }],
+    }), 'provider timed out');
+    expect(JSON.stringify(logger.error.mock.calls)).not.toContain('"goal":"test"');
+  });
+
+  it('logs thrown executor failures before attempting to persist them', async () => {
+    const claim = sampleClaim();
+    const store = workerStore({ action: 'process', claim });
+    store.complete.mockRejectedValue(new Error('database unavailable'));
+    const executor = workloadExecutor();
+    executor.execute.mockRejectedValue(new Error('workspace setup failed'));
+    const logger = testLogger();
+    const worker = new AgentWorker(store, executor, logger);
+
+    await expect(worker.process({ jobId: claim.job.id })).rejects.toThrow('database unavailable');
+
+    expect(logger.error).toHaveBeenCalledWith('job_failed', expect.objectContaining({
+      jobId: claim.job.id,
+      sessionId: claim.job.sessionId,
+      errorCode: 'worker_execution_failed',
+    }), expect.objectContaining({ message: 'workspace setup failed' }));
   });
 });
 
@@ -275,4 +336,8 @@ function workloadExecutor(outcome: import('./worker.js').ExecutionOutcome = { st
     execute: vi.fn(async () => outcome),
     close: vi.fn(async () => undefined),
   };
+}
+
+function testLogger(): ServiceLogger & Record<'debug' | 'info' | 'warn' | 'error', ReturnType<typeof vi.fn>> {
+  return { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
 }

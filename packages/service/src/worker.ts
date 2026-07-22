@@ -1,4 +1,5 @@
 import type { JobRunRole, JobState, JsonValue, ServiceError, ServiceResult } from '@adaptive-agent/service-sdk';
+import type { ServiceLogger } from './composition.js';
 import type { ClaimedJob, ClaimResult } from './postgres.js';
 
 export interface ExecutionOutcome {
@@ -23,7 +24,7 @@ export interface AgentWorkerStore {
 export class AgentWorker {
   private stopping = false;
   private readonly active = new Set<Promise<void>>();
-  constructor(private readonly store: AgentWorkerStore, private readonly executor: WorkloadExecutor) {}
+  constructor(private readonly store: AgentWorkerStore, private readonly executor: WorkloadExecutor, private readonly logger?: ServiceLogger) {}
 
   async process(payload: { jobId: string }): Promise<void> {
     if (this.stopping) throw new Error('Worker is shutting down');
@@ -42,15 +43,25 @@ export class AgentWorker {
     const claimed = await this.store.claim(jobId);
     if (claimed.action === 'ack') return;
     const { job } = claimed.claim;
+    const context = { jobId: job.id, tenantId: job.tenantId, sessionId: job.sessionId, kind: job.kind, command: claimed.claim.command.kind, commandVersion: claimed.claim.commandVersion };
+    this.logger?.info('job_started', context);
     try {
       const outcome = await this.executor.execute(claimed.claim);
       for (const run of outcome.runs ?? []) await this.store.link(job.id, run.runId, run.role);
       if (outcome.deferred) {
         await this.store.defer(claimed.claim, outcome.state);
+        this.logger?.info('job_deferred', { ...context, state: outcome.state });
         return;
       }
       await this.store.complete(claimed.claim, outcome.state, outcome.result, outcome.error ? toPublicServiceError(outcome.error) : undefined);
+      const runs = outcome.runs?.map(({ runId, role }) => ({ runId, role }));
+      if (outcome.state === 'failed') {
+        this.logger?.error('job_failed', { ...context, errorCode: outcome.error?.code ?? 'agent_execution_failed', runs }, outcome.error?.message ?? 'Agent execution failed');
+      } else {
+        this.logger?.info('job_completed', { ...context, state: outcome.state, runs });
+      }
     } catch (error) {
+      this.logger?.error('job_failed', { ...context, errorCode: isServiceError(error) ? safeCode(error.code) : 'worker_execution_failed' }, error);
       await this.store.complete(claimed.claim, 'failed', undefined, toPublicServiceError(error));
       throw error;
     }

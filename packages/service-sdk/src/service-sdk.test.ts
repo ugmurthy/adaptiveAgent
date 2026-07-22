@@ -41,12 +41,13 @@ describe('ServiceSdk', () => {
     const jobs = await Promise.all([
       sdk.submitRun(actor, { schemaVersion: 1, agentId: 'a', goal: 'g' }),
       sdk.submitChat(actor, { schemaVersion: 1, agentId: 'a', message: 'm' }),
-      sdk.submitSwarmRun(actor, { schemaVersion: 1, coordinatorAgentId: 'c', workerAgentIds: ['w'], objective: 'o' }),
+      sdk.submitSwarmRun(actor, { schemaVersion: 1, coordinatorAgentId: 'c', workerAgentIds: ['w'], qualityAgentId: 'q', synthesizerAgentId: 's', objective: 'o' }),
       sdk.submitOrchestratedRun(actor, { schemaVersion: 1, orchestratorAgentId: 'o', agentIds: ['a'], objective: 'x' }),
     ]);
 
     expect(jobs.map((job) => job.kind)).toEqual(['run', 'chat', 'swarm', 'orchestration']);
     expect(jobs.every((job) => job.sessionId && job.profiles.every((profile) => !('model' in profile)))).toBe(true);
+    expect(jobs[2]?.profiles.map((profile) => profile.agentId)).toEqual(['c', 'w', 'q', 's']);
     expect(store.outboxRows).toHaveLength(4);
   });
 

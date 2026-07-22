@@ -274,10 +274,16 @@ export class AgentSdkWorkloadExecutor implements WorkloadExecutor {
 
   private async createSwarm(job: ServiceJob, coordinatorSdk: AgentSdk, workspaceRoot: string): Promise<SwarmSdk> {
     const request = job.request as SwarmRunRequest;
-    const workers = await Promise.all(request.workerAgentIds.map((id) => this.resolveConfig(job, id, workspaceRoot)));
+    const [workers, qualityConfig, synthesizerConfig] = await Promise.all([
+      Promise.all(request.workerAgentIds.map((id) => this.resolveConfig(job, id, workspaceRoot))),
+      this.resolveConfig(job, request.qualityAgentId ?? request.coordinatorAgentId, workspaceRoot),
+      this.resolveConfig(job, request.synthesizerAgentId ?? request.coordinatorAgentId, workspaceRoot),
+    ]);
     return SwarmSdk.create({
       coordinatorSdk,
       workerConfigs: workers,
+      qualityConfig,
+      synthesizerConfig,
       runtime: this.bootstrap.created.runtime,
       maxWorkers: this.maxSubtasks,
     });
@@ -297,7 +303,6 @@ export class AgentSdkWorkloadExecutor implements WorkloadExecutor {
     const profile = job.profiles.find((candidate) => candidate.agentId === id);
     if (!profile) throw new Error(`Agent ${id} is not pinned to service job ${job.id}`);
     const { config } = await this.registry.resolvePinned(profile, job.kind);
-    if (config.agent.tools.includes('shell_exec')) throw new Error(`Agent ${id} cannot use shell_exec in the shared service worker`);
     return { ...config, agent: { ...config.agent, workspaceRoot } };
   }
 
