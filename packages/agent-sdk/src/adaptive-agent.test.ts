@@ -591,7 +591,8 @@ describe('adaptive-agent cli parsing', () => {
   });
 
   it('parses install workflow commands', () => {
-    expect(parseCliArgs(['--version'])).toMatchObject({ command: 'version' });
+    expect(parseCliArgs(['--version'])).toMatchObject({ command: 'version', output: 'pretty' });
+    expect(parseCliArgs(['--version', '--output', 'json'])).toMatchObject({ command: 'version', output: 'json' });
     expect(parseCliArgs([
       'init',
       '--provider', 'mesh',
@@ -638,6 +639,25 @@ describe('adaptive-agent cli parsing', () => {
       dryRun: true,
       output: 'json',
     });
+  });
+
+  it('honors JSON output for the version command', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      await expect(main(['--version', '--output', 'json'])).resolves.toBe(0);
+
+      const output = String(log.mock.calls[0]?.[0]);
+      expect(JSON.parse(output)).toMatchObject({
+        name: 'adaptive-agent',
+        version: expect.any(String),
+        target: expect.any(String),
+        repository: expect.any(String),
+      });
+      expect(output).toContain('\n  "version":');
+    } finally {
+      log.mockRestore();
+    }
   });
 
   it('returns success for init when bundled defaults already exist', async () => {

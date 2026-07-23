@@ -51,7 +51,10 @@ printf '%s\n' '{"version":1,"id":"smoke-hello","type":"hello"}' | "$runtime_bina
 rm -f "$runtime_binary"
 tar -xzf "$runtime_asset" -C "$tmp_dir"
 [ -x "$runtime_binary" ] || fail "runtime-only asset does not contain executable agent-runtime"
-printf '%s\n' '{"version":1,"id":"runtime-smoke-hello","type":"hello"}' | "$runtime_binary" | grep '"id":"runtime-smoke-hello"' >/dev/null
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":"runtime-smoke-init","method":"initialize","params":{"protocolVersion":"1.10","clientInfo":{"name":"release-smoke"}}}' \
+  '{"jsonrpc":"2.0","id":"runtime-smoke-version","method":"cli/execute","params":{"argv":["--version"]}}' \
+  | "$runtime_binary" | grep '"id":"runtime-smoke-version".*"exitCode":0' >/dev/null
 ADAPTIVE_AGENT_HOME="$home_dir" "$binary" init --dry-run --yes --cwd "$cwd_dir" >/dev/null
 ADAPTIVE_AGENT_HOME="$home_dir" "$binary" init --yes --cwd "$cwd_dir" >/dev/null
 ADAPTIVE_AGENT_HOME="$home_dir" "$binary" doctor --cwd "$cwd_dir" --output json >/dev/null || true

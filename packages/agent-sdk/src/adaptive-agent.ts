@@ -640,7 +640,10 @@ const VERSION_HELP_TEXT = `adaptive-agent --version
 Print adaptive-agent version.
 
 Usage:
-  adaptive-agent --version`;
+  adaptive-agent --version [--output <format>]
+
+Options:
+  --output <format>       Output format: pretty, json, or jsonl. Default: pretty.`;
 
 function getHelpText(topic?: ManualTestCliOptions['helpTopic']): string {
   switch (topic) {
@@ -724,7 +727,7 @@ export async function main(argv = Bun.argv.slice(2)): Promise<number> {
   }
 
   if (cli.command === 'version') {
-    console.log(renderVersion(getVersionInfo()));
+    console.log(renderVersion(getVersionInfo(), cli.output));
     return 0;
   }
 

@@ -26,7 +26,13 @@ export function getVersionInfo(env: NodeJS.ProcessEnv = process.env): VersionInf
   };
 }
 
-export function renderVersion(info: VersionInfo = getVersionInfo()): string {
+export function renderVersion(
+  info: VersionInfo = getVersionInfo(),
+  output: 'pretty' | 'json' | 'jsonl' = 'pretty',
+): string {
+  if (output === 'json') return JSON.stringify(info, null, 2);
+  if (output === 'jsonl') return JSON.stringify(info);
+
   const version = info.commit && !info.version.includes('+') ? `${info.version}+${info.commit}` : info.version;
   const lines = [`${info.name} ${version}`];
   if (info.commit) lines.push(`commit: ${info.commit}`);
