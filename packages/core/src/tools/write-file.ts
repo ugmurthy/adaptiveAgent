@@ -43,6 +43,7 @@ export type SupportedPandocOutputFormat = 'docx' | 'pptx' | 'latex';
 
 const DEFAULT_INPUT_FORMAT = 'markdown';
 const INTERMEDIATE_DIR = 'tmp/write-file-conversions';
+const RAW_TEXT_OUTPUT_FORMATS = new Set(['txt', 'plain', 'md', 'markdown']);
 const SUPPORTED_PANDOC_OUTPUT_FORMATS = new Set<SupportedPandocOutputFormat>(['docx', 'pptx', 'latex']);
 const DEFERRED_OUTPUT_FORMATS = new Set(['pdf', 'xlsx']);
 const INTERMEDIATE_EXTENSION_BY_INPUT_FORMAT: Record<string, string> = {
@@ -68,7 +69,7 @@ export function createWriteFileTool(config?: WriteFileToolConfig): ToolDefinitio
   return {
     name: 'write_file',
     description:
-      'Write text content to a file at the given path, optionally converting Markdown/text content to docx, pptx, or latex with pandoc. Creates parent directories if needed. Requires approval.',
+      'Write UTF-8 text content to a file at the given path. For plain text or Markdown, omit outputFormat; txt, plain, md, and markdown are accepted aliases that write content unchanged. Optionally converts content to docx, pptx, or latex with pandoc. Creates parent directories if needed. Requires approval.',
     inputSchema: {
       type: 'object',
       required: ['path', 'content'],
@@ -78,16 +79,16 @@ export function createWriteFileTool(config?: WriteFileToolConfig): ToolDefinitio
         content: { type: 'string', description: 'Text content to write to the file.' },
         inputFormat: {
           type: 'string',
-          description: 'Optional pandoc input format used when outputFormat is provided. Defaults to markdown.',
+          description: 'Optional pandoc input format used for docx, pptx, or latex conversion. Defaults to markdown.',
         },
         outputFormat: {
           type: 'string',
-          enum: ['docx', 'pptx', 'latex', 'pdf', 'xlsx'],
-          description: 'Optional output format. Supports docx, pptx, and latex. pdf and xlsx are deferred and rejected clearly.',
+          enum: ['txt', 'plain', 'md', 'markdown', 'docx', 'pptx', 'latex'],
+          description: 'Optional output format. Omit for normal UTF-8 writes. txt, plain, md, and markdown write content unchanged; docx, pptx, and latex convert with pandoc.',
         },
         keepIntermediate: {
           type: 'boolean',
-          description: 'Whether to keep the temporary source file under tmp/write-file-conversions. Defaults to true.',
+          description: 'For pandoc conversion, whether to keep the temporary source file under tmp/write-file-conversions. Defaults to true.',
         },
       },
     },
@@ -125,8 +126,11 @@ export function createWriteFileTool(config?: WriteFileToolConfig): ToolDefinitio
       }
 
       const resolved = resolvePathWithinRoot(allowedRoot, filePath);
+      const normalizedOutputFormat = typeof outputFormat === 'string'
+        ? outputFormat.trim().toLowerCase()
+        : '';
 
-      if (typeof outputFormat === 'string' && outputFormat.trim()) {
+      if (normalizedOutputFormat && !RAW_TEXT_OUTPUT_FORMATS.has(normalizedOutputFormat)) {
         const conversion = await writeConvertedFile({
           allowedRoot,
           resolvedOutputPath: resolved,

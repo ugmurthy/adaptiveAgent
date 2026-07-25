@@ -85,6 +85,38 @@ describe('createEditFileTool', () => {
     await expect(readFile(join(tempDir, 'file.txt'), 'utf8')).resolves.toBe('hello there');
   });
 
+  it('infers replace for an unambiguous oldText/newText edit', async () => {
+    await writeFile(join(tempDir, 'compiler.py'), 'def compile():\n    return False\n');
+
+    const tool = createEditFileTool({ allowedRoot: tempDir });
+    await tool.execute(
+      {
+        path: 'compiler.py',
+        edits: [{ oldText: 'return False', newText: 'return True' }],
+      } as any,
+      stubToolContext(),
+    );
+
+    await expect(readFile(join(tempDir, 'compiler.py'), 'utf8')).resolves.toBe(
+      'def compile():\n    return True\n',
+    );
+  });
+
+  it('reports the supported operation types for an unknown type', async () => {
+    await writeFile(join(tempDir, 'file.ts'), 'const enabled = false;\n');
+
+    const tool = createEditFileTool({ allowedRoot: tempDir });
+    await expect(
+      tool.execute(
+        {
+          path: 'file.ts',
+          edits: [{ type: 'update', oldText: 'false', newText: 'true' }],
+        } as any,
+        stubToolContext(),
+      ),
+    ).rejects.toThrow('supported types are "replace", "insert_after", and "insert_before"');
+  });
+
   it('applies multiple edits in order to in-memory content and writes once', async () => {
     await writeFile(join(tempDir, 'file.txt'), 'alpha\nbeta\n');
 

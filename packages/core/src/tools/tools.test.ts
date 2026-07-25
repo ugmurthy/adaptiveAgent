@@ -472,6 +472,27 @@ describe('createWriteFileTool', () => {
     expect(actual).toBe('deep');
   });
 
+  it.each([
+    ['md', 'article.md'],
+    ['markdown', 'article.md'],
+    ['txt', 'article.txt'],
+    ['plain', 'article.txt'],
+  ])('writes %s output as unchanged UTF-8 text without pandoc', async (outputFormat, path) => {
+    const convertWithPandoc = vi.fn();
+    const tool = createWriteFileTool({ allowedRoot: tempDir, convertWithPandoc });
+    const content = '# Heading\n\nFormatted **content**';
+
+    const result = (await tool.execute(
+      { path, content, inputFormat: 'markdown', outputFormat } as any,
+      stubToolContext(),
+    )) as any;
+
+    expect(result.path).toBe(join(tempDir, path));
+    expect(result.sizeBytes).toBe(Buffer.byteLength(content));
+    await expect(readFile(join(tempDir, path), 'utf-8')).resolves.toBe(content);
+    expect(convertWithPandoc).not.toHaveBeenCalled();
+  });
+
   it('normalizes alternate absolute write paths that clearly embed the workspace root name', async () => {
     const tool = createWriteFileTool({ allowedRoot: tempDir });
     const rebasedPath = join('/virtual/workspaces', tempDir.split('/').pop() ?? 'workspace', 'nested', 'file.txt');
@@ -616,6 +637,15 @@ describe('createWriteFileTool', () => {
     const tool = createWriteFileTool();
     expect(tool.name).toBe('write_file');
     expect(tool.requiresApproval).toBe(true);
+    expect((tool.inputSchema.properties?.outputFormat as any).enum).toEqual([
+      'txt',
+      'plain',
+      'md',
+      'markdown',
+      'docx',
+      'pptx',
+      'latex',
+    ]);
   });
 });
 

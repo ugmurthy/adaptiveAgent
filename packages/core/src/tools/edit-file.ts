@@ -28,6 +28,12 @@ type EditOperationInput =
       expectedMatches?: number;
     }
   | {
+      type?: undefined;
+      oldText: string;
+      newText: string;
+      expectedMatches?: number;
+    }
+  | {
       type: 'insert_after';
       anchorText: string;
       text: string;
@@ -90,7 +96,7 @@ export function createEditFileTool(config?: EditFileToolConfig): ToolDefinition 
   return {
     name: 'edit_file',
     description:
-      'Apply conservative text edits to an existing UTF-8 file. Supports exact replace and anchored insert operations. Requires approval.',
+      'Apply conservative text edits to any existing UTF-8 text or code file, regardless of file extension. Supports exact replace and anchored insert operations. Requires approval.',
     inputSchema: {
       type: 'object',
       required: ['path', 'edits'],
@@ -103,7 +109,8 @@ export function createEditFileTool(config?: EditFileToolConfig): ToolDefinition 
         edits: {
           type: 'array',
           minItems: 1,
-          description: 'Ordered edit operations. Each operation must match its expected match count or no write occurs.',
+          description:
+            'Ordered edit operations. Each operation must match its expected match count or no write occurs. For an oldText/newText replacement, type defaults to replace.',
           items: {
             oneOf: [
               {
@@ -112,6 +119,19 @@ export function createEditFileTool(config?: EditFileToolConfig): ToolDefinition 
                 additionalProperties: false,
                 properties: {
                   type: { type: 'string', enum: ['replace'] },
+                  oldText: { type: 'string', description: 'Exact text to replace. Must be non-empty.' },
+                  newText: { type: 'string', description: 'Replacement text. May be empty to delete oldText.' },
+                  expectedMatches: {
+                    type: 'number',
+                    description: 'Expected non-overlapping match count. Defaults to 1.',
+                  },
+                },
+              },
+              {
+                type: 'object',
+                required: ['oldText', 'newText'],
+                additionalProperties: false,
+                properties: {
                   oldText: { type: 'string', description: 'Exact text to replace. Must be non-empty.' },
                   newText: { type: 'string', description: 'Replacement text. May be empty to delete oldText.' },
                   expectedMatches: {
@@ -275,7 +295,10 @@ function normalizeEditOperation(value: unknown, index: number): NormalizedEditOp
 
   const edit = value as Record<string, unknown>;
   const expectedMatches = normalizeExpectedMatches(edit.expectedMatches, index);
-  switch (edit.type) {
+  const editType = edit.type === undefined && 'oldText' in edit && 'newText' in edit
+    ? 'replace'
+    : edit.type;
+  switch (editType) {
     case 'replace': {
       if (typeof edit.oldText !== 'string' || edit.oldText.length === 0) {
         throw new Error(`edit_file replace edit ${index} requires non-empty "oldText"`);
@@ -306,7 +329,9 @@ function normalizeEditOperation(value: unknown, index: number): NormalizedEditOp
       };
     }
     default:
-      throw new Error(`edit_file edit ${index} has unsupported type`);
+      throw new Error(
+        `edit_file edit ${index} has unsupported type ${JSON.stringify(edit.type)}; supported types are "replace", "insert_after", and "insert_before"`,
+      );
   }
 }
 

@@ -2542,6 +2542,58 @@ describe('AdaptiveAgent', () => {
     }
   });
 
+  it.each([
+    ['md', 'article.md'],
+    ['txt', 'article.txt'],
+  ])('accepts write_file outputFormat %s without invalid tool-call repair', async (outputFormat, path) => {
+    const tempDir = await mkdtemp(join(tmpdir(), 'adaptive-agent-write-text-'));
+    try {
+      const runStore = new InMemoryRunStore();
+      const eventStore = new InMemoryEventStore();
+      const snapshotStore = new InMemorySnapshotStore();
+      const model = new SequenceModel([
+        {
+          finishReason: 'tool_calls',
+          toolCalls: [
+            {
+              id: `write-${outputFormat}`,
+              name: 'write_file',
+              input: {
+                path,
+                content: '# Report',
+                inputFormat: 'markdown',
+                outputFormat,
+              },
+            },
+          ],
+        },
+        {
+          finishReason: 'stop',
+          text: 'saved',
+        },
+      ]);
+
+      const agent = new AdaptiveAgent({
+        model,
+        tools: [createWriteFileTool({ allowedRoot: tempDir })],
+        runStore,
+        eventStore,
+        snapshotStore,
+        defaults: { autoApproveAll: true },
+      });
+
+      const result = await agent.run({ goal: 'Write a text report' });
+
+      expect(result).toMatchObject({ status: 'success', output: 'saved' });
+      await expect(readFile(join(tempDir, path), 'utf-8')).resolves.toBe('# Report');
+      const events = await eventStore.listByRun(result.runId);
+      expect(events.some((event) => event.type === 'model.tool_call_rejected')).toBe(false);
+      expect(events.some((event) => event.type === 'tool.completed' && event.toolCallId === `write-${outputFormat}`)).toBe(true);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('normalizes schema-guided numeric string tool input before validation and execution', async () => {
     const runStore = new InMemoryRunStore();
     const eventStore = new InMemoryEventStore();
