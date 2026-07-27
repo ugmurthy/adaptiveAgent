@@ -612,6 +612,8 @@ new execution-context persistence column.
 
 ### Phase 0: Freeze gateway and execution contracts
 
+**Status:** Completed.
+
 **Outcome:** AmpCode has stable names, ownership boundaries, and wire contracts
 before implementation begins.
 
@@ -633,19 +635,21 @@ validators so client and server cannot drift.
 
 **Acceptance criteria:**
 
-- [ ] Client and server can import one protocol source of truth.
-- [ ] Validators reject batches, binary-equivalent inputs, invalid IDs,
+- [x] Client and server can import one protocol source of truth.
+- [x] Validators reject batches, binary-equivalent inputs, invalid IDs,
       unsupported methods, unknown tiers, oversized fields, and malformed
       stream envelopes.
-- [ ] Protocol package has no runtime/network/provider dependencies.
-- [ ] `bun run build`, `bun run typecheck`, and focused tests pass.
+- [x] Protocol package has no runtime/network/provider dependencies.
+- [x] `bun run build`, `bun run typecheck`, and focused tests pass.
 
 #### Phase 0 gate
 
-- Protocol names, tier spelling, profile reference shape, idempotency behavior,
+- [x] Protocol names, tier spelling, profile reference shape, idempotency behavior,
   and error taxonomy are reviewed before Phase 1.
 
 ### Phase 1: Add protected execution context and expose provider streams
+
+**Status:** Completed.
 
 **Outcome:** Core can safely carry gateway policy, generate stable call IDs,
 and expose normalized provider streams without changing final run behavior.
@@ -665,12 +669,12 @@ and expose normalized provider streams without changing final run behavior.
 
 **Acceptance criteria:**
 
-- [ ] A delegate payload that attempts to supply another tier or permit cannot
+- [x] A delegate payload that attempts to supply another tier or permit cannot
       alter the child execution context.
-- [ ] Retry, continuation, swarm stages, and orchestration stages retain the
+- [x] Retry, continuation, swarm stages, and orchestration stages retain the
       original context.
-- [ ] Existing metadata behavior remains unchanged.
-- [ ] Existing memory and Postgres tests pass.
+- [x] Existing metadata behavior remains unchanged.
+- [x] Existing memory and Postgres tests pass.
 
 #### US-003: Add deterministic model invocation context
 
@@ -683,9 +687,9 @@ and expose normalized provider streams without changing final run behavior.
 
 **Acceptance criteria:**
 
-- [ ] The same recovered logical attempt produces the same call ID.
-- [ ] A new deliberate attempt produces a different call ID.
-- [ ] Output repair never collides with the main model turn.
+- [x] The same recovered logical attempt produces the same call ID.
+- [x] A new deliberate attempt produces a different call ID.
+- [x] Output repair never collides with the main model turn.
 
 #### US-004: Make adapter streaming reusable
 
@@ -702,18 +706,20 @@ and expose normalized provider streams without changing final run behavior.
 
 **Acceptance criteria:**
 
-- [ ] Existing `generate()` adapter tests remain behaviorally identical.
-- [ ] Stream tests reconstruct the same final `ModelResponse` as `generate()`.
-- [ ] Partial tool calls are never exposed as executable complete calls.
-- [ ] Cancellation terminates provider consumption promptly.
-- [ ] No raw reasoning/chain-of-thought is forwarded.
+- [x] Existing `generate()` adapter tests remain behaviorally identical.
+- [x] Stream tests reconstruct the same final `ModelResponse` as `generate()`.
+- [x] Partial tool calls are never exposed as executable complete calls.
+- [x] Cancellation terminates provider consumption promptly.
+- [x] No raw reasoning/chain-of-thought is forwarded.
 
 #### Phase 1 gate
 
-- Core, Agent SDK, swarm, and desktop-bridge existing suites pass.
-- Postgres migration compatibility is verified.
+- [x] Core, Agent SDK, swarm, and desktop-bridge existing suites pass.
+- [x] Postgres migration compatibility is verified.
 
 ### Phase 2: Build the authenticated model gateway vertical slice
+
+**Status:** Completed and manually tested.
 
 **Outcome:** An authenticated client can request one tier-routed model call,
 receive WSS stream events and a final response, and produce one billing row.
@@ -731,10 +737,10 @@ receive WSS stream events and a final response, and produce one billing row.
 
 **Acceptance criteria:**
 
-- [ ] Missing, expired, wrong-audience, and wrong-issuer tokens are rejected.
-- [ ] Non-`/rpc`, non-upgrade, binary, and oversized inputs are rejected.
-- [ ] A valid principal can initialize exactly once per connection.
-- [ ] Shutdown stops upgrades and drains or cancels bounded in-flight work.
+- [x] Missing, expired, wrong-audience, and wrong-issuer tokens are rejected.
+- [x] Non-`/rpc`, non-upgrade, binary, and oversized inputs are rejected.
+- [x] A valid principal can initialize exactly once per connection.
+- [x] Shutdown stops upgrades and drains or cancels bounded in-flight work.
 
 #### US-006: Add tier router and model provider execution
 
@@ -751,11 +757,11 @@ receive WSS stream events and a final response, and produce one billing row.
 
 **Acceptance criteria:**
 
-- [ ] Clients cannot name a concrete provider/model in gateway mode.
-- [ ] Tier entitlement is enforced before provider invocation.
-- [ ] Configured fallback is deterministic and observable.
-- [ ] The final response can be reconstructed from stream events.
-- [ ] Actual route and usage are returned without exposing credentials.
+- [x] Clients cannot name a concrete provider/model in gateway mode.
+- [x] Tier entitlement is enforced before provider invocation.
+- [x] Configured fallback is deterministic and observable.
+- [x] The final response can be reconstructed from stream events.
+- [x] Actual route and usage are returned without exposing credentials.
 
 #### US-007: Add permits, idempotency, and billing ledger
 
@@ -772,17 +778,17 @@ receive WSS stream events and a final response, and produce one billing row.
 
 **Acceptance criteria:**
 
-- [ ] Repeating an identical completed call returns the same final response
+- [x] Repeating an identical completed call returns the same final response
       with no second provider invocation or billing row.
-- [ ] Reusing the call ID with different content is rejected.
-- [ ] No prompt, model output, tool output, page content, API key, or access
+- [x] Reusing the call ID with different content is rejected.
+- [x] No prompt, model output, tool output, page content, API key, or access
       token is present in billing storage.
-- [ ] Failed and cancelled calls have explicit billing states.
+- [x] Failed and cancelled calls have explicit billing states.
 
 #### Phase 2 gate
 
-- A protocol test client completes a real or stubbed tier-routed model call.
-- A forced WSS disconnect followed by retry with the same call ID produces one
+- [x] A protocol test client completes a real or stubbed tier-routed model call.
+- [x] A forced WSS disconnect followed by retry with the same call ID produces one
   provider invocation and one billing record within the same gateway process.
 
 ### Phase 3: Add gateway client and Agent SDK integration

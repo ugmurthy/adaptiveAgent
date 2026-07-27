@@ -220,6 +220,12 @@ export interface UsageSummary {
   cost?: number;
 }
 
+export interface ModelGenerateTimings {
+  gatewayDurationMs: number;
+  providerDurationMs: number;
+  routeAttempts: number;
+}
+
 export interface ModelGenerateResult {
   callId: string;
   text?: string;
@@ -230,6 +236,7 @@ export interface ModelGenerateResult {
   providerResponseId?: string;
   summary?: string;
   routePolicyVersion: string;
+  timings: ModelGenerateTimings;
 }
 
 export interface ToolExecuteParams {
@@ -942,6 +949,7 @@ function validateModelGenerateResult(value: unknown): void {
     'providerResponseId',
     'summary',
     'routePolicyVersion',
+    'timings',
   ], 'result');
   boundedString(result.callId, 'result.callId');
   if (result.text !== undefined) {
@@ -965,6 +973,11 @@ function validateModelGenerateResult(value: unknown): void {
     boundedString(result.summary, 'result.summary', { max: PROTOCOL_LIMITS.maxStringBytes });
   }
   boundedString(result.routePolicyVersion, 'result.routePolicyVersion');
+  const timings = record(result.timings, 'result.timings');
+  exactKeys(timings, ['gatewayDurationMs', 'providerDurationMs', 'routeAttempts'], 'result.timings');
+  finiteNumber(timings.gatewayDurationMs, 'result.timings.gatewayDurationMs', 0);
+  finiteNumber(timings.providerDurationMs, 'result.timings.providerDurationMs', 0);
+  safeInteger(timings.routeAttempts, 'result.timings.routeAttempts', 1);
 }
 
 function validateToolExecuteResult(value: unknown): void {

@@ -1,0 +1,21 @@
+{
+  "version": "2026-01",
+  "tiers": {
+    "low": {
+      "limits": { "maxMessages": 32, "maxOutputTokens": 4096, "modelTimeoutMs": 60000 },
+      "targets": [{ "provider": "ollama", "model": "llama3.2", "maxConcurrency": 8 }]
+    },
+    "medium": {
+      "limits": { "maxMessages": 64, "maxOutputTokens": 8192, "modelTimeoutMs": 90000 },
+      "targets": [{ "provider": "openrouter", "model": "openai/gpt-4.1-mini", "apiKeyEnv": "OPENROUTER_API_KEY", "maxConcurrency": 8, "structuredOutputMode": "strict" }]
+    },
+    "high": {
+      "limits": { "maxMessages": 96, "maxOutputTokens": 16384, "modelTimeoutMs": 120000 },
+      "targets": [{ "provider": "openrouter", "model": "anthropic/claude-sonnet-4", "apiKeyEnv": "OPENROUTER_API_KEY", "maxConcurrency": 8, "structuredOutputMode": "strict" }]
+    },
+    "xtra-high": {
+      "limits": { "maxMessages": 128, "maxOutputTokens": 32768, "modelTimeoutMs": 180000 },
+      "targets": [{ "provider": "mistral", "model": "mistral-large-latest", "apiKeyEnv": "MISTRAL_API_KEY", "maxConcurrency": 2, "structuredOutputMode": "strict" }]
+    }
+  }
+}

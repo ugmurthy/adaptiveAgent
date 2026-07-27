@@ -80,7 +80,7 @@ describe('response validation', () => {
     ['profile/list',{profiles:[{ref:profileRef,name:'P',allowedTiers:['high'],remoteCapabilities:['web_search']}]}],
     ['profile/get',{bundle:profile}],
     ['run/authorize',{permitId:'permit',inferenceMode:'gateway',inferenceTier:'high',routePolicyVersion:'1',remoteCapabilities:['web_search'],expiresAt:'2026-07-27T00:00:00Z'}],
-    ['model/generate',{callId:'c',text:'ok',finishReason:'stop',usage,routePolicyVersion:'1'}],
+    ['model/generate',{callId:'c',text:'ok',finishReason:'stop',usage,routePolicyVersion:'1',timings:{gatewayDurationMs:10,providerDurationMs:8,routeAttempts:1}}],
     ['tool/execute',{idempotencyKey:'key',output:{answer:42},usage:{units:1},cacheHit:false}],
     ['request/cancel',{cancelled:true}],
     ['account/usage',{items:[{capability:'model',units:3,cost:0.01,occurredAt:'2026-07-26T00:00:00Z'}]}],
