@@ -370,6 +370,8 @@ export interface RunRequest {
   contentParts?: ModelContentPart[];
   contextRefs?: ContextRef[];
   context?: Record<string, JsonValue>;
+  /** Opaque host-owned policy inherited by derived runs and never added to model-visible context. */
+  executionContext?: JsonObject;
   allowedTools?: string[];
   forbiddenTools?: string[];
   outputSchema?: JsonSchema;
@@ -387,6 +389,8 @@ export interface ChatRequest {
   messages: ChatMessage[];
   contextRefs?: ContextRef[];
   context?: Record<string, JsonValue>;
+  /** Opaque host-owned policy inherited by derived runs and never added to model-visible context. */
+  executionContext?: JsonObject;
   outputSchema?: JsonSchema;
   metadata?: Record<string, JsonValue>;
 }
@@ -395,6 +399,7 @@ export interface PlanRequest {
   goal: string;
   input?: JsonValue;
   context?: Record<string, JsonValue>;
+  executionContext?: JsonObject;
   allowedTools?: string[];
   forbiddenTools?: string[];
   inputSchema?: JsonSchema;
@@ -406,6 +411,7 @@ export interface ExecutePlanRequest {
   planId: UUID;
   input?: JsonValue;
   context?: Record<string, JsonValue>;
+  executionContext?: JsonObject;
   metadata?: Record<string, JsonValue>;
 }
 
@@ -501,6 +507,8 @@ export interface ToolContext {
   planExecutionId?: UUID;
   input?: JsonValue;
   context?: Record<string, JsonValue>;
+  /** Opaque host-owned policy. Tools may read it but model output cannot replace it. */
+  executionContext?: JsonObject;
   idempotencyKey: string;
   /** Effective runtime timeout for this tool call. A value <= 0 means disabled. */
   timeoutMs?: number;
@@ -564,6 +572,15 @@ export interface ModelToolCall {
   input: JsonValue;
 }
 
+export interface ModelInvocationContext {
+  runId: UUID;
+  rootRunId: UUID;
+  stepId: string;
+  purpose: 'agent_turn' | 'output_repair';
+  callId: string;
+  attempt: number;
+}
+
 export interface ModelRequest {
   messages: ModelMessage[];
   tools?: Array<Pick<ToolDefinition, 'name' | 'description' | 'inputSchema'>>;
@@ -571,6 +588,9 @@ export interface ModelRequest {
   signal?: AbortSignal;
   modelTimeoutMs?: number;
   metadata?: Record<string, JsonValue>;
+  /** Opaque host-owned policy, separate from provider-visible metadata and messages. */
+  executionContext?: JsonObject;
+  invocation?: ModelInvocationContext;
   onRetry?: (event: ModelRetryEvent) => Promise<void> | void;
 }
 
@@ -599,10 +619,16 @@ export interface ModelResponse {
   performance?: JsonObject;
 }
 
-export interface ModelStreamEvent {
-  type: 'status' | 'summary' | 'usage';
-  payload: JsonValue;
-}
+export type ModelStreamEvent =
+  | { type: 'start'; provider: string; model: string }
+  | { type: 'text_delta'; delta: string }
+  | { type: 'tool_call_start'; toolCallId: string; name: string }
+  | { type: 'tool_call_delta'; toolCallId: string; argumentsDelta: string }
+  | { type: 'tool_call_end'; toolCall: ModelToolCall }
+  | { type: 'summary'; summary: string }
+  | { type: 'usage'; usage: UsageSummary }
+  | { type: 'done' }
+  | { type: 'error'; error: { message: string; name?: string } };
 
 export interface ModelAdapter {
   provider: string;
@@ -671,6 +697,7 @@ export interface AgentRun {
   goal: string;
   input?: JsonValue;
   context?: Record<string, JsonValue>;
+  executionContext?: JsonObject;
   modelProvider?: string;
   modelName?: string;
   modelParameters?: Record<string, JsonValue>;
@@ -865,6 +892,7 @@ export interface RunStore {
     goal: string;
     input?: JsonValue;
     context?: Record<string, JsonValue>;
+    executionContext?: JsonObject;
     modelProvider?: string;
     modelName?: string;
     modelParameters?: Record<string, JsonValue>;
@@ -955,6 +983,7 @@ export interface SwarmRequest {
   topLevelObjective: string;
   input?: JsonValue;
   contentParts?: ModelContentPart[];
+  executionContext?: JsonObject;
   maxWorkers?: number;
   metadata?: Record<string, JsonValue>;
 }
@@ -967,6 +996,7 @@ export interface SwarmExecutionRequest {
   subtasks: SwarmSubtask[];
   input?: JsonValue;
   contentParts?: ModelContentPart[];
+  executionContext?: JsonObject;
   maxWorkers?: number;
   metadata?: Record<string, JsonValue>;
 }

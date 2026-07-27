@@ -3,8 +3,17 @@ import { createHash } from 'node:crypto';
 import { MeshAPI, MeshAPIApiError, type ModelInfo } from 'meshapi-node-sdk';
 
 import { approximateSerializedByteLength, compactJsonObject } from '../logging.js';
-import type { JsonValue, ModelRequest, ModelResponse, StructuredOutputMode } from '../types.js';
-import { BaseOpenAIChatAdapter, MAX_LOCAL_AUDIO_BYTES, type BaseOpenAIChatAdapterConfig } from './base-openai-chat-adapter.js';
+import type { JsonValue, ModelRequest, ModelResponse, ModelStreamEvent, StructuredOutputMode } from '../types.js';
+import {
+  BaseOpenAIChatAdapter,
+  MAX_LOCAL_AUDIO_BYTES,
+  createModelStreamEmitter,
+  emitModelStreamError,
+  emitModelStreamEvents,
+  emitTerminalModelStreamEvents,
+  fromProviderToolName,
+  type BaseOpenAIChatAdapterConfig,
+} from './base-openai-chat-adapter.js';
 
 const MESH_BASE_URL = 'https://api.meshapi.ai/v1';
 const DISABLED_MODEL_TIMEOUT_MESH_HTTP_TIMEOUT_MS = 900_000;
@@ -58,11 +67,16 @@ export class MeshAdapter extends BaseOpenAIChatAdapter {
     });
   }
 
-  override async generate(request: ModelRequest): Promise<ModelResponse> {
-    const body = await this.buildRequestBody(request);
-    const chunks: unknown[] = [];
-    const startedAt = Date.now();
+  override async stream(
+    request: ModelRequest,
+    onEvent: (event: ModelStreamEvent) => Promise<void> | void,
+  ): Promise<ModelResponse> {
+    const emitter = createModelStreamEmitter(onEvent);
+    await emitter.emit({ type: 'start', provider: this.provider, model: this.model });
     try {
+      const body = await this.buildRequestBody(request);
+      const chunks: unknown[] = [];
+      const startedAt = Date.now();
       const stream = this.client.chat.completions.create(
         {
           ...body,
@@ -73,14 +87,14 @@ export class MeshAdapter extends BaseOpenAIChatAdapter {
       const accumulator = new MeshStreamAccumulator();
       for await (const chunk of stream as AsyncIterable<unknown>) {
         chunks.push(chunk);
-        accumulator.add(chunk);
+        await emitModelStreamEvents(emitter.emit, accumulator.add(chunk));
       }
 
       const completion = accumulator.toCompletion();
       const providerReportedCost = hasPositiveProviderReportedCost(completion);
       const parsed = this.parseResponse(completion as never);
       const priced = await this.withEstimatedMeshCost(parsed, completion, providerReportedCost, request.signal);
-      return {
+      const response = {
         ...priced,
         providerResponseId: priced.providerResponseId || undefined,
         rawProviderResponse: chunks,
@@ -92,8 +106,12 @@ export class MeshAdapter extends BaseOpenAIChatAdapter {
           adapterResponseBytes: approximateSerializedByteLength(chunks),
         }),
       };
+      await emitTerminalModelStreamEvents(emitter.emit, response, emitter.startedToolCallIds);
+      return response;
     } catch (error) {
-      throw enrichMeshError(error);
+      const enriched = enrichMeshError(error);
+      await emitModelStreamError(emitter.emit, enriched);
+      throw enriched;
     }
   }
 
@@ -191,12 +209,14 @@ class MeshStreamAccumulator {
   private reasoning = '';
   private reasoningDetails: JsonValue[] | undefined;
   private readonly toolCalls = new Map<number, MeshAccumulatedToolCall>();
+  private readonly announcedToolCallIndexes = new Set<number>();
   private nextToolCallIndex = 0;
 
-  add(chunk: unknown): void {
+  add(chunk: unknown): ModelStreamEvent[] {
     if (!isRecord(chunk)) {
-      return;
+      return [];
     }
+    const events: ModelStreamEvent[] = [];
 
     if (typeof chunk.id === 'string' && this.id === undefined) {
       this.id = chunk.id;
@@ -231,6 +251,9 @@ class MeshStreamAccumulator {
 
       if (typeof delta.content === 'string') {
         this.text += delta.content;
+        if (delta.content.length > 0) {
+          events.push({ type: 'text_delta', delta: delta.content });
+        }
       }
       if (typeof delta.reasoning === 'string') {
         this.reasoning += delta.reasoning;
@@ -243,9 +266,10 @@ class MeshStreamAccumulator {
 
       const toolCallDeltas = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
       for (const toolCallDelta of toolCallDeltas) {
-        this.addToolCall(toolCallDelta);
+        events.push(...this.addToolCall(toolCallDelta));
       }
     }
+    return events;
   }
 
   toCompletion(): Record<string, unknown> {
@@ -282,10 +306,11 @@ class MeshStreamAccumulator {
     };
   }
 
-  private addToolCall(value: unknown): void {
+  private addToolCall(value: unknown): ModelStreamEvent[] {
     if (!isRecord(value)) {
-      return;
+      return [];
     }
+    const events: ModelStreamEvent[] = [];
 
     const index = typeof value.index === 'number' && Number.isInteger(value.index)
       ? value.index
@@ -301,14 +326,26 @@ class MeshStreamAccumulator {
     }
     const fn = isRecord(value.function) ? value.function : undefined;
     if (!fn) {
-      return;
+      return events;
     }
     if (typeof fn.name === 'string' && fn.name.length > 0) {
       toolCall.name = fn.name;
     }
+    if (toolCall.id && toolCall.name && !this.announcedToolCallIndexes.has(index)) {
+      this.announcedToolCallIndexes.add(index);
+      events.push({
+        type: 'tool_call_start',
+        toolCallId: toolCall.id,
+        name: fromProviderToolName(toolCall.name),
+      });
+    }
     if (typeof fn.arguments === 'string') {
       toolCall.argumentsText += fn.arguments;
+      if (fn.arguments.length > 0 && toolCall.id && this.announcedToolCallIndexes.has(index)) {
+        events.push({ type: 'tool_call_delta', toolCallId: toolCall.id, argumentsDelta: fn.arguments });
+      }
     }
+    return events;
   }
 }
 

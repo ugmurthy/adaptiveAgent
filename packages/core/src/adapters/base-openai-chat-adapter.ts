@@ -287,6 +287,29 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
   }
 
   async generate(request: ModelRequest): Promise<ModelResponse> {
+    return this.stream(request, () => undefined);
+  }
+
+  async stream(
+    request: ModelRequest,
+    onEvent: (event: ModelStreamEvent) => Promise<void> | void,
+  ): Promise<ModelResponse> {
+    const emitter = createModelStreamEmitter(onEvent);
+    await emitter.emit({ type: 'start', provider: this.provider, model: this.model });
+    try {
+      const response = await this.generateFromProvider(request, emitter.emit);
+      await emitTerminalModelStreamEvents(emitter.emit, response, emitter.startedToolCallIds);
+      return response;
+    } catch (error) {
+      await emitModelStreamError(emitter.emit, error);
+      throw error;
+    }
+  }
+
+  protected async generateFromProvider(
+    request: ModelRequest,
+    onEvent: (event: ModelStreamEvent) => Promise<void> | void,
+  ): Promise<ModelResponse> {
     const body = this.buildStreamingRequestBody(await this.buildRequestBody(request));
     const headers = this.buildHeaders();
     const url = `${this.baseUrl}/chat/completions`;
@@ -342,9 +365,14 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
         let responseBytes = 0;
         try {
           if (isEventStreamResponse(response)) {
-            const chunks = await readOpenAICompatibleSseStream(response.body, request.signal);
+            const accumulator = new OpenAIChatStreamAccumulator();
+            const chunks = await readOpenAICompatibleSseStream(
+              response.body,
+              request.signal,
+              async (chunk) => emitModelStreamEvents(onEvent, accumulator.add(chunk)),
+            );
             responseBytes = approximateSerializedByteLengthForStream(chunks);
-            data = openAIChatCompletionFromStreamChunks(chunks);
+            data = accumulator.toCompletion();
           } else {
             const responseText = await response.text();
             responseBytes = encodedByteLength(responseText);
@@ -540,14 +568,16 @@ export class OpenAIChatStreamAccumulator {
   private reasoning = '';
   private reasoningDetails: JsonValue[] | undefined;
   private readonly toolCalls = new Map<number, AccumulatedToolCall>();
+  private readonly announcedToolCallIndexes = new Set<number>();
   private nextToolCallIndex = 0;
 
-  add(chunk: unknown): void {
+  add(chunk: unknown): ModelStreamEvent[] {
     if (!isRecord(chunk)) {
-      return;
+      return [];
     }
 
     throwOnOpenAICompatibleStreamError(chunk);
+    const events: ModelStreamEvent[] = [];
 
     if (typeof chunk.id === 'string' && this.id === undefined) {
       this.id = chunk.id;
@@ -582,6 +612,9 @@ export class OpenAIChatStreamAccumulator {
       const content = readStringProperty(delta, 'content');
       if (content !== undefined) {
         this.text += content;
+        if (content.length > 0) {
+          events.push({ type: 'text_delta', delta: content });
+        }
       }
 
       const reasoning = readStringProperty(delta, 'reasoning') ?? readStringProperty(delta, 'reasoning_content');
@@ -596,9 +629,11 @@ export class OpenAIChatStreamAccumulator {
 
       const toolCallDeltas = readArrayProperty(delta, 'tool_calls') ?? readArrayProperty(delta, 'toolCalls') ?? [];
       for (const toolCallDelta of toolCallDeltas) {
-        this.addToolCall(toolCallDelta);
+        events.push(...this.addToolCall(toolCallDelta));
       }
     }
+
+    return events;
   }
 
   toCompletion(): OpenAIChatCompletionResponse {
@@ -634,10 +669,12 @@ export class OpenAIChatStreamAccumulator {
     };
   }
 
-  private addToolCall(value: unknown): void {
+  private addToolCall(value: unknown): ModelStreamEvent[] {
     if (!isRecord(value)) {
-      return;
+      return [];
     }
+
+    const events: ModelStreamEvent[] = [];
 
     const index = typeof value.index === 'number' && Number.isInteger(value.index)
       ? value.index
@@ -654,36 +691,110 @@ export class OpenAIChatStreamAccumulator {
     }
     const fn = readRecord(value, 'function');
     if (!fn) {
-      return;
+      return events;
     }
     const name = readStringProperty(fn, 'name');
     if (name && name.length > 0) {
       toolCall.name = name;
     }
+    if (
+      toolCall.id &&
+      toolCall.name &&
+      !this.announcedToolCallIndexes.has(index)
+    ) {
+      this.announcedToolCallIndexes.add(index);
+      events.push({
+        type: 'tool_call_start',
+        toolCallId: toolCall.id,
+        name: fromProviderToolName(toolCall.name),
+      });
+    }
     const args = readStringProperty(fn, 'arguments');
     if (args !== undefined) {
       toolCall.argumentsText += args;
-      return;
+      if (args.length > 0 && toolCall.id && this.announcedToolCallIndexes.has(index)) {
+        events.push({ type: 'tool_call_delta', toolCallId: toolCall.id, argumentsDelta: args });
+      }
+      return events;
     }
 
     const argumentsValue = fn.arguments;
     if (argumentsValue !== undefined) {
-      toolCall.argumentsText += JSON.stringify(argumentsValue);
+      const argumentsDelta = JSON.stringify(argumentsValue);
+      toolCall.argumentsText += argumentsDelta;
+      if (argumentsDelta.length > 0 && toolCall.id && this.announcedToolCallIndexes.has(index)) {
+        events.push({ type: 'tool_call_delta', toolCallId: toolCall.id, argumentsDelta });
+      }
     }
+    return events;
   }
 }
 
-function openAIChatCompletionFromStreamChunks(chunks: unknown[]): OpenAIChatCompletionResponse {
-  const accumulator = new OpenAIChatStreamAccumulator();
-  for (const chunk of chunks) {
-    accumulator.add(chunk);
+export async function emitModelStreamEvents(
+  onEvent: (event: ModelStreamEvent) => Promise<void> | void,
+  events: ModelStreamEvent[],
+): Promise<void> {
+  for (const event of events) {
+    await onEvent(event);
   }
-  return accumulator.toCompletion();
+}
+
+export function createModelStreamEmitter(
+  onEvent: (event: ModelStreamEvent) => Promise<void> | void,
+): {
+  emit: (event: ModelStreamEvent) => Promise<void>;
+  startedToolCallIds: ReadonlySet<string>;
+} {
+  const startedToolCallIds = new Set<string>();
+  return {
+    startedToolCallIds,
+    emit: async (event) => {
+      if (event.type === 'tool_call_start') {
+        startedToolCallIds.add(event.toolCallId);
+      }
+      await onEvent(event);
+    },
+  };
+}
+
+export async function emitTerminalModelStreamEvents(
+  onEvent: (event: ModelStreamEvent) => Promise<void> | void,
+  response: ModelResponse,
+  startedToolCallIds: ReadonlySet<string> = new Set(),
+): Promise<void> {
+  for (const toolCall of response.toolCalls ?? []) {
+    if (!startedToolCallIds.has(toolCall.id)) {
+      await onEvent({ type: 'tool_call_start', toolCallId: toolCall.id, name: toolCall.name });
+    }
+    await onEvent({ type: 'tool_call_end', toolCall });
+  }
+  if (response.summary) {
+    await onEvent({ type: 'summary', summary: response.summary });
+  }
+  if (response.usage) {
+    await onEvent({ type: 'usage', usage: response.usage });
+  }
+  await onEvent({ type: 'done' });
+}
+
+export async function emitModelStreamError(
+  onEvent: (event: ModelStreamEvent) => Promise<void> | void,
+  error: unknown,
+): Promise<void> {
+  const normalized = error instanceof Error ? error : new Error(String(error));
+  await onEvent({
+    type: 'error',
+    error: {
+      message: normalized.message,
+      ...(normalized.name ? { name: normalized.name } : {}),
+    },
+  });
 }
 
 async function readOpenAICompatibleSseStream(
   body: ReadableStream<Uint8Array> | null,
   signal?: AbortSignal,
+  onChunk?: (chunk: unknown) => Promise<void> | void,
 ): Promise<unknown[]> {
   if (!body) {
     throw new Error('Streaming response did not include a response body');
@@ -702,7 +813,7 @@ async function readOpenAICompatibleSseStream(
     }
   };
 
-  const flushEvent = () => {
+  const flushEvent = async () => {
     if (eventData.length === 0 || complete) {
       eventData = [];
       return;
@@ -718,12 +829,13 @@ async function readOpenAICompatibleSseStream(
     const chunk = JSON.parse(data) as unknown;
     throwOnOpenAICompatibleStreamError(chunk);
     chunks.push(chunk);
+    await onChunk?.(chunk);
   };
 
-  const processLine = (rawLine: string) => {
+  const processLine = async (rawLine: string) => {
     const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
     if (line === '') {
-      flushEvent();
+      await flushEvent();
       return;
     }
     if (line.startsWith(':')) {
@@ -761,7 +873,7 @@ async function readOpenAICompatibleSseStream(
       buffered += decoder.decode(value, { stream: true });
       let newlineIndex = buffered.indexOf('\n');
       while (newlineIndex >= 0 && !complete) {
-        processLine(buffered.slice(0, newlineIndex));
+        await processLine(buffered.slice(0, newlineIndex));
         buffered = buffered.slice(newlineIndex + 1);
         newlineIndex = buffered.indexOf('\n');
       }
@@ -769,10 +881,10 @@ async function readOpenAICompatibleSseStream(
 
     buffered += decoder.decode();
     if (!complete && buffered.length > 0) {
-      processLine(buffered);
+      await processLine(buffered);
     }
     if (!complete) {
-      flushEvent();
+      await flushEvent();
     }
 
     throwIfAborted();
@@ -1238,7 +1350,7 @@ function toProviderToolName(name: string): string {
   return `${DELEGATE_TOOL_ALIAS_PREFIX}${encodedSuffix}`;
 }
 
-function fromProviderToolName(name: string): string {
+export function fromProviderToolName(name: string): string {
   if (!name.startsWith(DELEGATE_TOOL_ALIAS_PREFIX)) {
     return name;
   }

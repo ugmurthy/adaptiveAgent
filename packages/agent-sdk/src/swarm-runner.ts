@@ -1,6 +1,7 @@
 import {
   SwarmCoordinator,
   createSwarmDecompositionOutputSchema,
+  type JsonObject,
   type JsonValue,
   type ModelContentPart,
   type RunResult,
@@ -83,6 +84,7 @@ export interface SwarmDecompositionArgs {
   workerAgents: readonly AgentConfigFile[];
   workerIds: string[];
   contentParts?: ModelContentPart[];
+  executionContext?: JsonObject;
 }
 
 export async function runSwarmDecomposition(args: SwarmDecompositionArgs): Promise<RunResult> {
@@ -94,6 +96,7 @@ export async function runSwarmDecomposition(args: SwarmDecompositionArgs): Promi
       workerCatalog: buildSwarmWorkerCatalog(args.workerAgents),
     },
     ...(contentParts ? { contentParts } : {}),
+    executionContext: args.executionContext,
     context: {
       phase: 'swarm.decompose',
       topLevelObjective: args.topLevelObjective,

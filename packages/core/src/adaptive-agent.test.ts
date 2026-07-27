@@ -63,12 +63,13 @@ class AliasingSequenceModel extends SequenceModel {
   }
 }
 
-function createLookupTool(): ToolDefinition {
+function createLookupTool(onExecute?: (context: Parameters<ToolDefinition['execute']>[1]) => void): ToolDefinition {
   return {
     name: 'lookup',
     description: 'Looks up a topic.',
     inputSchema: { type: 'object', additionalProperties: true },
-    execute: async (input) => {
+    execute: async (input, context) => {
+      onExecute?.(context);
       const topic = typeof input === 'object' && input && 'topic' in input ? input.topic : 'unknown';
       return {
         finding: `researched:${String(topic)}`,
@@ -137,6 +138,77 @@ function createBudgetedReadWebPageTool(onExecute?: () => void): ToolDefinition {
 }
 
 describe('AdaptiveAgent', () => {
+  it('persists protected execution context separately from model-visible context and metadata', async () => {
+    const runStore = new InMemoryRunStore();
+    const model = new SequenceModel([{ finishReason: 'stop', text: 'done' }]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore,
+      eventStore: new InMemoryEventStore(),
+      snapshotStore: new InMemorySnapshotStore(),
+    });
+    const executionContext = {
+      inferenceMode: 'gateway',
+      inferenceTier: 'high',
+      authorizationRef: 'permit-protected',
+    } as const;
+
+    const result = await agent.run({
+      goal: 'Keep host policy protected',
+      context: { visibleContext: 'visible' },
+      executionContext,
+      metadata: { visibleMetadata: 'visible' },
+    });
+
+    const storedRun = await runStore.getRun(result.runId);
+    expect(storedRun?.executionContext).toEqual(executionContext);
+    expect(storedRun?.context).toEqual({ visibleContext: 'visible' });
+    expect(storedRun?.metadata).toEqual({ visibleMetadata: 'visible' });
+    expect(model.receivedRequests[0]?.executionContext).toEqual(executionContext);
+    expect(model.receivedRequests[0]?.metadata).toEqual({ visibleMetadata: 'visible' });
+    expect(JSON.stringify(model.receivedRequests[0]?.messages)).not.toContain('permit-protected');
+  });
+
+  it('rejects non-JSON execution context before creating a run', async () => {
+    const runStore = new InMemoryRunStore();
+    const agent = new AdaptiveAgent({
+      model: new SequenceModel([]),
+      tools: [],
+      runStore,
+      eventStore: new InMemoryEventStore(),
+      snapshotStore: new InMemorySnapshotStore(),
+    });
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+
+    await expect(agent.run({ sessionId: 'invalid', goal: 'Reject NaN', executionContext: { value: Number.NaN } })).rejects.toThrow(/executionContext/);
+    await expect(agent.run({ sessionId: 'invalid', goal: 'Reject cycles', executionContext: cyclic as never })).rejects.toThrow(/executionContext/);
+    await expect(agent.run({ sessionId: 'invalid', goal: 'Reject class instances', executionContext: new Date() as never })).rejects.toThrow(/executionContext/);
+    expect(await runStore.listBySession('invalid')).toEqual([]);
+  });
+
+  it('stores an immutable copy and always inherits the parent execution context', async () => {
+    const runStore = new InMemoryRunStore();
+    const supplied = { inferenceTier: 'high' };
+    const parent = await runStore.createRun({ goal: 'parent', executionContext: supplied, status: 'queued' });
+    supplied.inferenceTier = 'low';
+    const child = await runStore.createRun({
+      parentRunId: parent.id,
+      parentStepId: 'step-1',
+      delegateName: 'worker',
+      goal: 'child',
+      executionContext: { inferenceTier: 'xtra-high' },
+      status: 'queued',
+    });
+
+    expect((await runStore.getRun(parent.id))?.executionContext).toEqual({ inferenceTier: 'high' });
+    expect(child.executionContext).toEqual({ inferenceTier: 'high' });
+    await expect(runStore.updateRun(parent.id, { executionContext: { inferenceTier: 'low' } })).rejects.toThrow(
+      'executionContext is immutable',
+    );
+  });
+
   it('persists sessionId for run-style root runs', async () => {
     const runStore = new InMemoryRunStore();
     const agent = new AdaptiveAgent({
@@ -749,7 +821,12 @@ describe('AdaptiveAgent', () => {
       },
     });
 
-    const failedResult = await agent.run({ sessionId: 'session-continuation-1', goal: 'Research continuation recovery' });
+    const executionContext = { inferenceMode: 'gateway', inferenceTier: 'medium', authorizationRef: 'permit-continuation' } as const;
+    const failedResult = await agent.run({
+      sessionId: 'session-continuation-1',
+      goal: 'Research continuation recovery',
+      executionContext,
+    });
     expect(failedResult).toMatchObject({
       status: 'failure',
       code: 'MODEL_ERROR',
@@ -794,6 +871,7 @@ describe('AdaptiveAgent', () => {
     expect(sourceRun).toMatchObject({ status: 'failed', sessionId: 'session-continuation-1' });
     expect(continuationRun).toMatchObject({
       sessionId: 'session-continuation-1',
+      executionContext,
       status: 'succeeded',
       metadata: expect.objectContaining({
         continuationOfRunId: failedResult.runId,
@@ -813,6 +891,7 @@ describe('AdaptiveAgent', () => {
     });
     expect(continuationEvents.some((event) => event.type === 'run.continuation_created')).toBe(true);
     expect(continuationRequest?.messages.at(-1)?.content).toContain('Continue the previous failed run');
+    expect(continuationRequest?.executionContext).toEqual(executionContext);
     expect(continuationRequest?.messages.at(-1)?.content).toContain('"lastCompletedStepId": "step-1"');
     expect(continuationRequest?.messages.at(-1)?.content).toContain('"nextStepId": "step-2"');
   });
@@ -1181,12 +1260,56 @@ describe('AdaptiveAgent', () => {
       output: 'Recovered after repeated retries.',
       stepsUsed: 1,
     });
+    expect(model.receivedRequests.map((request) => request.invocation?.attempt)).toEqual([1, 1, 1]);
+    expect(new Set(model.receivedRequests.map((request) => request.invocation?.callId)).size).toBe(3);
 
     const storedRun = await runStore.getRun(failed.runId);
     expect(storedRun?.metadata).toMatchObject({
       retryAttempts: 2,
       lastRetryFailureKind: 'timeout',
     });
+  });
+
+  it('reuses the model call ID when recovering the same logical attempt', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const model = new SequenceModel([
+      new Error('simulated process interruption'),
+      { finishReason: 'stop', text: 'Recovered logical attempt.' },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    const failed = await agent.run({ goal: 'Recover the same model attempt' });
+    expect(failed.status).toBe('failure');
+    const failedRun = await runStore.getRun(failed.runId);
+    if (!failedRun) {
+      throw new Error('Expected failed run to be persisted');
+    }
+    await runStore.updateRun(failedRun.id, {
+      status: 'interrupted',
+      errorCode: undefined,
+      errorMessage: undefined,
+      completedAt: undefined,
+    }, failedRun.version);
+
+    const resumed = await agent.resume(failed.runId);
+
+    expect(resumed).toMatchObject({
+      status: 'success',
+      runId: failed.runId,
+      output: 'Recovered logical attempt.',
+    });
+    expect(model.receivedRequests).toHaveLength(2);
+    expect(model.receivedRequests[0]?.invocation).toMatchObject({ attempt: 1, purpose: 'agent_turn' });
+    expect(model.receivedRequests[1]?.invocation).toMatchObject({ attempt: 1, purpose: 'agent_turn' });
+    expect(model.receivedRequests[1]?.invocation?.callId).toBe(model.receivedRequests[0]?.invocation?.callId);
   });
 
   it('retries a read_file not_found failure after the file is created', async () => {
@@ -1731,6 +1854,48 @@ describe('AdaptiveAgent', () => {
     expect(events.some((event) => event.type === 'delegate.spawned')).toBe(false);
   });
 
+  it('rejects model-supplied delegate execution context before spawning a child run', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [{
+          id: 'bad-delegate-context',
+          name: 'delegate.researcher',
+          input: {
+            goal: 'Attempt to replace protected policy',
+            executionContext: { inferenceTier: 'xtra-high', authorizationRef: 'attacker-permit' },
+          },
+        }],
+      },
+      { finishReason: 'stop', structuredOutput: { report: 'continued safely' } },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      delegates: [{ name: 'researcher', description: 'Researches a topic.', allowedTools: [] }],
+      runStore,
+      eventStore,
+      snapshotStore: new InMemorySnapshotStore(),
+    });
+
+    const result = await agent.run({
+      goal: 'Protect delegate policy',
+      executionContext: { inferenceTier: 'high', authorizationRef: 'host-permit' },
+    });
+
+    expect(result).toMatchObject({ status: 'success', output: { report: 'continued safely' } });
+    expect(await runStore.listChildren(result.runId)).toHaveLength(0);
+    expect((await eventStore.listByRun(result.runId)).find(
+      (event) => event.type === 'model.tool_call_rejected',
+    )?.payload).toMatchObject({
+      requestedToolName: 'delegate.researcher',
+      reason: 'invalid_tool_input',
+      error: expect.stringContaining('input.executionContext is host-protected'),
+    });
+  });
+
   it.each([
     ['context', { context: '{"topic":"delegation"}' }, 'input.context'],
     ['metadata', { metadata: '{"source":"model"}' }, 'input.metadata'],
@@ -2010,6 +2175,20 @@ describe('AdaptiveAgent', () => {
       tools: [],
       outputSchema,
     });
+    expect(model.receivedRequests[1]?.invocation).toMatchObject({
+      purpose: 'agent_turn',
+      attempt: 1,
+    });
+    expect(model.receivedRequests[2]?.invocation).toMatchObject({
+      runId: model.receivedRequests[1]?.invocation?.runId,
+      rootRunId: result.runId,
+      stepId: model.receivedRequests[1]?.invocation?.stepId,
+      purpose: 'output_repair',
+      attempt: 1,
+    });
+    expect(model.receivedRequests[2]?.invocation?.callId).not.toBe(
+      model.receivedRequests[1]?.invocation?.callId,
+    );
     expect(model.receivedRequests[2]?.messages.at(-1)?.content).toContain('plain child report');
     const parentToolMessage = model.receivedRequests[3]?.messages.find((message) => message.role === 'tool');
     expect(JSON.parse(parentToolMessage?.content as string)).toEqual({ finding: 'repaired from plain child report' });
@@ -4022,6 +4201,8 @@ describe('AdaptiveAgent', () => {
     const result = await agent.run({ goal: 'Recover from provider error once' });
     expect(result).toMatchObject({ status: 'success', output: 'Recovered after provider error.' });
     expect(model.receivedRequests).toHaveLength(2);
+    expect(model.receivedRequests.map((request) => request.invocation?.attempt)).toEqual([1, 2]);
+    expect(model.receivedRequests[0]?.invocation?.callId).not.toBe(model.receivedRequests[1]?.invocation?.callId);
 
     const events = await eventStore.listByRun(result.runId);
     expect(events.find((event) => event.type === 'model.retry' && event.payload.phase === 'runtime')).toMatchObject({
@@ -4173,45 +4354,47 @@ describe('AdaptiveAgent', () => {
     const eventStore = new InMemoryEventStore();
     const snapshotStore = new InMemorySnapshotStore();
     const toolExecutionStore = new InMemoryToolExecutionStore();
-    const agent = new AdaptiveAgent({
-      model: new SequenceModel([
-        {
-          finishReason: 'tool_calls',
-          toolCalls: [
-            {
-              id: 'parent-call-1',
-              name: 'delegate.researcher',
-              input: {
-                goal: 'Research delegation',
-                input: { topic: 'delegation' },
-              },
-            },
-          ],
-        },
-        {
-          finishReason: 'tool_calls',
-          toolCalls: [
-            {
-              id: 'child-call-1',
-              name: 'lookup',
+    const toolContexts: Array<Parameters<ToolDefinition['execute']>[1]> = [];
+    const model = new SequenceModel([
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'parent-call-1',
+            name: 'delegate.researcher',
+            input: {
+              goal: 'Research delegation',
               input: { topic: 'delegation' },
             },
-          ],
-        },
-        {
-          finishReason: 'stop',
-          structuredOutput: {
-            finding: 'researched:delegation',
           },
-        },
-        {
-          finishReason: 'stop',
-          structuredOutput: {
-            report: 'delegation complete',
+        ],
+      },
+      {
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'child-call-1',
+            name: 'lookup',
+            input: { topic: 'delegation' },
           },
+        ],
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: {
+          finding: 'researched:delegation',
         },
-      ]),
-      tools: [createLookupTool()],
+      },
+      {
+        finishReason: 'stop',
+        structuredOutput: {
+          report: 'delegation complete',
+        },
+      },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [createLookupTool((context) => toolContexts.push(context))],
       delegates: [
         {
           name: 'researcher',
@@ -4225,7 +4408,16 @@ describe('AdaptiveAgent', () => {
       toolExecutionStore,
     });
 
-    const result = await agent.run({ sessionId: 'session-delegation-1', goal: 'Write a delegation memo' });
+    const executionContext = {
+      inferenceMode: 'gateway',
+      inferenceTier: 'high',
+      authorizationRef: 'permit-delegation',
+    } as const;
+    const result = await agent.run({
+      sessionId: 'session-delegation-1',
+      goal: 'Write a delegation memo',
+      executionContext,
+    });
     if (result.status !== 'success') {
       throw new Error(`Expected success, received ${result.status}`);
     }
@@ -4238,10 +4430,30 @@ describe('AdaptiveAgent', () => {
       sessionId: 'session-delegation-1',
       parentRunId: result.runId,
       delegateName: 'researcher',
+      executionContext,
       status: 'succeeded',
       result: {
         finding: 'researched:delegation',
       },
+    });
+    expect(model.receivedRequests.every((request) =>
+      JSON.stringify(request.executionContext) === JSON.stringify(executionContext)
+    )).toBe(true);
+    expect(toolContexts).toHaveLength(1);
+    expect(toolContexts[0]?.executionContext).toEqual(executionContext);
+    expect(model.receivedRequests[0]?.invocation).toMatchObject({
+      runId: result.runId,
+      rootRunId: result.runId,
+      stepId: 'step-1',
+      purpose: 'agent_turn',
+      attempt: 1,
+    });
+    expect(model.receivedRequests[1]?.invocation).toMatchObject({
+      runId: childRuns[0]?.id,
+      rootRunId: result.runId,
+      stepId: 'step-1',
+      purpose: 'agent_turn',
+      attempt: 1,
     });
 
     const parentEvents = await eventStore.listByRun(result.runId);

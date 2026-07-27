@@ -4,12 +4,16 @@ import { extname } from 'node:path';
 import { OpenRouter } from '@openrouter/sdk';
 
 import { approximateSerializedByteLength, compactJsonObject } from '../logging.js';
-import type { FileInput, ModelContentPart, ModelMessage, ModelRequest, ModelResponse, StructuredOutputMode } from '../types.js';
+import type { FileInput, ModelContentPart, ModelMessage, ModelRequest, ModelResponse, ModelStreamEvent, StructuredOutputMode } from '../types.js';
 import {
   BaseOpenAIChatAdapter,
   MAX_LOCAL_AUDIO_BYTES,
   MAX_LOCAL_FILE_BYTES,
   OpenAIChatStreamAccumulator,
+  createModelStreamEmitter,
+  emitModelStreamError,
+  emitModelStreamEvents,
+  emitTerminalModelStreamEvents,
   type BaseOpenAIChatAdapterConfig,
   withModelInvocationDiagnostics,
 } from './base-openai-chat-adapter.js';
@@ -90,13 +94,18 @@ export class OpenRouterAdapter extends BaseOpenAIChatAdapter {
     });
   }
 
-  override async generate(request: ModelRequest): Promise<ModelResponse> {
-    const normalizedRequest = await normalizeOpenRouterRequest(request);
-    const body = this.buildStreamingRequestBody(await this.buildRequestBody(normalizedRequest));
-    const startedAt = Date.now();
-    const chunks: unknown[] = [];
+  override async stream(
+    request: ModelRequest,
+    onEvent: (event: ModelStreamEvent) => Promise<void> | void,
+  ): Promise<ModelResponse> {
+    const emitter = createModelStreamEmitter(onEvent);
+    await emitter.emit({ type: 'start', provider: this.provider, model: this.model });
     let completion: unknown;
     try {
+      const normalizedRequest = await normalizeOpenRouterRequest(request);
+      const body = this.buildStreamingRequestBody(await this.buildRequestBody(normalizedRequest));
+      const startedAt = Date.now();
+      const chunks: unknown[] = [];
       const sdkResult = await this.client.chat.send(
         {
           chatRequest: toSdkRequest(body),
@@ -107,27 +116,30 @@ export class OpenRouterAdapter extends BaseOpenAIChatAdapter {
         const accumulator = new OpenAIChatStreamAccumulator();
         for await (const chunk of sdkResult as AsyncIterable<unknown>) {
           chunks.push(chunk);
-          accumulator.add(chunk);
+          await emitModelStreamEvents(emitter.emit, accumulator.add(chunk));
         }
         completion = accumulator.toCompletion();
       } else {
         completion = fromSdkResponse(unwrapOpenRouterSdkResult(sdkResult));
       }
+      const parsed = this.parseResponse(completion as never);
+      const response = {
+        ...parsed,
+        performance: compactJsonObject({
+          ...(parsed.performance ?? {}),
+          adapterAttemptCount: 1,
+          adapterResponseLatencyMs: Date.now() - startedAt,
+          adapterRequestBytes: approximateSerializedByteLength(body),
+          adapterResponseBytes: approximateSerializedByteLength(chunks.length > 0 ? chunks : completion),
+        }),
+      };
+      await emitTerminalModelStreamEvents(emitter.emit, response, emitter.startedToolCallIds);
+      return response;
     } catch (error) {
-      throw enrichOpenRouterSdkError(error);
+      const enriched = enrichOpenRouterSdkError(error);
+      await emitModelStreamError(emitter.emit, enriched);
+      throw enriched;
     }
-
-    const parsed = this.parseResponse(completion as never);
-    return {
-      ...parsed,
-      performance: compactJsonObject({
-        ...(parsed.performance ?? {}),
-        adapterAttemptCount: 1,
-        adapterResponseLatencyMs: Date.now() - startedAt,
-        adapterRequestBytes: approximateSerializedByteLength(body),
-        adapterResponseBytes: approximateSerializedByteLength(chunks.length > 0 ? chunks : completion),
-      }),
-    };
   }
 }
 

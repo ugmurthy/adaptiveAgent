@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { ModelRequest } from '../types.js';
+import type { ModelRequest, ModelStreamEvent } from '../types.js';
 import { BaseOpenAIChatAdapter, ModelRequestError } from './base-openai-chat-adapter.js';
 import { MeshAdapter } from './mesh-adapter.js';
 import { OllamaAdapter } from './ollama-adapter.js';
@@ -426,6 +426,7 @@ describe('BaseOpenAIChatAdapter', () => {
 
   it('aggregates OpenAI-compatible SSE text chunks and stops at DONE', async () => {
     const adapter = createAdapter();
+    const events: ModelStreamEvent[] = [];
     fetchSpy.mockResolvedValueOnce(
       new Response(
         ': keepalive\n\n' +
@@ -441,7 +442,7 @@ describe('BaseOpenAIChatAdapter', () => {
       ),
     );
 
-    const result = await adapter.generate(simpleRequest());
+    const result = await adapter.stream(simpleRequest(), (event) => events.push(event));
 
     expect(result.text).toBe('Hello world');
     expect(result.finishReason).toBe('stop');
@@ -453,10 +454,18 @@ describe('BaseOpenAIChatAdapter', () => {
       provider: 'test',
       model: adapter.model,
     });
+    expect(events).toMatchObject([
+      { type: 'start', provider: 'test', model: adapter.model },
+      { type: 'text_delta', delta: 'Hello' },
+      { type: 'text_delta', delta: ' world' },
+      { type: 'usage', usage: expect.objectContaining({ promptTokens: 10, completionTokens: 5 }) },
+      { type: 'done' },
+    ]);
   });
 
   it('reconstructs fragmented OpenAI-compatible streaming tool calls by index', async () => {
     const adapter = createAdapter();
+    const events: ModelStreamEvent[] = [];
     mockFetchSseResponse([
       openAIStreamDelta({ tool_calls: [{ index: 1, id: 'call-2', type: 'function', function: { name: 'lookup', arguments: '{"topic":"two"}' } }] }),
       openAIStreamDelta({ tool_calls: [{ index: 0, id: 'call-1', type: 'function', function: { name: 'lookup', arguments: '{"topic"' } }] }),
@@ -464,7 +473,7 @@ describe('BaseOpenAIChatAdapter', () => {
       openAIStreamDelta({}, { finishReason: 'tool_calls' }),
     ]);
 
-    const result = await adapter.generate(requestWithTools());
+    const result = await adapter.stream(requestWithTools(), (event) => events.push(event));
 
     expect(result.finishReason).toBe('tool_calls');
     expect(result.text).toBeUndefined();
@@ -472,10 +481,38 @@ describe('BaseOpenAIChatAdapter', () => {
       { id: 'call-1', name: 'lookup', input: { topic: 'one' } },
       { id: 'call-2', name: 'lookup', input: { topic: 'two' } },
     ]);
+    expect(events.filter((event) => event.type === 'tool_call_end')).toEqual([
+      { type: 'tool_call_end', toolCall: { id: 'call-1', name: 'lookup', input: { topic: 'one' } } },
+      { type: 'tool_call_end', toolCall: { id: 'call-2', name: 'lookup', input: { topic: 'two' } } },
+    ]);
+    expect(events.at(-1)).toEqual({ type: 'done' });
+    expect(events.findIndex((event) => event.type === 'tool_call_end')).toBeGreaterThan(
+      events.findLastIndex((event) => event.type === 'tool_call_delta'),
+    );
+  });
+
+  it('starts fallback-ID tool calls before emitting their terminal event', async () => {
+    const adapter = createAdapter();
+    const events: ModelStreamEvent[] = [];
+    mockFetchSseResponse([
+      openAIStreamDelta({ tool_calls: [{ index: 0, type: 'function', function: { name: 'lookup', arguments: '{"topic":"testing"}' } }] }),
+      openAIStreamDelta({}, { finishReason: 'tool_calls' }),
+    ]);
+
+    const result = await adapter.stream(requestWithTools(), (event) => events.push(event));
+
+    expect(result.toolCalls).toEqual([
+      { id: 'call_0', name: 'lookup', input: { topic: 'testing' } },
+    ]);
+    expect(events.filter((event) => event.type === 'tool_call_start' || event.type === 'tool_call_end')).toEqual([
+      { type: 'tool_call_start', toolCallId: 'call_0', name: 'lookup' },
+      { type: 'tool_call_end', toolCall: { id: 'call_0', name: 'lookup', input: { topic: 'testing' } } },
+    ]);
   });
 
   it('does not retry OpenAI-compatible mid-stream failures', async () => {
     const adapter = createAdapter();
+    const events: ModelStreamEvent[] = [];
     const encoder = new TextEncoder();
     fetchSpy.mockResolvedValueOnce(
       new Response(
@@ -492,12 +529,15 @@ describe('BaseOpenAIChatAdapter', () => {
       ),
     );
 
-    await expect(adapter.generate(simpleRequest())).rejects.toMatchObject({
+    await expect(adapter.stream(simpleRequest(), (event) => events.push(event))).rejects.toMatchObject({
       message: 'stream broke',
       modelInvocationPhase: 'response_body',
       modelInvocationAttempt: 1,
     });
     expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(events[0]).toMatchObject({ type: 'start' });
+    expect(events.at(-1)).toMatchObject({ type: 'error', error: { message: 'stream broke' } });
+    expect(events.some((event) => event.type === 'done')).toBe(false);
   });
 
   it('fails OpenAI-compatible provider error frames without retrying', async () => {
@@ -664,6 +704,21 @@ describe('BaseOpenAIChatAdapter', () => {
           format: 'openai-responses-v1',
         },
       ],
+    });
+  });
+
+  it('does not forward raw reasoning through normalized stream events', async () => {
+    const adapter = createAdapter();
+    const events: ModelStreamEvent[] = [];
+    mockFetchResponse(TOOL_CALL_RESPONSE_WITH_REASONING);
+
+    const response = await adapter.stream(requestWithTools(), (event) => events.push(event));
+
+    expect(response.reasoning).toBe('Need to call the lookup tool first.');
+    expect(JSON.stringify(events)).not.toContain('Need to call the lookup tool first.');
+    expect(events).toContainEqual({
+      type: 'tool_call_end',
+      toolCall: { id: 'call-1', name: 'lookup', input: { topic: 'testing' } },
     });
   });
 
@@ -1321,6 +1376,7 @@ describe('OpenRouterAdapter', () => {
       model: 'anthropic/claude-sonnet-4',
       apiKey: 'or-key',
     });
+    const events: ModelStreamEvent[] = [];
     mockFetchSseResponse([
       openAIStreamDelta({ content: 'Preparing delegation. ' }),
       openAIStreamDelta({ tool_calls: [{ index: 0, id: 'call-delegate-1', type: 'function', function: { name: 'delegate__72657365617263686572', arguments: '{"goal"' } }] }),
@@ -1328,7 +1384,7 @@ describe('OpenRouterAdapter', () => {
       openAIStreamDelta({}, { finishReason: 'tool_calls', usage: { prompt_tokens: 20, completion_tokens: 10, total_tokens: 30 } }),
     ]);
 
-    const result = await adapter.generate(requestWithDelegateTools());
+    const result = await adapter.stream(requestWithDelegateTools(), (event) => events.push(event));
 
     expect(result.text).toBe('Preparing delegation. ');
     expect(result.finishReason).toBe('tool_calls');
@@ -1339,6 +1395,19 @@ describe('OpenRouterAdapter', () => {
         input: { goal: 'research testing' },
       },
     ]);
+    expect(events).toContainEqual({
+      type: 'tool_call_start',
+      toolCallId: 'call-delegate-1',
+      name: 'delegate.researcher',
+    });
+    expect(events).toContainEqual({
+      type: 'tool_call_end',
+      toolCall: {
+        id: 'call-delegate-1',
+        name: 'delegate.researcher',
+        input: { goal: 'research testing' },
+      },
+    });
     expect(result.usage).toMatchObject({
       promptTokens: 20,
       completionTokens: 10,
@@ -1617,13 +1686,14 @@ describe('MistralAdapter', () => {
 
   it('reconstructs fragmented Mistral stream tool calls', async () => {
     const adapter = new MistralAdapter({ model: 'mistral-large-latest', apiKey: 'ms-key' });
+    const events: ModelStreamEvent[] = [];
     mockFetchSseResponse([
       mistralStreamDelta({ tool_calls: [{ index: 0, id: 'call-1', type: 'function', function: { name: 'lookup', arguments: '{"topic"' } }] }),
       mistralStreamDelta({ tool_calls: [{ index: 0, type: 'function', function: { name: 'lookup', arguments: ':"testing"}' } }] }),
       mistralStreamDelta({}, { finishReason: 'tool_calls' }),
     ]);
 
-    const result = await adapter.generate(requestWithTools());
+    const result = await adapter.stream(requestWithTools(), (event) => events.push(event));
 
     expect(result.finishReason).toBe('tool_calls');
     expect(result.toolCalls).toEqual([
@@ -1633,6 +1703,11 @@ describe('MistralAdapter', () => {
         input: { topic: 'testing' },
       },
     ]);
+    expect(events.filter((event) => event.type === 'tool_call_delta')).toEqual([
+      { type: 'tool_call_delta', toolCallId: 'call-1', argumentsDelta: '{"topic"' },
+      { type: 'tool_call_delta', toolCallId: 'call-1', argumentsDelta: ':"testing"}' },
+    ]);
+    expect(events.at(-1)).toEqual({ type: 'done' });
   });
 
   it('handles Mistral stream responses without usage', async () => {
@@ -2003,13 +2078,14 @@ describe('MeshAdapter', () => {
 
   it('reconstructs fragmented Mesh streaming tool call arguments', async () => {
     const adapter = new MeshAdapter({ model: 'auto', apiKey: 'mesh-key' });
+    const events: ModelStreamEvent[] = [];
     mockFetchSseResponse([
       meshDelta({ tool_calls: [{ index: 0, id: 'call-1', type: 'function', function: { name: 'lookup', arguments: '{"topic"' } }] }),
       meshDelta({ tool_calls: [{ index: 0, type: 'function', function: { arguments: ':"testing"}' } }] }),
       meshDelta({}, { finishReason: 'tool_calls' }),
     ]);
 
-    const result = await adapter.generate(requestWithTools());
+    const result = await adapter.stream(requestWithTools(), (event) => events.push(event));
 
     expect(result.finishReason).toBe('tool_calls');
     expect(result.text).toBeUndefined();
@@ -2020,6 +2096,10 @@ describe('MeshAdapter', () => {
         input: { topic: 'testing' },
       },
     ]);
+    expect(events.filter((event) => event.type === 'tool_call_end')).toEqual([
+      { type: 'tool_call_end', toolCall: { id: 'call-1', name: 'lookup', input: { topic: 'testing' } } },
+    ]);
+    expect(events.at(-1)).toEqual({ type: 'done' });
   });
 
   it('reconstructs multiple Mesh streaming tool calls by index', async () => {

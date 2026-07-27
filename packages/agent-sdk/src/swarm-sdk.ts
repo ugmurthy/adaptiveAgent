@@ -1,5 +1,6 @@
 import type {
   AgentRun,
+  JsonObject,
   JsonValue,
   ModelContentPart,
   RunResult,
@@ -58,6 +59,7 @@ export interface SwarmRunRequest {
   sessionId?: string;
   input?: JsonValue;
   contentParts?: ModelContentPart[];
+  executionContext?: JsonObject;
   maxWorkers?: number;
 }
 
@@ -77,6 +79,7 @@ export interface SwarmPreparedExecutionRequest {
   decompositionOutput: JsonValue;
   input?: JsonValue;
   contentParts?: ModelContentPart[];
+  executionContext?: JsonObject;
   maxWorkers?: number;
 }
 
@@ -160,7 +163,7 @@ export class SwarmSdk {
     this.emit('decomposition', 'started', sessionId);
     let decompositionResult: RunResult;
     try {
-      decompositionResult = await runSwarmDecomposition({ coordinatorSdk: this.coordinatorSdk, sessionId, topLevelObjective: request.topLevelObjective, inputJson: request.input, workerAgents: this.config.workers.map((c) => c.agent), workerIds: this.config.workerIds, contentParts: request.contentParts });
+      decompositionResult = await runSwarmDecomposition({ coordinatorSdk: this.coordinatorSdk, sessionId, topLevelObjective: request.topLevelObjective, inputJson: request.input, workerAgents: this.config.workers.map((c) => c.agent), workerIds: this.config.workerIds, contentParts: request.contentParts, executionContext: request.executionContext });
     } catch (error) { this.emit('decomposition', 'failed', sessionId, undefined, error); throw error; }
     const common = { sessionId, coordinatorRunId: decompositionResult.runId, decompositionResult, workerIds: this.config.workerIds, subtasks: [] as SwarmSubtask[], defaultsUsed: this.config.defaultsUsed };
     if (decompositionResult.status !== 'success') {
@@ -177,6 +180,7 @@ export class SwarmSdk {
         decompositionOutput: decompositionResult.output,
         input: request.input,
         contentParts: request.contentParts,
+        executionContext: request.executionContext,
         maxWorkers: request.maxWorkers,
       });
     }
@@ -196,6 +200,7 @@ export class SwarmSdk {
         topLevelObjective: request.topLevelObjective,
         input: request.input,
         contentParts: request.contentParts?.length ? request.contentParts : undefined,
+        executionContext: request.executionContext,
         maxWorkers: request.maxWorkers,
         metadata: { defaultsUsed: this.config.defaultsUsed },
         subtasks,

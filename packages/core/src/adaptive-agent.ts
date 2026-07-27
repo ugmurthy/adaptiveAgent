@@ -1,4 +1,5 @@
 import type { Logger } from 'pino';
+import { createHash } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { basename, extname, join } from 'node:path';
@@ -61,6 +62,7 @@ import type {
   JsonSchema,
   JsonValue,
   ModelContentPart,
+  ModelInvocationContext,
   ModelMessage,
   ModelMessageContent,
   ModelRequest,
@@ -340,6 +342,7 @@ export class AdaptiveAgent {
   }
 
   async run(request: RunRequest): Promise<RunResult> {
+    assertValidExecutionContext(request.executionContext);
     if (request.outputSchema !== undefined) {
       assertValidOutputSchema(request.outputSchema);
     }
@@ -362,6 +365,7 @@ export class AdaptiveAgent {
       goal: request.goal,
       input: request.input,
       context: resolvedContext,
+      executionContext: request.executionContext,
       metadata: resolvedMetadata,
       status: 'queued',
     }, (run) =>
@@ -391,6 +395,7 @@ export class AdaptiveAgent {
   }
 
   async chat(request: ChatRequest): Promise<ChatResult> {
+    assertValidExecutionContext(request.executionContext);
     if (request.outputSchema !== undefined) {
       assertValidOutputSchema(request.outputSchema);
     }
@@ -411,6 +416,7 @@ export class AdaptiveAgent {
       sessionId: request.sessionId,
       goal,
       context: resolvedContext,
+      executionContext: request.executionContext,
       metadata: resolvedMetadata,
       status: 'queued',
     }, () => this.createExecutionState(initialMessages, request.outputSchema));
@@ -437,6 +443,7 @@ export class AdaptiveAgent {
   }
 
   async executePlan(request: ExecutePlanRequest): Promise<RunResult> {
+    assertValidExecutionContext(request.executionContext);
     const planStore = this.options.planStore;
     if (!planStore) {
       throw new Error('executePlan() requires a configured planStore');
@@ -452,6 +459,7 @@ export class AdaptiveAgent {
       goal: plan.goal,
       input: request.input,
       context: request.context,
+      executionContext: request.executionContext,
       modelProvider: this.options.model.provider,
       modelName: this.options.model.model,
       metadata: mergeMetadata(plan.metadata, request.metadata),
@@ -1517,6 +1525,7 @@ export class AdaptiveAgent {
           ...(sourceRun.context ?? {}),
           continuation: continuationBrief,
         },
+        executionContext: sourceRun.executionContext,
         metadata: continuationMetadata,
         modelProvider: targetProvider,
         modelName: targetModel,
@@ -3056,6 +3065,7 @@ export class AdaptiveAgent {
       planExecutionId: run.currentPlanExecutionId,
       input: run.input,
       context: run.context,
+      executionContext: run.executionContext,
       idempotencyKey: `${run.id}:${stepId}:${toolCallId}`,
       timeoutMs,
       signal: controller.signal,
@@ -3933,11 +3943,12 @@ export class AdaptiveAgent {
       assertValidOutputSchema(state.outputSchema);
     }
 
-    const modelRequest = {
+    const modelRequest: ModelRequest = {
       messages: normalizeSystemMessagesAtStart(normalizeToolResultMessagesForModel(state.messages)),
       tools: this.plannerVisibleTools(state),
       outputSchema: state.outputSchema,
       metadata: run.metadata,
+      executionContext: run.executionContext,
     };
     const modelTimeoutMs = this.defaults.modelTimeoutMs;
     const modelProvider = this.options.model.provider;
@@ -3946,23 +3957,29 @@ export class AdaptiveAgent {
     const retryPolicy = this.defaults.modelRetryPolicy;
     const maxAttempts = retryPolicy.maxRetries + 1;
 
-    this.logLifecycle('debug', 'model.request', {
-      ...runLogBindings(run),
-      stepId: run.currentStepId,
-      ...summarizeModelRequestForLog(modelRequest),
-    });
-
     for (let attempt = 1; ; attempt += 1) {
+      const invocation = createModelInvocationContext(run, 'agent_turn', attempt, modelRequest);
       const startedAt = Date.now();
       const timeoutContext = createAbortTimeoutContext(modelTimeoutMs);
 
+      this.logLifecycle('debug', 'model.request', {
+        ...runLogBindings(run),
+        stepId: invocation.stepId,
+        callId: invocation.callId,
+        purpose: invocation.purpose,
+        attempt: invocation.attempt,
+        ...summarizeModelRequestForLog(modelRequest),
+      });
+
       await this.emit({
         runId: run.id,
-        stepId: run.currentStepId,
+        stepId: invocation.stepId,
         type: 'model.started',
         schemaVersion: 1,
         payload: compactJsonObject({
-          stepId: run.currentStepId,
+          stepId: invocation.stepId,
+          callId: invocation.callId,
+          purpose: invocation.purpose,
           modelTimeoutMs,
           provider: modelProvider,
           model: modelName,
@@ -3979,6 +3996,7 @@ export class AdaptiveAgent {
       try {
         response = await this.options.model.generate({
           ...modelRequest,
+          invocation,
           signal: timeoutContext.signal,
           modelTimeoutMs,
           onRetry: async (retry) => {
@@ -3992,7 +4010,8 @@ export class AdaptiveAgent {
             });
             this.logLifecycle('warn', 'model.retry', {
               ...runLogBindings(run),
-              stepId: run.currentStepId,
+              stepId: invocation.stepId,
+              callId: invocation.callId,
               provider: modelProvider,
               model: modelName,
               durationMs,
@@ -4008,11 +4027,12 @@ export class AdaptiveAgent {
             });
             await this.emit({
               runId: run.id,
-              stepId: run.currentStepId,
+              stepId: invocation.stepId,
               type: 'model.retry',
               schemaVersion: 1,
               payload: compactJsonObject({
-                stepId: run.currentStepId,
+                stepId: invocation.stepId,
+                callId: invocation.callId,
                 provider: modelProvider,
                 model: modelName,
                 durationMs,
@@ -4058,7 +4078,8 @@ export class AdaptiveAgent {
         });
         this.logLifecycle('error', 'model.failed', {
           ...runLogBindings(run),
-          stepId: run.currentStepId,
+          stepId: invocation.stepId,
+          callId: invocation.callId,
           durationMs,
           performance: failurePerformance,
           ...summarizeModelFailureForLog(modelError, {
@@ -4074,11 +4095,12 @@ export class AdaptiveAgent {
         try {
           await this.emit({
             runId: run.id,
-            stepId: run.currentStepId,
+            stepId: invocation.stepId,
             type: 'model.failed',
             schemaVersion: 1,
             payload: compactJsonObject({
-              stepId: run.currentStepId,
+              stepId: invocation.stepId,
+              callId: invocation.callId,
               durationMs,
               timedOut,
               modelTimeoutMs,
@@ -4111,7 +4133,8 @@ export class AdaptiveAgent {
         });
         this.logLifecycle('warn', 'model.retry', {
           ...runLogBindings(run),
-          stepId: run.currentStepId,
+          stepId: invocation.stepId,
+          callId: invocation.callId,
           provider: modelProvider,
           model: modelName,
           durationMs,
@@ -4125,11 +4148,12 @@ export class AdaptiveAgent {
         });
         await this.emit({
           runId: run.id,
-          stepId: run.currentStepId,
+          stepId: invocation.stepId,
           type: 'model.retry',
           schemaVersion: 1,
           payload: compactJsonObject({
-            stepId: run.currentStepId,
+            stepId: invocation.stepId,
+            callId: invocation.callId,
             provider: modelProvider,
             model: modelName,
             durationMs,
@@ -4151,6 +4175,8 @@ export class AdaptiveAgent {
       }
 
       const durationMs = Date.now() - startedAt;
+      const actualProvider = response.usage?.provider ?? modelProvider;
+      const actualModel = response.usage?.model ?? modelName;
       const responsePerformance = compactJsonObject({
         ...modelResponsePerformanceMetrics(response),
         durationMs,
@@ -4160,7 +4186,10 @@ export class AdaptiveAgent {
       });
       this.logLifecycle('debug', 'model.response', {
         ...runLogBindings(run),
-        stepId: run.currentStepId,
+        stepId: invocation.stepId,
+        callId: invocation.callId,
+        provider: actualProvider,
+        model: actualModel,
         durationMs,
         ...summarizeModelResponseForLog(response),
         performance: responsePerformance,
@@ -4170,14 +4199,16 @@ export class AdaptiveAgent {
 
       await this.emit({
         runId: run.id,
-        stepId: run.currentStepId,
+        stepId: invocation.stepId,
         type: 'model.completed',
         schemaVersion: 1,
         payload: compactJsonObject({
-          stepId: run.currentStepId,
+          stepId: invocation.stepId,
+          callId: invocation.callId,
+          purpose: invocation.purpose,
           durationMs,
-          provider: modelProvider,
-          model: modelName,
+          provider: actualProvider,
+          model: actualModel,
           finishReason: response.finishReason,
           toolCallCount: response.toolCalls?.length ?? 0,
           attempt,
@@ -4203,6 +4234,7 @@ export class AdaptiveAgent {
       messages: buildOutputSchemaRepairMessages(text, outputSchema),
       tools: [],
       outputSchema,
+      executionContext: run.executionContext,
       metadata: mergeMetadata(
         run.metadata,
         {
@@ -4213,13 +4245,16 @@ export class AdaptiveAgent {
         },
       ),
     };
+    const invocation = createModelInvocationContext(run, 'output_repair', 1, repairRequest);
     const requestPerformance = modelRequestPerformanceMetrics(repairRequest);
     const startedAt = Date.now();
     const timeoutContext = createAbortTimeoutContext(this.defaults.modelTimeoutMs);
 
     this.logLifecycle('debug', 'model.output_schema_repair.request', {
       ...runLogBindings(run),
-      stepId: run.currentStepId,
+      stepId: invocation.stepId,
+      callId: invocation.callId,
+      purpose: invocation.purpose,
       ...summarizeModelRequestForLog(repairRequest),
     });
 
@@ -4227,6 +4262,7 @@ export class AdaptiveAgent {
     try {
       response = await this.options.model.generate({
         ...repairRequest,
+        invocation,
         signal: timeoutContext.signal,
         modelTimeoutMs: this.defaults.modelTimeoutMs,
       });
@@ -4234,7 +4270,8 @@ export class AdaptiveAgent {
       const durationMs = Date.now() - startedAt;
       this.logLifecycle('warn', 'model.output_schema_repair.failed', {
         ...runLogBindings(run),
-        stepId: run.currentStepId,
+        stepId: invocation.stepId,
+        callId: invocation.callId,
         durationMs,
         performance: compactJsonObject({
           ...requestPerformance,
@@ -4262,7 +4299,8 @@ export class AdaptiveAgent {
     const output = isJsonObject(structuredOutput) ? structuredOutput : undefined;
     this.logLifecycle(output ? 'debug' : 'warn', 'model.output_schema_repair.response', {
       ...runLogBindings(run),
-      stepId: run.currentStepId,
+      stepId: invocation.stepId,
+      callId: invocation.callId,
       durationMs,
       ...summarizeModelResponseForLog(response),
       repaired: Boolean(output),
@@ -6102,6 +6140,16 @@ function isJsonObject(value: JsonValue | undefined): value is JsonObject {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+export function assertValidExecutionContext(value: unknown): asserts value is JsonObject | undefined {
+  if (value === undefined) {
+    return;
+  }
+
+  if (!isPlainJsonObject(value) || !isJsonValue(value)) {
+    throw new TypeError('executionContext must be a plain JSON object containing only finite JSON values');
+  }
+}
+
 function removeUndefinedJsonFields(value: Record<string, JsonValue | undefined>): JsonObject {
   const result: JsonObject = {};
   for (const [key, entry] of Object.entries(value)) {
@@ -6307,27 +6355,96 @@ function getJsonPathValue(value: JsonValue | undefined, path: string[]): JsonVal
 }
 
 function isJsonValue(value: unknown): value is JsonValue {
+  return isJsonValueInternal(value, new Set<object>());
+}
+
+function isJsonValueInternal(value: unknown, ancestors: Set<object>): value is JsonValue {
   if (value === null) {
     return true;
   }
 
-  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+  if (typeof value === 'string' || typeof value === 'boolean') {
     return true;
   }
 
-  if (Array.isArray(value)) {
-    return value.every((entry) => isJsonValue(entry));
+  if (typeof value === 'number') {
+    return Number.isFinite(value);
   }
 
-  if (typeof value !== 'object') {
+  if (Array.isArray(value)) {
+    if (ancestors.has(value)) {
+      return false;
+    }
+    ancestors.add(value);
+    const valid = value.every((entry) => isJsonValueInternal(entry, ancestors));
+    ancestors.delete(value);
+    return valid;
+  }
+
+  if (!isPlainJsonObject(value)) {
     return false;
   }
 
-  return Object.values(value as Record<string, unknown>).every((entry) => isJsonValue(entry));
+  if (ancestors.has(value)) {
+    return false;
+  }
+  ancestors.add(value);
+  const valid = Object.values(value).every((entry) => isJsonValueInternal(entry, ancestors));
+  ancestors.delete(value);
+  return valid;
+}
+
+function isPlainJsonObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
 }
 
 function stableJsonStringify(value: unknown): string {
-  return JSON.stringify(value ?? null);
+  return JSON.stringify(value ?? null, (_key, entry: unknown) => {
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+      return entry;
+    }
+
+    return Object.fromEntries(
+      Object.keys(entry as Record<string, unknown>)
+        .sort()
+        .map((key) => [key, (entry as Record<string, unknown>)[key]]),
+    );
+  });
+}
+
+function createModelInvocationContext(
+  run: AgentRun,
+  purpose: ModelInvocationContext['purpose'],
+  attempt: number,
+  request: ModelRequest,
+): ModelInvocationContext {
+  const stepId = run.currentStepId;
+  if (!stepId) {
+    throw new Error(`Run ${run.id} has no current step for model invocation`);
+  }
+
+  const requestHash = createHash('sha256')
+    .update(stableJsonStringify({
+      messages: request.messages,
+      tools: request.tools,
+      outputSchema: request.outputSchema,
+    }))
+    .digest('hex')
+    .slice(0, 24);
+  const retryGeneration = readRetryAttempts(run.metadata);
+  return {
+    runId: run.id,
+    rootRunId: run.rootRunId,
+    stepId,
+    purpose,
+    callId: `model:${run.id}:${stepId}:${purpose}:r${retryGeneration}:a${attempt}:${requestHash}`,
+    attempt,
+  };
 }
 
 function recoverToolError<O extends JsonValue>(

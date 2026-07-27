@@ -1,0 +1,25 @@
+{
+  "name": "@adaptive-agent/gateway-protocol",
+  "version": "0.1.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "bunx tsc --outDir dist --declaration --noEmit false",
+    "typecheck": "bunx tsc --noEmit",
+    "test": "bunx vitest run"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.1"
+  }
+}

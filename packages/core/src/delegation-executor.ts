@@ -645,6 +645,7 @@ export class DelegationExecutor {
       goal: params.input.goal,
       input: params.input.input,
       context: params.input.context,
+      executionContext: params.parentContext.executionContext,
       metadata: params.input.metadata,
       status: 'queued',
     };
@@ -1311,6 +1312,10 @@ export function validateDelegateToolInput(input: JsonValue, toolName = 'delegate
 
   if (input.metadata !== undefined && !isJsonObject(input.metadata)) {
     return `${toolName} input.metadata must be a JSON object, not ${describeJsonType(input.metadata)}`;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(input, 'executionContext')) {
+    return `${toolName} input.executionContext is host-protected and cannot be supplied by a delegate`;
   }
 
   if (input.outputSchema !== undefined) {

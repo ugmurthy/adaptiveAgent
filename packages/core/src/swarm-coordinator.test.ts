@@ -129,6 +129,11 @@ describe('SwarmCoordinator', () => {
     const result = await swarm.run({
       sessionId: 'session-swarm-1',
       topLevelObjective: 'Create a market entry recommendation.',
+      executionContext: {
+        inferenceMode: 'gateway',
+        inferenceTier: 'high',
+        authorizationRef: 'permit-swarm',
+      },
       maxWorkers: 1,
     });
 
@@ -148,6 +153,22 @@ describe('SwarmCoordinator', () => {
 
     const sessionRuns = await runStore.listBySession('session-swarm-1');
     expect(sessionRuns).toHaveLength(5);
+    expect(sessionRuns.every((run) =>
+      JSON.stringify(run.executionContext) === JSON.stringify({
+        inferenceMode: 'gateway',
+        inferenceTier: 'high',
+        authorizationRef: 'permit-swarm',
+      })
+    )).toBe(true);
+    expect([
+      coordinatorModel,
+      researcherModel,
+      writerModel,
+      qualityModel,
+      synthesizerModel,
+    ].every((model) => model.receivedRequests.every((request) =>
+      request.executionContext?.authorizationRef === 'permit-swarm'
+    ))).toBe(true);
     const runsByRole = new Map(
       sessionRuns.map((run) => [
         typeof run.metadata?.orchestration === 'object' && run.metadata.orchestration !== null

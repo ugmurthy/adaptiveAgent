@@ -421,9 +421,9 @@ function buildNodeOptions(options: OrchestratedRunOptions, plan: OrchestrationPl
   }));
   const orchestration = { sessionId: plan.sessionId, requestedAgentId: plan.requestedAgentId, selectedAgentId: node.agentId, executionShape: plan.executionShape, stage: node.stage, nodeId: node.id, dependsOn: node.dependsOn, detectedModalities: plan.detectedModalities, routingReason: plan.routingReason } satisfies JsonObject;
   if (node.stage === 'final_synthesis') {
-    return { input: { originalInput: options.input ?? null, upstreamResults: priorOutputs }, context: { ...(options.context ?? {}), sessionId: plan.sessionId, orchestration }, outputSchema: options.outputSchema, metadata: { ...(options.metadata ?? {}), orchestration } };
+    return { input: { originalInput: options.input ?? null, upstreamResults: priorOutputs }, context: { ...(options.context ?? {}), sessionId: plan.sessionId, orchestration }, executionContext: options.executionContext, outputSchema: options.outputSchema, metadata: { ...(options.metadata ?? {}), orchestration } };
   }
-  return { ...selectNodeInputs(options, plan, node), context: { ...(options.context ?? {}), sessionId: plan.sessionId, orchestration }, outputSchema: options.outputSchema, metadata: { ...(options.metadata ?? {}), orchestration } };
+  return { ...selectNodeInputs(options, plan, node), context: { ...(options.context ?? {}), sessionId: plan.sessionId, orchestration }, executionContext: options.executionContext, outputSchema: options.outputSchema, metadata: { ...(options.metadata ?? {}), orchestration } };
 }
 
 function selectNodeInputs(options: OrchestratedRunOptions, plan: OrchestrationPlan, node: OrchestrationPlanNode): AgentSdkRunOptions {

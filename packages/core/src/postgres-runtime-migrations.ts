@@ -254,4 +254,11 @@ create index if not exists agent_runs_session_idx
   where session_id is not null;
 `,
   },
+  {
+    name: 'core:006_run_execution_context',
+    sql: `
+alter table agent_runs
+  add column if not exists execution_context jsonb;
+`,
+  },
 ];

@@ -136,7 +136,14 @@ describe('orchestration sdk', () => {
       orchestrationListener: (event) => events.push(event),
     });
 
-    const result = await sdk.run('compare the image and audio', multimodalOptions());
+    const result = await sdk.run('compare the image and audio', {
+      ...multimodalOptions(),
+      executionContext: {
+        inferenceMode: 'gateway',
+        inferenceTier: 'high',
+        authorizationRef: 'permit-orchestration',
+      },
+    });
     const inspection = await sdk.inspectSession('session-1');
 
     expect(result.executionShape).toBe('parallel_fanout_then_synthesis');
@@ -145,6 +152,9 @@ describe('orchestration sdk', () => {
     expect(calls[0]?.options.contentParts).toBeUndefined();
     expect(calls[1]?.options.images).toBeUndefined();
     expect(calls[1]?.options.contentParts).toEqual([{ type: 'audio', audio: { source: { kind: 'path', path: '/tmp/audio.wav' }, format: 'wav' } }]);
+    expect(calls.every((call) =>
+      call.options.executionContext?.authorizationRef === 'permit-orchestration'
+    )).toBe(true);
     expect(inspection.links.map((link) => [link.nodeId, link.upstreamRunIds])).toEqual([
       ['image_specialist', []],
       ['audio_specialist', []],

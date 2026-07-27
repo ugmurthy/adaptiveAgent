@@ -19,6 +19,7 @@ import {
   type PostgresClient,
   type PostgresTransactionClient,
 } from './postgres-runtime-stores.js';
+import { POSTGRES_RUNTIME_MIGRATIONS } from './postgres-runtime-migrations.js';
 
 function createMockClient(): PostgresClient & { calls: Array<{ sql: string; params?: unknown[] }> } {
   const calls: Array<{ sql: string; params?: unknown[] }> = [];
@@ -59,6 +60,7 @@ const sampleRunRow = {
   goal: 'Write a report',
   input: { topic: 'resumability' },
   context: { locale: 'en-US' },
+  execution_context: { inferenceMode: 'gateway', inferenceTier: 'high', authorizationRef: 'permit-1' },
   model_provider: 'mesh',
   model_name: 'openai/gpt-4o',
   model_parameters: { temperature: 0.2, reasoningEffort: 'medium' },
@@ -198,6 +200,15 @@ const sampleToolExecutionRow = {
   completed_at: '2026-04-13T10:01:00.000Z',
 };
 
+describe('Postgres runtime migrations', () => {
+  it('adds execution context after the existing run migrations', () => {
+    expect(POSTGRES_RUNTIME_MIGRATIONS.at(-1)).toMatchObject({
+      name: 'core:006_run_execution_context',
+      sql: expect.stringContaining('add column if not exists execution_context jsonb'),
+    });
+  });
+});
+
 describe('PostgresRunStore', () => {
   it('creates a root run and maps the returned row', async () => {
     const client = createMockClientWithRows([sampleRunRow]);
@@ -209,6 +220,7 @@ describe('PostgresRunStore', () => {
       goal: 'Write a report',
       input: { topic: 'resumability' },
       context: { locale: 'en-US' },
+      executionContext: { inferenceMode: 'gateway', inferenceTier: 'high', authorizationRef: 'permit-1' },
       modelProvider: 'mesh',
       modelName: 'openai/gpt-4o',
       modelParameters: { temperature: 0.2, reasoningEffort: 'medium' },
@@ -222,6 +234,7 @@ describe('PostgresRunStore', () => {
       rootRunId: 'run-1',
       goal: 'Write a report',
       status: 'running',
+      executionContext: { inferenceMode: 'gateway', inferenceTier: 'high', authorizationRef: 'permit-1' },
       modelProvider: 'mesh',
       modelName: 'openai/gpt-4o',
       modelParameters: { temperature: 0.2, reasoningEffort: 'medium' },
@@ -242,11 +255,21 @@ describe('PostgresRunStore', () => {
         null,
         null,
         null,
+        JSON.stringify({ inferenceMode: 'gateway', inferenceTier: 'high', authorizationRef: 'permit-1' }),
         'mesh',
         'openai/gpt-4o',
         JSON.stringify({ temperature: 0.2, reasoningEffort: 'medium' }),
       ]),
     );
+  });
+
+  it('rejects execution context mutation', async () => {
+    const client = createMockClientWithRows([sampleRunRow]);
+    const store = new PostgresRunStore(client);
+
+    await expect(store.updateRun('run-1', {
+      executionContext: { inferenceMode: 'gateway', inferenceTier: 'low', authorizationRef: 'permit-1' },
+    })).rejects.toThrow('executionContext is immutable');
   });
 
   it('returns null when a run is missing', async () => {

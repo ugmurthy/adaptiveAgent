@@ -1,4 +1,4 @@
-import { AdaptiveAgent } from './adaptive-agent.js';
+import { AdaptiveAgent, assertValidExecutionContext } from './adaptive-agent.js';
 import type {
   AgentRun,
   JsonValue,
@@ -35,12 +35,14 @@ export class SwarmCoordinator {
   constructor(private readonly options: SwarmCoordinatorOptions) {}
 
   async run(request: SwarmRequest): Promise<SwarmRunResult> {
+    assertValidExecutionContext(request.executionContext);
     const sessionId = request.sessionId ?? crypto.randomUUID();
     const coordinatorResult = await this.options.coordinatorAgent.run({
       sessionId,
       goal: request.topLevelObjective,
       input: request.input,
       contentParts: request.contentParts,
+      executionContext: request.executionContext,
       context: {
         topLevelObjective: request.topLevelObjective,
         phase: 'swarm.decompose',
@@ -93,6 +95,7 @@ export class SwarmCoordinator {
       topLevelObjective: request.topLevelObjective,
       input: request.input,
       contentParts: request.contentParts,
+      executionContext: request.executionContext,
       maxWorkers: request.maxWorkers,
       metadata: request.metadata,
       subtasks,
@@ -100,23 +103,32 @@ export class SwarmCoordinator {
   }
 
   async execute(request: SwarmExecutionRequest): Promise<SwarmRunResult> {
+    assertValidExecutionContext(request.executionContext);
     const sessionId = request.sessionId ?? crypto.randomUUID();
     const maxWorkers = Math.max(1, request.maxWorkers ?? this.options.defaultMaxWorkers ?? 4);
-    const coordinatorRunId = request.coordinatorRunId ?? (await this.options.runStore.createRun({
-      sessionId,
-      goal: request.topLevelObjective,
-      input: request.input,
-      context: { topLevelObjective: request.topLevelObjective, phase: 'swarm.execute' },
-      metadata: {
-        ...(request.metadata ?? {}),
-        orchestration: {
-          kind: 'swarm',
-          coordinatorRunId: 'pending',
-          role: 'coordinator',
-        } as unknown as JsonValue,
-      },
-      status: 'running',
-    })).id;
+    const coordinatorRun = request.coordinatorRunId
+      ? await this.options.runStore.getRun(request.coordinatorRunId)
+      : await this.options.runStore.createRun({
+          sessionId,
+          goal: request.topLevelObjective,
+          input: request.input,
+          context: { topLevelObjective: request.topLevelObjective, phase: 'swarm.execute' },
+          executionContext: request.executionContext,
+          metadata: {
+            ...(request.metadata ?? {}),
+            orchestration: {
+              kind: 'swarm',
+              coordinatorRunId: 'pending',
+              role: 'coordinator',
+            } as unknown as JsonValue,
+          },
+          status: 'running',
+        });
+    if (!coordinatorRun) {
+      throw new Error(`Swarm coordinator run ${request.coordinatorRunId} does not exist`);
+    }
+    const coordinatorRunId = coordinatorRun.id;
+    const executionContext = coordinatorRun.executionContext;
 
     await this.patchRunMetadata(coordinatorRunId, {
       ...(request.metadata ?? {}),
@@ -150,13 +162,14 @@ export class SwarmCoordinator {
     });
 
     const subtaskResults = await runWithConcurrency(request.subtasks, maxWorkers, (subtask) =>
-      this.runWorker({ sessionId, coordinatorRunId, topLevelObjective: request.topLevelObjective, subtask }),
+      this.runWorker({ sessionId, coordinatorRunId, topLevelObjective: request.topLevelObjective, executionContext, subtask }),
     );
 
     return this.runFinalizers({
       sessionId,
       coordinatorRunId,
       topLevelObjective: request.topLevelObjective,
+      executionContext,
       subtasks: request.subtasks,
       subtaskResults,
     });
@@ -298,6 +311,7 @@ export class SwarmCoordinator {
         sessionId: request.sessionId,
         coordinatorRunId,
         topLevelObjective: descriptor.topLevelObjective,
+        executionContext: coordinatorRun.executionContext,
         subtasks: descriptor.subtasks,
         subtaskResults,
         previousQualityRunId: latestQuality?.id,
@@ -327,6 +341,7 @@ export class SwarmCoordinator {
     sessionId: string;
     coordinatorRunId: UUID;
     topLevelObjective: string;
+    executionContext?: AgentRun['executionContext'];
     subtasks: SwarmSubtask[];
     subtaskResults: SwarmSubtaskResult[];
     previousQualityRunId?: UUID;
@@ -342,6 +357,7 @@ export class SwarmCoordinator {
         subtasks: params.subtasks as unknown as JsonValue,
         subtaskResults: params.subtaskResults as unknown as JsonValue,
       },
+      executionContext: params.executionContext,
       outputSchema: qualityOutputSchema,
       metadata: {
         orchestration: orchestrationMetadata(params.coordinatorRunId, 'quality', undefined, this.options.qualityAgentId, qualityAttempt, params.previousQualityRunId) as unknown as JsonValue,
@@ -366,6 +382,7 @@ export class SwarmCoordinator {
       sessionId: params.sessionId,
       goal: 'Synthesize the final response for the top-level objective from worker results and quality assessments.',
       input: synthesizerInput,
+      executionContext: params.executionContext,
       metadata: {
         orchestration: orchestrationMetadata(params.coordinatorRunId, 'synthesizer', undefined, this.options.synthesizerAgentId, synthesizerAttempt, params.previousSynthesizerRunId) as unknown as JsonValue,
       },
@@ -445,6 +462,7 @@ export class SwarmCoordinator {
     sessionId: string;
     coordinatorRunId: UUID;
     topLevelObjective: string;
+    executionContext?: AgentRun['executionContext'];
     subtask: SwarmSubtask;
   }): Promise<SwarmSubtaskResult> {
     const targetAgentId = params.subtask.targetAgentId ?? this.options.defaultWorkerAgentId;
@@ -468,6 +486,7 @@ export class SwarmCoordinator {
       goal: params.subtask.subObjective,
       input: params.subtask.input,
       contentParts: [],
+      executionContext: params.executionContext,
       context: {
         topLevelObjective: params.topLevelObjective,
         subtaskId: params.subtask.id,

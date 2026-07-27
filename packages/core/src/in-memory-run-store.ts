@@ -86,6 +86,7 @@ export class InMemoryRunStore implements RunStore {
       goal: run.goal,
       input: run.input,
       context: run.context,
+      executionContext: structuredClone(parent ? parent.executionContext : run.executionContext),
       modelProvider: run.modelProvider,
       modelName: run.modelName,
       modelParameters: run.modelParameters,
@@ -176,6 +177,13 @@ export class InMemoryRunStore implements RunStore {
 
     if (patch.modelParameters && JSON.stringify(patch.modelParameters) !== JSON.stringify(current.modelParameters)) {
       throw new Error('modelParameters is immutable');
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(patch, 'executionContext') &&
+      JSON.stringify(patch.executionContext) !== JSON.stringify(current.executionContext)
+    ) {
+      throw new Error('executionContext is immutable');
     }
 
     if (patch.currentChildRunId && !this.runs.has(patch.currentChildRunId)) {
