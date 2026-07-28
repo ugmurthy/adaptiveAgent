@@ -228,6 +228,7 @@ export interface ModelGenerateTimings {
 
 export interface ModelGenerateResult {
   callId: string;
+  traceId: string;
   text?: string;
   structuredOutput?: JsonValue;
   toolCalls?: ModelToolCall[];
@@ -941,6 +942,7 @@ function validateModelGenerateResult(value: unknown): void {
   const result = record(value, 'result');
   exactKeys(result, [
     'callId',
+    'traceId',
     'text',
     'structuredOutput',
     'toolCalls',
@@ -952,6 +954,7 @@ function validateModelGenerateResult(value: unknown): void {
     'timings',
   ], 'result');
   boundedString(result.callId, 'result.callId');
+  boundedString(result.traceId, 'result.traceId');
   if (result.text !== undefined) {
     boundedString(result.text, 'result.text', { max: PROTOCOL_LIMITS.maxStringBytes, allowEmpty: true });
   }

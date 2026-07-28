@@ -811,11 +811,11 @@ the execution authority.
 
 **Acceptance criteria:**
 
-- [ ] Concurrent model requests do not cross streams.
-- [ ] Missing, duplicate, and out-of-order sequences are diagnosed.
-- [ ] Abort signals issue cancellation and stop local consumption.
-- [ ] Reconnect uses the original call ID.
-- [ ] Final usage includes actual server-selected provider/model.
+- [x] Concurrent model requests do not cross streams.
+- [x] Missing, duplicate, and out-of-order sequences are diagnosed.
+- [x] Abort signals issue cancellation and stop local consumption.
+- [x] Reconnect uses the original call ID.
+- [x] Final usage includes actual server-selected provider/model.
 
 #### US-009: Add Agent SDK inference modes and run tiers
 
@@ -833,11 +833,11 @@ the execution authority.
 
 **Acceptance criteria:**
 
-- [ ] Two runs using one SDK instance may select different tiers safely.
-- [ ] A local core run completes using only the gateway model adapter.
-- [ ] Local file tools execute on the client during the remote-model run.
-- [ ] Gateway unavailability produces an actionable client error.
-- [ ] Access tokens are absent from logs, events, and run inspection.
+- [x] Two runs using one SDK instance may select different tiers safely.
+- [x] A local core run completes using only the gateway model adapter.
+- [x] Local file tools execute on the client during the remote-model run.
+- [x] Gateway unavailability produces an actionable client error.
+- [x] Access tokens are absent from logs, events, and run inspection.
 
 #### Phase 3 architecture-validation gate
 

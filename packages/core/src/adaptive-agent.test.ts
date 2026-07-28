@@ -229,6 +229,32 @@ describe('AdaptiveAgent', () => {
     });
   });
 
+  it('uses a host-assigned identity for run and chat root runs', async () => {
+    const runStore = new InMemoryRunStore();
+    const model = new SequenceModel([
+      { finishReason: 'stop', text: 'run done' },
+      { finishReason: 'stop', text: 'chat done' },
+    ]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore,
+      eventStore: new InMemoryEventStore(),
+      snapshotStore: new InMemorySnapshotStore(),
+    });
+    const runId = '11111111-1111-4111-8111-111111111111';
+    const chatRunId = '22222222-2222-4222-8222-222222222222';
+
+    const run = await agent.run({ runId, goal: 'Use the authorized run identity' });
+    const chat = await agent.chat({ runId: chatRunId, messages: [{ role: 'user', content: 'Use this identity too' }] });
+
+    expect(run.runId).toBe(runId);
+    expect(chat.runId).toBe(chatRunId);
+    expect((await runStore.getRun(runId))?.id).toBe(runId);
+    expect((await runStore.getRun(chatRunId))?.id).toBe(chatRunId);
+    expect(model.receivedRequests.map((request) => request.invocation?.rootRunId)).toEqual([runId, chatRunId]);
+  });
+
   it('resolves run context refs into model-visible reserved context and audit events', async () => {
     const runStore = new InMemoryRunStore();
     const eventStore = new InMemoryEventStore();

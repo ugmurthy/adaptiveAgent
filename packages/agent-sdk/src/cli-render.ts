@@ -172,6 +172,8 @@ export function summarizeCli(cli: ManualTestCliOptions): Record<string, JsonValu
     ...(cli.agentConfigPath ? { agentConfigPath: resolve(cli.agentConfigPath) } : {}),
     ...(cli.settingsConfigPath ? { settingsConfigPath: resolve(cli.settingsConfigPath) } : {}),
     ...(cli.runtimeMode ? { runtimeMode: cli.runtimeMode } : {}),
+    ...(cli.inferenceMode ? { inferenceMode: cli.inferenceMode } : {}),
+    ...(cli.inferenceTier ? { inferenceTier: cli.inferenceTier } : {}),
     ...(cli.provider ? { provider: cli.provider } : {}),
     ...(cli.model ? { model: cli.model } : {}),
     ...(cli.approvalMode ? { approvalMode: cli.approvalMode } : {}),
@@ -205,6 +207,8 @@ export function summarizeResolvedConfig(
     agentName: resolvedConfig.agent.name,
     provider: resolvedConfig.model.provider,
     model: resolvedConfig.model.model,
+    inferenceMode: resolvedConfig.inference.mode,
+    inferenceTier: resolvedConfig.inference.tier,
     runtimeMode: resolvedConfig.runtime.mode,
     requestedRuntimeMode: resolvedConfig.runtime.requestedMode,
     autoMigrate: resolvedConfig.runtime.autoMigrate,
@@ -1058,6 +1062,7 @@ export function printResolvedConfigSummary(
   console.log(`mode: ${spec.mode}`);
   console.log(`agent: ${resolvedConfig.agent.id} (${resolvedConfig.agent.name})`);
   console.log(`model: ${resolvedConfig.model.provider}/${resolvedConfig.model.model}`);
+  console.log(`inference: ${resolvedConfig.inference.mode}/${resolvedConfig.inference.tier}`);
   console.log(`runtime: ${resolvedConfig.runtime.mode} (requested ${resolvedConfig.runtime.requestedMode})`);
   console.log(`workspace: ${resolvedConfig.workspaceRoot}`);
   console.log(`messages: ${summary.messageCount}`);
@@ -1198,6 +1203,7 @@ export function printInlineConfigSummary(
   console.log(`mode: ${spec.mode}`);
   console.log(`agent: ${resolvedConfig.agent.id} (${resolvedConfig.agent.name})`);
   console.log(`model: ${resolvedConfig.model.provider}/${resolvedConfig.model.model}`);
+  console.log(`inference: ${resolvedConfig.inference.mode}/${resolvedConfig.inference.tier}`);
   console.log(`runtime: ${resolvedConfig.runtime.mode} (requested ${resolvedConfig.runtime.requestedMode})`);
   console.log(`workspace: ${resolvedConfig.workspaceRoot}`);
   console.log(`messages: ${summary.messageCount}`);

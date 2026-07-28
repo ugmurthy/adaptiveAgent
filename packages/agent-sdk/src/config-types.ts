@@ -11,6 +11,7 @@ import {
   type FailureClass,
   type JsonObject,
   type JsonValue,
+  type ModelAdapter,
   type ModelAdapterConfig,
   type PlanStore,
   type RunRequest,
@@ -18,6 +19,15 @@ import {
   type SnapshotStore,
   type ToolDefinition,
 } from '@adaptive-agent/core';
+import type {
+  GatewayClient,
+  GatewayClientOptions,
+  InferenceMode,
+  InferenceTier,
+  ProfileRef,
+} from '@adaptive-agent/gateway-client';
+
+export type { InferenceMode, InferenceTier, ProfileRef } from '@adaptive-agent/gateway-client';
 
 export type InvocationMode = 'run' | 'chat';
 export type RuntimeMode = 'memory' | 'postgres';
@@ -92,6 +102,16 @@ export interface AgentSettingsFile {
   skills?: { dirs?: string[]; allowExampleSkills?: boolean };
   workspace?: { overrideRoot?: string; overrideShellCwd?: string };
   model?: { overrideProvider?: string; overrideModel?: string; overrideBaseUrl?: string; overrideApiKeyEnv?: string; overrideStructuredOutputMode?: ModelAdapterConfig['structuredOutputMode'] };
+  inference?: { mode?: InferenceMode; tier?: InferenceTier };
+  gateway?: {
+    url?: string;
+    clientName?: string;
+    clientVersion?: string;
+    accessTokenEnv?: string;
+    connectTimeoutMs?: number;
+    requestTimeoutMs?: number;
+    reconnectAttempts?: number;
+  };
   defaults?: Partial<AgentDefaults>;
   env?: Record<string, string>;
   tui?: TuiSettingsConfig;
@@ -104,6 +124,16 @@ export interface ResolvedAgentSdkConfig {
   workspaceRoot: string;
   shellCwd: string;
   model: ModelAdapterConfig;
+  inference: { mode: InferenceMode; tier: InferenceTier };
+  gateway: {
+    url?: string;
+    clientName: string;
+    clientVersion: string;
+    accessTokenEnv: string;
+    connectTimeoutMs?: number;
+    requestTimeoutMs?: number;
+    reconnectAttempts?: number;
+  };
   runtime: { requestedMode: RuntimeMode; mode: RuntimeMode; autoMigrate: boolean };
   logging: { enabled: boolean; level: LogLevel; destination: LogDestination; filePath?: string; pretty: boolean };
   interaction: { approvalMode: ApprovalMode; clarificationMode: ClarificationMode };
@@ -169,6 +199,13 @@ export interface AgentSdkOptions {
   settingsOverrides?: AgentSettingsFile;
   settingsConfigPath?: string;
   model?: Partial<ModelAdapterConfig> & { apiKeyEnv?: string };
+  modelAdapter?: ModelAdapter;
+  inferenceMode?: InferenceMode;
+  inferenceTier?: InferenceTier;
+  profileRefs?: ProfileRef[];
+  gatewayClient?: GatewayClient;
+  gateway?: Partial<Pick<GatewayClientOptions, 'url' | 'clientName' | 'clientVersion' | 'connectTimeoutMs' | 'requestTimeoutMs' | 'reconnectAttempts'>>;
+  accessToken?: GatewayClientOptions['accessToken'];
   runtimeMode?: RuntimeMode;
   runtime?: AdaptiveAgentRuntimeOptions<RunStore, EventStore, SnapshotStore, PlanStore | undefined, ContinuationStore>;
   tools?: Array<ToolDefinition<any, any>>;
@@ -178,5 +215,5 @@ export interface AgentSdkOptions {
   clock?: () => Date;
 }
 
-export interface AgentSdkRunOptions extends Omit<RunRequest, 'goal' | 'metadata'> { metadata?: JsonObject }
-export interface AgentSdkChatOptions extends Omit<ChatRequest, 'messages' | 'metadata'> { metadata?: JsonObject }
+export interface AgentSdkRunOptions extends Omit<RunRequest, 'goal' | 'metadata'> { metadata?: JsonObject; inferenceTier?: InferenceTier }
+export interface AgentSdkChatOptions extends Omit<ChatRequest, 'messages' | 'metadata'> { metadata?: JsonObject; inferenceTier?: InferenceTier }

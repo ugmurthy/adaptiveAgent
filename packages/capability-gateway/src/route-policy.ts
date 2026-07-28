@@ -100,7 +100,13 @@ export type AdapterFactory = (
 ) => ProviderAdapter | Promise<ProviderAdapter>;
 
 export async function loadRoutePolicy(path: string): Promise<RoutePolicy> {
-  return validateRoutePolicy(await Bun.file(path).json());
+  const value = await Bun.file(path).json();
+  try {
+    return validateRoutePolicy(value);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : 'validation failed';
+    throw new Error(`invalid route policy: ${detail}`, { cause: error });
+  }
 }
 
 export function assertRoutePolicyEnvironment(
@@ -303,7 +309,12 @@ function validateTarget(value: unknown, at: string): RouteTarget {
   }
   if (target.baseUrl !== undefined) {
     boundedString(target.baseUrl, `${at}.baseUrl`, PROTOCOL_LIMITS.maxUrlBytes);
-    const url = new URL(target.baseUrl as string);
+    let url: URL;
+    try {
+      url = new URL(target.baseUrl as string);
+    } catch {
+      throw new Error(`${at}.baseUrl must be a valid URL`);
+    }
     if (url.protocol !== 'http:' && url.protocol !== 'https:') {
       throw new Error(`${at}.baseUrl must use HTTP or HTTPS`);
     }
@@ -339,7 +350,7 @@ function exactKeys(
   at: string,
 ): void {
   const unknown = Object.keys(value).find((key) => !allowed.includes(key));
-  if (unknown) throw new Error(`${at} contains unknown field ${unknown}`);
+  if (unknown) throw new Error(`${at} contains an unknown field`);
 }
 
 function boundedString(value: unknown, at: string, maximum = 256): void {

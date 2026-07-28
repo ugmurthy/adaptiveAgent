@@ -191,6 +191,8 @@ const COMMON_AGENT_OPTIONS_TEXT = `Agent/config options:
   --agent <path-or-name>  Explicit path to agent.json, or filename from agents.dirs.
   --settings <path>       Explicit path to agent.settings.json.
   --runtime <mode>        Runtime mode: memory or postgres.
+  --inference-mode <mode> Inference mode: gateway, local, or byok.
+  --tier <tier>           Gateway tier: low, medium, high, or xtra-high.
   --provider <name>       Override provider: openrouter, ollama, mistral, mesh.
   --model <name>          Override model name.
   --approval <mode>       Approval mode: auto, manual, reject.
@@ -199,6 +201,8 @@ const COMMON_AGENT_OPTIONS_TEXT = `Agent/config options:
 const COMMON_RUNTIME_OPTIONS_TEXT = `Additional agent/config options:
   --settings <path>       Explicit path to agent.settings.json.
   --runtime <mode>        Runtime mode: memory or postgres.
+  --inference-mode <mode> Inference mode: gateway, local, or byok.
+  --tier <tier>           Gateway tier: low, medium, high, or xtra-high.
   --provider <name>       Override provider: openrouter, ollama, mistral, mesh.
   --model <name>          Override model name.
   --approval <mode>       Approval mode: auto, manual, reject.
@@ -2308,6 +2312,12 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
       case '--runtime':
         options.runtimeMode = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['memory', 'postgres']);
         break;
+      case '--inference-mode':
+        options.inferenceMode = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['gateway', 'local', 'byok']);
+        break;
+      case '--tier':
+        options.inferenceTier = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['low', 'medium', 'high', 'xtra-high']);
+        break;
       case '--provider':
         options.provider = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['openrouter', 'ollama', 'mistral', 'mesh']);
         break;
@@ -2579,6 +2589,8 @@ function buildSdkOptions(cli: ManualTestCliOptions, cwd: string): AgentSdkOption
     agentConfigPath: cli.agentConfigPath,
     settingsConfigPath: cli.settingsConfigPath,
     runtimeMode: cli.runtimeMode,
+    inferenceMode: cli.inferenceMode,
+    inferenceTier: cli.inferenceTier,
     model: cli.provider || cli.model ? { ...(cli.provider ? { provider: cli.provider } : {}), ...(cli.model ? { model: cli.model } : {}) } : undefined,
     settingsOverrides: cli.approvalMode || cli.clarificationMode
       ? {

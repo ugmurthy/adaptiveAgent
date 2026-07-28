@@ -8,6 +8,7 @@ import type {
   SwarmRunResult,
   SwarmSubtask,
 } from '@adaptive-agent/core';
+import type { InferenceTier } from '@adaptive-agent/gateway-client';
 
 import {
   AgentSdk,
@@ -60,6 +61,7 @@ export interface SwarmRunRequest {
   input?: JsonValue;
   contentParts?: ModelContentPart[];
   executionContext?: JsonObject;
+  inferenceTier?: InferenceTier;
   maxWorkers?: number;
 }
 
@@ -163,7 +165,7 @@ export class SwarmSdk {
     this.emit('decomposition', 'started', sessionId);
     let decompositionResult: RunResult;
     try {
-      decompositionResult = await runSwarmDecomposition({ coordinatorSdk: this.coordinatorSdk, sessionId, topLevelObjective: request.topLevelObjective, inputJson: request.input, workerAgents: this.config.workers.map((c) => c.agent), workerIds: this.config.workerIds, contentParts: request.contentParts, executionContext: request.executionContext });
+      decompositionResult = await runSwarmDecomposition({ coordinatorSdk: this.coordinatorSdk, sessionId, topLevelObjective: request.topLevelObjective, inputJson: request.input, workerAgents: this.config.workers.map((c) => c.agent), workerIds: this.config.workerIds, contentParts: request.contentParts, executionContext: request.executionContext, inferenceTier: request.inferenceTier });
     } catch (error) { this.emit('decomposition', 'failed', sessionId, undefined, error); throw error; }
     const common = { sessionId, coordinatorRunId: decompositionResult.runId, decompositionResult, workerIds: this.config.workerIds, subtasks: [] as SwarmSubtask[], defaultsUsed: this.config.defaultsUsed };
     if (decompositionResult.status !== 'success') {

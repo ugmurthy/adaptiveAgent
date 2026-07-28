@@ -175,6 +175,7 @@ export function startupFailureStatus(error: unknown): string {
     /^JWT issuer and audience are required$/,
     /^JWT HMAC secret must be at least 32 bytes$/,
     /^route policy requires environment variables: [A-Z][A-Z0-9_, ]*$/,
+    /^invalid route policy: [A-Za-z0-9_.\[\] -]+$/,
   ];
   if (safeMessagePatterns.some((pattern) => pattern.test(error.message))) {
     return error.message;

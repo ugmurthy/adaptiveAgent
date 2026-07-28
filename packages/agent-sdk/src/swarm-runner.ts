@@ -7,6 +7,7 @@ import {
   type RunResult,
   type SwarmSubtask,
 } from '@adaptive-agent/core';
+import type { InferenceTier } from '@adaptive-agent/gateway-client';
 
 import type { AgentConfigFile, AgentSdk } from './index.js';
 
@@ -85,6 +86,7 @@ export interface SwarmDecompositionArgs {
   workerIds: string[];
   contentParts?: ModelContentPart[];
   executionContext?: JsonObject;
+  inferenceTier?: InferenceTier;
 }
 
 export async function runSwarmDecomposition(args: SwarmDecompositionArgs): Promise<RunResult> {
@@ -97,6 +99,7 @@ export async function runSwarmDecomposition(args: SwarmDecompositionArgs): Promi
     },
     ...(contentParts ? { contentParts } : {}),
     executionContext: args.executionContext,
+    inferenceTier: args.inferenceTier,
     context: {
       phase: 'swarm.decompose',
       topLevelObjective: args.topLevelObjective,

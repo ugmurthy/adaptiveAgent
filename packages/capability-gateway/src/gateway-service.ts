@@ -203,7 +203,7 @@ export class GatewayService {
       params.permitId,
       principal,
       params.tier,
-      params.invocation.runId,
+      params.invocation.rootRunId,
       this.options.routePolicy.version,
     );
     const tierPolicy = this.options.routePolicy.tiers[params.tier];
@@ -321,6 +321,7 @@ export class GatewayService {
           const usage = gatewayUsage(response.usage, target, lease.adapter);
           const result = compactResult({
             callId: call.callId,
+            traceId,
             text: response.text,
             structuredOutput: response.structuredOutput,
             toolCalls: response.toolCalls,

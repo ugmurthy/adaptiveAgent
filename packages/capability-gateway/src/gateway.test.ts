@@ -233,6 +233,11 @@ describe('idempotency, billing, errors, and logs', () => {
   test('reports actionable startup configuration errors without leaking internals', () => {
     expect(startupFailureStatus(new Error('DATABASE_URL is required')))
       .toBe('DATABASE_URL is required');
+    expect(startupFailureStatus(new Error(
+      'invalid route policy: low.targets[0].model must be a bounded non-empty string',
+    ))).toBe(
+      'invalid route policy: low.targets[0].model must be a bounded non-empty string',
+    );
     expect(startupFailureStatus(Object.assign(
       new Error('password authentication failed with secret details'),
       { code: '28P01' },

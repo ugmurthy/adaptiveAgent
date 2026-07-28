@@ -7,7 +7,14 @@ import type {
   ModelContentPart,
 } from '@adaptive-agent/core';
 
-import type { ApprovalMode, ClarificationMode, RuntimeMode, createAgentSdk } from './index.js';
+import type {
+  ApprovalMode,
+  ClarificationMode,
+  InferenceMode,
+  InferenceTier,
+  RuntimeMode,
+  createAgentSdk,
+} from './index.js';
 import type { ContextBundleInput } from './context-bundles.js';
 import type { InitProfile } from './install/init.js';
 
@@ -55,6 +62,8 @@ export interface ManualTestCliOptions {
   agentCreateId?: string;
   settingsConfigPath?: string;
   runtimeMode?: RuntimeMode;
+  inferenceMode?: InferenceMode;
+  inferenceTier?: InferenceTier;
   provider?: 'openrouter' | 'ollama' | 'mistral' | 'mesh';
   model?: string;
   apiKeyEnv?: string;

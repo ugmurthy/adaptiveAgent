@@ -361,6 +361,7 @@ export class AdaptiveAgent {
     const resolvedContext = injectResolvedContextRefs(request.context, contextRefResolution);
     const resolvedMetadata = mergeContextRefMetadata(request.metadata, contextRefResolution);
     const { run: createdRun, state } = await this.createRunWithInitialSnapshot({
+      id: request.runId,
       sessionId: request.sessionId,
       goal: request.goal,
       input: request.input,
@@ -413,6 +414,7 @@ export class AdaptiveAgent {
     );
     const goal = summarizeChatGoal(normalizedMessages);
     const { run: createdRun, state } = await this.createRunWithInitialSnapshot({
+      id: request.runId,
       sessionId: request.sessionId,
       goal,
       context: resolvedContext,

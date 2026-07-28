@@ -18,6 +18,8 @@ import {
   type AgentSdkRunOptions,
   type ApprovalMode,
   type ClarificationMode,
+  type InferenceMode,
+  type InferenceTier,
   type OrchestrationLifecycleEvent,
   type OrchestrationSdk,
   type RuntimeMode,
@@ -86,6 +88,8 @@ Options:
   --agent <path>            Explicit path to agent.json
   --settings <path>         Explicit path to agent.settings.json
   --runtime <mode>          Runtime mode: memory or postgres
+  --inference-mode <mode>   Inference mode: gateway, local, or byok
+  --tier <tier>             Gateway tier: low, medium, high, or xtra-high
   --provider <name>         Override provider: openrouter, ollama, mistral, mesh
   --model <name>            Override model name
   --approval <mode>         Approval mode override: auto, manual, reject
@@ -114,6 +118,8 @@ interface TuiCliOptions {
   agentConfigPath?: string;
   settingsConfigPath?: string;
   runtimeMode?: RuntimeMode;
+  inferenceMode?: InferenceMode;
+  inferenceTier?: InferenceTier;
   provider?: ModelAdapterConfig['provider'];
   model?: string;
   approvalMode?: ApprovalMode;
@@ -158,6 +164,7 @@ async function main(argv = Bun.argv.slice(2)): Promise<number> {
     console.log(`agent: ${inspection.config.agent.id} (${inspection.config.agent.name})`);
     console.log(`model: ${inspection.config.model.provider}/${inspection.config.model.model}`);
     console.log(`runtime: ${inspection.config.runtime.mode}`);
+    console.log(`inference: ${inspection.config.inference.mode}/${inspection.config.inference.tier}`);
     console.log(`tools: ${inspection.registeredToolNames.join(', ') || '(none)'}`);
     console.log(`delegates: ${inspection.delegates.map((delegate) => delegate.name).join(', ') || '(none)'}`);
     return 0;
@@ -1050,6 +1057,8 @@ function parseArgs(argv: string[]): TuiCliOptions {
       case '--agent': options.agentConfigPath = requireValue(arg, argv[++index]); break;
       case '--settings': options.settingsConfigPath = requireValue(arg, argv[++index]); break;
       case '--runtime': options.runtimeMode = parseEnum(requireValue(arg, argv[++index]), ['memory', 'postgres'] as const, arg); break;
+      case '--inference-mode': options.inferenceMode = parseEnum(requireValue(arg, argv[++index]), ['gateway', 'local', 'byok'] as const, arg); break;
+      case '--tier': options.inferenceTier = parseEnum(requireValue(arg, argv[++index]), ['low', 'medium', 'high', 'xtra-high'] as const, arg); break;
       case '--provider': options.provider = parseEnum(requireValue(arg, argv[++index]), ['openrouter', 'ollama', 'mistral', 'mesh'] as const, arg); break;
       case '--model': options.model = requireValue(arg, argv[++index]); break;
       case '--approval': options.approvalMode = parseEnum(requireValue(arg, argv[++index]), ['auto', 'manual', 'reject'] as const, arg); break;
@@ -1067,6 +1076,8 @@ function buildSdkOptions(cli: TuiCliOptions): AgentSdkOptions {
     agentConfigPath: cli.agentConfigPath,
     settingsConfigPath: cli.settingsConfigPath,
     runtimeMode: cli.runtimeMode,
+    inferenceMode: cli.inferenceMode,
+    inferenceTier: cli.inferenceTier,
     model: cli.provider || cli.model ? { ...(cli.provider ? { provider: cli.provider } : {}), ...(cli.model ? { model: cli.model } : {}) } : undefined,
     settingsOverrides: cli.approvalMode || cli.clarificationMode
       ? {
@@ -1132,6 +1143,7 @@ function formatConfig(state: TuiClientState, sdk: AgentSdk): string {
     `session: ${state.sessionId}`,
     `model: ${state.provider}/${state.model}`,
     `runtime: ${state.runtimeMode}`,
+    `inference: ${sdk.config.inference.mode}/${sdk.config.inference.tier}`,
     `workspace: ${sdk.config.workspaceRoot}`,
     `shellCwd: ${sdk.config.shellCwd}`,
     `approval: ${sdk.config.interaction.approvalMode}`,

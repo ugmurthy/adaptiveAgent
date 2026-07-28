@@ -2,9 +2,22 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { GatewayTransportError, type GatewayClient, type ModelGenerateParams } from '@adaptive-agent/gateway-client';
+import { SignJWT } from 'jose';
+import {
+  GatewayService,
+  InMemoryBillingStore,
+  createJwtAuthenticator,
+  startGatewayServer,
+  validateRoutePolicy,
+  type ProviderAdapter,
+} from '@adaptive-agent/capability-gateway';
 
-import { AgentSettingsValidationError, inspectAgentSdkResolution, loadAgentSdkConfig } from './index.js';
+import { main as runCli } from './adaptive-agent.js';
+import { AgentSettingsValidationError, createAgentSdk, inspectAgentSdkResolution, loadAgentSdkConfig } from './index.js';
+
+const bunIt = typeof Bun === 'undefined' ? it.skip : it;
 
 describe('agent-sdk config resolution', () => {
   let tempDir: string;
@@ -120,6 +133,34 @@ describe('agent-sdk config resolution', () => {
     });
   });
 
+  it('resolves non-secret gateway settings and inference defaults', async () => {
+    await writeAgentConfig(join(tempDir, 'agent.json'));
+    await writeFile(
+      join(tempDir, 'agent.settings.json'),
+      JSON.stringify({
+        inference: { mode: 'gateway', tier: 'high' },
+        gateway: {
+          url: '${GATEWAY_URL}',
+          accessTokenEnv: 'TEST_GATEWAY_TOKEN',
+          connectTimeoutMs: 1500,
+        },
+      }),
+    );
+
+    const config = await loadAgentSdkConfig({
+      cwd: tempDir,
+      env: { GATEWAY_URL: 'wss://gateway.example/rpc' },
+    });
+
+    expect(config.inference).toEqual({ mode: 'gateway', tier: 'high' });
+    expect(config.gateway).toMatchObject({
+      url: 'wss://gateway.example/rpc',
+      accessTokenEnv: 'TEST_GATEWAY_TOKEN',
+      connectTimeoutMs: 1500,
+    });
+    expect(JSON.stringify(config)).not.toContain('access-token-value');
+  });
+
   it('rejects invalid fiscal year start month', async () => {
     await writeAgentConfig(join(tempDir, 'agent.json'));
     await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({ groundTruth: { fiscalYearStartMonth: 13 } }));
@@ -138,6 +179,377 @@ describe('agent-sdk config resolution', () => {
     expect(inspection.registeredToolNames).toContain('search_files');
     expect(inspection.registeredToolNames).toContain('edit_file');
     expect(inspection.delegates).toEqual([]);
+  });
+});
+
+describe('agent-sdk gateway integration', () => {
+  it('uses an injected model adapter instead of the configured provider', async () => {
+    const generate = vi.fn(async () => ({ finishReason: 'stop' as const, text: 'injected adapter result' }));
+    const sdk = await createAgentSdk({
+      cwd: process.cwd(),
+      env: {},
+      runtimeMode: 'memory',
+      inferenceMode: 'local',
+      modelAdapter: {
+        provider: 'injected',
+        model: 'injected-model',
+        capabilities: { toolCalling: true, jsonOutput: true, streaming: false, usage: false },
+        generate,
+      },
+      agentConfig: {
+        id: 'injected-model-agent',
+        name: 'Injected Model Agent',
+        invocationModes: ['run'],
+        defaultInvocationMode: 'run',
+        model: { provider: 'openrouter', model: 'must-not-be-used' },
+        tools: [],
+      },
+    });
+
+    try {
+      await expect(sdk.runRaw('use the injected model')).resolves.toMatchObject({
+        status: 'success',
+        output: 'injected adapter result',
+      });
+      expect(generate).toHaveBeenCalledTimes(1);
+    } finally {
+      await sdk.close();
+    }
+  });
+
+  it('fails actionably before creating a local run when authorization is unavailable', async () => {
+    const sdk = await createAgentSdk({
+      cwd: process.cwd(),
+      env: {},
+      runtimeMode: 'memory',
+      inferenceMode: 'gateway',
+      gatewayClient: {
+        authorizeRun: vi.fn(async () => { throw new GatewayTransportError(); }),
+      } as unknown as GatewayClient,
+      agentConfig: {
+        id: 'gateway-unavailable-agent',
+        name: 'Gateway Unavailable Agent',
+        invocationModes: ['run'],
+        defaultInvocationMode: 'run',
+        model: { provider: 'ollama', model: 'unused-local-model' },
+        tools: [],
+      },
+    });
+
+    try {
+      await expect(sdk.runRaw('must not be created', { sessionId: 'gateway-unavailable' }))
+        .rejects.toThrow('Gateway network connection unavailable');
+      await expect(sdk.created.runtime.runStore.listBySession?.('gateway-unavailable')).resolves.toEqual([]);
+    } finally {
+      await sdk.close();
+    }
+  });
+
+  it('authorizes each run before local execution and safely supports per-run tiers and local tools', async () => {
+    const authorizeRun = vi.fn(async (params: { runId: string; requestedTier?: string }) => ({
+      permitId: `permit-${params.runId}`,
+      inferenceMode: 'gateway' as const,
+      inferenceTier: params.requestedTier as 'low' | 'high',
+      routePolicyVersion: 'policy-v3',
+      remoteCapabilities: [],
+      expiresAt: '2026-07-28T00:00:00.000Z',
+    }));
+    const generateModel = vi.fn(async (params: ModelGenerateParams) => {
+      const hasToolResult = params.messages.some((message) => message.role === 'tool');
+      return {
+        callId: params.invocation.callId,
+        traceId: `trace-${params.tier}`,
+        ...(hasToolResult
+          ? { text: `completed-${params.tier}` }
+          : { toolCalls: [{ id: `tool-${params.invocation.callId}`, name: 'local_echo', input: { text: params.tier } }] }),
+        finishReason: hasToolResult ? 'stop' as const : 'tool_calls' as const,
+        usage: {
+          provider: 'ollama',
+          model: `actual-${params.tier}`,
+          inputTokens: 3,
+          outputTokens: 2,
+          totalTokens: 5,
+          cost: 0.001,
+        },
+        routePolicyVersion: 'policy-v3',
+        timings: { gatewayDurationMs: 9, providerDurationMs: 7, routeAttempts: 1 },
+      };
+    });
+    const gatewayClient = { authorizeRun, generateModel } as unknown as GatewayClient;
+    const localTool = vi.fn(async (input: { text: string }) => ({ echoed: input.text }));
+    const sdk = await createAgentSdk({
+      cwd: process.cwd(),
+      env: {},
+      runtimeMode: 'memory',
+      inferenceMode: 'gateway',
+      inferenceTier: 'medium',
+      gatewayClient,
+      agentConfig: {
+        id: 'gateway-agent',
+        name: 'Gateway Agent',
+        invocationModes: ['run'],
+        defaultInvocationMode: 'run',
+        model: { provider: 'ollama', model: 'unused-local-model' },
+        tools: ['local_echo'],
+      },
+      tools: [{
+        name: 'local_echo',
+        description: 'Echo locally',
+        inputSchema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['text'],
+          properties: { text: { type: 'string' } },
+        },
+        execute: localTool,
+      }],
+    });
+
+    try {
+      const [low, high] = await Promise.all([
+        sdk.runRaw('low tier run', {
+          inferenceTier: 'low',
+          executionContext: {
+            inferenceMode: 'byok',
+            inferenceTier: 'xtra-high',
+            authorizationRef: 'caller-supplied-permit',
+            authorizationRunId: 'caller-supplied-run',
+            routePolicyRef: 'caller-supplied-policy',
+            profileRefs: [{ source: 'server', id: 'caller', version: '1', contentHash: 'caller' }],
+            callerContext: 'preserved',
+          },
+        }),
+        sdk.runRaw('high tier run', { inferenceTier: 'high' }),
+      ]);
+
+      expect(low).toMatchObject({ status: 'success', output: 'completed-low' });
+      expect(high).toMatchObject({ status: 'success', output: 'completed-high' });
+      expect(authorizeRun.mock.calls.map(([params]) => params.requestedTier)).toEqual(['low', 'high']);
+      expect(generateModel.mock.calls.map(([params]) => params.tier).sort()).toEqual(['high', 'high', 'low', 'low']);
+      expect(localTool.mock.calls.map(([input]) => input.text)).toEqual(['low', 'high']);
+
+      const lowInspection = await sdk.inspect(low.runId);
+      expect(lowInspection.run?.executionContext).toMatchObject({
+        inferenceMode: 'gateway',
+        inferenceTier: 'low',
+        authorizationRunId: low.runId,
+        routePolicyRef: 'policy-v3',
+        profileRefs: [],
+        callerContext: 'preserved',
+      });
+      expect(JSON.stringify(lowInspection)).not.toContain('caller-supplied-permit');
+      expect(JSON.stringify(lowInspection)).not.toContain('caller-supplied-policy');
+      expect(lowInspection.events.find((event) => event.type === 'model.completed')?.payload).toMatchObject({
+        callId: generateModel.mock.calls.find(([params]) => params.tier === 'low')?.[0].invocation.callId,
+        provider: 'ollama',
+        model: 'actual-low',
+        performance: {
+          adapter: {
+            traceId: 'trace-low',
+            requestedTier: 'low',
+            routePolicyVersion: 'policy-v3',
+          },
+        },
+      });
+      expect(lowInspection.events.find((event) => event.type === 'usage.updated')?.payload).toMatchObject({
+        usage: {
+          promptTokens: 3,
+          completionTokens: 2,
+          provider: 'ollama',
+          model: 'actual-low',
+        },
+      });
+      expect(JSON.stringify(lowInspection)).not.toContain('access-token-value');
+    } finally {
+      await sdk.close();
+    }
+  });
+
+  bunIt('completes memory-runtime SDK and CLI WSS runs with local tools between model turns', async () => {
+    const cliDir = await mkdtemp(join(tmpdir(), 'agent-sdk-gateway-cli-'));
+    const cliInputPath = join(cliDir, 'gateway-input.txt');
+    await writeFile(cliInputPath, 'CLI-GATEWAY-CONTENT');
+    const billing = new InMemoryBillingStore();
+    const providerRequests: Parameters<ProviderAdapter['generate']>[0][] = [];
+    const provider: ProviderAdapter = {
+      provider: 'ollama',
+      model: 'gateway-e2e-model',
+      capabilities: {
+        toolCalling: true,
+        jsonOutput: true,
+        streaming: true,
+        usage: true,
+      },
+      async generate(request) {
+        return this.stream!(request, () => undefined);
+      },
+      async stream(request, onEvent) {
+        providerRequests.push(request);
+        const hasLocalToolResult = request.messages.some((message) => message.role === 'tool');
+        const usage = {
+          promptTokens: 4,
+          completionTokens: 2,
+          totalTokens: 6,
+          estimatedCostUSD: 0.002,
+          provider: 'ollama',
+          model: 'gateway-e2e-model',
+        };
+        if (hasLocalToolResult) {
+          onEvent({ type: 'text_delta', delta: 'gateway complete' });
+          return { text: 'gateway complete', finishReason: 'stop', usage };
+        }
+        const useSdkTool = request.tools?.some((tool) => tool.name === 'local_uppercase');
+        if (useSdkTool) {
+          return {
+            toolCalls: [{ id: 'local-tool-call', name: 'local_uppercase', input: { text: 'client-side' } }],
+            finishReason: 'tool_calls',
+            usage,
+          };
+        }
+        return {
+          toolCalls: [{ id: 'local-tool-call', name: 'read_file', input: { path: cliInputPath } }],
+          finishReason: 'tool_calls',
+          usage,
+        };
+      },
+    };
+    const routeTarget = { provider: 'ollama', model: provider.model, maxConcurrency: 4 } as const;
+    const tierPolicy = {
+      limits: { maxMessages: 32, maxOutputTokens: 4096, modelTimeoutMs: 5000 },
+      targets: [routeTarget],
+    };
+    const service = new GatewayService({
+      routePolicy: validateRoutePolicy({
+        version: 'policy-e2e',
+        tiers: {
+          low: structuredClone(tierPolicy),
+          medium: structuredClone(tierPolicy),
+          high: structuredClone(tierPolicy),
+          'xtra-high': structuredClone(tierPolicy),
+        },
+      }),
+      billingStore: billing,
+      adapterFactory: () => provider,
+    });
+    const jwtSecret = 'phase-3-agent-sdk-gateway-test-secret';
+    const server = startGatewayServer({
+      authenticator: createJwtAuthenticator({
+        hmacSecret: jwtSecret,
+        issuer: 'agent-sdk-test',
+        audience: 'capability-gateway',
+      }),
+      service,
+      hostname: '127.0.0.1',
+      port: 0,
+    });
+    const token = await new SignJWT({
+      account_id: 'account-e2e',
+      tenant_id: 'tenant-e2e',
+      allowed_tiers: ['medium'],
+      permitted_modes: ['gateway'],
+    })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setSubject('user-e2e')
+      .setIssuer('agent-sdk-test')
+      .setAudience('capability-gateway')
+      .setExpirationTime('1h')
+      .sign(new TextEncoder().encode(jwtSecret));
+    const localTool = vi.fn(async (input: { text: string }) => ({ uppercased: input.text.toUpperCase() }));
+    const sdk = await createAgentSdk({
+      cwd: process.cwd(),
+      env: {},
+      runtimeMode: 'memory',
+      inferenceMode: 'gateway',
+      inferenceTier: 'medium',
+      gateway: { url: server.url, requestTimeoutMs: 5000 },
+      accessToken: () => token,
+      agentConfig: {
+        id: 'gateway-e2e-agent',
+        name: 'Gateway E2E Agent',
+        invocationModes: ['run'],
+        defaultInvocationMode: 'run',
+        model: { provider: 'ollama', model: 'unused-local-model' },
+        tools: ['local_uppercase'],
+      },
+      tools: [{
+        name: 'local_uppercase',
+        description: 'Uppercase text on the client',
+        inputSchema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['text'],
+          properties: { text: { type: 'string' } },
+        },
+        execute: localTool,
+      }],
+    });
+
+    try {
+      const result = await sdk.runRaw('Use the local uppercase tool');
+      const inspection = await sdk.inspect(result.runId);
+
+      expect(result).toMatchObject({ status: 'success', output: 'gateway complete' });
+      expect(localTool).toHaveBeenCalledWith(
+        { text: 'client-side' },
+        expect.objectContaining({ runId: result.runId }),
+      );
+      expect(providerRequests).toHaveLength(2);
+      expect(providerRequests[1]?.messages.some((message) => message.role === 'tool' && message.content.includes('CLIENT-SIDE'))).toBe(true);
+      expect([...billing.records.values()]).toHaveLength(2);
+      expect([...billing.records.values()].every((record) => record.status === 'completed')).toBe(true);
+      expect(inspection.run?.executionContext).toMatchObject({
+        inferenceMode: 'gateway',
+        inferenceTier: 'medium',
+        routePolicyRef: 'policy-e2e',
+      });
+      expect(inspection.events.filter((event) => event.type === 'model.completed')).toHaveLength(2);
+      expect(JSON.stringify(inspection)).not.toContain(token);
+      expect(JSON.stringify([...billing.records.values()])).not.toContain('Use the local uppercase tool');
+      expect(JSON.stringify([...billing.records.values()])).not.toContain('CLIENT-SIDE');
+
+      await writeAgentConfig(join(cliDir, 'agent.json'), 'gateway-cli-agent');
+      await writeFile(join(cliDir, 'agent.settings.json'), JSON.stringify({
+        runtime: { mode: 'memory' },
+        gateway: { url: server.url, accessTokenEnv: 'PHASE_3_GATEWAY_CLI_TOKEN' },
+      }));
+      const previousToken = process.env.PHASE_3_GATEWAY_CLI_TOKEN;
+      process.env.PHASE_3_GATEWAY_CLI_TOKEN = token;
+      const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+      try {
+        const exitCode = await runCli([
+          'run',
+          'Read the local gateway input file',
+          '--cwd', cliDir,
+          '--runtime', 'memory',
+          '--inference-mode', 'gateway',
+          '--tier', 'medium',
+          '--inspect',
+          '--output', 'json',
+        ]);
+        const cliOutput = JSON.parse(String(log.mock.calls.at(-1)?.[0])) as {
+          resolvedConfig: { inferenceMode: string; inferenceTier: string; runtimeMode: string };
+          result: { status: string; output: string };
+          inspection: { run: { executionContext: Record<string, unknown> }; eventTypes: Record<string, number> };
+        };
+
+        expect(exitCode).toBe(0);
+        expect(cliOutput.resolvedConfig).toMatchObject({ inferenceMode: 'gateway', inferenceTier: 'medium', runtimeMode: 'memory' });
+        expect(cliOutput.result).toMatchObject({ status: 'success', output: 'gateway complete' });
+        expect(cliOutput.inspection.run.executionContext).toMatchObject({ inferenceMode: 'gateway', inferenceTier: 'medium', routePolicyRef: 'policy-e2e' });
+        expect(cliOutput.inspection.eventTypes).toMatchObject({ 'tool.completed': 1, 'model.completed': 2 });
+        expect(providerRequests).toHaveLength(4);
+        expect(providerRequests[3]?.messages.some((message) => message.role === 'tool' && message.content.includes('CLI-GATEWAY-CONTENT'))).toBe(true);
+        expect(JSON.stringify(cliOutput)).not.toContain(token);
+      } finally {
+        log.mockRestore();
+        if (previousToken === undefined) delete process.env.PHASE_3_GATEWAY_CLI_TOKEN;
+        else process.env.PHASE_3_GATEWAY_CLI_TOKEN = previousToken;
+      }
+    } finally {
+      await sdk.close();
+      await server.stop({ gracePeriodMs: 100 });
+      await rm(cliDir, { recursive: true, force: true });
+    }
   });
 });
 

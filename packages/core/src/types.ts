@@ -363,6 +363,8 @@ export interface RecoveryPolicy {
 }
 
 export interface RunRequest {
+  /** Optional host-assigned identity for authorization before local run creation. */
+  runId?: UUID;
   sessionId?: string;
   goal: string;
   input?: JsonValue;
@@ -385,6 +387,8 @@ export interface ChatMessage {
 }
 
 export interface ChatRequest {
+  /** Optional host-assigned identity for authorization before local run creation. */
+  runId?: UUID;
   sessionId?: string;
   messages: ChatMessage[];
   contextRefs?: ContextRef[];

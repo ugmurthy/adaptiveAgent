@@ -1,5 +1,5 @@
 import { createAdaptiveAgentRuntime } from '@adaptive-agent/core';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   AgentSdk,
@@ -8,6 +8,7 @@ import {
   type AgentConfigFile,
   type ResolvedAgentSdkConfig,
 } from './index.js';
+import { runSwarmDecomposition } from './swarm-runner.js';
 
 const openSdks: AgentSdk[] = [];
 
@@ -16,6 +17,28 @@ afterEach(async () => {
 });
 
 describe('SwarmSdk', () => {
+  it('forwards a per-run inference tier into coordinator authorization', async () => {
+    const runRaw = vi.fn(async () => ({
+      status: 'success' as const,
+      runId: 'coordinator-run',
+      output: { subtasks: [] },
+      stepsUsed: 1,
+      usage: { promptTokens: 0, completionTokens: 0, estimatedCostUSD: 0 },
+    }));
+
+    await runSwarmDecomposition({
+      coordinatorSdk: { runRaw } as unknown as AgentSdk,
+      sessionId: 'session-tier',
+      topLevelObjective: 'decompose this',
+      workerAgents: [agentConfig('worker')],
+      workerIds: ['worker'],
+      inputJson: undefined,
+      inferenceTier: 'high',
+    });
+
+    expect(runRaw).toHaveBeenCalledWith('decompose this', expect.objectContaining({ inferenceTier: 'high' }));
+  });
+
   it('rejects duplicate worker IDs during transport-neutral resolution', async () => {
     const coordinator = await resolvedConfig('coordinator');
     const worker = await resolvedConfig('worker');

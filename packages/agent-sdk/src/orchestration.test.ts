@@ -138,6 +138,7 @@ describe('orchestration sdk', () => {
 
     const result = await sdk.run('compare the image and audio', {
       ...multimodalOptions(),
+      inferenceTier: 'high',
       executionContext: {
         inferenceMode: 'gateway',
         inferenceTier: 'high',
@@ -155,6 +156,7 @@ describe('orchestration sdk', () => {
     expect(calls.every((call) =>
       call.options.executionContext?.authorizationRef === 'permit-orchestration'
     )).toBe(true);
+    expect(calls.every((call) => call.options.inferenceTier === 'high')).toBe(true);
     expect(inspection.links.map((link) => [link.nodeId, link.upstreamRunIds])).toEqual([
       ['image_specialist', []],
       ['audio_specialist', []],
