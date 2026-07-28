@@ -816,7 +816,9 @@ function parseRuntimeMode(value: unknown): RuntimeMode | undefined {
   const object = parseObject(value, 'runtime');
   const mode = optionalString(object.mode, 'runtime.mode');
   if (mode === undefined) return undefined;
-  if (mode !== 'memory' && mode !== 'postgres') throw new Error(`runtime.mode must be memory or postgres`);
+  if (mode !== 'memory' && mode !== 'sqlite' && mode !== 'postgres') {
+    throw new Error('runtime.mode must be memory, sqlite, or postgres');
+  }
   return mode;
 }
 

@@ -104,7 +104,14 @@ export class AgentSdk {
 
   static async create(options: AgentSdkOptions = {}): Promise<AgentSdk> {
     const config = await resolveAgentSdkConfig(options);
-    const runtime = options.runtime ? { mode: config.runtime.mode, runtime: options.runtime } : await resolveRuntimeBundle(config.runtime.mode, config.runtime.autoMigrate, options.env);
+    const runtime = options.runtime
+      ? { mode: config.runtime.mode, runtime: options.runtime }
+      : await resolveRuntimeBundle(
+          config.runtime.mode,
+          config.runtime.autoMigrate,
+          options.env,
+          config.runtime.sqlitePath,
+        );
     const modules = await resolveToolsAndDelegates(config, options);
     const logger = options.logger ?? (config.logging.enabled ? createAdaptiveAgentLogger(config.logging) : undefined);
     const metadata: JsonObject = { agentId: config.agent.id, agentName: config.agent.name, runtimeMode: config.runtime.mode, ...(config.agent.metadata ?? {}) };

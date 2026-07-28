@@ -6220,6 +6220,7 @@ function isOptimisticConcurrencyError(error: unknown): error is Error {
     error instanceof Error &&
     (error.name === 'OptimisticConcurrencyError' ||
       error.name === 'PostgresOptimisticConcurrencyError' ||
+      error.name === 'SqliteOptimisticConcurrencyError' ||
       error.message.includes('version mismatch'))
   );
 }

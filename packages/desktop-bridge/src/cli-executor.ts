@@ -14,7 +14,7 @@ export class ProcessCliExecutor implements CliExecutor {
     if (this.closing) throw new Error('The CLI executor is shutting down.');
 
     const child = spawn(process.execPath, this.childArguments(request.argv), {
-      env: childEnvironment(),
+      env: childEnvironment(request.environment),
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
     });
@@ -79,8 +79,8 @@ function isCompiledEntrypoint(entrypointPath: string): boolean {
   return entrypointPath.startsWith('/$bunfs/') || import.meta.url.startsWith('file:///$bunfs/');
 }
 
-function childEnvironment(): NodeJS.ProcessEnv {
-  const env = { ...process.env };
+function childEnvironment(overrides: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv {
+  const env = { ...process.env, ...overrides };
   // Bun uses this internal variable to make a compiled executable act like the
   // Bun CLI. Inheriting it would bypass the embedded desktop bridge entrypoint.
   delete env.BUN_BE_BUN;

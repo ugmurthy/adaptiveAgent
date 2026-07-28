@@ -59,6 +59,12 @@ export async function resolveAgentSdkConfigWithSources(options: AgentSdkOptions)
   const postgresExplicit = Boolean(options.runtimeMode === 'postgres' || settings.runtime?.mode === 'postgres');
   const mode = requestedMode === 'postgres' && !env.DATABASE_URL && !postgresExplicit ? 'memory' : requestedMode;
   if (requestedMode === 'postgres' && !env.DATABASE_URL && postgresExplicit && !options.runtime) throw new AgentSettingsValidationError(settingsSource, ['runtime.mode is postgres but DATABASE_URL is not set']);
+  const configuredSqlitePath = options.sqlitePath ?? settings.runtime?.sqlitePath ?? env.ADAPTIVE_AGENT_SQLITE_PATH;
+  const sqlitePath = mode === 'sqlite'
+    ? configuredSqlitePath
+      ? resolvePath(cwd, expandEnvironmentVariables(configuredSqlitePath, env))
+      : resolve(adaptiveAgentHome(env), 'runtime.sqlite')
+    : undefined;
   const config: ResolvedAgentSdkConfig = {
     agent,
     settings,
@@ -85,7 +91,12 @@ export async function resolveAgentSdkConfigWithSources(options: AgentSdkOptions)
       requestTimeoutMs: options.gateway?.requestTimeoutMs ?? settings.gateway?.requestTimeoutMs,
       reconnectAttempts: options.gateway?.reconnectAttempts ?? settings.gateway?.reconnectAttempts,
     },
-    runtime: { requestedMode, mode, autoMigrate: settings.runtime?.autoMigrate ?? true },
+    runtime: {
+      requestedMode,
+      mode,
+      autoMigrate: settings.runtime?.autoMigrate ?? true,
+      ...(sqlitePath ? { sqlitePath } : {}),
+    },
     logging: { enabled: settings.logging?.enabled ?? false, level: settings.logging?.level ?? 'info', destination: settings.logging?.destination ?? 'console', filePath: expandOptional(settings.logging?.filePath, env), pretty: settings.logging?.pretty ?? true },
     interaction: { approvalMode: settings.interaction?.approvalMode ?? (settings.interaction?.autoApprove === false ? 'manual' : 'auto'), clarificationMode: settings.interaction?.clarificationMode ?? (settings.interaction?.interactive === false ? 'fail' : 'interactive') },
     events: { printLifecycle: settings.events?.printLifecycle ?? false, subscribe: settings.events?.subscribe ?? false, verbose: settings.events?.verbose ?? false },

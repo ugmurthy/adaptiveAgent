@@ -15,7 +15,7 @@
     "adaptive-agent": "bun run ./dist/adaptive-agent.js",
     "adaptive-agent:tui": "bun run ./src/adaptive-agent-tui.ts",
     "link:global": "bun run ./scripts/link-global.ts",
-    "test": "bunx vitest run",
+    "test": "bunx vitest run && bun test ./src/sqlite-runtime.bun.ts",
     "typecheck": "bunx tsc --noEmit"
   },
   "dependencies": {

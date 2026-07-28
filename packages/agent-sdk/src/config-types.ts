@@ -30,7 +30,7 @@ import type {
 export type { InferenceMode, InferenceTier, ProfileRef } from '@adaptive-agent/gateway-client';
 
 export type InvocationMode = 'run' | 'chat';
-export type RuntimeMode = 'memory' | 'postgres';
+export type RuntimeMode = 'memory' | 'sqlite' | 'postgres';
 export type ApprovalMode = 'manual' | 'auto' | 'reject';
 export type ClarificationMode = 'interactive' | 'fail';
 export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'silent';
@@ -95,7 +95,7 @@ export interface AgentSettingsFile {
   version?: 1;
   agent?: { configPath?: string; id?: string };
   agents?: { dirs?: string[] };
-  runtime?: { mode?: RuntimeMode; autoMigrate?: boolean };
+  runtime?: { mode?: RuntimeMode; autoMigrate?: boolean; sqlitePath?: string };
   logging?: { enabled?: boolean; level?: LogLevel; destination?: LogDestination; filePath?: string; pretty?: boolean };
   interaction?: { autoApprove?: boolean; interactive?: boolean; approvalMode?: ApprovalMode; clarificationMode?: ClarificationMode };
   events?: { printLifecycle?: boolean; subscribe?: boolean; verbose?: boolean };
@@ -134,7 +134,7 @@ export interface ResolvedAgentSdkConfig {
     requestTimeoutMs?: number;
     reconnectAttempts?: number;
   };
-  runtime: { requestedMode: RuntimeMode; mode: RuntimeMode; autoMigrate: boolean };
+  runtime: { requestedMode: RuntimeMode; mode: RuntimeMode; autoMigrate: boolean; sqlitePath?: string };
   logging: { enabled: boolean; level: LogLevel; destination: LogDestination; filePath?: string; pretty: boolean };
   interaction: { approvalMode: ApprovalMode; clarificationMode: ClarificationMode };
   events: { printLifecycle: boolean; subscribe: boolean; verbose: boolean };
@@ -207,6 +207,7 @@ export interface AgentSdkOptions {
   gateway?: Partial<Pick<GatewayClientOptions, 'url' | 'clientName' | 'clientVersion' | 'connectTimeoutMs' | 'requestTimeoutMs' | 'reconnectAttempts'>>;
   accessToken?: GatewayClientOptions['accessToken'];
   runtimeMode?: RuntimeMode;
+  sqlitePath?: string;
   runtime?: AdaptiveAgentRuntimeOptions<RunStore, EventStore, SnapshotStore, PlanStore | undefined, ContinuationStore>;
   tools?: Array<ToolDefinition<any, any>>;
   delegates?: DelegateDefinition[];

@@ -87,7 +87,7 @@ Options:
   --cwd <path>              Working directory used for SDK config lookup
   --agent <path>            Explicit path to agent.json
   --settings <path>         Explicit path to agent.settings.json
-  --runtime <mode>          Runtime mode: memory or postgres
+  --runtime <mode>          Runtime mode: memory, sqlite, or postgres
   --inference-mode <mode>   Inference mode: gateway, local, or byok
   --tier <tier>             Gateway tier: low, medium, high, or xtra-high
   --provider <name>         Override provider: openrouter, ollama, mistral, mesh
@@ -1056,7 +1056,7 @@ function parseArgs(argv: string[]): TuiCliOptions {
       case '--cwd': options.cwd = requireValue(arg, argv[++index]); break;
       case '--agent': options.agentConfigPath = requireValue(arg, argv[++index]); break;
       case '--settings': options.settingsConfigPath = requireValue(arg, argv[++index]); break;
-      case '--runtime': options.runtimeMode = parseEnum(requireValue(arg, argv[++index]), ['memory', 'postgres'] as const, arg); break;
+      case '--runtime': options.runtimeMode = parseEnum(requireValue(arg, argv[++index]), ['memory', 'sqlite', 'postgres'] as const, arg); break;
       case '--inference-mode': options.inferenceMode = parseEnum(requireValue(arg, argv[++index]), ['gateway', 'local', 'byok'] as const, arg); break;
       case '--tier': options.inferenceTier = parseEnum(requireValue(arg, argv[++index]), ['low', 'medium', 'high', 'xtra-high'] as const, arg); break;
       case '--provider': options.provider = parseEnum(requireValue(arg, argv[++index]), ['openrouter', 'ollama', 'mistral', 'mesh'] as const, arg); break;

@@ -1,8 +1,11 @@
 import { Pool, types } from 'pg';
+import { mkdir } from 'node:fs/promises';
+import { dirname } from 'node:path';
 
 import {
   createAdaptiveAgentRuntime,
   createPostgresRuntimeStores,
+  openSqliteRuntimeStores,
   POSTGRES_RUNTIME_MIGRATIONS,
   type AdaptiveAgentRuntimeOptions,
   type ContinuationStore,
@@ -20,8 +23,26 @@ import {
 import type { RuntimeMode } from './config-types.js';
 import { readBooleanEnv } from './sdk-utils.js';
 
-export async function resolveRuntimeBundle(mode: RuntimeMode, autoMigrate: boolean, env: NodeJS.ProcessEnv = process.env): Promise<{ mode: RuntimeMode; runtime?: AdaptiveAgentRuntimeOptions<RunStore, EventStore, SnapshotStore, PlanStore | undefined, ContinuationStore>; close?: () => Promise<void> }> {
+export async function resolveRuntimeBundle(mode: RuntimeMode, autoMigrate: boolean, env: NodeJS.ProcessEnv = process.env, sqlitePath?: string): Promise<{ mode: RuntimeMode; runtime?: AdaptiveAgentRuntimeOptions<RunStore, EventStore, SnapshotStore, PlanStore | undefined, ContinuationStore>; close?: () => Promise<void> }> {
   if (mode === 'memory') return { mode, runtime: createAdaptiveAgentRuntime<RunStore, EventStore, SnapshotStore, PlanStore | undefined>() };
+  if (mode === 'sqlite') {
+    if (!sqlitePath) throw new Error('SQLite runtime requires a database path.');
+    await mkdir(dirname(sqlitePath), { recursive: true });
+    const stores = await openSqliteRuntimeStores({ path: sqlitePath, migrate: autoMigrate });
+    return {
+      mode,
+      runtime: {
+        runStore: stores.runStore,
+        eventStore: stores.eventStore,
+        snapshotStore: stores.snapshotStore,
+        planStore: stores.planStore,
+        continuationStore: stores.continuationStore,
+        toolExecutionStore: stores.toolExecutionStore,
+        transactionStore: stores,
+      },
+      close: () => stores.close(),
+    };
+  }
   const pool = createPostgresPool(env);
   if (autoMigrate) await runPostgresRuntimeMigrations(pool);
   const stores = createPostgresRuntimeStores({ client: pool });

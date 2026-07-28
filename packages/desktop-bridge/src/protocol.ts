@@ -6,7 +6,7 @@ export const SUPPORTED_DESKTOP_PROTOCOL_VERSIONS = [DESKTOP_PROTOCOL_VERSION] as
 export const DESKTOP_BRIDGE_VERSION = '0.1.0';
 
 export type DesktopProtocolVersion = (typeof SUPPORTED_DESKTOP_PROTOCOL_VERSIONS)[number];
-export type RuntimeMode = 'memory' | 'postgres';
+export type RuntimeMode = 'memory' | 'sqlite' | 'postgres';
 export type ProviderName = 'openrouter' | 'ollama' | 'mistral' | 'mesh';
 export type ApprovalMode = 'auto' | 'manual' | 'reject';
 export type ClarificationMode = 'interactive' | 'fail';
@@ -67,6 +67,7 @@ export interface RuntimeInitializeParams {
   agentConfigPath?: string;
   settingsConfigPath?: string;
   runtimeMode?: RuntimeMode;
+  sqlitePath?: string;
   provider?: ProviderName;
   model?: string;
   approvalMode?: ApprovalMode;
@@ -347,7 +348,8 @@ function validateRuntimeInitializeParams(value: Record<string, unknown>): void {
   optionalString(value, 'cwd');
   optionalString(value, 'agentConfigPath');
   optionalString(value, 'settingsConfigPath');
-  optionalEnum(value, 'runtimeMode', ['memory', 'postgres']);
+  optionalEnum(value, 'runtimeMode', ['memory', 'sqlite', 'postgres']);
+  optionalString(value, 'sqlitePath');
   optionalEnum(value, 'provider', ['openrouter', 'ollama', 'mistral', 'mesh']);
   optionalString(value, 'model');
   optionalEnum(value, 'approvalMode', ['auto', 'manual', 'reject']);

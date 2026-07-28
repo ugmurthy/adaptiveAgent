@@ -46,7 +46,7 @@ inspection, and CLI commands to run without eagerly creating a model client or
 database connection.
 
 ```json
-{"jsonrpc":"2.0","id":"runtime","method":"runtime/initialize","params":{"cwd":"/workspace","agentConfigPath":"/profiles/agent.json","settingsConfigPath":"/profiles/agent.settings.json","runtimeMode":"postgres","provider":"openrouter","model":"openai/gpt-5","approvalMode":"manual","clarificationMode":"interactive"}}
+{"jsonrpc":"2.0","id":"runtime","method":"runtime/initialize","params":{"cwd":"/workspace","agentConfigPath":"/profiles/agent.json","settingsConfigPath":"/profiles/agent.settings.json","runtimeMode":"sqlite","sqlitePath":"/workspace/runtime.sqlite","provider":"openrouter","model":"openai/gpt-5","approvalMode":"manual","clarificationMode":"interactive"}}
 ```
 
 ## Typed JSON-RPC methods
@@ -58,7 +58,7 @@ steering, and in-memory run state.
 | Method | Required params | Optional params |
 | --- | --- | --- |
 | `initialize` | `protocolVersion`, `clientInfo.name` | `clientInfo.version`, `capabilities` |
-| `runtime/initialize` | - | `cwd`, `agentConfigPath`, `settingsConfigPath`, `runtimeMode`, `provider`, `model`, `approvalMode`, `clarificationMode` |
+| `runtime/initialize` | - | `cwd`, `agentConfigPath`, `settingsConfigPath`, `runtimeMode`, `sqlitePath`, `provider`, `model`, `approvalMode`, `clarificationMode` |
 | `runtime/info` | - | - |
 | `runtime/shutdown` | - | - |
 | `agent/run` | `goal` | `sessionId`, `input` |

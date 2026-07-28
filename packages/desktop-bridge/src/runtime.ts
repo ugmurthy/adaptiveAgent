@@ -27,6 +27,7 @@ export interface CliExecutionOutput {
 }
 
 export interface CliExecutionRequest extends CliExecuteParams {
+  environment?: NodeJS.ProcessEnv;
   onOutput: (output: CliExecutionOutput) => void;
 }
 
@@ -238,7 +239,8 @@ export class DesktopRuntime {
       ...(params.cwd ? { cwd: params.cwd } : {}),
       ...(params.agentConfigPath ? { agentConfigPath: params.agentConfigPath } : {}),
       ...(params.settingsConfigPath ? { settingsConfigPath: params.settingsConfigPath } : {}),
-      ...(params.runtimeMode ? { runtimeMode: params.runtimeMode } : {}),
+      runtimeMode: params.runtimeMode ?? 'sqlite',
+      ...(params.sqlitePath ? { sqlitePath: params.sqlitePath } : {}),
       ...(params.provider || params.model ? {
         model: {
           ...(params.provider ? { provider: params.provider } : {}),
@@ -350,15 +352,22 @@ export class DesktopRuntime {
       );
     }
 
+    const runtime = this.sdk?.config.runtime;
     const argv = parsed.output === 'pretty' && !params.argv.includes('--output')
       ? [...params.argv, '--output', 'json']
       : [...params.argv];
+    if (runtime?.mode === 'sqlite' && parsed.runtimeMode === undefined) {
+      argv.push('--runtime', 'sqlite');
+    }
     let result: CliExecutionResult;
     try {
       result = await this.cliExecutor.execute({
         argv,
         ...(params.stdin !== undefined ? { stdin: params.stdin } : {}),
         ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : {}),
+        ...(runtime?.mode === 'sqlite' && runtime.sqlitePath
+          ? { environment: { ADAPTIVE_AGENT_SQLITE_PATH: runtime.sqlitePath } }
+          : {}),
         onOutput: ({ stream, line }) => {
           this.write({
             jsonrpc: '2.0',

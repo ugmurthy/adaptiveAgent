@@ -30,7 +30,7 @@ Common options:
 | `--agent <path-or-name>` | Use a specific `agent.json`, or a named file found in `settings.agents.dirs`. |
 | `--settings <path>` | Use a specific `agent.settings.json`. |
 | `--cwd <path>` | Change config lookup and workspace resolution root. |
-| `--runtime memory\|postgres` | Override runtime store mode. |
+| `--runtime memory\|sqlite\|postgres` | Override runtime store mode. |
 | `--provider openrouter\|ollama\|mistral\|mesh` | Override the model provider. |
 | `--model <name>` | Override the model name. |
 | `--approval auto\|manual\|reject` | Decide how approval-gated tools are handled. |

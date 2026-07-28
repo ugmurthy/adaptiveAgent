@@ -395,11 +395,203 @@ The deterministic automated gateway test is the stronger proof that the
 provider invocation count is exactly one. This manual test proves the real CLI,
 transport reconnect, server replay, and billing behavior together.
 
+## Repeat Tests 1-12 with SQLite (Phase 4 gate)
+
+Repeat the Phase 3 tests with SQLite as the CLI/core runtime. PostgreSQL is
+still required by the capability gateway for billing; do not unset
+`DATABASE_URL` or stop the PostgreSQL container. SQLite replaces only the
+memory/PostgreSQL runtime selected by the CLI.
+
+Use Terminal B with the gateway, PostgreSQL container, Ollama, token minting
+function, and access token from the original setup still active.
+
+### Create an isolated SQLite runtime
+
+Use a fresh database so runs from another test do not affect inspection or
+recovery results:
+
+```bash
+export PHASE3_SQLITE_PATH="/tmp/adaptive-gateway-phase3-$(date +%s).sqlite"
+export PHASE3_SQLITE_SETTINGS=/tmp/adaptive-gateway-sqlite.settings.json
+export PHASE3_SQLITE_PROXY_SETTINGS=/tmp/adaptive-gateway-sqlite-proxy.settings.json
+
+rm -f "$PHASE3_SQLITE_PATH" \
+  "$PHASE3_SQLITE_PATH-wal" \
+  "$PHASE3_SQLITE_PATH-shm"
+
+jq --arg path "$PHASE3_SQLITE_PATH" '
+  .runtime.mode = "sqlite"
+  | .runtime.sqlitePath = $path
+' /tmp/adaptive-gateway.settings.json >"$PHASE3_SQLITE_SETTINGS"
+
+COMMON=(
+  --cwd "$ROOT"
+  --agent /tmp/adaptive-gateway-agent.json
+  --settings "$PHASE3_SQLITE_SETTINGS"
+  --runtime sqlite
+  --inference-mode gateway
+)
+```
+
+The explicit `--runtime sqlite` verifies the CLI option. The settings path
+verifies that every new CLI process reopens the same database. No
+`ADAPTIVE_AGENT_SQLITE_PATH` or core-runtime `DATABASE_URL` is needed.
+
+### Repeat Tests 1-10
+
+Run Tests 1 and 2 exactly as written with the SQLite `COMMON` array above.
+Treat Test 2 as the basic SQLite run, then complete the persistence checkpoint
+in the next section before continuing with Tests 3-10. The commands will
+overwrite the earlier `/tmp/gateway-basic.json` and `/tmp/gateway-tool.json`
+files; rename those outputs first if the memory-run evidence must be retained.
+
+For Test 1, also verify the resolved SQLite mode and path:
+
+```bash
+"${AA[@]}" config "${COMMON[@]}" --output json \
+  | tee /tmp/gateway-sqlite-config.json \
+  | jq '.runtime, .inference, .gateway'
+
+jq -e --arg path "$PHASE3_SQLITE_PATH" '
+  .runtime.requestedMode == "sqlite"
+  and .runtime.mode == "sqlite"
+  and .runtime.sqlitePath == $path
+  and .inference.mode == "gateway"
+' /tmp/gateway-sqlite-config.json
+```
+
+Tests 7-9 retain the same negative-path expectations. Compare billing row
+counts immediately before and after each rejected request if previous Phase 3
+runs make the "no billing row" check ambiguous.
+
+### Verify persistence across CLI processes
+
+After Test 2 completes, its CLI process has closed the SQLite connection. Save
+that successful output before later test variants can overwrite it, then open
+the same run from a new CLI process:
+
+```bash
+cp /tmp/gateway-basic.json /tmp/gateway-sqlite-basic.json
+export SQLITE_RUN_ID="$(jq -er '.result.runId' /tmp/gateway-sqlite-basic.json)"
+
+"${AA[@]}" inspect --run-id "$SQLITE_RUN_ID" \
+  "${COMMON[@]}" --output json \
+  >/tmp/gateway-sqlite-inspect.json
+
+jq -e --arg run_id "$SQLITE_RUN_ID" '
+  .inspection.run.id == $run_id
+  and .inspection.run.status == "succeeded"
+  and .inspection.eventCount > 0
+' /tmp/gateway-sqlite-inspect.json
+```
+
+Pass: the second process finds the completed run and its persisted events.
+Continue with Tests 3-10 after this check passes.
+
+Inspect the embedded database directly after all CLI commands have exited:
+
+```bash
+bun -e '
+  import { Database } from "bun:sqlite";
+  const db = new Database(process.env.PHASE3_SQLITE_PATH, { strict: true });
+  console.log({
+    journalMode: db.query("pragma journal_mode").get(),
+    schemaVersion: db.query("pragma user_version").get(),
+    runCount: db.query("select count(*) as count from agent_runs").get(),
+    eventCount: db.query("select count(*) as count from agent_events").get()
+  });
+  db.close(false);
+'
+```
+
+Pass: journal mode is `wal`, schema version is nonzero, and run/event counts
+are nonzero.
+
+### Repeat Test 11 with SQLite
+
+Use the persisted Test 2 run instead of creating a PostgreSQL-backed core run:
+
+```bash
+"${AA[@]}" replay --run-id "$SQLITE_RUN_ID" \
+  "${COMMON[@]}" --output json \
+  >/tmp/gateway-sqlite-replay.json
+```
+
+Apply the same trace-correlation checks from Test 11. Pass: the replayed local
+`model.completed` call ID and adapter trace ID match the gateway log and billing
+row, and the run is available after reopening SQLite.
+
+### Repeat Test 12 with SQLite
+
+Create the proxy settings from the SQLite settings, not from the original
+memory settings:
+
+```bash
+jq '
+  .gateway.url = "ws://127.0.0.1:3001/rpc"
+  | .gateway.reconnectAttempts = 10
+' "$PHASE3_SQLITE_SETTINGS" >"$PHASE3_SQLITE_PROXY_SETTINGS"
+```
+
+If the Toxiproxy server and `adaptive-gateway` proxy from the original Test 12
+are still running, reuse them instead of creating another server or proxy with
+the same name. Otherwise, repeat the original Toxiproxy setup. Then repeat the
+active-billing wait, connection reset, and billing validation from Test 12.
+Replace only the long model-call command with:
+
+```bash
+"${AA[@]}" run \
+  "Do not call tools. Write a detailed 1500-word explanation of WebSocket reconnect semantics." \
+  --cwd "$ROOT" --agent /tmp/adaptive-gateway-agent.json \
+  --settings "$PHASE3_SQLITE_PROXY_SETTINGS" \
+  --runtime sqlite --inference-mode gateway --tier medium \
+  --inspect --output json \
+  >/tmp/gateway-reconnect.json 2>/tmp/gateway-reconnect.err &
+export RECONNECT_PID=$!
+```
+
+After the original Test 12 validations pass, verify the completed reconnect run
+from another process:
+
+```bash
+export SQLITE_RECONNECT_RUN_ID="$(jq -er '.result.runId' /tmp/gateway-reconnect.json)"
+
+"${AA[@]}" inspect --run-id "$SQLITE_RECONNECT_RUN_ID" \
+  --cwd "$ROOT" --agent /tmp/adaptive-gateway-agent.json \
+  --settings "$PHASE3_SQLITE_PROXY_SETTINGS" \
+  --runtime sqlite --inference-mode gateway --output json \
+  >/tmp/gateway-sqlite-reconnect-inspect.json
+
+jq -e --arg run_id "$SQLITE_RECONNECT_RUN_ID" '
+  .inspection.run.id == $run_id
+  and .inspection.run.status == "succeeded"
+  and .inspection.eventTypes["model.completed"] >= 1
+' /tmp/gateway-sqlite-reconnect-inspect.json
+```
+
+SQLite repeat pass criteria:
+
+- Tests 1-12 retain all original Phase 3 pass criteria.
+- Every command resolves runtime mode `sqlite` and the same database path.
+- A new CLI process can inspect and replay the Test 2 run.
+- The Toxiproxy reconnect still produces one logical gateway call and one
+  billing row.
+- The completed reconnect run remains inspectable after the originating CLI
+  exits.
+- No prompt, output, tool result, API key, or access token is persisted in
+  gateway billing or gateway logs.
+
+The SQLite database is local runtime state and may contain prompts, tool
+inputs/results, and model output. Protect it as sensitive data and remove it
+during cleanup.
+
 ## Cleanup
 
 ```bash
 rm -f /tmp/adaptive-gateway*.json /tmp/gateway-*.json \
   /tmp/gateway-*.err /tmp/adaptive-gateway-manual.env tmp/gateway-proof.txt
+test -z "${PHASE3_SQLITE_PATH:-}" || rm -f \
+  "$PHASE3_SQLITE_PATH" "$PHASE3_SQLITE_PATH-wal" "$PHASE3_SQLITE_PATH-shm"
 test -z "${TOXIPROXY_PID:-}" || kill "$TOXIPROXY_PID"
 docker stop "$PHASE3_DB_CONTAINER"
 ```

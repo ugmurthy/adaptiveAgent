@@ -190,7 +190,7 @@ More help:
 const COMMON_AGENT_OPTIONS_TEXT = `Agent/config options:
   --agent <path-or-name>  Explicit path to agent.json, or filename from agents.dirs.
   --settings <path>       Explicit path to agent.settings.json.
-  --runtime <mode>        Runtime mode: memory or postgres.
+  --runtime <mode>        Runtime mode: memory, sqlite, or postgres.
   --inference-mode <mode> Inference mode: gateway, local, or byok.
   --tier <tier>           Gateway tier: low, medium, high, or xtra-high.
   --provider <name>       Override provider: openrouter, ollama, mistral, mesh.
@@ -200,7 +200,7 @@ const COMMON_AGENT_OPTIONS_TEXT = `Agent/config options:
 
 const COMMON_RUNTIME_OPTIONS_TEXT = `Additional agent/config options:
   --settings <path>       Explicit path to agent.settings.json.
-  --runtime <mode>        Runtime mode: memory or postgres.
+  --runtime <mode>        Runtime mode: memory, sqlite, or postgres.
   --inference-mode <mode> Inference mode: gateway, local, or byok.
   --tier <tier>           Gateway tier: low, medium, high, or xtra-high.
   --provider <name>       Override provider: openrouter, ollama, mistral, mesh.
@@ -568,7 +568,7 @@ Usage:
 Doctor options:
   --agent <path-or-name>  Explicit path to agent.json, or filename from agents.dirs.
   --settings <path>       Explicit path to agent.settings.json.
-  --runtime <mode>        Runtime store mode to validate: memory or postgres.
+  --runtime <mode>        Runtime store mode to validate: memory, sqlite, or postgres.
   --provider <name>       Provider override to validate: openrouter, ollama, mistral, mesh.
   --model <name>          Model override to validate.
   --network               Allow doctor network checks against GitHub.
@@ -2310,7 +2310,11 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
         options.settingsConfigPath = requireOptionValue(arg, argv[++index]);
         break;
       case '--runtime':
-        options.runtimeMode = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['memory', 'postgres']);
+        options.runtimeMode = parseEnumOption(
+          arg,
+          requireOptionValue(arg, argv[++index]),
+          ['memory', 'sqlite', 'postgres'],
+        );
         break;
       case '--inference-mode':
         options.inferenceMode = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['gateway', 'local', 'byok']);
