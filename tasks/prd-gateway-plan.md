@@ -966,6 +966,8 @@ executing server-delivered handlers.
 
 ### Phase 7: Integrate the local desktop bridge and Swift host
 
+**Status:** Completed.
+
 **Outcome:** A Swift app controls the durable local runtime while the sidecar
 uses the gateway for authorized capabilities.
 
@@ -983,11 +985,11 @@ uses the gateway for authorized capabilities.
 
 **Acceptance criteria:**
 
-- [ ] Swift can initialize a SQLite runtime and start a gateway-backed run.
-- [ ] Token replacement does not require rebuilding the runtime.
-- [ ] Tokens do not appear in protocol diagnostics or local persistence.
-- [ ] Artifact paths and writes remain local.
-- [ ] Existing stdio CLI-child isolation remains intact.
+- [x] Swift can initialize a SQLite runtime and start a gateway-backed run.
+- [x] Token replacement does not require rebuilding the runtime.
+- [x] Tokens do not appear in protocol diagnostics or local persistence.
+- [x] Artifact paths and writes remain local.
+- [x] Existing stdio CLI-child isolation remains intact.
 
 #### Phase 7 gate
 

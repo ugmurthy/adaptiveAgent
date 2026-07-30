@@ -34,8 +34,8 @@ describe('desktop bridge protocol', () => {
     );
   });
 
-  it('uses a string for protocol 1.10', () => {
-    expect(DESKTOP_PROTOCOL_VERSION).toBe('1.10');
+  it('uses a string for protocol 1.11', () => {
+    expect(DESKTOP_PROTOCOL_VERSION).toBe('1.11');
   });
 
   it('uses standard JSON-RPC parse, request, method, and params error codes', () => {
@@ -66,6 +66,28 @@ describe('desktop bridge protocol', () => {
       id: 'exec',
       method: 'cli/execute',
       params: { argv: [] },
+    }))).toThrowError(expect.objectContaining<Partial<DesktopProtocolError>>({ code: 'INVALID_PARAMS' }));
+  });
+
+  it('validates gateway run selection and access-token updates', () => {
+    const profileRef = { source: 'server', id: 'researcher', version: '1', contentHash: 'abc123' };
+    expect(parseDesktopRpcRequest(JSON.stringify({
+      jsonrpc: '2.0',
+      id: 'run',
+      method: 'agent/run',
+      params: { goal: 'Research', inferenceMode: 'gateway', inferenceTier: 'high', profileRef },
+    }))).toMatchObject({ method: 'agent/run' });
+    expect(parseDesktopRpcRequest(JSON.stringify({
+      jsonrpc: '2.0',
+      id: 'token',
+      method: 'auth/updateAccessToken',
+      params: { accessToken: 'secret-value' },
+    }))).toMatchObject({ method: 'auth/updateAccessToken' });
+    expect(() => parseDesktopRpcRequest(JSON.stringify({
+      jsonrpc: '2.0',
+      id: 'bad-profile',
+      method: 'agent/chat',
+      params: { message: 'Hello', profileRef: { source: 'server', id: 'missing-fields' } },
     }))).toThrowError(expect.objectContaining<Partial<DesktopProtocolError>>({ code: 'INVALID_PARAMS' }));
   });
 

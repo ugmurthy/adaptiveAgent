@@ -1,6 +1,12 @@
 import { AgentSdk, type AgentSdkOptions } from '@adaptive-agent/agent-sdk';
 import { parseCliArgs, type ManualTestCliOptions } from '@adaptive-agent/agent-sdk/src/adaptive-agent.js';
 import type { AgentEvent, JsonValue, UUID } from '@adaptive-agent/core';
+import {
+  GatewayClient,
+  type InferenceMode,
+  type InferenceTier,
+  type ProfileRef,
+} from '@adaptive-agent/gateway-client';
 
 import {
   ADAPTIVE_AGENT_CLI_COMMANDS,
@@ -14,6 +20,7 @@ import {
   type CliExecuteParams,
   type DesktopClientInfo,
   type DesktopMessage,
+  type DesktopProtocolVersion,
   type DesktopRpcRequest,
   type JsonRpcId,
   type RuntimeInitializeParams,
@@ -61,6 +68,10 @@ export class DesktopRuntime {
   private sdkInitialization: Promise<AgentSdk> | undefined;
   private rpcInitialized = false;
   private clientInfo: DesktopClientInfo | undefined;
+  private negotiatedProtocolVersion: DesktopProtocolVersion = DESKTOP_PROTOCOL_VERSION;
+  private accessToken: string | undefined;
+  private gatewayClient: GatewayClient | undefined;
+  private executionSelection: { inferenceMode: InferenceMode; inferenceTier: InferenceTier; profileRef?: ProfileRef } | undefined;
 
   constructor(
     private readonly write: DesktopMessageWriter,
@@ -84,9 +95,12 @@ export class DesktopRuntime {
     if (!this.rpcInitialized) {
       throw new DesktopProtocolError(
         'NOT_INITIALIZED',
-        'Call initialize with protocolVersion "1.10" before other JSON-RPC methods.',
+        'Call initialize with a supported protocolVersion before other JSON-RPC methods.',
         JSON_RPC_ERROR_CODES.notInitialized,
       );
+    }
+    if (this.negotiatedProtocolVersion === '1.10' && request.method === 'auth/updateAccessToken') {
+      throw new DesktopProtocolError('METHOD_NOT_FOUND', 'auth/updateAccessToken requires desktop protocol 1.11.', JSON_RPC_ERROR_CODES.methodNotFound);
     }
 
     switch (request.method) {
@@ -97,17 +111,25 @@ export class DesktopRuntime {
       case 'runtime/shutdown':
         await this.close();
         return { shutdown: true };
+      case 'auth/updateAccessToken':
+        this.accessToken = request.params!.accessToken;
+        await this.gatewayClient?.reconnect();
+        return { updated: true };
       case 'agent/run': {
         const params = request.params!;
+        this.validateExecutionSelection(params);
         return asJsonValue(await this.requireSdk().runRaw(params.goal, {
           ...(params.sessionId ? { sessionId: params.sessionId } : {}),
           ...(params.input === undefined ? {} : { input: params.input }),
+          ...(params.inferenceTier ? { inferenceTier: params.inferenceTier } : {}),
         }));
       }
       case 'agent/chat': {
         const params = request.params!;
+        this.validateExecutionSelection(params);
         return asJsonValue(await this.requireSdk().chatRaw(params.message, {
           ...(params.sessionId ? { sessionId: params.sessionId } : {}),
+          ...(params.inferenceTier ? { inferenceTier: params.inferenceTier } : {}),
         }));
       }
       case 'run/resume':
@@ -167,6 +189,8 @@ export class DesktopRuntime {
     const sdk = this.sdk;
     this.sdk = undefined;
     await sdk?.close();
+    this.gatewayClient?.close();
+    this.gatewayClient = undefined;
   }
 
   private initializeProtocol(params: { protocolVersion: string; clientInfo: DesktopClientInfo }): JsonValue {
@@ -177,7 +201,7 @@ export class DesktopRuntime {
         JSON_RPC_ERROR_CODES.alreadyInitialized,
       );
     }
-    if (params.protocolVersion !== DESKTOP_PROTOCOL_VERSION) {
+    if (!SUPPORTED_DESKTOP_PROTOCOL_VERSIONS.includes(params.protocolVersion as typeof SUPPORTED_DESKTOP_PROTOCOL_VERSIONS[number])) {
       throw new DesktopProtocolError(
         'UNSUPPORTED_PROTOCOL_VERSION',
         `Protocol version ${params.protocolVersion} is not supported by the JSON-RPC endpoint.`,
@@ -186,13 +210,14 @@ export class DesktopRuntime {
       );
     }
     this.rpcInitialized = true;
+    this.negotiatedProtocolVersion = params.protocolVersion as typeof SUPPORTED_DESKTOP_PROTOCOL_VERSIONS[number];
     this.clientInfo = params.clientInfo;
     return {
-      protocolVersion: DESKTOP_PROTOCOL_VERSION,
+      protocolVersion: this.negotiatedProtocolVersion,
       bridgeVersion: DESKTOP_BRIDGE_VERSION,
       serverInfo: { name: '@adaptive-agent/desktop-bridge', version: DESKTOP_BRIDGE_VERSION },
       capabilities: {
-        methods: [...DESKTOP_RPC_METHODS],
+        methods: DESKTOP_RPC_METHODS.filter((method) => this.negotiatedProtocolVersion === '1.11' || method !== 'auth/updateAccessToken'),
         notifications: ['runtime/ready', 'agent/event', 'cli/output'],
         cli: {
           commands: [...ADAPTIVE_AGENT_CLI_COMMANDS],
@@ -206,7 +231,7 @@ export class DesktopRuntime {
 
   private runtimeInfo(): JsonValue {
     return {
-      protocolVersion: DESKTOP_PROTOCOL_VERSION,
+      protocolVersion: this.negotiatedProtocolVersion,
       bridgeVersion: DESKTOP_BRIDGE_VERSION,
       initialized: this.sdk !== undefined,
       ...(this.clientInfo ? { clientInfo: asJsonValue(this.clientInfo) } : {}),
@@ -214,6 +239,20 @@ export class DesktopRuntime {
         runtimeMode: this.sdk.config.runtime.mode,
         agentId: this.sdk.config.agent.id,
         workspaceRoot: this.sdk.config.workspaceRoot,
+        inferenceMode: this.sdk.config.inference.mode,
+        inferenceTier: this.sdk.config.inference.tier,
+        ...(this.executionSelection?.profileRef ? { profileRef: asJsonValue(this.executionSelection.profileRef) } : {}),
+        connections: {
+          sqlite: {
+            configured: this.sdk.config.runtime.mode === 'sqlite',
+            state: this.sdk.config.runtime.mode === 'sqlite' ? 'connected' : 'not_configured',
+            ...(this.sdk.config.runtime.sqlitePath ? { path: this.sdk.config.runtime.sqlitePath } : {}),
+          },
+          gateway: {
+            configured: this.gatewayClient !== undefined,
+            state: this.gatewayClient?.connectionState ?? 'not_configured',
+          },
+        },
       } : {}),
     };
   }
@@ -226,6 +265,27 @@ export class DesktopRuntime {
         JSON_RPC_ERROR_CODES.alreadyInitialized,
       );
     }
+
+    const inferenceMode = params.inferenceMode ?? (params.profileRef?.source === 'server' ? 'gateway' : undefined);
+    if (params.profileRef?.source === 'local') {
+      throw new DesktopProtocolError('INVALID_PARAMS', 'runtime/initialize profileRef currently supports exact server profile refs; use agentConfigPath for local profiles.', JSON_RPC_ERROR_CODES.invalidParams);
+    }
+    if (params.profileRef && inferenceMode !== 'gateway') {
+      throw new DesktopProtocolError('INVALID_PARAMS', 'Server profile refs require gateway inference mode.', JSON_RPC_ERROR_CODES.invalidParams);
+    }
+    if (inferenceMode === 'gateway' && !params.gatewayUrl) {
+      throw new DesktopProtocolError('INVALID_PARAMS', 'gatewayUrl is required for a desktop gateway runtime.', JSON_RPC_ERROR_CODES.invalidParams);
+    }
+
+    const gatewayClient = inferenceMode === 'gateway'
+      ? new GatewayClient({
+          url: params.gatewayUrl!,
+          accessToken: () => this.accessToken ?? '',
+          clientName: '@adaptive-agent/desktop-bridge',
+          clientVersion: DESKTOP_BRIDGE_VERSION,
+        })
+      : undefined;
+    this.gatewayClient = gatewayClient;
 
     const settingsOverrides: NonNullable<AgentSdkOptions['settingsOverrides']> = {
       logging: { enabled: false },
@@ -248,6 +308,13 @@ export class DesktopRuntime {
         },
       } : {}),
       settingsOverrides,
+      ...(inferenceMode ? { inferenceMode } : {}),
+      ...(params.inferenceTier ? { inferenceTier: params.inferenceTier } : {}),
+      ...(params.profileRef ? { serverProfile: params.profileRef, profileRefs: [params.profileRef] } : {}),
+      ...(gatewayClient ? {
+        gatewayClient,
+        gateway: { url: params.gatewayUrl, clientName: '@adaptive-agent/desktop-bridge', clientVersion: DESKTOP_BRIDGE_VERSION },
+      } : {}),
       eventListener: (event: AgentEvent) => this.writeAgentEvent(event),
     };
 
@@ -256,6 +323,11 @@ export class DesktopRuntime {
     try {
       const sdk = await initialization;
       this.sdk = sdk;
+      this.executionSelection = {
+        inferenceMode: sdk.config.inference.mode,
+        inferenceTier: sdk.config.inference.tier,
+        ...(params.profileRef ? { profileRef: structuredClone(params.profileRef) } : {}),
+      };
       return {
         agent: {
           id: sdk.config.agent.id,
@@ -266,9 +338,34 @@ export class DesktopRuntime {
         workspaceRoot: sdk.config.workspaceRoot,
         shellCwd: sdk.config.shellCwd,
         registeredToolNames: sdk.registeredToolNames,
+        inferenceMode: sdk.config.inference.mode,
+        inferenceTier: sdk.config.inference.tier,
+        ...(params.profileRef ? { profileRef: asJsonValue(params.profileRef) } : {}),
+        connections: {
+          sqlite: sdk.config.runtime.mode === 'sqlite' ? 'connected' : 'not_configured',
+          gateway: gatewayClient?.connectionState ?? 'not_configured',
+        },
       };
+    } catch (error) {
+      gatewayClient?.close();
+      if (this.gatewayClient === gatewayClient) this.gatewayClient = undefined;
+      throw error;
     } finally {
       this.sdkInitialization = undefined;
+    }
+  }
+
+  private validateExecutionSelection(params: { inferenceMode?: InferenceMode; inferenceTier?: InferenceTier; profileRef?: ProfileRef }): void {
+    const selection = this.executionSelection;
+    if (!selection) return;
+    if (params.inferenceMode && params.inferenceMode !== selection.inferenceMode) {
+      throw new DesktopProtocolError('INVALID_PARAMS', `This runtime uses ${selection.inferenceMode} inference; initialize a separate runtime to use ${params.inferenceMode}.`, JSON_RPC_ERROR_CODES.invalidParams);
+    }
+    if (params.inferenceTier && selection.inferenceMode !== 'gateway') {
+      throw new DesktopProtocolError('INVALID_PARAMS', 'inferenceTier may be selected per run only in gateway inference mode.', JSON_RPC_ERROR_CODES.invalidParams);
+    }
+    if (params.profileRef && !sameProfileRef(params.profileRef, selection.profileRef)) {
+      throw new DesktopProtocolError('INVALID_PARAMS', 'The requested profileRef does not match the profile pinned when this runtime was initialized.', JSON_RPC_ERROR_CODES.invalidParams);
     }
   }
 
@@ -401,6 +498,14 @@ export class DesktopRuntime {
 function asRunId(runId: string): UUID {
   if (!runId.trim()) throw new DesktopProtocolError('INVALID_PARAMS', 'runId must be a non-empty string.');
   return runId as UUID;
+}
+
+function sameProfileRef(left: ProfileRef, right: ProfileRef | undefined): boolean {
+  return right !== undefined
+    && left.source === right.source
+    && left.id === right.id
+    && left.version === right.version
+    && left.contentHash === right.contentHash;
 }
 
 function asJsonValue(value: unknown): JsonValue {

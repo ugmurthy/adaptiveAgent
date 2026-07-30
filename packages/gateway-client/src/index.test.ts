@@ -19,6 +19,17 @@ import {
 } from './index.js';
 
 describe('gateway client transport', () => {
+  test('requires TLS except for loopback development gateways', () => {
+    const options = {
+      accessToken: () => 'token',
+      clientName: 'test',
+      clientVersion: '1',
+    };
+    expect(() => new GatewayClient({ ...options, url: 'ws://gateway.example/rpc' })).toThrow('must use wss');
+    expect(() => new GatewayClient({ ...options, url: 'wss://gateway.example/rpc' })).not.toThrow();
+    expect(() => new GatewayClient({ ...options, url: 'ws://127.0.0.1:8080/rpc' })).not.toThrow();
+  });
+
   test('keeps concurrent model streams correlated when frames are interleaved', async () => {
     const generateRequests: Array<{ request: JsonRpcRequest<'model/generate'>; socket: FakeSocket }> = [];
     const { client } = fakeClient((request, socket) => {
@@ -169,6 +180,76 @@ describe('gateway client transport', () => {
       { Authorization: 'Bearer rotating-token-2' },
     ]);
     expect(JSON.stringify(client)).not.toContain('rotating-token');
+    client.close();
+  });
+
+  test('reports connection state and reconnects with a replaced token', async () => {
+    let token = 'first-token';
+    const headers: Readonly<Record<string, string>>[] = [];
+    const { client } = fakeClient((request, socket) => {
+      respondToSetup(request, socket);
+    }, {
+      accessToken: () => token,
+      onCreate(socketHeaders) { headers.push(socketHeaders); },
+    });
+
+    expect(client.connectionState).toBe('disconnected');
+    await client.connect();
+    expect(client.connectionState).toBe('connected');
+
+    token = 'replacement-token';
+    await client.reconnect();
+    expect(client.connectionState).toBe('disconnected');
+    await client.connect();
+    expect(headers).toEqual([
+      { Authorization: 'Bearer first-token' },
+      { Authorization: 'Bearer replacement-token' },
+    ]);
+
+    client.close();
+    expect(client.connectionState).toBe('closed');
+  });
+
+  test('lets an active authorization finish before rotating credentials', async () => {
+    let token = 'first-token';
+    const headers: Readonly<Record<string, string>>[] = [];
+    const authorizationStarted = deferred<void>();
+    const finishAuthorization = deferred<void>();
+    const { client } = fakeClient((request, socket) => {
+      if (request.method === 'initialize') {
+        respondToSetup(request, socket);
+        return;
+      }
+      if (request.method !== 'run/authorize') return;
+      authorizationStarted.resolve();
+      void finishAuthorization.promise.then(() => socket.serverMessage({
+        jsonrpc: '2.0',
+        id: request.id,
+        result: {
+          permitId: 'permit', inferenceMode: 'gateway', inferenceTier: 'high',
+          routePolicyVersion: 'policy', remoteCapabilities: [], expiresAt: '2099-01-01T00:00:00.000Z',
+        },
+      }));
+    }, {
+      accessToken: () => token,
+      onCreate(socketHeaders) { headers.push(socketHeaders); },
+    });
+    const authorization = client.authorizeRun({
+      runId: 'run', inferenceMode: 'gateway', requestedTier: 'high', profileRefs: [],
+    });
+    await authorizationStarted.promise;
+
+    token = 'replacement-token';
+    await client.reconnect();
+    finishAuthorization.resolve();
+
+    await expect(authorization).resolves.toMatchObject({ permitId: 'permit' });
+    expect(client.connectionState).toBe('disconnected');
+    await client.connect();
+    expect(headers).toEqual([
+      { Authorization: 'Bearer first-token' },
+      { Authorization: 'Bearer replacement-token' },
+    ]);
     client.close();
   });
 

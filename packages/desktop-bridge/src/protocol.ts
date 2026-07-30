@@ -1,8 +1,9 @@
 import type { JsonValue } from '@adaptive-agent/core';
+import type { InferenceMode, InferenceTier, ProfileRef } from '@adaptive-agent/gateway-client';
 
-/** Keep 1.10 as a string: JSON numbers cannot distinguish 1.10 from 1.1. */
-export const DESKTOP_PROTOCOL_VERSION = '1.10' as const;
-export const SUPPORTED_DESKTOP_PROTOCOL_VERSIONS = [DESKTOP_PROTOCOL_VERSION] as const;
+/** Keep versions as strings: JSON numbers cannot distinguish 1.10 from 1.1. */
+export const DESKTOP_PROTOCOL_VERSION = '1.11' as const;
+export const SUPPORTED_DESKTOP_PROTOCOL_VERSIONS = ['1.10', DESKTOP_PROTOCOL_VERSION] as const;
 export const DESKTOP_BRIDGE_VERSION = '0.1.0';
 
 export type DesktopProtocolVersion = (typeof SUPPORTED_DESKTOP_PROTOCOL_VERSIONS)[number];
@@ -72,6 +73,10 @@ export interface RuntimeInitializeParams {
   model?: string;
   approvalMode?: ApprovalMode;
   clarificationMode?: ClarificationMode;
+  inferenceMode?: InferenceMode;
+  inferenceTier?: InferenceTier;
+  profileRef?: ProfileRef;
+  gatewayUrl?: string;
 }
 
 export interface InitializeParams {
@@ -92,11 +97,21 @@ export interface RunParams {
   goal: string;
   sessionId?: string;
   input?: JsonValue;
+  inferenceMode?: InferenceMode;
+  inferenceTier?: InferenceTier;
+  profileRef?: ProfileRef;
 }
 
 export interface ChatParams {
   message: string;
   sessionId?: string;
+  inferenceMode?: InferenceMode;
+  inferenceTier?: InferenceTier;
+  profileRef?: ProfileRef;
+}
+
+export interface UpdateAccessTokenParams {
+  accessToken: string;
 }
 
 export interface RunIdParams {
@@ -130,6 +145,7 @@ export type DesktopRpcRequest =
   | RpcRequest<'runtime/initialize', RuntimeInitializeParams>
   | RpcRequestWithoutParams<'runtime/info'>
   | RpcRequestWithoutParams<'runtime/shutdown'>
+  | RpcRequest<'auth/updateAccessToken', UpdateAccessTokenParams>
   | RpcRequest<'agent/run', RunParams>
   | RpcRequest<'agent/chat', ChatParams>
   | RpcRequest<'run/resume', RunIdParams>
@@ -150,6 +166,7 @@ export const DESKTOP_RPC_METHODS = [
   'runtime/initialize',
   'runtime/info',
   'runtime/shutdown',
+  'auth/updateAccessToken',
   'agent/run',
   'agent/chat',
   'run/resume',
@@ -271,6 +288,9 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
     case 'cli/commands':
       if (params && Object.keys(params).length > 0) invalidParams(`${method} does not accept params.`);
       return;
+    case 'auth/updateAccessToken':
+      requiredString(requiredParams(method, params), 'accessToken');
+      return;
     case 'initialize': {
       const value = requiredParams(method, params);
       requiredString(value, 'protocolVersion');
@@ -287,12 +307,14 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
       const value = requiredParams(method, params);
       requiredString(value, 'goal');
       optionalString(value, 'sessionId');
+      validateExecutionSelection(value);
       return;
     }
     case 'agent/chat': {
       const value = requiredParams(method, params);
       requiredString(value, 'message');
       optionalString(value, 'sessionId');
+      validateExecutionSelection(value);
       return;
     }
     case 'run/resume':
@@ -354,6 +376,25 @@ function validateRuntimeInitializeParams(value: Record<string, unknown>): void {
   optionalString(value, 'model');
   optionalEnum(value, 'approvalMode', ['auto', 'manual', 'reject']);
   optionalEnum(value, 'clarificationMode', ['interactive', 'fail']);
+  optionalEnum(value, 'inferenceMode', ['gateway', 'local', 'byok']);
+  optionalEnum(value, 'inferenceTier', ['low', 'medium', 'high', 'xtra-high']);
+  optionalProfileRef(value, 'profileRef');
+  optionalString(value, 'gatewayUrl');
+}
+
+function validateExecutionSelection(value: Record<string, unknown>): void {
+  optionalEnum(value, 'inferenceMode', ['gateway', 'local', 'byok']);
+  optionalEnum(value, 'inferenceTier', ['low', 'medium', 'high', 'xtra-high']);
+  optionalProfileRef(value, 'profileRef');
+}
+
+function optionalProfileRef(value: Record<string, unknown>, field: string): void {
+  if (value[field] === undefined) return;
+  if (!isRecord(value[field])) invalidParams(`${field} must be an object.`);
+  const ref = value[field] as Record<string, unknown>;
+  optionalEnum(ref, 'source', ['local', 'server']);
+  if (ref.source === undefined) invalidParams(`${field}.source is required.`);
+  for (const key of ['id', 'version', 'contentHash']) requiredString(ref, key);
 }
 
 function requiredParams(method: string, params: Record<string, unknown> | undefined): Record<string, unknown> {

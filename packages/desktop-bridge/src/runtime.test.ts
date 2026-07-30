@@ -23,7 +23,7 @@ async function initialize(runtime: DesktopRuntime): Promise<void> {
   }));
 }
 
-describe('desktop runtime protocol 1.10', () => {
+describe('desktop runtime protocol', () => {
   it('requires and negotiates the JSON-RPC protocol handshake', async () => {
     const { runtime } = createRuntime();
     await expect(runtime.handleRpc(request({ id: 1, method: 'runtime/info' }))).rejects.toMatchObject({
@@ -47,8 +47,44 @@ describe('desktop runtime protocol 1.10', () => {
       params: { protocolVersion: '2.0', clientInfo: { name: 'desktop' } },
     }))).rejects.toMatchObject({
       code: 'UNSUPPORTED_PROTOCOL_VERSION',
-      data: { supportedProtocolVersions: ['1.10'] },
+      data: { supportedProtocolVersions: ['1.10', '1.11'] },
     });
+  });
+
+  it('negotiates 1.11 and updates an access token without exposing it', async () => {
+    const { runtime } = createRuntime();
+    const initialized = await runtime.handleRpc(request({
+      id: 'init',
+      method: 'initialize',
+      params: { protocolVersion: '1.11', clientInfo: { name: 'swift-host' } },
+    })) as Record<string, unknown>;
+    expect(initialized).toMatchObject({
+      protocolVersion: '1.11',
+      capabilities: { methods: expect.arrayContaining(['auth/updateAccessToken']) },
+    });
+
+    await expect(runtime.handleRpc(request({
+      id: 'token',
+      method: 'auth/updateAccessToken',
+      params: { accessToken: 'swift-secret-token' },
+    }))).resolves.toEqual({ updated: true });
+    const info = await runtime.handleRpc(request({ id: 'info', method: 'runtime/info' }));
+    expect(JSON.stringify(info)).not.toContain('swift-secret-token');
+  });
+
+  it('keeps protocol 1.10 behavior and does not expose the 1.11 token method', async () => {
+    const { runtime } = createRuntime();
+    const initialized = await runtime.handleRpc(request({
+      id: 'init',
+      method: 'initialize',
+      params: { protocolVersion: '1.10', clientInfo: { name: 'legacy-host' } },
+    })) as { capabilities: { methods: string[] } };
+    expect(initialized.capabilities.methods).not.toContain('auth/updateAccessToken');
+    await expect(runtime.handleRpc(request({
+      id: 'token',
+      method: 'auth/updateAccessToken',
+      params: { accessToken: 'secret' },
+    }))).rejects.toMatchObject({ code: 'METHOD_NOT_FOUND' });
   });
 
   it('lists the complete CLI command surface and its execution restrictions', async () => {

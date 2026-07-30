@@ -13,32 +13,33 @@ object per line to stdout and reserves stderr for diagnostics. Requests may run
 concurrently, so clients must correlate responses by `id` and process
 notifications independently.
 
-The bridge currently exposes protocol `1.10` over JSON-RPC 2.0. There is no
+The bridge currently exposes protocol `1.11` over JSON-RPC 2.0 and continues
+to accept protocol `1.10`. There is no
 legacy custom-envelope compatibility: every request must use JSON-RPC,
 including before initialization.
 
-Protocol `1.10` is intentionally a string. In JSON, the numeric values `1.10`,
-and `1.1` are indistinguishable, but those are different semantic versions.
+Protocol versions are intentionally strings. In JSON, numeric values such as
+`1.10` and `1.1` are indistinguishable, but those are different semantic versions.
 
 At startup the bridge emits this JSON-RPC notification:
 
 ```json
-{"jsonrpc":"2.0","method":"runtime/ready","params":{"protocolVersion":"1.10","bridgeVersion":"0.1.0","pid":1234}}
+{"jsonrpc":"2.0","method":"runtime/ready","params":{"protocolVersion":"1.11","bridgeVersion":"0.1.0","pid":1234}}
 ```
 
-## Protocol 1.10 handshake
+## Protocol 1.11 handshake
 
 The first JSON-RPC request must negotiate the protocol. Once successful, the
 connection is sticky: subsequent input and agent events use JSON-RPC only.
 
 ```json
-{"jsonrpc":"2.0","id":"initialize","method":"initialize","params":{"protocolVersion":"1.10","clientInfo":{"name":"adaptive-agent-desktop","version":"1.0.0"},"capabilities":{}}}
+{"jsonrpc":"2.0","id":"initialize","method":"initialize","params":{"protocolVersion":"1.11","clientInfo":{"name":"adaptive-agent-desktop","version":"1.0.0"},"capabilities":{}}}
 ```
 
 The result advertises supported methods, notifications, and CLI commands:
 
 ```json
-{"jsonrpc":"2.0","id":"initialize","result":{"protocolVersion":"1.10","bridgeVersion":"0.1.0","serverInfo":{"name":"@adaptive-agent/desktop-bridge","version":"0.1.0"},"capabilities":{"methods":["initialize","runtime/initialize","runtime/info","runtime/shutdown","agent/run","agent/chat","run/resume","run/retry","run/recover","run/continue","run/interrupt","run/inspect","run/replay","run/steer","interaction/resolveApproval","interaction/resolveClarification","cli/commands","cli/execute"],"notifications":["runtime/ready","agent/event","cli/output"]}}}
+{"jsonrpc":"2.0","id":"initialize","result":{"protocolVersion":"1.11","bridgeVersion":"0.1.0","serverInfo":{"name":"@adaptive-agent/desktop-bridge","version":"0.1.0"},"capabilities":{"methods":["initialize","runtime/initialize","runtime/info","runtime/shutdown","auth/updateAccessToken","agent/run","agent/chat","run/resume","run/retry","run/recover","run/continue","run/interrupt","run/inspect","run/replay","run/steer","interaction/resolveApproval","interaction/resolveClarification","cli/commands","cli/execute"],"notifications":["runtime/ready","agent/event","cli/output"]}}}
 ```
 
 Initialize the persistent agent runtime separately. This allows setup,
@@ -46,8 +47,16 @@ inspection, and CLI commands to run without eagerly creating a model client or
 database connection.
 
 ```json
-{"jsonrpc":"2.0","id":"runtime","method":"runtime/initialize","params":{"cwd":"/workspace","agentConfigPath":"/profiles/agent.json","settingsConfigPath":"/profiles/agent.settings.json","runtimeMode":"sqlite","sqlitePath":"/workspace/runtime.sqlite","provider":"openrouter","model":"openai/gpt-5","approvalMode":"manual","clarificationMode":"interactive"}}
+{"jsonrpc":"2.0","id":"token","method":"auth/updateAccessToken","params":{"accessToken":"<access-token>"}}
+{"jsonrpc":"2.0","id":"runtime","method":"runtime/initialize","params":{"cwd":"/workspace","runtimeMode":"sqlite","sqlitePath":"/workspace/runtime.sqlite","inferenceMode":"gateway","inferenceTier":"high","gatewayUrl":"wss://gateway.example/rpc","profileRef":{"source":"server","id":"researcher","version":"1","contentHash":"sha256"},"approvalMode":"manual","clarificationMode":"interactive"}}
 ```
+
+The token is retained only in bridge memory. Replacing it retires the
+authenticated connection after active requests finish; the next request uses
+the replacement token. Remote gateway URLs must use `wss:`. Plain `ws:` is
+accepted only for loopback development servers. An `agent/run` or `agent/chat`
+`profileRef` must match the exact server profile pinned during
+`runtime/initialize`; selecting another profile requires another runtime.
 
 ## Typed JSON-RPC methods
 
@@ -58,11 +67,12 @@ steering, and in-memory run state.
 | Method | Required params | Optional params |
 | --- | --- | --- |
 | `initialize` | `protocolVersion`, `clientInfo.name` | `clientInfo.version`, `capabilities` |
-| `runtime/initialize` | - | `cwd`, `agentConfigPath`, `settingsConfigPath`, `runtimeMode`, `sqlitePath`, `provider`, `model`, `approvalMode`, `clarificationMode` |
+| `runtime/initialize` | - | `cwd`, `agentConfigPath`, `settingsConfigPath`, `runtimeMode`, `sqlitePath`, `provider`, `model`, `approvalMode`, `clarificationMode`, `inferenceMode`, `inferenceTier`, `profileRef`, `gatewayUrl` |
 | `runtime/info` | - | - |
 | `runtime/shutdown` | - | - |
-| `agent/run` | `goal` | `sessionId`, `input` |
-| `agent/chat` | `message` | `sessionId` |
+| `auth/updateAccessToken` | `accessToken` | - |
+| `agent/run` | `goal` | `sessionId`, `input`, `inferenceMode`, `inferenceTier`, `profileRef` |
+| `agent/chat` | `message` | `sessionId`, `inferenceMode`, `inferenceTier`, `profileRef` |
 | `run/resume` | `runId` | - |
 | `run/retry` | `runId` | - |
 | `run/recover` | `runId` | `strategy` (`auto`, `resume`, `retry`, `continue`), `dryRun` |
@@ -157,7 +167,7 @@ Postgres runtime for cross-process inspection and recovery.
 
 ## Errors
 
-Protocol 1.10 uses standard JSON-RPC codes and adds a stable protocol code in
+Protocol 1.11 uses standard JSON-RPC codes and adds a stable protocol code in
 `error.data.protocolCode`.
 
 | JSON-RPC code | Meaning |
@@ -181,7 +191,7 @@ ids may be strings or finite numbers and are echoed without coercion.
 ```sh
 bun run compile
 printf '%s\n' \
-  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1.10","clientInfo":{"name":"smoke"}}}' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1.11","clientInfo":{"name":"smoke"}}}' \
   '{"jsonrpc":"2.0","id":2,"method":"cli/execute","params":{"argv":["--version"]}}' \
   | dist/agent-runtime
 ```

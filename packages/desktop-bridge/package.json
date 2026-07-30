@@ -13,10 +13,13 @@
   },
   "dependencies": {
     "@adaptive-agent/agent-sdk": "workspace:*",
-    "@adaptive-agent/core": "workspace:*"
+    "@adaptive-agent/core": "workspace:*",
+    "@adaptive-agent/gateway-client": "workspace:*"
   },
   "devDependencies": {
+    "@adaptive-agent/capability-gateway": "workspace:*",
     "bun-types": "^1.3.5",
+    "jose": "^6.1.3",
     "typescript": "^5.8.3",
     "vitest": "^3.1.1"
   }

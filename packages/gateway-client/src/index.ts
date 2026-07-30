@@ -42,6 +42,7 @@ export interface WebSocketLike {
 }
 
 export type GatewayWebSocketFactory = (url: string, headers: Readonly<Record<string, string>>) => WebSocketLike;
+export type GatewayConnectionState = 'disconnected' | 'connecting' | 'connected' | 'closed';
 
 export interface GatewayClientOptions {
   url: string;
@@ -101,10 +102,12 @@ export class GatewayClient {
   private readonly factory: GatewayWebSocketFactory;
   private readonly lifetime = new AbortController();
   private initialized?: InitializeResult;
+  private credentialRefreshRequested = false;
 
   constructor(private readonly options: GatewayClientOptions) {
     const url = new URL(options.url);
     if (url.protocol !== 'ws:' && url.protocol !== 'wss:') throw new GatewayClientError('Gateway URL must use ws or wss');
+    if (url.protocol === 'ws:' && !isLoopbackHost(url.hostname)) throw new GatewayClientError('Remote gateway URLs must use wss');
     if (url.username || url.password || [...url.searchParams.keys()].some(key => /token|auth|key/i.test(key))) throw new GatewayClientError('Gateway URL must not contain credentials');
     this.connectTimeoutMs = bounded(options.connectTimeoutMs, 10_000, 100, 120_000);
     this.requestTimeoutMs = bounded(options.requestTimeoutMs, 120_000, 100, 300_000);
@@ -113,6 +116,12 @@ export class GatewayClient {
       const BunWebSocket = WebSocket as unknown as new (url: string, options: { headers: Readonly<Record<string, string>> }) => WebSocketLike;
       return new BunWebSocket(target, { headers });
     });
+  }
+
+  get connectionState(): GatewayConnectionState {
+    if (this.lifetime.signal.aborted) return 'closed';
+    if (this.socket?.readyState === 1 && this.initialized) return 'connected';
+    return this.connecting ? 'connecting' : 'disconnected';
   }
 
   async connect(): Promise<void> {
@@ -138,6 +147,24 @@ export class GatewayClient {
     this.initialized = undefined;
     socket?.close(1000, 'client closing');
     this.failAll(closedError());
+  }
+
+  /** Drops the authenticated socket so the next request obtains a fresh access token. */
+  async reconnect(): Promise<void> {
+    if (this.lifetime.signal.aborted) throw closedError();
+    await this.connecting?.catch(() => undefined);
+    if (this.lifetime.signal.aborted) throw closedError();
+    this.credentialRefreshRequested = true;
+    this.applyCredentialRefreshIfIdle();
+  }
+
+  private applyCredentialRefreshIfIdle(): void {
+    if (!this.credentialRefreshRequested || this.connecting || this.pending.size > 0 || this.streams.size > 0) return;
+    this.credentialRefreshRequested = false;
+    const socket = this.socket;
+    this.socket = undefined;
+    this.initialized = undefined;
+    socket?.close(1000, 'credentials updated');
   }
 
   async authorizeRun(params: RunAuthorizeParams): Promise<RunAuthorizeResult> { return this.request('run/authorize', params); }
@@ -230,7 +257,11 @@ export class GatewayClient {
       try { state.validator.assertTerminal(); } catch (error) { throw new GatewayProtocolError('incomplete model stream', error); }
       if (result.callId !== params.invocation.callId) throw new GatewayProtocolError('terminal response callId changed');
       return result;
-    } finally { signal?.removeEventListener('abort', abort); this.streams.delete(params.invocation.callId); }
+    } finally {
+      signal?.removeEventListener('abort', abort);
+      this.streams.delete(params.invocation.callId);
+      this.applyCredentialRefreshIfIdle();
+    }
   }
 
   private async openAndInitialize(): Promise<void> {
@@ -266,9 +297,19 @@ export class GatewayClient {
     if (!ws || ws.readyState !== 1) return Promise.reject(new GatewayTransportError());
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.pending.delete(id); reject(new GatewayTimeoutError()); }, this.requestTimeoutMs);
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        this.applyCredentialRefreshIfIdle();
+        reject(new GatewayTimeoutError());
+      }, this.requestTimeoutMs);
       this.pending.set(id, { method, resolve: resolve as (value: unknown) => void, reject, timer });
-      try { ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params })); } catch (error) { clearTimeout(timer); this.pending.delete(id); reject(new GatewayTransportError(undefined, error)); }
+      try { ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params })); }
+      catch (error) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        this.applyCredentialRefreshIfIdle();
+        reject(new GatewayTransportError(undefined, error));
+      }
     });
   }
 
@@ -283,11 +324,13 @@ export class GatewayClient {
       const timer = setTimeout(() => {
         cleanup();
         this.pending.delete(id);
+        this.applyCredentialRefreshIfIdle();
         reject(new GatewayTimeoutError());
       }, this.requestTimeoutMs);
       const abort = () => {
         clearTimeout(timer);
         this.pending.delete(id);
+        this.applyCredentialRefreshIfIdle();
         cleanup();
         reject(abortError());
       };
@@ -299,7 +342,13 @@ export class GatewayClient {
         timer,
       });
       try { ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params })); }
-      catch (error) { clearTimeout(timer); this.pending.delete(id); cleanup(); reject(new GatewayTransportError(undefined, error)); }
+      catch (error) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        this.applyCredentialRefreshIfIdle();
+        cleanup();
+        reject(new GatewayTransportError(undefined, error));
+      }
     });
   }
 
@@ -343,6 +392,7 @@ export class GatewayClient {
       if ('error' in response) pending.reject(response.error.data ? fromPublicError(response.error.data) : new GatewayResponseError('unknown', false));
       else pending.resolve(response.result);
     } catch (error) { pending.reject(new GatewayProtocolError((error as Error).message, error)); }
+    this.applyCredentialRefreshIfIdle();
   }
 
   private onDisconnect(socket: WebSocketLike): void {
@@ -350,6 +400,7 @@ export class GatewayClient {
     this.socket = undefined;
     this.initialized = undefined;
     this.failAll(new GatewayTransportError('Gateway network connection closed'));
+    this.applyCredentialRefreshIfIdle();
   }
   private failStreams(error: unknown): void { for (const state of this.streams.values()) state.reject(error); }
   private failAll(error: unknown): void { for (const item of this.pending.values()) { clearTimeout(item.timer); item.reject(error); } this.pending.clear(); this.failStreams(error); }
@@ -517,3 +568,4 @@ function safeErrorMessage(code: PublicGatewayErrorCode | 'unknown'): string {
 }
 function statusFor(code: PublicGatewayErrorCode | 'unknown'): number { if (code === 'rate_limited' || code === 'quota_exceeded') return 429; if (code === 'provider_timeout') return 524; if (code === 'unauthenticated' || code === 'token_expired') return 401; if (code === 'forbidden' || code === 'tier_not_entitled' || code === 'capability_not_entitled') return 403; if (code === 'provider_unavailable' || code === 'internal_error') return 503; return 400; }
 function authorizationExpired(expiresAt: string): boolean { const expiration = Date.parse(expiresAt); return Number.isFinite(expiration) && expiration <= Date.now(); }
+function isLoopbackHost(hostname: string): boolean { return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]' || hostname === '::1'; }
