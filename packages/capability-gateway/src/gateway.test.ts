@@ -35,6 +35,10 @@ import {
   validateRoutePolicy,
 } from './route-policy.js';
 import {
+  RemoteToolRegistry,
+  type RemoteToolProvider,
+} from './remote-tools.js';
+import {
   startGatewayServer,
   type GatewayServer,
   type GatewayServerOptions,
@@ -441,6 +445,84 @@ describe('routing service', () => {
 });
 
 describe('Bun WebSocket gateway', () => {
+  test('advertises and executes an idempotent remote tool over JSON-RPC', async () => {
+    let providerCalls = 0;
+    const remoteTools = await RemoteToolRegistry.create({
+      tools: [{
+        name: 'web_search@1',
+        provider: 'brave',
+        apiKeyEnv: 'SEARCH_KEY',
+      }],
+    }, { SEARCH_KEY: 'server-owned-secret' }, (config): RemoteToolProvider => ({
+      provider: config.provider,
+      operation: config.name,
+      async execute() {
+        providerCalls += 1;
+        return {
+          output: {
+            query: 'gateway search',
+            results: [{
+              title: 'Gateway result',
+              url: 'https://example.test/result',
+              snippet: 'Result content',
+            }],
+          },
+          units: 1,
+          cost: 0.01,
+          providerRequestId: 'provider-request-1',
+        };
+      },
+    }));
+    const billing = new InMemoryBillingStore();
+    const target = { provider: 'ollama', model: 'stub-model', maxConcurrency: 4 } as const;
+    const { server, token } = await integrationGateway(
+      providerAdapter(target, async () => providerResponse(target, 'unused')),
+      billing,
+      {},
+      remoteTools,
+    );
+    const client = await RpcClient.connect(server.url, token);
+    try {
+      const initialized = validateRpcResponse('initialize', await client.request('initialize', {
+        protocolVersion: '1.0',
+        clientName: 'gateway-tool-test',
+        clientVersion: '0.1.0',
+      }));
+      expect('result' in initialized && initialized.result.remoteTools).toEqual([
+        { name: 'web_search', schemaVersion: '1' },
+      ]);
+      const permit = await authorize(client);
+      expect(permit.remoteCapabilities).toContain('web_search@1');
+      const params = {
+        permitId: permit.permitId,
+        idempotencyKey: 'wss-tool-key',
+        toolName: 'web_search@1',
+        input: { query: 'gateway search' },
+      };
+
+      const first = validateRpcResponse(
+        'tool/execute',
+        await client.request('tool/execute', params),
+      );
+      const replay = validateRpcResponse(
+        'tool/execute',
+        await client.request('tool/execute', params),
+      );
+
+      expect('result' in first && first.result).toMatchObject({
+        output: { query: 'gateway search' },
+        providerRequestId: 'provider-request-1',
+        diagnostics: { provider: 'brave', operation: 'web_search@1' },
+      });
+      expect('result' in replay && replay.result.cacheHit).toBe(true);
+      expect(providerCalls).toBe(1);
+      expect(billing.records.size).toBe(1);
+    } finally {
+      client.close();
+      await server.stop({ gracePeriodMs: 100 });
+    }
+  });
+
   test('authenticates, initializes, authorizes, streams, responds, and bills once', async () => {
     let providerCalls = 0;
     const billing = new InMemoryBillingStore();
@@ -746,6 +828,7 @@ async function integrationGateway(
   adapter: ProviderAdapter,
   billing: InMemoryBillingStore,
   serverOptions: Partial<GatewayServerOptions> = {},
+  remoteTools?: RemoteToolRegistry,
 ): Promise<{ server: GatewayServer; token: string }> {
   const policy = validateRoutePolicy(testPolicy([{
     provider: adapter.provider as RouteTarget['provider'],
@@ -756,6 +839,7 @@ async function integrationGateway(
     routePolicy: policy,
     billingStore: billing,
     adapterFactory: () => adapter,
+    remoteTools,
   });
   const server = startGatewayServer({
     authenticator: createJwtAuthenticator({

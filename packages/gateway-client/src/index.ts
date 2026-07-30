@@ -8,6 +8,7 @@ import {
   PROTOCOL_VERSION,
   StreamSequenceValidator,
   validateModelStreamNotification,
+  validateDeclarativeProfileBundle,
   validateRpcResponse,
   type GatewayRequestMethod,
   type InferenceMode,
@@ -19,14 +20,19 @@ import {
   type ModelGenerateParams,
   type ModelGenerateResult,
   type ModelStreamEnvelope,
+  type DeclarativeProfileBundle,
+  type ProfileSummary,
   type ProfileRef,
   type PublicGatewayError,
   type PublicGatewayErrorCode,
   type RunAuthorizeParams,
   type RunAuthorizeResult,
+  type ToolExecuteParams,
+  type ToolExecuteResult,
 } from '@adaptive-agent/gateway-protocol';
 
-export type { InferenceMode, InferenceTier, ProfileRef, PublicGatewayError, PublicGatewayErrorCode, RunAuthorizeParams, RunAuthorizeResult, ModelGenerateParams, ModelGenerateResult };
+export type { DeclarativeProfileBundle, ProfileSummary, InferenceMode, InferenceTier, ProfileRef, PublicGatewayError, PublicGatewayErrorCode, RunAuthorizeParams, RunAuthorizeResult, ModelGenerateParams, ModelGenerateResult, ToolExecuteParams, ToolExecuteResult };
+export { validateDeclarativeProfileBundle };
 
 export interface WebSocketLike {
   readonly readyState: number;
@@ -136,6 +142,38 @@ export class GatewayClient {
 
   async authorizeRun(params: RunAuthorizeParams): Promise<RunAuthorizeResult> { return this.request('run/authorize', params); }
 
+  async listProfiles(schemaVersion?: string): Promise<ProfileSummary[]> {
+    return (await this.request('profile/list', schemaVersion ? { schemaVersion } : {})).profiles;
+  }
+
+  async getProfile(ref: ProfileRef): Promise<DeclarativeProfileBundle> {
+    return (await this.request('profile/get', { ref })).bundle;
+  }
+
+  async executeTool(params: ToolExecuteParams, options: { signal?: AbortSignal } = {}): Promise<ToolExecuteResult> {
+    let last: unknown;
+    for (let attempt = 0; attempt <= this.reconnectAttempts; attempt++) {
+      if (options.signal?.aborted) throw abortError();
+      try {
+        await waitForConnection(this.connect(), options.signal);
+        return await this.requestRawWithSignal('tool/execute', params, options.signal);
+      } catch (error) {
+        last = error;
+        if (options.signal?.aborted || error instanceof GatewayTimeoutError) {
+          void this.requestRaw('request/cancel', { idempotencyKey: params.idempotencyKey }).catch(() => undefined);
+          throw options.signal?.aborted ? abortError() : error;
+        }
+        if (!(error instanceof GatewayTransportError) || attempt === this.reconnectAttempts) throw error;
+        const socket = this.socket;
+        this.socket = undefined;
+        this.initialized = undefined;
+        this.failAll(error);
+        socket?.close(1012, 'reconnecting');
+      }
+    }
+    throw last;
+  }
+
   async generateModel(params: ModelGenerateParams, options: { signal?: AbortSignal } = {}): Promise<ModelGenerateResult> {
     let last: unknown;
     for (let attempt = 0; attempt <= this.reconnectAttempts; attempt++) {
@@ -231,6 +269,37 @@ export class GatewayClient {
       const timer = setTimeout(() => { this.pending.delete(id); reject(new GatewayTimeoutError()); }, this.requestTimeoutMs);
       this.pending.set(id, { method, resolve: resolve as (value: unknown) => void, reject, timer });
       try { ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params })); } catch (error) { clearTimeout(timer); this.pending.delete(id); reject(new GatewayTransportError(undefined, error)); }
+    });
+  }
+
+  private requestRawWithSignal<M extends GatewayRequestMethod>(method: M, params: MethodParams[M], signal?: AbortSignal): Promise<MethodResults[M]> {
+    if (!signal) return this.requestRaw(method, params);
+    const ws = this.socket;
+    if (!ws || ws.readyState !== 1) return Promise.reject(new GatewayTransportError());
+    if (signal.aborted) return Promise.reject(abortError());
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      const cleanup = () => signal.removeEventListener('abort', abort);
+      const timer = setTimeout(() => {
+        cleanup();
+        this.pending.delete(id);
+        reject(new GatewayTimeoutError());
+      }, this.requestTimeoutMs);
+      const abort = () => {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        cleanup();
+        reject(abortError());
+      };
+      signal.addEventListener('abort', abort, { once: true });
+      this.pending.set(id, {
+        method,
+        resolve: (value) => { cleanup(); resolve(value as MethodResults[M]); },
+        reject: (error) => { cleanup(); reject(error); },
+        timer,
+      });
+      try { ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params })); }
+      catch (error) { clearTimeout(timer); this.pending.delete(id); cleanup(); reject(new GatewayTransportError(undefined, error)); }
     });
   }
 

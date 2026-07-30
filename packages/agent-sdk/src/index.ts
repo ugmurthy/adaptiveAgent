@@ -45,12 +45,15 @@ import { groundTruthSystemInstructions, mergeGroundTruthContext } from './ground
 import { resolveRuntimeBundle } from './postgres-runtime.js';
 import { discoverCatalogAgents, discoverCatalogDelegates, resolveToolsAndDelegates } from './tool-registry.js';
 import { mergeMetadata, normalizeRecovery, promptText, promptYesNo } from './sdk-utils.js';
+import { resolveServerProfile } from './server-profiles.js';
 
 export * from './config-types.js';
 export * from './errors.js';
 export * from './ambient.js';
 export * from './swarm-sdk.js';
 export * from './context-bundles.js';
+export * from './server-profiles.js';
+export { createGatewayProxyTool, type GatewayProxyToolFactoryOptions, type GatewayRemoteToolName } from './gateway-tools.js';
 export { buildGroundTruthContext, mergeGroundTruthContext } from './ground-truth-context.js';
 export { expandEnvironmentVariables } from './sdk-utils.js';
 export { createOrchestrationSdk, OrchestrationSdk } from './orchestration.js';
@@ -103,6 +106,7 @@ export class AgentSdk {
   }
 
   static async create(options: AgentSdkOptions = {}): Promise<AgentSdk> {
+    options = await resolveServerProfileOptions(options);
     const config = await resolveAgentSdkConfig(options);
     const runtime = options.runtime
       ? { mode: config.runtime.mode, runtime: options.runtime }
@@ -112,10 +116,6 @@ export class AgentSdk {
           options.env,
           config.runtime.sqlitePath,
         );
-    const modules = await resolveToolsAndDelegates(config, options);
-    const logger = options.logger ?? (config.logging.enabled ? createAdaptiveAgentLogger(config.logging) : undefined);
-    const metadata: JsonObject = { agentId: config.agent.id, agentName: config.agent.name, runtimeMode: config.runtime.mode, ...(config.agent.metadata ?? {}) };
-    let model: ModelAdapter | ResolvedAgentSdkConfig['model'] = options.modelAdapter ?? config.model;
     let gateway: AgentSdk['gateway'];
     if (config.inference.mode === 'gateway') {
       const client = options.gatewayClient ?? createGatewayClient(config, options);
@@ -125,8 +125,12 @@ export class AgentSdk {
         profileRefs: structuredClone(options.profileRefs ?? []),
         owned: !options.gatewayClient,
       };
-      model = options.modelAdapter ?? new GatewayModelAdapter({ client, defaultTier: config.inference.tier });
     }
+    const modules = await resolveToolsAndDelegates(config, options, gateway?.client);
+    const logger = options.logger ?? (config.logging.enabled ? createAdaptiveAgentLogger(config.logging) : undefined);
+    const metadata: JsonObject = { agentId: config.agent.id, agentName: config.agent.name, runtimeMode: config.runtime.mode, ...(config.agent.metadata ?? {}) };
+    let model: ModelAdapter | ResolvedAgentSdkConfig['model'] = options.modelAdapter ?? config.model;
+    if (gateway) model = options.modelAdapter ?? new GatewayModelAdapter({ client: gateway.client, defaultTier: config.inference.tier });
     const created = createAdaptiveAgent({
       model,
       tools: modules.tools,
@@ -310,17 +314,42 @@ function withoutGatewayExecutionFields(context: JsonObject | undefined): JsonObj
     'authorizationRunId',
     'routePolicyRef',
     'profileRefs',
+    'remoteCapabilities',
+    'capabilityPermit',
   ]) {
     delete result[key];
   }
   return result;
 }
 
+async function resolveServerProfileOptions(options: AgentSdkOptions): Promise<AgentSdkOptions> {
+  const selection = options.serverProfile ?? (
+    options.agentConfigPath?.startsWith('server:') ? options.agentConfigPath : undefined
+  );
+  if (!selection) return options;
+  const resolved = await resolveServerProfile(selection, {
+    client: options.gatewayClient,
+    cachePath: options.profileCachePath,
+    env: options.env,
+  });
+  return {
+    ...options,
+    agentConfig: resolved.agentConfig,
+    agentConfigPath: undefined,
+    inferenceMode: 'gateway',
+    profileRefs: [resolved.ref],
+    delegates: [...resolved.delegates, ...(options.delegates ?? [])],
+  };
+}
+
 export async function loadAgentSdkConfig(options: AgentSdkOptions = {}): Promise<ResolvedAgentSdkConfig> { return resolveAgentSdkConfig(options); }
 
 export async function inspectAgentSdkResolution(options: AgentSdkOptions = {}): Promise<ResolvedAgentSdkModuleInspection> {
   const config = await resolveAgentSdkConfig(options);
-  const modules = await resolveToolsAndDelegates(config, options);
+  const client = config.inference.mode === 'gateway' && config.gateway.remoteTools.length
+    ? options.gatewayClient ?? createGatewayClient(config, options)
+    : undefined;
+  const modules = await resolveToolsAndDelegates(config, options, client);
   const registeredTools = modules.registeredTools.map(pickToolInspectionFields);
   return {
     config,
@@ -337,7 +366,10 @@ export async function inspectAgentSdkResolution(options: AgentSdkOptions = {}): 
 
 export async function inspectAgentSdkCatalog(options: AgentSdkOptions = {}): Promise<AgentSdkCatalogInspection> {
   const resolved = await resolveAgentSdkConfigWithSources(options);
-  const modules = await resolveToolsAndDelegates(resolved.config, options);
+  const client = resolved.config.inference.mode === 'gateway' && resolved.config.gateway.remoteTools.length
+    ? options.gatewayClient ?? createGatewayClient(resolved.config, options)
+    : undefined;
+  const modules = await resolveToolsAndDelegates(resolved.config, options, client);
   const configuredToolNames = new Set(resolved.config.agent.tools);
   const configuredDelegateNames = new Set(resolved.config.agent.delegates ?? []);
 

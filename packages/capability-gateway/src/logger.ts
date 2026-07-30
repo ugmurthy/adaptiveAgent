@@ -7,6 +7,8 @@ export interface GatewayLogFields {
   tenantId?: string;
   method?: string;
   callId?: string;
+  idempotencyKey?: string;
+  toolName?: string;
   tier?: string;
   routePolicyVersion?: string;
   routeIndex?: number;
@@ -33,6 +35,8 @@ export function createMetadataLogger(
         'tenantId',
         'method',
         'callId',
+        'idempotencyKey',
+        'toolName',
         'tier',
         'routePolicyVersion',
         'routeIndex',

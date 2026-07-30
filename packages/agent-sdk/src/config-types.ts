@@ -26,6 +26,7 @@ import type {
   InferenceTier,
   ProfileRef,
 } from '@adaptive-agent/gateway-client';
+import type { GatewayRemoteToolName } from './gateway-tools.js';
 
 export type { InferenceMode, InferenceTier, ProfileRef } from '@adaptive-agent/gateway-client';
 
@@ -111,6 +112,7 @@ export interface AgentSettingsFile {
     connectTimeoutMs?: number;
     requestTimeoutMs?: number;
     reconnectAttempts?: number;
+    remoteTools?: GatewayRemoteToolName[];
   };
   defaults?: Partial<AgentDefaults>;
   env?: Record<string, string>;
@@ -133,6 +135,7 @@ export interface ResolvedAgentSdkConfig {
     connectTimeoutMs?: number;
     requestTimeoutMs?: number;
     reconnectAttempts?: number;
+    remoteTools: GatewayRemoteToolName[];
   };
   runtime: { requestedMode: RuntimeMode; mode: RuntimeMode; autoMigrate: boolean; sqlitePath?: string };
   logging: { enabled: boolean; level: LogLevel; destination: LogDestination; filePath?: string; pretty: boolean };
@@ -202,9 +205,11 @@ export interface AgentSdkOptions {
   modelAdapter?: ModelAdapter;
   inferenceMode?: InferenceMode;
   inferenceTier?: InferenceTier;
+  serverProfile?: string | ProfileRef;
+  profileCachePath?: string;
   profileRefs?: ProfileRef[];
   gatewayClient?: GatewayClient;
-  gateway?: Partial<Pick<GatewayClientOptions, 'url' | 'clientName' | 'clientVersion' | 'connectTimeoutMs' | 'requestTimeoutMs' | 'reconnectAttempts'>>;
+  gateway?: Partial<Pick<GatewayClientOptions, 'url' | 'clientName' | 'clientVersion' | 'connectTimeoutMs' | 'requestTimeoutMs' | 'reconnectAttempts'>> & { remoteTools?: GatewayRemoteToolName[] };
   accessToken?: GatewayClientOptions['accessToken'];
   runtimeMode?: RuntimeMode;
   sqlitePath?: string;

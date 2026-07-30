@@ -26,24 +26,34 @@ import type {
   AgentSdkOptions,
   ResolvedAgentSdkConfig,
 } from './config-types.js';
+import type { GatewayClient } from '@adaptive-agent/gateway-client';
+import { createGatewayProxyTool } from './gateway-tools.js';
 import { validateAgent } from './config-validate.js';
 import { expandStrings, parseNonNegativeNumber, parsePositiveInteger, pathExists, readJson } from './sdk-utils.js';
 
 const DEFAULT_MODULE_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
 
-export async function resolveToolsAndDelegates(config: ResolvedAgentSdkConfig, options: AgentSdkOptions): Promise<{ tools: Array<ToolDefinition<any, any>>; delegates: DelegateDefinition[]; registeredTools: Array<ToolDefinition<any, any>>; registeredToolNames: string[] }> {
+export async function resolveToolsAndDelegates(config: ResolvedAgentSdkConfig, options: AgentSdkOptions, gatewayClient?: GatewayClient): Promise<{ tools: Array<ToolDefinition<any, any>>; delegates: DelegateDefinition[]; registeredTools: Array<ToolDefinition<any, any>>; registeredToolNames: string[] }> {
   process.env.ADAPTIVE_AGENT_MODULE_ROOT ??= DEFAULT_MODULE_ROOT;
 
   const env = { ...(options.env ?? process.env), ...(config.settings.env ?? {}) };
   const builtins = createBuiltinTools(config.workspaceRoot, config.shellCwd, env);
+  const gatewayTools = new Map<string, ToolDefinition<any, any>>();
+  if (config.inference.mode === 'gateway' && gatewayClient) {
+    for (const toolName of config.gateway.remoteTools) gatewayTools.set(toolName, createGatewayProxyTool({ client: gatewayClient, toolName }));
+  }
   const providedTools = new Map((options.tools ?? []).map((tool) => [tool.name, tool]));
-  const registry = new Map([...builtins, ...providedTools]);
+  const registry = new Map([...builtins, ...gatewayTools, ...providedTools]);
   const registeredToolNames = [...registry.keys()].sort();
   const registeredTools = registeredToolNames.map((toolName) => registry.get(toolName)!);
   const missing = config.agent.tools.filter((name) => !registry.has(name));
   if (missing.length) throw new Error(`Unknown tool reference(s): ${missing.join(', ')}. Registered tools: ${registeredToolNames.join(', ') || '(none)'}.`);
   const tools = config.agent.tools.map((name) => registry.get(name)!);
   const delegates = [...(options.delegates ?? []), ...(await loadDelegates(config.agent.delegates ?? [], config.skills.dirs, new Set(tools.map((tool) => tool.name))))];
+  for (const delegate of delegates) {
+    const unavailable = delegate.allowedTools.filter((name) => !registry.has(name));
+    if (unavailable.length) throw new Error(`Delegate "${delegate.name}" requires unavailable tool(s): ${unavailable.join(', ')}.`);
+  }
   return { tools, delegates, registeredTools, registeredToolNames };
 }
 

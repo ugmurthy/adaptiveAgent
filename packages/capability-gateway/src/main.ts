@@ -9,6 +9,8 @@ import {
   type RoutePolicy,
 } from './route-policy.js';
 import { startGatewayServer } from './server.js';
+import { RemoteToolRegistry, type RemoteToolPolicy } from './remote-tools.js';
+import { ProfileRegistry } from './profile-registry.js';
 
 async function main(): Promise<void> {
   const env = process.env;
@@ -18,6 +20,13 @@ async function main(): Promise<void> {
     'GATEWAY_ROUTE_POLICY_PATH',
   ));
   assertRoutePolicyEnvironment(routePolicy, env);
+  const remoteToolPolicy = env.GATEWAY_REMOTE_TOOL_POLICY_PATH
+    ? await Bun.file(env.GATEWAY_REMOTE_TOOL_POLICY_PATH).json() as RemoteToolPolicy
+    : undefined;
+  const remoteTools = await RemoteToolRegistry.create(remoteToolPolicy, env);
+  const profileRegistry = env.GATEWAY_PROFILE_MANIFEST_PATH
+    ? await ProfileRegistry.load(env.GATEWAY_PROFILE_MANIFEST_PATH, remoteTools)
+    : new ProfileRegistry();
   const shutdownGraceMs = positiveInteger(
     env.GATEWAY_SHUTDOWN_GRACE_MS,
     defaultShutdownGraceMs(routePolicy),
@@ -35,6 +44,8 @@ async function main(): Promise<void> {
       routePolicy,
       billingStore: new PostgresBillingStore(pool, true),
       logger,
+      remoteTools,
+      profileRegistry,
       serverVersion: '0.1.0',
     });
     const server = startGatewayServer({

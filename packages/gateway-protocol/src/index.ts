@@ -257,6 +257,12 @@ export interface ToolExecuteResult {
   };
   providerRequestId?: string;
   cacheHit?: boolean;
+  diagnostics?: {
+    provider: string;
+    operation: string;
+    durationMs: number;
+    traceId: string;
+  };
 }
 
 export interface RequestCancelParams {
@@ -985,7 +991,7 @@ function validateModelGenerateResult(value: unknown): void {
 
 function validateToolExecuteResult(value: unknown): void {
   const result = record(value, 'result');
-  exactKeys(result, ['idempotencyKey', 'output', 'usage', 'providerRequestId', 'cacheHit'], 'result');
+  exactKeys(result, ['idempotencyKey', 'output', 'usage', 'providerRequestId', 'cacheHit', 'diagnostics'], 'result');
   boundedString(result.idempotencyKey, 'result.idempotencyKey');
   validateJsonValue(result.output, 'result.output');
   if (result.usage !== undefined) {
@@ -1001,6 +1007,14 @@ function validateToolExecuteResult(value: unknown): void {
   }
   if (result.cacheHit !== undefined) {
     boolean(result.cacheHit, 'result.cacheHit');
+  }
+  if (result.diagnostics !== undefined) {
+    const diagnostics = record(result.diagnostics, 'result.diagnostics');
+    exactKeys(diagnostics, ['provider', 'operation', 'durationMs', 'traceId'], 'result.diagnostics');
+    boundedString(diagnostics.provider, 'result.diagnostics.provider');
+    boundedString(diagnostics.operation, 'result.diagnostics.operation');
+    finiteNumber(diagnostics.durationMs, 'result.diagnostics.durationMs', 0);
+    boundedString(diagnostics.traceId, 'result.diagnostics.traceId');
   }
 }
 

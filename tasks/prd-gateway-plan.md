@@ -942,10 +942,10 @@ executing server-delivered handlers.
 
 **Acceptance criteria:**
 
-- [ ] A handler in any transitive delegate rejects the entire bundle.
-- [ ] Content-hash mismatch prevents distribution.
-- [ ] Responses contain no server paths or secrets.
-- [ ] Unauthorized profiles are non-enumerable.
+- [x] A handler in any transitive delegate rejects the entire bundle.
+- [x] Content-hash mismatch prevents distribution.
+- [x] Responses contain no server paths or secrets.
+- [x] Unauthorized profiles are non-enumerable.
 
 #### US-014: Add Agent SDK server profile resolver and cache
 
@@ -959,10 +959,10 @@ executing server-delivered handlers.
 
 **Acceptance criteria:**
 
-- [ ] Ambiguous unqualified local/server IDs are rejected.
-- [ ] A cached pinned profile can resume while the gateway is unavailable.
-- [ ] A newer server version is not silently substituted during resume.
-- [ ] Server profiles cannot install or invoke downloaded code.
+- [x] Ambiguous unqualified local/server IDs are rejected.
+- [x] A cached pinned profile can resume while the gateway is unavailable.
+- [x] A newer server version is not silently substituted during resume.
+- [x] Server profiles cannot install or invoke downloaded code.
 
 ### Phase 7: Integrate the local desktop bridge and Swift host
 

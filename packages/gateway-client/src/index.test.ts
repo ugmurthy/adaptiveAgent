@@ -261,6 +261,94 @@ describe('gateway client transport', () => {
     expect(connections).toBe(1);
     client.close();
   });
+
+  test('forwards tool identity and idempotency and cancels with the tool key on abort', async () => {
+    let toolRequest: JsonRpcRequest<'tool/execute'> | undefined;
+    let cancelledKey: string | undefined;
+    const started = deferred<void>();
+    const { client } = fakeClient((request, socket) => {
+      if (respondToSetup(request, socket)) return;
+      if (request.method === 'tool/execute') {
+        toolRequest = request;
+        started.resolve();
+        return;
+      }
+      if (request.method === 'request/cancel') {
+        cancelledKey = request.params.idempotencyKey;
+        socket.serverMessage({
+          jsonrpc: '2.0',
+          id: request.id,
+          result: { cancelled: true },
+        });
+      }
+    });
+    const controller = new AbortController();
+    const execution = client.executeTool({
+      permitId: 'permit-tool',
+      idempotencyKey: 'run:step:tool',
+      toolName: 'web_search@1',
+      input: { query: 'current status' },
+      timeoutMs: 90_000,
+    }, { signal: controller.signal });
+    await started.promise;
+
+    controller.abort();
+
+    await expect(execution).rejects.toMatchObject({ name: 'AbortError' });
+    expect(toolRequest?.params).toEqual({
+      permitId: 'permit-tool',
+      idempotencyKey: 'run:step:tool',
+      toolName: 'web_search@1',
+      input: { query: 'current status' },
+      timeoutMs: 90_000,
+    });
+    expect(cancelledKey).toBe('run:step:tool');
+    client.close();
+  });
+
+  test('reconnects tool execution with the original idempotency key', async () => {
+    let connection = 0;
+    const keys: string[] = [];
+    const { client } = fakeClient((request, socket) => {
+      if (respondToSetup(request, socket)) return;
+      if (request.method !== 'tool/execute') return;
+      keys.push(request.params.idempotencyKey);
+      if (connection === 1) {
+        socket.disconnect();
+        return;
+      }
+      socket.serverMessage({
+        jsonrpc: '2.0',
+        id: request.id,
+        result: {
+          idempotencyKey: request.params.idempotencyKey,
+          output: { query: 'reconnected', results: [] },
+          usage: { units: 1, cost: 0.01 },
+          diagnostics: {
+            provider: 'brave',
+            operation: 'web_search@1',
+            durationMs: 5,
+            traceId: 'trace-tool',
+          },
+        },
+      });
+    }, {
+      onCreate() { connection += 1; },
+    });
+
+    await expect(client.executeTool({
+      permitId: 'permit-tool',
+      idempotencyKey: 'stable-tool-key',
+      toolName: 'web_search@1',
+      input: { query: 'reconnected' },
+    })).resolves.toMatchObject({
+      idempotencyKey: 'stable-tool-key',
+      output: { query: 'reconnected', results: [] },
+    });
+    expect(keys).toEqual(['stable-tool-key', 'stable-tool-key']);
+    expect(connection).toBe(2);
+    client.close();
+  });
 });
 
 describe('gateway model adapter', () => {

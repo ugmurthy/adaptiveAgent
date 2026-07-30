@@ -13,10 +13,10 @@ export interface BillingRecord {
   tenantId: string;
   subject: string;
   permitId: string;
-  capability: 'model/generate';
+  capability: 'model/generate' | 'web_search@1' | 'read_web_page@1';
   callId: string;
   requestHash: string;
-  requestedTier: InferenceTier;
+  requestedTier?: InferenceTier;
   routePolicyVersion: string;
   selectedRouteIndex?: number;
   provider?: string;
@@ -24,6 +24,7 @@ export interface BillingRecord {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
+  units?: number;
   cost: number;
   status: BillingStatus;
   createdAt: string;
@@ -44,7 +45,16 @@ export class InMemoryBillingStore implements BillingStore {
 
   async begin(record: BillingRecord): Promise<boolean> {
     const key = billingKey(record.accountId, record.callId);
-    if (this.records.has(key)) return false;
+    const existing = this.records.get(key);
+    if (existing) {
+      if (
+        existing.requestHash !== record.requestHash ||
+        existing.capability !== record.capability ||
+        (existing.status !== 'failed' && existing.status !== 'cancelled')
+      ) {
+        return false;
+      }
+    }
     this.records.set(key, structuredClone(record));
     return true;
   }
@@ -87,7 +97,7 @@ export class InMemoryBillingStore implements BillingStore {
     return {
       items: page.map((record) => ({
         capability: record.capability,
-        units: record.totalTokens,
+        units: record.units ?? record.totalTokens,
         cost: record.cost,
         occurredAt: record.updatedAt,
       })),
@@ -109,15 +119,34 @@ export const BILLING_INSERT_SQL = `
 insert into capability_gateway_billing (
   account_id, tenant_id, subject_id, permit_id, capability, call_id,
   request_hash, requested_tier, route_policy_version, selected_route_index,
-  provider, model, input_tokens, output_tokens, total_tokens, cost,
+  provider, model, input_tokens, output_tokens, total_tokens, units, cost,
   status, created_at, updated_at, completed_at
 ) values (
   $1, $2, $3, $4, $5, $6,
   $7, $8, $9, $10,
-  $11, $12, $13, $14, $15, $16,
-  $17, $18, $19, $20
+  $11, $12, $13, $14, $15, $16, $17,
+  $18, $19, $20, $21
 )
-on conflict (account_id, call_id) do nothing
+on conflict (account_id, call_id) do update
+set tenant_id = excluded.tenant_id,
+    subject_id = excluded.subject_id,
+    permit_id = excluded.permit_id,
+    requested_tier = excluded.requested_tier,
+    route_policy_version = excluded.route_policy_version,
+    selected_route_index = null,
+    provider = excluded.provider,
+    model = excluded.model,
+    input_tokens = 0,
+    output_tokens = 0,
+    total_tokens = 0,
+    units = 0,
+    cost = 0,
+    status = 'active',
+    updated_at = excluded.updated_at,
+    completed_at = null
+where capability_gateway_billing.capability = excluded.capability
+  and capability_gateway_billing.request_hash = excluded.request_hash
+  and capability_gateway_billing.status in ('failed', 'cancelled')
 returning account_id
 `;
 
@@ -129,10 +158,11 @@ set selected_route_index = $4,
     input_tokens = $7,
     output_tokens = $8,
     total_tokens = $9,
-    cost = $10,
-    status = $11,
-    updated_at = $12,
-    completed_at = $13
+    units = $10,
+    cost = $11,
+    status = $12,
+    updated_at = $13,
+    completed_at = $14
 where account_id = $1
   and call_id = $2
   and request_hash = $3
@@ -177,7 +207,7 @@ export class PostgresBillingStore implements BillingStore {
     const offset = parseCursor(params.cursor);
     const limit = params.limit ?? 100;
     const result = await this.db.query(`
-      select capability, total_tokens, cost, updated_at
+      select capability, units, cost, updated_at
       from capability_gateway_billing
       where account_id = $1
         and status = 'completed'
@@ -189,7 +219,7 @@ export class PostgresBillingStore implements BillingStore {
     return {
       items: rows.map((row) => ({
         capability: String(row.capability),
-        units: Number(row.total_tokens),
+        units: Number(row.units),
         cost: Number(row.cost),
         occurredAt: toIso(row.updated_at),
       })),
@@ -205,6 +235,8 @@ export class PostgresBillingStore implements BillingStore {
 export async function runBillingMigration(db: Pick<Pool | PoolClient, 'query'>): Promise<void> {
   const sql = await Bun.file(new URL('../migrations/001_capability_gateway_billing.sql', import.meta.url)).text();
   await db.query(sql);
+  const extension = await Bun.file(new URL('../migrations/002_remote_tool_billing.sql', import.meta.url)).text();
+  await db.query(extension);
 }
 
 export function billingInsertParameters(record: BillingRecord): unknown[] {
@@ -224,6 +256,7 @@ export function billingInsertParameters(record: BillingRecord): unknown[] {
     record.inputTokens,
     record.outputTokens,
     record.totalTokens,
+    record.units ?? record.totalTokens,
     record.cost,
     record.status,
     record.createdAt,
@@ -243,6 +276,7 @@ export function billingFinishParameters(record: BillingRecord): unknown[] {
     record.inputTokens,
     record.outputTokens,
     record.totalTokens,
+    record.units ?? record.totalTokens,
     record.cost,
     record.status,
     record.updatedAt,
@@ -256,10 +290,10 @@ function billingRecordFromRow(row: Record<string, unknown>): BillingRecord {
     tenantId: String(row.tenant_id),
     subject: String(row.subject_id),
     permitId: String(row.permit_id),
-    capability: 'model/generate',
+    capability: String(row.capability) as BillingRecord['capability'],
     callId: String(row.call_id),
     requestHash: String(row.request_hash),
-    requestedTier: row.requested_tier as InferenceTier,
+    requestedTier: row.requested_tier === null ? undefined : row.requested_tier as InferenceTier,
     routePolicyVersion: String(row.route_policy_version),
     selectedRouteIndex: row.selected_route_index === null
       ? undefined
@@ -269,6 +303,7 @@ function billingRecordFromRow(row: Record<string, unknown>): BillingRecord {
     inputTokens: Number(row.input_tokens),
     outputTokens: Number(row.output_tokens),
     totalTokens: Number(row.total_tokens),
+    units: row.units === undefined ? Number(row.total_tokens) : Number(row.units),
     cost: Number(row.cost),
     status: row.status as BillingStatus,
     createdAt: toIso(row.created_at),
@@ -293,6 +328,7 @@ function sameTerminalBillingRecord(left: BillingRecord, right: BillingRecord): b
     left.inputTokens === right.inputTokens &&
     left.outputTokens === right.outputTokens &&
     left.totalTokens === right.totalTokens &&
+    (left.units ?? left.totalTokens) === (right.units ?? right.totalTokens) &&
     left.cost === right.cost;
 }
 

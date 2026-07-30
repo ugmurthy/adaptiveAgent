@@ -90,6 +90,7 @@ export async function resolveAgentSdkConfigWithSources(options: AgentSdkOptions)
       connectTimeoutMs: options.gateway?.connectTimeoutMs ?? settings.gateway?.connectTimeoutMs,
       requestTimeoutMs: options.gateway?.requestTimeoutMs ?? settings.gateway?.requestTimeoutMs,
       reconnectAttempts: options.gateway?.reconnectAttempts ?? settings.gateway?.reconnectAttempts,
+      remoteTools: structuredClone(options.gateway?.remoteTools ?? settings.gateway?.remoteTools ?? []),
     },
     runtime: {
       requestedMode,
@@ -159,13 +160,14 @@ async function loadOptionalSettings(cwd: string, explicitPath: string | undefine
 }
 
 async function loadRequiredAgent(cwd: string, explicitPath: string | undefined, env: NodeJS.ProcessEnv, agentDirs: string[]): Promise<{ path: string; value: AgentConfigFile }> {
-  const candidates = [explicitPath, env.ADAPTIVE_AGENT_CONFIG, resolve(cwd, 'agent.json'), resolve(adaptiveAgentHome(env), 'agents', 'default-agent.json')].filter(Boolean) as string[];
+  const localPath = explicitPath?.startsWith('local:') ? explicitPath.slice('local:'.length) : explicitPath;
+  const candidates = [localPath, env.ADAPTIVE_AGENT_CONFIG, resolve(cwd, 'agent.json'), resolve(adaptiveAgentHome(env), 'agents', 'default-agent.json')].filter(Boolean) as string[];
   for (const candidate of candidates) {
     const path = resolvePath(cwd, candidate);
     if (await pathExists(path)) return { path, value: await readJson(path) as AgentConfigFile };
     const discovered = await resolveAgentConfigByName(candidate, agentDirs);
     if (discovered) return { path: discovered, value: await readJson(discovered) as AgentConfigFile };
-    if (candidate === explicitPath || candidate === env.ADAPTIVE_AGENT_CONFIG) throw new AgentSdkLookupError('agent.json', candidates.map((entry) => resolvePath(cwd, entry)));
+    if (candidate === localPath || candidate === env.ADAPTIVE_AGENT_CONFIG) throw new AgentSdkLookupError('agent.json', candidates.map((entry) => resolvePath(cwd, entry)));
   }
   throw new AgentSdkLookupError('agent.json', candidates.map((entry) => resolvePath(cwd, entry)));
 }

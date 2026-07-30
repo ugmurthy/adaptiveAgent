@@ -44,6 +44,7 @@ export class PermitService {
     principal: GatewayPrincipal,
     request: RunAuthorizeParams,
     routePolicyVersion: string,
+    remoteCapabilities: string[] = [],
   ): RunPermit {
     this.prune();
     if (!principal.permittedModes.includes(request.inferenceMode)) {
@@ -76,7 +77,7 @@ export class PermitService {
       inferenceTier,
       profileRefs: structuredClone(request.profileRefs),
       routePolicyVersion,
-      remoteCapabilities: request.inferenceMode === 'gateway' ? ['model/generate'] : [],
+      remoteCapabilities: request.inferenceMode === 'gateway' ? ['model/generate', ...remoteCapabilities] : [],
       expiresAt: new Date(this.now() + this.ttlMs).toISOString(),
     };
     this.permits.set(permit.id, permit);
@@ -109,6 +110,26 @@ export class PermitService {
     }
     if (permit.inferenceTier !== tier || !principal.allowedTiers.includes(tier)) {
       throw new GatewayError('tier_not_entitled');
+    }
+    return structuredClone(permit);
+  }
+
+  verifyToolPermit(permitId: string, principal: GatewayPrincipal, capability: string, routePolicyVersion: string): RunPermit {
+    const permit = this.permits.get(permitId);
+    if (
+      !permit ||
+      permit.subject !== principal.subject ||
+      permit.accountId !== principal.accountId ||
+      permit.tenantId !== principal.tenantId ||
+      permit.inferenceMode !== 'gateway' ||
+      permit.routePolicyVersion !== routePolicyVersion ||
+      !permit.remoteCapabilities.includes(capability)
+    ) {
+      throw new GatewayError('forbidden');
+    }
+    if (Date.parse(permit.expiresAt) <= this.now()) {
+      this.permits.delete(permitId);
+      throw new GatewayError('forbidden');
     }
     return structuredClone(permit);
   }

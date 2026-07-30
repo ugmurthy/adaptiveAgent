@@ -18,7 +18,7 @@ const validRequests: Array<[GatewayRequestMethod, Record<string, unknown>]> = [
   ['profile/get',{ref:profileRef}],
   ['run/authorize',{runId:'r',inferenceMode:'gateway',requestedTier:'high',profileRefs:[]}],
   ['model/generate',{permitId:'permit',tier:'high',invocation,messages:[{role:'user',content:'hi'}]}],
-  ['tool/execute',{permitId:'permit',idempotencyKey:'key',toolName:'web_search',input:{query:'q'}}],
+  ['tool/execute',{permitId:'permit',idempotencyKey:'key',toolName:'web_search@1',input:{query:'q'}}],
   ['request/cancel',{callId:'c'}],
   ['account/usage',{from:'2026-01-01',to:'2026-02-01'}],
 ];
@@ -81,7 +81,10 @@ describe('response validation', () => {
     ['profile/get',{bundle:profile}],
     ['run/authorize',{permitId:'permit',inferenceMode:'gateway',inferenceTier:'high',routePolicyVersion:'1',remoteCapabilities:['web_search'],expiresAt:'2026-07-27T00:00:00Z'}],
     ['model/generate',{callId:'c',traceId:'trace-c',text:'ok',finishReason:'stop',usage,routePolicyVersion:'1',timings:{gatewayDurationMs:10,providerDurationMs:8,routeAttempts:1}}],
-    ['tool/execute',{idempotencyKey:'key',output:{answer:42},usage:{units:1},cacheHit:false}],
+    ['tool/execute',{
+      idempotencyKey:'key',output:{answer:42},usage:{units:1,cost:0.01},cacheHit:false,
+      diagnostics:{provider:'brave',operation:'web_search@1',durationMs:8,traceId:'trace-tool'},
+    }],
     ['request/cancel',{cancelled:true}],
     ['account/usage',{items:[{capability:'model',units:3,cost:0.01,occurredAt:'2026-07-26T00:00:00Z'}]}],
   ];

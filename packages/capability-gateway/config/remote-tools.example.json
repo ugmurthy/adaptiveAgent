@@ -1,0 +1,26 @@
+{
+  "tools": [
+    {
+      "name": "web_search@1",
+      "provider": "brave",
+      "apiKeyEnv": "BRAVE_SEARCH_API_KEY",
+      "maxConcurrency": 8,
+      "accountQuota": 100,
+      "accountQuotaWindowMs": 60000,
+      "timeoutMs": 30000,
+      "maxOutputBytes": 262144,
+      "estimatedCostPerRequestUSD": 0.001
+    },
+    {
+      "name": "read_web_page@1",
+      "provider": "parallel",
+      "apiKeyEnv": "PARALLEL_API_KEY",
+      "maxConcurrency": 4,
+      "accountQuota": 60,
+      "accountQuotaWindowMs": 60000,
+      "timeoutMs": 60000,
+      "maxOutputBytes": 262144,
+      "estimatedCostPerRequestUSD": 0.01
+    }
+  ]
+}

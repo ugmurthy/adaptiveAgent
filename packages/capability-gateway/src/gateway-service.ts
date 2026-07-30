@@ -5,6 +5,8 @@ import {
   type AccountUsageParams,
   type GatewayRequestMethod,
   type InitializeResult,
+  type ProfileGetParams,
+  type ProfileListParams,
   type JsonValue,
   type MethodResults,
   type ModelGenerateParams,
@@ -12,6 +14,8 @@ import {
   type ModelStreamEnvelope,
   type ModelToolCall,
   type RequestCancelParams,
+  type ToolExecuteParams,
+  type ToolExecuteResult,
   type RunAuthorizeParams,
   type RunAuthorizeResult,
   type UsageSummary,
@@ -23,6 +27,7 @@ import { InMemoryBillingStore } from './billing.js';
 import {
   CachedModelCall,
   ModelCallCache,
+  ToolCallCache,
   stableModelRequestHash,
   type StreamSubscriber,
 } from './call-cache.js';
@@ -30,6 +35,7 @@ import { GatewayError, gatewayError } from './errors.js';
 import type { GatewayLogger } from './logger.js';
 import { silentGatewayLogger } from './logger.js';
 import { PermitService } from './permit.js';
+import { ProfileRegistry } from './profile-registry.js';
 import {
   AdapterPool,
   adapterSupportsRequest,
@@ -42,6 +48,11 @@ import {
   type RoutePolicy,
   type RouteTarget,
 } from './route-policy.js';
+import {
+  RemoteToolRegistry,
+  stableToolRequestHash,
+  type RemoteToolName,
+} from './remote-tools.js';
 
 export interface GatewayServiceOptions {
   routePolicy: RoutePolicy;
@@ -49,6 +60,9 @@ export interface GatewayServiceOptions {
   billingStore?: BillingStore;
   permitService?: PermitService;
   callCache?: ModelCallCache;
+  toolCallCache?: ToolCallCache;
+  remoteTools?: RemoteToolRegistry;
+  profileRegistry?: ProfileRegistry;
   logger?: GatewayLogger;
   serverVersion?: string;
   now?: () => number;
@@ -63,15 +77,21 @@ export class GatewayService {
   readonly billingStore: BillingStore;
   readonly permitService: PermitService;
   readonly callCache: ModelCallCache;
+  readonly toolCallCache: ToolCallCache;
   private readonly adapterPool: AdapterPool;
   private readonly logger: GatewayLogger;
   private readonly serverVersion: string;
   private readonly now: () => number;
+  private readonly remoteTools: RemoteToolRegistry;
+  private readonly profiles: ProfileRegistry;
 
   constructor(readonly options: GatewayServiceOptions) {
     this.billingStore = options.billingStore ?? new InMemoryBillingStore();
     this.permitService = options.permitService ?? new PermitService();
     this.callCache = options.callCache ?? new ModelCallCache();
+    this.toolCallCache = options.toolCallCache ?? new ToolCallCache();
+    this.remoteTools = options.remoteTools ?? new RemoteToolRegistry();
+    this.profiles = options.profileRegistry ?? new ProfileRegistry();
     this.adapterPool = new AdapterPool(options.routePolicy, options.adapterFactory);
     const configuredLogger = options.logger ?? silentGatewayLogger;
     this.logger = {
@@ -101,10 +121,9 @@ export class GatewayService {
       case 'initialize':
         return this.initialize(principal) as MethodResults[M];
       case 'profile/list':
-        return { profiles: [] } as unknown as MethodResults[M];
+        return { profiles: this.profiles.list(principal, (params as ProfileListParams).schemaVersion) } as MethodResults[M];
       case 'profile/get':
-      case 'tool/execute':
-        throw new GatewayError('capability_not_entitled');
+        return { bundle: this.profiles.get((params as ProfileGetParams).ref, principal) } as MethodResults[M];
       case 'run/authorize':
         return this.authorize(principal, params as RunAuthorizeParams) as MethodResults[M];
       case 'model/generate':
@@ -113,6 +132,8 @@ export class GatewayService {
           params as ModelGenerateParams,
           context,
         ) as MethodResults[M];
+      case 'tool/execute':
+        return await this.executeTool(principal, params as ToolExecuteParams, context) as MethodResults[M];
       case 'request/cancel':
         return this.cancel(principal, params as RequestCancelParams) as MethodResults[M];
       case 'account/usage':
@@ -124,17 +145,21 @@ export class GatewayService {
   }
 
   activeCallCount(): number {
-    return this.callCache.activeCount();
+    return this.callCache.activeCount() + this.toolCallCache.activeCount();
   }
 
   abortActiveCalls(): void {
     this.callCache.abortAll();
+    this.toolCallCache.abortAll();
   }
 
   async close(): Promise<void> {
     this.callCache.abortAll();
+    this.toolCallCache.abortAll();
     await this.callCache.waitForActiveCalls();
+    await this.toolCallCache.waitForActiveCalls();
     await this.adapterPool.close();
+    await this.remoteTools.close();
     await this.billingStore.close?.();
   }
 
@@ -144,8 +169,8 @@ export class GatewayService {
       serverVersion: this.serverVersion,
       inferenceTiers: INFERENCE_TIERS.filter((tier) => principal.allowedTiers.includes(tier)),
       streamEventVersions: ['1'],
-      profileSchemaVersions: [],
-      remoteTools: [],
+      profileSchemaVersions: this.profiles.schemaVersions(),
+      remoteTools: this.remoteTools.descriptors(),
       structuredOutput: true,
       cancellation: true,
       limits: {
@@ -168,10 +193,15 @@ export class GatewayService {
     principal: GatewayPrincipal,
     params: RunAuthorizeParams,
   ): RunAuthorizeResult {
+    const policy = this.profiles.policy(params.profileRefs, principal);
+    const effectivePrincipal = { ...principal, allowedTiers: policy.tiers };
     const permit = this.permitService.authorize(
-      principal,
+      effectivePrincipal,
       params,
       this.options.routePolicy.version,
+      params.profileRefs.some((ref) => ref.source === 'server')
+        ? this.remoteTools.capabilities().filter((capability) => policy.capabilities.includes(capability))
+        : this.remoteTools.capabilities(),
     );
     return {
       permitId: permit.id,
@@ -190,8 +220,163 @@ export class GatewayService {
     return {
       cancelled: params.callId
         ? this.callCache.cancel(principal.accountId, params.callId)
-        : false,
+        : params.idempotencyKey
+          ? this.toolCallCache.cancel(principal.accountId, params.idempotencyKey)
+          : false,
     };
+  }
+
+  private async executeTool(
+    principal: GatewayPrincipal,
+    params: ToolExecuteParams,
+    context: GatewayRequestContext,
+  ): Promise<ToolExecuteResult> {
+    const toolName = params.toolName;
+    if (!this.remoteTools.has(toolName)) {
+      throw new GatewayError('capability_not_entitled');
+    }
+    this.permitService.verifyToolPermit(
+      params.permitId,
+      principal,
+      toolName,
+      this.options.routePolicy.version,
+    );
+    // Deterministic client errors must not reserve an idempotency key or write
+    // a billing row. The registry validates again immediately before use.
+    this.remoteTools.validate(toolName, params.input, params.timeoutMs);
+    const hash = stableToolRequestHash(params);
+    const { call, created } = this.toolCallCache.reserve(principal.accountId, params.idempotencyKey, hash);
+    if (created) {
+      void this.executeReservedTool(
+        call.controller.signal,
+        principal,
+        { ...params, toolName },
+        hash,
+        context.traceId,
+      )
+        .then((result) => call.succeed(result))
+        .catch((error) => call.fail(gatewayError(error)));
+    }
+    const outcome = await call.outcome;
+    if (!outcome.ok) throw outcome.error;
+    return {
+      ...structuredClone(outcome.result),
+      ...(created ? {} : { cacheHit: true }),
+    };
+  }
+
+  private async executeReservedTool(
+    signal: AbortSignal,
+    principal: GatewayPrincipal,
+    params: ToolExecuteParams & { toolName: RemoteToolName },
+    hash: string,
+    traceId: string,
+  ): Promise<ToolExecuteResult> {
+    const started = this.now();
+    const timestamp = new Date(started).toISOString();
+    const provider = this.remoteTools.providerFor(params.toolName);
+    const active: BillingRecord = {
+      accountId: principal.accountId,
+      tenantId: principal.tenantId,
+      subject: principal.subject,
+      permitId: params.permitId,
+      capability: params.toolName,
+      callId: params.idempotencyKey,
+      requestHash: hash,
+      routePolicyVersion: this.options.routePolicy.version,
+      provider,
+      model: params.toolName,
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      units: 0,
+      cost: 0,
+      status: 'active',
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    if (!(await this.billingStore.begin(active))) {
+      throw new GatewayError('idempotency_conflict', {
+        idempotencyKey: params.idempotencyKey,
+      });
+    }
+    try {
+      const executed = await this.remoteTools.execute(
+        params.toolName,
+        principal.accountId,
+        params.input,
+        params.timeoutMs,
+        params.idempotencyKey,
+        signal,
+      );
+      const completedAt = new Date(this.now()).toISOString();
+      const units = executed.units ?? 1;
+      const result: ToolExecuteResult = {
+        idempotencyKey: params.idempotencyKey,
+        output: executed.output,
+        usage: {
+          units,
+          ...(executed.cost === undefined ? {} : { cost: executed.cost }),
+        },
+        ...(executed.providerRequestId
+          ? { providerRequestId: executed.providerRequestId }
+          : {}),
+        diagnostics: {
+          provider,
+          operation: executed.operation,
+          durationMs: this.now() - started,
+          traceId,
+        },
+      };
+      validateRpcResponse('tool/execute', {
+        jsonrpc: '2.0',
+        id: params.idempotencyKey,
+        result,
+      });
+      await this.billingStore.finish({
+        ...active,
+        model: executed.operation,
+        units,
+        cost: executed.cost ?? 0,
+        status: 'completed',
+        updatedAt: completedAt,
+        completedAt,
+      });
+      this.logger.log('info', 'tool.completed', {
+        traceId,
+        accountId: principal.accountId,
+        tenantId: principal.tenantId,
+        method: 'tool/execute',
+        idempotencyKey: params.idempotencyKey,
+        toolName: params.toolName,
+        provider,
+        status: 'completed',
+        durationMs: this.now() - started,
+      });
+      return result;
+    } catch (error) {
+      const normalized = gatewayError(error);
+      const completedAt = new Date(this.now()).toISOString();
+      await this.billingStore.finish({
+        ...active,
+        status: normalized.gatewayCode === 'cancelled' ? 'cancelled' : 'failed',
+        updatedAt: completedAt,
+        completedAt,
+      });
+      this.logger.log('warn', 'tool.failed', {
+        traceId,
+        accountId: principal.accountId,
+        tenantId: principal.tenantId,
+        method: 'tool/execute',
+        idempotencyKey: params.idempotencyKey,
+        toolName: params.toolName,
+        provider,
+        status: normalized.gatewayCode,
+        durationMs: this.now() - started,
+        errorType: normalized.gatewayCode,
+      });
+      throw normalized;
+    }
   }
 
   private async generate(

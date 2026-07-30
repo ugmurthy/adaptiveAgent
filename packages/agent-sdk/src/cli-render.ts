@@ -1186,10 +1186,22 @@ export function summarizeDryRun(
 }
 
 function resolvedWebSearchProviderForConfig(config: Awaited<ReturnType<typeof loadAgentSdkConfig>>): string {
+  if (
+    config.inference.mode === 'gateway' &&
+    config.gateway.remoteTools.includes('web_search')
+  ) {
+    return 'gateway';
+  }
   return resolveWebSearchProvider({ ...process.env, ...(config.settings.env ?? {}) });
 }
 
 function resolvedReadWebPageProviderForConfig(config: Awaited<ReturnType<typeof loadAgentSdkConfig>>): string {
+  if (
+    config.inference.mode === 'gateway' &&
+    config.gateway.remoteTools.includes('read_web_page')
+  ) {
+    return 'gateway';
+  }
   return resolveReadWebPageProvider({ ...process.env, ...(config.settings.env ?? {}) });
 }
 export function printInlineConfigSummary(

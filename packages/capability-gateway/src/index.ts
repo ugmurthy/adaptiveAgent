@@ -5,5 +5,7 @@ export * from './errors.js';
 export * from './gateway-service.js';
 export * from './logger.js';
 export * from './permit.js';
+export * from './profile-registry.js';
 export * from './route-policy.js';
+export * from './remote-tools.js';
 export * from './server.js';

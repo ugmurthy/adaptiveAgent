@@ -1891,8 +1891,8 @@ async function runConfigCommand(cli: ManualTestCliOptions): Promise<number> {
   const sdkOptions = buildSdkOptions(cli, resolvedCwd);
   const resolvedConfig = await loadAgentSdkConfig(sdkOptions);
   const providerEnv = { ...(sdkOptions.env ?? process.env), ...(resolvedConfig.settings.env ?? {}) };
-  const webSearchProvider = resolveWebSearchProvider(providerEnv);
-  const readWebPageProvider = resolveReadWebPageProvider(providerEnv);
+  const webSearchProvider = resolvedConfig.inference.mode === 'gateway' && resolvedConfig.gateway.remoteTools.includes('web_search') ? 'gateway' : resolveWebSearchProvider(providerEnv);
+  const readWebPageProvider = resolvedConfig.inference.mode === 'gateway' && resolvedConfig.gateway.remoteTools.includes('read_web_page') ? 'gateway' : resolveReadWebPageProvider(providerEnv);
   if (cli.output === 'json') {
     console.log(JSON.stringify({ ...resolvedConfig, webSearch: { provider: webSearchProvider }, readWebPage: { provider: readWebPageProvider } }, null, 2));
     return 0;
@@ -3550,8 +3550,8 @@ function formatEvalDryRunMarkdown(
 ): string {
   const config = inspection.config;
   const providerEnv = { ...process.env, ...(config.settings.env ?? {}) };
-  const webSearchProvider = resolveWebSearchProvider(providerEnv);
-  const readWebPageProvider = resolveReadWebPageProvider(providerEnv);
+  const webSearchProvider = config.inference.mode === 'gateway' && config.gateway.remoteTools.includes('web_search') ? 'gateway' : resolveWebSearchProvider(providerEnv);
+  const readWebPageProvider = config.inference.mode === 'gateway' && config.gateway.remoteTools.includes('read_web_page') ? 'gateway' : resolveReadWebPageProvider(providerEnv);
   const lines = [
     '# Dry run',
     '',
