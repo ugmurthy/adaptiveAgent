@@ -15,11 +15,12 @@ import type {
   RuntimeMode,
   createAgentSdk,
 } from './index.js';
+import type { AdaptiveAgentCliCommand } from './cli-command-metadata.js';
 import type { ContextBundleInput } from './context-bundles.js';
 import type { InitProfile } from './install/init.js';
 
 export interface ManualTestCliOptions {
-  command: 'run' | 'chat' | 'spec' | 'config' | 'catalog' | 'eval' | 'swarm-run' | 'ambient' | 'inspect' | 'resume' | 'retry' | 'recover' | 'continue' | 'interrupt' | 'replay' | 'init' | 'doctor' | 'update' | 'uninstall' | 'agent-create' | 'context' | 'version';
+  command: AdaptiveAgentCliCommand;
   specPath: string;
   goalArgs: string[];
   runId?: string;

@@ -108,6 +108,10 @@ import {
   summarizeSwarmRetry,
   summarizeSwarmRun,
 } from './cli-render.js';
+import {
+  ADAPTIVE_AGENT_POSITIONAL_COMMANDS,
+  type AdaptiveAgentPositionalCommand,
+} from './cli-command-metadata.js';
 
 export { formatSwarmExecutionPlan, formatSwarmRunStatuses, formatSwarmSubtasks } from './swarm-format.js';
 export { formatCoordinatorDecompositionFailure, formatInteractiveChatResult, renderPrettyString, renderStyledPrettyMessage };
@@ -119,11 +123,9 @@ const IMAGE_FILE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp',
 const AUDIO_FILE_EXTENSIONS = new Set(['.wav', '.mp3', '.flac', '.m4a', '.ogg', '.aac', '.aiff', '.aif', '.opus', '.oga', '.weba']);
 const VIDEO_FILE_EXTENSIONS = new Set(['.mp4', '.m4v', '.mov', '.webm', '.mkv', '.avi', '.mpeg', '.mpg', '.ogv', '.wmv', '.flv', '.3gp', '.ts', '.mts', '.m2ts']);
 
-const CLI_COMMANDS = ['run', 'chat', 'spec', 'config', 'catalog', 'eval', 'swarm-run', 'ambient', 'inspect', 'resume', 'retry', 'recover', 'continue', 'interrupt', 'replay', 'init', 'doctor', 'update', 'uninstall', 'agent-create', 'context'] as const;
-type CliCommand = (typeof CLI_COMMANDS)[number];
-const CLI_COMMAND_SET = new Set<string>(CLI_COMMANDS);
+const CLI_COMMAND_SET = new Set<string>(ADAPTIVE_AGENT_POSITIONAL_COMMANDS);
 
-function isCliCommand(value: string): value is CliCommand {
+function isCliCommand(value: string): value is AdaptiveAgentPositionalCommand {
   return CLI_COMMAND_SET.has(value);
 }
 

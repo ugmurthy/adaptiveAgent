@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import { ADAPTIVE_AGENT_CLI_COMMANDS } from '@adaptive-agent/agent-sdk/cli';
+
 import { JSON_RPC_ERROR_CODES, type DesktopMessage, type DesktopRpcRequest } from './protocol.js';
 import { DesktopRuntime, type CliExecutor } from './runtime.js';
 
@@ -92,12 +94,16 @@ describe('desktop runtime protocol', () => {
     await initialize(runtime);
     const result = await runtime.handleRpc(request({ id: 2, method: 'cli/commands' })) as Array<Record<string, unknown>>;
 
-    expect(result.map(({ command }) => command)).toEqual(expect.arrayContaining([
-      'run', 'chat', 'spec', 'swarm-run', 'ambient', 'eval', 'context', 'init', 'doctor', 'update', 'uninstall',
-    ]));
+    expect(result.map(({ command }) => command)).toEqual(ADAPTIVE_AGENT_CLI_COMMANDS);
+    expect(result.find(({ command }) => command === 'ambient')).toMatchObject({
+      subcommands: ['start'],
+      cliExecute: false,
+      unavailableReason: expect.any(String),
+    });
     expect(result.find(({ command }) => command === 'eval')).toMatchObject({ subcommands: ['cases', 'gaia'] });
     expect(result.find(({ command }) => command === 'context')).toMatchObject({ subcommands: ['create', 'list', 'show', 'delete'] });
-    expect(result.find(({ command }) => command === 'update')).toMatchObject({ cliExecute: false });
+    expect(result.find(({ command }) => command === 'update')).toMatchObject({ cliExecute: false, unavailableReason: expect.any(String) });
+    expect(result.find(({ command }) => command === 'uninstall')).toMatchObject({ cliExecute: false, unavailableReason: expect.any(String) });
   });
 
   it('validates with the canonical CLI parser, forces machine output, and streams opaque lines', async () => {

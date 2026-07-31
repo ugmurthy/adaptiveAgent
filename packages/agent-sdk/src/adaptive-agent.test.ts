@@ -24,6 +24,11 @@ import {
 } from './adaptive-agent.js';
 import type { BenchmarkAttachmentType, BenchmarkCase, ManualTestCliOptions } from './adaptive-agent.js';
 import { formatAgentEventSummary, summarizeAgentEvent } from './agent-event-rendering.js';
+import {
+  ADAPTIVE_AGENT_CLI_COMMANDS,
+  ADAPTIVE_AGENT_CLI_SUBCOMMANDS,
+  ADAPTIVE_AGENT_POSITIONAL_COMMANDS,
+} from './cli-api.js';
 import { extractToolProgressContent, printProgressEvent } from './cli-render.js';
 
 const RUN_REF_ID = '11111111-1111-4111-8111-111111111111';
@@ -183,6 +188,25 @@ describe('adaptive-agent spec loading', () => {
 });
 
 describe('adaptive-agent cli parsing', () => {
+  it('derives parser commands and subcommands from canonical CLI metadata', () => {
+    expect(ADAPTIVE_AGENT_CLI_COMMANDS).toEqual([
+      'run', 'chat', 'spec', 'swarm-run', 'ambient', 'retry', 'inspect', 'resume', 'recover', 'continue',
+      'interrupt', 'replay', 'eval', 'config', 'catalog', 'init', 'doctor', 'update', 'uninstall',
+      'agent-create', 'context', 'version',
+    ]);
+    expect(ADAPTIVE_AGENT_POSITIONAL_COMMANDS).toEqual(ADAPTIVE_AGENT_CLI_COMMANDS.filter((command) => command !== 'version'));
+    expect(ADAPTIVE_AGENT_CLI_SUBCOMMANDS).toEqual({
+      ambient: ['start'],
+      eval: ['cases', 'gaia'],
+      context: ['create', 'list', 'show', 'delete'],
+    });
+
+    for (const command of ADAPTIVE_AGENT_POSITIONAL_COMMANDS) {
+      expect(parseCliArgs([command, '--help'])).toMatchObject({ command, help: true, helpTopic: command });
+    }
+    expect(parseCliArgs(['--version'])).toMatchObject({ command: 'version' });
+  });
+
   it('parses top-level and command-specific help requests', () => {
     expect(parseCliArgs(['--help'])).toMatchObject({ help: true });
     expect(parseCliArgs(['swarm-run', '--help'])).toMatchObject({ help: true, helpTopic: 'swarm-run' });

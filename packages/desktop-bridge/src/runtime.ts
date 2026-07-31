@@ -1,5 +1,11 @@
 import { AgentSdk, type AgentSdkOptions } from '@adaptive-agent/agent-sdk';
-import { parseCliArgs, type ManualTestCliOptions } from '@adaptive-agent/agent-sdk/src/adaptive-agent.js';
+import {
+  ADAPTIVE_AGENT_CLI_COMMANDS,
+  ADAPTIVE_AGENT_CLI_SUBCOMMANDS,
+  parseCliArgs,
+  type AdaptiveAgentCliCommand,
+  type ManualTestCliOptions,
+} from '@adaptive-agent/agent-sdk/cli';
 import type { AgentEvent, JsonValue, UUID } from '@adaptive-agent/core';
 import {
   GatewayClient,
@@ -9,14 +15,12 @@ import {
 } from '@adaptive-agent/gateway-client';
 
 import {
-  ADAPTIVE_AGENT_CLI_COMMANDS,
   DESKTOP_BRIDGE_VERSION,
   DESKTOP_PROTOCOL_VERSION,
   DESKTOP_RPC_METHODS,
   JSON_RPC_ERROR_CODES,
   SUPPORTED_DESKTOP_PROTOCOL_VERSIONS,
   DesktopProtocolError,
-  type AdaptiveAgentCliCommand,
   type CliExecuteParams,
   type DesktopClientInfo,
   type DesktopMessage,
@@ -388,13 +392,14 @@ export class DesktopRuntime {
   private cliCommands(): JsonValue {
     return ADAPTIVE_AGENT_CLI_COMMANDS.map((command) => {
       const unavailableReason = CLI_EXECUTE_DENYLIST.get(command);
+      const subcommands = command in ADAPTIVE_AGENT_CLI_SUBCOMMANDS
+        ? ADAPTIVE_AGENT_CLI_SUBCOMMANDS[command as keyof typeof ADAPTIVE_AGENT_CLI_SUBCOMMANDS]
+        : undefined;
       return {
         command,
         cliExecute: !unavailableReason,
         ...(unavailableReason ? { unavailableReason } : {}),
-        ...(command === 'ambient' ? { subcommands: ['start'] } : {}),
-        ...(command === 'eval' ? { subcommands: ['cases', 'gaia'] } : {}),
-        ...(command === 'context' ? { subcommands: ['create', 'list', 'show', 'delete'] } : {}),
+        ...(subcommands ? { subcommands: [...subcommands] } : {}),
       };
     });
   }

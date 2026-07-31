@@ -1,6 +1,11 @@
 import type { JsonValue } from '@adaptive-agent/core';
 import type { InferenceMode, InferenceTier, ProfileRef } from '@adaptive-agent/gateway-client';
 
+export {
+  ADAPTIVE_AGENT_CLI_COMMANDS,
+  type AdaptiveAgentCliCommand,
+} from '@adaptive-agent/agent-sdk/cli';
+
 /** Keep versions as strings: JSON numbers cannot distinguish 1.10 from 1.1. */
 export const DESKTOP_PROTOCOL_VERSION = '1.11' as const;
 export const SUPPORTED_DESKTOP_PROTOCOL_VERSIONS = ['1.10', DESKTOP_PROTOCOL_VERSION] as const;
@@ -183,33 +188,6 @@ export const DESKTOP_RPC_METHODS = [
   'cli/commands',
   'cli/execute',
 ] as const satisfies readonly DesktopRpcRequest['method'][];
-
-export const ADAPTIVE_AGENT_CLI_COMMANDS = [
-  'run',
-  'chat',
-  'spec',
-  'swarm-run',
-  'ambient',
-  'retry',
-  'inspect',
-  'resume',
-  'recover',
-  'continue',
-  'interrupt',
-  'replay',
-  'eval',
-  'config',
-  'catalog',
-  'init',
-  'doctor',
-  'update',
-  'uninstall',
-  'agent-create',
-  'context',
-  'version',
-] as const;
-
-export type AdaptiveAgentCliCommand = (typeof ADAPTIVE_AGENT_CLI_COMMANDS)[number];
 
 export type DesktopMessage = JsonRpcNotification | JsonRpcSuccessResponse | JsonRpcErrorResponse;
 
