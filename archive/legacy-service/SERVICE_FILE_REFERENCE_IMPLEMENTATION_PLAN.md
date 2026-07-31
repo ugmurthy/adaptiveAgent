@@ -1,5 +1,7 @@
 # Service File Reference Implementation Plan
 
+> Archived on 2026-07-31. This plan targets the retired hosted service stack and is retained only as historical reference.
+
 ## Status
 
 - Target: `@adaptive-agent/service`, `@adaptive-agent/service-sdk`, and `@adaptive-agent/service-console`

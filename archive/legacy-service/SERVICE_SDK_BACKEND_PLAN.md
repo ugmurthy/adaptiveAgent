@@ -1,5 +1,7 @@
 # Service SDK and Backend Implementation Plan
 
+> Archived on 2026-07-31. This plan targets the retired hosted service stack and is retained only as historical reference.
+
 ## Purpose
 
 Build a production service around Adaptive Agent while preserving the existing runtime and CLI architecture.

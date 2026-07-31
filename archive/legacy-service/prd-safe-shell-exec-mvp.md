@@ -1,5 +1,7 @@
 # Implementation Plan: Safe `shell_exec` MVP
 
+> Archived on 2026-07-31. This plan targets the retired hosted service stack and is retained only as historical reference.
+
 ## 1. Introduction
 
 Allow server-owned agents using `shell_exec` to be advertised and executed by the Adaptive Agent service without giving model-generated commands access to the shared agent worker, its credentials, or the host network.

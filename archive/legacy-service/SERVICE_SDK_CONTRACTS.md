@@ -1,5 +1,7 @@
 # Service SDK Contracts v1
 
+> Archived on 2026-07-31. These contracts describe the retired hosted service stack and are retained only as historical reference.
+
 ## Status and scope
 
 This document freezes the Phase 0 public behavior for the initial Adaptive Agent service. It is normative for `@adaptive-agent/service-sdk` and the backend adapters built on it.

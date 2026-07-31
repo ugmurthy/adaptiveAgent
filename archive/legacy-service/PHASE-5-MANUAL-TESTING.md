@@ -1,5 +1,7 @@
 # Phase 5 Manual Test Plan
 
+> Archived on 2026-07-31. This runbook targets the retired hosted service stack and is retained only as historical reference.
+
 ## Purpose
 
 This runbook verifies durable public-event projection, HTTP replay, Redis/Valkey fanout, authenticated WebSockets, reconnect recovery, exact-user ownership, controls, and terminal result delivery on a local development machine.

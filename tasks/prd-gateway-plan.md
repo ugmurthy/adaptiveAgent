@@ -171,7 +171,7 @@ A new `@adaptive-agent/capability-gateway` package owns:
 - ephemeral active-call and result replay state
 
 It must not construct `AgentSdk`, execute agent runs, or import server job
-orchestration from `@adaptive-agent/service-sdk`.
+orchestration from the retired hosted service stack.
 
 ### 5.5 Shared protocol
 

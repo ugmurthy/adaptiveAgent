@@ -1,5 +1,7 @@
 # Phase 6 Local Manual Test Plan
 
+> Archived on 2026-07-31. This runbook targets the retired hosted service stack and is retained only as historical reference.
+
 ## Purpose
 
 Validate private artifact management end to end:
