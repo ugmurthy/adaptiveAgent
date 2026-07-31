@@ -28,6 +28,7 @@ import {
   GatewayClient,
   GatewayModelAdapter,
   type GatewayExecutionContext,
+  type InferenceMode,
   type InferenceTier,
   type ProfileRef,
 } from '@adaptive-agent/gateway-client';
@@ -84,8 +85,9 @@ export class AgentSdk {
   readonly metadata: JsonObject;
   readonly registeredToolNames: string[];
   private readonly closeRuntime?: () => Promise<void>;
-  private readonly gateway?: {
+  private readonly authorization?: {
     client: GatewayClient;
+    inferenceMode: InferenceMode;
     defaultTier: InferenceTier;
     profileRefs: ProfileRef[];
     owned: boolean;
@@ -93,14 +95,14 @@ export class AgentSdk {
   private readonly clock?: () => Date;
   private unsubscribe?: () => void;
 
-  private constructor(args: { created: CreatedAdaptiveAgent<RunStore, EventStore, SnapshotStore, PlanStore | undefined, ContinuationStore>; config: ResolvedAgentSdkConfig; metadata: JsonObject; registeredToolNames: string[]; closeRuntime?: () => Promise<void>; gateway?: { client: GatewayClient; defaultTier: InferenceTier; profileRefs: ProfileRef[]; owned: boolean }; unsubscribe?: () => void; clock?: () => Date }) {
+  private constructor(args: { created: CreatedAdaptiveAgent<RunStore, EventStore, SnapshotStore, PlanStore | undefined, ContinuationStore>; config: ResolvedAgentSdkConfig; metadata: JsonObject; registeredToolNames: string[]; closeRuntime?: () => Promise<void>; authorization?: { client: GatewayClient; inferenceMode: InferenceMode; defaultTier: InferenceTier; profileRefs: ProfileRef[]; owned: boolean }; unsubscribe?: () => void; clock?: () => Date }) {
     this.created = args.created;
     this.agent = args.created.agent;
     this.config = args.config;
     this.metadata = args.metadata;
     this.registeredToolNames = args.registeredToolNames;
     this.closeRuntime = args.closeRuntime;
-    this.gateway = args.gateway;
+    this.authorization = args.authorization;
     this.clock = args.clock;
     this.unsubscribe = args.unsubscribe;
   }
@@ -116,21 +118,28 @@ export class AgentSdk {
           options.env,
           config.runtime.sqlitePath,
         );
-    let gateway: AgentSdk['gateway'];
-    if (config.inference.mode === 'gateway') {
+    let authorization: AgentSdk['authorization'];
+    if (config.inference.mode === 'gateway' || config.gateway.requireRunPermit) {
       const client = options.gatewayClient ?? createGatewayClient(config, options);
-      gateway = {
+      authorization = {
         client,
+        inferenceMode: config.inference.mode,
         defaultTier: config.inference.tier,
         profileRefs: structuredClone(options.profileRefs ?? []),
         owned: !options.gatewayClient,
       };
     }
-    const modules = await resolveToolsAndDelegates(config, options, gateway?.client);
+    const modules = await resolveToolsAndDelegates(
+      config,
+      options,
+      config.inference.mode === 'gateway' ? authorization?.client : undefined,
+    );
     const logger = options.logger ?? (config.logging.enabled ? createAdaptiveAgentLogger(config.logging) : undefined);
     const metadata: JsonObject = { agentId: config.agent.id, agentName: config.agent.name, runtimeMode: config.runtime.mode, ...(config.agent.metadata ?? {}) };
     let model: ModelAdapter | ResolvedAgentSdkConfig['model'] = options.modelAdapter ?? config.model;
-    if (gateway) model = options.modelAdapter ?? new GatewayModelAdapter({ client: gateway.client, defaultTier: config.inference.tier });
+    if (config.inference.mode === 'gateway' && authorization) {
+      model = options.modelAdapter ?? new GatewayModelAdapter({ client: authorization.client, defaultTier: config.inference.tier });
+    }
     const created = createAdaptiveAgent({
       model,
       tools: modules.tools,
@@ -144,7 +153,7 @@ export class AgentSdk {
       logger,
     });
     const unsubscribe = config.events.subscribe && created.runtime.eventStore.subscribe ? created.runtime.eventStore.subscribe((event) => options.eventListener?.(event)) : undefined;
-    return new AgentSdk({ created, config, metadata, registeredToolNames: modules.registeredToolNames, closeRuntime: runtime.close, gateway, unsubscribe, clock: options.clock });
+    return new AgentSdk({ created, config, metadata, registeredToolNames: modules.registeredToolNames, closeRuntime: runtime.close, authorization, unsubscribe, clock: options.clock });
   }
 
   async run(goal: string, options: AgentSdkRunOptions = {}): Promise<RunResult> {
@@ -186,7 +195,7 @@ export class AgentSdk {
   async close(): Promise<void> {
     this.unsubscribe?.();
     this.unsubscribe = undefined;
-    if (this.gateway?.owned) this.gateway.client.close();
+    if (this.authorization?.owned) this.authorization.client.close();
     await this.closeRuntime?.();
   }
 
@@ -220,7 +229,7 @@ export class AgentSdk {
     executionContext: JsonObject | undefined,
   ): Promise<{ runId?: UUID; executionContext: JsonObject }> {
     const base = withoutGatewayExecutionFields(executionContext);
-    if (!this.gateway) {
+    if (!this.authorization) {
       if (requestedTier !== undefined) {
         throw new Error('inferenceTier may be selected per run only in gateway inference mode');
       }
@@ -231,23 +240,30 @@ export class AgentSdk {
     }
 
     const runId = requestedRunId ?? crypto.randomUUID();
-    const tier = requestedTier ?? this.gateway.defaultTier;
-    const authorization = await this.gateway.client.authorizeRun({
+    const mode = this.authorization.inferenceMode;
+    if (mode !== 'gateway' && requestedTier !== undefined) {
+      throw new Error('inferenceTier may be selected per run only in gateway inference mode');
+    }
+    const tier = requestedTier ?? this.authorization.defaultTier;
+    const authorization = await this.authorization.client.authorizeRun({
       runId,
-      inferenceMode: 'gateway',
-      requestedTier: tier,
-      profileRefs: this.gateway.profileRefs,
+      inferenceMode: mode,
+      ...(mode === 'gateway' ? { requestedTier: tier } : {}),
+      profileRefs: this.authorization.profileRefs,
     });
-    if (authorization.inferenceMode !== 'gateway' || authorization.inferenceTier !== tier) {
+    if (authorization.inferenceMode !== mode) {
+      throw new Error(`Gateway did not authorize requested inference mode ${mode}`);
+    }
+    if (mode === 'gateway' && authorization.inferenceTier !== tier) {
       throw new Error(`Gateway did not authorize requested inference tier ${tier}`);
     }
     const protectedContext: GatewayExecutionContext = {
-      inferenceMode: 'gateway',
-      inferenceTier: tier,
+      inferenceMode: mode,
+      ...(mode === 'gateway' ? { inferenceTier: tier } : {}),
       authorizationRef: authorization.permitId,
       authorizationRunId: runId,
       routePolicyRef: authorization.routePolicyVersion,
-      profileRefs: this.gateway.profileRefs,
+      profileRefs: this.authorization.profileRefs,
     };
     return {
       runId,

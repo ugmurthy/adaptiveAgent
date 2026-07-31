@@ -109,6 +109,7 @@ export interface AgentSettingsFile {
     clientName?: string;
     clientVersion?: string;
     accessTokenEnv?: string;
+    requireRunPermit?: boolean;
     connectTimeoutMs?: number;
     requestTimeoutMs?: number;
     reconnectAttempts?: number;
@@ -132,6 +133,7 @@ export interface ResolvedAgentSdkConfig {
     clientName: string;
     clientVersion: string;
     accessTokenEnv: string;
+    requireRunPermit: boolean;
     connectTimeoutMs?: number;
     requestTimeoutMs?: number;
     reconnectAttempts?: number;
@@ -209,7 +211,7 @@ export interface AgentSdkOptions {
   profileCachePath?: string;
   profileRefs?: ProfileRef[];
   gatewayClient?: GatewayClient;
-  gateway?: Partial<Pick<GatewayClientOptions, 'url' | 'clientName' | 'clientVersion' | 'connectTimeoutMs' | 'requestTimeoutMs' | 'reconnectAttempts'>> & { remoteTools?: GatewayRemoteToolName[] };
+  gateway?: Partial<Pick<GatewayClientOptions, 'url' | 'clientName' | 'clientVersion' | 'connectTimeoutMs' | 'requestTimeoutMs' | 'reconnectAttempts'>> & { requireRunPermit?: boolean; remoteTools?: GatewayRemoteToolName[] };
   accessToken?: GatewayClientOptions['accessToken'];
   runtimeMode?: RuntimeMode;
   sqlitePath?: string;

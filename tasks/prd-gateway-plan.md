@@ -1015,10 +1015,10 @@ sending inference through the gateway.
 
 **Acceptance criteria:**
 
-- [ ] Local and BYOK prompts do not reach the gateway after authorization.
-- [ ] Provider keys do not reach the gateway in direct BYOK mode.
-- [ ] Gateway billing does not claim authoritative token usage for direct work.
-- [ ] Documentation states that a modified local client can bypass local
+- [x] Local and BYOK prompts do not reach the gateway after authorization.
+- [x] Provider keys do not reach the gateway in direct BYOK mode.
+- [x] Gateway billing does not claim authoritative token usage for direct work.
+- [x] Documentation states that a modified local client can bypass local
       authorization enforcement.
 
 ### Phase 9: Expose existing gateway streams to core and desktop UIs

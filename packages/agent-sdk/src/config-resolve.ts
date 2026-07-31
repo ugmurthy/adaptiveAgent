@@ -87,6 +87,7 @@ export async function resolveAgentSdkConfigWithSources(options: AgentSdkOptions)
       clientName: options.gateway?.clientName ?? settings.gateway?.clientName ?? 'adaptive-agent-cli',
       clientVersion: options.gateway?.clientVersion ?? settings.gateway?.clientVersion ?? '0.1.0',
       accessTokenEnv: settings.gateway?.accessTokenEnv ?? 'ADAPTIVE_AGENT_ACCESS_TOKEN',
+      requireRunPermit: options.gateway?.requireRunPermit ?? settings.gateway?.requireRunPermit ?? false,
       connectTimeoutMs: options.gateway?.connectTimeoutMs ?? settings.gateway?.connectTimeoutMs,
       requestTimeoutMs: options.gateway?.requestTimeoutMs ?? settings.gateway?.requestTimeoutMs,
       reconnectAttempts: options.gateway?.reconnectAttempts ?? settings.gateway?.reconnectAttempts,

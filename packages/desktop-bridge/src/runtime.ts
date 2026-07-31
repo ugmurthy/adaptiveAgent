@@ -273,11 +273,11 @@ export class DesktopRuntime {
     if (params.profileRef && inferenceMode !== 'gateway') {
       throw new DesktopProtocolError('INVALID_PARAMS', 'Server profile refs require gateway inference mode.', JSON_RPC_ERROR_CODES.invalidParams);
     }
-    if (inferenceMode === 'gateway' && !params.gatewayUrl) {
-      throw new DesktopProtocolError('INVALID_PARAMS', 'gatewayUrl is required for a desktop gateway runtime.', JSON_RPC_ERROR_CODES.invalidParams);
+    if ((inferenceMode === 'gateway' || params.requireRunPermit) && !params.gatewayUrl) {
+      throw new DesktopProtocolError('INVALID_PARAMS', 'gatewayUrl is required for gateway inference or required run permits.', JSON_RPC_ERROR_CODES.invalidParams);
     }
 
-    const gatewayClient = inferenceMode === 'gateway'
+    const gatewayClient = inferenceMode === 'gateway' || params.requireRunPermit
       ? new GatewayClient({
           url: params.gatewayUrl!,
           accessToken: () => this.accessToken ?? '',
@@ -313,7 +313,12 @@ export class DesktopRuntime {
       ...(params.profileRef ? { serverProfile: params.profileRef, profileRefs: [params.profileRef] } : {}),
       ...(gatewayClient ? {
         gatewayClient,
-        gateway: { url: params.gatewayUrl, clientName: '@adaptive-agent/desktop-bridge', clientVersion: DESKTOP_BRIDGE_VERSION },
+        gateway: {
+          url: params.gatewayUrl,
+          requireRunPermit: params.requireRunPermit ?? false,
+          clientName: '@adaptive-agent/desktop-bridge',
+          clientVersion: DESKTOP_BRIDGE_VERSION,
+        },
       } : {}),
       eventListener: (event: AgentEvent) => this.writeAgentEvent(event),
     };

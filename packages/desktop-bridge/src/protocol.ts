@@ -77,6 +77,7 @@ export interface RuntimeInitializeParams {
   inferenceTier?: InferenceTier;
   profileRef?: ProfileRef;
   gatewayUrl?: string;
+  requireRunPermit?: boolean;
 }
 
 export interface InitializeParams {
@@ -380,6 +381,7 @@ function validateRuntimeInitializeParams(value: Record<string, unknown>): void {
   optionalEnum(value, 'inferenceTier', ['low', 'medium', 'high', 'xtra-high']);
   optionalProfileRef(value, 'profileRef');
   optionalString(value, 'gatewayUrl');
+  optionalBoolean(value, 'requireRunPermit');
 }
 
 function validateExecutionSelection(value: Record<string, unknown>): void {

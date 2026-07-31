@@ -1,0 +1,11 @@
+{
+  "inference": {
+    "mode": "gateway"
+  },
+  "gateway": {
+    "url": "ws://127.0.0.1:3006/rpc",
+    "accessTokenEnv": "ADAPTIVE_AGENT_ACCESS_TOKEN",
+    "requireRunPermit": true
+  }
+}
+

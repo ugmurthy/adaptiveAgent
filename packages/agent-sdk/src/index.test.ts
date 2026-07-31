@@ -142,6 +142,7 @@ describe('agent-sdk config resolution', () => {
         gateway: {
           url: '${GATEWAY_URL}',
           accessTokenEnv: 'TEST_GATEWAY_TOKEN',
+          requireRunPermit: true,
           connectTimeoutMs: 1500,
         },
       }),
@@ -156,6 +157,7 @@ describe('agent-sdk config resolution', () => {
     expect(config.gateway).toMatchObject({
       url: 'wss://gateway.example/rpc',
       accessTokenEnv: 'TEST_GATEWAY_TOKEN',
+      requireRunPermit: true,
       connectTimeoutMs: 1500,
     });
     expect(JSON.stringify(config)).not.toContain('access-token-value');
@@ -212,6 +214,66 @@ describe('agent-sdk gateway integration', () => {
         output: 'injected adapter result',
       });
       expect(generate).toHaveBeenCalledTimes(1);
+    } finally {
+      await sdk.close();
+    }
+  });
+
+  it.each(['local', 'byok'] as const)('authorizes %s runs without sending prompts or provider keys to the gateway', async (inferenceMode) => {
+    const authorizeRun = vi.fn(async (params: { runId: string; inferenceMode: 'local' | 'byok' }) => ({
+      permitId: `permit-${params.runId}`,
+      inferenceMode: params.inferenceMode,
+      routePolicyVersion: 'policy-direct-v1',
+      remoteCapabilities: [],
+      expiresAt: '2099-01-01T00:00:00.000Z',
+    }));
+    const generateModel = vi.fn();
+    const localGenerate = vi.fn(async () => ({ finishReason: 'stop' as const, text: `${inferenceMode} complete` }));
+    const sdk = await createAgentSdk({
+      cwd: process.cwd(),
+      env: { OPENROUTER_API_KEY: 'client-owned-provider-key' },
+      runtimeMode: 'memory',
+      inferenceMode,
+      gateway: { requireRunPermit: true },
+      gatewayClient: { authorizeRun, generateModel } as unknown as GatewayClient,
+      modelAdapter: {
+        provider: inferenceMode === 'local' ? 'ollama' : 'openrouter',
+        model: 'client-owned-model',
+        capabilities: { toolCalling: true, jsonOutput: true, streaming: false, usage: true },
+        generate: localGenerate,
+      },
+      agentConfig: {
+        id: `${inferenceMode}-permit-agent`,
+        name: `${inferenceMode} Permit Agent`,
+        invocationModes: ['run'],
+        defaultInvocationMode: 'run',
+        model: { provider: 'openrouter', model: 'client-owned-model', apiKeyEnv: 'OPENROUTER_API_KEY' },
+        tools: [],
+      },
+    });
+
+    try {
+      const goal = `private ${inferenceMode} prompt`;
+      const result = await sdk.runRaw(goal);
+      const inspection = await sdk.inspect(result.runId);
+
+      expect(result).toMatchObject({ status: 'success', output: `${inferenceMode} complete` });
+      expect(authorizeRun).toHaveBeenCalledWith({
+        runId: result.runId,
+        inferenceMode,
+        profileRefs: [],
+      });
+      expect(JSON.stringify(authorizeRun.mock.calls)).not.toContain(goal);
+      expect(JSON.stringify(authorizeRun.mock.calls)).not.toContain('client-owned-provider-key');
+      expect(generateModel).not.toHaveBeenCalled();
+      expect(localGenerate).toHaveBeenCalled();
+      expect(inspection.run?.executionContext).toMatchObject({
+        inferenceMode,
+        authorizationRef: `permit-${result.runId}`,
+        authorizationRunId: result.runId,
+        routePolicyRef: 'policy-direct-v1',
+      });
+      expect(inspection.run?.executionContext).not.toHaveProperty('inferenceTier');
     } finally {
       await sdk.close();
     }

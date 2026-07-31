@@ -58,6 +58,26 @@ accepted only for loopback development servers. An `agent/run` or `agent/chat`
 `profileRef` must match the exact server profile pinned during
 `runtime/initialize`; selecting another profile requires another runtime.
 
+## Local model and direct BYOK inference
+
+Set `inferenceMode` to `local` for Ollama or `byok` for a direct provider
+adapter. Provider configuration is loaded from the local agent/settings files,
+and provider keys are read from the sidecar process environment. Provider keys
+must not be sent in JSON-RPC requests.
+
+When official-client policy requires online authorization, also set
+`requireRunPermit` to `true`, provide `gatewayUrl`, and install the access token
+with `auth/updateAccessToken`. The bridge obtains `run/authorize` before it
+creates each run and records the returned permit in the local protected
+execution context. After authorization, prompts and model usage go directly to
+the selected local/BYOK adapter; they are not sent to the gateway. Consequently,
+gateway billing has no authoritative token usage for this direct work. Any
+client-reported direct usage is non-authoritative telemetry.
+
+This is policy enforcement by the official client, not a hard security
+boundary. A modified local client controls its own process and can bypass the
+authorization check.
+
 ## Typed JSON-RPC methods
 
 Use typed methods for persistent desktop workflows. They share one `AgentSdk`,
@@ -67,7 +87,7 @@ steering, and in-memory run state.
 | Method | Required params | Optional params |
 | --- | --- | --- |
 | `initialize` | `protocolVersion`, `clientInfo.name` | `clientInfo.version`, `capabilities` |
-| `runtime/initialize` | - | `cwd`, `agentConfigPath`, `settingsConfigPath`, `runtimeMode`, `sqlitePath`, `provider`, `model`, `approvalMode`, `clarificationMode`, `inferenceMode`, `inferenceTier`, `profileRef`, `gatewayUrl` |
+| `runtime/initialize` | - | `cwd`, `agentConfigPath`, `settingsConfigPath`, `runtimeMode`, `sqlitePath`, `provider`, `model`, `approvalMode`, `clarificationMode`, `inferenceMode`, `inferenceTier`, `profileRef`, `gatewayUrl`, `requireRunPermit` |
 | `runtime/info` | - | - |
 | `runtime/shutdown` | - | - |
 | `auth/updateAccessToken` | `accessToken` | - |
