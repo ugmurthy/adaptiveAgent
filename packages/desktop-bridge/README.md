@@ -51,6 +51,15 @@ database connection.
 {"jsonrpc":"2.0","id":"runtime","method":"runtime/initialize","params":{"cwd":"/workspace","runtimeMode":"sqlite","sqlitePath":"/workspace/runtime.sqlite","inferenceMode":"gateway","inferenceTier":"high","gatewayUrl":"wss://gateway.example/rpc","profileRef":{"source":"server","id":"researcher","version":"1","contentHash":"sha256"},"approvalMode":"manual","clarificationMode":"interactive"}}
 ```
 
+Restricted clients can instead send `{"configurationDriven":true}`. This
+preserves runtime, model, inference, workspace, and interaction choices from
+the conventional settings/agent files and rejects request-level overrides. It
+also requires BYOK inference, run invocation, non-interactive interaction
+policies, and an available provider credential. Initialization and
+`runtime/info` then include an allowlisted `resolvedConfiguration` summary with
+agent/provider/model/runtime/workspace/policy fields and credential availability
+only. Credential values are never included.
+
 The token is retained only in bridge memory. Replacing it retires the
 authenticated connection after active requests finish; the next request uses
 the replacement token. Remote gateway URLs must use `wss:`. Plain `ws:` is
@@ -87,7 +96,7 @@ steering, and in-memory run state.
 | Method | Required params | Optional params |
 | --- | --- | --- |
 | `initialize` | `protocolVersion`, `clientInfo.name` | `clientInfo.version`, `capabilities` |
-| `runtime/initialize` | - | `cwd`, `agentConfigPath`, `settingsConfigPath`, `runtimeMode`, `sqlitePath`, `provider`, `model`, `approvalMode`, `clarificationMode`, `inferenceMode`, `inferenceTier`, `profileRef`, `gatewayUrl`, `requireRunPermit` |
+| `runtime/initialize` | - | `configurationDriven`, `cwd`, `agentConfigPath`, `settingsConfigPath`, `runtimeMode`, `sqlitePath`, `provider`, `model`, `approvalMode`, `clarificationMode`, `inferenceMode`, `inferenceTier`, `profileRef`, `gatewayUrl`, `requireRunPermit` |
 | `runtime/info` | - | - |
 | `runtime/shutdown` | - | - |
 | `auth/updateAccessToken` | `accessToken` | - |

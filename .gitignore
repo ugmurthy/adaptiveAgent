@@ -6,6 +6,8 @@ node_modules/
 # Build outputs
 dist/
 build/
+target/
+packages/desktop-app/src-tauri/binaries/
 
 marketing/
 

@@ -91,6 +91,21 @@ describe('desktop bridge protocol', () => {
     }))).toThrowError(expect.objectContaining<Partial<DesktopProtocolError>>({ code: 'INVALID_PARAMS' }));
   });
 
+  it('validates configuration-driven runtime initialization', () => {
+    expect(parseDesktopRpcRequest(JSON.stringify({
+      jsonrpc: '2.0',
+      id: 'runtime',
+      method: 'runtime/initialize',
+      params: { configurationDriven: true },
+    }))).toMatchObject({ method: 'runtime/initialize' });
+    expect(() => parseDesktopRpcRequest(JSON.stringify({
+      jsonrpc: '2.0',
+      id: 'runtime',
+      method: 'runtime/initialize',
+      params: { configurationDriven: 'yes' },
+    }))).toThrowError(expect.objectContaining<Partial<DesktopProtocolError>>({ code: 'INVALID_PARAMS' }));
+  });
+
   it('recovers JSON-RPC string and numeric ids without coercion', () => {
     expect(rpcIdFromUnknownLine('{"jsonrpc":"2.0","id":"rpc-1"}')).toBe('rpc-1');
     expect(rpcIdFromUnknownLine('{"jsonrpc":"2.0","id":42}')).toBe(42);

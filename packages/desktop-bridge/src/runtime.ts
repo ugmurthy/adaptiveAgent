@@ -1,4 +1,4 @@
-import { AgentSdk, type AgentSdkOptions } from '@adaptive-agent/agent-sdk';
+import { AgentSdk, type AgentSdkOptions, type ResolvedAgentSdkConfig } from '@adaptive-agent/agent-sdk';
 import {
   ADAPTIVE_AGENT_CLI_COMMANDS,
   ADAPTIVE_AGENT_CLI_SUBCOMMANDS,
@@ -52,6 +52,15 @@ export interface CliExecutor {
   execute(request: CliExecutionRequest): Promise<CliExecutionResult>;
 }
 
+export interface SafeResolvedConfiguration {
+  agent: { id: string; name: string; description?: string; defaultInvocationMode: string };
+  model: { provider: string; model: string; credentialAvailable: boolean };
+  inference: { mode: string; tier: string };
+  runtime: { mode: string; sqlitePath?: string };
+  workspace: { root: string; shellCwd: string };
+  interaction: { approvalMode: string; clarificationMode: string };
+}
+
 const CLI_EXECUTE_DENYLIST = new Map<AdaptiveAgentCliCommand, string>([
   ['ambient', 'ambient start is a long-running supervisor; use a dedicated lifecycle API instead'],
   ['update', 'the desktop sidecar must not replace installed binaries'],
@@ -76,6 +85,7 @@ export class DesktopRuntime {
   private accessToken: string | undefined;
   private gatewayClient: GatewayClient | undefined;
   private executionSelection: { inferenceMode: InferenceMode; inferenceTier: InferenceTier; profileRef?: ProfileRef } | undefined;
+  private configurationDriven = false;
 
   constructor(
     private readonly write: DesktopMessageWriter,
@@ -122,7 +132,9 @@ export class DesktopRuntime {
       case 'agent/run': {
         const params = request.params!;
         this.validateExecutionSelection(params);
-        return asJsonValue(await this.requireSdk().runRaw(params.goal, {
+        const sdk = this.requireSdk();
+        const run = this.configurationDriven ? sdk.run.bind(sdk) : sdk.runRaw.bind(sdk);
+        return asJsonValue(await run(params.goal, {
           ...(params.sessionId ? { sessionId: params.sessionId } : {}),
           ...(params.input === undefined ? {} : { input: params.input }),
           ...(params.inferenceTier ? { inferenceTier: params.inferenceTier } : {}),
@@ -245,6 +257,7 @@ export class DesktopRuntime {
         workspaceRoot: this.sdk.config.workspaceRoot,
         inferenceMode: this.sdk.config.inference.mode,
         inferenceTier: this.sdk.config.inference.tier,
+        resolvedConfiguration: asJsonValue(safeResolvedConfiguration(this.sdk.config)),
         ...(this.executionSelection?.profileRef ? { profileRef: asJsonValue(this.executionSelection.profileRef) } : {}),
         connections: {
           sqlite: {
@@ -280,6 +293,13 @@ export class DesktopRuntime {
     if ((inferenceMode === 'gateway' || params.requireRunPermit) && !params.gatewayUrl) {
       throw new DesktopProtocolError('INVALID_PARAMS', 'gatewayUrl is required for gateway inference or required run permits.', JSON_RPC_ERROR_CODES.invalidParams);
     }
+    if (params.configurationDriven && hasConfigurationOverrides(params)) {
+      throw new DesktopProtocolError(
+        'INVALID_PARAMS',
+        'configurationDriven initialization cannot override runtime, model, inference, gateway, or interaction settings.',
+        JSON_RPC_ERROR_CODES.invalidParams,
+      );
+    }
 
     const gatewayClient = inferenceMode === 'gateway' || params.requireRunPermit
       ? new GatewayClient({
@@ -294,16 +314,18 @@ export class DesktopRuntime {
     const settingsOverrides: NonNullable<AgentSdkOptions['settingsOverrides']> = {
       logging: { enabled: false },
       events: { subscribe: false, printLifecycle: false, verbose: false },
-      interaction: {
-        approvalMode: params.approvalMode ?? 'manual',
-        clarificationMode: params.clarificationMode ?? 'interactive',
-      },
+      ...(params.configurationDriven ? {} : {
+        interaction: {
+          approvalMode: params.approvalMode ?? 'manual',
+          clarificationMode: params.clarificationMode ?? 'interactive',
+        },
+      }),
     };
     const options: AgentSdkOptions = {
       ...(params.cwd ? { cwd: params.cwd } : {}),
       ...(params.agentConfigPath ? { agentConfigPath: params.agentConfigPath } : {}),
       ...(params.settingsConfigPath ? { settingsConfigPath: params.settingsConfigPath } : {}),
-      runtimeMode: params.runtimeMode ?? 'sqlite',
+      ...(params.configurationDriven ? {} : { runtimeMode: params.runtimeMode ?? 'sqlite' }),
       ...(params.sqlitePath ? { sqlitePath: params.sqlitePath } : {}),
       ...(params.provider || params.model ? {
         model: {
@@ -331,7 +353,16 @@ export class DesktopRuntime {
     this.sdkInitialization = initialization;
     try {
       const sdk = await initialization;
+      if (params.configurationDriven) {
+        try {
+          validateRestrictedDesktopConfiguration(sdk.config);
+        } catch (error) {
+          await sdk.close();
+          throw error;
+        }
+      }
       this.sdk = sdk;
+      this.configurationDriven = params.configurationDriven ?? false;
       this.executionSelection = {
         inferenceMode: sdk.config.inference.mode,
         inferenceTier: sdk.config.inference.tier,
@@ -349,6 +380,7 @@ export class DesktopRuntime {
         registeredToolNames: sdk.registeredToolNames,
         inferenceMode: sdk.config.inference.mode,
         inferenceTier: sdk.config.inference.tier,
+        resolvedConfiguration: asJsonValue(safeResolvedConfiguration(sdk.config)),
         ...(params.profileRef ? { profileRef: asJsonValue(params.profileRef) } : {}),
         connections: {
           sqlite: sdk.config.runtime.mode === 'sqlite' ? 'connected' : 'not_configured',
@@ -356,6 +388,8 @@ export class DesktopRuntime {
         },
       };
     } catch (error) {
+      await this.sdk?.close().catch(() => undefined);
+      this.sdk = undefined;
       gatewayClient?.close();
       if (this.gatewayClient === gatewayClient) this.gatewayClient = undefined;
       throw error;
@@ -502,6 +536,73 @@ export class DesktopRuntime {
       );
     }
     return this.sdk;
+  }
+}
+
+export function safeResolvedConfiguration(config: ResolvedAgentSdkConfig): SafeResolvedConfiguration {
+  return {
+    agent: {
+      id: config.agent.id,
+      name: config.agent.name,
+      ...(config.agent.description ? { description: config.agent.description } : {}),
+      defaultInvocationMode: config.agent.defaultInvocationMode,
+    },
+    model: {
+      provider: config.model.provider,
+      model: config.model.model,
+      credentialAvailable: Boolean(config.model.apiKey) || config.model.provider === 'ollama',
+    },
+    inference: { mode: config.inference.mode, tier: config.inference.tier },
+    runtime: {
+      mode: config.runtime.mode,
+      ...(config.runtime.sqlitePath ? { sqlitePath: config.runtime.sqlitePath } : {}),
+    },
+    workspace: { root: config.workspaceRoot, shellCwd: config.shellCwd },
+    interaction: { ...config.interaction },
+  };
+}
+
+function hasConfigurationOverrides(params: RuntimeInitializeParams): boolean {
+  return [
+    params.agentConfigPath,
+    params.runtimeMode,
+    params.sqlitePath,
+    params.provider,
+    params.model,
+    params.approvalMode,
+    params.clarificationMode,
+    params.inferenceMode,
+    params.inferenceTier,
+    params.profileRef,
+    params.gatewayUrl,
+    params.requireRunPermit,
+  ].some((value) => value !== undefined);
+}
+
+export function validateRestrictedDesktopConfiguration(config: ResolvedAgentSdkConfig): void {
+  const errors: string[] = [];
+  if (config.inference.mode !== 'byok') errors.push(`inference.mode must be "byok" (resolved: "${config.inference.mode}")`);
+  if (!config.agent.invocationModes.includes('run') || config.agent.defaultInvocationMode !== 'run') {
+    errors.push('the selected agent must support run and set defaultInvocationMode to "run"');
+  }
+  if (config.interaction.approvalMode === 'manual') {
+    errors.push('interaction.approvalMode must be "auto" or "reject"; manual approval is not available in the desktop MVP');
+  }
+  if (config.interaction.approvalMode === 'reject' && config.settings.defaults?.autoApproveAll === true) {
+    errors.push('interaction.approvalMode "reject" conflicts with defaults.autoApproveAll true; remove autoApproveAll or set it to false');
+  }
+  if (config.interaction.clarificationMode === 'interactive') {
+    errors.push('interaction.clarificationMode must be "fail"; interactive clarification is not available in the desktop MVP');
+  }
+  if (!safeResolvedConfiguration(config).model.credentialAvailable) {
+    errors.push(`the configured ${config.model.provider} credential is unavailable in the sidecar environment`);
+  }
+  if (errors.length > 0) {
+    throw new DesktopProtocolError(
+      'INVALID_DESKTOP_CONFIGURATION',
+      `Desktop settings are not runnable: ${errors.join('; ')}. Update agent.settings.json and reload settings.`,
+      JSON_RPC_ERROR_CODES.invalidParams,
+    );
   }
 }
 
