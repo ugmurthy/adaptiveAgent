@@ -69,6 +69,8 @@ export interface DesktopClientInfo {
 }
 
 export interface RuntimeInitializeParams {
+  /** Preserve settings/agent runtime and interaction choices for restricted desktop clients. */
+  configurationDriven?: boolean;
   cwd?: string;
   agentConfigPath?: string;
   settingsConfigPath?: string;
@@ -346,6 +348,7 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
 }
 
 function validateRuntimeInitializeParams(value: Record<string, unknown>): void {
+  optionalBoolean(value, 'configurationDriven');
   optionalString(value, 'cwd');
   optionalString(value, 'agentConfigPath');
   optionalString(value, 'settingsConfigPath');

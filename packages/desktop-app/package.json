@@ -1,0 +1,28 @@
+{
+  "name": "@adaptive-agent/desktop-app",
+  "version": "0.1.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "web:build": "vite build",
+    "sidecar:prepare": "bun run scripts/prepare-sidecar.ts",
+    "tauri:dev": "bun run sidecar:prepare && tauri dev",
+    "tauri:build": "bun run sidecar:prepare && tauri build",
+    "typecheck": "bunx svelte-check --tsconfig ./tsconfig.json && bunx tsc --noEmit"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.8.0",
+    "svelte": "^5.35.0"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^6.1.0",
+    "@tauri-apps/cli": "^2.8.0",
+    "@tsconfig/svelte": "^5.0.4",
+    "bun-types": "^1.3.5",
+    "svelte-check": "^4.2.2",
+    "typescript": "^5.8.3",
+    "vite": "^7.0.2"
+  }
+}

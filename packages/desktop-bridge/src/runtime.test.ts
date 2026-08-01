@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { ADAPTIVE_AGENT_CLI_COMMANDS } from '@adaptive-agent/agent-sdk/cli';
+import type { ResolvedAgentSdkConfig } from '@adaptive-agent/agent-sdk';
 
 import { JSON_RPC_ERROR_CODES, type DesktopMessage, type DesktopRpcRequest } from './protocol.js';
-import { DesktopRuntime, type CliExecutor } from './runtime.js';
+import { DesktopRuntime, safeResolvedConfiguration, validateRestrictedDesktopConfiguration, type CliExecutor } from './runtime.js';
 
 function request(value: Omit<DesktopRpcRequest, 'jsonrpc'>): DesktopRpcRequest {
   return { jsonrpc: '2.0', ...value } as DesktopRpcRequest;
@@ -26,6 +27,38 @@ async function initialize(runtime: DesktopRuntime): Promise<void> {
 }
 
 describe('desktop runtime protocol', () => {
+  it('projects only allowlisted resolved settings and credential availability', () => {
+    const summary = safeResolvedConfiguration({
+      agent: { id: 'agent-1', name: 'Researcher', description: 'Finds facts', invocationModes: ['run'], defaultInvocationMode: 'run' },
+      model: { provider: 'openrouter', model: 'test-model', apiKey: 'never-expose-this' },
+      inference: { mode: 'byok', tier: 'medium' },
+      runtime: { requestedMode: 'sqlite', mode: 'sqlite', autoMigrate: true, sqlitePath: '/tmp/runtime.sqlite' },
+      workspaceRoot: '/workspace',
+      shellCwd: '/workspace/project',
+      interaction: { approvalMode: 'reject', clarificationMode: 'fail' },
+    } as ResolvedAgentSdkConfig);
+
+    expect(summary).toMatchObject({
+      agent: { id: 'agent-1', name: 'Researcher', defaultInvocationMode: 'run' },
+      model: { provider: 'openrouter', model: 'test-model', credentialAvailable: true },
+      inference: { mode: 'byok' },
+      interaction: { approvalMode: 'reject', clarificationMode: 'fail' },
+    });
+    expect(JSON.stringify(summary)).not.toContain('never-expose-this');
+  });
+
+  it('rejects conflicting reject and auto-approve settings for restricted desktop runs', () => {
+    expect(() => validateRestrictedDesktopConfiguration({
+      agent: { id: 'agent-1', name: 'Researcher', invocationModes: ['run'], defaultInvocationMode: 'run' },
+      settings: { defaults: { autoApproveAll: true } },
+      model: { provider: 'openrouter', model: 'test-model', apiKey: 'available' },
+      inference: { mode: 'byok', tier: 'medium' },
+      runtime: { requestedMode: 'memory', mode: 'memory', autoMigrate: true },
+      workspaceRoot: '/workspace', shellCwd: '/workspace',
+      interaction: { approvalMode: 'reject', clarificationMode: 'fail' },
+    } as ResolvedAgentSdkConfig)).toThrow(/conflicts with defaults\.autoApproveAll true/);
+  });
+
   it('requires and negotiates the JSON-RPC protocol handshake', async () => {
     const { runtime } = createRuntime();
     await expect(runtime.handleRpc(request({ id: 1, method: 'runtime/info' }))).rejects.toMatchObject({
