@@ -1,9 +1,9 @@
 # `@adaptive-agent/trace-session`
 
-`trace-session` is a decision-oriented Postgres trace reporter for persisted
-AdaptiveAgent sessions and runs. It turns runtime records into a stable
-human-readable, JSON, or HTML report that explains what ran, whether the
-execution can be trusted, what it consumed, and what to inspect next.
+`trace-session` is a decision-oriented SQLite/Postgres trace reporter for
+persisted AdaptiveAgent sessions and runs. It turns runtime records into a
+stable human-readable, JSON, or HTML report that explains what ran, whether
+the execution can be trusted, what it consumed, and what to inspect next.
 
 The package reads the core runtime tables directly. Gateway session tables are
 optional, so reports continue to work for core-only runs.
@@ -74,6 +74,22 @@ trace-session view run "$RUN_ID"
 
 Use `--database-url`, `--database-url-env <name>`, or `--pgssl` when the default
 `DATABASE_URL` connection is not appropriate.
+
+For an embedded runtime, pass an Agent SDK settings file whose `runtime.mode`
+is `sqlite` (and optional `runtime.sqlitePath`) with `--settings <path>`.
+
+## Read-only sidecar
+
+The `trace-session-sidecar` binary exposes the same `TraceService` over bounded
+NDJSON JSON-RPC 2.0 for desktop/native hosts. It supports SQLite and Postgres,
+requires an `initialize` handshake for protocol `1.0`, and provides runtime
+info, trace lookup/listing, usage, comparison, aggregation, and shutdown
+methods. Persisted messages, reasoning, and raw tool payloads are denied unless
+their startup policy flags are explicitly enabled.
+
+```bash
+bun run --cwd packages/trace-session trace-sidecar --settings ./agent.settings.json
+```
 
 ## Views
 

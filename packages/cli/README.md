@@ -7,7 +7,7 @@ Installable command-line tools for running Adaptive Agent profiles and inspectin
 This npm package installs two binaries:
 
 - `adaptive-agent` - initialize, configure, run, chat with, evaluate, retry, and orchestrate agents.
-- `trace-session` - inspect Postgres-backed sessions, runs, messages, timelines, usage, and trace reports created by Adaptive Agent.
+- `trace-session` - inspect SQLite- or Postgres-backed sessions, runs, messages, timelines, usage, and trace reports created by Adaptive Agent.
 
 The package is a small JavaScript wrapper around platform-specific native binaries. It installs the right binary package for macOS, Linux, or Windows through optional dependencies.
 
@@ -172,9 +172,9 @@ adaptive-agent retry --runtime postgres --agent agents/market.json --run-id <fai
 
 ## Trace sessions
 
-`trace-session` reads the same Postgres runtime store used by
-`adaptive-agent --runtime postgres`. It reads core runtime tables directly;
-legacy gateway session tables are optional. Use it to discover traces, assess
+`trace-session` reads core runtime tables from embedded SQLite or the same
+Postgres store used by `adaptive-agent --runtime postgres`; gateway session
+tables are optional. Use it to discover traces, assess
 runtime reliability, investigate causal findings, inspect operations and model
 context, compare exact runs, or aggregate trends. Reports can be rendered for
 the terminal, as JSON, or as self-contained HTML.
@@ -274,7 +274,7 @@ trace-session view run <run-id> --cache-ttl 30s
 adaptive-agent init --yes
 adaptive-agent config [--output pretty|json|jsonl]
 adaptive-agent catalog [--output pretty|json|jsonl]
-adaptive-agent doctor [--runtime memory|postgres] [--provider-check]
+adaptive-agent doctor [--runtime memory|sqlite|postgres] [--provider-check]
 adaptive-agent run [options] <goal...>
 adaptive-agent chat [options] [message...]
 adaptive-agent swarm-run --agent <agent> --worker-catalog <agents> <objective...>

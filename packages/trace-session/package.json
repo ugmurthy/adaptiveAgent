@@ -7,11 +7,13 @@
   "main": "src/trace-session.ts",
   "bin": {
     "adaptive-agent-trace-session": "./src/trace-session.ts",
-    "trace-session": "./src/trace-session.ts"
+    "trace-session": "./src/trace-session.ts",
+    "trace-session-sidecar": "./src/trace-sidecar.ts"
   },
   "scripts": {
-    "build": "bun build ./src/trace-session.ts --outdir dist --target bun",
+    "build": "bun build ./src/trace-session.ts ./src/trace-sidecar.ts --outdir dist --target bun",
     "trace-session": "bun run ./src/trace-session.ts",
+    "trace-sidecar": "bun run ./src/trace-sidecar.ts",
     "test": "bunx vitest run && bun test ./src/sqlite-reader.bun.ts",
     "typecheck": "bunx tsc --noEmit"
   },

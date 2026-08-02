@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AdaptiveAgent | Reliable AI Agents</title>
-  <meta name="description" content="AdaptiveAgent is the operating layer for reliable AI agents, built as a Bun and TypeScript runtime and CLI stack.">
+  <title>AdaptiveAgent | Durable Runtime for Reliable AI Agents</title>
+  <meta name="description" content="AdaptiveAgent is a Bun and TypeScript agent runtime with durable execution, embedded SQLite, JSON-RPC 2.0 sidecars, trace analysis, and an authenticated capability gateway.">
   <style>
     :root {
       color-scheme: light;
@@ -43,7 +43,7 @@
       margin: 0;
       background: var(--paper);
       color: var(--ink);
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-family: "Avenir Next", Avenir, "Segoe UI", sans-serif;
       line-height: 1.55;
       text-rendering: optimizeLegibility;
     }
@@ -72,7 +72,7 @@
 
     .hero {
       position: relative;
-      min-height: 84svh;
+      min-height: 760px;
       overflow: hidden;
       background: var(--charcoal);
       color: #fffaf0;
@@ -86,6 +86,7 @@
       height: 100%;
       z-index: -2;
       background: #101418;
+      opacity: 0.14;
     }
 
     .hero::after {
@@ -93,18 +94,18 @@
       position: absolute;
       inset: 0;
       z-index: -1;
-      background: rgba(16, 20, 24, 0.42);
-      box-shadow: inset 700px 0 360px rgba(16, 20, 24, 0.56), inset 0 -260px 190px rgba(16, 20, 24, 0.78);
+      background: rgba(16, 20, 24, 0.64);
+      box-shadow: inset 0 -280px 190px rgba(16, 20, 24, 0.86);
     }
 
     .nav {
-      width: min(var(--max), calc(100% - 40px));
+      width: min(var(--max), calc(100% - 32px));
       margin: 0 auto;
-      padding: 24px 0;
+      padding: 18px 0;
       display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 20px;
+      align-items: flex-start;
+      flex-direction: column;
+      gap: 14px;
     }
 
     .brand {
@@ -133,11 +134,11 @@
     }
 
     .nav-links {
-      display: flex;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
       align-items: center;
       gap: 6px;
-      flex-wrap: wrap;
-      justify-content: flex-end;
+      width: 100%;
     }
 
     .nav-links a {
@@ -148,8 +149,11 @@
       color: rgba(255, 250, 240, 0.76);
       font-size: 0.94rem;
       font-weight: 700;
-      padding: 8px 10px;
+      min-height: 44px;
+      justify-content: center;
+      padding: 10px 6px;
       border-radius: 6px;
+      white-space: nowrap;
     }
 
     .nav-links svg {
@@ -166,9 +170,9 @@
     }
 
     .hero-inner {
-      width: min(var(--max), calc(100% - 40px));
+      width: min(var(--max), calc(100% - 32px));
       margin: 0 auto;
-      padding: clamp(50px, 9vw, 112px) 0 76px;
+      padding: 48px 0 64px;
     }
 
     .eyebrow {
@@ -186,19 +190,21 @@
       margin: 0;
       line-height: 1.04;
       letter-spacing: 0;
+      font-family: "Iowan Old Style", "Palatino Linotype", Georgia, serif;
     }
 
     h1 {
       max-width: 860px;
-      font-size: 7rem;
+      font-size: clamp(3rem, 15vw, 4.5rem);
       font-weight: 900;
+      letter-spacing: -0.055em;
     }
 
     .lede {
       max-width: 730px;
       margin: 24px 0 0;
       color: #fff4dc;
-      font-size: 1.78rem;
+      font-size: 1.36rem;
       line-height: 1.24;
       font-weight: 700;
     }
@@ -207,14 +213,14 @@
       max-width: 760px;
       margin: 22px 0 0;
       color: rgba(255, 250, 240, 0.84);
-      font-size: 1.15rem;
+      font-size: 1.02rem;
     }
 
     .hero-actions {
       display: flex;
-      align-items: center;
+      align-items: stretch;
+      flex-direction: column;
       gap: 12px;
-      flex-wrap: wrap;
       margin-top: 34px;
     }
 
@@ -230,6 +236,8 @@
       text-decoration: none;
       font-weight: 800;
       background: rgba(255, 244, 220, 0.08);
+      width: 100%;
+      justify-content: center;
     }
 
     .button svg {
@@ -251,10 +259,10 @@
     }
 
     .hero-index {
-      width: min(var(--max), calc(100% - 40px));
+      width: min(var(--max), calc(100% - 32px));
       margin: 0 auto;
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-columns: minmax(0, 1fr);
       gap: 12px;
       color: rgba(255, 250, 240, 0.82);
     }
@@ -274,7 +282,7 @@
     }
 
     .band {
-      padding: clamp(56px, 8vw, 96px) 0;
+      padding: 56px 0;
     }
 
     .band-light {
@@ -291,7 +299,7 @@
     }
 
     .container {
-      width: min(var(--max), calc(100% - 40px));
+      width: min(var(--max), calc(100% - 32px));
       margin: 0 auto;
     }
 
@@ -310,15 +318,16 @@
 
     .section-title {
       max-width: 820px;
-      font-size: 3.6rem;
+      font-size: 2.15rem;
       font-weight: 900;
+      letter-spacing: -0.035em;
     }
 
     .section-lede {
       max-width: 780px;
       margin: 18px 0 0;
       color: var(--muted);
-      font-size: 1.18rem;
+      font-size: 1.02rem;
     }
 
     .band-dark .section-lede {
@@ -327,7 +336,7 @@
 
     .overview-grid {
       display: grid;
-      grid-template-columns: minmax(0, 1.04fr) minmax(320px, 0.76fr);
+      grid-template-columns: minmax(0, 1fr);
       gap: clamp(24px, 5vw, 60px);
       align-items: start;
       margin-top: 34px;
@@ -343,7 +352,7 @@
 
     .feature-grid {
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: minmax(0, 1fr);
       gap: 12px;
     }
 
@@ -381,7 +390,7 @@
     .example-grid,
     .docs-grid {
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: minmax(0, 1fr);
       gap: 16px;
       margin-top: 36px;
     }
@@ -397,6 +406,7 @@
       border-radius: 10px;
       background: var(--paper-strong);
       box-shadow: 0 16px 46px rgba(23, 32, 38, 0.08);
+      min-width: 0;
     }
 
     .example-card h3,
@@ -450,7 +460,7 @@
 
     .doc-mini-grid {
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: minmax(0, 1fr);
       gap: 12px;
     }
 
@@ -481,7 +491,7 @@
 
     .doc-recipe-grid {
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: minmax(0, 1fr);
       gap: 14px;
     }
 
@@ -489,6 +499,7 @@
       display: flex;
       flex-direction: column;
       gap: 10px;
+      min-width: 0;
     }
 
     .doc-recipe .code-block {
@@ -506,7 +517,7 @@
 
     .doc-table-row {
       display: grid;
-      grid-template-columns: minmax(170px, 0.7fr) minmax(0, 1.3fr);
+      grid-template-columns: minmax(0, 1fr);
       gap: 1px;
     }
 
@@ -533,8 +544,8 @@
 
     .workflow-header {
       display: flex;
-      align-items: center;
-      justify-content: space-between;
+      align-items: flex-start;
+      flex-direction: column;
       gap: 18px;
       padding: 16px 18px;
       border-bottom: 1px solid var(--line);
@@ -565,7 +576,7 @@
 
     .runtime-map {
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-columns: minmax(0, 1fr);
       gap: 1px;
       background: var(--line);
     }
@@ -599,7 +610,7 @@
 
     .step {
       display: grid;
-      grid-template-columns: minmax(180px, 0.34fr) minmax(0, 1fr);
+      grid-template-columns: minmax(0, 1fr);
       gap: 22px;
       padding: 22px;
       border: 1px solid rgba(255, 244, 220, 0.22);
@@ -665,6 +676,7 @@
 
     .code-block {
       overflow: hidden;
+      min-width: 0;
       border: 1px solid var(--code-line);
       border-radius: 8px;
       background: var(--code-bg);
@@ -719,7 +731,7 @@
       overflow-x: auto;
       padding: 16px;
       color: var(--code-text);
-      font: 0.95rem/1.6 "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font: 0.84rem/1.6 "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
       tab-size: 2;
     }
 
@@ -742,7 +754,7 @@
 
     .provider-list {
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: minmax(0, 1fr);
       gap: 10px;
       margin: 14px 0 0;
       padding: 0;
@@ -756,7 +768,8 @@
       background: rgba(255, 244, 220, 0.06);
       color: rgba(255, 250, 240, 0.78);
       display: flex;
-      align-items: center;
+      align-items: flex-start;
+      flex-direction: column;
       justify-content: space-between;
       gap: 14px;
     }
@@ -807,17 +820,34 @@
     }
 
     .footer-inner {
-      width: min(var(--max), calc(100% - 40px));
+      width: min(var(--max), calc(100% - 32px));
       margin: 0 auto;
       display: flex;
-      align-items: center;
-      justify-content: space-between;
+      align-items: flex-start;
+      flex-direction: column;
       gap: 16px;
       flex-wrap: wrap;
       font-size: 0.94rem;
     }
 
-    @media (max-width: 880px) {
+    @media (min-width: 621px) {
+      .nav {
+        align-items: center;
+        flex-direction: row;
+        justify-content: space-between;
+      }
+
+      .nav-links {
+        display: flex;
+        width: auto;
+        justify-content: flex-end;
+        flex-wrap: wrap;
+      }
+
+      .nav-links a {
+        padding-inline: 10px;
+      }
+
       h1 {
         font-size: 4.75rem;
       }
@@ -832,81 +862,112 @@
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
 
-      .example-grid,
-      .docs-grid {
-        grid-template-columns: 1fr;
-      }
-
-      .doc-mini-grid,
-      .doc-recipe-grid,
-      .doc-table-row {
-        grid-template-columns: 1fr;
-      }
-
-      .overview-grid,
-      .step {
-        grid-template-columns: 1fr;
-      }
-
       .feature-grid {
-        grid-template-columns: 1fr;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .hero-actions {
+        align-items: center;
+        flex-direction: row;
+        flex-wrap: wrap;
+      }
+
+      .button {
+        width: auto;
+      }
+
+      .provider-list li {
+        align-items: center;
+        flex-direction: row;
+      }
+
+      .footer-inner {
+        align-items: center;
+        flex-direction: row;
+        justify-content: space-between;
+      }
+
+      .workflow-header {
+        align-items: center;
+        flex-direction: row;
+        justify-content: space-between;
+      }
+
+      pre {
+        font-size: 0.9rem;
       }
     }
 
-    @media (max-width: 620px) {
+    @media (min-width: 881px) {
       h1 {
-        font-size: 3rem;
+        font-size: 6.3rem;
       }
 
       .lede {
-        font-size: 1.36rem;
+        font-size: 1.78rem;
       }
 
       .hero-copy,
       .section-lede {
-        font-size: 1.02rem;
+        font-size: 1.15rem;
       }
 
       .section-title {
-        font-size: 2.1rem;
+        font-size: 3.6rem;
       }
 
-      .nav {
-        align-items: flex-start;
-        flex-direction: column;
+      .hero::after {
+        background: linear-gradient(90deg, rgba(16, 20, 24, 0.94) 0%, rgba(16, 20, 24, 0.82) 54%, rgba(16, 20, 24, 0.28) 100%);
+        box-shadow: inset 700px 0 360px rgba(16, 20, 24, 0.56), inset 0 -260px 190px rgba(16, 20, 24, 0.78);
       }
 
-      .nav-links {
-        justify-content: flex-start;
+      .hero-canvas {
+        opacity: 0.72;
       }
 
       .hero-inner {
-        padding-top: 44px;
+        padding: clamp(50px, 9vw, 112px) 0 76px;
       }
 
-      .hero-index,
-      .runtime-map,
-      .provider-list {
-        grid-template-columns: 1fr;
+      .band {
+        padding: 96px 0;
       }
 
-      .button {
-        width: 100%;
-        justify-content: center;
+      .hero-index {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
       }
 
-      .workflow-header {
-        align-items: flex-start;
-        flex-direction: column;
+      .runtime-map {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .overview-grid {
+        grid-template-columns: minmax(0, 1.04fr) minmax(320px, 0.76fr);
+      }
+
+      .example-grid,
+      .docs-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .doc-mini-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .doc-recipe-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .doc-table-row {
+        grid-template-columns: minmax(170px, 0.7fr) minmax(0, 1.3fr);
+      }
+
+      .step {
+        grid-template-columns: minmax(180px, 0.34fr) minmax(0, 1fr);
       }
 
       pre {
-        font-size: 0.86rem;
-      }
-
-      .provider-list li {
-        align-items: flex-start;
-        flex-direction: column;
+        font-size: 0.95rem;
       }
     }
   </style>
@@ -930,11 +991,11 @@
       </a>
       <div class="nav-links">
         <a href="#overview">Overview</a>
-        <a href="#runtime">Runtime</a>
+        <a href="#runtime">Architecture</a>
         <a href="#quickstart">Quickstart</a>
         <a href="#examples">Examples</a>
-        <a href="showcase.html">Showcase</a>
         <a href="#docs">Docs</a>
+        <a href="CHANGELOG.md">Changelog</a>
         <a href="https://github.com/ugmurthy/adaptiveAgent" target="_blank" rel="noopener">
           <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
             <path d="M12 .5C5.65.5.5 5.65.5 12c0 5.1 3.29 9.41 7.86 10.94.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.38-3.88-1.38-.52-1.33-1.28-1.68-1.28-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.03 1.75 2.69 1.25 3.35.96.1-.74.4-1.25.73-1.54-2.55-.29-5.23-1.28-5.23-5.68 0-1.25.45-2.28 1.18-3.08-.12-.29-.51-1.46.11-3.04 0 0 .96-.31 3.16 1.18A10.9 10.9 0 0 1 12 6.21c.98 0 1.96.13 2.88.39 2.2-1.49 3.16-1.18 3.16-1.18.62 1.58.23 2.75.11 3.04.74.8 1.18 1.83 1.18 3.08 0 4.41-2.69 5.39-5.25 5.67.41.36.78 1.06.78 2.14v3.03c0 .31.21.67.79.56A11.52 11.52 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z"/>
@@ -945,10 +1006,10 @@
     </nav>
 
     <div class="hero-inner">
-      <p class="eyebrow">Bun + TypeScript runtime and CLI stack</p>
+      <p class="eyebrow">Durable agent runtime · local first · inspectable by design</p>
       <h1>Adaptive<wbr>Agent</h1>
       <p class="lede">AdaptiveAgent is the operating layer for reliable AI agents.</p>
-      <p class="hero-copy">Run goal-oriented agents with typed tools, structured events, approvals, resumable runs, retries, child-run delegation, and multi-model support.</p>
+      <p class="hero-copy">Run goal-oriented agents with typed tools and durable execution. Embed with SQLite, scale with Postgres, connect native hosts through JSON-RPC 2.0 sidecars, or route protected inference and remote tools through the capability gateway.</p>
       <div class="hero-actions">
         <a class="button button-primary" href="#quickstart">
           <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -972,10 +1033,10 @@
   <main id="main">
     <section class="signal-strip" aria-label="AdaptiveAgent capabilities">
       <div class="hero-index">
-        <span>Typed tools and structured events</span>
-        <span>Approvals and controlled execution</span>
-        <span>Resumable runs with retries</span>
-        <span>Child-run delegation and multi-model support</span>
+        <span>Core-owned durable execution semantics</span>
+        <span>Embedded SQLite or shared Postgres</span>
+        <span>Desktop and trace JSON-RPC 2.0 sidecars</span>
+        <span>Authenticated capability gateway</span>
       </div>
     </section>
 
@@ -986,8 +1047,9 @@
         <div class="overview-grid">
           <div class="prose">
             <p>AdaptiveAgent is the operating layer for reliable AI agents.</p>
-            <p>It is a Bun + TypeScript runtime and CLI stack for running goal-oriented agents with typed tools, structured events, approvals, resumable runs, retries, child-run delegation, and multi-model support.</p>
-            <p>It helps teams move from fragile agent demos to controlled, inspectable, recoverable production workflows.</p>
+            <p>Its Bun + TypeScript core owns runs, sessions, child runs, retries, continuation, persistence, eventing, snapshots, and execution-time validation. The Agent SDK owns profiles, configuration, and the user-facing CLI.</p>
+            <p><code>Tool</code> remains the only first-class executable primitive. Plans stay inspectable artifacts rather than becoming a second hidden execution system.</p>
+            <p>Local and native clients can use direct providers or the authenticated capability gateway without moving durable runtime semantics out of core.</p>
           </div>
           <div class="feature-grid" aria-label="Core capabilities">
             <div class="feature">
@@ -995,8 +1057,8 @@
               <span>Keep executable primitives explicit and inspectable.</span>
             </div>
             <div class="feature">
-              <strong>Structured events</strong>
-              <span>Make runtime history legible for teams and systems.</span>
+              <strong>Structured events + traces</strong>
+              <span>Turn runtime history into reliability, causal, usage, and comparison reports.</span>
             </div>
             <div class="feature">
               <strong>Approvals</strong>
@@ -1014,6 +1076,14 @@
               <strong>Multi-model support</strong>
               <span>Route work across providers that match the task.</span>
             </div>
+            <div class="feature">
+              <strong>Embedded durability</strong>
+              <span>Keep local history in SQLite or use Postgres for shared runtimes.</span>
+            </div>
+            <div class="feature">
+              <strong>Native boundaries</strong>
+              <span>Use bounded JSON-RPC 2.0 sidecars for execution and read-only traces.</span>
+            </div>
           </div>
         </div>
       </div>
@@ -1021,35 +1091,45 @@
 
     <section class="band band-white" id="runtime">
       <div class="container">
-        <p class="section-kicker">Runtime shape</p>
-        <h2 class="section-title">A local stack for goals, tools, history, and recovery.</h2>
-        <p class="section-lede">AdaptiveAgent runs goals as durable sessions: tools stay explicit, events record each step, approvals gate sensitive actions, and runtime history supports inspection, retries, and recovery.</p>
+        <p class="section-kicker">Current architecture</p>
+        <h2 class="section-title">One runtime core. Multiple safe ways to operate it.</h2>
+        <p class="section-lede">Core owns execution semantics and validation. The Agent SDK prepares strict requests, durable stores preserve history, sidecars expose bounded native process boundaries, and the capability gateway protects remote inference and tools.</p>
 
         <div class="workflow" aria-label="AdaptiveAgent runtime flow">
           <div class="workflow-header">
-            <span>Inspectable agent execution loop</span>
+            <span>Core, clients, stores, and protected capabilities</span>
             <span class="workflow-dots" aria-hidden="true"><i></i><i></i><i></i></span>
           </div>
           <div class="runtime-map">
             <div class="runtime-node">
-              <b>Goal-oriented agents</b>
-              <span>Begin with a top-level objective and run through the CLI.</span>
-              <code>adaptive-agent run</code>
+              <b>Agent SDK + CLI</b>
+              <span>Loads profiles and settings, resolves user intent, and prepares strict execution requests.</span>
+              <code>@adaptive-agent/agent-sdk</code>
             </div>
             <div class="runtime-node">
-              <b>Typed tools</b>
-              <span>Use explicit capabilities instead of hidden side effects.</span>
-              <code>Tool</code>
+              <b>Runtime core</b>
+              <span>Owns runs, tools, validation, events, retries, continuation, and child-run semantics.</span>
+              <code>@adaptive-agent/core</code>
             </div>
             <div class="runtime-node">
-              <b>Structured events</b>
-              <span>Trace approvals, retries, child runs, and model activity.</span>
-              <code>event log</code>
+              <b>Durable stores</b>
+              <span>Choose ephemeral memory, embedded SQLite, or shared Postgres without changing run semantics.</span>
+              <code>memory · sqlite · postgres</code>
             </div>
             <div class="runtime-node">
-              <b>Recoverable history</b>
-              <span>Resume, inspect, and reason about production workflows.</span>
-              <code>runtime history</code>
+              <b>Desktop bridge</b>
+              <span>Runs agents and streams lifecycle events across a typed NDJSON JSON-RPC 2.0 stdio boundary.</span>
+              <code>agent-runtime</code>
+            </div>
+            <div class="runtime-node">
+              <b>Trace sidecar</b>
+              <span>Gives desktop and native hosts read-only, policy-bounded access to SQLite or Postgres traces.</span>
+              <code>trace-session-sidecar</code>
+            </div>
+            <div class="runtime-node">
+              <b>Capability gateway</b>
+              <span>Authorizes remote inference, server profiles, web tools, streaming, and usage accounting.</span>
+              <code>gateway protocol + client</code>
             </div>
           </div>
         </div>
@@ -1093,7 +1173,7 @@
               <span class="step-number">2</span>
               <div>
                 <h3>Add an API key</h3>
-                <p>The default hosted quickstart uses OpenRouter.</p>
+                <p>The default quickstart calls OpenRouter directly with your key.</p>
               </div>
             </summary>
             <div class="code-stack">
@@ -1230,7 +1310,7 @@ adaptive-agent run \
       <div class="container">
         <p class="section-kicker">Docs</p>
         <h2 class="section-title">How to use AdaptiveAgent from install to repeatable runs.</h2>
-        <p class="section-lede">AdaptiveAgent is a CLI-facing shell workflow backed by a typed runtime. The normal path is initialize config, choose an agent profile, run a goal, and inspect or retry the result.</p>
+        <p class="section-lede">Start in the CLI, then move the same runtime semantics into SQLite-backed local apps, native sidecars, shared Postgres deployments, or gateway-protected inference.</p>
 
         <div class="docs-grid">
           <article class="doc-card">
@@ -1248,7 +1328,7 @@ adaptive-agent run \
             <p>The default command is <code>adaptive-agent run "goal"</code>. Pass <code>--agent</code> to use a specific JSON profile by path or by a name found in your configured agent directories.</p>
             <ul class="doc-list">
               <li><strong>Provider:</strong> override with <code>--provider</code> and <code>--model</code>.</li>
-              <li><strong>Runtime:</strong> use <code>--runtime memory</code> locally or <code>--runtime postgres</code> for durable history.</li>
+              <li><strong>Runtime:</strong> choose <code>memory</code>, embedded durable <code>sqlite</code>, or shared <code>postgres</code>.</li>
               <li><strong>Safety:</strong> choose <code>--approval manual</code>, <code>auto</code>, or <code>reject</code>.</li>
             </ul>
           </article>
@@ -1259,7 +1339,7 @@ adaptive-agent run \
             <ul class="doc-list">
               <li><strong>Readable runs:</strong> add <code>--progress</code>, <code>--events</code>, and <code>--inspect</code>.</li>
               <li><strong>Automation:</strong> use <code>--output json</code> or <code>--output jsonl</code>.</li>
-              <li><strong>Recovery:</strong> use <code>adaptive-agent retry --run-id &lt;runId&gt;</code> for failed retryable runs.</li>
+              <li><strong>Recovery:</strong> inspect, resume, recover, continue, replay, or retry a persisted run.</li>
             </ul>
           </article>
 
@@ -1284,7 +1364,11 @@ adaptive-agent run \
               </div>
               <div class="doc-table-row" role="row">
                 <span role="cell">Make it durable</span>
-                <span role="cell">Use <code>--runtime postgres</code> when a run needs history, retry, or restart-safe execution.</span>
+                <span role="cell">Use <code>--runtime sqlite</code> for embedded local history or <code>postgres</code> for a shared runtime.</span>
+              </div>
+              <div class="doc-table-row" role="row">
+                <span role="cell">Reuse evidence</span>
+                <span role="cell">Create named context bundles from prior run and session outputs, then attach them to new runs.</span>
               </div>
             </div>
           </article>
@@ -1400,16 +1484,16 @@ adaptive-agent catalog</code></pre>
                 </div>
               </div>
               <div class="doc-recipe">
-                <p><strong>Persist and retry long-running work</strong></p>
+                <p><strong>Persist and retry local work</strong></p>
                 <div class="code-block">
                   <div class="code-label">terminal</div>
                   <pre><code>adaptive-agent run \
-  --runtime postgres \
+  --runtime sqlite \
   --events \
   --inspect \
   "Audit these logs and summarize likely root causes."
 
-adaptive-agent retry --run-id &lt;runId&gt; --runtime postgres</code></pre>
+adaptive-agent retry --run-id &lt;runId&gt; --runtime sqlite</code></pre>
                 </div>
               </div>
             </div>
@@ -1443,12 +1527,24 @@ adaptive-agent retry --run-id &lt;runId&gt; --runtime postgres</code></pre>
           </article>
 
           <article class="doc-card">
+            <h3>Inspect traces</h3>
+            <p>Use the decision-oriented trace reporter against embedded SQLite or shared Postgres runtime history.</p>
+            <div class="code-block">
+              <div class="code-label">terminal</div>
+              <pre><code>trace-session list traces --limit 20
+trace-session view run &lt;runId&gt;
+trace-session compare &lt;baselineRunId&gt; &lt;candidateRunId&gt;</code></pre>
+            </div>
+          </article>
+
+          <article class="doc-card">
             <h3>Beyond the terminal</h3>
-            <p>AdaptiveAgent is technical today, but the same runtime can be packaged for non-technical users.</p>
+            <p>The repository now includes native process boundaries and a desktop MVP rather than treating them as future concepts.</p>
             <ul class="doc-list">
-              <li><strong>Desktop app:</strong> guided setup, saved profiles, run history, and approval prompts.</li>
-              <li><strong>Team workspace:</strong> shared templates, durable runs, human review, and audit trails.</li>
-              <li><strong>Hosted forms:</strong> turn common workflows into simple inputs such as topic, files, and desired output.</li>
+              <li><strong>Desktop app:</strong> a Tauri 2 + Svelte client backed by the desktop bridge.</li>
+              <li><strong>Desktop bridge:</strong> typed JSON-RPC 2.0 execution, events, interactions, and run control.</li>
+              <li><strong>Trace sidecar:</strong> read-only JSON-RPC 2.0 trace access with explicit sensitive-data policy.</li>
+              <li><strong>Capability gateway:</strong> authenticated inference, remote tools, profiles, and accounting.</li>
             </ul>
           </article>
         </div>
@@ -1595,10 +1691,19 @@ adaptive-agent retry --run-id &lt;runId&gt; --runtime postgres</code></pre>
       function layoutTrace() {
         const driftX = (pointer.x - 0.5) * 26;
         const driftY = (pointer.y - 0.5) * 16;
+        if (width < 700) {
+          const mobileWidth = Math.min(430, Math.max(width - 32, 240));
+          return {
+            x: 16 + driftX * 0.25,
+            y: height * 0.48 + driftY * 0.25,
+            w: mobileWidth,
+            h: Math.min(300, height * 0.38)
+          };
+        }
         const w = Math.min(540, width * 0.36);
         const h = Math.min(420, height * 0.56);
         return {
-          x: width - w - width * 0.07 + driftX,
+          x: width - w - width * 0.015 + driftX,
           y: height * 0.2 + driftY,
           w,
           h

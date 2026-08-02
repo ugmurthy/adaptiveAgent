@@ -14,9 +14,11 @@ adaptive-agent run [options] <goal...>
 adaptive-agent chat [options] [message...]
 adaptive-agent spec <path> [options]
 adaptive-agent catalog [options]
+adaptive-agent context create|list|show|delete [options]
 adaptive-agent swarm-run --agent <agent> --worker-catalog <agents> [options] <task...>
 adaptive-agent retry --run-id <runId> [options]
 adaptive-agent retry --agent <agent> --worker-catalog <agents> [options] <sessionId>
+adaptive-agent inspect|resume|recover|continue|interrupt|replay <runId> [options]
 adaptive-agent eval cases --input <path> --out <path> [options]
 adaptive-agent eval gaia --input <path> --out <path> [options]
 adaptive-agent update [options]
@@ -42,6 +44,13 @@ Common options:
 | `--dry-run` | Resolve config, request, tools, and delegates without executing. |
 
 Use `adaptive-agent catalog` to print a human-readable inventory of the active agent, every agent found in `settings.agents.dirs`, every registered tool, and delegate skills found in `settings.skills.dirs`. Add `--output json` or `--output jsonl` for scripts.
+
+Runtime stores may be ephemeral `memory`, embedded durable `sqlite`, or
+shared `postgres`. Inference may be local (Ollama), direct BYOK, or routed via
+`@adaptive-agent/gateway-client`; gateway mode can use pinned server profiles
+and the allowlisted remote `web_search` and `read_web_page` tools. Agent SDK
+loads profiles and prepares requests, while core still validates and owns their
+execution semantics.
 
 ## Init install options
 

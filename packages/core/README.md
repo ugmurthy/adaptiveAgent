@@ -11,7 +11,7 @@ The package entrypoint exports:
 - `AdaptiveAgent`: the main run-oriented runtime class.
 - `createAdaptiveAgent(options)`: convenience constructor that resolves model config, creates default in-memory stores, merges skills into delegates, and returns `{ agent, runtime }`.
 - `createAdaptiveAgentRuntime(options?)`: builds a runtime store bundle, defaulting to in-memory stores.
-- Store implementations: in-memory stores and Postgres-backed runtime stores.
+- Store implementations: in-memory, embedded Bun SQLite, and Postgres-backed runtime stores.
 - Model adapters: `createModelAdapter`, `OpenRouterAdapter`, `OllamaAdapter`, `MistralAdapter`, and `MeshAdapter`.
 - Tool factories: `createReadFileTool`, `createListDirectoryTool`, `createWriteFileTool`, `createShellExecTool`, `createWebSearchTool`, and `createReadWebPageTool`.
 - Skill helpers: `loadSkillFromDirectory`, `skillToDelegate`, and related skill types.
@@ -188,7 +188,9 @@ Use this shape when your host application supplies business capabilities as tool
 
 ## Complex use case: durable runtime, approvals, delegates, and recovery
 
-Production hosts should provide durable stores. Core includes Postgres store implementations and migrations; the host supplies a compatible client or pool.
+Production hosts should provide durable stores. Core includes embedded SQLite
+stores plus Postgres store implementations and migrations; the example below
+uses Postgres with a host-supplied compatible client or pool.
 
 ```ts
 import { Pool } from "pg";
@@ -378,6 +380,9 @@ switch (result.status) {
 ### Stores
 
 - In-memory stores are useful for tests and local prototypes.
+- SQLite stores provide an embedded durable runtime through
+  `openSqliteRuntimeStores({ path })` (or `createSqliteRuntimeStores` with an
+  existing `bun:sqlite` database).
 - Postgres stores are useful for durable production runs and expose `runStore`, `eventStore`, `snapshotStore`, `planStore`, `continuationStore`, `toolExecutionStore`, and transaction support.
 - `POSTGRES_RUNTIME_MIGRATIONS` contains the SQL required for the Postgres runtime schema.
 

@@ -22,9 +22,9 @@ Do not add these to core:
 - Fields that duplicate agent definitions such as model, instructions,
   delegates, or allowed tools.
 
-If the new tool should be available from Agent SDK, Core CLI, or the Fastify
-gateway, add that registration in those packages after the core factory is
-implemented and exported.
+If the new tool should be available from Agent SDK or proxied by the capability
+gateway, add that host-owned registration after the core factory is implemented
+and exported.
 
 ## 2. Follow the file and naming pattern
 

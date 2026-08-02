@@ -500,10 +500,14 @@ function emptyUsageSummary(): UsageSummary {
   };
 }
 
-export async function listSessionlessRuns(client: PostgresClient, detectedSupport?: Awaited<ReturnType<typeof detectTraceSupport>>): Promise<SessionlessRunListItem[]> {
+export async function listSessionlessRuns(
+  client: PostgresClient,
+  detectedSupport?: Awaited<ReturnType<typeof detectTraceSupport>>,
+  limit?: number,
+): Promise<SessionlessRunListItem[]> {
   const support = detectedSupport ?? await detectTraceSupport(client);
   if (!support.hasGatewaySessionTables) {
-    return listCoreSessionlessRuns(client);
+    return listCoreSessionlessRuns(client, limit);
   }
 
   const result = await client.query<{
@@ -529,7 +533,8 @@ export async function listSessionlessRuns(client: PostgresClient, detectedSuppor
     where r.id = r.root_run_id
       and l.root_run_id is null
     order by r.created_at desc, r.id desc
-  `);
+    ${limit === undefined ? '' : 'limit $1'}
+  `, limit === undefined ? undefined : [limit]);
 
   return result.rows.map((row) => ({
     sessionId: row.session_id,
@@ -609,7 +614,7 @@ async function listCoreSessions(client: PostgresClient): Promise<SessionListItem
   );
 }
 
-async function listCoreSessionlessRuns(client: PostgresClient): Promise<SessionlessRunListItem[]> {
+async function listCoreSessionlessRuns(client: PostgresClient, limit?: number): Promise<SessionlessRunListItem[]> {
   const result = await client.query<{
     session_id: string | null;
     root_run_id: string;
@@ -631,7 +636,8 @@ async function listCoreSessionlessRuns(client: PostgresClient): Promise<Sessionl
     where r.id = r.root_run_id
       and r.session_id is null
     order by r.created_at desc, r.id desc
-  `);
+    ${limit === undefined ? '' : 'limit $1'}
+  `, limit === undefined ? undefined : [limit]);
 
   return result.rows.map((row) => ({
     sessionId: row.session_id,

@@ -75,13 +75,15 @@ export async function resolveTracePostgresConfig(options: TraceConfigOptions = {
   };
 }
 
-export function createTracePostgresPool(config: TracePostgresConfig, options: { password?: string } = {}): TracePostgresPool {
+export function createTracePostgresPool(config: TracePostgresConfig, options: { password?: string; statementTimeoutMs?: number } = {}): TracePostgresPool {
   configurePgTypeParsers();
 
   const pool = new Pool({
     connectionString: options.password ? connectionStringWithPassword(config.connectionString, options.password) : config.connectionString,
     password: options.password,
     ssl: config.ssl ? { rejectUnauthorized: false } : undefined,
+    statement_timeout: options.statementTimeoutMs,
+    query_timeout: options.statementTimeoutMs,
   });
 
   return pool as unknown as TracePostgresPool;
