@@ -1,7 +1,8 @@
 import { createHash, randomBytes } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir, platform } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import type { CliOptions, SessionUsageSummary, TraceReport } from './types.js';
 
@@ -11,6 +12,9 @@ const MAX_BYTES = 100 * 1024 * 1024;
 const TEMP_FILE_GRACE_MS = 10 * 60_000;
 
 export type CacheValue = TraceReport | SessionUsageSummary;
+export type TraceCacheTarget =
+  | { kind?: 'postgres'; connectionString: string }
+  | { kind: 'sqlite'; path: string };
 interface Entry { version: number; createdAt: number; expiresAt: number; terminal: boolean; value: CacheValue }
 
 export function parseCacheDuration(value: string, source = '--cache-ttl'): number {
@@ -46,7 +50,7 @@ export function databaseIdentity(connectionString: string, env = process.env): s
   return createHash('sha256').update(identity).digest('hex');
 }
 
-export function cacheKey(config: { connectionString: string }, options: CliOptions, kind: 'trace' | 'usage'): string {
+export function cacheKey(config: TraceCacheTarget, options: CliOptions, kind: 'trace' | 'usage'): string {
   const target = options.sessionId
     ? ['session', options.sessionId, options.rootRunId ?? null]
     : options.rootRunId
@@ -57,7 +61,18 @@ export function cacheKey(config: { connectionString: string }, options: CliOptio
     reasoning: Boolean(options.reasoning), includePlans: options.includePlans,
     focusRunId: options.focusRunId ?? null, onlyDelegates: options.onlyDelegates,
   };
-  return createHash('sha256').update(JSON.stringify({ version: VERSION, db: databaseIdentity(config.connectionString), kind, target, variant })).digest('hex');
+  const backend = config.kind === 'sqlite'
+    ? { kind: 'sqlite', identity: canonicalSqliteIdentity(config.path) }
+    : { kind: 'postgres', identity: databaseIdentity(config.connectionString) };
+  return createHash('sha256').update(JSON.stringify({ version: VERSION, backend, kind, target, variant })).digest('hex');
+}
+
+function canonicalSqliteIdentity(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
 }
 
 export function cacheDirectory(env = process.env): string {

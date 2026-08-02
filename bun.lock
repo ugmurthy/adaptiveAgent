@@ -137,6 +137,7 @@
         "trace-session": "./src/trace-session.ts",
       },
       "dependencies": {
+        "@adaptive-agent/agent-sdk": "workspace:*",
         "chalk": "^5.5.0",
         "cli-table3": "0.6.5",
         "marked": "^15.0.12",

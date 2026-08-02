@@ -32,6 +32,38 @@ export interface ResolvedAgentSdkConfigWithSources {
   settingsPath?: string;
 }
 
+export type RuntimeTarget =
+  | { kind: 'memory'; requestedMode: 'memory' | 'postgres'; effectiveMode: 'memory'; settingsPath?: string }
+  | { kind: 'sqlite'; requestedMode: 'sqlite'; effectiveMode: 'sqlite'; path: string; settingsPath?: string }
+  | { kind: 'postgres'; requestedMode: 'postgres'; effectiveMode: 'postgres'; databaseUrl: string; settingsPath?: string };
+
+export interface ResolveRuntimeTargetOptions {
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+  settingsPath?: string;
+}
+
+/** Resolve only durable-runtime settings. This intentionally never discovers an agent or model. */
+export async function resolveRuntimeTarget(options: ResolveRuntimeTargetOptions = {}): Promise<RuntimeTarget> {
+  const cwd = options.cwd ?? process.cwd();
+  const env = { ...(options.env ?? process.env) };
+  const loaded = await loadOptionalSettings(cwd, options.settingsPath, env);
+  const settings = validateSettings(expandStrings(loaded?.value ?? {}, env), loaded?.path ?? '<defaults>');
+  Object.assign(env, settings.env ?? {});
+  const requestedMode = settings.runtime?.mode ?? 'postgres';
+  const source = loaded?.path ? { settingsPath: loaded.path } : {};
+  if (requestedMode === 'memory') return { kind: 'memory', requestedMode, effectiveMode: 'memory', ...source };
+  if (requestedMode === 'sqlite') {
+    const configured = settings.runtime?.sqlitePath ?? env.ADAPTIVE_AGENT_SQLITE_PATH;
+    const path = configured
+      ? resolvePath(cwd, configured, env)
+      : resolve(adaptiveAgentHome(env), 'runtime.sqlite');
+    return { kind: 'sqlite', requestedMode, effectiveMode: 'sqlite', path, ...source };
+  }
+  if (env.DATABASE_URL) return { kind: 'postgres', requestedMode, effectiveMode: 'postgres', databaseUrl: env.DATABASE_URL, ...source };
+  return { kind: 'memory', requestedMode, effectiveMode: 'memory', ...source };
+}
+
 export async function resolveAgentSdkConfig(options: AgentSdkOptions): Promise<ResolvedAgentSdkConfig> {
   return (await resolveAgentSdkConfigWithSources(options)).config;
 }
@@ -153,9 +185,9 @@ function normalizeTuiSettings(settings: TuiSettingsConfig | undefined): TuiSetti
 async function loadOptionalSettings(cwd: string, explicitPath: string | undefined, env: NodeJS.ProcessEnv): Promise<{ path: string; value: AgentSettingsFile } | undefined> {
   const candidates = [explicitPath, env.ADAPTIVE_AGENT_SETTINGS, resolve(cwd, 'agent.settings.json'), resolve(adaptiveAgentHome(env), 'agent.settings.json')].filter(Boolean) as string[];
   for (const candidate of candidates) {
-    const path = resolvePath(cwd, candidate);
+    const path = resolvePath(cwd, candidate, env);
     if (await pathExists(path)) return { path, value: await readJson(path) as AgentSettingsFile };
-    if (candidate === explicitPath || candidate === env.ADAPTIVE_AGENT_SETTINGS) throw new AgentSdkLookupError('agent.settings.json', candidates.map((entry) => resolvePath(cwd, entry)));
+    if (candidate === explicitPath || candidate === env.ADAPTIVE_AGENT_SETTINGS) throw new AgentSdkLookupError('agent.settings.json', candidates.map((entry) => resolvePath(cwd, entry, env)));
   }
   return undefined;
 }

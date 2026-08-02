@@ -81,6 +81,7 @@ export interface CliOptions {
   until?: string;
   htmlPath?: string;
   configPath?: string;
+  settingsPath?: string;
   databaseUrl?: string;
   databaseUrlEnv?: string;
   pgssl?: boolean;

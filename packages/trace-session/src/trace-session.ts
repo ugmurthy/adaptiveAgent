@@ -1,9 +1,11 @@
 #!/usr/bin/env bun
 
 export { main, parseArgs } from './trace-session/cli.js';
-export { createTracePostgresPool, resolveTracePostgresConfig } from './db.js';
-export type { TraceConfigOptions, TracePostgresConfig, TracePostgresPool } from './db.js';
+export { createTracePostgresPool, resolveTracePostgresConfig, resolveTraceRuntimeTarget, UnsupportedTraceRuntimeError } from './db.js';
+export type { TraceConfigOptions, TracePostgresConfig, TracePostgresPool, TraceRuntimeTarget } from './db.js';
 export { aggregateSessionPerformance, listSessionlessRuns, listSessionPerformance, listSessions, loadUsageForTraceTarget, traceSession } from './trace-session/data.js';
+export { PostgresTraceReader, SqliteTraceReader, TraceService } from './trace-session/reader.js';
+export type { TraceReader } from './trace-session/reader.js';
 export {
   buildTraceAggregateReport,
   buildTraceDiagnostics,

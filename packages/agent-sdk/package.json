@@ -7,7 +7,8 @@
   "main": "src/index.ts",
   "exports": {
     ".": "./src/index.ts",
-    "./cli": "./src/cli-api.ts"
+    "./cli": "./src/cli-api.ts",
+    "./runtime-settings": "./src/runtime-settings.ts"
   },
   "bin": {
     "adaptive-agent": "./dist/adaptive-agent.js",

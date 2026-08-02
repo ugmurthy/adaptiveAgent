@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 
 import { Pool, types } from 'pg';
+import { resolveRuntimeTarget } from '@adaptive-agent/agent-sdk/runtime-settings';
 
 import type { PostgresClient } from './trace-session/data.js';
 
@@ -22,6 +23,32 @@ export interface TraceConfigOptions {
   ssl?: boolean;
   env?: NodeJS.ProcessEnv;
   cwd?: string;
+  settingsPath?: string;
+}
+
+export type TraceRuntimeTarget =
+  | { kind: 'postgres'; config: TracePostgresConfig; diagnostic: string }
+  | { kind: 'sqlite'; path: string; diagnostic: string }
+  | { kind: 'memory'; diagnostic: string };
+
+export class UnsupportedTraceRuntimeError extends Error {
+  readonly code = 'TRACE_RUNTIME_UNSUPPORTED';
+  constructor(mode: string) {
+    super(`trace-session cannot inspect the ${mode} runtime because it has no durable data. Select sqlite or postgres in agent.settings.json.`);
+    this.name = 'UnsupportedTraceRuntimeError';
+  }
+}
+
+/** Resolve the trace backend while preserving legacy Postgres option priority. */
+export async function resolveTraceRuntimeTarget(options: TraceConfigOptions = {}): Promise<TraceRuntimeTarget> {
+  const env = options.env ?? process.env;
+  if (options.databaseUrl || options.configPath || options.databaseUrlEnv !== undefined) {
+    return { kind: 'postgres', config: await resolveTracePostgresConfig(options), diagnostic: 'postgres' };
+  }
+  const target = await resolveRuntimeTarget({ cwd: options.cwd, env, settingsPath: options.settingsPath });
+  if (target.kind === 'sqlite') return { kind: 'sqlite', path: target.path, diagnostic: `sqlite:${target.path}` };
+  if (target.kind === 'postgres') return { kind: 'postgres', config: { connectionString: target.databaseUrl, ssl: options.ssl ?? readBoolean(env.PGSSL) }, diagnostic: 'postgres' };
+  return { kind: 'memory', diagnostic: 'memory' };
 }
 
 export type TracePostgresPool = PostgresClient & {

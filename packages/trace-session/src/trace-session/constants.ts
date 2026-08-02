@@ -4,6 +4,7 @@ const GLOBAL_OPTIONS = `Database options:
   --database-url <url>   Postgres connection string. Defaults to DATABASE_URL.
   --database-url-env <n> Read the connection string from this environment variable.
   --config <path>        Config containing connectionString/databaseUrl or urlEnv.
+  --settings <path>      Agent settings used to infer the runtime backend.
   --pgssl                Enable Postgres SSL with rejectUnauthorized=false.
   -h, --help             Show help.`;
 

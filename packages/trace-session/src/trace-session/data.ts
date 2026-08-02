@@ -42,7 +42,7 @@ import type {
   SwarmRole,
 } from './types.js';
 
-type ListFilterOptions = Pick<CliOptions, 'goals' | 'goalRegex' | 'hasGoal' | 'noGoal' | 'statuses' | 'limit' | 'types' | 'swarmRole' | 'since' | 'until'>;
+export type ListFilterOptions = Pick<CliOptions, 'goals' | 'goalRegex' | 'hasGoal' | 'noGoal' | 'statuses' | 'limit' | 'types' | 'swarmRole' | 'since' | 'until'>;
 
 interface TraceSupport {
   hasTraceView: boolean;
@@ -367,7 +367,7 @@ export async function aggregateSessionPerformance(
   return report;
 }
 
-function buildAggregateObservation(
+export function buildAggregateObservation(
   goal: SessionListItem['goals'][number],
   rows: TraceRow[],
   rootUsage: UsageSummary,
@@ -688,7 +688,7 @@ function classifyListItem(record: Record<string, unknown>): { type: TraceListTyp
   return { type: 'run' };
 }
 
-function filterSessions(sessions: SessionListItem[], options: ListFilterOptions): SessionListItem[] {
+export function filterSessions(sessions: SessionListItem[], options: ListFilterOptions): SessionListItem[] {
   const textGoals = options.goals?.map((value) => value.toLocaleLowerCase()) ?? [];
   const statuses = new Set(options.statuses ?? []);
   const types = new Set(options.types ?? []);
@@ -2290,7 +2290,7 @@ async function loadPlans(client: PostgresClient, rootRunIds: string[]): Promise<
   return result.rows;
 }
 
-function runMessageTraceFromRow(
+export function runMessageTraceFromRow(
   row: SnapshotMessageRow,
   options: { includeReasoning?: boolean } = {},
 ): RunMessageTrace | null {

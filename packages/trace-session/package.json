@@ -12,10 +12,11 @@
   "scripts": {
     "build": "bun build ./src/trace-session.ts --outdir dist --target bun",
     "trace-session": "bun run ./src/trace-session.ts",
-    "test": "bunx vitest run",
+    "test": "bunx vitest run && bun test ./src/sqlite-reader.bun.ts",
     "typecheck": "bunx tsc --noEmit"
   },
   "dependencies": {
+    "@adaptive-agent/agent-sdk": "workspace:*",
     "chalk": "^5.5.0",
     "cli-table3": "0.6.5",
     "marked": "^15.0.12",

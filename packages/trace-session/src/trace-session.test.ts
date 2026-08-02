@@ -5,12 +5,49 @@ import chalk from 'chalk';
 import stringWidth from 'string-width';
 import { describe, expect, it } from 'vitest';
 
-import { aggregateSessionPerformance, buildTimeline, buildTraceAggregateReport, buildTraceComparison, buildTraceDiagnostics, computeDelegateReason, listSessionPerformance, listSessions, loadUsageForTraceTarget, parseArgs, renderDeleteEmptyGoalSessionsSql, renderSessionList, renderSessionPerformanceList, renderSessionlessRunList, renderTraceAggregate, renderTraceAggregateHtml, renderTraceComparison, renderTraceComparisonHtml, renderTraceHtml, renderTraceReport, renderUsageReport, summarizePerformance, summarizeTrace, traceSession } from './trace-session.js';
+import { aggregateSessionPerformance, buildTimeline, buildTraceAggregateReport, buildTraceComparison, buildTraceDiagnostics, computeDelegateReason, listSessionPerformance, listSessions, loadUsageForTraceTarget, parseArgs, renderDeleteEmptyGoalSessionsSql, renderSessionList, renderSessionPerformanceList, renderSessionlessRunList, renderTraceAggregate, renderTraceAggregateHtml, renderTraceComparison, renderTraceComparisonHtml, renderTraceHtml, renderTraceReport, renderUsageReport, resolveTraceRuntimeTarget, summarizePerformance, summarizeTrace, traceSession, UnsupportedTraceRuntimeError } from './trace-session.js';
 import { cacheKey, databaseIdentity, effectiveCacheTtl, parseCacheDuration, readCache, writeCache } from './trace-session/cache.js';
 import { usageForArgs } from './trace-session/constants.js';
 import type { EventType, MilestoneEntry, TraceAggregateObservation, TraceReport, TraceRow } from './trace-session.js';
 
 describe('trace-session CLI helpers', () => {
+  it('parses a distinct settings path for runtime inference', () => {
+    expect(parseArgs(['trace-session', 'view', 'session', 's', '--settings', './agent.settings.json']))
+      .toMatchObject({ settingsPath: './agent.settings.json' });
+  });
+
+  it('infers SQLite from settings while preserving explicit PostgreSQL overrides', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'trace-runtime-target-'));
+    try {
+      const settingsPath = join(directory, 'agent.settings.json');
+      await writeFile(settingsPath, JSON.stringify({ runtime: { mode: 'sqlite', sqlitePath: 'runtime.sqlite' } }));
+      await expect(resolveTraceRuntimeTarget({
+        cwd: directory,
+        settingsPath,
+        env: { DATABASE_URL: 'postgres://ambient.example/runtime' },
+      })).resolves.toMatchObject({ kind: 'sqlite', path: join(directory, 'runtime.sqlite') });
+      await expect(resolveTraceRuntimeTarget({
+        cwd: directory,
+        settingsPath,
+        databaseUrl: 'postgres://explicit.example/runtime',
+        env: { DATABASE_URL: 'postgres://ambient.example/runtime' },
+      })).resolves.toMatchObject({ kind: 'postgres', diagnostic: 'postgres' });
+      await expect(resolveTraceRuntimeTarget({
+        cwd: directory,
+        settingsPath,
+        databaseUrlEnv: 'EXPLICIT_MISSING_DATABASE_URL',
+        env: {},
+      })).rejects.toThrow(/EXPLICIT_MISSING_DATABASE_URL/);
+      expect(new UnsupportedTraceRuntimeError('memory')).toMatchObject({
+        code: 'TRACE_RUNTIME_UNSUPPORTED',
+        name: 'UnsupportedTraceRuntimeError',
+      });
+      expect(new UnsupportedTraceRuntimeError('memory').message).toMatch(/Select sqlite or postgres/);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it('parses comparison mode and rejects incomplete, identical, and incompatible targets', () => {
     expect(parseArgs(['trace-session', 'compare', 'base', 'candidate'])).toMatchObject({ compareRunIds: ['base', 'candidate'] });
     expect(() => parseArgs(['trace-session', 'compare', 'base'])).toThrow('candidate run id is required');
@@ -484,6 +521,9 @@ describe('trace-session CLI helpers', () => {
     expect(cacheKey(config, base, 'trace')).not.toBe(cacheKey(config, { ...base, messages: true }, 'trace'));
     expect(cacheKey(config, base, 'trace')).not.toBe(cacheKey(config, { ...base, rootRunId: 'root-1' }, 'trace'));
     expect(cacheKey(config, base, 'usage')).not.toBe(cacheKey(config, base, 'trace'));
+    expect(cacheKey(config, base, 'trace')).not.toBe(cacheKey({ kind: 'sqlite', path: '/tmp/runtime.sqlite' }, base, 'trace'));
+    expect(cacheKey({ kind: 'sqlite', path: '/tmp/runtime.sqlite' }, base, 'trace'))
+      .not.toBe(cacheKey({ kind: 'sqlite', path: '/tmp/other.sqlite' }, base, 'trace'));
     expect(cacheKey(config, base, 'trace')).not.toContain('secret');
   });
 

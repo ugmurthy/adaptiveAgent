@@ -57,6 +57,7 @@ export * from './server-profiles.js';
 export { createGatewayProxyTool, type GatewayProxyToolFactoryOptions, type GatewayRemoteToolName } from './gateway-tools.js';
 export { buildGroundTruthContext, mergeGroundTruthContext } from './ground-truth-context.js';
 export { expandEnvironmentVariables } from './sdk-utils.js';
+export { resolveRuntimeTarget, type ResolveRuntimeTargetOptions, type RuntimeTarget } from './config-resolve.js';
 export { createOrchestrationSdk, OrchestrationSdk } from './orchestration.js';
 export type {
   AgentCatalogEntry,

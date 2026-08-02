@@ -5,12 +5,13 @@ import readline from 'node:readline/promises';
 
 import chalk from 'chalk';
 
-import { createTracePostgresPool as createPostgresPool, resolveTracePostgresConfig, type TracePostgresConfig, type TracePostgresPool } from '../db.js';
+import { createTracePostgresPool as createPostgresPool, resolveTraceRuntimeTarget, UnsupportedTraceRuntimeError, type TracePostgresConfig, type TracePostgresPool } from '../db.js';
 
 import { USAGE, usageForArgs } from './constants.js';
-import { cacheKey, isTerminalReport, parseCacheDuration, readCache, writeCache } from './cache.js';
+import { cacheKey, isTerminalReport, parseCacheDuration, readCache, writeCache, type TraceCacheTarget } from './cache.js';
 import { aggregateSessionPerformance, listSessionlessRuns, listSessionPerformance, listSessions, loadUsageForTraceTargetWithTerminalState, traceSession } from './data.js';
 import { buildTraceComparison } from './report.js';
+import { SqliteTraceReader, TraceService } from './reader.js';
 import {
   renderDeleteEmptyGoalSessionsSql,
   renderSessionPerformanceList,
@@ -196,6 +197,9 @@ export function parseArgs(args: string[]): CliOptions {
       case '--config':
         options.configPath = requireValue(arg, normalizedArgs[++index]);
         break;
+      case '--settings':
+        options.settingsPath = requireValue(arg, normalizedArgs[++index]);
+        break;
       case '--database-url':
         options.databaseUrl = requireValue(arg, normalizedArgs[++index]);
         break;
@@ -245,12 +249,20 @@ export async function main(): Promise<void> {
     }
     if (process.env.TRACE_SESSION_CACHE === 'off' && options.noCache === undefined) options.noCache = true;
 
-    const postgresConfig = await resolveTracePostgresConfig({
+    const runtimeTarget = await resolveTraceRuntimeTarget({
       configPath: options.configPath,
       databaseUrl: options.databaseUrl,
       databaseUrlEnv: options.databaseUrlEnv,
       ssl: options.pgssl,
+      settingsPath: options.settingsPath,
     });
+    if (runtimeTarget.kind === 'memory') throw new UnsupportedTraceRuntimeError('memory');
+    if (runtimeTarget.kind === 'sqlite') {
+      const service = new TraceService(new SqliteTraceReader(runtimeTarget.path));
+      try { await runWithService(service, options, { kind: 'sqlite', path: runtimeTarget.path }); } finally { await service.close(); }
+      return;
+    }
+    const postgresConfig = runtimeTarget.config;
 
     if (options.compareRunIds) {
       const [baselineId, candidateId] = options.compareRunIds;
@@ -323,6 +335,61 @@ export async function main(): Promise<void> {
     console.error(chalk.red(errorMessage(error)));
     process.exitCode = 1;
   }
+}
+
+async function runWithService(service: TraceService, options: CliOptions, cacheTarget: TraceCacheTarget): Promise<void> {
+  if (options.compareRunIds) {
+    const [baselineId, candidateId] = options.compareRunIds;
+    const [baseline, candidate] = await Promise.all([
+      loadServiceTraceWithCache(service, cacheTarget, { ...options, compareRunIds: undefined, runId: baselineId, focusRunId: baselineId }),
+      loadServiceTraceWithCache(service, cacheTarget, { ...options, compareRunIds: undefined, runId: candidateId, focusRunId: candidateId }),
+    ]);
+    const comparison = buildTraceComparison(baseline, candidate, baselineId, candidateId);
+    if (options.htmlPath) {
+      const path = await writeTraceHtmlReport(options.htmlPath, renderTraceComparisonHtml(comparison));
+      if (!options.json) { console.log(`Wrote trace comparison HTML report: ${path}`); return; }
+    }
+    console.log(renderTraceComparison(comparison, { json: options.json }));
+  } else if (options.listPerformance && options.groupBy) {
+    const aggregate = await service.aggregate({ ...options, groupBy: options.groupBy });
+    if (options.htmlPath) {
+      const path = await writeTraceHtmlReport(options.htmlPath, renderTraceAggregateHtml(aggregate));
+      if (!options.json) { console.log(`Wrote trace aggregate HTML report: ${path}`); return; }
+    }
+    console.log(renderTraceAggregate(aggregate, { json: options.json }));
+  } else if (options.listPerformance) {
+    console.log(renderSessionPerformanceList(await service.listPerformance(options), options));
+  } else if (options.listSessionless) {
+    console.log(renderSessionlessRunList(await service.listSessionless(), options));
+  } else if (options.listSessions || options.deleteEmptyGoalSessions) {
+    const sessions = await service.listSessions(options);
+    console.log(options.deleteEmptyGoalSessions ? renderDeleteEmptyGoalSessionsSql(sessions, options) : renderSessionList(sessions, options));
+  } else if (options.usageOnly) {
+    const key = cacheKey(cacheTarget, options, 'usage');
+    const cached = !options.noCache && !options.fresh ? await readCache(key, options.cacheTtl) : undefined;
+    const usage = cached as SessionUsageSummary | undefined ?? await service.usage(options);
+    if (!cached && !options.noCache) await writeCache(key, usage, false, options.cacheTtl).catch(() => undefined);
+    console.log(renderUsageReport(usage, options));
+  } else {
+    const report = await loadServiceTraceWithCache(service, cacheTarget, options);
+    if (traceTargetNotFoundMessage(report)) { console.log(renderTraceReport(report, options)); return; }
+    if (options.htmlPath) {
+      const path = await writeTraceHtmlReport(options.htmlPath, renderTraceHtml(report, options));
+      if (!options.json) { console.log(`Wrote trace HTML report: ${path}`); return; }
+    }
+    console.log(renderTraceReport(report, options));
+  }
+}
+
+async function loadServiceTraceWithCache(service: TraceService, target: TraceCacheTarget, options: CliOptions): Promise<TraceReport> {
+  const key = cacheKey(target, options, 'trace');
+  if (!options.noCache && !options.fresh) {
+    const cached = await readCache(key, options.cacheTtl);
+    if (cached) return cached as TraceReport;
+  }
+  const report = await service.trace(options);
+  if (!options.noCache) await writeCache(key, report, isTerminalReport(report), options.cacheTtl).catch(() => undefined);
+  return report;
 }
 
 async function writeTraceHtmlReport(htmlPath: string, html: string): Promise<string> {
@@ -619,7 +686,7 @@ async function promptHidden(prompt: string): Promise<string> {
 }
 
 function assertOptionApplies(command: string, option: string, options: CliOptions): void {
-  const globalOptions = ['--database-url', '--database-url-env', '--config', '--pgssl', '--help', '-h'];
+  const globalOptions = ['--database-url', '--database-url-env', '--config', '--settings', '--pgssl', '--help', '-h'];
   const optionsByCommand: Record<string, string[]> = {
     view: ['--root-run', '--report', '--focus-run', '--messages', '--reasoning', '--messages-view', '--system-only', '--include-plans', '--only-delegates', '--preview-chars', '--json', '--html', '--fresh', '--no-cache', '--cache-ttl'],
     compare: ['--json', '--html', '--fresh', '--no-cache', '--cache-ttl'],
