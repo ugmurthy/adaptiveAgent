@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { addActivity, formatDuration, modelTiming, type ActivityEvent } from './activity';
+  import ResultRenderer from './ResultRenderer.svelte';
   import {
     getDesktopState,
     createChat, listChats, loadChat, sendChatTurn,
@@ -215,6 +216,13 @@
     return 'No priced usage recorded';
   }
 
+  function resultOutput(value: unknown): unknown {
+    if (value && typeof value === 'object' && 'status' in value && 'output' in value && value.status === 'success') {
+      return value.output;
+    }
+    return value;
+  }
+
   $: inspectionRoot = selectedRunId;
   $: if (inspectionRoot !== traceRoot) {
     traceRoot=inspectionRoot; traceReport=undefined; traceError='';
@@ -310,7 +318,7 @@
         </div>
       {/if}
       {#if finalError}<div class="result error"><h2>Error</h2><pre>{finalError}</pre></div>{/if}
-      {#if finalValue !== undefined}<div class="result"><h2>Result</h2><pre>{typeof finalValue === 'string' ? finalValue : JSON.stringify(finalValue, null, 2)}</pre></div>{/if}
+      {#if finalValue !== undefined}<div class="result"><h2>Result</h2><ResultRenderer value={resultOutput(finalValue)} /></div>{/if}
     </section>
   {:else if tab === 'chat'}
     <section class="panel">
