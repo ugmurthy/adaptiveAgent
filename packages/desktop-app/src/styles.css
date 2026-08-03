@@ -25,3 +25,6 @@ textarea:focus { border-color: #56d6b2; box-shadow: 0 0 0 3px rgba(86,214,178,.1
 .settings-title { justify-content: space-between; margin-bottom: 18px; } .settings-title h2 { margin-bottom: 0; }
 .validity { display: inline-block; margin-bottom: 18px; border-radius: 999px; padding: 6px 10px; background: #3a2426; color: #ffaaa6; font-size: 12px; } .validity.valid { background: #163229; color: #74dfbd; }
 dl { display: grid; grid-template-columns: 150px 1fr; margin: 0; } dt, dd { margin: 0; padding: 12px 0; border-bottom: 1px solid #26323a; } dt { color: #81919b; font-size: 13px; } dd { overflow-wrap: anywhere; font-size: 14px; } small { display: block; margin-top: 3px; color: #6f8089; }
+.quit-backdrop { position: fixed; z-index: 10; inset: 0; display: grid; place-items: center; background: rgba(4, 8, 11, .78); }
+.quit-dialog { width: min(560px, calc(100% - 40px)); padding: 24px; border: 1px solid #3b4951; border-radius: 14px; background: #11191f; box-shadow: 0 20px 70px #000; }
+.quit-dialog h2 { margin: 0 0 8px; } .quit-dialog p { color: #a8b5bc; } .quit-dialog .actions { justify-content: flex-end; } button.danger { border-color: #91484b; background: #6b292d; }

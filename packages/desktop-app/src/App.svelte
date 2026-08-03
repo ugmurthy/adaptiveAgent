@@ -4,6 +4,9 @@
     getDesktopState,
     getRunResult,
     reloadSettings,
+    quitCancel,
+    quitTerminate,
+    quitWait,
     startRun,
     stopRun,
     subscribe,
@@ -13,7 +16,7 @@
 
   let tab: 'run' | 'settings' = 'run';
   let task = '';
-  let desktop: DesktopState = { status: 'starting', configurationValid: false, runs: [], occupiedSlotCount: 0, capacity: 3, executionHealth: 'error', traceHealth: 'starting' };
+  let desktop: DesktopState = { status: 'starting', configurationValid: false, runs: [], occupiedSlotCount: 0, capacity: 3, executionHealth: 'error', traceHealth: 'starting', quitState: 'idle' };
   let progress: ProgressEvent[] = [];
   let finalValue: unknown;
   let finalError = '';
@@ -22,7 +25,7 @@
   let selectedRunId = '';
   let resultsByRun: Record<string, { result?: unknown; error?: string }> = {};
 
-  const canSend = () => desktop.configurationValid && desktop.status !== 'error' && desktop.occupiedSlotCount < desktop.capacity && task.trim().length > 0 && !startPending;
+  const canSend = () => desktop.quitState === 'idle' && desktop.configurationValid && desktop.status !== 'error' && desktop.occupiedSlotCount < desktop.capacity && task.trim().length > 0 && !startPending;
 
   onMount(() => {
     let unlisten = () => {};
@@ -95,7 +98,29 @@
     catch (error) { finalError = String(error); }
     controlPending = false;
   }
+
+  async function quit(action: 'wait' | 'terminate' | 'cancel') {
+    controlPending = true;
+    try {
+      desktop = await (action === 'wait' ? quitWait() : action === 'terminate' ? quitTerminate() : quitCancel());
+    } catch (error) { finalError = String(error); }
+    controlPending = false;
+  }
 </script>
+
+{#if desktop.quitState === 'confirming'}
+  <div class="quit-backdrop" role="presentation">
+    <div class="quit-dialog" role="dialog" aria-modal="true" aria-labelledby="quit-title">
+      <h2 id="quit-title">Runs are still active</h2>
+      <p>Choose how AdaptiveAgent should finish before quitting.</p>
+      <div class="actions">
+        <button disabled={controlPending} on:click={() => quit('cancel')}>Cancel</button>
+        <button disabled={controlPending} on:click={() => quit('wait')}>Wait for runs</button>
+        <button class="danger" disabled={controlPending} on:click={() => quit('terminate')}>Terminate all and quit</button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <main>
   <header>
@@ -119,7 +144,7 @@
       {/if}
       {#if desktop.error}<div class="alert">{desktop.error}</div>{/if}
       <label for="task">Task</label>
-      <textarea id="task" bind:value={task} disabled={!desktop.configurationValid} placeholder="Describe the task for AdaptiveAgent…"></textarea>
+      <textarea id="task" bind:value={task} disabled={!desktop.configurationValid || desktop.quitState !== 'idle'} placeholder="Describe the task for AdaptiveAgent…"></textarea>
       <div class="actions">
         <button class="primary" disabled={!canSend()} on:click={send}>Send</button>
         <span class="run-status">{desktop.occupiedSlotCount}/{desktop.capacity} slots occupied</span>

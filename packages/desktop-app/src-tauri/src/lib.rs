@@ -1,8 +1,10 @@
 use serde::Serialize;
 use serde_json::{json, Value};
 mod registry;
+mod shutdown;
 mod workbench;
 use registry::{CancelAction, RunRecord, RunRegistry, CAPACITY};
+use shutdown::{CloseDecision, QuitCoordinator, QuitState};
 use std::{
     collections::HashMap,
     sync::{
@@ -80,6 +82,7 @@ struct DesktopState {
     trace_health: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     trace_error: Option<String>,
+    quit_state: QuitState,
 }
 
 #[derive(Clone, Serialize)]
@@ -121,9 +124,12 @@ struct Bridge {
 
 #[derive(Default)]
 struct AppState {
+    lifecycle: Mutex<()>,
     bridge: Mutex<Option<Arc<Bridge>>>,
     trace: Mutex<Option<Arc<TraceBridge>>>,
     generation: AtomicU64,
+    quit: Mutex<QuitCoordinator>,
+    shutdown_started: AtomicBool,
 }
 
 struct TraceBridge {
@@ -138,7 +144,7 @@ struct TraceBridge {
 }
 
 impl TraceBridge {
-    fn spawn(
+    fn spawn_process(
         app: &AppHandle,
         sqlite_path: &str,
         healthy: Arc<AtomicBool>,
@@ -174,15 +180,19 @@ impl TraceBridge {
                 }
             }
         });
-        let initialized=match sidecar.request_wait("initialize",Some(json!({"protocolVersion":"1.0","clientInfo":{"name":"adaptive-agent-desktop","version":"0.1.0"}})),REQUEST_TIMEOUT){Ok(value)=>value,Err(error)=>{sidecar.fail(&error);return Err(error)}};
+        Ok(sidecar)
+    }
+
+    fn initialize(&self) -> Result<(), String> {
+        let initialized=match self.request_wait("initialize",Some(json!({"protocolVersion":"1.0","clientInfo":{"name":"adaptive-agent-desktop","version":"0.1.0"}})),REQUEST_TIMEOUT){Ok(value)=>value,Err(error)=>{self.fail(&error);return Err(error)}};
         if initialized.get("protocolVersion").and_then(Value::as_str) != Some("1.0") {
             let error = "Trace sidecar did not negotiate protocol 1.0.".to_string();
-            sidecar.fail(&error);
+            self.fail(&error);
             return Err(error);
         }
-        sidecar.healthy.store(true, Ordering::SeqCst);
-        sidecar.emit_state();
-        Ok(sidecar)
+        self.healthy.store(true, Ordering::SeqCst);
+        self.emit_state();
+        Ok(())
     }
     fn request_wait(&self, method: &str, params: Option<Value>, timeout: Duration) -> Response {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -277,6 +287,9 @@ impl TraceBridge {
 
 impl Bridge {
     fn spawn(app: &AppHandle, workbench: Arc<WorkbenchDb>) -> Result<Arc<Self>, String> {
+        // Complete all fallible persistence reads before creating a child process so every
+        // spawned runtime can be published to, and shut down through, the native lifecycle.
+        let saved_runs = workbench.load_runs()?;
         let (mut events, child) = app
             .shell()
             .sidecar("agent-runtime")
@@ -301,7 +314,7 @@ impl Bridge {
             draining: AtomicBool::new(false),
             reconciling: Mutex::new(HashMap::new()),
         });
-        for saved in bridge.workbench.load_runs()? {
+        for saved in saved_runs {
             bridge.registry.lock().unwrap().insert(RunRecord {
                 run_id: saved.run_id,
                 item_id: saved.item_id,
@@ -447,6 +460,12 @@ impl Bridge {
                         .workbench
                         .store_result(&run_id, result.as_ref().unwrap());
                 }
+                if applied_quiescent {
+                    let _ = bridge.workbench.set_interrupt_pending(&run_id, false);
+                    if let Some(record) = bridge.registry.lock().unwrap().get_mut(&run_id) {
+                        record.interrupt_pending = false;
+                    }
+                }
                 if stale {
                     if let Some(rerun) = bridge.reconciling.lock().unwrap().get_mut(&run_id) {
                         *rerun = true;
@@ -479,31 +498,42 @@ impl Bridge {
     }
 
     fn issue_interrupt(&self, run_id: &str) -> bool {
-        if let Some(record) = self.registry.lock().unwrap().get_mut(run_id) {
-            record.interrupt_pending = true;
-            record.revision += 1;
-        }
         let result = self.request_wait(
             "run/interrupt",
             json!({ "runId": run_id }),
             Duration::from_secs(10),
         );
         if result.is_ok() {
-            // Acceptance is not quiescence. Keep retry intent durable until inspection proves it.
-            let _ = self.workbench.set_interrupt_pending(run_id, true);
-            if let Some(record) = self.registry.lock().unwrap().get_mut(run_id) {
-                // This process has delivered the interrupt. A manual retry or restart can arm it again.
-                record.interrupt_pending = false;
-                record.revision += 1;
-            }
+            // Acceptance is not quiescence. Reconciliation clears the durable intent.
             true
         } else {
-            let _ = self.workbench.set_interrupt_pending(run_id, true);
             let _ = self.app.emit(
                 "adaptive-agent://control-error",
                 json!({ "runId": run_id, "error": result.unwrap_err() }),
             );
             false
+        }
+    }
+
+    fn arm_interrupt(&self, run_id: &str, retry: bool) -> Result<(), String> {
+        loop {
+            match self.workbench.set_interrupt_pending(run_id, true) {
+                Ok(()) => {
+                    if let Some(record) = self.registry.lock().unwrap().get_mut(run_id) {
+                        record.interrupt_pending = true;
+                        record.revision += 1;
+                    }
+                    return Ok(());
+                }
+                Err(error) if retry => {
+                    let _ = self.app.emit(
+                        "adaptive-agent://control-error",
+                        json!({ "runId": run_id, "error": format!("Unable to persist shutdown interrupt; retrying: {error}") }),
+                    );
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
 
@@ -610,7 +640,11 @@ impl Bridge {
                 let bridge = self.clone();
                 let run_id = run_id.to_string();
                 std::thread::spawn(move || {
-                    if bridge.issue_interrupt(&run_id) {
+                    if bridge
+                        .arm_interrupt(&run_id, bridge.draining.load(Ordering::SeqCst))
+                        .is_ok()
+                        && bridge.issue_interrupt(&run_id)
+                    {
                         bridge.reconcile_run(run_id);
                     }
                 });
@@ -828,13 +862,43 @@ impl Bridge {
         }
         self.emit_state();
         if action == CancelAction::Interrupt {
-            let _ = self.workbench.set_interrupt_pending(run_id, true);
+            if let Err(error) = self.arm_interrupt(run_id, false) {
+                if let Some(record) = self.registry.lock().unwrap().get_mut(run_id) {
+                    record.interrupt_pending = false;
+                }
+                return Err(error);
+            }
             if self.issue_interrupt(run_id) {
                 self.reconcile_run(run_id.to_owned());
             }
             Ok(())
         } else {
             Ok(())
+        }
+    }
+
+    fn arm_cancellations(self: &Arc<Self>, run_ids: &[String]) {
+        for run_id in run_ids {
+            loop {
+                match self.workbench.set_cancel_requested(run_id) {
+                    Ok(()) => break,
+                    Err(error) => {
+                        let _ = self.app.emit(
+                            "adaptive-agent://control-error",
+                            json!({ "runId": run_id, "error": format!("Unable to persist shutdown cancellation; retrying: {error}") }),
+                        );
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                }
+            }
+            let action = self.registry.lock().unwrap().request_cancel(run_id);
+            if matches!(action, Ok(CancelAction::Interrupt)) {
+                let _ = self.arm_interrupt(run_id, true);
+                if self.issue_interrupt(run_id) {
+                    self.reconcile_run(run_id.clone());
+                }
+            }
+            self.emit_state();
         }
     }
 
@@ -897,6 +961,7 @@ impl Bridge {
                 "starting"
             },
             trace_error: self.trace_error.lock().unwrap().clone(),
+            quit_state: self.app.state::<AppState>().quit.lock().unwrap().state(),
         }
     }
 
@@ -933,13 +998,22 @@ impl Bridge {
     }
 }
 
-fn replace_bridge(app: &AppHandle) -> Arc<Bridge> {
+fn replace_bridge(app: &AppHandle) -> Result<Arc<Bridge>, String> {
     let state = app.state::<AppState>();
+    let lifecycle = state.lifecycle.lock().unwrap();
+    if state.shutdown_started.load(Ordering::SeqCst)
+        || state.quit.lock().unwrap().state() != QuitState::Idle
+    {
+        return Err("Settings cannot be reloaded while quitting.".into());
+    }
     let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
-    if let Some(previous) = state.bridge.lock().unwrap().take() {
+    let previous_bridge = state.bridge.lock().unwrap().clone();
+    let previous_trace = state.trace.lock().unwrap().clone();
+    drop(lifecycle);
+    if let Some(previous) = previous_bridge {
         previous.shutdown();
     }
-    if let Some(previous) = state.trace.lock().unwrap().take() {
+    if let Some(previous) = previous_trace {
         previous.shutdown();
     }
     let workbench_result = app
@@ -960,15 +1034,26 @@ fn replace_bridge(app: &AppHandle) -> Arc<Bridge> {
             Some(error),
         ),
     };
-    let bridge_result = match persistence_error {
+    let lifecycle = state.lifecycle.lock().unwrap();
+    if state.shutdown_started.load(Ordering::SeqCst)
+        || state.quit.lock().unwrap().state() != QuitState::Idle
+        || state.generation.load(Ordering::SeqCst) != generation
+    {
+        return Err("Settings replacement was superseded or shutdown has started.".into());
+    }
+    // Process creation and publication are one lifecycle operation: no child can exist
+    // while neither the old nor new bridge is visible to close handling.
+    state.bridge.lock().unwrap().take();
+    state.trace.lock().unwrap().take();
+    let spawn_result = match persistence_error {
         Some(error) => Err(error),
         None => Bridge::spawn(app, workbench.clone()),
     };
-    let bridge = match bridge_result {
-        Ok(bridge) => bridge,
+    let (bridge, spawn_error) = match spawn_result {
+        Ok(bridge) => (bridge, None),
         Err(error) => {
             // A non-running placeholder keeps renderer state and errors restricted to the same API.
-            Arc::new(Bridge {
+            let placeholder = Arc::new(Bridge {
                 app: app.clone(),
                 child: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
@@ -980,20 +1065,29 @@ fn replace_bridge(app: &AppHandle) -> Arc<Bridge> {
                 submission: Mutex::new(()),
                 expected_shutdown: AtomicBool::new(true),
                 configuration: Mutex::new(None),
-                initialization_error: Mutex::new(Some(error)),
+                initialization_error: Mutex::new(Some(error.clone())),
                 trace_healthy: Arc::new(AtomicBool::new(false)),
                 trace_error: Arc::new(Mutex::new(None)),
                 draining: AtomicBool::new(false),
                 reconciling: Mutex::new(HashMap::new()),
-            })
+            });
+            (placeholder, Some(error))
         }
     };
+    *state.bridge.lock().unwrap() = Some(bridge.clone());
+    drop(lifecycle);
+
+    if let Some(error) = spawn_error {
+        bridge.emit_state();
+        return Err(error);
+    }
     if bridge.child.lock().unwrap().is_some() {
         if let Err(error) = bridge.initialize() {
-            *bridge.initialization_error.lock().unwrap() = Some(error);
+            *bridge.initialization_error.lock().unwrap() = Some(error.clone());
+            bridge.emit_state();
+            return Err(error);
         }
     }
-    *state.bridge.lock().unwrap() = Some(bridge.clone());
     bridge.emit_state();
     if bridge.initialization_error.lock().unwrap().is_none() {
         let path = bridge
@@ -1008,20 +1102,48 @@ fn replace_bridge(app: &AppHandle) -> Arc<Bridge> {
             let app = app.clone();
             let target = bridge.clone();
             std::thread::spawn(move || {
-                match TraceBridge::spawn(
+                let state = app.state::<AppState>();
+                let lifecycle = state.lifecycle.lock().unwrap();
+                if state.shutdown_started.load(Ordering::SeqCst)
+                    || state.quit.lock().unwrap().state() != QuitState::Idle
+                    || state.generation.load(Ordering::SeqCst) != generation
+                {
+                    return;
+                }
+                match TraceBridge::spawn_process(
                     &app,
                     &path,
                     target.trace_healthy.clone(),
                     target.trace_error.clone(),
                 ) {
-                    Ok(trace)
-                        if app.state::<AppState>().generation.load(Ordering::SeqCst)
-                            == generation =>
-                    {
-                        *app.state::<AppState>().trace.lock().unwrap() = Some(trace);
+                    Ok(trace) => {
+                        *state.trace.lock().unwrap() = Some(trace.clone());
+                        drop(lifecycle);
+                        if let Err(error) = trace.initialize() {
+                            let removed = {
+                                let _lifecycle = state.lifecycle.lock().unwrap();
+                                let mut slot = state.trace.lock().unwrap();
+                                if slot
+                                    .as_ref()
+                                    .is_some_and(|current| Arc::ptr_eq(current, &trace))
+                                {
+                                    slot.take();
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            if removed {
+                                trace.shutdown();
+                            }
+                            if state.generation.load(Ordering::SeqCst) == generation {
+                                *target.trace_error.lock().unwrap() = Some(error);
+                                target.emit_state();
+                            }
+                        }
                     }
-                    Ok(trace) => trace.shutdown(),
                     Err(error) => {
+                        drop(lifecycle);
                         if app.state::<AppState>().generation.load(Ordering::SeqCst) == generation {
                             *target.trace_error.lock().unwrap() = Some(error);
                             target.emit_state();
@@ -1040,7 +1162,7 @@ fn replace_bridge(app: &AppHandle) -> Arc<Bridge> {
             Some("Execution configuration is invalid; trace is unavailable.".into());
         bridge.emit_state();
     }
-    bridge
+    Ok(bridge)
 }
 
 #[tauri::command]
@@ -1059,22 +1181,32 @@ fn reload_settings(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<DesktopState, String> {
-    if state
-        .bridge
-        .lock()
-        .unwrap()
-        .as_ref()
-        .is_some_and(|bridge| bridge.registry.lock().unwrap().any_active())
     {
-        return Err("Stop the active run before reloading settings.".into());
+        let _lifecycle = state.lifecycle.lock().unwrap();
+        if state.quit.lock().unwrap().state() != QuitState::Idle {
+            return Err("Settings cannot be reloaded while quitting.".into());
+        }
+        if state
+            .bridge
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|bridge| bridge.registry.lock().unwrap().any_active())
+        {
+            return Err("Stop the active run before reloading settings.".into());
+        }
     }
-    Ok(replace_bridge(&app).snapshot())
+    Ok(replace_bridge(&app)?.snapshot())
 }
 
 #[tauri::command]
 fn start_run(task: String, state: tauri::State<'_, AppState>) -> Result<StartedRun, String> {
     if task.trim().is_empty() {
         return Err("Task description is required.".into());
+    }
+    let _lifecycle = state.lifecycle.lock().unwrap();
+    if state.quit.lock().unwrap().state() != QuitState::Idle {
+        return Err("The desktop is quitting and cannot start new runs.".into());
     }
     let bridge = state
         .bridge
@@ -1120,6 +1252,110 @@ fn get_run_result(
         .get_result(&run_id)
 }
 
+#[derive(Clone, Copy)]
+enum DrainMode {
+    Wait,
+    Terminate,
+}
+
+fn begin_drain(app: &AppHandle, mode: DrainMode) -> Result<DesktopState, String> {
+    let state = app.state::<AppState>();
+    let lifecycle = state.lifecycle.lock().unwrap();
+    let bridge = state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "Desktop runtime is not available.".to_string())?;
+    state.quit.lock().unwrap().drain().map_err(str::to_owned)?;
+    bridge.draining.store(true, Ordering::SeqCst);
+    let cancellation_targets = bridge.registry.lock().unwrap().occupied_ids();
+    drop(lifecycle);
+    bridge.emit_state();
+    let snapshot = bridge.snapshot();
+
+    let app = app.clone();
+    std::thread::spawn(move || {
+        if matches!(mode, DrainMode::Terminate) {
+            bridge.arm_cancellations(&cancellation_targets);
+        }
+        loop {
+            let ids = bridge.registry.lock().unwrap().occupied_ids();
+            if ids.is_empty() {
+                break;
+            }
+            for id in ids {
+                bridge.reconcile_run(id);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        approve_and_exit(&app);
+    });
+    Ok(snapshot)
+}
+
+fn approve_and_exit(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let lifecycle = state.lifecycle.lock().unwrap();
+    if state.shutdown_started.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let bridge = state.bridge.lock().unwrap().take();
+    let trace = state.trace.lock().unwrap().take();
+    drop(lifecycle);
+    // Potentially blocking sidecar shutdown and app.exit happen with no native mutex held.
+    if let Some(bridge) = bridge {
+        bridge.emit_state();
+        bridge.shutdown();
+    }
+    if let Some(trace) = trace {
+        trace.shutdown();
+    }
+    {
+        let _lifecycle = state.lifecycle.lock().unwrap();
+        let _ = state.quit.lock().unwrap().approve();
+    }
+    app.exit(0);
+}
+
+fn native_close_requested(app: &AppHandle) -> CloseDecision {
+    let state = app.state::<AppState>();
+    let _lifecycle = state.lifecycle.lock().unwrap();
+    let occupied = state.bridge.lock().unwrap().as_ref().map_or(0, |bridge| {
+        bridge.registry.lock().unwrap().occupied_slot_count()
+    });
+    let decision = state.quit.lock().unwrap().close_requested(occupied);
+    if let Some(bridge) = state.bridge.lock().unwrap().as_ref() {
+        bridge.emit_state();
+    }
+    decision
+}
+
+#[tauri::command]
+fn quit_wait(app: AppHandle) -> Result<DesktopState, String> {
+    begin_drain(&app, DrainMode::Wait)
+}
+
+#[tauri::command]
+fn quit_terminate(app: AppHandle) -> Result<DesktopState, String> {
+    begin_drain(&app, DrainMode::Terminate)
+}
+
+#[tauri::command]
+fn quit_cancel(state: tauri::State<'_, AppState>) -> Result<DesktopState, String> {
+    state.quit.lock().unwrap().cancel().map_err(str::to_owned)?;
+    let bridge = state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "Desktop runtime is not available.".to_string())?;
+    bridge.emit_state();
+    Ok(bridge.snapshot())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
@@ -1130,22 +1366,39 @@ pub fn run() {
             reload_settings,
             start_run,
             stop_run,
-            get_run_result
+            get_run_result,
+            quit_wait,
+            quit_terminate,
+            quit_cancel
         ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                match native_close_requested(window.app_handle()) {
+                    CloseDecision::Prevent => api.prevent_close(),
+                    CloseDecision::ShutdownNow => {
+                        api.prevent_close();
+                        approve_and_exit(window.app_handle());
+                    }
+                    CloseDecision::Allow => {}
+                }
+            }
+        })
         .setup(|app| {
-            replace_bridge(app.handle());
+            let _ = replace_bridge(app.handle());
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("failed to build AdaptiveAgent desktop");
 
     app.run(|app, event| {
-        if let tauri::RunEvent::ExitRequested { .. } = event {
-            if let Some(bridge) = app.state::<AppState>().bridge.lock().unwrap().take() {
-                bridge.shutdown();
-            }
-            if let Some(trace) = app.state::<AppState>().trace.lock().unwrap().take() {
-                trace.shutdown();
+        if let tauri::RunEvent::ExitRequested { api, .. } = event {
+            match native_close_requested(app) {
+                CloseDecision::Prevent => api.prevent_exit(),
+                CloseDecision::ShutdownNow => {
+                    api.prevent_exit();
+                    approve_and_exit(app);
+                }
+                CloseDecision::Allow => {}
             }
         }
     });

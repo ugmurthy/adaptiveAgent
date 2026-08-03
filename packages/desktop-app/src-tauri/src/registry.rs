@@ -62,6 +62,23 @@ impl RunRegistry {
             .values()
             .any(|r| r.occupies_slot && r.cancel_requested)
     }
+    pub fn occupied_ids(&self) -> Vec<String> {
+        self.records
+            .values()
+            .filter(|record| record.occupies_slot)
+            .map(|record| record.run_id.clone())
+            .collect()
+    }
+    #[cfg(test)]
+    pub fn cancellation_selection(&mut self) -> Vec<(String, CancelAction)> {
+        let ids = self.occupied_ids();
+        ids.into_iter()
+            .map(|id| {
+                let action = self.request_cancel(&id).expect("selected run must exist");
+                (id, action)
+            })
+            .collect()
+    }
     pub fn request_cancel(&mut self, id: &str) -> Result<CancelAction, &'static str> {
         let record = self.records.get_mut(id).ok_or("Run is not known.")?;
         if !record.occupies_slot {
@@ -180,6 +197,21 @@ mod tests {
 
         registry.terminal("a", "succeeded");
         assert_eq!(registry.request_cancel("a"), Ok(CancelAction::Quiescent));
+    }
+
+    #[test]
+    fn terminate_selects_every_occupied_root_including_not_yet_created() {
+        let mut registry = RunRegistry::default();
+        registry.insert(rec("late"));
+        registry.insert(rec("known"));
+        registry.get_mut("known").unwrap().root_created = true;
+        registry.insert(rec("done"));
+        registry.terminal("done", "succeeded");
+        let selected = registry.cancellation_selection();
+        assert!(selected.contains(&("late".into(), CancelAction::AwaitCreation)));
+        assert!(selected.contains(&("known".into(), CancelAction::Interrupt)));
+        assert!(!selected.iter().any(|(id, _)| id == "done"));
+        assert!(registry.get("late").unwrap().cancel_requested);
     }
 
     #[test]

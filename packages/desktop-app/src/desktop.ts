@@ -21,6 +21,7 @@ export interface DesktopState {
   executionHealth: 'ready' | 'error';
   traceHealth: 'starting' | 'ready' | 'error';
   traceError?: string;
+  quitState: 'idle' | 'confirming' | 'draining' | 'approved';
 }
 
 export interface RunSummary { itemId: string; runId: string; status: string; cancelRequested: boolean; occupiesSlot: boolean; }
@@ -34,6 +35,9 @@ export const reloadSettings = () => invoke<DesktopState>('reload_settings');
 export const startRun = (task: string) => invoke<StartedRun>('start_run', { task });
 export const stopRun = (runId: string) => invoke<void>('stop_run', { runId });
 export const getRunResult = (runId: string) => invoke<unknown | null>('get_run_result', { runId });
+export const quitWait = () => invoke<DesktopState>('quit_wait');
+export const quitTerminate = () => invoke<DesktopState>('quit_terminate');
+export const quitCancel = () => invoke<DesktopState>('quit_cancel');
 
 export async function subscribe(
   progress: (event: ProgressEvent) => void,
