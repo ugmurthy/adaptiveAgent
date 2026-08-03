@@ -31,6 +31,20 @@ export interface StartedRun { itemId: string; runId: string; }
 export interface ChatMessage { id: string; ordinal: number; role: 'user'|'assistant'; content: string; runId?: string; }
 export interface Chat { itemId:string; title:string; sessionId:string; pinnedAgentId:string; pinnedAgentName:string; pinnedAgentFingerprint:string; messages:ChatMessage[]; readOnlyReason?:string; occupied:boolean; }
 
+export interface TracePrivacy { messages:boolean; reasoning:boolean; rawToolPayloads:boolean; }
+export interface TraceReport {
+  summary?: { status?:string; reason?:string };
+  rootRuns?: unknown[];
+  timeline?: Array<Record<string, unknown>>;
+  runTree?: unknown[];
+  usage?: { total?: { promptTokens?:number; completionTokens?:number; reasoningTokens?:number; totalTokens?:number; estimatedCostUSD?:number }; toolAccounting?: { unpricedRequests?:number }; [key:string]:unknown };
+  performance?: Record<string, unknown>;
+  diagnostics?: { performance?: { toolAccounting?: { unpricedRequests?:number } }; [key:string]:unknown };
+  llmMessages?: unknown[];
+  warnings?: string[];
+}
+export interface TraceEvent { rootRunId:string; revision:number; finalRefresh:boolean; report?:TraceReport; error?:string; }
+
 export interface RunFinishedEvent { runId: string; result?: unknown; error?: string; }
 
 export const getDesktopState = () => invoke<DesktopState>('desktop_state');
@@ -43,6 +57,9 @@ export const createChat = (title:string) => invoke<Chat>('create_chat',{title});
 export const listChats = () => invoke<Chat[]>('list_chats');
 export const loadChat = (itemId:string) => invoke<Chat>('load_chat',{itemId});
 export const sendChatTurn = (itemId:string,content:string) => invoke<StartedRun>('send_chat_turn',{itemId,content});
+export const selectTrace = (rootRunId?:string) => invoke<number>('select_trace',{rootRunId});
+export const getTracePrivacy = () => invoke<TracePrivacy>('get_trace_privacy');
+export const setTracePrivacy = (privacy:TracePrivacy) => invoke<TracePrivacy>('set_trace_privacy',{privacy});
 export const quitWait = () => invoke<DesktopState>('quit_wait');
 export const quitTerminate = () => invoke<DesktopState>('quit_terminate');
 export const quitCancel = () => invoke<DesktopState>('quit_cancel');
@@ -51,6 +68,7 @@ export async function subscribe(
   activity: (event: ActivityEvent) => void,
   finished: (event: RunFinishedEvent) => void,
   state: (event: DesktopState) => void,
+  trace: (event: TraceEvent) => void,
 ): Promise<UnlistenFn> {
   const unlisten = await Promise.all([
     listen<ActivityEvent>('adaptive-agent://activity', ({ payload }) => activity(payload)),
@@ -58,6 +76,7 @@ export async function subscribe(
       if (payload && typeof payload.runId === 'string' && payload.runId.length > 0) finished(payload);
     }),
     listen<DesktopState>('adaptive-agent://state', ({ payload }) => state(payload)),
+    listen<TraceEvent>('adaptive-agent://trace', ({ payload }) => trace(payload)),
   ]);
   return () => unlisten.forEach((fn) => fn());
 }

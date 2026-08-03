@@ -12,12 +12,14 @@
     startRun,
     stopRun,
     resolveApproval,
+    selectTrace, getTracePrivacy, setTracePrivacy,
     subscribe,
     type DesktopState,
     type Chat,
+    type TracePrivacy, type TraceReport,
   } from './desktop';
 
-  let tab: 'run' | 'chat' | 'settings' = 'run';
+  let tab: 'run' | 'chat' | 'inspect' | 'settings' = 'run';
   let task = '';
   let desktop: DesktopState = { status: 'starting', configurationValid: false, runs: [], occupiedSlotCount: 0, capacity: 3, executionHealth: 'error', traceHealth: 'starting', quitState: 'idle' };
   let activityByRoot: Record<string, ActivityEvent[]> = {};
@@ -33,6 +35,12 @@
   let chatMessage = '';
   let refreshGeneration = 0;
   let refreshScheduled = false;
+  let traceRoot = '';
+  let traceReport: TraceReport | undefined;
+  let traceError = '';
+  let traceView: 'overview'|'timeline'|'agents'|'tools'|'usage'|'diagnostics'|'sensitive' = 'overview';
+  let tracePrivacy: TracePrivacy = { messages:false, reasoning:false, rawToolPayloads:false };
+  let privacyPending = false;
   $: selectedActivity = selectedRunId ? activityByRoot[selectedRunId] ?? [] : [];
   $: selectedTiming = modelTiming(selectedActivity, now);
 
@@ -61,8 +69,13 @@
         scheduleRefresh();
       },
       (state) => { desktop = state; scheduleRefresh(); },
+      (event) => {
+        if (event.rootRunId !== traceRoot || privacyPending) return;
+        traceReport = event.report;
+        traceError = event.error ?? '';
+      },
     );
-    if (cancelled) unlisten(); else await refresh();
+    if (cancelled) unlisten(); else { await refresh(); tracePrivacy = await getTracePrivacy(); }
     })().catch((error) => { finalError = String(error); });
     return () => { cancelled = true; window.clearInterval(timer); unlisten(); };
   });
@@ -88,9 +101,9 @@
     }
   }
 
-  async function newChat() { try { selectedChat=await createChat('New chat'); chats=await listChats(); tab='chat'; } catch(error){finalError=String(error);} }
-  async function selectChat(itemId:string){selectedChat=await loadChat(itemId);}
-  async function sendMessage(){if(!selectedChat||!chatMessage.trim())return; startPending=true; finalError=''; try{await sendChatTurn(selectedChat.itemId,chatMessage.trim());chatMessage='';selectedChat=await loadChat(selectedChat.itemId);}catch(error){finalError=String(error);}startPending=false;await refresh();}
+  async function newChat() { try { selectedChat=await createChat('New chat'); selectedRunId=''; chats=await listChats(); tab='chat'; } catch(error){finalError=String(error);} }
+  async function selectChat(itemId:string){selectedChat=await loadChat(itemId);selectedRunId=[...selectedChat.messages].reverse().find((message)=>message.runId)?.runId ?? '';}
+  async function sendMessage(){if(!selectedChat||!chatMessage.trim())return; startPending=true; finalError=''; try{const started=await sendChatTurn(selectedChat.itemId,chatMessage.trim());selectedRunId=started.runId;chatMessage='';selectedChat=await loadChat(selectedChat.itemId);}catch(error){finalError=String(error);}startPending=false;await refresh();}
 
   async function send() {
     if (!canSend()) return;
@@ -157,6 +170,28 @@
     const root = occupied?.runId ?? latestMessage?.runId;
     return root ? activityByRoot[root] ?? [] : [];
   }
+
+  async function savePrivacy(next: TracePrivacy) {
+    privacyPending=true; traceReport=undefined; traceError='';
+    try { tracePrivacy=await setTracePrivacy(next); }
+    catch(error) { traceError=String(error); }
+    privacyPending=false;
+  }
+
+  function costSummary(report: TraceReport): string {
+    const total=report.usage?.total;
+    const unpriced=report.diagnostics?.performance?.toolAccounting?.unpricedRequests ?? report.usage?.toolAccounting?.unpricedRequests ?? 0;
+    const estimate=total?.estimatedCostUSD ?? 0;
+    if (unpriced>0) return `${unpriced} unpriced request${unpriced===1?'':'s'}; $${estimate.toFixed(4)} is a partial estimate`;
+    if ((total?.totalTokens ?? 0)>0 || estimate>0) return `Estimated cost $${estimate.toFixed(4)}`;
+    return 'No priced usage recorded';
+  }
+
+  $: inspectionRoot = selectedRunId;
+  $: if (inspectionRoot !== traceRoot) {
+    traceRoot=inspectionRoot; traceReport=undefined; traceError='';
+    void selectTrace(traceRoot || undefined).catch((error)=>{traceError=String(error);});
+  }
 </script>
 
 {#if desktop.quitState === 'confirming'}
@@ -182,6 +217,7 @@
   <nav aria-label="Application sections">
     <button class:active={tab === 'run'} on:click={() => tab = 'run'}>Run</button>
     <button class:active={tab === 'chat'} on:click={() => tab = 'chat'}>Chat</button>
+    <button class:active={tab === 'inspect'} on:click={() => tab = 'inspect'}>Inspector</button>
     <button class:active={tab === 'settings'} on:click={() => tab = 'settings'}>Settings</button>
   </nav>
 
@@ -245,6 +281,43 @@
         {#if activity.length}<div class="model-timer">{#if timing.current}<strong>{timing.current.delegateName ?? 'Agent'} · {timing.current.provider ?? 'model'} / {timing.current.model ?? 'unknown'}</strong><span>{formatDuration(timing.current.elapsedMs)} in progress</span>{/if}<span>{formatDuration(timing.completedMs)} completed model time</span></div><div class="progress narrative">{#each activity as event (event.eventId)}<div><span>{event.runId===event.rootRunId?'Agent':event.delegateName??'Delegate'}</span>{event.message}</div>{/each}</div>{/if}
       {/if}
       {#if finalError}<div class="result error"><pre>{finalError}</pre></div>{/if}
+    </section>
+  {:else if tab === 'inspect'}
+    <section class="panel inspector">
+      <div class="settings-title"><div><h2>Trace inspector</h2><p>Read-only durable execution evidence for {traceRoot ? traceRoot.slice(0,8) : 'the selected run'}.</p></div><span class:good={desktop.traceHealth==='ready'} class="status-dot">{desktop.traceHealth}</span></div>
+      {#if desktop.traceError}<div class="alert">{desktop.traceError}</div>{/if}
+      {#if traceError}<div class="alert">{traceError}</div>{/if}
+      {#if !traceRoot}<div class="alert">Select a run or start a chat turn to inspect its trace.</div>{/if}
+      <div class="inspector-tabs">
+        {#each [['overview','Overview'],['timeline','Timeline'],['agents','Agents / run tree'],['tools','Tools'],['usage','Tokens and cost'],['diagnostics','Diagnostics'],['sensitive','Sensitive data']] as item}
+          <button class:active={traceView===item[0]} on:click={()=>traceView=item[0] as typeof traceView}>{item[1]}</button>
+        {/each}
+      </div>
+      {#if traceReport}
+        {#if traceView==='overview'}
+          <div class="summary"><strong>{traceReport.summary?.status ?? 'unknown'}</strong><span>{traceReport.summary?.reason ?? 'No summary available.'}</span></div>
+          <pre>{JSON.stringify({rootRuns:traceReport.rootRuns,performance:traceReport.performance},null,2)}</pre>
+        {:else if traceView==='timeline'}
+          <pre>{JSON.stringify(traceReport.timeline ?? [],null,2)}</pre>
+        {:else if traceView==='agents'}
+          <pre>{JSON.stringify(traceReport.runTree ?? [],null,2)}</pre>
+        {:else if traceView==='tools'}
+          <pre>{JSON.stringify((traceReport.timeline ?? []).filter((entry)=>typeof entry.toolName==='string'),null,2)}</pre>
+        {:else if traceView==='usage'}
+          {@const total=traceReport.usage?.total}
+          <div class="summary"><strong>{total?.totalTokens ?? 0} tokens</strong><span>{total?.promptTokens ?? 0} prompt · {total?.completionTokens ?? 0} completion · {total?.reasoningTokens ?? 0} reasoning</span><span>{costSummary(traceReport)}</span></div>
+          <pre>{JSON.stringify(traceReport.usage,null,2)}</pre>
+        {:else if traceView==='diagnostics'}
+          <pre>{JSON.stringify(traceReport.diagnostics ?? {warnings:traceReport.warnings ?? [],performance:traceReport.performance},null,2)}</pre>
+        {:else}
+          <div class="privacy-controls">
+            <label><input type="checkbox" checked={tracePrivacy.messages} disabled={privacyPending || tracePrivacy.reasoning} on:change={(event)=>savePrivacy({...tracePrivacy,messages:event.currentTarget.checked})}> Messages</label>
+            <label><input type="checkbox" checked={tracePrivacy.reasoning} disabled={privacyPending} on:change={(event)=>savePrivacy({...tracePrivacy,reasoning:event.currentTarget.checked,messages:event.currentTarget.checked || tracePrivacy.messages})}> Reasoning</label>
+            <label><input type="checkbox" checked={tracePrivacy.rawToolPayloads} disabled={privacyPending} on:change={(event)=>savePrivacy({...tracePrivacy,rawToolPayloads:event.currentTarget.checked})}> Raw tool payloads</label>
+          </div>
+          <pre>{JSON.stringify({messages:tracePrivacy.messages ? traceReport.llmMessages ?? [] : 'Disabled',reasoning:tracePrivacy.reasoning ? 'Included in authorized messages' : 'Disabled',rawToolPayloads:tracePrivacy.rawToolPayloads ? (traceReport.timeline ?? []).map(({params,output,eventType,runId,toolName})=>({eventType,runId,toolName,params,output})) : 'Disabled'},null,2)}</pre>
+        {/if}
+      {/if}
     </section>
   {:else}
     <section class="panel settings">

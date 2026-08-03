@@ -1,4 +1,5 @@
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use serde_json::Value;
 use std::{path::Path, sync::Mutex};
 
 const MIGRATIONS: &[(i64, &str)] = &[(
@@ -416,6 +417,34 @@ impl WorkbenchDb {
         Ok(rows)
     }
 
+    pub fn load_setting(&self, key: &str) -> Result<Option<Value>, String> {
+        let connection = self.connection.lock().unwrap();
+        let value = connection
+            .query_row(
+                "select value_json from desktop_settings where key=?1",
+                [key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        value
+            .map(|value| serde_json::from_str(&value).map_err(|error| error.to_string()))
+            .transpose()
+    }
+
+    pub fn save_setting(&self, key: &str, value: &Value) -> Result<(), String> {
+        let value = serde_json::to_string(value).map_err(|error| error.to_string())?;
+        self.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "insert into desktop_settings(key,value_json) values(?1,?2) on conflict(key) do update set value_json=excluded.value_json",
+                params![key, value],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     pub fn save_pending_approval(&self, value: &PendingApproval) -> Result<(), String> {
         self.connection.lock().unwrap().execute("insert into pending_approvals(root_run_id,approval_run_id,approval_id,parent_run_id,tool_name,message,decision_in_flight,decision,operation_state,updated_at) values(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) on conflict(root_run_id) do update set approval_run_id=excluded.approval_run_id,approval_id=excluded.approval_id,parent_run_id=excluded.parent_run_id,tool_name=excluded.tool_name,message=excluded.message,decision_in_flight=case when pending_approvals.approval_id=excluded.approval_id then pending_approvals.decision_in_flight else excluded.decision_in_flight end,decision=case when pending_approvals.approval_id=excluded.approval_id then pending_approvals.decision else excluded.decision end,operation_state=case when pending_approvals.approval_id=excluded.approval_id then pending_approvals.operation_state else excluded.operation_state end,updated_at=excluded.updated_at", params![value.root_run_id,value.approval_run_id,value.approval_id,value.parent_run_id,value.tool_name,value.message,value.decision_in_flight,value.decision,value.operation_state,now()]).map_err(|e|e.to_string())?;
         Ok(())
@@ -758,5 +787,24 @@ mod tests {
             .finalize_chat_success("run-2", &serde_json::json!(2), "answer")
             .unwrap_err()
             .contains("occupied"));
+    }
+
+    #[test]
+    fn desktop_settings_round_trip_structured_privacy_values() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        {
+            let db = WorkbenchDb::open(file.path()).unwrap();
+            db.save_setting(
+                "trace_privacy",
+                &serde_json::json!({"messages":true,"reasoning":false,"rawToolPayloads":true}),
+            )
+            .unwrap();
+        }
+        let db = WorkbenchDb::open(file.path()).unwrap();
+        assert_eq!(
+            db.load_setting("trace_privacy").unwrap(),
+            Some(serde_json::json!({"messages":true,"reasoning":false,"rawToolPayloads":true}))
+        );
+        assert_eq!(db.load_setting("missing").unwrap(), None);
     }
 }

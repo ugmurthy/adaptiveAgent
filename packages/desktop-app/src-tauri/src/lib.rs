@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 mod registry;
 mod shutdown;
@@ -25,6 +25,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_NDJSON_FRAME_SIZE: usize = 1024 * 1024;
 const TRACE_MAX_NDJSON_FRAME_SIZE: usize = 8 * 1024 * 1024;
+const TRACE_PRIVACY_SETTING: &str = "trace_privacy";
 
 type Response = Result<Value, String>;
 
@@ -144,6 +145,28 @@ struct AppState {
     generation: AtomicU64,
     quit: Mutex<QuitCoordinator>,
     shutdown_started: AtomicBool,
+    trace_selection: Mutex<TraceSelection>,
+    trace_refreshes: Mutex<HashMap<String, TraceRefreshState>>,
+}
+
+#[derive(Default)]
+struct TraceSelection {
+    root_run_id: Option<String>,
+    revision: u64,
+}
+
+#[derive(Default)]
+struct TraceRefreshState {
+    pending: bool,
+    final_refresh: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TracePrivacy {
+    messages: bool,
+    reasoning: bool,
+    raw_tool_payloads: bool,
 }
 
 struct TraceBridge {
@@ -152,6 +175,7 @@ struct TraceBridge {
     pending: Mutex<HashMap<u64, Sender<Response>>>,
     decoder: Mutex<NdjsonDecoder>,
     next_id: AtomicU64,
+    request_gate: Mutex<()>,
     healthy: Arc<AtomicBool>,
     error: Arc<Mutex<Option<String>>>,
     expected_shutdown: AtomicBool,
@@ -161,14 +185,25 @@ impl TraceBridge {
     fn spawn_process(
         app: &AppHandle,
         sqlite_path: &str,
+        privacy: TracePrivacy,
         healthy: Arc<AtomicBool>,
         error: Arc<Mutex<Option<String>>>,
     ) -> Result<Arc<Self>, String> {
+        let mut arguments = vec!["--sqlite-path".to_string(), sqlite_path.to_string()];
+        if privacy.messages || privacy.reasoning {
+            arguments.push("--allow-messages".into());
+        }
+        if privacy.reasoning {
+            arguments.push("--allow-reasoning".into());
+        }
+        if privacy.raw_tool_payloads {
+            arguments.push("--allow-raw-tool-payloads".into());
+        }
         let (mut events, child) = app
             .shell()
             .sidecar("trace-session-sidecar")
             .map_err(|e| format!("Unable to locate trace sidecar: {e}"))?
-            .args(["--sqlite-path", sqlite_path])
+            .args(arguments)
             .spawn()
             .map_err(|e| format!("Unable to start trace sidecar: {e}"))?;
         let sidecar = Arc::new(Self {
@@ -177,6 +212,7 @@ impl TraceBridge {
             pending: Mutex::new(HashMap::new()),
             decoder: Mutex::new(NdjsonDecoder::new(TRACE_MAX_NDJSON_FRAME_SIZE)),
             next_id: AtomicU64::new(1),
+            request_gate: Mutex::new(()),
             healthy,
             error,
             expected_shutdown: AtomicBool::new(false),
@@ -197,10 +233,32 @@ impl TraceBridge {
         Ok(sidecar)
     }
 
-    fn initialize(&self) -> Result<(), String> {
+    fn initialize(&self, privacy: TracePrivacy) -> Result<(), String> {
         let initialized=match self.request_wait("initialize",Some(json!({"protocolVersion":"1.0","clientInfo":{"name":"adaptive-agent-desktop","version":"0.1.0"}})),REQUEST_TIMEOUT){Ok(value)=>value,Err(error)=>{self.fail(&error);return Err(error)}};
         if initialized.get("protocolVersion").and_then(Value::as_str) != Some("1.0") {
             let error = "Trace sidecar did not negotiate protocol 1.0.".to_string();
+            self.fail(&error);
+            return Err(error);
+        }
+        if initialized
+            .pointer("/backend/readOnly")
+            .and_then(Value::as_bool)
+            != Some(true)
+            || initialized
+                .pointer("/capabilities/messages")
+                .and_then(Value::as_bool)
+                != Some(privacy.messages || privacy.reasoning)
+            || initialized
+                .pointer("/capabilities/reasoning")
+                .and_then(Value::as_bool)
+                != Some(privacy.reasoning)
+            || initialized
+                .pointer("/capabilities/rawToolPayloads")
+                .and_then(Value::as_bool)
+                != Some(privacy.raw_tool_payloads)
+        {
+            let error =
+                "Trace sidecar capabilities do not match the trusted privacy policy.".to_string();
             self.fail(&error);
             return Err(error);
         }
@@ -209,6 +267,18 @@ impl TraceBridge {
         Ok(())
     }
     fn request_wait(&self, method: &str, params: Option<Value>, timeout: Duration) -> Response {
+        let _request = self.request_gate.lock().unwrap();
+        if self.expected_shutdown.load(Ordering::SeqCst) {
+            return Err("Trace sidecar is shutting down.".into());
+        }
+        self.request_wait_serialized(method, params, timeout)
+    }
+    fn request_wait_serialized(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        timeout: Duration,
+    ) -> Response {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
         self.pending.lock().unwrap().insert(id, tx);
@@ -289,7 +359,9 @@ impl TraceBridge {
     }
     fn shutdown(&self) {
         self.expected_shutdown.store(true, Ordering::SeqCst);
-        let _ = self.request_wait("shutdown", None, SHUTDOWN_TIMEOUT);
+        if let Ok(_request) = self.request_gate.try_lock() {
+            let _ = self.request_wait_serialized("shutdown", None, SHUTDOWN_TIMEOUT);
+        }
         if let Some(child) = self.child.lock().unwrap().take() {
             let _ = child.kill();
         }
@@ -800,6 +872,12 @@ impl Bridge {
                 project_activity_event(event, &root_run_id, delegate_name.as_deref())
             {
                 let _ = self.app.emit("adaptive-agent://activity", projected);
+            }
+            if matches!(
+                kind,
+                "run.completed" | "run.failed" | "run.interrupted" | "replan.required"
+            ) {
+                schedule_trace_refresh(&self.app, root_run_id, true);
             }
         }
         let root_created = is_root_run_created(event);
@@ -1714,6 +1792,14 @@ fn replace_bridge(app: &AppHandle) -> Result<Arc<Bridge>, String> {
             let app = app.clone();
             let target = bridge.clone();
             std::thread::spawn(move || {
+                let privacy = match load_trace_privacy(&target.workbench) {
+                    Ok(privacy) => privacy,
+                    Err(error) => {
+                        *target.trace_error.lock().unwrap() = Some(error);
+                        target.emit_state();
+                        return;
+                    }
+                };
                 let state = app.state::<AppState>();
                 let lifecycle = state.lifecycle.lock().unwrap();
                 if state.shutdown_started.load(Ordering::SeqCst)
@@ -1725,13 +1811,14 @@ fn replace_bridge(app: &AppHandle) -> Result<Arc<Bridge>, String> {
                 match TraceBridge::spawn_process(
                     &app,
                     &path,
+                    privacy,
                     target.trace_healthy.clone(),
                     target.trace_error.clone(),
                 ) {
                     Ok(trace) => {
                         *state.trace.lock().unwrap() = Some(trace.clone());
                         drop(lifecycle);
-                        if let Err(error) = trace.initialize() {
+                        if let Err(error) = trace.initialize(privacy) {
                             let removed = {
                                 let _lifecycle = state.lifecycle.lock().unwrap();
                                 let mut slot = state.trace.lock().unwrap();
@@ -1775,6 +1862,333 @@ fn replace_bridge(app: &AppHandle) -> Result<Arc<Bridge>, String> {
         bridge.emit_state();
     }
     Ok(bridge)
+}
+
+fn load_trace_privacy(workbench: &WorkbenchDb) -> Result<TracePrivacy, String> {
+    let mut privacy: TracePrivacy = workbench
+        .load_setting(TRACE_PRIVACY_SETTING)?
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| format!("Invalid persisted trace privacy settings: {error}"))?
+        .unwrap_or_default();
+    if privacy.reasoning {
+        privacy.messages = true;
+    }
+    Ok(privacy)
+}
+
+fn queue_trace_refresh(
+    refreshes: &mut HashMap<String, TraceRefreshState>,
+    root_run_id: &str,
+    final_refresh: bool,
+) -> bool {
+    if let Some(refresh) = refreshes.get_mut(root_run_id) {
+        refresh.pending = true;
+        refresh.final_refresh |= final_refresh;
+        return false;
+    }
+    refreshes.insert(
+        root_run_id.into(),
+        TraceRefreshState {
+            pending: false,
+            final_refresh,
+        },
+    );
+    true
+}
+
+fn complete_trace_refresh(
+    refreshes: &mut HashMap<String, TraceRefreshState>,
+    root_run_id: &str,
+) -> bool {
+    if refreshes.get_mut(root_run_id).is_some_and(|refresh| {
+        if refresh.pending {
+            refresh.pending = false;
+            true
+        } else {
+            false
+        }
+    }) {
+        return true;
+    }
+    refreshes.remove(root_run_id);
+    false
+}
+
+fn schedule_trace_refresh(app: &AppHandle, root_run_id: String, final_refresh: bool) {
+    let state = app.state::<AppState>();
+    {
+        let mut refreshes = state.trace_refreshes.lock().unwrap();
+        if !queue_trace_refresh(&mut refreshes, &root_run_id, final_refresh) {
+            return;
+        }
+    }
+
+    let app = app.clone();
+    std::thread::spawn(move || loop {
+        let final_refresh = app
+            .state::<AppState>()
+            .trace_refreshes
+            .lock()
+            .unwrap()
+            .get_mut(&root_run_id)
+            .is_some_and(|refresh| std::mem::take(&mut refresh.final_refresh));
+        let (privacy, trace, request_revision) = {
+            let state = app.state::<AppState>();
+            let bridge = state.bridge.lock().unwrap().as_ref().cloned();
+            let trace = state.trace.lock().unwrap().as_ref().cloned();
+            let privacy = bridge
+                .as_ref()
+                .and_then(|bridge| load_trace_privacy(&bridge.workbench).ok());
+            let selection = state.trace_selection.lock().unwrap();
+            let request_revision = (selection.root_run_id.as_deref() == Some(root_run_id.as_str()))
+                .then_some(selection.revision);
+            (privacy, trace, request_revision)
+        };
+        let response = match (privacy, trace.as_ref()) {
+            (Some(privacy), Some(trace)) => trace.request_wait(
+                "trace/get",
+                Some(json!({
+                    "target": { "kind": "root-run", "rootRunId": root_run_id },
+                    "include": {
+                        "plans": true,
+                        "messages": privacy.messages,
+                        "reasoning": privacy.reasoning,
+                        "rawToolPayloads": privacy.raw_tool_payloads
+                    }
+                })),
+                REQUEST_TIMEOUT,
+            ),
+            _ => Err("Trace inspector is not ready.".into()),
+        };
+        let state = app.state::<AppState>();
+        let selection = state.trace_selection.lock().unwrap();
+        if request_revision == Some(selection.revision)
+            && selection.root_run_id.as_deref() == Some(root_run_id.as_str())
+        {
+            let payload = match response.as_ref() {
+                Ok(report) => json!({
+                    "rootRunId": root_run_id,
+                    "revision": selection.revision,
+                    "finalRefresh": final_refresh,
+                    "report": report
+                }),
+                Err(error) => json!({
+                    "rootRunId": root_run_id,
+                    "revision": selection.revision,
+                    "finalRefresh": final_refresh,
+                    "error": error
+                }),
+            };
+            let _ = app.emit("adaptive-agent://trace", payload);
+        }
+        drop(selection);
+        if let Ok(report) = response {
+            let _ = app.emit(
+                "adaptive-agent://trace-summary",
+                json!({
+                    "rootRunId": root_run_id,
+                    "summary": report.get("summary"),
+                    "usage": report.get("usage"),
+                    "rootRuns": report.get("rootRuns")
+                }),
+            );
+        }
+
+        let mut refreshes = state.trace_refreshes.lock().unwrap();
+        if complete_trace_refresh(&mut refreshes, &root_run_id) {
+            continue;
+        }
+        break;
+    });
+}
+
+#[tauri::command]
+fn select_trace(root_run_id: Option<String>, app: AppHandle) -> Result<u64, String> {
+    let state = app.state::<AppState>();
+    let revision = {
+        let mut selection = state.trace_selection.lock().unwrap();
+        selection.revision += 1;
+        selection.root_run_id = root_run_id.clone();
+        selection.revision
+    };
+    let Some(root_run_id) = root_run_id else {
+        return Ok(revision);
+    };
+    schedule_trace_refresh(&app, root_run_id.clone(), false);
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let mut tick = 0_u64;
+        loop {
+            std::thread::sleep(Duration::from_millis(1_500));
+            let state = app.state::<AppState>();
+            let selected = {
+                let selection = state.trace_selection.lock().unwrap();
+                selection.revision == revision
+                    && selection.root_run_id.as_deref() == Some(root_run_id.as_str())
+            };
+            if !selected || state.shutdown_started.load(Ordering::SeqCst) {
+                break;
+            }
+            tick += 1;
+            let active = state.bridge.lock().unwrap().as_ref().is_some_and(|bridge| {
+                bridge
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .get(&root_run_id)
+                    .is_some_and(|run| run.occupies_slot)
+            });
+            if active || tick % 7 == 0 {
+                schedule_trace_refresh(&app, root_run_id.clone(), false);
+            }
+            if tick % 7 == 0 {
+                let roots = state
+                    .bridge
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|bridge| {
+                        bridge
+                            .registry
+                            .lock()
+                            .unwrap()
+                            .records()
+                            .map(|run| run.run_id.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let background = roots
+                    .into_iter()
+                    .filter(|root| root != &root_run_id)
+                    .collect::<Vec<_>>();
+                if let Some(root) = background.get((tick as usize / 7) % background.len().max(1)) {
+                    schedule_trace_refresh(&app, root.clone(), false);
+                }
+            }
+        }
+    });
+    Ok(revision)
+}
+
+#[tauri::command]
+fn get_trace_privacy(state: tauri::State<'_, AppState>) -> Result<TracePrivacy, String> {
+    let bridge = state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or("Desktop runtime is starting.")?;
+    load_trace_privacy(&bridge.workbench)
+}
+
+#[tauri::command]
+fn set_trace_privacy(mut privacy: TracePrivacy, app: AppHandle) -> Result<TracePrivacy, String> {
+    if privacy.reasoning {
+        privacy.messages = true;
+    }
+    let state = app.state::<AppState>();
+    let (bridge, sqlite_path, old_trace) = {
+        let _lifecycle = state.lifecycle.lock().unwrap();
+        let bridge = state
+            .bridge
+            .lock()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .ok_or("Desktop runtime is starting.")?;
+        let sqlite_path = bridge
+            .configuration
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|value| value.pointer("/runtime/sqlitePath"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or("Trace requires an exact SQLite path.")?;
+        let old_trace = state.trace.lock().unwrap().as_ref().cloned();
+        (bridge, sqlite_path, old_trace)
+    };
+    if load_trace_privacy(&bridge.workbench)? == privacy && old_trace.is_some() {
+        return Ok(privacy);
+    }
+    let (stopped_trace, selected_root) = {
+        let _lifecycle = state.lifecycle.lock().unwrap();
+        if state
+            .bridge
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|current| !Arc::ptr_eq(current, &bridge))
+        {
+            return Err("Execution runtime changed while trace privacy was updating.".into());
+        }
+        let stopped_trace = state.trace.lock().unwrap().take();
+        let mut selection = state.trace_selection.lock().unwrap();
+        selection.revision += 1;
+        (stopped_trace, selection.root_run_id.clone())
+    };
+    bridge.trace_healthy.store(false, Ordering::SeqCst);
+    *bridge.trace_error.lock().unwrap() = None;
+    bridge.emit_state();
+    if let Some(stopped_trace) = stopped_trace {
+        stopped_trace.shutdown();
+    }
+
+    let replacement = match TraceBridge::spawn_process(
+        &app,
+        &sqlite_path,
+        privacy,
+        bridge.trace_healthy.clone(),
+        bridge.trace_error.clone(),
+    ) {
+        Ok(replacement) => replacement,
+        Err(error) => {
+            *bridge.trace_error.lock().unwrap() = Some(error.clone());
+            bridge.emit_state();
+            return Err(error);
+        }
+    };
+    if let Err(error) = replacement.initialize(privacy) {
+        replacement.shutdown();
+        return Err(error);
+    }
+    if let Err(error) = bridge.workbench.save_setting(
+        TRACE_PRIVACY_SETTING,
+        &serde_json::to_value(privacy).unwrap(),
+    ) {
+        replacement.shutdown();
+        *bridge.trace_error.lock().unwrap() = Some(error.clone());
+        bridge.emit_state();
+        return Err(error);
+    }
+    let runtime_changed = {
+        let _lifecycle = state.lifecycle.lock().unwrap();
+        if state
+            .bridge
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|current| !Arc::ptr_eq(current, &bridge))
+        {
+            true
+        } else {
+            *state.trace.lock().unwrap() = Some(replacement.clone());
+            false
+        }
+    };
+    if runtime_changed {
+        replacement.shutdown();
+        return Err("Execution runtime changed while trace privacy was updating.".into());
+    }
+    bridge.trace_healthy.store(true, Ordering::SeqCst);
+    *bridge.trace_error.lock().unwrap() = None;
+    bridge.emit_state();
+    if let Some(root_run_id) = selected_root {
+        let _ = select_trace(Some(root_run_id), app.clone());
+    }
+    Ok(privacy)
 }
 
 #[tauri::command]
@@ -2084,6 +2498,9 @@ pub fn run() {
             list_chats,
             load_chat,
             send_chat_turn,
+            select_trace,
+            get_trace_privacy,
+            set_trace_privacy,
             quit_wait,
             quit_terminate,
             quit_cancel
@@ -2829,5 +3246,38 @@ mod tests {
         let payload = chat_request_params("run", "session", history.clone());
         assert_eq!(payload.get("transcript"), Some(&Value::Array(history)));
         assert!(payload.get("messages").is_none());
+    }
+
+    #[test]
+    fn persisted_trace_reasoning_always_enables_messages() {
+        let workbench = WorkbenchDb::open_in_memory().unwrap();
+        workbench
+            .save_setting(
+                TRACE_PRIVACY_SETTING,
+                &json!({"messages":false,"reasoning":true,"rawToolPayloads":false}),
+            )
+            .unwrap();
+        assert_eq!(
+            load_trace_privacy(&workbench).unwrap(),
+            TracePrivacy {
+                messages: true,
+                reasoning: true,
+                raw_tool_payloads: false,
+            }
+        );
+    }
+
+    #[test]
+    fn trace_refreshes_coalesce_to_one_pending_pass_and_preserve_final_priority() {
+        let mut refreshes = HashMap::new();
+        assert!(queue_trace_refresh(&mut refreshes, "root", false));
+        assert!(!queue_trace_refresh(&mut refreshes, "root", false));
+        assert!(!queue_trace_refresh(&mut refreshes, "root", true));
+        assert_eq!(refreshes.len(), 1);
+        assert!(refreshes["root"].final_refresh);
+        assert!(complete_trace_refresh(&mut refreshes, "root"));
+        assert_eq!(refreshes.len(), 1);
+        assert!(!complete_trace_refresh(&mut refreshes, "root"));
+        assert!(refreshes.is_empty());
     }
 }
