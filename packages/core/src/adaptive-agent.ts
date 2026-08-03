@@ -1212,15 +1212,15 @@ export class AdaptiveAgent {
   ): Promise<void> {
     const transactionStore = this.options.transactionStore;
     if (transactionStore?.eventStore && transactionStore.snapshotStore) {
-      const downstream: Array<Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>> = [];
+      const downstream: AgentEvent[] = [];
       await transactionStore.runInTransaction(async (stores) => {
         if (!stores.eventStore || !stores.snapshotStore) throw new Error('Transactional approval stores unavailable');
         const awaiting = await stores.runStore.updateRun(run.id, { status: 'awaiting_approval' }, run.version);
         const statusEvent = runStatusChangedEvent(run, awaiting, 'awaiting_approval');
-        await stores.eventStore.append(statusEvent);
-        await stores.eventStore.append(requestedEvent);
+        const persistedStatusEvent = await stores.eventStore.append(statusEvent);
+        const persistedRequestedEvent = await stores.eventStore.append(requestedEvent);
         const snapshotEvent = await this.saveExecutionSnapshotWithStores(stores, awaiting, state, awaiting.status);
-        downstream.push(statusEvent, requestedEvent, ...(snapshotEvent ? [snapshotEvent] : []));
+        downstream.push(persistedStatusEvent, persistedRequestedEvent, ...(snapshotEvent ? [snapshotEvent] : []));
       });
       await this.emitDownstreamOnly(downstream);
       return;
@@ -1239,15 +1239,15 @@ export class AdaptiveAgent {
   ): Promise<void> {
     const transactionStore = this.options.transactionStore;
     if (transactionStore?.eventStore && transactionStore.snapshotStore) {
-      const snapshotEvents: Array<Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>> = [];
+      const snapshotEvents: AgentEvent[] = [];
       await transactionStore.runInTransaction(async (stores) => {
         if (!stores.eventStore || !stores.snapshotStore) throw new Error('Transactional approval stores unavailable');
         const resumed = await stores.runStore.updateRun(run.id, { status: 'running' }, run.version);
         const statusEvent = runStatusChangedEvent(run, resumed, 'running');
-        await stores.eventStore.append(statusEvent);
-        await stores.eventStore.append(event);
+        const persistedStatusEvent = await stores.eventStore.append(statusEvent);
+        const persistedEvent = await stores.eventStore.append(event);
         const snapshotEvent = await this.saveExecutionSnapshotWithStores(stores, resumed, state, resumed.status);
-        snapshotEvents.push(statusEvent, event, ...(snapshotEvent ? [snapshotEvent] : []));
+        snapshotEvents.push(persistedStatusEvent, persistedEvent, ...(snapshotEvent ? [snapshotEvent] : []));
       });
       await this.emitDownstreamOnly(snapshotEvents);
       return;
@@ -1271,15 +1271,15 @@ export class AdaptiveAgent {
     });
     const transactionStore = this.options.transactionStore;
     if (transactionStore?.eventStore && transactionStore.snapshotStore) {
-      const downstream: Array<Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>> = [];
+      const downstream: AgentEvent[] = [];
       await transactionStore.runInTransaction(async (stores) => {
         if (!stores.eventStore || !stores.snapshotStore) throw new Error('Transactional approval stores unavailable');
         const failed = await stores.runStore.updateRun(run.id, { status: 'failed', errorCode: 'APPROVAL_REJECTED', errorMessage: error }, run.version);
-        await stores.eventStore.append(resolvedEvent);
+        const persistedResolvedEvent = await stores.eventStore.append(resolvedEvent);
         const snapshotEvent = await this.saveExecutionSnapshotWithStores(stores, failed, state, failed.status);
         const terminalEvent = failedEvent(failed);
-        await stores.eventStore.append(terminalEvent);
-        downstream.push(resolvedEvent, ...(snapshotEvent ? [snapshotEvent] : []), terminalEvent);
+        const persistedTerminalEvent = await stores.eventStore.append(terminalEvent);
+        downstream.push(persistedResolvedEvent, ...(snapshotEvent ? [snapshotEvent] : []), persistedTerminalEvent);
       });
       await this.emitDownstreamOnly(downstream);
       return;
@@ -3688,7 +3688,7 @@ export class AdaptiveAgent {
     const persistedRunInput = this.withPersistedModelConfig(runInput);
     const transactionStore = this.options.transactionStore;
     if (transactionStore?.eventStore && transactionStore.snapshotStore) {
-      const downstreamEvents: Array<Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>> = [];
+      const downstreamEvents: AgentEvent[] = [];
       const result = await transactionStore.runInTransaction(async (stores) => {
         if (!stores.eventStore || !stores.snapshotStore) {
           throw new Error('Transactional run creation requires eventStore and snapshotStore');
@@ -3698,7 +3698,7 @@ export class AdaptiveAgent {
         const state = createState(run);
         this.logInitialInjectedSystemMessages(run, state);
         const createdEvent = this.withEventPayloadPerformance(this.runCreatedEvent(run));
-        await stores.eventStore.append(createdEvent);
+        const persistedCreatedEvent = await stores.eventStore.append(createdEvent);
 
         const serializedState = serializeExecutionState(state);
         const snapshotSaveStartedAt = Date.now();
@@ -3724,8 +3724,8 @@ export class AdaptiveAgent {
         const snapshotEvent = this.withEventPayloadPerformance(
           this.snapshotCreatedEvent(run, snapshot.snapshotSeq, run.status, performance),
         );
-        await stores.eventStore.append(snapshotEvent);
-        downstreamEvents.push(createdEvent, snapshotEvent);
+        const persistedSnapshotEvent = await stores.eventStore.append(snapshotEvent);
+        downstreamEvents.push(persistedCreatedEvent, persistedSnapshotEvent);
         this.logSnapshotCreated(run, state, snapshot.snapshotSeq, run.status, performance);
 
         return { run, state };
@@ -3779,7 +3779,7 @@ export class AdaptiveAgent {
       return;
     }
 
-    await this.saveExecutionSnapshotWithStores(
+    const snapshotEvent = await this.saveExecutionSnapshotWithStores(
       {
         eventStore: this.options.eventStore,
         snapshotStore: this.options.snapshotStore,
@@ -3788,6 +3788,7 @@ export class AdaptiveAgent {
       state,
       status,
     );
+    await this.emitDownstreamOnly(snapshotEvent ? [snapshotEvent] : []);
   }
 
   private async saveExecutionSnapshotWithStores(
@@ -3795,7 +3796,7 @@ export class AdaptiveAgent {
     run: AgentRun,
     state: ExecutionState,
     status: RunStatus,
-  ): Promise<Omit<AgentEvent, 'id' | 'seq' | 'createdAt'> | null> {
+  ): Promise<AgentEvent | null> {
     if (!stores.snapshotStore) {
       return null;
     }
@@ -3825,9 +3826,11 @@ export class AdaptiveAgent {
     const snapshotEvent = this.withEventPayloadPerformance(
       this.snapshotCreatedEvent(run, snapshot.snapshotSeq, status, performance),
     );
-    await stores.eventStore?.append(snapshotEvent);
+    const persistedEvent = stores.eventStore
+      ? await stores.eventStore.append(snapshotEvent)
+      : null;
     this.logSnapshotCreated(run, state, snapshot.snapshotSeq, status, performance);
-    return snapshotEvent;
+    return persistedEvent;
   }
 
   private async persistToolExecutionCompletion(params: {
@@ -3838,7 +3841,7 @@ export class AdaptiveAgent {
     const event = params.event ? this.withEventPayloadPerformance(params.event) : undefined;
     const transactionStore = this.options.transactionStore;
     if (transactionStore?.toolExecutionStore && (transactionStore.eventStore || !event)) {
-      await transactionStore.runInTransaction(async (stores) => {
+      const persistedEvent = await transactionStore.runInTransaction(async (stores) => {
         if (!stores.toolExecutionStore) {
           throw new Error('Transactional tool completion requires toolExecutionStore');
         }
@@ -3849,11 +3852,12 @@ export class AdaptiveAgent {
             throw new Error('Transactional tool completion event requires eventStore');
           }
 
-          await stores.eventStore.append(event);
+          return stores.eventStore.append(event);
         }
+        return null;
       });
 
-      await this.emitDownstreamOnly(event ? [event] : []);
+      await this.emitDownstreamOnly(persistedEvent ? [persistedEvent] : []);
       return;
     }
 
@@ -3872,7 +3876,7 @@ export class AdaptiveAgent {
     const event = params.event ? this.withEventPayloadPerformance(params.event) : undefined;
     const transactionStore = this.options.transactionStore;
     if (transactionStore?.toolExecutionStore && (transactionStore.eventStore || !event)) {
-      await transactionStore.runInTransaction(async (stores) => {
+      const persistedEvent = await transactionStore.runInTransaction(async (stores) => {
         if (!stores.toolExecutionStore) {
           throw new Error('Transactional tool failure requires toolExecutionStore');
         }
@@ -3883,11 +3887,12 @@ export class AdaptiveAgent {
             throw new Error('Transactional tool failure event requires eventStore');
           }
 
-          await stores.eventStore.append(event);
+          return stores.eventStore.append(event);
         }
+        return null;
       });
 
-      await this.emitDownstreamOnly(event ? [event] : []);
+      await this.emitDownstreamOnly(persistedEvent ? [persistedEvent] : []);
       return;
     }
 
@@ -3913,7 +3918,7 @@ export class AdaptiveAgent {
       transactionStore.snapshotStore &&
       (!params.completion || transactionStore.toolExecutionStore)
     ) {
-      const downstreamEvents: Array<Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>> = [];
+      const downstreamEvents: AgentEvent[] = [];
       await transactionStore.runInTransaction(async (stores) => {
         if (!stores.eventStore || !stores.snapshotStore) {
           throw new Error('Transactional tool continuation requires eventStore and snapshotStore');
@@ -3926,13 +3931,11 @@ export class AdaptiveAgent {
 
           await stores.toolExecutionStore.markCompleted(params.completion.idempotencyKey, params.completion.output);
           if (completionEvent) {
-            await stores.eventStore.append(completionEvent);
-            downstreamEvents.push(completionEvent);
+            downstreamEvents.push(await stores.eventStore.append(completionEvent));
           }
         }
 
-        await stores.eventStore.append(stepCompletedEvent);
-        downstreamEvents.push(stepCompletedEvent);
+        downstreamEvents.push(await stores.eventStore.append(stepCompletedEvent));
         const snapshotEvent = await this.saveExecutionSnapshotWithStores(
           stores,
           params.run,
@@ -3967,7 +3970,7 @@ export class AdaptiveAgent {
   }): Promise<AgentRun> {
     const transactionStore = this.options.transactionStore;
     if (transactionStore?.eventStore && transactionStore.snapshotStore) {
-      const downstreamEvents: Array<Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>> = [];
+      const downstreamEvents: AgentEvent[] = [];
       const terminalRun = await transactionStore.runInTransaction(async (stores) => {
         if (!stores.eventStore || !stores.snapshotStore) {
           throw new Error('Transactional terminal transition requires eventStore and snapshotStore');
@@ -3985,8 +3988,7 @@ export class AdaptiveAgent {
         }
 
         const terminalEvent = this.withEventPayloadPerformance(params.event(updatedRun));
-        await stores.eventStore.append(terminalEvent);
-        downstreamEvents.push(terminalEvent);
+        downstreamEvents.push(await stores.eventStore.append(terminalEvent));
         return updatedRun;
       });
 
@@ -4909,7 +4911,7 @@ export class AdaptiveAgent {
     });
   }
 
-  private async emitDownstreamOnly(events: Array<Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>>): Promise<void> {
+  private async emitDownstreamOnly(events: AgentEvent[]): Promise<void> {
     if (!this.options.eventSink || this.options.eventSink === (this.options.eventStore as unknown as EventSink | undefined)) {
       return;
     }
@@ -4983,12 +4985,10 @@ function createCompositeEventSink(
 ): EventSink {
   return {
     emit: async (event) => {
-      if (eventStore) {
-        await eventStore.append(event);
-      }
+      const persisted = eventStore ? await eventStore.append(event) : undefined;
 
       if (downstreamSink && downstreamSink !== (eventStore as unknown as EventSink | undefined)) {
-        await downstreamSink.emit(event);
+        await downstreamSink.emit(persisted ?? event);
       }
     },
   };

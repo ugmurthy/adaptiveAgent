@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import type { ActivityEvent } from './activity';
 
 export interface ResolvedConfiguration {
   agent: { id: string; name: string; description?: string; defaultInvocationMode: string; configurationFingerprint: string };
@@ -30,7 +31,6 @@ export interface StartedRun { itemId: string; runId: string; }
 export interface ChatMessage { id: string; ordinal: number; role: 'user'|'assistant'; content: string; runId?: string; }
 export interface Chat { itemId:string; title:string; sessionId:string; pinnedAgentId:string; pinnedAgentName:string; pinnedAgentFingerprint:string; messages:ChatMessage[]; readOnlyReason?:string; occupied:boolean; }
 
-export interface ProgressEvent { runId: string; kind: string; message: string; }
 export interface RunFinishedEvent { runId: string; result?: unknown; error?: string; }
 
 export const getDesktopState = () => invoke<DesktopState>('desktop_state');
@@ -48,12 +48,12 @@ export const quitTerminate = () => invoke<DesktopState>('quit_terminate');
 export const quitCancel = () => invoke<DesktopState>('quit_cancel');
 
 export async function subscribe(
-  progress: (event: ProgressEvent) => void,
+  activity: (event: ActivityEvent) => void,
   finished: (event: RunFinishedEvent) => void,
   state: (event: DesktopState) => void,
 ): Promise<UnlistenFn> {
   const unlisten = await Promise.all([
-    listen<ProgressEvent>('adaptive-agent://progress', ({ payload }) => progress(payload)),
+    listen<ActivityEvent>('adaptive-agent://activity', ({ payload }) => activity(payload)),
     listen<RunFinishedEvent>('adaptive-agent://run-finished', ({ payload }) => {
       if (payload && typeof payload.runId === 'string' && payload.runId.length > 0) finished(payload);
     }),

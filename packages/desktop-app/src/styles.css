@@ -21,6 +21,8 @@ textarea:focus { border-color: #56d6b2; box-shadow: 0 0 0 3px rgba(86,214,178,.1
 .run-status { margin-left: auto; color: #82939d; max-width: 55%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .alert { margin: 0 0 18px; border: 1px solid #713b3d; border-radius: 8px; background: #291719; color: #ffb9b6; padding: 12px; font-size: 13px; line-height: 1.45; }
 .progress { margin-top: 20px; border-top: 1px solid #26323a; padding-top: 12px; color: #a8b5bc; font-size: 13px; } .progress div { padding: 5px 0; } .progress span { display: inline-block; width: 105px; color: #61cfae; }
+.model-timer { display: flex; gap: 12px; align-items: center; margin-top: 20px; padding: 10px 12px; border: 1px solid #315047; border-radius: 9px; background: #10231e; color: #9aaba4; font-size: 12px; } .model-timer strong { color: #74dfbd; } .model-timer span:last-child { margin-left: auto; }
+.narrative div { display: flex; gap: 10px; align-items: baseline; } .narrative span { flex: 0 0 105px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .result { margin-top: 20px; border-radius: 9px; background: #0c1519; padding: 16px; } .result.error { border: 1px solid #713b3d; } .result h2, .settings h2 { margin: 0 0 10px; font-size: 15px; } pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.5 ui-monospace, monospace; color: #dce5e8; }
 .settings-title { justify-content: space-between; margin-bottom: 18px; } .settings-title h2 { margin-bottom: 0; }
 .validity { display: inline-block; margin-bottom: 18px; border-radius: 999px; padding: 6px 10px; background: #3a2426; color: #ffaaa6; font-size: 12px; } .validity.valid { background: #163229; color: #74dfbd; }

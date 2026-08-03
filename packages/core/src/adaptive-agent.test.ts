@@ -16,7 +16,7 @@ import { InMemorySnapshotStore } from './in-memory-snapshot-store.js';
 import { InMemoryToolExecutionStore } from './in-memory-tool-execution-store.js';
 import { createReadFileTool } from './tools/read-file.js';
 import { createWriteFileTool } from './tools/write-file.js';
-import type { ModelAdapter, ModelRequest, ModelResponse, RuntimeStores, ToolDefinition } from './types.js';
+import type { AgentEvent, ModelAdapter, ModelRequest, ModelResponse, RuntimeStores, ToolDefinition } from './types.js';
 
 class SequenceModel implements ModelAdapter {
   readonly provider: string;
@@ -3268,6 +3268,7 @@ describe('AdaptiveAgent', () => {
     const runStore = new InMemoryRunStore();
     const eventStore = new InMemoryEventStore();
     const snapshotStore = new InMemorySnapshotStore();
+    const downstreamEvents: AgentEvent[] = [];
     const runInTransaction = vi.fn(async (operation: (stores: RuntimeStores) => Promise<unknown>) =>
       operation({
         runStore,
@@ -3286,6 +3287,7 @@ describe('AdaptiveAgent', () => {
       runStore,
       eventStore,
       snapshotStore,
+      eventSink: { emit: async (event) => { downstreamEvents.push(event as AgentEvent); } },
       transactionStore: {
         runStore,
         eventStore,
@@ -3306,6 +3308,11 @@ describe('AdaptiveAgent', () => {
       schemaVersion: 1,
       stepsUsed: 1,
     });
+    expect(downstreamEvents).toHaveLength(events.length);
+    expect(downstreamEvents.map(({ id, seq, createdAt }) => ({ id, seq, createdAt }))).toEqual(
+      events.map(({ id, seq, createdAt }) => ({ id, seq, createdAt })),
+    );
+    expect(new Set(downstreamEvents.map(({ id }) => id)).size).toBe(downstreamEvents.length);
   });
 
   it('uses a transaction store for terminal failure persistence', async () => {
@@ -3464,6 +3471,7 @@ describe('AdaptiveAgent', () => {
     const eventStore = new InMemoryEventStore();
     const snapshotStore = new InMemorySnapshotStore();
     const transactionEventGroups: string[][] = [];
+    const downstreamEvents: AgentEvent[] = [];
     const runInTransaction = vi.fn(async (operation: (stores: RuntimeStores) => Promise<unknown>) => {
       const eventTypes: string[] = [];
       try {
@@ -3522,6 +3530,7 @@ describe('AdaptiveAgent', () => {
       runStore,
       eventStore,
       snapshotStore,
+      eventSink: { emit: async (event) => { downstreamEvents.push(event as AgentEvent); } },
       transactionStore: {
         runStore,
         eventStore,
@@ -3553,6 +3562,13 @@ describe('AdaptiveAgent', () => {
       && !Array.isArray(event.payload)
       && event.payload.status === 'awaiting_subagent',
     )?.payload).toMatchObject({ snapshotSeq: 3 });
+    const allPersistedEvents = [
+      ...parentEvents,
+      ...(await Promise.all((await runStore.listChildren(result.runId)).map((run) => eventStore.listByRun(run.id)))).flat(),
+    ];
+    expect(downstreamEvents.every(({ id, seq, createdAt }) => Boolean(id && seq > 0 && createdAt))).toBe(true);
+    expect(new Set(downstreamEvents.map(({ id }) => id)).size).toBe(downstreamEvents.length);
+    expect(downstreamEvents.map(({ id }) => id).sort()).toEqual(allPersistedEvents.map(({ id }) => id).sort());
   });
 
   it('emits structured lifecycle logs with model, tool, and delegation context', async () => {

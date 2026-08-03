@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { addActivity, formatDuration, modelTiming, type ActivityEvent } from './activity';
   import {
     getDesktopState,
     createChat, listChats, loadChat, sendChatTurn,
@@ -13,14 +14,14 @@
     resolveApproval,
     subscribe,
     type DesktopState,
-    type ProgressEvent,
     type Chat,
   } from './desktop';
 
   let tab: 'run' | 'chat' | 'settings' = 'run';
   let task = '';
   let desktop: DesktopState = { status: 'starting', configurationValid: false, runs: [], occupiedSlotCount: 0, capacity: 3, executionHealth: 'error', traceHealth: 'starting', quitState: 'idle' };
-  let progress: ProgressEvent[] = [];
+  let activityByRoot: Record<string, ActivityEvent[]> = {};
+  let now = Date.now();
   let finalValue: unknown;
   let finalError = '';
   let startPending = false;
@@ -32,15 +33,18 @@
   let chatMessage = '';
   let refreshGeneration = 0;
   let refreshScheduled = false;
+  $: selectedActivity = selectedRunId ? activityByRoot[selectedRunId] ?? [] : [];
+  $: selectedTiming = modelTiming(selectedActivity, now);
 
   const canSend = () => desktop.quitState === 'idle' && desktop.configurationValid && desktop.status !== 'error' && desktop.occupiedSlotCount < desktop.capacity && task.trim().length > 0 && !startPending;
 
   onMount(() => {
     let unlisten = () => {};
     let cancelled = false;
+    const timer = window.setInterval(() => { now = Date.now(); }, 100);
     void (async () => {
     unlisten = await subscribe(
-      (event) => { progress = [...progress.slice(-19), event]; },
+      (event) => { activityByRoot = addActivity(activityByRoot, event); },
       (event) => {
         const previous = resultsByRun[event.runId];
         resultsByRun = {
@@ -60,7 +64,7 @@
     );
     if (cancelled) unlisten(); else await refresh();
     })().catch((error) => { finalError = String(error); });
-    return () => { cancelled = true; unlisten(); };
+    return () => { cancelled = true; window.clearInterval(timer); unlisten(); };
   });
 
   function scheduleRefresh() {
@@ -90,7 +94,6 @@
 
   async function send() {
     if (!canSend()) return;
-    progress = [];
     finalValue = undefined;
     finalError = '';
     startPending = true;
@@ -144,6 +147,15 @@
       desktop = await (action === 'wait' ? quitWait() : action === 'terminate' ? quitTerminate() : quitCancel());
     } catch (error) { finalError = String(error); }
     controlPending = false;
+  }
+
+  function chatActivity(itemId:string): ActivityEvent[] {
+    const occupied = desktop.runs.find((run) => run.itemId === itemId && run.occupiesSlot);
+    const latestMessage = selectedChat?.itemId === itemId
+      ? [...selectedChat.messages].reverse().find((message) => message.runId)
+      : undefined;
+    const root = occupied?.runId ?? latestMessage?.runId;
+    return root ? activityByRoot[root] ?? [] : [];
   }
 </script>
 
@@ -202,9 +214,16 @@
         </div>
       {/if}
 
-      {#if progress.length}
-        <div class="progress" aria-live="polite">
-          {#each progress.filter((event) => !selectedRunId || event.runId === selectedRunId) as event}<div><span>{event.kind}</span>{event.message}</div>{/each}
+      {#if selectedActivity.length}
+        <div class="model-timer" aria-live="polite">
+          {#if selectedTiming.current}
+            <strong>{selectedTiming.current.delegateName ?? 'Agent'} · {selectedTiming.current.provider ?? 'model'} / {selectedTiming.current.model ?? 'unknown'}</strong>
+            <span>{formatDuration(selectedTiming.current.elapsedMs)} in progress</span>
+          {:else}<strong>Model idle</strong>{/if}
+          <span>{formatDuration(selectedTiming.completedMs)} completed model time</span>
+        </div>
+        <div class="progress narrative" aria-live="polite">
+          {#each selectedActivity as event (event.eventId)}<div><span>{event.runId === event.rootRunId ? 'Agent' : event.delegateName ?? 'Delegate'}</span>{event.message}{event.durationMs !== undefined ? ` · ${formatDuration(event.durationMs)}` : ''}</div>{/each}
         </div>
       {/if}
       {#if finalError}<div class="result error"><h2>Error</h2><pre>{finalError}</pre></div>{/if}
@@ -221,6 +240,9 @@
         <label for="chat-message">Message</label><textarea id="chat-message" bind:value={chatMessage} disabled={!!selectedChat.readOnlyReason || selectedChat.occupied || desktop.quitState!=='idle'}></textarea>
         <div class="actions"><button class="primary" disabled={!chatMessage.trim() || !!selectedChat.readOnlyReason || selectedChat.occupied || startPending || desktop.occupiedSlotCount>=desktop.capacity} on:click={sendMessage}>Send</button><span>{selectedChat.occupied?'Turn in progress':'Ready'}</span></div>
         {#each desktop.runs.filter(run=>run.itemId===selectedChat?.itemId && run.pendingApproval) as run}<div class="alert"><strong>{run.pendingApproval!.toolName}</strong><p>{run.pendingApproval!.message}</p><button disabled={controlPending || run.pendingApproval!.decisionInFlight} on:click={()=>decide(run,true)}>Approve</button><button disabled={controlPending || run.pendingApproval!.decisionInFlight} on:click={()=>decide(run,false)}>Reject</button></div>{/each}
+        {@const activity = chatActivity(selectedChat.itemId)}
+        {@const timing = modelTiming(activity, now)}
+        {#if activity.length}<div class="model-timer">{#if timing.current}<strong>{timing.current.delegateName ?? 'Agent'} · {timing.current.provider ?? 'model'} / {timing.current.model ?? 'unknown'}</strong><span>{formatDuration(timing.current.elapsedMs)} in progress</span>{/if}<span>{formatDuration(timing.completedMs)} completed model time</span></div><div class="progress narrative">{#each activity as event (event.eventId)}<div><span>{event.runId===event.rootRunId?'Agent':event.delegateName??'Delegate'}</span>{event.message}</div>{/each}</div>{/if}
       {/if}
       {#if finalError}<div class="result error"><pre>{finalError}</pre></div>{/if}
     </section>

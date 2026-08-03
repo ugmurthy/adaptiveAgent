@@ -122,6 +122,8 @@ struct Bridge {
     generation: u64,
     next_id: AtomicU64,
     registry: Mutex<RunRegistry>,
+    run_roots: Mutex<HashMap<String, String>>,
+    run_delegates: Mutex<HashMap<String, String>>,
     submission: Mutex<()>,
     workbench: Arc<WorkbenchDb>,
     expected_shutdown: AtomicBool,
@@ -316,6 +318,8 @@ impl Bridge {
             generation: 1,
             next_id: AtomicU64::new(1),
             registry: Mutex::new(RunRegistry::default()),
+            run_roots: Mutex::new(HashMap::new()),
+            run_delegates: Mutex::new(HashMap::new()),
             workbench,
             submission: Mutex::new(()),
             expected_shutdown: AtomicBool::new(false),
@@ -327,6 +331,11 @@ impl Bridge {
             reconciling: Mutex::new(HashMap::new()),
         });
         for saved in saved_runs {
+            bridge
+                .run_roots
+                .lock()
+                .unwrap()
+                .insert(saved.run_id.clone(), saved.run_id.clone());
             bridge.registry.lock().unwrap().insert(RunRecord {
                 run_id: saved.run_id,
                 item_id: saved.item_id,
@@ -349,6 +358,17 @@ impl Bridge {
             });
         }
         for approval in bridge.workbench.load_pending_approvals()? {
+            bridge.run_roots.lock().unwrap().insert(
+                approval.approval_run_id.clone(),
+                approval.root_run_id.clone(),
+            );
+            if let Some(parent_run_id) = approval.parent_run_id.as_ref() {
+                bridge
+                    .run_roots
+                    .lock()
+                    .unwrap()
+                    .insert(parent_run_id.clone(), approval.root_run_id.clone());
+            }
             if let Some(root) = bridge
                 .registry
                 .lock()
@@ -401,6 +421,7 @@ impl Bridge {
             })?;
         *self.configuration.lock().unwrap() = Some(configuration);
         *self.initialization_error.lock().unwrap() = None;
+        self.prime_run_roots();
         self.reconcile_saved_runs();
         self.recover_pending_approval_operations();
         Ok(())
@@ -410,6 +431,42 @@ impl Bridge {
         let ids = self.registry.lock().unwrap().ids_requiring_reconciliation();
         for run_id in ids {
             self.reconcile_run(run_id);
+        }
+    }
+
+    fn prime_run_roots(&self) {
+        let root_run_ids = self.registry.lock().unwrap().ids_requiring_reconciliation();
+        for root_run_id in root_run_ids {
+            let mut inspection = self.inspect_for_recovery(&root_run_id).ok();
+            for _ in 0..16 {
+                let Some(run) = inspection.as_ref().and_then(|value| value.get("run")) else {
+                    break;
+                };
+                if let Some(run_id) = run.get("id").and_then(Value::as_str) {
+                    self.run_roots
+                        .lock()
+                        .unwrap()
+                        .insert(run_id.into(), root_run_id.clone());
+                    if let Some(delegate_name) = run.get("delegateName").and_then(Value::as_str) {
+                        self.run_delegates
+                            .lock()
+                            .unwrap()
+                            .insert(run_id.into(), delegate_name.into());
+                    }
+                }
+                let Some(child_run_id) = run
+                    .get("currentChildRunId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                else {
+                    break;
+                };
+                self.run_roots
+                    .lock()
+                    .unwrap()
+                    .insert(child_run_id.clone(), root_run_id.clone());
+                inspection = self.inspect_for_recovery(&child_run_id).ok();
+            }
         }
     }
 
@@ -694,6 +751,57 @@ impl Bridge {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or("run.progress");
+        let root_run_id = event
+            .pointer("/payload/rootRunId")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| self.run_roots.lock().unwrap().get(run_id).cloned())
+            .or_else(|| {
+                self.registry
+                    .lock()
+                    .unwrap()
+                    .get(run_id)
+                    .map(|_| run_id.to_owned())
+            });
+        if let Some(root_run_id) = root_run_id {
+            self.run_roots
+                .lock()
+                .unwrap()
+                .insert(run_id.into(), root_run_id.clone());
+            if kind == "run.created" {
+                if let Some(delegate_name) = event
+                    .pointer("/payload/delegateName")
+                    .and_then(Value::as_str)
+                {
+                    self.run_delegates
+                        .lock()
+                        .unwrap()
+                        .insert(run_id.into(), delegate_name.into());
+                }
+            } else if kind == "delegate.spawned" {
+                if let (Some(child_run_id), Some(delegate_name)) = (
+                    event.pointer("/payload/childRunId").and_then(Value::as_str),
+                    event
+                        .pointer("/payload/delegateName")
+                        .and_then(Value::as_str),
+                ) {
+                    self.run_roots
+                        .lock()
+                        .unwrap()
+                        .insert(child_run_id.into(), root_run_id.clone());
+                    self.run_delegates
+                        .lock()
+                        .unwrap()
+                        .insert(child_run_id.into(), delegate_name.into());
+                }
+            }
+            let delegate_name = self.run_delegates.lock().unwrap().get(run_id).cloned();
+            if let Some(projected) =
+                project_activity_event(event, &root_run_id, delegate_name.as_deref())
+            {
+                let _ = self.app.emit("adaptive-agent://activity", projected);
+            }
+        }
         let root_created = is_root_run_created(event);
         if kind == "approval.requested" {
             self.capture_pending_approval(event, run_id);
@@ -775,23 +883,6 @@ impl Bridge {
         ) {
             self.reconcile_run(run_id.to_owned());
         }
-        let message = match kind {
-            "run.created" => "Run started",
-            "plan.execution_started" => "Plan started",
-            "model.started" => "Thinking",
-            "model.retry" => "Retrying inference",
-            "tool.started" => "Tool started",
-            "tool.completed" => "Tool completed",
-            "tool.failed" => "Tool failed",
-            "run.completed" => "Run completed",
-            "run.failed" => "Run failed",
-            "run.interrupted" => "Run interrupted",
-            _ => return,
-        };
-        let _ = self.app.emit(
-            "adaptive-agent://progress",
-            json!({ "runId": run_id, "kind": kind, "message": message }),
-        );
     }
 
     fn capture_pending_approval(&self, value: &Value, fallback_root: &str) {
@@ -1410,6 +1501,18 @@ impl Bridge {
         let mut inspection = root_inspection.as_ref().ok()?.clone();
         for _ in 0..16 {
             let run = inspection.get("run")?;
+            if let Some(run_id) = run.get("id").and_then(Value::as_str) {
+                self.run_roots
+                    .lock()
+                    .unwrap()
+                    .insert(run_id.into(), root_run_id.into());
+                if let Some(delegate_name) = run.get("delegateName").and_then(Value::as_str) {
+                    self.run_delegates
+                        .lock()
+                        .unwrap()
+                        .insert(run_id.into(), delegate_name.into());
+                }
+            }
             match run.get("status").and_then(Value::as_str)? {
                 "awaiting_approval" => {
                     return pending_approval_from_inspection(root_run_id, &inspection)
@@ -1568,6 +1671,8 @@ fn replace_bridge(app: &AppHandle) -> Result<Arc<Bridge>, String> {
                 generation: 1,
                 next_id: AtomicU64::new(1),
                 registry: Mutex::new(RunRegistry::default()),
+                run_roots: Mutex::new(HashMap::new()),
+                run_delegates: Mutex::new(HashMap::new()),
                 workbench,
                 submission: Mutex::new(()),
                 expected_shutdown: AtomicBool::new(true),
@@ -2097,6 +2202,182 @@ fn recovered_result(inspection: &Response) -> Option<Value> {
     }
 }
 
+fn project_activity_event(
+    event: &Value,
+    root_run_id: &str,
+    cached_delegate_name: Option<&str>,
+) -> Option<Value> {
+    let event_id = event.get("id").and_then(Value::as_str)?;
+    let run_id = event.get("runId").and_then(Value::as_str)?;
+    let sequence = event.get("seq").and_then(Value::as_u64)?;
+    let kind = event.get("type").and_then(Value::as_str)?;
+    let created_at = event.get("createdAt").and_then(Value::as_str)?;
+    if !matches!(
+        kind,
+        "run.created"
+            | "run.status_changed"
+            | "run.interrupted"
+            | "run.steered"
+            | "run.resumed"
+            | "run.retry_started"
+            | "run.completed"
+            | "run.failed"
+            | "recovery.analyzed"
+            | "run.continuation_created"
+            | "context.refs.resolved"
+            | "plan.created"
+            | "plan.execution_started"
+            | "step.started"
+            | "step.completed"
+            | "model.started"
+            | "model.retry"
+            | "model.tool_call_rejected"
+            | "model.completed"
+            | "model.failed"
+            | "tool.started"
+            | "tool.completed"
+            | "tool.failed"
+            | "delegate.spawned"
+            | "approval.requested"
+            | "approval.resolved"
+            | "clarification.requested"
+            | "usage.updated"
+            | "snapshot.created"
+            | "replan.required"
+    ) {
+        return None;
+    }
+    let payload = event.get("payload").and_then(Value::as_object);
+    let mut projected = serde_json::Map::from_iter([
+        ("eventId".into(), Value::String(event_id.into())),
+        ("rootRunId".into(), Value::String(root_run_id.into())),
+        ("runId".into(), Value::String(run_id.into())),
+        ("seq".into(), Value::Number(sequence.into())),
+        ("kind".into(), Value::String(kind.into())),
+        ("createdAt".into(), Value::String(created_at.into())),
+        (
+            "message".into(),
+            Value::String(activity_message(kind, payload).into()),
+        ),
+    ]);
+    for key in ["stepId", "toolCallId"] {
+        if let Some(value) = event.get(key).and_then(Value::as_str) {
+            projected.insert(key.into(), Value::String(value.into()));
+        }
+    }
+    if let Some(payload) = payload {
+        for key in [
+            "callId",
+            "status",
+            "toStatus",
+            "fromStatus",
+            "provider",
+            "model",
+            "toolName",
+            "delegateName",
+            "approvalId",
+            "parentRunId",
+            "startedAt",
+            "failureKind",
+        ] {
+            if let Some(value) = payload.get(key).and_then(Value::as_str) {
+                projected.insert(key.into(), Value::String(value.into()));
+            }
+        }
+        for key in [
+            "durationMs",
+            "attempt",
+            "maxAttempts",
+            "nextAttempt",
+            "retryDelayMs",
+            "statusCode",
+        ] {
+            if let Some(value) = payload.get(key).and_then(Value::as_f64) {
+                if value.is_finite() && value >= 0.0 {
+                    if let Some(number) = serde_json::Number::from_f64(value) {
+                        projected.insert(key.into(), Value::Number(number));
+                    }
+                }
+            }
+        }
+        for key in ["retryable", "timedOut", "approved"] {
+            if let Some(value) = payload.get(key).and_then(Value::as_bool) {
+                projected.insert(key.into(), Value::Bool(value));
+            }
+        }
+        if matches!(kind, "model.retry" | "model.tool_call_rejected") {
+            for key in ["reason", "phase"] {
+                if let Some(value) = payload.get(key).and_then(Value::as_str) {
+                    projected.insert(key.into(), Value::String(value.into()));
+                }
+            }
+        }
+    }
+    if !projected.contains_key("delegateName") {
+        if let Some(delegate_name) = cached_delegate_name {
+            projected.insert("delegateName".into(), Value::String(delegate_name.into()));
+        }
+    }
+    Some(Value::Object(projected))
+}
+
+fn activity_message(kind: &str, payload: Option<&serde_json::Map<String, Value>>) -> String {
+    let name = |key: &str| {
+        payload
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+    };
+    match kind {
+        "run.created" => "Run started".into(),
+        "run.status_changed" => name("toStatus")
+            .map(|status| format!("Run is {}", status.replace('_', " ")))
+            .unwrap_or_else(|| "Run status changed".into()),
+        "plan.created" => "Plan created".into(),
+        "plan.execution_started" => "Plan started".into(),
+        "step.started" => "Step started".into(),
+        "step.completed" => "Step completed".into(),
+        "model.started" => match (name("provider"), name("model")) {
+            (Some(provider), Some(model)) => format!("Calling {provider} / {model}"),
+            _ => "Model call started".into(),
+        },
+        "model.retry" => "Retrying model call".into(),
+        "model.completed" => "Model call completed".into(),
+        "model.failed" => "Model call failed".into(),
+        "tool.started" => name("toolName")
+            .map(|tool| format!("Running {tool}"))
+            .unwrap_or_else(|| "Tool started".into()),
+        "tool.completed" => name("toolName")
+            .map(|tool| format!("{tool} completed"))
+            .unwrap_or_else(|| "Tool completed".into()),
+        "tool.failed" => name("toolName")
+            .map(|tool| format!("{tool} failed"))
+            .unwrap_or_else(|| "Tool failed".into()),
+        "delegate.spawned" => name("delegateName")
+            .map(|delegate| format!("Delegated to {delegate}"))
+            .unwrap_or_else(|| "Delegate started".into()),
+        "approval.requested" => payload
+            .and_then(|value| value.get("message"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| name("toolName").map(|tool| format!("Approval required for {tool}")))
+            .unwrap_or_else(|| "Approval required".into()),
+        "approval.resolved" => match payload
+            .and_then(|value| value.get("approved"))
+            .and_then(Value::as_bool)
+        {
+            Some(true) => "Approval granted".into(),
+            Some(false) => "Approval rejected".into(),
+            None => "Approval resolved".into(),
+        },
+        "usage.updated" => "Usage updated".into(),
+        "run.completed" => "Run completed".into(),
+        "run.failed" => "Run failed".into(),
+        "run.interrupted" => "Run interrupted".into(),
+        "replan.required" => "Replan required".into(),
+        _ => kind.replace('.', " "),
+    }
+}
+
 fn pending_approval_from_inspection(
     root_run_id: &str,
     inspection: &Value,
@@ -2492,6 +2773,50 @@ mod tests {
                 operation_state: "awaiting_decision".into(),
             })
         );
+    }
+
+    #[test]
+    fn activity_projection_whitelists_fields_and_removes_sensitive_payloads() {
+        let projected = project_activity_event(
+            &json!({
+                "id": "event-1",
+                "runId": "child-run",
+                "seq": 4,
+                "type": "model.started",
+                "createdAt": "2026-01-01T00:00:00.000Z",
+                "payload": {
+                    "callId": "call-1",
+                    "provider": "openai",
+                    "model": "gpt-test",
+                    "attempt": 1,
+                    "input": { "secret": true },
+                    "output": "private output",
+                    "assistantContent": "private assistant content",
+                    "messages": ["private message"],
+                    "reasoning": "private reasoning"
+                }
+            }),
+            "root-run",
+            Some("researcher"),
+        )
+        .unwrap();
+
+        assert_eq!(projected.get("eventId"), Some(&json!("event-1")));
+        assert_eq!(projected.get("rootRunId"), Some(&json!("root-run")));
+        assert_eq!(projected.get("runId"), Some(&json!("child-run")));
+        assert_eq!(projected.get("callId"), Some(&json!("call-1")));
+        assert_eq!(projected.get("provider"), Some(&json!("openai")));
+        assert_eq!(projected.get("delegateName"), Some(&json!("researcher")));
+        for forbidden in [
+            "input",
+            "output",
+            "assistantContent",
+            "messages",
+            "reasoning",
+            "payload",
+        ] {
+            assert!(projected.get(forbidden).is_none(), "leaked {forbidden}");
+        }
     }
 
     #[test]
