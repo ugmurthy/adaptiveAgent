@@ -120,6 +120,14 @@ export class DelegationError extends Error {
   }
 }
 
+/** Internal control-flow signal used to preserve a delegated approval pause. */
+export class DelegatedApprovalRequiredError extends Error {
+  constructor(readonly result: Extract<RunResult, { status: 'approval_requested' }>) {
+    super(result.message);
+    this.name = 'DelegatedApprovalRequiredError';
+  }
+}
+
 export class DelegationExecutor {
   private readonly hostToolsByName = new Map<string, ToolDefinition>();
   private readonly delegatesByName = new Map<string, DelegateDefinition>();
@@ -276,6 +284,10 @@ export class DelegationExecutor {
         resultBytes: approximateSerializedByteLength(childResult),
       }),
     });
+
+    if (childResult.status === 'approval_requested' && this.policy.childRunsMayRequestApproval) {
+      throw new DelegatedApprovalRequiredError(childResult);
+    }
 
     await this.materializeChildTerminalState(childRunId, childResult);
 
@@ -533,7 +545,7 @@ export class DelegationExecutor {
   }): Promise<AgentRun> {
     const transactionStore = this.options.transactionStore;
     if (transactionStore?.eventStore && transactionStore.snapshotStore) {
-      const downstreamEvents: Array<Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>> = [];
+      const downstreamEvents: AgentEvent[] = [];
       const updatedParent = await transactionStore.runInTransaction(async (stores) => {
         if (!stores.eventStore || !stores.snapshotStore) {
           throw new Error('Transactional child spawn requires eventStore and snapshotStore');
@@ -564,8 +576,7 @@ export class DelegationExecutor {
             params.childRunId,
           ),
         );
-        await stores.eventStore.append(statusChangedEvent);
-        downstreamEvents.push(statusChangedEvent);
+        downstreamEvents.push(await stores.eventStore.append(statusChangedEvent));
 
         const snapshotEvent = await this.persistAwaitingChildSnapshotWithStores(
           stores,
@@ -573,7 +584,7 @@ export class DelegationExecutor {
           params.childRunId,
           params.delegate.name,
         );
-        if (snapshotEvent) {
+        if (snapshotEvent && 'id' in snapshotEvent) {
           downstreamEvents.push(snapshotEvent);
         }
 
@@ -584,12 +595,10 @@ export class DelegationExecutor {
             params.delegatePayload,
           ),
         );
-        await stores.eventStore.append(delegateSpawnedEvent);
-        downstreamEvents.push(delegateSpawnedEvent);
+        downstreamEvents.push(await stores.eventStore.append(delegateSpawnedEvent));
 
         const childCreatedEvent = this.withEventPayloadPerformance(this.childRunCreatedEvent(childRun));
-        await stores.eventStore.append(childCreatedEvent);
-        downstreamEvents.push(childCreatedEvent);
+        downstreamEvents.push(await stores.eventStore.append(childCreatedEvent));
 
         return nextParent;
       });
@@ -660,7 +669,7 @@ export class DelegationExecutor {
     const parentToolEvent = this.withEventPayloadPerformance(params.parentToolEvent);
     const transactionStore = this.options.transactionStore;
     if (transactionStore?.eventStore) {
-      const updatedParent = await transactionStore.runInTransaction(async (stores) => {
+      const { updatedParent, events } = await transactionStore.runInTransaction(async (stores) => {
         if (!stores.eventStore) {
           throw new Error('Transactional parent resolution requires eventStore');
         }
@@ -673,12 +682,12 @@ export class DelegationExecutor {
           },
           params.parentRun.version,
         );
-        await stores.eventStore.append(statusChangedEvent);
-        await stores.eventStore.append(parentToolEvent);
-        return nextParent;
+        const persistedStatusEvent = await stores.eventStore.append(statusChangedEvent);
+        const persistedParentToolEvent = await stores.eventStore.append(parentToolEvent);
+        return { updatedParent: nextParent, events: [persistedStatusEvent, persistedParentToolEvent] };
       });
 
-      await this.emitDownstreamOnly([statusChangedEvent, parentToolEvent]);
+      await this.emitDownstreamOnly(events);
       return updatedParent;
     }
 
@@ -783,7 +792,7 @@ export class DelegationExecutor {
     parentRun: AgentRun,
     childRunId: UUID,
     delegateName: string,
-  ): Promise<Omit<AgentEvent, 'id' | 'seq' | 'createdAt'> | null> {
+  ): Promise<AgentEvent | Omit<AgentEvent, 'id' | 'seq' | 'createdAt'> | null> {
     if (!stores.snapshotStore) {
       return null;
     }
@@ -833,7 +842,9 @@ export class DelegationExecutor {
       },
     } satisfies Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>);
 
-    await stores.eventStore?.append(snapshotEvent);
+    const persistedEvent = stores.eventStore
+      ? await stores.eventStore.append(snapshotEvent)
+      : snapshotEvent;
 
     this.logLifecycle('debug', 'snapshot.created', {
       ...runLogBindings(parentRun),
@@ -844,7 +855,7 @@ export class DelegationExecutor {
       performance,
     });
 
-    return snapshotEvent;
+    return persistedEvent;
   }
 
   private delegateSpawnedEvent(
@@ -857,7 +868,7 @@ export class DelegationExecutor {
       stepId,
       type: 'delegate.spawned',
       schemaVersion: 1,
-      payload,
+      payload: compactJsonObject({ ...payload }),
     };
   }
 
@@ -866,13 +877,13 @@ export class DelegationExecutor {
       runId: childRun.id,
       type: 'run.created',
       schemaVersion: 1,
-      payload: {
+      payload: compactJsonObject({
         rootRunId: childRun.rootRunId,
         parentRunId: childRun.parentRunId,
         parentStepId: childRun.parentStepId,
         delegateName: childRun.delegateName,
         delegationDepth: childRun.delegationDepth,
-      },
+      }),
     };
   }
 
@@ -941,7 +952,7 @@ export class DelegationExecutor {
     };
   }
 
-  private async emitDownstreamOnly(events: Array<Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>>): Promise<void> {
+  private async emitDownstreamOnly(events: AgentEvent[]): Promise<void> {
     if (!this.options.downstreamEventSink) {
       return;
     }
@@ -1121,21 +1132,9 @@ export class DelegationExecutor {
     });
   }
 
-  private async emitRunEvent(event: {
-    runId: UUID;
-    type:
-      | 'run.created'
-      | 'run.status_changed'
-      | 'run.completed'
-      | 'run.failed'
-      | 'snapshot.created'
-      | 'delegate.spawned'
-      | 'tool.completed'
-      | 'tool.failed';
-    schemaVersion: number;
-    payload: JsonValue;
-    stepId?: string;
-  }): Promise<void> {
+  private async emitRunEvent(
+    event: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>,
+  ): Promise<void> {
     if (!this.options.eventSink) {
       return;
     }

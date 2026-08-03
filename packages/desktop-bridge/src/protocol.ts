@@ -1,4 +1,4 @@
-import type { JsonValue } from '@adaptive-agent/core';
+import type { ChatMessage, JsonValue, RuntimeDeletionTarget } from '@adaptive-agent/core';
 import type { InferenceMode, InferenceTier, ProfileRef } from '@adaptive-agent/gateway-client';
 
 export {
@@ -7,8 +7,8 @@ export {
 } from '@adaptive-agent/agent-sdk/cli';
 
 /** Keep versions as strings: JSON numbers cannot distinguish 1.10 from 1.1. */
-export const DESKTOP_PROTOCOL_VERSION = '1.11' as const;
-export const SUPPORTED_DESKTOP_PROTOCOL_VERSIONS = ['1.10', DESKTOP_PROTOCOL_VERSION] as const;
+export const DESKTOP_PROTOCOL_VERSION = '1.12' as const;
+export const SUPPORTED_DESKTOP_PROTOCOL_VERSIONS = ['1.10', '1.11', DESKTOP_PROTOCOL_VERSION] as const;
 export const DESKTOP_BRIDGE_VERSION = '0.1.0';
 
 export type DesktopProtocolVersion = (typeof SUPPORTED_DESKTOP_PROTOCOL_VERSIONS)[number];
@@ -102,6 +102,7 @@ export interface CliExecuteParams {
 }
 
 export interface RunParams {
+  runId: string;
   goal: string;
   sessionId?: string;
   input?: JsonValue;
@@ -111,7 +112,8 @@ export interface RunParams {
 }
 
 export interface ChatParams {
-  message: string;
+  runId: string;
+  transcript: ChatMessage[];
   sessionId?: string;
   inferenceMode?: InferenceMode;
   inferenceTier?: InferenceTier;
@@ -138,11 +140,16 @@ export interface SteerParams extends RunIdParams {
 }
 
 export interface ApprovalParams extends RunIdParams {
+  approvalId: string;
   approved: boolean;
 }
 
 export interface ClarificationParams extends RunIdParams {
   answer: string;
+}
+
+export interface HistoryDeletionParams {
+  target: RuntimeDeletionTarget;
 }
 
 type RpcRequest<TMethod extends string, TParams> = JsonRpcRequest<TMethod, TParams>;
@@ -166,6 +173,8 @@ export type DesktopRpcRequest =
   | RpcRequest<'run/steer', SteerParams>
   | RpcRequest<'interaction/resolveApproval', ApprovalParams>
   | RpcRequest<'interaction/resolveClarification', ClarificationParams>
+  | RpcRequest<'history/previewDeletion', HistoryDeletionParams>
+  | RpcRequest<'history/delete', HistoryDeletionParams>
   | RpcRequestWithoutParams<'cli/commands'>
   | RpcRequest<'cli/execute', CliExecuteParams>;
 
@@ -187,6 +196,8 @@ export const DESKTOP_RPC_METHODS = [
   'run/steer',
   'interaction/resolveApproval',
   'interaction/resolveClarification',
+  'history/previewDeletion',
+  'history/delete',
   'cli/commands',
   'cli/execute',
 ] as const satisfies readonly DesktopRpcRequest['method'][];
@@ -286,6 +297,7 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
       return;
     case 'agent/run': {
       const value = requiredParams(method, params);
+      requiredString(value, 'runId');
       requiredString(value, 'goal');
       optionalString(value, 'sessionId');
       validateExecutionSelection(value);
@@ -293,7 +305,8 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
     }
     case 'agent/chat': {
       const value = requiredParams(method, params);
-      requiredString(value, 'message');
+      requiredString(value, 'runId');
+      validateTranscript(value.transcript);
       optionalString(value, 'sessionId');
       validateExecutionSelection(value);
       return;
@@ -324,6 +337,7 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
     case 'interaction/resolveApproval': {
       const value = requiredParams(method, params);
       requiredString(value, 'runId');
+      requiredString(value, 'approvalId');
       if (typeof value.approved !== 'boolean') invalidParams('approved must be a boolean.');
       return;
     }
@@ -331,6 +345,22 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
       const value = requiredParams(method, params);
       requiredString(value, 'runId');
       requiredString(value, 'answer');
+      return;
+    }
+    case 'history/previewDeletion':
+    case 'history/delete': {
+      const value = requiredParams(method, params);
+      requiredObject(value, 'target');
+      const target = value.target as Record<string, unknown>;
+      requiredString(target, 'kind');
+      const kind = target.kind;
+      if (kind === 'root-run') {
+        requiredString(target, 'rootRunId');
+      } else if (kind === 'session') {
+        requiredString(target, 'sessionId');
+      } else {
+        invalidParams('target.kind must be root-run or session.');
+      }
       return;
     }
     case 'cli/execute': {
@@ -343,6 +373,27 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
         invalidParams('timeoutMs must be an integer between 1 and 86400000.');
       }
       return;
+    }
+  }
+}
+
+function validateTranscript(value: unknown): asserts value is ChatMessage[] {
+  if (!Array.isArray(value) || value.length === 0) invalidParams('transcript must be a non-empty ChatMessage array.');
+  for (const [index, message] of value.entries()) {
+    if (!isRecord(message) || !['system', 'user', 'assistant'].includes(String(message.role))) {
+      invalidParams(`transcript[${index}].role must be system, user, or assistant.`);
+    }
+    if (typeof message.content !== 'string' && !Array.isArray(message.content)) {
+      invalidParams(`transcript[${index}].content must be a string or content-part array.`);
+    }
+    if (typeof message.content === 'string' && !message.content.trim()) {
+      invalidParams(`transcript[${index}].content must not be empty.`);
+    }
+    if (Array.isArray(message.content) && (message.content.length === 0 || message.content.some((part) => !isRecord(part)))) {
+      invalidParams(`transcript[${index}].content must contain valid content parts.`);
+    }
+    if (message.images !== undefined && !Array.isArray(message.images)) {
+      invalidParams(`transcript[${index}].images must be an array.`);
     }
   }
 }

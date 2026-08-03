@@ -281,14 +281,14 @@ export class AgentSdk {
     while (result.status === 'approval_requested' || result.status === 'clarification_requested') {
       if (result.status === 'approval_requested') {
         if (this.config.interaction.approvalMode === 'reject') {
-          await this.agent.resolveApproval(result.runId, false);
+          await this.agent.resolveApproval(result.runId, result.approvalId, false);
           result = await this.agent.resume(result.runId);
         } else if (this.config.interaction.approvalMode === 'auto') {
-          await this.agent.resolveApproval(result.runId, true);
+          await this.agent.resolveApproval(result.runId, result.approvalId, true);
           result = await this.agent.resume(result.runId);
         } else {
           const approved = await promptYesNo(`Approve tool "${result.toolName}"? [y/N] `);
-          await this.agent.resolveApproval(result.runId, approved);
+          await this.agent.resolveApproval(result.runId, result.approvalId, approved);
           result = await this.agent.resume(result.runId);
         }
         continue;

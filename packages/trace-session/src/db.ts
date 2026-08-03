@@ -17,6 +17,8 @@ export interface TracePostgresConfig {
 }
 
 export interface TraceConfigOptions {
+  /** Trusted startup-only exact runtime SQLite path. */
+  sqlitePath?: string;
   configPath?: string;
   databaseUrl?: string;
   databaseUrlEnv?: string;
@@ -42,6 +44,10 @@ export class UnsupportedTraceRuntimeError extends Error {
 /** Resolve the trace backend while preserving legacy Postgres option priority. */
 export async function resolveTraceRuntimeTarget(options: TraceConfigOptions = {}): Promise<TraceRuntimeTarget> {
   const env = options.env ?? process.env;
+  if (options.sqlitePath) {
+    const path = resolve(options.cwd ?? process.cwd(), options.sqlitePath);
+    return { kind: 'sqlite', path, diagnostic: `sqlite:${path}` };
+  }
   if (options.databaseUrl || options.configPath || options.databaseUrlEnv !== undefined) {
     return { kind: 'postgres', config: await resolveTracePostgresConfig(options), diagnostic: 'postgres' };
   }

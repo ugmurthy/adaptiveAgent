@@ -128,6 +128,8 @@ describe('ambient supervisor', () => {
     const runRaw = vi.fn<AmbientAgentSdk['runRaw']>().mockResolvedValue({
       status: 'approval_requested',
       runId: 'run-approval',
+      approvalId: 'tool-call-approval',
+      rootRunId: 'run-approval',
       message: 'Approve edit_file?',
       toolName: 'edit_file',
     });

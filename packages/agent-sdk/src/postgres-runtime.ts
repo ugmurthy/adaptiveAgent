@@ -39,6 +39,7 @@ export async function resolveRuntimeBundle(mode: RuntimeMode, autoMigrate: boole
         continuationStore: stores.continuationStore,
         toolExecutionStore: stores.toolExecutionStore,
         transactionStore: stores,
+        maintenanceStore: stores.maintenanceStore,
       },
       close: () => stores.close(),
     };

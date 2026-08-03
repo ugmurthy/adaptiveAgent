@@ -141,6 +141,11 @@ describe('trace sidecar runtime policy', () => {
 });
 
 describe('trace sidecar startup policy', () => {
+  it('accepts an exact trusted SQLite path and keeps backend selectors exclusive', () => {
+    expect(parseSidecarArgs(['--sqlite-path', './runtime.sqlite'])).toMatchObject({ sqlitePath: './runtime.sqlite' });
+    expect(() => parseSidecarArgs(['--sqlite-path', './runtime.sqlite', '--settings', './settings.json'])).toThrow(/exactly one backend source/);
+  });
+
   it('makes reasoning imply messages without accepting RPC database configuration', () => {
     expect(parseSidecarArgs(['--settings', './agent.settings.json', '--allow-reasoning'])).toMatchObject({
       settingsPath: './agent.settings.json',

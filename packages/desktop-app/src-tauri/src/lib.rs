@@ -1,7 +1,12 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+mod registry;
+mod shutdown;
+mod workbench;
+use registry::{CancelAction, RunRecord, RunRegistry, CAPACITY};
+use shutdown::{CloseDecision, QuitCoordinator, QuitState};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
@@ -14,11 +19,53 @@ use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent},
     ShellExt,
 };
+use workbench::{ChatItem, ChatMessage, PendingApproval, Reservation, WorkbenchDb};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_NDJSON_FRAME_SIZE: usize = 1024 * 1024;
+const TRACE_MAX_NDJSON_FRAME_SIZE: usize = 8 * 1024 * 1024;
+const TRACE_PRIVACY_SETTING: &str = "trace_privacy";
 
 type Response = Result<Value, String>;
+
+struct NdjsonDecoder {
+    buffer: Vec<u8>,
+    max_frame_size: usize,
+}
+
+impl NdjsonDecoder {
+    fn new(max_frame_size: usize) -> Self {
+        Self {
+            buffer: Vec::new(),
+            max_frame_size,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<Value>, String> {
+        self.buffer.extend_from_slice(bytes);
+        let mut frames = Vec::new();
+        while let Some(end) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            if end > self.max_frame_size {
+                self.buffer.drain(..=end);
+                return Err("Sidecar NDJSON frame exceeded the maximum size.".into());
+            }
+            let line: Vec<u8> = self.buffer.drain(..=end).take(end).collect();
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            frames.push(
+                serde_json::from_slice(&line)
+                    .map_err(|_| "Sidecar emitted invalid NDJSON.".to_string())?,
+            );
+        }
+        if self.buffer.len() > self.max_frame_size {
+            self.buffer.clear();
+            return Err("Sidecar NDJSON frame exceeded the maximum size.".into());
+        }
+        Ok(frames)
+    }
+}
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -29,31 +76,331 @@ struct DesktopState {
     configuration: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    runs: Vec<RunSummary>,
+    occupied_slot_count: usize,
+    capacity: usize,
+    execution_health: &'static str,
+    trace_health: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    active_run_id: Option<String>,
+    trace_error: Option<String>,
+    quit_state: QuitState,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunSummary {
+    item_id: String,
+    run_id: String,
+    title: String,
+    invocation_kind: String,
+    status: String,
+    cancel_requested: bool,
+    occupies_slot: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending_approval: Option<PendingApproval>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StartedRun {
+    item_id: String,
+    run_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatDto {
+    #[serde(flatten)]
+    chat: ChatItem,
+    messages: Vec<ChatMessage>,
+    read_only_reason: Option<String>,
+    occupied: bool,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+enum ProductDeletionTarget {
+    Item { item_id: String },
+    Run { run_id: String },
+    ChatTurn { item_id: String, ordinal: i64 },
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeletionPreview {
+    target: ProductDeletionTarget,
+    label: String,
+    run_count: usize,
+    plan_count: usize,
+    occupied: bool,
+    warning: &'static str,
 }
 
 struct Bridge {
     app: AppHandle,
     child: Mutex<Option<CommandChild>>,
     pending: Mutex<HashMap<u64, Sender<Response>>>,
+    decoder: Mutex<NdjsonDecoder>,
+    generation: u64,
     next_id: AtomicU64,
-    active: AtomicBool,
-    stopping: AtomicBool,
-    queued_stop: AtomicBool,
+    registry: Mutex<RunRegistry>,
+    run_roots: Mutex<HashMap<String, String>>,
+    run_delegates: Mutex<HashMap<String, String>>,
+    submission: Mutex<()>,
+    workbench: Arc<WorkbenchDb>,
     expected_shutdown: AtomicBool,
-    active_run_id: Mutex<Option<String>>,
     configuration: Mutex<Option<Value>>,
     initialization_error: Mutex<Option<String>>,
+    trace_healthy: Arc<AtomicBool>,
+    trace_error: Arc<Mutex<Option<String>>>,
+    draining: AtomicBool,
+    // false means running; true means one more pass was requested while running.
+    reconciling: Mutex<HashMap<String, bool>>,
 }
 
 #[derive(Default)]
 struct AppState {
+    lifecycle: Mutex<()>,
     bridge: Mutex<Option<Arc<Bridge>>>,
+    trace: Mutex<Option<Arc<TraceBridge>>>,
+    generation: AtomicU64,
+    quit: Mutex<QuitCoordinator>,
+    shutdown_started: AtomicBool,
+    trace_selection: Mutex<TraceSelection>,
+    trace_refreshes: Mutex<HashMap<String, TraceRefreshState>>,
+}
+
+#[derive(Default)]
+struct TraceSelection {
+    root_run_id: Option<String>,
+    revision: u64,
+}
+
+#[derive(Default)]
+struct TraceRefreshState {
+    pending: bool,
+    final_refresh: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TracePrivacy {
+    messages: bool,
+    reasoning: bool,
+    raw_tool_payloads: bool,
+}
+
+struct TraceBridge {
+    app: AppHandle,
+    child: Mutex<Option<CommandChild>>,
+    pending: Mutex<HashMap<u64, Sender<Response>>>,
+    decoder: Mutex<NdjsonDecoder>,
+    next_id: AtomicU64,
+    request_gate: Mutex<()>,
+    healthy: Arc<AtomicBool>,
+    error: Arc<Mutex<Option<String>>>,
+    expected_shutdown: AtomicBool,
+}
+
+impl TraceBridge {
+    fn spawn_process(
+        app: &AppHandle,
+        sqlite_path: &str,
+        privacy: TracePrivacy,
+        healthy: Arc<AtomicBool>,
+        error: Arc<Mutex<Option<String>>>,
+    ) -> Result<Arc<Self>, String> {
+        let mut arguments = vec!["--sqlite-path".to_string(), sqlite_path.to_string()];
+        if privacy.messages || privacy.reasoning {
+            arguments.push("--allow-messages".into());
+        }
+        if privacy.reasoning {
+            arguments.push("--allow-reasoning".into());
+        }
+        if privacy.raw_tool_payloads {
+            arguments.push("--allow-raw-tool-payloads".into());
+        }
+        let (mut events, child) = app
+            .shell()
+            .sidecar("trace-session-sidecar")
+            .map_err(|e| format!("Unable to locate trace sidecar: {e}"))?
+            .args(arguments)
+            .spawn()
+            .map_err(|e| format!("Unable to start trace sidecar: {e}"))?;
+        let sidecar = Arc::new(Self {
+            app: app.clone(),
+            child: Mutex::new(Some(child)),
+            pending: Mutex::new(HashMap::new()),
+            decoder: Mutex::new(NdjsonDecoder::new(TRACE_MAX_NDJSON_FRAME_SIZE)),
+            next_id: AtomicU64::new(1),
+            request_gate: Mutex::new(()),
+            healthy,
+            error,
+            expected_shutdown: AtomicBool::new(false),
+        });
+        let reader = sidecar.clone();
+        tauri::async_runtime::spawn(async move {
+            while let Some(event) = events.recv().await {
+                match event {
+                    CommandEvent::Stdout(bytes) => reader.stdout(&bytes),
+                    CommandEvent::Terminated(_) | CommandEvent::Error(_) => {
+                        reader.fail("Trace sidecar exited unexpectedly.");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        Ok(sidecar)
+    }
+
+    fn initialize(&self, privacy: TracePrivacy) -> Result<(), String> {
+        let initialized=match self.request_wait("initialize",Some(json!({"protocolVersion":"1.0","clientInfo":{"name":"adaptive-agent-desktop","version":"0.1.0"}})),REQUEST_TIMEOUT){Ok(value)=>value,Err(error)=>{self.fail(&error);return Err(error)}};
+        if initialized.get("protocolVersion").and_then(Value::as_str) != Some("1.0") {
+            let error = "Trace sidecar did not negotiate protocol 1.0.".to_string();
+            self.fail(&error);
+            return Err(error);
+        }
+        if initialized
+            .pointer("/backend/readOnly")
+            .and_then(Value::as_bool)
+            != Some(true)
+            || initialized
+                .pointer("/capabilities/messages")
+                .and_then(Value::as_bool)
+                != Some(privacy.messages || privacy.reasoning)
+            || initialized
+                .pointer("/capabilities/reasoning")
+                .and_then(Value::as_bool)
+                != Some(privacy.reasoning)
+            || initialized
+                .pointer("/capabilities/rawToolPayloads")
+                .and_then(Value::as_bool)
+                != Some(privacy.raw_tool_payloads)
+        {
+            let error =
+                "Trace sidecar capabilities do not match the trusted privacy policy.".to_string();
+            self.fail(&error);
+            return Err(error);
+        }
+        self.healthy.store(true, Ordering::SeqCst);
+        self.emit_state();
+        Ok(())
+    }
+    fn request_wait(&self, method: &str, params: Option<Value>, timeout: Duration) -> Response {
+        let _request = self.request_gate.lock().unwrap();
+        if self.expected_shutdown.load(Ordering::SeqCst) {
+            return Err("Trace sidecar is shutting down.".into());
+        }
+        self.request_wait_serialized(method, params, timeout)
+    }
+    fn request_wait_serialized(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        timeout: Duration,
+    ) -> Response {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
+        self.pending.lock().unwrap().insert(id, tx);
+        let message = match params {
+            Some(params) => json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+            None => json!({"jsonrpc":"2.0","id":id,"method":method}),
+        };
+        let mut bytes = serde_json::to_vec(&message).map_err(|e| e.to_string())?;
+        bytes.push(b'\n');
+        let write = self
+            .child
+            .lock()
+            .unwrap()
+            .as_mut()
+            .ok_or("Trace sidecar is not running.")
+            .and_then(|child| {
+                child
+                    .write(&bytes)
+                    .map_err(|_| "Unable to write to trace sidecar.")
+            });
+        if let Err(error) = write {
+            self.pending.lock().unwrap().remove(&id);
+            self.fail(error);
+            return Err(error.into());
+        }
+        match rx.recv_timeout(timeout) {
+            Ok(response) => response,
+            Err(_) => {
+                self.pending.lock().unwrap().remove(&id);
+                let error = "Trace sidecar request timed out.";
+                self.fail(error);
+                Err(error.into())
+            }
+        }
+    }
+    fn stdout(&self, bytes: &[u8]) {
+        let frames = self.decoder.lock().unwrap().push(bytes);
+        match frames {
+            Ok(messages) => {
+                for message in messages {
+                    if let Some(id) = message.get("id").and_then(Value::as_u64) {
+                        if let Some(sender) = self.pending.lock().unwrap().remove(&id) {
+                            let response = if let Some(error) = message.get("error") {
+                                Err(error
+                                    .get("message")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("Trace request failed.")
+                                    .into())
+                            } else {
+                                Ok(message.get("result").cloned().unwrap_or(Value::Null))
+                            };
+                            let _ = sender.send(response);
+                        }
+                    }
+                }
+            }
+            Err(error) => self.fail(&error),
+        }
+    }
+    fn fail(&self, message: &str) {
+        if self.expected_shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        self.healthy.store(false, Ordering::SeqCst);
+        *self.error.lock().unwrap() = Some(message.into());
+        for (_, sender) in self.pending.lock().unwrap().drain() {
+            let _ = sender.send(Err(message.into()));
+        }
+        if let Some(child) = self.child.lock().unwrap().take() {
+            let _ = child.kill();
+        }
+        self.emit_state();
+    }
+    fn emit_state(&self) {
+        if let Some(bridge) = self.app.state::<AppState>().bridge.lock().unwrap().as_ref() {
+            bridge.emit_state();
+        }
+    }
+    fn shutdown(&self) {
+        self.expected_shutdown.store(true, Ordering::SeqCst);
+        if let Ok(_request) = self.request_gate.try_lock() {
+            let _ = self.request_wait_serialized("shutdown", None, SHUTDOWN_TIMEOUT);
+        }
+        if let Some(child) = self.child.lock().unwrap().take() {
+            let _ = child.kill();
+        }
+        for (_, sender) in self.pending.lock().unwrap().drain() {
+            let _ = sender.send(Err("Trace sidecar was shut down.".into()));
+        }
+    }
 }
 
 impl Bridge {
-    fn spawn(app: &AppHandle) -> Result<Arc<Self>, String> {
+    fn spawn(app: &AppHandle, workbench: Arc<WorkbenchDb>) -> Result<Arc<Self>, String> {
+        // Complete all fallible persistence reads before creating a child process so every
+        // spawned runtime can be published to, and shut down through, the native lifecycle.
+        let saved_runs = workbench.load_runs()?;
         let (mut events, child) = app
             .shell()
             .sidecar("agent-runtime")
@@ -64,20 +411,76 @@ impl Bridge {
             app: app.clone(),
             child: Mutex::new(Some(child)),
             pending: Mutex::new(HashMap::new()),
+            decoder: Mutex::new(NdjsonDecoder::new(MAX_NDJSON_FRAME_SIZE)),
+            generation: 1,
             next_id: AtomicU64::new(1),
-            active: AtomicBool::new(false),
-            stopping: AtomicBool::new(false),
-            queued_stop: AtomicBool::new(false),
+            registry: Mutex::new(RunRegistry::default()),
+            run_roots: Mutex::new(HashMap::new()),
+            run_delegates: Mutex::new(HashMap::new()),
+            workbench,
+            submission: Mutex::new(()),
             expected_shutdown: AtomicBool::new(false),
-            active_run_id: Mutex::new(None),
             configuration: Mutex::new(None),
             initialization_error: Mutex::new(None),
+            trace_healthy: Arc::new(AtomicBool::new(false)),
+            trace_error: Arc::new(Mutex::new(None)),
+            draining: AtomicBool::new(false),
+            reconciling: Mutex::new(HashMap::new()),
         });
+        for saved in saved_runs {
+            bridge
+                .run_roots
+                .lock()
+                .unwrap()
+                .insert(saved.run_id.clone(), saved.run_id.clone());
+            bridge.registry.lock().unwrap().insert(RunRecord {
+                run_id: saved.run_id,
+                item_id: saved.item_id,
+                title: saved.title,
+                session_id: saved.session_id,
+                invocation_kind: saved.invocation_kind,
+                submission_state: saved.submission_state.clone(),
+                cached_status: saved.cached_status.clone(),
+                root_created: saved.submission_state == "durable"
+                    || saved.submission_state == "created",
+                cancel_requested: saved.cancel_requested,
+                interrupt_pending: saved.interrupt_pending,
+                request_active: false,
+                revision: 0,
+                pending_interaction: None,
+                pending_approval: None,
+                occupies_slot: !matches!(
+                    saved.submission_state.as_str(),
+                    "terminal" | "submission_failed"
+                ),
+            });
+        }
+        for approval in bridge.workbench.load_pending_approvals()? {
+            bridge.run_roots.lock().unwrap().insert(
+                approval.approval_run_id.clone(),
+                approval.root_run_id.clone(),
+            );
+            if let Some(parent_run_id) = approval.parent_run_id.as_ref() {
+                bridge
+                    .run_roots
+                    .lock()
+                    .unwrap()
+                    .insert(parent_run_id.clone(), approval.root_run_id.clone());
+            }
+            if let Some(root) = bridge
+                .registry
+                .lock()
+                .unwrap()
+                .get_mut(&approval.root_run_id)
+            {
+                root.pending_approval = Some(approval);
+            }
+        }
         let reader = bridge.clone();
         tauri::async_runtime::spawn(async move {
             while let Some(event) = events.recv().await {
                 match event {
-                    CommandEvent::Stdout(bytes) => reader.handle_stdout(&bytes),
+                    CommandEvent::Stdout(bytes) => reader.handle_stdout(1, &bytes),
                     CommandEvent::Stderr(_) => {
                         // Sidecar diagnostics stay native and are deliberately not logged or sent to the webview.
                     }
@@ -94,14 +497,14 @@ impl Bridge {
         Ok(bridge)
     }
 
-    fn initialize(&self) -> Result<(), String> {
+    fn initialize(self: &Arc<Self>) -> Result<(), String> {
         let negotiated = self.request_wait(
             "initialize",
-            json!({ "protocolVersion": "1.11", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }),
+            json!({ "protocolVersion": "1.12", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }),
             REQUEST_TIMEOUT,
         )?;
-        if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.11") {
-            return Err("The sidecar did not negotiate desktop protocol 1.11.".into());
+        if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.12") {
+            return Err("The sidecar did not negotiate desktop protocol 1.12.".into());
         }
         let initialized = self.request_wait(
             "runtime/initialize",
@@ -111,27 +514,296 @@ impl Bridge {
         let configuration = initialized
             .get("resolvedConfiguration")
             .cloned()
-            .ok_or_else(|| "The sidecar did not return a safe resolved configuration.".to_string())?;
+            .ok_or_else(|| {
+                "The sidecar did not return a safe resolved configuration.".to_string()
+            })?;
         *self.configuration.lock().unwrap() = Some(configuration);
         *self.initialization_error.lock().unwrap() = None;
+        self.prime_run_roots();
+        self.reconcile_saved_runs();
+        self.recover_pending_approval_operations();
+        self.recover_deletion_jobs();
         Ok(())
+    }
+
+    fn recover_deletion_jobs(self: &Arc<Self>) {
+        let Ok(jobs) = self.workbench.load_deletion_jobs() else {
+            return;
+        };
+        for job in jobs {
+            if let Err(error) = self.execute_deletion_job(&job) {
+                let _ = self.workbench.fail_deletion_job(&job.id, &error);
+            }
+        }
+    }
+
+    fn reconcile_saved_runs(self: &Arc<Self>) {
+        let ids = self.registry.lock().unwrap().ids_requiring_reconciliation();
+        for run_id in ids {
+            self.reconcile_run(run_id);
+        }
+    }
+
+    fn prime_run_roots(&self) {
+        let root_run_ids = self.registry.lock().unwrap().ids_requiring_reconciliation();
+        for root_run_id in root_run_ids {
+            let mut inspection = self.inspect_for_recovery(&root_run_id).ok();
+            for _ in 0..16 {
+                let Some(run) = inspection.as_ref().and_then(|value| value.get("run")) else {
+                    break;
+                };
+                if let Some(run_id) = run.get("id").and_then(Value::as_str) {
+                    self.run_roots
+                        .lock()
+                        .unwrap()
+                        .insert(run_id.into(), root_run_id.clone());
+                    if let Some(delegate_name) = run.get("delegateName").and_then(Value::as_str) {
+                        self.run_delegates
+                            .lock()
+                            .unwrap()
+                            .insert(run_id.into(), delegate_name.into());
+                    }
+                }
+                let Some(child_run_id) = run
+                    .get("currentChildRunId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                else {
+                    break;
+                };
+                self.run_roots
+                    .lock()
+                    .unwrap()
+                    .insert(child_run_id.clone(), root_run_id.clone());
+                inspection = self.inspect_for_recovery(&child_run_id).ok();
+            }
+        }
+    }
+
+    fn reconcile_run(self: &Arc<Self>, run_id: String) {
+        let mut reconciling = self.reconciling.lock().unwrap();
+        if let Some(rerun) = reconciling.get_mut(&run_id) {
+            *rerun = true;
+            return;
+        }
+        reconciling.insert(run_id.clone(), false);
+        drop(reconciling);
+        let bridge = self.clone();
+        std::thread::spawn(move || {
+            let mut attempted_interrupt = false;
+            loop {
+                let (revision, previous, root_created, definitely_absent) = bridge
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .get(&run_id)
+                    .map(|record| {
+                        (
+                            record.revision,
+                            record.occupies_slot,
+                            record.root_created,
+                            !record.request_active
+                                && !record.root_created
+                                && matches!(
+                                    record.submission_state.as_str(),
+                                    "reserved" | "submitted"
+                                ),
+                        )
+                    })
+                    .unwrap_or((0, false, false, false));
+                let inspection = bridge.inspect_for_recovery(&run_id);
+                let mut state = reconciliation_classification(
+                    &inspection,
+                    previous,
+                    root_created,
+                    definitely_absent,
+                );
+                let result = recovered_result(&inspection);
+                let recovered_approval = bridge.discover_pending_approval(&run_id, &inspection);
+                let chat_success = bridge
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .get(&run_id)
+                    .is_some_and(|record| record.invocation_kind == "chat")
+                    && state.cached_status == "succeeded";
+                if chat_success {
+                    let finalized = result
+                        .as_ref()
+                        .ok_or_else(|| "A succeeded chat has no durable /run/result.".to_string())
+                        .and_then(|result| {
+                            let output = response_assistant_value(result).ok_or_else(|| {
+                                "A succeeded chat has no durable output.".to_string()
+                            })?;
+                            bridge
+                                .workbench
+                                .finalize_chat_success(&run_id, result, &value_as_content(&output))
+                                .map(|_| ())
+                        });
+                    if let Err(error) = finalized {
+                        state = recovery_required(true);
+                        let _=bridge.app.emit("adaptive-agent://control-error",json!({"runId":run_id,"error":format!("Unable to reconcile successful chat turn: {error}")}));
+                    }
+                }
+                let mut applied_quiescent = false;
+                let mut stale = false;
+                let mut persisted = None;
+                let mut persist_approval = None;
+                let mut clear_approval_id = None;
+                let mut should_interrupt = false;
+                if let Some(record) = bridge.registry.lock().unwrap().get_mut(&run_id) {
+                    match apply_run_state(record, &state, Some(revision)) {
+                        ApplyState::Accepted => {
+                            applied_quiescent = !state.occupies_slot;
+                            if let Some(mut approval) = recovered_approval.clone() {
+                                preserve_approval_operation(
+                                    &mut approval,
+                                    record.pending_approval.as_ref(),
+                                );
+                                record.pending_approval = Some(approval.clone());
+                                persist_approval = Some(approval);
+                            } else if applied_quiescent {
+                                clear_approval_id = record
+                                    .pending_approval
+                                    .as_ref()
+                                    .map(|approval| approval.approval_id.clone());
+                                record.pending_approval = None;
+                            }
+                            persisted = Some((
+                                record.cached_status.clone(),
+                                record.submission_state.clone(),
+                            ));
+                        }
+                        ApplyState::Stale => stale = true,
+                        ApplyState::Rejected => {}
+                    }
+                    should_interrupt = !attempted_interrupt
+                        && !stale
+                        && record.occupies_slot
+                        && record.root_created
+                        && record.interrupt_pending;
+                }
+                if let Some((status, submission)) = persisted {
+                    let _ = bridge.workbench.update_run(&run_id, &status, &submission);
+                }
+                if let Some(approval) = persist_approval {
+                    let _ = bridge.workbench.save_pending_approval(&approval);
+                } else if let Some(approval_id) = clear_approval_id {
+                    let _ = bridge
+                        .workbench
+                        .clear_pending_approval(&run_id, Some(&approval_id));
+                }
+                if applied_quiescent && result.is_some() && !chat_success {
+                    if let Err(error) = bridge
+                        .workbench
+                        .store_result(&run_id, result.as_ref().unwrap())
+                    {
+                        let _ = bridge.app.emit(
+                            "adaptive-agent://control-error",
+                            json!({"runId":run_id,"error":error}),
+                        );
+                    }
+                }
+                if applied_quiescent {
+                    let _ = bridge.workbench.set_interrupt_pending(&run_id, false);
+                    if let Some(record) = bridge.registry.lock().unwrap().get_mut(&run_id) {
+                        record.interrupt_pending = false;
+                    }
+                }
+                if stale {
+                    if let Some(rerun) = bridge.reconciling.lock().unwrap().get_mut(&run_id) {
+                        *rerun = true;
+                    }
+                }
+                if should_interrupt {
+                    attempted_interrupt = true;
+                    if bridge.issue_interrupt(&run_id) {
+                        if let Some(rerun) = bridge.reconciling.lock().unwrap().get_mut(&run_id) {
+                            *rerun = true;
+                        }
+                    }
+                }
+                if applied_quiescent {
+                    let _ = bridge.app.emit(
+                        "adaptive-agent://run-finished",
+                        json!({ "runId": run_id, "result": result }),
+                    );
+                }
+                bridge.emit_state();
+                let mut active = bridge.reconciling.lock().unwrap();
+                if active.get(&run_id).copied().unwrap_or(false) {
+                    active.insert(run_id.clone(), false);
+                    continue;
+                }
+                active.remove(&run_id);
+                break;
+            }
+        });
+    }
+
+    fn issue_interrupt(&self, run_id: &str) -> bool {
+        let result = self.request_wait(
+            "run/interrupt",
+            json!({ "runId": run_id }),
+            Duration::from_secs(10),
+        );
+        if result.is_ok() {
+            // Acceptance is not quiescence. Reconciliation clears the durable intent.
+            true
+        } else {
+            let _ = self.app.emit(
+                "adaptive-agent://control-error",
+                json!({ "runId": run_id, "error": result.unwrap_err() }),
+            );
+            false
+        }
+    }
+
+    fn arm_interrupt(&self, run_id: &str, retry: bool) -> Result<(), String> {
+        loop {
+            match self.workbench.set_interrupt_pending(run_id, true) {
+                Ok(()) => {
+                    if let Some(record) = self.registry.lock().unwrap().get_mut(run_id) {
+                        record.interrupt_pending = true;
+                        record.revision += 1;
+                    }
+                    return Ok(());
+                }
+                Err(error) if retry => {
+                    let _ = self.app.emit(
+                        "adaptive-agent://control-error",
+                        json!({ "runId": run_id, "error": format!("Unable to persist shutdown interrupt; retrying: {error}") }),
+                    );
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn request(&self, method: &str, params: Value) -> Result<(u64, Receiver<Response>), String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel();
         self.pending.lock().unwrap().insert(id, sender);
-        let mut bytes = serde_json::to_vec(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
+        let request = (|| {
+            let mut bytes = serde_json::to_vec(
+                &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
+            )
             .map_err(|error| error.to_string())?;
-        bytes.push(b'\n');
-        let write_result = self.child.lock().unwrap().as_mut()
-            .ok_or_else(|| "The agent runtime is not running.".to_string())?
-            .write(&bytes)
-            .map_err(|_| "Unable to write to the agent runtime.".to_string());
-        if write_result.is_err() {
+            bytes.push(b'\n');
+            self.child
+                .lock()
+                .unwrap()
+                .as_mut()
+                .ok_or_else(|| "The agent runtime is not running.".to_string())?
+                .write(&bytes)
+                .map_err(|_| "Unable to write to the agent runtime.".to_string())?;
+            Ok(())
+        })();
+        if request.is_err() {
             self.pending.lock().unwrap().remove(&id);
         }
-        write_result.map(|_| (id, receiver))
+        request.map(|_| (id, receiver))
     }
 
     fn request_wait(&self, method: &str, params: Value, timeout: Duration) -> Response {
@@ -142,16 +814,39 @@ impl Bridge {
         })?
     }
 
-    fn handle_stdout(self: &Arc<Self>, bytes: &[u8]) {
-        let Ok(message) = serde_json::from_slice::<Value>(bytes) else { return };
+    fn handle_stdout(self: &Arc<Self>, generation: u64, bytes: &[u8]) {
+        if generation != self.generation {
+            return;
+        }
+        let messages = match self.decoder.lock().unwrap().push(bytes) {
+            Ok(messages) => messages,
+            Err(error) => {
+                self.fail_all(&error);
+                return;
+            }
+        };
+        for message in messages {
+            self.handle_message(message);
+        }
+    }
+
+    fn handle_message(self: &Arc<Self>, message: Value) {
         if message.get("method").and_then(Value::as_str) == Some("agent/event") {
             self.handle_agent_event(message.get("params").unwrap_or(&Value::Null));
             return;
         }
-        let Some(id) = message.get("id").and_then(Value::as_u64) else { return };
-        let Some(sender) = self.pending.lock().unwrap().remove(&id) else { return };
+        let Some(id) = message.get("id").and_then(Value::as_u64) else {
+            return;
+        };
+        let Some(sender) = self.pending.lock().unwrap().remove(&id) else {
+            return;
+        };
         let response = if let Some(error) = message.get("error") {
-            Err(error.get("message").and_then(Value::as_str).unwrap_or("Agent runtime request failed.").to_string())
+            Err(error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Agent runtime request failed.")
+                .to_string())
         } else {
             Ok(message.get("result").cloned().unwrap_or(Value::Null))
         };
@@ -159,104 +854,999 @@ impl Bridge {
     }
 
     fn handle_agent_event(self: &Arc<Self>, event: &Value) {
-        let Some(run_id) = event.get("runId").and_then(Value::as_str) else { return };
-        let kind = event.get("type").and_then(Value::as_str).unwrap_or("run.progress");
+        let Some(run_id) = event.get("runId").and_then(Value::as_str) else {
+            return;
+        };
+        let kind = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("run.progress");
+        let root_run_id = event
+            .pointer("/payload/rootRunId")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| self.run_roots.lock().unwrap().get(run_id).cloned())
+            .or_else(|| {
+                self.registry
+                    .lock()
+                    .unwrap()
+                    .get(run_id)
+                    .map(|_| run_id.to_owned())
+            });
+        if let Some(root_run_id) = root_run_id {
+            self.run_roots
+                .lock()
+                .unwrap()
+                .insert(run_id.into(), root_run_id.clone());
+            if kind == "run.created" {
+                if let Some(delegate_name) = event
+                    .pointer("/payload/delegateName")
+                    .and_then(Value::as_str)
+                {
+                    self.run_delegates
+                        .lock()
+                        .unwrap()
+                        .insert(run_id.into(), delegate_name.into());
+                }
+            } else if kind == "delegate.spawned" {
+                if let (Some(child_run_id), Some(delegate_name)) = (
+                    event.pointer("/payload/childRunId").and_then(Value::as_str),
+                    event
+                        .pointer("/payload/delegateName")
+                        .and_then(Value::as_str),
+                ) {
+                    self.run_roots
+                        .lock()
+                        .unwrap()
+                        .insert(child_run_id.into(), root_run_id.clone());
+                    self.run_delegates
+                        .lock()
+                        .unwrap()
+                        .insert(child_run_id.into(), delegate_name.into());
+                }
+            }
+            let delegate_name = self.run_delegates.lock().unwrap().get(run_id).cloned();
+            if let Some(projected) =
+                project_activity_event(event, &root_run_id, delegate_name.as_deref())
+            {
+                let _ = self.app.emit("adaptive-agent://activity", projected);
+            }
+            if matches!(
+                kind,
+                "run.completed" | "run.failed" | "run.interrupted" | "replan.required"
+            ) {
+                schedule_trace_refresh(&self.app, root_run_id, true);
+            }
+        }
         let root_created = is_root_run_created(event);
+        if kind == "approval.requested" {
+            self.capture_pending_approval(event, run_id);
+        }
         if root_created {
-            *self.active_run_id.lock().unwrap() = Some(run_id.to_string());
+            let cancel = {
+                let mut registry = self.registry.lock().unwrap();
+                let Some(record) = registry.get_mut(run_id) else {
+                    return;
+                };
+                record.root_created = true;
+                record.revision += 1;
+                record.cancel_requested
+            };
+            let persisted = self.registry.lock().unwrap().get(run_id).map(|record| {
+                (
+                    record.cached_status.clone(),
+                    record.submission_state.clone(),
+                )
+            });
+            if let Some((status, submission)) = persisted {
+                let _ = self.workbench.update_run(run_id, &status, &submission);
+            }
             self.emit_state();
-            if self.queued_stop.swap(false, Ordering::SeqCst) {
+            if cancel {
                 let bridge = self.clone();
                 let run_id = run_id.to_string();
                 std::thread::spawn(move || {
-                    if let Err(error) = bridge.request_wait("run/interrupt", json!({ "runId": run_id }), Duration::from_secs(10)) {
-                        let _ = bridge.app.emit("adaptive-agent://run-finished", json!({ "error": error }));
+                    if bridge
+                        .arm_interrupt(&run_id, bridge.draining.load(Ordering::SeqCst))
+                        .is_ok()
+                        && bridge.issue_interrupt(&run_id)
+                    {
+                        bridge.reconcile_run(run_id);
                     }
                 });
             }
         }
-        let message = match kind {
-            "run.created" => "Run started",
-            "plan.execution_started" => "Plan started",
-            "model.started" => "Thinking",
-            "model.retry" => "Retrying inference",
-            "tool.started" => "Tool started",
-            "tool.completed" => "Tool completed",
-            "tool.failed" => "Tool failed",
-            "run.completed" => "Run completed",
-            "run.failed" => "Run failed",
-            "run.interrupted" => "Run interrupted",
-            _ => return,
-        };
-        let _ = self.app.emit("adaptive-agent://progress", json!({ "runId": run_id, "kind": kind, "message": message }));
+        if kind == "run.status_changed" {
+            if let Some(status) = event.pointer("/payload/toStatus").and_then(Value::as_str) {
+                let chat_success = status == "succeeded"
+                    && self
+                        .registry
+                        .lock()
+                        .unwrap()
+                        .get(run_id)
+                        .is_some_and(|record| record.invocation_kind == "chat");
+                if chat_success {
+                    self.reconcile_run(run_id.to_owned());
+                    self.emit_state();
+                    return;
+                }
+                let mut registry = self.registry.lock().unwrap();
+                let persisted = if let Some(record) = registry.get_mut(run_id) {
+                    let state = state_for_durable_status(status, record.occupies_slot);
+                    if apply_run_state(record, &state, None) == ApplyState::Accepted {
+                        Some((
+                            record.cached_status.clone(),
+                            record.submission_state.clone(),
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                drop(registry);
+                if let Some((cached_status, submission_state)) = persisted {
+                    let _ = self
+                        .workbench
+                        .update_run(run_id, &cached_status, &submission_state);
+                }
+                self.emit_state();
+            }
+        }
+        if matches!(
+            kind,
+            "run.completed" | "run.failed" | "run.interrupted" | "replan.required"
+        ) {
+            self.reconcile_run(run_id.to_owned());
+        }
     }
 
-    fn start_run(self: &Arc<Self>, task: String) -> Result<(), String> {
-        if self.active.swap(true, Ordering::SeqCst) {
-            return Err("A run is already active.".into());
-        }
-        *self.active_run_id.lock().unwrap() = None;
-        let (_, receiver) = match self.request("agent/run", json!({ "goal": task })) {
-            Ok(request) => request,
-            Err(error) => { self.active.store(false, Ordering::SeqCst); return Err(error); }
+    fn capture_pending_approval(&self, value: &Value, fallback_root: &str) {
+        let payload = value.get("payload").unwrap_or(value);
+        let owner = value
+            .get("runId")
+            .or_else(|| payload.get("runId"))
+            .and_then(Value::as_str)
+            .unwrap_or(fallback_root);
+        let root = payload
+            .get("rootRunId")
+            .and_then(Value::as_str)
+            .unwrap_or(fallback_root);
+        let Some(approval_id) = payload.get("approvalId").and_then(Value::as_str) else {
+            return;
         };
-        self.emit_state();
-        let bridge = self.clone();
-        std::thread::spawn(move || {
-            let response = receiver.recv().unwrap_or_else(|_| Err("The agent runtime exited before returning a result.".into()));
-            let run_id = bridge.active_run_id.lock().unwrap().clone();
-            bridge.active.store(false, Ordering::SeqCst);
-            bridge.stopping.store(false, Ordering::SeqCst);
-            bridge.queued_stop.store(false, Ordering::SeqCst);
-            *bridge.active_run_id.lock().unwrap() = None;
-            let payload = match response {
-                Ok(result) => json!({ "runId": run_id, "result": result }),
-                Err(error) => json!({ "runId": run_id, "error": error }),
+        let mut approval = PendingApproval {
+            root_run_id: root.into(),
+            approval_run_id: owner.into(),
+            approval_id: approval_id.into(),
+            parent_run_id: payload
+                .get("parentRunId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            tool_name: payload
+                .get("toolName")
+                .and_then(Value::as_str)
+                .unwrap_or("Tool")
+                .into(),
+            message: payload
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Approve this tool call?")
+                .into(),
+            decision_in_flight: false,
+            decision: None,
+            operation_state: "awaiting_decision".into(),
+        };
+        {
+            let mut registry = self.registry.lock().unwrap();
+            let Some(record) = registry.get_mut(root) else {
+                return;
             };
-            let _ = bridge.app.emit("adaptive-agent://run-finished", payload);
-            bridge.emit_state();
+            preserve_approval_operation(&mut approval, record.pending_approval.as_ref());
+            record.revision += 1;
+        }
+        if self.workbench.save_pending_approval(&approval).is_ok() {
+            if let Some(record) = self.registry.lock().unwrap().get_mut(root) {
+                record.pending_approval = Some(approval);
+                record.revision += 1;
+            }
+            self.emit_state();
+        }
+    }
+
+    fn resolve_approval(
+        self: &Arc<Self>,
+        root_run_id: String,
+        approval_run_id: String,
+        approval_id: String,
+        approved: bool,
+    ) -> Result<(), String> {
+        if !self.workbench.begin_approval_decision(
+            &root_run_id,
+            &approval_run_id,
+            &approval_id,
+            approved,
+        )? {
+            return Err("Approval is stale or a decision is already in flight.".into());
+        }
+        if let Some(p) = self
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&root_run_id)
+            .and_then(|r| r.pending_approval.as_mut())
+        {
+            p.decision_in_flight = true;
+            p.decision = Some(approved);
+            p.operation_state = "resolving".into();
+        }
+        if let Some(record) = self.registry.lock().unwrap().get_mut(&root_run_id) {
+            record.revision += 1;
+        }
+        self.emit_state();
+        self.drive_approval_operation(PendingApproval {
+            root_run_id,
+            approval_run_id,
+            approval_id,
+            parent_run_id: None,
+            tool_name: String::new(),
+            message: String::new(),
+            decision_in_flight: true,
+            decision: Some(approved),
+            operation_state: "resolving".into(),
         });
         Ok(())
     }
 
-    fn stop_run(&self) -> Result<(), String> {
-        if !self.active.load(Ordering::SeqCst) { return Err("No run is active.".into()); }
-        self.stopping.store(true, Ordering::SeqCst);
-        self.queued_stop.store(true, Ordering::SeqCst);
-        self.emit_state();
-        let Some(run_id) = self.active_run_id.lock().unwrap().clone() else {
-            return Ok(());
+    fn recover_pending_approval_operations(self: &Arc<Self>) {
+        if let Ok(approvals) = self.workbench.load_pending_approvals() {
+            for approval in approvals
+                .into_iter()
+                .filter(|approval| approval.operation_state != "awaiting_decision")
+            {
+                self.drive_approval_operation(approval);
+            }
+        }
+    }
+
+    fn drive_approval_operation(self: &Arc<Self>, approval: PendingApproval) {
+        let bridge = self.clone();
+        std::thread::spawn(move || {
+            let root_run_id = approval.root_run_id;
+            let approval_run_id = approval.approval_run_id;
+            let approval_id = approval.approval_id;
+            let Some(approved) = approval.decision else {
+                return;
+            };
+            if approval.operation_state == "resolving" {
+                let resolved = bridge.request_wait(
+                    "interaction/resolveApproval",
+                    json!({"runId":approval_run_id,"approvalId":approval_id,"approved":approved}),
+                    REQUEST_TIMEOUT,
+                );
+                if let Err(error) = resolved {
+                    let _ = bridge.app.emit(
+                        "adaptive-agent://control-error",
+                        json!({"runId":root_run_id,"error":format!("Approval outcome is unknown and will be retried after runtime restart: {error}")}),
+                    );
+                    bridge.reconcile_run(root_run_id.clone());
+                    bridge.emit_state();
+                    return;
+                }
+                let _ = bridge.workbench.mark_approval_resolved(
+                    &root_run_id,
+                    &approval_run_id,
+                    &approval_id,
+                    approved,
+                );
+                if let Some(p) = bridge
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .get_mut(&root_run_id)
+                    .and_then(|record| record.pending_approval.as_mut())
+                {
+                    p.operation_state = if approved {
+                        "resume_pending".into()
+                    } else {
+                        "rejection_pending".into()
+                    };
+                }
+            }
+            if approved {
+                match bridge.request("run/resume", json!({"runId":approval_run_id})) {
+                    Ok((_, receiver)) => {
+                        let bridge2 = bridge.clone();
+                        let root = root_run_id.clone();
+                        std::thread::spawn(move || {
+                            match receiver.recv() {
+                                Ok(Ok(_)) => bridge2.reconcile_run(root),
+                                Ok(Err(error)) => {
+                                    let _ = bridge2.app.emit(
+                                        "adaptive-agent://control-error",
+                                        json!({"runId":root,"error":error}),
+                                    );
+                                    bridge2.reconcile_run(root)
+                                }
+                                Err(_) => bridge2.reconcile_run(root),
+                            };
+                        });
+                    }
+                    Err(error) => {
+                        let _ = bridge.app.emit(
+                            "adaptive-agent://control-error",
+                            json!({"runId":root_run_id,"error":error}),
+                        );
+                        bridge.reconcile_run(root_run_id.clone());
+                    }
+                }
+            } else {
+                bridge.reconcile_run(root_run_id.clone());
+            }
+            bridge.emit_state();
+        });
+    }
+
+    fn start_run(self: &Arc<Self>, task: String) -> Result<StartedRun, String> {
+        let _submission = self.submission.lock().unwrap();
+        if self.draining.load(Ordering::SeqCst) {
+            return Err("The desktop is draining and cannot start new runs.".into());
+        }
+        if !self.registry.lock().unwrap().has_capacity() {
+            return Err(
+                "All 3 task slots are occupied. Stop or wait for a run, then try again.".into(),
+            );
+        }
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let item_id = uuid::Uuid::new_v4().to_string();
+        let configuration = self
+            .configuration
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or("Settings are invalid.")?;
+        let agent = configuration
+            .get("agent")
+            .ok_or("Resolved agent is missing.")?;
+        let required_agent_value = |key| {
+            agent
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| format!("Resolved agent {key} is missing."))
         };
-        if self.queued_stop.swap(false, Ordering::SeqCst) {
-            self.request_wait("run/interrupt", json!({ "runId": run_id }), Duration::from_secs(10)).map(|_| ())
+        let reservation = Reservation {
+            item_id: item_id.clone(),
+            run_id: run_id.clone(),
+            title: task.clone(),
+            session_id: None,
+            agent_id: required_agent_value("id")?,
+            agent_name: required_agent_value("name")?,
+            agent_fingerprint: required_agent_value("configurationFingerprint")?,
+            invocation_kind: "run".into(),
+            cached_status: "reserved".into(),
+            submission_state: "reserved".into(),
+            cancel_requested: false,
+            interrupt_pending: false,
+        };
+        self.registry.lock().unwrap().insert(RunRecord {
+            run_id: run_id.clone(),
+            item_id: item_id.clone(),
+            title: task.clone(),
+            session_id: None,
+            invocation_kind: "run".into(),
+            submission_state: "submitted".into(),
+            cached_status: "submitted".into(),
+            root_created: false,
+            cancel_requested: false,
+            interrupt_pending: false,
+            request_active: true,
+            revision: 0,
+            pending_interaction: None,
+            pending_approval: None,
+            occupies_slot: true,
+        });
+        if let Err(error) = self.workbench.reserve_task(&reservation) {
+            self.registry.lock().unwrap().remove(&run_id);
+            return Err(error);
+        }
+        if let Err(error) = self.workbench.update_run(&run_id, "submitted", "submitted") {
+            self.registry.lock().unwrap().remove(&run_id);
+            let _ = self.workbench.delete_item(&item_id);
+            return Err(error);
+        }
+        let (_request_id, receiver) =
+            match self.request("agent/run", json!({ "runId": run_id, "goal": task })) {
+                Ok(request) => request,
+                Err(error) => {
+                    self.registry.lock().unwrap().terminal(&run_id, "failed");
+                    self.registry.lock().unwrap().remove(&run_id);
+                    let _ = self.workbench.delete_item(&item_id);
+                    return Err(error);
+                }
+            };
+        self.emit_state();
+        let bridge = self.clone();
+        let started = StartedRun {
+            item_id,
+            run_id: run_id.clone(),
+        };
+        std::thread::spawn(move || {
+            let response = match receiver.recv_timeout(Duration::from_secs(30)) {
+                Ok(response) => response,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    bridge.reconcile_run(run_id.clone());
+                    receiver.recv().unwrap_or_else(|_| {
+                        Err("The agent runtime exited before returning a result.".into())
+                    })
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    Err("The agent runtime exited before returning a result.".into())
+                }
+            };
+            if let Some(record) = bridge.registry.lock().unwrap().get_mut(&run_id) {
+                record.request_active = false;
+                record.revision += 1;
+            }
+            match response {
+                Ok(result) => {
+                    let state = state_for_execution_result(&result);
+                    let stored_result = canonical_workbench_result(&result);
+                    let _ = bridge.workbench.store_result(&run_id, &stored_result);
+                    let mut accepted_quiescent = false;
+                    if let Some(record) = bridge.registry.lock().unwrap().get_mut(&run_id) {
+                        accepted_quiescent = apply_run_state(record, &state, None)
+                            == ApplyState::Accepted
+                            && !state.occupies_slot;
+                    }
+                    if let Some(record) = bridge.registry.lock().unwrap().get(&run_id) {
+                        let _ = bridge.workbench.update_run(
+                            &run_id,
+                            &record.cached_status,
+                            &record.submission_state,
+                        );
+                    }
+                    if accepted_quiescent {
+                        let _ = bridge.app.emit(
+                            "adaptive-agent://run-finished",
+                            json!({ "runId": run_id, "result": stored_result }),
+                        );
+                    } else {
+                        bridge.reconcile_run(run_id.clone());
+                    }
+                }
+                Err(error) => {
+                    let _ = bridge.app.emit(
+                        "adaptive-agent://control-error",
+                        json!({ "runId": run_id, "error": error }),
+                    );
+                    bridge.reconcile_run(run_id.clone());
+                }
+            }
+            bridge.emit_state();
+        });
+        Ok(started)
+    }
+
+    fn current_agent(&self) -> Result<(String, String, String), String> {
+        let configuration = self
+            .configuration
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or("Settings are invalid.")?;
+        let agent = configuration
+            .get("agent")
+            .ok_or("Resolved agent is missing.")?;
+        let value = |key: &str| {
+            agent
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|v| !v.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| format!("Resolved agent {key} is missing."))
+        };
+        Ok((
+            value("id")?,
+            value("name")?,
+            value("configurationFingerprint")?,
+        ))
+    }
+
+    fn chat_reason(&self, chat: &ChatItem) -> Option<String> {
+        match self.current_agent() {
+            Err(_) => Some("The pinned agent is not currently available; this chat is read-only.".into()),
+            Ok((id,_,_)) if id != chat.pinned_agent_id => Some("The resolved agent ID no longer matches this chat's pin; this chat is read-only.".into()),
+            Ok((_,_,fingerprint)) if fingerprint != chat.pinned_agent_fingerprint => Some("The resolved agent configuration fingerprint no longer matches this chat's pin; this chat is read-only.".into()),
+            _ => None,
+        }
+    }
+
+    fn chat_dto(&self, item_id: &str) -> Result<ChatDto, String> {
+        let (chat, messages) = self.workbench.load_chat(item_id)?;
+        Ok(ChatDto {
+            read_only_reason: self.chat_reason(&chat),
+            occupied: self.registry.lock().unwrap().item_is_occupied(item_id),
+            chat,
+            messages,
+        })
+    }
+
+    fn deletion_operation(&self, target: &ProductDeletionTarget) -> Result<Value, String> {
+        match target {
+            ProductDeletionTarget::Item { item_id } => {
+                self.workbench.item_deletion_operation(item_id)
+            }
+            ProductDeletionTarget::Run { run_id } => self.workbench.run_deletion_operation(run_id),
+            ProductDeletionTarget::ChatTurn { item_id, ordinal } => self
+                .workbench
+                .chat_turn_deletion_operation(item_id, *ordinal),
+        }
+    }
+
+    fn preview_deletion(
+        self: &Arc<Self>,
+        target: ProductDeletionTarget,
+    ) -> Result<DeletionPreview, String> {
+        let operation = self.deletion_operation(&target)?;
+        let mut run_ids = HashSet::new();
+        let mut plan_ids = HashSet::new();
+        for runtime_target in operation["runtimeTargets"]
+            .as_array()
+            .ok_or("Deletion operation has no runtime targets.")?
+        {
+            let (_, receiver) =
+                self.request("history/previewDeletion", json!({"target":runtime_target}))?;
+            let response = receiver
+                .recv_timeout(REQUEST_TIMEOUT)
+                .map_err(|_| "History preview timed out.".to_string())??;
+            for id in response["runIds"].as_array().into_iter().flatten() {
+                if let Some(id) = id.as_str() {
+                    run_ids.insert(id.to_owned());
+                }
+            }
+            for field in ["ownedPlanIds", "preservedPlanIds"] {
+                for id in response[field].as_array().into_iter().flatten() {
+                    if let Some(id) = id.as_str() {
+                        plan_ids.insert(id.to_owned());
+                    }
+                }
+            }
+        }
+        let registry = self.registry.lock().unwrap();
+        let occupied = run_ids
+            .iter()
+            .any(|id| registry.get(id).is_some_and(|record| record.occupies_slot));
+        drop(registry);
+        let label = match &target {
+            ProductDeletionTarget::Item { .. } => operation["label"]
+                .as_str()
+                .ok_or("History item has no label.")?
+                .to_owned(),
+            ProductDeletionTarget::Run { run_id } => format!("run {run_id}"),
+            ProductDeletionTarget::ChatTurn { ordinal, .. } => {
+                format!("chat from turn {} onward", ordinal / 2 + 1)
+            }
+        };
+        Ok(DeletionPreview {
+            target,
+            label,
+            run_count: run_ids.len(),
+            plan_count: plan_ids.len(),
+            occupied,
+            warning: "This permanently deletes the selected history and its runtime evidence. This cannot be undone.",
+        })
+    }
+
+    fn execute_deletion_job(self: &Arc<Self>, job: &workbench::DeletionJob) -> Result<(), String> {
+        for runtime_target in job.operation["runtimeTargets"]
+            .as_array()
+            .ok_or("Deletion operation has no runtime targets.")?
+        {
+            let (_, receiver) = self.request("history/delete", json!({"target":runtime_target}))?;
+            receiver
+                .recv_timeout(REQUEST_TIMEOUT)
+                .map_err(|_| "History deletion timed out.".to_string())??;
+        }
+        self.workbench.complete_deletion_job(job)?;
+        let roots = job.operation["workbenchRunIds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect::<HashSet<_>>();
+        let affected = self
+            .run_roots
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(run_id, root_run_id)| roots.contains(*run_id) || roots.contains(*root_run_id))
+            .map(|(run_id, _)| run_id.clone())
+            .chain(roots.iter().cloned())
+            .collect::<HashSet<_>>();
+        let mut registry = self.registry.lock().unwrap();
+        for run_id in &affected {
+            registry.remove(run_id);
+        }
+        drop(registry);
+        self.run_roots
+            .lock()
+            .unwrap()
+            .retain(|run_id, _| !affected.contains(run_id));
+        self.run_delegates
+            .lock()
+            .unwrap()
+            .retain(|run_id, _| !affected.contains(run_id));
+        self.reconciling
+            .lock()
+            .unwrap()
+            .retain(|run_id, _| !affected.contains(run_id));
+        Ok(())
+    }
+
+    fn delete_history(self: &Arc<Self>, target: ProductDeletionTarget) -> Result<(), String> {
+        let preview = self.preview_deletion(target.clone())?;
+        if preview.occupied {
+            return Err("Stop or wait for every affected run before deleting history.".into());
+        }
+        let operation = self.deletion_operation(&target)?;
+        let job = self.workbench.create_deletion_job(&operation)?;
+        match self.execute_deletion_job(&job) {
+            Ok(()) => {
+                self.emit_state();
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.workbench.fail_deletion_job(&job.id, &error);
+                Err(format!(
+                    "Deletion is incomplete and will be retried safely: {error}"
+                ))
+            }
+        }
+    }
+
+    fn send_chat(self: &Arc<Self>, item_id: String, content: String) -> Result<StartedRun, String> {
+        let _submission = self.submission.lock().unwrap();
+        if self.draining.load(Ordering::SeqCst) {
+            return Err("The desktop is draining and cannot start new runs.".into());
+        }
+        let mut registry = self.registry.lock().unwrap();
+        if !registry.has_capacity() {
+            return Err(
+                "All 3 task slots are occupied. Stop or wait for a run, then try again.".into(),
+            );
+        }
+        if registry.item_is_occupied(&item_id) {
+            return Err("This chat already has a turn in progress.".into());
+        }
+        let (chat, _) = self.workbench.load_chat(&item_id)?;
+        if let Some(reason) = self.chat_reason(&chat) {
+            return Err(reason);
+        }
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let messages = self
+            .workbench
+            .reserve_chat_turn(&item_id, &run_id, &content)?;
+        registry.insert(RunRecord {
+            run_id: run_id.clone(),
+            item_id: item_id.clone(),
+            title: chat.title.clone(),
+            session_id: Some(chat.session_id.clone()),
+            invocation_kind: "chat".into(),
+            submission_state: "submitted".into(),
+            cached_status: "submitted".into(),
+            root_created: false,
+            cancel_requested: false,
+            interrupt_pending: false,
+            request_active: true,
+            revision: 0,
+            pending_interaction: None,
+            pending_approval: None,
+            occupies_slot: true,
+        });
+        drop(registry);
+        if let Err(error) = self.workbench.update_run(&run_id, "submitted", "submitted") {
+            let _ = self.app.emit("adaptive-agent://control-error", json!({"runId":run_id,"error":format!("The chat reservation is durable, but its redundant submitted update failed: {error}")}));
+        }
+        let transcript = messages
+            .iter()
+            .map(|message| json!({"role":message.role,"content":message.content}))
+            .collect::<Vec<_>>();
+        let receiver = match self.request(
+            "agent/chat",
+            chat_request_params(&run_id, &chat.session_id, transcript),
+        ) {
+            Ok((_, receiver)) => receiver,
+            Err(error) => {
+                if let Some(record) = self.registry.lock().unwrap().get_mut(&run_id) {
+                    record.request_active = false;
+                    record.revision += 1;
+                }
+                if self.workbench.mark_submission_failed(&run_id).is_ok() {
+                    if let Some(record) = self.registry.lock().unwrap().get_mut(&run_id) {
+                        let state = submission_failed();
+                        apply_run_state(record, &state, None);
+                    }
+                } else {
+                    let _=self.app.emit("adaptive-agent://control-error",json!({"runId":run_id,"error":"Unable to persist submission failure; retaining the occupied slot for recovery."}));
+                    self.reconcile_run(run_id.clone());
+                }
+                self.emit_state();
+                return Err(error);
+            }
+        };
+        self.emit_state();
+        let bridge = self.clone();
+        let response_run_id = run_id.clone();
+        std::thread::spawn(move || {
+            let response = loop {
+                match receiver.recv_timeout(Duration::from_secs(30)) {
+                    Ok(response) => break response,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        bridge.reconcile_run(response_run_id.clone())
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        break Err("The agent runtime exited before returning a result.".into())
+                    }
+                }
+            };
+            if let Some(record) = bridge.registry.lock().unwrap().get_mut(&response_run_id) {
+                record.request_active = false;
+                record.revision += 1;
+            }
+            match response {
+                Ok(result) => {
+                    let state = state_for_execution_result(&result);
+                    let stored_result = canonical_workbench_result(&result);
+                    if state.cached_status == "succeeded" {
+                        let finalized = response_assistant_value(&stored_result)
+                            .ok_or_else(|| {
+                                "Successful chat response did not include output.".to_string()
+                            })
+                            .and_then(|output| {
+                                let content = value_as_content(&output);
+                                bridge
+                                    .workbench
+                                    .finalize_chat_success(
+                                        &response_run_id,
+                                        &stored_result,
+                                        &content,
+                                    )
+                                    .map(|_| ())
+                            });
+                        if let Err(error) = finalized {
+                            let _=bridge.app.emit("adaptive-agent://control-error",json!({"runId":response_run_id,"error":format!("Unable to finalize successful chat turn: {error}")}));
+                            bridge.reconcile_run(response_run_id.clone());
+                            bridge.emit_state();
+                            return;
+                        }
+                    } else if let Err(error) = bridge
+                        .workbench
+                        .store_result(&response_run_id, &stored_result)
+                    {
+                        let _ = bridge.app.emit(
+                            "adaptive-agent://control-error",
+                            json!({"runId":response_run_id,"error":error}),
+                        );
+                    }
+                    if let Some(record) = bridge.registry.lock().unwrap().get_mut(&response_run_id)
+                    {
+                        let _ = apply_run_state(record, &state, None);
+                        if state.cached_status != "succeeded" {
+                            if let Err(error) = bridge.workbench.update_run(
+                                &response_run_id,
+                                &record.cached_status,
+                                &record.submission_state,
+                            ) {
+                                let _ = bridge.app.emit(
+                                    "adaptive-agent://control-error",
+                                    json!({"runId":response_run_id,"error":error}),
+                                );
+                            }
+                        }
+                    }
+                    if !state.occupies_slot {
+                        let _ = bridge.app.emit(
+                            "adaptive-agent://run-finished",
+                            json!({"runId":response_run_id,"result":stored_result}),
+                        );
+                    }
+                }
+                Err(error) => {
+                    let _ = bridge.app.emit(
+                        "adaptive-agent://control-error",
+                        json!({"runId":response_run_id,"error":error}),
+                    );
+                    bridge.reconcile_run(response_run_id.clone());
+                }
+            }
+            bridge.emit_state();
+        });
+        Ok(StartedRun { item_id, run_id })
+    }
+
+    fn stop_run(self: &Arc<Self>, run_id: &str) -> Result<(), String> {
+        let action = self
+            .registry
+            .lock()
+            .unwrap()
+            .request_cancel(run_id)
+            .map_err(str::to_owned)?;
+        if action == CancelAction::Quiescent {
+            return Ok(());
+        }
+        if action == CancelAction::AlreadyRequested {
+            self.reconcile_run(run_id.to_owned());
+            return Ok(());
+        }
+        if let Err(error) = self.workbench.set_cancel_requested(run_id) {
+            if let Some(record) = self.registry.lock().unwrap().get_mut(run_id) {
+                record.cancel_requested = false;
+            }
+            return Err(error);
+        }
+        self.emit_state();
+        if action == CancelAction::Interrupt {
+            if let Err(error) = self.arm_interrupt(run_id, false) {
+                if let Some(record) = self.registry.lock().unwrap().get_mut(run_id) {
+                    record.interrupt_pending = false;
+                }
+                return Err(error);
+            }
+            if self.issue_interrupt(run_id) {
+                self.reconcile_run(run_id.to_owned());
+            }
+            Ok(())
         } else {
             Ok(())
         }
     }
 
-    fn snapshot(&self) -> DesktopState {
-        let configuration = self.configuration.lock().unwrap().clone();
-        let error = self.initialization_error.lock().unwrap().clone();
-        DesktopState {
-            status: if error.is_some() { "error" } else if self.stopping.load(Ordering::SeqCst) { "stopping" } else if self.active.load(Ordering::SeqCst) { "running" } else { "ready" },
-            configuration_valid: error.is_none() && configuration.is_some(),
-            configuration,
-            error,
-            active_run_id: self.active_run_id.lock().unwrap().clone(),
+    fn arm_cancellations(self: &Arc<Self>, run_ids: &[String]) {
+        for run_id in run_ids {
+            loop {
+                match self.workbench.set_cancel_requested(run_id) {
+                    Ok(()) => break,
+                    Err(error) => {
+                        let _ = self.app.emit(
+                            "adaptive-agent://control-error",
+                            json!({ "runId": run_id, "error": format!("Unable to persist shutdown cancellation; retrying: {error}") }),
+                        );
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                }
+            }
+            let action = self.registry.lock().unwrap().request_cancel(run_id);
+            if matches!(action, Ok(CancelAction::Interrupt)) {
+                let _ = self.arm_interrupt(run_id, true);
+                if self.issue_interrupt(run_id) {
+                    self.reconcile_run(run_id.clone());
+                }
+            }
+            self.emit_state();
         }
     }
 
-    fn emit_state(&self) { let _ = self.app.emit("adaptive-agent://state", self.snapshot()); }
+    fn inspect_for_recovery(&self, run_id: &str) -> Response {
+        let mut last = Err("Inspection unavailable.".into());
+        for _ in 0..3 {
+            last = self.request_wait(
+                "run/inspect",
+                json!({ "runId": run_id }),
+                Duration::from_secs(3),
+            );
+            if last.is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        last
+    }
+
+    fn discover_pending_approval(
+        &self,
+        root_run_id: &str,
+        root_inspection: &Response,
+    ) -> Option<PendingApproval> {
+        let mut inspection = root_inspection.as_ref().ok()?.clone();
+        for _ in 0..16 {
+            let run = inspection.get("run")?;
+            if let Some(run_id) = run.get("id").and_then(Value::as_str) {
+                self.run_roots
+                    .lock()
+                    .unwrap()
+                    .insert(run_id.into(), root_run_id.into());
+                if let Some(delegate_name) = run.get("delegateName").and_then(Value::as_str) {
+                    self.run_delegates
+                        .lock()
+                        .unwrap()
+                        .insert(run_id.into(), delegate_name.into());
+                }
+            }
+            match run.get("status").and_then(Value::as_str)? {
+                "awaiting_approval" => {
+                    return pending_approval_from_inspection(root_run_id, &inspection)
+                }
+                "awaiting_subagent" => {
+                    let child_run_id = run.get("currentChildRunId").and_then(Value::as_str)?;
+                    inspection = self.inspect_for_recovery(child_run_id).ok()?;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    fn snapshot(&self) -> DesktopState {
+        let configuration = self.configuration.lock().unwrap().clone();
+        let error = self.initialization_error.lock().unwrap().clone();
+        let execution_health = if error.is_some() { "error" } else { "ready" };
+        let registry = self.registry.lock().unwrap();
+        let any_stopping = registry.any_stopping();
+        let any_active = registry.any_active();
+        let mut runs = registry
+            .records()
+            .map(|run| RunSummary {
+                item_id: run.item_id.clone(),
+                run_id: run.run_id.clone(),
+                title: run.title.clone(),
+                invocation_kind: run.invocation_kind.clone(),
+                status: run.cached_status.clone(),
+                cancel_requested: run.cancel_requested,
+                occupies_slot: run.occupies_slot,
+                pending_approval: run.pending_approval.clone(),
+            })
+            .collect::<Vec<_>>();
+        runs.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+        DesktopState {
+            status: if error.is_some() {
+                "error"
+            } else if any_stopping {
+                "stopping"
+            } else if any_active {
+                "running"
+            } else {
+                "ready"
+            },
+            configuration_valid: error.is_none() && configuration.is_some(),
+            configuration,
+            error,
+            runs,
+            occupied_slot_count: registry.occupied_slot_count(),
+            capacity: CAPACITY,
+            execution_health,
+            trace_health: if self.trace_healthy.load(Ordering::SeqCst) {
+                "ready"
+            } else if self.trace_error.lock().unwrap().is_some() {
+                "error"
+            } else {
+                "starting"
+            },
+            trace_error: self.trace_error.lock().unwrap().clone(),
+            quit_state: self.app.state::<AppState>().quit.lock().unwrap().state(),
+        }
+    }
+
+    fn emit_state(&self) {
+        let _ = self.app.emit("adaptive-agent://state", self.snapshot());
+    }
 
     fn fail_all(&self, message: &str) {
-        for (_, sender) in self.pending.lock().unwrap().drain() { let _ = sender.send(Err(message.into())); }
+        for (_, sender) in self.pending.lock().unwrap().drain() {
+            let _ = sender.send(Err(message.into()));
+        }
     }
 
     fn transport_failed(&self) {
-        if self.expected_shutdown.load(Ordering::SeqCst) { return; }
+        if self.expected_shutdown.load(Ordering::SeqCst) {
+            return;
+        }
         self.fail_all("The agent runtime exited unexpectedly.");
         *self.configuration.lock().unwrap() = None;
-        *self.initialization_error.lock().unwrap() = Some("The agent runtime exited unexpectedly. Reload Settings to restart it.".into());
+        *self.initialization_error.lock().unwrap() =
+            Some("The agent runtime exited unexpectedly. Reload Settings to restart it.".into());
         self.emit_state();
     }
 
@@ -265,58 +1855,841 @@ impl Bridge {
         if let Ok((_, receiver)) = self.request("runtime/shutdown", json!({})) {
             let _ = receiver.recv_timeout(SHUTDOWN_TIMEOUT);
         }
-        if let Some(child) = self.child.lock().unwrap().take() { let _ = child.kill(); }
+        if let Some(child) = self.child.lock().unwrap().take() {
+            let _ = child.kill();
+        }
         self.fail_all("The agent runtime was shut down.");
     }
 }
 
-fn replace_bridge(app: &AppHandle) -> Arc<Bridge> {
+fn replace_bridge(app: &AppHandle) -> Result<Arc<Bridge>, String> {
     let state = app.state::<AppState>();
-    if let Some(previous) = state.bridge.lock().unwrap().take() { previous.shutdown(); }
-    let bridge = match Bridge::spawn(app) {
-        Ok(bridge) => bridge,
+    let lifecycle = state.lifecycle.lock().unwrap();
+    if state.shutdown_started.load(Ordering::SeqCst)
+        || state.quit.lock().unwrap().state() != QuitState::Idle
+    {
+        return Err("Settings cannot be reloaded while quitting.".into());
+    }
+    let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let previous_bridge = state.bridge.lock().unwrap().clone();
+    let previous_trace = state.trace.lock().unwrap().clone();
+    drop(lifecycle);
+    if let Some(previous) = previous_bridge {
+        previous.shutdown();
+    }
+    if let Some(previous) = previous_trace {
+        previous.shutdown();
+    }
+    let workbench_result = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Unable to resolve desktop application data: {error}"))
+        .and_then(|directory| {
+            WorkbenchDb::open(directory.join("workbench.sqlite"))
+                .map_err(|error| format!("Unable to open workbench persistence: {error}"))
+        });
+    let (workbench, persistence_error) = match workbench_result {
+        Ok(workbench) => (Arc::new(workbench), None),
+        Err(error) => (
+            Arc::new(
+                WorkbenchDb::open_in_memory()
+                    .expect("in-memory error-state workbench database must open"),
+            ),
+            Some(error),
+        ),
+    };
+    let lifecycle = state.lifecycle.lock().unwrap();
+    if state.shutdown_started.load(Ordering::SeqCst)
+        || state.quit.lock().unwrap().state() != QuitState::Idle
+        || state.generation.load(Ordering::SeqCst) != generation
+    {
+        return Err("Settings replacement was superseded or shutdown has started.".into());
+    }
+    // Process creation and publication are one lifecycle operation: no child can exist
+    // while neither the old nor new bridge is visible to close handling.
+    state.bridge.lock().unwrap().take();
+    state.trace.lock().unwrap().take();
+    let spawn_result = match persistence_error {
+        Some(error) => Err(error),
+        None => Bridge::spawn(app, workbench.clone()),
+    };
+    let (bridge, spawn_error) = match spawn_result {
+        Ok(bridge) => (bridge, None),
         Err(error) => {
             // A non-running placeholder keeps renderer state and errors restricted to the same API.
-            Arc::new(Bridge {
-                app: app.clone(), child: Mutex::new(None), pending: Mutex::new(HashMap::new()), next_id: AtomicU64::new(1),
-                active: AtomicBool::new(false), stopping: AtomicBool::new(false), queued_stop: AtomicBool::new(false),
-                expected_shutdown: AtomicBool::new(true), active_run_id: Mutex::new(None),
-                configuration: Mutex::new(None), initialization_error: Mutex::new(Some(error)),
-            })
+            let placeholder = Arc::new(Bridge {
+                app: app.clone(),
+                child: Mutex::new(None),
+                pending: Mutex::new(HashMap::new()),
+                decoder: Mutex::new(NdjsonDecoder::new(MAX_NDJSON_FRAME_SIZE)),
+                generation: 1,
+                next_id: AtomicU64::new(1),
+                registry: Mutex::new(RunRegistry::default()),
+                run_roots: Mutex::new(HashMap::new()),
+                run_delegates: Mutex::new(HashMap::new()),
+                workbench,
+                submission: Mutex::new(()),
+                expected_shutdown: AtomicBool::new(true),
+                configuration: Mutex::new(None),
+                initialization_error: Mutex::new(Some(error.clone())),
+                trace_healthy: Arc::new(AtomicBool::new(false)),
+                trace_error: Arc::new(Mutex::new(None)),
+                draining: AtomicBool::new(false),
+                reconciling: Mutex::new(HashMap::new()),
+            });
+            (placeholder, Some(error))
         }
     };
-    if bridge.child.lock().unwrap().is_some() {
-        if let Err(error) = bridge.initialize() { *bridge.initialization_error.lock().unwrap() = Some(error); }
-    }
     *state.bridge.lock().unwrap() = Some(bridge.clone());
+    drop(lifecycle);
+
+    if let Some(error) = spawn_error {
+        bridge.emit_state();
+        return Err(error);
+    }
+    if bridge.child.lock().unwrap().is_some() {
+        if let Err(error) = bridge.initialize() {
+            *bridge.initialization_error.lock().unwrap() = Some(error.clone());
+            bridge.emit_state();
+            return Err(error);
+        }
+    }
     bridge.emit_state();
-    bridge
+    if bridge.initialization_error.lock().unwrap().is_none() {
+        let path = bridge
+            .configuration
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|configuration| configuration.pointer("/runtime/sqlitePath"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if let Some(path) = path {
+            let app = app.clone();
+            let target = bridge.clone();
+            std::thread::spawn(move || {
+                let privacy = match load_trace_privacy(&target.workbench) {
+                    Ok(privacy) => privacy,
+                    Err(error) => {
+                        *target.trace_error.lock().unwrap() = Some(error);
+                        target.emit_state();
+                        return;
+                    }
+                };
+                let state = app.state::<AppState>();
+                let lifecycle = state.lifecycle.lock().unwrap();
+                if state.shutdown_started.load(Ordering::SeqCst)
+                    || state.quit.lock().unwrap().state() != QuitState::Idle
+                    || state.generation.load(Ordering::SeqCst) != generation
+                {
+                    return;
+                }
+                match TraceBridge::spawn_process(
+                    &app,
+                    &path,
+                    privacy,
+                    target.trace_healthy.clone(),
+                    target.trace_error.clone(),
+                ) {
+                    Ok(trace) => {
+                        *state.trace.lock().unwrap() = Some(trace.clone());
+                        drop(lifecycle);
+                        if let Err(error) = trace.initialize(privacy) {
+                            let removed = {
+                                let _lifecycle = state.lifecycle.lock().unwrap();
+                                let mut slot = state.trace.lock().unwrap();
+                                if slot
+                                    .as_ref()
+                                    .is_some_and(|current| Arc::ptr_eq(current, &trace))
+                                {
+                                    slot.take();
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            if removed {
+                                trace.shutdown();
+                            }
+                            if state.generation.load(Ordering::SeqCst) == generation {
+                                *target.trace_error.lock().unwrap() = Some(error);
+                                target.emit_state();
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        drop(lifecycle);
+                        if app.state::<AppState>().generation.load(Ordering::SeqCst) == generation {
+                            *target.trace_error.lock().unwrap() = Some(error);
+                            target.emit_state();
+                        }
+                    }
+                }
+            });
+        } else {
+            *bridge.trace_error.lock().unwrap() = Some(
+                "Execution did not resolve an exact SQLite path; trace is unavailable.".into(),
+            );
+            bridge.emit_state();
+        }
+    } else {
+        *bridge.trace_error.lock().unwrap() =
+            Some("Execution configuration is invalid; trace is unavailable.".into());
+        bridge.emit_state();
+    }
+    Ok(bridge)
+}
+
+fn load_trace_privacy(workbench: &WorkbenchDb) -> Result<TracePrivacy, String> {
+    let mut privacy: TracePrivacy = workbench
+        .load_setting(TRACE_PRIVACY_SETTING)?
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| format!("Invalid persisted trace privacy settings: {error}"))?
+        .unwrap_or_default();
+    if privacy.reasoning {
+        privacy.messages = true;
+    }
+    Ok(privacy)
+}
+
+fn queue_trace_refresh(
+    refreshes: &mut HashMap<String, TraceRefreshState>,
+    root_run_id: &str,
+    final_refresh: bool,
+) -> bool {
+    if let Some(refresh) = refreshes.get_mut(root_run_id) {
+        refresh.pending = true;
+        refresh.final_refresh |= final_refresh;
+        return false;
+    }
+    refreshes.insert(
+        root_run_id.into(),
+        TraceRefreshState {
+            pending: false,
+            final_refresh,
+        },
+    );
+    true
+}
+
+fn complete_trace_refresh(
+    refreshes: &mut HashMap<String, TraceRefreshState>,
+    root_run_id: &str,
+) -> bool {
+    if refreshes.get_mut(root_run_id).is_some_and(|refresh| {
+        if refresh.pending {
+            refresh.pending = false;
+            true
+        } else {
+            false
+        }
+    }) {
+        return true;
+    }
+    refreshes.remove(root_run_id);
+    false
+}
+
+fn schedule_trace_refresh(app: &AppHandle, root_run_id: String, final_refresh: bool) {
+    let state = app.state::<AppState>();
+    {
+        let mut refreshes = state.trace_refreshes.lock().unwrap();
+        if !queue_trace_refresh(&mut refreshes, &root_run_id, final_refresh) {
+            return;
+        }
+    }
+
+    let app = app.clone();
+    std::thread::spawn(move || loop {
+        let final_refresh = app
+            .state::<AppState>()
+            .trace_refreshes
+            .lock()
+            .unwrap()
+            .get_mut(&root_run_id)
+            .is_some_and(|refresh| std::mem::take(&mut refresh.final_refresh));
+        let (privacy, trace, request_revision) = {
+            let state = app.state::<AppState>();
+            let bridge = state.bridge.lock().unwrap().as_ref().cloned();
+            let trace = state.trace.lock().unwrap().as_ref().cloned();
+            let privacy = bridge
+                .as_ref()
+                .and_then(|bridge| load_trace_privacy(&bridge.workbench).ok());
+            let selection = state.trace_selection.lock().unwrap();
+            let request_revision = (selection.root_run_id.as_deref() == Some(root_run_id.as_str()))
+                .then_some(selection.revision);
+            (privacy, trace, request_revision)
+        };
+        let response = match (privacy, trace.as_ref()) {
+            (Some(privacy), Some(trace)) => trace.request_wait(
+                "trace/get",
+                Some(json!({
+                    "target": { "kind": "root-run", "rootRunId": root_run_id },
+                    "include": {
+                        "plans": true,
+                        "messages": privacy.messages,
+                        "reasoning": privacy.reasoning,
+                        "rawToolPayloads": privacy.raw_tool_payloads
+                    }
+                })),
+                REQUEST_TIMEOUT,
+            ),
+            _ => Err("Trace inspector is not ready.".into()),
+        };
+        let state = app.state::<AppState>();
+        let selection = state.trace_selection.lock().unwrap();
+        if request_revision == Some(selection.revision)
+            && selection.root_run_id.as_deref() == Some(root_run_id.as_str())
+        {
+            let payload = match response.as_ref() {
+                Ok(report) => json!({
+                    "rootRunId": root_run_id,
+                    "revision": selection.revision,
+                    "finalRefresh": final_refresh,
+                    "report": report
+                }),
+                Err(error) => json!({
+                    "rootRunId": root_run_id,
+                    "revision": selection.revision,
+                    "finalRefresh": final_refresh,
+                    "error": error
+                }),
+            };
+            let _ = app.emit("adaptive-agent://trace", payload);
+        }
+        drop(selection);
+        if let Ok(report) = response {
+            let _ = app.emit(
+                "adaptive-agent://trace-summary",
+                json!({
+                    "rootRunId": root_run_id,
+                    "summary": report.get("summary"),
+                    "usage": report.get("usage"),
+                    "rootRuns": report.get("rootRuns")
+                }),
+            );
+        }
+
+        let mut refreshes = state.trace_refreshes.lock().unwrap();
+        if complete_trace_refresh(&mut refreshes, &root_run_id) {
+            continue;
+        }
+        break;
+    });
+}
+
+#[tauri::command]
+fn select_trace(root_run_id: Option<String>, app: AppHandle) -> Result<u64, String> {
+    let state = app.state::<AppState>();
+    let revision = {
+        let mut selection = state.trace_selection.lock().unwrap();
+        selection.revision += 1;
+        selection.root_run_id = root_run_id.clone();
+        selection.revision
+    };
+    let Some(root_run_id) = root_run_id else {
+        return Ok(revision);
+    };
+    schedule_trace_refresh(&app, root_run_id.clone(), false);
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let mut tick = 0_u64;
+        loop {
+            std::thread::sleep(Duration::from_millis(1_500));
+            let state = app.state::<AppState>();
+            let selected = {
+                let selection = state.trace_selection.lock().unwrap();
+                selection.revision == revision
+                    && selection.root_run_id.as_deref() == Some(root_run_id.as_str())
+            };
+            if !selected || state.shutdown_started.load(Ordering::SeqCst) {
+                break;
+            }
+            tick += 1;
+            let active = state.bridge.lock().unwrap().as_ref().is_some_and(|bridge| {
+                bridge
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .get(&root_run_id)
+                    .is_some_and(|run| run.occupies_slot)
+            });
+            if active || tick % 7 == 0 {
+                schedule_trace_refresh(&app, root_run_id.clone(), false);
+            }
+            if tick % 7 == 0 {
+                let roots = state
+                    .bridge
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|bridge| {
+                        bridge
+                            .registry
+                            .lock()
+                            .unwrap()
+                            .records()
+                            .map(|run| run.run_id.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let background = roots
+                    .into_iter()
+                    .filter(|root| root != &root_run_id)
+                    .collect::<Vec<_>>();
+                if let Some(root) = background.get((tick as usize / 7) % background.len().max(1)) {
+                    schedule_trace_refresh(&app, root.clone(), false);
+                }
+            }
+        }
+    });
+    Ok(revision)
+}
+
+#[tauri::command]
+fn get_trace_privacy(state: tauri::State<'_, AppState>) -> Result<TracePrivacy, String> {
+    let bridge = state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or("Desktop runtime is starting.")?;
+    load_trace_privacy(&bridge.workbench)
+}
+
+#[tauri::command]
+fn set_trace_privacy(mut privacy: TracePrivacy, app: AppHandle) -> Result<TracePrivacy, String> {
+    if privacy.reasoning {
+        privacy.messages = true;
+    }
+    let state = app.state::<AppState>();
+    let (bridge, sqlite_path, old_trace) = {
+        let _lifecycle = state.lifecycle.lock().unwrap();
+        let bridge = state
+            .bridge
+            .lock()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .ok_or("Desktop runtime is starting.")?;
+        let sqlite_path = bridge
+            .configuration
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|value| value.pointer("/runtime/sqlitePath"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or("Trace requires an exact SQLite path.")?;
+        let old_trace = state.trace.lock().unwrap().as_ref().cloned();
+        (bridge, sqlite_path, old_trace)
+    };
+    if load_trace_privacy(&bridge.workbench)? == privacy && old_trace.is_some() {
+        return Ok(privacy);
+    }
+    let (stopped_trace, selected_root) = {
+        let _lifecycle = state.lifecycle.lock().unwrap();
+        if state
+            .bridge
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|current| !Arc::ptr_eq(current, &bridge))
+        {
+            return Err("Execution runtime changed while trace privacy was updating.".into());
+        }
+        let stopped_trace = state.trace.lock().unwrap().take();
+        let mut selection = state.trace_selection.lock().unwrap();
+        selection.revision += 1;
+        (stopped_trace, selection.root_run_id.clone())
+    };
+    bridge.trace_healthy.store(false, Ordering::SeqCst);
+    *bridge.trace_error.lock().unwrap() = None;
+    bridge.emit_state();
+    if let Some(stopped_trace) = stopped_trace {
+        stopped_trace.shutdown();
+    }
+
+    let replacement = match TraceBridge::spawn_process(
+        &app,
+        &sqlite_path,
+        privacy,
+        bridge.trace_healthy.clone(),
+        bridge.trace_error.clone(),
+    ) {
+        Ok(replacement) => replacement,
+        Err(error) => {
+            *bridge.trace_error.lock().unwrap() = Some(error.clone());
+            bridge.emit_state();
+            return Err(error);
+        }
+    };
+    if let Err(error) = replacement.initialize(privacy) {
+        replacement.shutdown();
+        return Err(error);
+    }
+    if let Err(error) = bridge.workbench.save_setting(
+        TRACE_PRIVACY_SETTING,
+        &serde_json::to_value(privacy).unwrap(),
+    ) {
+        replacement.shutdown();
+        *bridge.trace_error.lock().unwrap() = Some(error.clone());
+        bridge.emit_state();
+        return Err(error);
+    }
+    let runtime_changed = {
+        let _lifecycle = state.lifecycle.lock().unwrap();
+        if state
+            .bridge
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|current| !Arc::ptr_eq(current, &bridge))
+        {
+            true
+        } else {
+            *state.trace.lock().unwrap() = Some(replacement.clone());
+            false
+        }
+    };
+    if runtime_changed {
+        replacement.shutdown();
+        return Err("Execution runtime changed while trace privacy was updating.".into());
+    }
+    bridge.trace_healthy.store(true, Ordering::SeqCst);
+    *bridge.trace_error.lock().unwrap() = None;
+    bridge.emit_state();
+    if let Some(root_run_id) = selected_root {
+        let _ = select_trace(Some(root_run_id), app.clone());
+    }
+    Ok(privacy)
 }
 
 #[tauri::command]
 fn desktop_state(state: tauri::State<'_, AppState>) -> Result<DesktopState, String> {
-    state.bridge.lock().unwrap().as_ref().map(|bridge| bridge.snapshot()).ok_or_else(|| "Desktop runtime is starting.".into())
+    state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|bridge| bridge.snapshot())
+        .ok_or_else(|| "Desktop runtime is starting.".into())
 }
 
 #[tauri::command]
-fn reload_settings(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<DesktopState, String> {
-    if state.bridge.lock().unwrap().as_ref().is_some_and(|bridge| bridge.active.load(Ordering::SeqCst)) {
-        return Err("Stop the active run before reloading settings.".into());
+fn reload_settings(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<DesktopState, String> {
+    {
+        let _lifecycle = state.lifecycle.lock().unwrap();
+        if state.quit.lock().unwrap().state() != QuitState::Idle {
+            return Err("Settings cannot be reloaded while quitting.".into());
+        }
+        if state
+            .bridge
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|bridge| bridge.registry.lock().unwrap().any_active())
+        {
+            return Err("Stop the active run before reloading settings.".into());
+        }
     }
-    Ok(replace_bridge(&app).snapshot())
+    Ok(replace_bridge(&app)?.snapshot())
 }
 
 #[tauri::command]
-fn start_run(task: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    if task.trim().is_empty() { return Err("Task description is required.".into()); }
-    let bridge = state.bridge.lock().unwrap().as_ref().cloned().ok_or_else(|| "Desktop runtime is starting.".to_string())?;
-    if !bridge.snapshot().configuration_valid { return Err(bridge.snapshot().error.unwrap_or_else(|| "Settings are invalid.".into())); }
+fn start_run(task: String, state: tauri::State<'_, AppState>) -> Result<StartedRun, String> {
+    if task.trim().is_empty() {
+        return Err("Task description is required.".into());
+    }
+    let _lifecycle = state.lifecycle.lock().unwrap();
+    if state.quit.lock().unwrap().state() != QuitState::Idle {
+        return Err("The desktop is quitting and cannot start new runs.".into());
+    }
+    let bridge = state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "Desktop runtime is starting.".to_string())?;
+    if !bridge.snapshot().configuration_valid {
+        return Err(bridge
+            .snapshot()
+            .error
+            .unwrap_or_else(|| "Settings are invalid.".into()));
+    }
     bridge.start_run(task)
 }
 
 #[tauri::command]
-fn stop_run(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state.bridge.lock().unwrap().as_ref().cloned().ok_or_else(|| "Desktop runtime is not available.".to_string())?.stop_run()
+fn stop_run(run_id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "Desktop runtime is not available.".to_string())?
+        .stop_run(&run_id)
+}
+
+#[tauri::command]
+fn get_run_result(
+    run_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<Value>, String> {
+    state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "Desktop runtime is not available.".to_string())?
+        .workbench
+        .get_result(&run_id)
+}
+
+#[tauri::command]
+fn resolve_approval(
+    root_run_id: String,
+    approval_run_id: String,
+    approval_id: String,
+    approved: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or("Desktop runtime is starting.")?
+        .resolve_approval(root_run_id, approval_run_id, approval_id, approved)
+}
+
+#[tauri::command]
+fn create_chat(title: String, state: tauri::State<'_, AppState>) -> Result<ChatDto, String> {
+    let _lifecycle = state.lifecycle.lock().unwrap();
+    if state.quit.lock().unwrap().state() != QuitState::Idle {
+        return Err("The desktop is quitting and cannot create chats.".into());
+    }
+    let bridge = state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or("Desktop runtime is starting.")?;
+    let (id, name, fingerprint) = bridge.current_agent()?;
+    let chat = ChatItem {
+        item_id: uuid::Uuid::new_v4().to_string(),
+        title: if title.trim().is_empty() {
+            "New chat".into()
+        } else {
+            title.trim().into()
+        },
+        session_id: uuid::Uuid::new_v4().to_string(),
+        pinned_agent_id: id,
+        pinned_agent_name: name,
+        pinned_agent_fingerprint: fingerprint,
+    };
+    bridge.workbench.create_chat(&chat)?;
+    bridge.chat_dto(&chat.item_id)
+}
+
+#[tauri::command]
+fn list_chats(state: tauri::State<'_, AppState>) -> Result<Vec<ChatDto>, String> {
+    let bridge = state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or("Desktop runtime is starting.")?;
+    bridge
+        .workbench
+        .list_chats()?
+        .iter()
+        .map(|chat| bridge.chat_dto(&chat.item_id))
+        .collect()
+}
+
+#[tauri::command]
+fn load_chat(item_id: String, state: tauri::State<'_, AppState>) -> Result<ChatDto, String> {
+    state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or("Desktop runtime is starting.")?
+        .chat_dto(&item_id)
+}
+
+#[tauri::command]
+fn preview_history_deletion(
+    target: ProductDeletionTarget,
+    state: tauri::State<'_, AppState>,
+) -> Result<DeletionPreview, String> {
+    state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or("Desktop runtime is starting.")?
+        .preview_deletion(target)
+}
+
+#[tauri::command]
+fn delete_history(
+    target: ProductDeletionTarget,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let _lifecycle = state.lifecycle.lock().unwrap();
+    if state.quit.lock().unwrap().state() != QuitState::Idle {
+        return Err("The desktop is quitting and cannot delete history.".into());
+    }
+    state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or("Desktop runtime is starting.")?
+        .delete_history(target)
+}
+
+#[tauri::command]
+fn send_chat_turn(
+    item_id: String,
+    content: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<StartedRun, String> {
+    if content.trim().is_empty() {
+        return Err("Message is required.".into());
+    }
+    let _lifecycle = state.lifecycle.lock().unwrap();
+    if state.quit.lock().unwrap().state() != QuitState::Idle {
+        return Err("The desktop is quitting and cannot start new runs.".into());
+    }
+    state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or("Desktop runtime is starting.")?
+        .send_chat(item_id, content.trim().into())
+}
+
+#[derive(Clone, Copy)]
+enum DrainMode {
+    Wait,
+    Terminate,
+}
+
+fn begin_drain(app: &AppHandle, mode: DrainMode) -> Result<DesktopState, String> {
+    let state = app.state::<AppState>();
+    let lifecycle = state.lifecycle.lock().unwrap();
+    let bridge = state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "Desktop runtime is not available.".to_string())?;
+    state.quit.lock().unwrap().drain().map_err(str::to_owned)?;
+    bridge.draining.store(true, Ordering::SeqCst);
+    let cancellation_targets = bridge.registry.lock().unwrap().occupied_ids();
+    drop(lifecycle);
+    bridge.emit_state();
+    let snapshot = bridge.snapshot();
+
+    let app = app.clone();
+    std::thread::spawn(move || {
+        if matches!(mode, DrainMode::Terminate) {
+            bridge.arm_cancellations(&cancellation_targets);
+        }
+        loop {
+            let ids = bridge.registry.lock().unwrap().occupied_ids();
+            if ids.is_empty() {
+                break;
+            }
+            for id in ids {
+                bridge.reconcile_run(id);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        approve_and_exit(&app);
+    });
+    Ok(snapshot)
+}
+
+fn approve_and_exit(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let lifecycle = state.lifecycle.lock().unwrap();
+    if state.shutdown_started.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let bridge = state.bridge.lock().unwrap().take();
+    let trace = state.trace.lock().unwrap().take();
+    drop(lifecycle);
+    // Potentially blocking sidecar shutdown and app.exit happen with no native mutex held.
+    if let Some(bridge) = bridge {
+        bridge.emit_state();
+        bridge.shutdown();
+    }
+    if let Some(trace) = trace {
+        trace.shutdown();
+    }
+    {
+        let _lifecycle = state.lifecycle.lock().unwrap();
+        let _ = state.quit.lock().unwrap().approve();
+    }
+    app.exit(0);
+}
+
+fn native_close_requested(app: &AppHandle) -> CloseDecision {
+    let state = app.state::<AppState>();
+    let _lifecycle = state.lifecycle.lock().unwrap();
+    let occupied = state.bridge.lock().unwrap().as_ref().map_or(0, |bridge| {
+        bridge.registry.lock().unwrap().occupied_slot_count()
+    });
+    let decision = state.quit.lock().unwrap().close_requested(occupied);
+    if let Some(bridge) = state.bridge.lock().unwrap().as_ref() {
+        bridge.emit_state();
+    }
+    decision
+}
+
+#[tauri::command]
+fn quit_wait(app: AppHandle) -> Result<DesktopState, String> {
+    begin_drain(&app, DrainMode::Wait)
+}
+
+#[tauri::command]
+fn quit_terminate(app: AppHandle) -> Result<DesktopState, String> {
+    begin_drain(&app, DrainMode::Terminate)
+}
+
+#[tauri::command]
+fn quit_cancel(state: tauri::State<'_, AppState>) -> Result<DesktopState, String> {
+    state.quit.lock().unwrap().cancel().map_err(str::to_owned)?;
+    let bridge = state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "Desktop runtime is not available.".to_string())?;
+    bridge.emit_state();
+    Ok(bridge.snapshot())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -324,23 +2697,523 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(AppState::default())
-        .invoke_handler(tauri::generate_handler![desktop_state, reload_settings, start_run, stop_run])
-        .setup(|app| { replace_bridge(app.handle()); Ok(()) })
+        .invoke_handler(tauri::generate_handler![
+            desktop_state,
+            reload_settings,
+            start_run,
+            stop_run,
+            get_run_result,
+            resolve_approval,
+            create_chat,
+            list_chats,
+            load_chat,
+            preview_history_deletion,
+            delete_history,
+            send_chat_turn,
+            select_trace,
+            get_trace_privacy,
+            set_trace_privacy,
+            quit_wait,
+            quit_terminate,
+            quit_cancel
+        ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                match native_close_requested(window.app_handle()) {
+                    CloseDecision::Prevent => api.prevent_close(),
+                    CloseDecision::ShutdownNow => {
+                        api.prevent_close();
+                        approve_and_exit(window.app_handle());
+                    }
+                    CloseDecision::Allow => {}
+                }
+            }
+        })
+        .setup(|app| {
+            let _ = replace_bridge(app.handle());
+            Ok(())
+        })
         .build(tauri::generate_context!())
         .expect("failed to build AdaptiveAgent desktop");
 
     app.run(|app, event| {
-        if let tauri::RunEvent::ExitRequested { .. } = event {
-            if let Some(bridge) = app.state::<AppState>().bridge.lock().unwrap().take() { bridge.shutdown(); }
+        if let tauri::RunEvent::ExitRequested { api, .. } = event {
+            match native_close_requested(app) {
+                CloseDecision::Prevent => api.prevent_exit(),
+                CloseDecision::ShutdownNow => {
+                    api.prevent_exit();
+                    approve_and_exit(app);
+                }
+                CloseDecision::Allow => {}
+            }
         }
     });
 }
 
 fn is_root_run_created(event: &Value) -> bool {
     event.get("type").and_then(Value::as_str) == Some("run.created")
-        && event.pointer("/payload/delegationDepth").and_then(Value::as_u64) == Some(0)
+        && event
+            .pointer("/payload/delegationDepth")
+            .and_then(Value::as_u64)
+            == Some(0)
         && event.pointer("/payload/rootRunId").and_then(Value::as_str)
             == event.get("runId").and_then(Value::as_str)
+}
+
+fn reconciliation_classification(
+    inspection: &Response,
+    previous_occupancy: bool,
+    root_created: bool,
+    definitely_absent: bool,
+) -> RunState {
+    match inspection {
+        Ok(value)
+            if value.get("run").is_some_and(Value::is_null)
+                && value
+                    .get("events")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty)
+                && !root_created
+                && definitely_absent =>
+        {
+            submission_failed()
+        }
+        Ok(value) => value
+            .pointer("/run/status")
+            .and_then(Value::as_str)
+            .map(|status| state_for_durable_status(status, previous_occupancy))
+            .unwrap_or_else(|| recovery_required(previous_occupancy)),
+        Err(error)
+            if !root_created
+                && definitely_absent
+                && error.to_ascii_lowercase().contains("not found") =>
+        {
+            submission_failed()
+        }
+        Err(_) => recovery_required(previous_occupancy),
+    }
+}
+
+fn submission_failed() -> RunState {
+    RunState {
+        cached_status: "submission_failed",
+        submission_state: "submission_failed",
+        pending_interaction: None,
+        occupies_slot: false,
+        proves_existing: false,
+    }
+}
+
+fn recovered_result(inspection: &Response) -> Option<Value> {
+    let run = inspection.as_ref().ok()?.get("run")?;
+    let run_id = run.get("id")?.as_str()?;
+    match run.get("status")?.as_str()? {
+        "succeeded" => Some(json!({
+            "status": "success",
+            "runId": run_id,
+            "output": run.get("result").cloned().unwrap_or(Value::Null)
+        })),
+        "failed" | "interrupted" | "replan_required" | "cancelled" => Some(json!({
+            "status": "failure",
+            "runId": run_id,
+            "error": run.get("errorMessage").and_then(Value::as_str).unwrap_or_else(|| match run.get("status").and_then(Value::as_str) {
+                Some("interrupted") | Some("cancelled") => "Run interrupted",
+                Some("replan_required") => "Replan required",
+                _ => "Run failed",
+            }),
+            "code": run.get("errorCode").and_then(Value::as_str).unwrap_or_else(|| match run.get("status").and_then(Value::as_str) {
+                Some("interrupted") | Some("cancelled") => "INTERRUPTED",
+                Some("replan_required") => "REPLAN_REQUIRED",
+                _ => "MODEL_ERROR",
+            })
+        })),
+        _ => None,
+    }
+}
+
+fn project_activity_event(
+    event: &Value,
+    root_run_id: &str,
+    cached_delegate_name: Option<&str>,
+) -> Option<Value> {
+    let event_id = event.get("id").and_then(Value::as_str)?;
+    let run_id = event.get("runId").and_then(Value::as_str)?;
+    let sequence = event.get("seq").and_then(Value::as_u64)?;
+    let kind = event.get("type").and_then(Value::as_str)?;
+    let created_at = event.get("createdAt").and_then(Value::as_str)?;
+    if !matches!(
+        kind,
+        "run.created"
+            | "run.status_changed"
+            | "run.interrupted"
+            | "run.steered"
+            | "run.resumed"
+            | "run.retry_started"
+            | "run.completed"
+            | "run.failed"
+            | "recovery.analyzed"
+            | "run.continuation_created"
+            | "context.refs.resolved"
+            | "plan.created"
+            | "plan.execution_started"
+            | "step.started"
+            | "step.completed"
+            | "model.started"
+            | "model.retry"
+            | "model.tool_call_rejected"
+            | "model.completed"
+            | "model.failed"
+            | "tool.started"
+            | "tool.completed"
+            | "tool.failed"
+            | "delegate.spawned"
+            | "approval.requested"
+            | "approval.resolved"
+            | "clarification.requested"
+            | "usage.updated"
+            | "snapshot.created"
+            | "replan.required"
+    ) {
+        return None;
+    }
+    let payload = event.get("payload").and_then(Value::as_object);
+    let mut projected = serde_json::Map::from_iter([
+        ("eventId".into(), Value::String(event_id.into())),
+        ("rootRunId".into(), Value::String(root_run_id.into())),
+        ("runId".into(), Value::String(run_id.into())),
+        ("seq".into(), Value::Number(sequence.into())),
+        ("kind".into(), Value::String(kind.into())),
+        ("createdAt".into(), Value::String(created_at.into())),
+        (
+            "message".into(),
+            Value::String(activity_message(kind, payload).into()),
+        ),
+    ]);
+    for key in ["stepId", "toolCallId"] {
+        if let Some(value) = event.get(key).and_then(Value::as_str) {
+            projected.insert(key.into(), Value::String(value.into()));
+        }
+    }
+    if let Some(payload) = payload {
+        for key in [
+            "callId",
+            "status",
+            "toStatus",
+            "fromStatus",
+            "provider",
+            "model",
+            "toolName",
+            "delegateName",
+            "approvalId",
+            "parentRunId",
+            "startedAt",
+            "failureKind",
+        ] {
+            if let Some(value) = payload.get(key).and_then(Value::as_str) {
+                projected.insert(key.into(), Value::String(value.into()));
+            }
+        }
+        for key in [
+            "durationMs",
+            "attempt",
+            "maxAttempts",
+            "nextAttempt",
+            "retryDelayMs",
+            "statusCode",
+        ] {
+            if let Some(value) = payload.get(key).and_then(Value::as_f64) {
+                if value.is_finite() && value >= 0.0 {
+                    if let Some(number) = serde_json::Number::from_f64(value) {
+                        projected.insert(key.into(), Value::Number(number));
+                    }
+                }
+            }
+        }
+        for key in ["retryable", "timedOut", "approved"] {
+            if let Some(value) = payload.get(key).and_then(Value::as_bool) {
+                projected.insert(key.into(), Value::Bool(value));
+            }
+        }
+        if matches!(kind, "model.retry" | "model.tool_call_rejected") {
+            for key in ["reason", "phase"] {
+                if let Some(value) = payload.get(key).and_then(Value::as_str) {
+                    projected.insert(key.into(), Value::String(value.into()));
+                }
+            }
+        }
+    }
+    if !projected.contains_key("delegateName") {
+        if let Some(delegate_name) = cached_delegate_name {
+            projected.insert("delegateName".into(), Value::String(delegate_name.into()));
+        }
+    }
+    Some(Value::Object(projected))
+}
+
+fn activity_message(kind: &str, payload: Option<&serde_json::Map<String, Value>>) -> String {
+    let name = |key: &str| {
+        payload
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+    };
+    match kind {
+        "run.created" => "Run started".into(),
+        "run.status_changed" => name("toStatus")
+            .map(|status| format!("Run is {}", status.replace('_', " ")))
+            .unwrap_or_else(|| "Run status changed".into()),
+        "plan.created" => "Plan created".into(),
+        "plan.execution_started" => "Plan started".into(),
+        "step.started" => "Step started".into(),
+        "step.completed" => "Step completed".into(),
+        "model.started" => match (name("provider"), name("model")) {
+            (Some(provider), Some(model)) => format!("Calling {provider} / {model}"),
+            _ => "Model call started".into(),
+        },
+        "model.retry" => "Retrying model call".into(),
+        "model.completed" => "Model call completed".into(),
+        "model.failed" => "Model call failed".into(),
+        "tool.started" => name("toolName")
+            .map(|tool| format!("Running {tool}"))
+            .unwrap_or_else(|| "Tool started".into()),
+        "tool.completed" => name("toolName")
+            .map(|tool| format!("{tool} completed"))
+            .unwrap_or_else(|| "Tool completed".into()),
+        "tool.failed" => name("toolName")
+            .map(|tool| format!("{tool} failed"))
+            .unwrap_or_else(|| "Tool failed".into()),
+        "delegate.spawned" => name("delegateName")
+            .map(|delegate| format!("Delegated to {delegate}"))
+            .unwrap_or_else(|| "Delegate started".into()),
+        "approval.requested" => payload
+            .and_then(|value| value.get("message"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| name("toolName").map(|tool| format!("Approval required for {tool}")))
+            .unwrap_or_else(|| "Approval required".into()),
+        "approval.resolved" => match payload
+            .and_then(|value| value.get("approved"))
+            .and_then(Value::as_bool)
+        {
+            Some(true) => "Approval granted".into(),
+            Some(false) => "Approval rejected".into(),
+            None => "Approval resolved".into(),
+        },
+        "usage.updated" => "Usage updated".into(),
+        "run.completed" => "Run completed".into(),
+        "run.failed" => "Run failed".into(),
+        "run.interrupted" => "Run interrupted".into(),
+        "replan.required" => "Replan required".into(),
+        _ => kind.replace('.', " "),
+    }
+}
+
+fn pending_approval_from_inspection(
+    root_run_id: &str,
+    inspection: &Value,
+) -> Option<PendingApproval> {
+    let run = inspection.get("run")?;
+    let owner_run_id = run.get("id").and_then(Value::as_str)?;
+    let event = inspection
+        .get("events")?
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|event| event.get("type").and_then(Value::as_str) == Some("approval.requested"))?;
+    let payload = event.get("payload")?;
+    let approval_id = payload.get("approvalId").and_then(Value::as_str)?;
+    Some(PendingApproval {
+        root_run_id: root_run_id.into(),
+        approval_run_id: owner_run_id.into(),
+        approval_id: approval_id.into(),
+        parent_run_id: run
+            .get("parentRunId")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        tool_name: payload
+            .get("toolName")
+            .and_then(Value::as_str)
+            .unwrap_or("Tool")
+            .into(),
+        message: payload
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                let tool = payload
+                    .get("toolName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("this tool");
+                format!("Approval required before invoking {tool}")
+            }),
+        decision_in_flight: false,
+        decision: None,
+        operation_state: "awaiting_decision".into(),
+    })
+}
+
+fn preserve_approval_operation(approval: &mut PendingApproval, current: Option<&PendingApproval>) {
+    if let Some(current) = current.filter(|current| current.approval_id == approval.approval_id) {
+        approval.decision_in_flight = current.decision_in_flight;
+        approval.decision = current.decision;
+        approval.operation_state = current.operation_state.clone();
+    }
+}
+
+fn response_assistant_value(result: &Value) -> Option<Value> {
+    (result.get("status").and_then(Value::as_str) == Some("success"))
+        .then(|| result.get("output"))
+        .flatten()
+        .cloned()
+}
+
+fn canonical_workbench_result(result: &Value) -> Value {
+    match result.get("status").and_then(Value::as_str) {
+        Some("success") => json!({
+            "status": "success",
+            "runId": result.get("runId").cloned().unwrap_or(Value::Null),
+            "output": result.get("output").cloned().unwrap_or(Value::Null)
+        }),
+        Some("failure") => json!({
+            "status": "failure",
+            "runId": result.get("runId").cloned().unwrap_or(Value::Null),
+            "error": if result.get("code").and_then(Value::as_str) == Some("INTERRUPTED") {
+                Value::String("Run interrupted".into())
+            } else {
+                result.get("error").cloned().unwrap_or_else(|| Value::String("Run failed".into()))
+            },
+            "code": result.get("code").cloned().unwrap_or_else(|| Value::String("MODEL_ERROR".into()))
+        }),
+        _ => result.clone(),
+    }
+}
+
+fn value_as_content(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn chat_request_params(run_id: &str, session_id: &str, transcript: Vec<Value>) -> Value {
+    json!({"runId":run_id,"sessionId":session_id,"transcript":transcript})
+}
+
+fn recovery_required(previous_occupancy: bool) -> RunState {
+    RunState {
+        cached_status: "recovery_required",
+        submission_state: "recovery_required",
+        pending_interaction: None,
+        occupies_slot: previous_occupancy,
+        proves_existing: false,
+    }
+}
+
+struct RunState {
+    cached_status: &'static str,
+    submission_state: &'static str,
+    pending_interaction: Option<&'static str>,
+    occupies_slot: bool,
+    proves_existing: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApplyState {
+    Accepted,
+    Stale,
+    Rejected,
+}
+
+fn apply_run_state(
+    record: &mut RunRecord,
+    state: &RunState,
+    expected_revision: Option<u64>,
+) -> ApplyState {
+    if expected_revision.is_some_and(|revision| revision != record.revision) {
+        return ApplyState::Stale;
+    }
+    // Once quiescent evidence has been accepted, delayed active/recovery evidence cannot revive it.
+    if !record.occupies_slot && state.occupies_slot {
+        return ApplyState::Rejected;
+    }
+    record.cached_status = state.cached_status.into();
+    record.submission_state = state.submission_state.into();
+    record.pending_interaction = state.pending_interaction.map(str::to_owned);
+    record.occupies_slot = state.occupies_slot;
+    if state.proves_existing {
+        record.root_created = true;
+    }
+    record.revision += 1;
+    ApplyState::Accepted
+}
+
+fn state_for_execution_result(result: &Value) -> RunState {
+    match result.get("status").and_then(Value::as_str) {
+        Some("success") => state_for_durable_status("succeeded", true),
+        Some("failure") => match result.get("code").and_then(Value::as_str) {
+            Some("INTERRUPTED") => state_for_durable_status("interrupted", true),
+            Some("REPLAN_REQUIRED") => state_for_durable_status("replan_required", true),
+            _ => state_for_durable_status("failed", true),
+        },
+        Some("approval_requested") => state_for_durable_status("awaiting_approval", true),
+        Some("clarification_requested") => {
+            state_for_durable_status("clarification_requested", true)
+        }
+        _ => recovery_required(true),
+    }
+}
+
+fn state_for_durable_status(status: &str, previous_occupancy: bool) -> RunState {
+    let quiescent = matches!(
+        status,
+        "succeeded"
+            | "failed"
+            | "cancelled"
+            | "interrupted"
+            | "clarification_requested"
+            | "replan_required"
+    );
+    RunState {
+        cached_status: match status {
+            "queued" => "queued",
+            "planning" => "planning",
+            "running" => "running",
+            "awaiting_subagent" => "awaiting_subagent",
+            "awaiting_approval" => "awaiting_approval",
+            "succeeded" => "succeeded",
+            "failed" => "failed",
+            "cancelled" => "cancelled",
+            "interrupted" => "interrupted",
+            "clarification_requested" => "clarification_requested",
+            "replan_required" => "replan_required",
+            _ => "recovery_required",
+        },
+        submission_state: if quiescent {
+            "terminal"
+        } else if matches!(
+            status,
+            "queued" | "planning" | "running" | "awaiting_subagent" | "awaiting_approval"
+        ) {
+            "durable"
+        } else {
+            "recovery_required"
+        },
+        pending_interaction: (status == "awaiting_approval").then_some("approval"),
+        occupies_slot: if quiescent {
+            false
+        } else if matches!(
+            status,
+            "queued" | "planning" | "running" | "awaiting_subagent" | "awaiting_approval"
+        ) {
+            true
+        } else {
+            previous_occupancy
+        },
+        proves_existing: quiescent
+            || matches!(
+                status,
+                "queued" | "planning" | "running" | "awaiting_subagent" | "awaiting_approval"
+            ),
+    }
 }
 
 #[cfg(test)]
@@ -353,5 +3226,270 @@ mod tests {
         let child = json!({ "type": "run.created", "runId": "child", "payload": { "rootRunId": "root", "delegationDepth": 1 } });
         assert!(is_root_run_created(&root));
         assert!(!is_root_run_created(&child));
+    }
+
+    #[test]
+    fn ndjson_decoder_handles_partial_and_multiple_out_of_order_frames() {
+        let mut decoder = NdjsonDecoder::new(128);
+        assert!(decoder.push(b"{\"id\":2").unwrap().is_empty());
+        let frames = decoder.push(b"}\n{\"id\":1}\n").unwrap();
+        assert_eq!(frames, vec![json!({ "id": 2 }), json!({ "id": 1 })]);
+    }
+
+    #[test]
+    fn ndjson_decoder_rejects_oversized_frames_and_recovers() {
+        let mut decoder = NdjsonDecoder::new(8);
+        assert!(decoder
+            .push(b"123456789")
+            .unwrap_err()
+            .contains("maximum size"));
+        assert_eq!(
+            decoder.push(b"{\"a\":1}\n").unwrap(),
+            vec![json!({ "a": 1 })]
+        );
+        assert!(decoder
+            .push(b"{}\n123456789")
+            .unwrap_err()
+            .contains("maximum size"));
+    }
+
+    #[test]
+    fn reconciliation_classifies_missing_terminal_and_nonterminal_runs_as_quiescent() {
+        let missing =
+            reconciliation_classification(&Err("Run not found".into()), true, false, true);
+        assert_eq!(missing.cached_status, "submission_failed");
+        let succeeded = reconciliation_classification(
+            &Ok(json!({ "run": { "status": "succeeded", "result": "done" } })),
+            true,
+            true,
+            false,
+        );
+        assert_eq!(succeeded.cached_status, "succeeded");
+        assert!(!succeeded.occupies_slot);
+        let running = reconciliation_classification(
+            &Ok(json!({ "run": { "status": "running" } })),
+            true,
+            true,
+            false,
+        );
+        assert_eq!(running.cached_status, "running");
+        assert!(running.occupies_slot);
+        let unavailable =
+            reconciliation_classification(&Err("transport unavailable".into()), true, true, false);
+        assert_eq!(unavailable.cached_status, "recovery_required");
+        assert!(unavailable.occupies_slot);
+    }
+
+    #[test]
+    fn unknown_and_absent_inspection_semantics() {
+        assert!(state_for_durable_status("future_status", true).occupies_slot);
+        assert!(!state_for_durable_status("future_status", false).occupies_slot);
+        let absent = Ok(json!({ "run": null, "events": [] }));
+        assert!(reconciliation_classification(&absent, true, false, false).occupies_slot);
+        let startup = reconciliation_classification(&absent, true, false, true);
+        assert_eq!(startup.submission_state, "submission_failed");
+        assert!(!startup.occupies_slot);
+        assert!(reconciliation_classification(&absent, true, true, true).occupies_slot);
+    }
+
+    #[test]
+    fn guarded_state_application_is_revision_checked_and_monotonic() {
+        let mut record = registry::tests_record_for_transition();
+        let revision = record.revision;
+        record.revision += 1;
+        let terminal = state_for_durable_status("succeeded", true);
+        assert_eq!(
+            apply_run_state(&mut record, &terminal, Some(revision)),
+            ApplyState::Stale
+        );
+        assert!(record.occupies_slot);
+        assert_eq!(
+            apply_run_state(&mut record, &terminal, None),
+            ApplyState::Accepted
+        );
+        let running = state_for_durable_status("running", false);
+        assert_eq!(
+            apply_run_state(&mut record, &running, None),
+            ApplyState::Rejected
+        );
+        assert_eq!(record.cached_status, "succeeded");
+    }
+
+    #[test]
+    fn execution_results_preserve_approval_occupancy_and_terminal_statuses() {
+        let approval = state_for_execution_result(&json!({ "status": "approval_requested" }));
+        assert_eq!(approval.cached_status, "awaiting_approval");
+        assert_eq!(approval.pending_interaction, Some("approval"));
+        assert!(approval.occupies_slot);
+
+        let success = state_for_execution_result(&json!({ "status": "success" }));
+        assert_eq!(success.cached_status, "succeeded");
+        assert!(!success.occupies_slot);
+
+        let interrupted =
+            state_for_execution_result(&json!({ "status": "failure", "code": "INTERRUPTED" }));
+        assert_eq!(interrupted.cached_status, "interrupted");
+        assert!(!interrupted.occupies_slot);
+    }
+
+    #[test]
+    fn lost_response_recovery_reads_final_output_from_execution_inspection() {
+        let inspection = Ok(json!({
+            "run": {
+                "id": "run-1",
+                "status": "succeeded",
+                "result": { "answer": 42 }
+            }
+        }));
+        assert_eq!(
+            recovered_result(&inspection),
+            Some(json!({
+                "status": "success",
+                "runId": "run-1",
+                "output": { "answer": 42 }
+            }))
+        );
+        assert_eq!(recovered_result(&Err("transport unavailable".into())), None);
+
+        let interrupted = Ok(json!({
+            "run": { "id": "run-2", "status": "interrupted" }
+        }));
+        assert_eq!(
+            recovered_result(&interrupted),
+            Some(canonical_workbench_result(&json!({
+                "status": "failure",
+                "runId": "run-2",
+                "error": "Run interrupted",
+                "code": "INTERRUPTED",
+                "stepsUsed": 1,
+                "usage": {}
+            })))
+        );
+    }
+
+    #[test]
+    fn pending_approval_is_rebuilt_from_durable_inspection() {
+        let inspection = json!({
+            "run": {
+                "id": "child-run",
+                "rootRunId": "root-run",
+                "parentRunId": "root-run",
+                "status": "awaiting_approval"
+            },
+            "events": [{
+                "type": "approval.requested",
+                "runId": "child-run",
+                "payload": {
+                    "approvalId": "approval:child-run:step-1:call-1",
+                    "toolName": "secure.lookup",
+                    "rootRunId": "root-run",
+                    "parentRunId": "root-run"
+                }
+            }]
+        });
+
+        assert_eq!(
+            pending_approval_from_inspection("root-run", &inspection),
+            Some(PendingApproval {
+                root_run_id: "root-run".into(),
+                approval_run_id: "child-run".into(),
+                approval_id: "approval:child-run:step-1:call-1".into(),
+                parent_run_id: Some("root-run".into()),
+                tool_name: "secure.lookup".into(),
+                message: "Approval required before invoking secure.lookup".into(),
+                decision_in_flight: false,
+                decision: None,
+                operation_state: "awaiting_decision".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn activity_projection_whitelists_fields_and_removes_sensitive_payloads() {
+        let projected = project_activity_event(
+            &json!({
+                "id": "event-1",
+                "runId": "child-run",
+                "seq": 4,
+                "type": "model.started",
+                "createdAt": "2026-01-01T00:00:00.000Z",
+                "payload": {
+                    "callId": "call-1",
+                    "provider": "openai",
+                    "model": "gpt-test",
+                    "attempt": 1,
+                    "input": { "secret": true },
+                    "output": "private output",
+                    "assistantContent": "private assistant content",
+                    "messages": ["private message"],
+                    "reasoning": "private reasoning"
+                }
+            }),
+            "root-run",
+            Some("researcher"),
+        )
+        .unwrap();
+
+        assert_eq!(projected.get("eventId"), Some(&json!("event-1")));
+        assert_eq!(projected.get("rootRunId"), Some(&json!("root-run")));
+        assert_eq!(projected.get("runId"), Some(&json!("child-run")));
+        assert_eq!(projected.get("callId"), Some(&json!("call-1")));
+        assert_eq!(projected.get("provider"), Some(&json!("openai")));
+        assert_eq!(projected.get("delegateName"), Some(&json!("researcher")));
+        for forbidden in [
+            "input",
+            "output",
+            "assistantContent",
+            "messages",
+            "reasoning",
+            "payload",
+        ] {
+            assert!(projected.get(forbidden).is_none(), "leaked {forbidden}");
+        }
+    }
+
+    #[test]
+    fn chat_payload_uses_only_transcript_and_preserves_complete_history() {
+        let history = vec![
+            json!({"role":"user","content":"one"}),
+            json!({"role":"assistant","content":"two"}),
+            json!({"role":"user","content":"three"}),
+        ];
+        let payload = chat_request_params("run", "session", history.clone());
+        assert_eq!(payload.get("transcript"), Some(&Value::Array(history)));
+        assert!(payload.get("messages").is_none());
+    }
+
+    #[test]
+    fn persisted_trace_reasoning_always_enables_messages() {
+        let workbench = WorkbenchDb::open_in_memory().unwrap();
+        workbench
+            .save_setting(
+                TRACE_PRIVACY_SETTING,
+                &json!({"messages":false,"reasoning":true,"rawToolPayloads":false}),
+            )
+            .unwrap();
+        assert_eq!(
+            load_trace_privacy(&workbench).unwrap(),
+            TracePrivacy {
+                messages: true,
+                reasoning: true,
+                raw_tool_payloads: false,
+            }
+        );
+    }
+
+    #[test]
+    fn trace_refreshes_coalesce_to_one_pending_pass_and_preserve_final_priority() {
+        let mut refreshes = HashMap::new();
+        assert!(queue_trace_refresh(&mut refreshes, "root", false));
+        assert!(!queue_trace_refresh(&mut refreshes, "root", false));
+        assert!(!queue_trace_refresh(&mut refreshes, "root", true));
+        assert_eq!(refreshes.len(), 1);
+        assert!(refreshes["root"].final_refresh);
+        assert!(complete_trace_refresh(&mut refreshes, "root"));
+        assert_eq!(refreshes.len(), 1);
+        assert!(!complete_trace_refresh(&mut refreshes, "root"));
+        assert!(refreshes.is_empty());
     }
 }

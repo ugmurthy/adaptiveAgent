@@ -9,8 +9,15 @@ import { aggregateSessionPerformance, buildTimeline, buildTraceAggregateReport, 
 import { cacheKey, databaseIdentity, effectiveCacheTtl, parseCacheDuration, readCache, writeCache } from './trace-session/cache.js';
 import { usageForArgs } from './trace-session/constants.js';
 import type { EventType, MilestoneEntry, TraceAggregateObservation, TraceReport, TraceRow } from './trace-session.js';
+import { SQLITE_TRACE_DATABASE_OPTIONS } from './trace-session/reader.js';
 
 describe('trace-session CLI helpers', () => {
+  it('resolves an exact trusted SQLite path without settings inference', async () => {
+    await expect(resolveTraceRuntimeTarget({ sqlitePath: './exact.sqlite', databaseUrl: 'postgres://ignored/runtime', cwd: '/tmp' }))
+      .resolves.toMatchObject({ kind: 'sqlite', path: '/tmp/exact.sqlite' });
+    expect(SQLITE_TRACE_DATABASE_OPTIONS).toEqual({ readonly: true, strict: true });
+  });
+
   it('parses a distinct settings path for runtime inference', () => {
     expect(parseArgs(['trace-session', 'view', 'session', 's', '--settings', './agent.settings.json']))
       .toMatchObject({ settingsPath: './agent.settings.json' });

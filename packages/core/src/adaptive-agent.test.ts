@@ -16,7 +16,7 @@ import { InMemorySnapshotStore } from './in-memory-snapshot-store.js';
 import { InMemoryToolExecutionStore } from './in-memory-tool-execution-store.js';
 import { createReadFileTool } from './tools/read-file.js';
 import { createWriteFileTool } from './tools/write-file.js';
-import type { ModelAdapter, ModelRequest, ModelResponse, RuntimeStores, ToolDefinition } from './types.js';
+import type { AgentEvent, ModelAdapter, ModelRequest, ModelResponse, RuntimeStores, ToolDefinition } from './types.js';
 
 class SequenceModel implements ModelAdapter {
   readonly provider: string;
@@ -3268,6 +3268,7 @@ describe('AdaptiveAgent', () => {
     const runStore = new InMemoryRunStore();
     const eventStore = new InMemoryEventStore();
     const snapshotStore = new InMemorySnapshotStore();
+    const downstreamEvents: AgentEvent[] = [];
     const runInTransaction = vi.fn(async (operation: (stores: RuntimeStores) => Promise<unknown>) =>
       operation({
         runStore,
@@ -3286,6 +3287,7 @@ describe('AdaptiveAgent', () => {
       runStore,
       eventStore,
       snapshotStore,
+      eventSink: { emit: async (event) => { downstreamEvents.push(event as AgentEvent); } },
       transactionStore: {
         runStore,
         eventStore,
@@ -3306,6 +3308,11 @@ describe('AdaptiveAgent', () => {
       schemaVersion: 1,
       stepsUsed: 1,
     });
+    expect(downstreamEvents).toHaveLength(events.length);
+    expect(downstreamEvents.map(({ id, seq, createdAt }) => ({ id, seq, createdAt }))).toEqual(
+      events.map(({ id, seq, createdAt }) => ({ id, seq, createdAt })),
+    );
+    expect(new Set(downstreamEvents.map(({ id }) => id)).size).toBe(downstreamEvents.length);
   });
 
   it('uses a transaction store for terminal failure persistence', async () => {
@@ -3464,6 +3471,7 @@ describe('AdaptiveAgent', () => {
     const eventStore = new InMemoryEventStore();
     const snapshotStore = new InMemorySnapshotStore();
     const transactionEventGroups: string[][] = [];
+    const downstreamEvents: AgentEvent[] = [];
     const runInTransaction = vi.fn(async (operation: (stores: RuntimeStores) => Promise<unknown>) => {
       const eventTypes: string[] = [];
       try {
@@ -3522,6 +3530,7 @@ describe('AdaptiveAgent', () => {
       runStore,
       eventStore,
       snapshotStore,
+      eventSink: { emit: async (event) => { downstreamEvents.push(event as AgentEvent); } },
       transactionStore: {
         runStore,
         eventStore,
@@ -3553,6 +3562,13 @@ describe('AdaptiveAgent', () => {
       && !Array.isArray(event.payload)
       && event.payload.status === 'awaiting_subagent',
     )?.payload).toMatchObject({ snapshotSeq: 3 });
+    const allPersistedEvents = [
+      ...parentEvents,
+      ...(await Promise.all((await runStore.listChildren(result.runId)).map((run) => eventStore.listByRun(run.id)))).flat(),
+    ];
+    expect(downstreamEvents.every(({ id, seq, createdAt }) => Boolean(id && seq > 0 && createdAt))).toBe(true);
+    expect(new Set(downstreamEvents.map(({ id }) => id)).size).toBe(downstreamEvents.length);
+    expect(downstreamEvents.map(({ id }) => id).sort()).toEqual(allPersistedEvents.map(({ id }) => id).sort());
   });
 
   it('emits structured lifecycle logs with model, tool, and delegation context', async () => {
@@ -4375,6 +4391,123 @@ describe('AdaptiveAgent', () => {
     });
   });
 
+  it('pauses a delegated child for approval and resumes the scoped child and root without another spawn', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const toolExecutionStore = new InMemoryToolExecutionStore();
+    const rootModel = new SequenceModel([
+      { finishReason: 'tool_calls', toolCalls: [{ id: 'delegate-approval-1', name: 'delegate.researcher', input: { goal: 'Use secure lookup' } }] },
+      { finishReason: 'stop', structuredOutput: { report: 'root consumed child output' } },
+    ], 'root-model');
+    const childModel = new SequenceModel([
+      { finishReason: 'tool_calls', toolCalls: [{ id: 'secure-child-1', name: 'secure.lookup', input: { topic: 'approval' } }] },
+      { finishReason: 'stop', structuredOutput: { finding: 'approved child result' } },
+    ], 'child-model');
+    const execute = vi.fn(async () => ({ finding: 'secure result' }));
+    const options = {
+      model: rootModel,
+      tools: [{
+        name: 'secure.lookup', description: 'Gated lookup', inputSchema: { type: 'object' },
+        requiresApproval: true, execute,
+      } satisfies ToolDefinition],
+      delegates: [{ name: 'researcher', description: 'Scoped researcher', allowedTools: ['secure.lookup'], model: childModel }],
+      delegation: { childRunsMayRequestApproval: true },
+      runStore, eventStore, snapshotStore, toolExecutionStore,
+    };
+    const firstAgent = new AdaptiveAgent(options);
+
+    const paused = await firstAgent.run({ goal: 'Delegate gated work' });
+    if (paused.status !== 'approval_requested') throw new Error(`Expected approval, received ${paused.status}`);
+    const rootRunId = paused.rootRunId;
+    const childRunId = paused.runId;
+    expect(childRunId).not.toBe(rootRunId);
+    expect(paused).toMatchObject({
+      approvalId: `approval:${childRunId}:step-1:secure-child-1`,
+      rootRunId,
+      parentRunId: rootRunId,
+      toolName: 'secure.lookup',
+    });
+    expect(await runStore.getRun(childRunId)).toMatchObject({ status: 'awaiting_approval', rootRunId, parentRunId: rootRunId });
+    expect(await runStore.getRun(rootRunId)).toMatchObject({ status: 'awaiting_subagent' });
+    expect((await snapshotStore.getLatest(rootRunId))?.state).toMatchObject({ waitingOnChildRunId: childRunId });
+    expect(await toolExecutionStore.getByIdempotencyKey(`${rootRunId}:step-1:delegate-approval-1`)).toMatchObject({ status: 'started', childRunId });
+    expect(execute).not.toHaveBeenCalled();
+
+    // Reconstructing the runtime proves that all linkage needed for cascading resume is durable.
+    const restartedAgent = new AdaptiveAgent(options);
+    await restartedAgent.resolveApproval(childRunId, paused.approvalId, true);
+    const completed = await restartedAgent.resume(childRunId);
+    expect(completed).toMatchObject({ status: 'success', runId: rootRunId, output: { report: 'root consumed child output' } });
+    expect(await runStore.getRun(childRunId)).toMatchObject({ status: 'succeeded', result: { finding: 'approved child result' } });
+    expect(await runStore.getRun(rootRunId)).toMatchObject({ status: 'succeeded', result: { report: 'root consumed child output' } });
+    expect(await runStore.listChildren(rootRunId)).toHaveLength(1);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(rootModel.receivedRequests).toHaveLength(2);
+    expect(childModel.receivedRequests).toHaveLength(2);
+
+    const duplicate = await restartedAgent.resume(childRunId);
+    expect(duplicate).toMatchObject({ status: 'success', runId: rootRunId, output: { report: 'root consumed child output' } });
+    expect(await runStore.listChildren(rootRunId)).toHaveLength(1);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(rootModel.receivedRequests).toHaveLength(2);
+    expect(childModel.receivedRequests).toHaveLength(2);
+  });
+
+  it('cascades delegated child approval rejection to the durable root exactly once', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const execute = vi.fn();
+    const agent = new AdaptiveAgent({
+      model: new SequenceModel([
+        { finishReason: 'tool_calls', toolCalls: [{ id: 'reject-delegate-1', name: 'delegate.researcher', input: { goal: 'Reject me' } }] },
+      ], 'reject-root'),
+      tools: [{ name: 'secure.lookup', description: 'Gated', inputSchema: { type: 'object' }, requiresApproval: true, execute }],
+      delegates: [{
+        name: 'researcher', description: 'Researcher', allowedTools: ['secure.lookup'],
+        model: new SequenceModel([{ finishReason: 'tool_calls', toolCalls: [{ id: 'reject-child-1', name: 'secure.lookup', input: {} }] }], 'reject-child'),
+      }],
+      delegation: { childRunsMayRequestApproval: true },
+      runStore, eventStore, snapshotStore,
+    });
+    const paused = await agent.run({ goal: 'Delegate then reject' });
+    if (paused.status !== 'approval_requested') throw new Error('Expected delegated approval');
+
+    await agent.resolveApproval(paused.runId, paused.approvalId, false);
+    expect(await runStore.getRun(paused.runId)).toMatchObject({ status: 'failed', errorCode: 'APPROVAL_REJECTED' });
+    expect(await runStore.getRun(paused.rootRunId)).toMatchObject({ status: 'failed', errorCode: 'APPROVAL_REJECTED' });
+    expect(execute).not.toHaveBeenCalled();
+    await agent.resolveApproval(paused.runId, paused.approvalId, false);
+    const childEvents = await eventStore.listByRun(paused.runId);
+    const rootEvents = await eventStore.listByRun(paused.rootRunId);
+    expect(childEvents.filter((event) => event.type === 'approval.resolved')).toHaveLength(1);
+    expect(childEvents.filter((event) => event.type === 'run.failed')).toHaveLength(1);
+    expect(rootEvents.filter((event) => event.type === 'run.failed')).toHaveLength(1);
+  });
+
+  it('fails closed when delegated children are not permitted to request approval', async () => {
+    const runStore = new InMemoryRunStore();
+    const execute = vi.fn();
+    const agent = new AdaptiveAgent({
+      model: new SequenceModel([
+        { finishReason: 'tool_calls', toolCalls: [{ id: 'closed-delegate-1', name: 'delegate.researcher', input: { goal: 'Gated work' } }] },
+      ], 'closed-root'),
+      tools: [{ name: 'secure.lookup', description: 'Gated', inputSchema: { type: 'object' }, requiresApproval: true, execute }],
+      delegates: [{
+        name: 'researcher', description: 'Researcher', allowedTools: ['secure.lookup'],
+        model: new SequenceModel([{ finishReason: 'tool_calls', toolCalls: [{ id: 'closed-child-1', name: 'secure.lookup', input: {} }] }], 'closed-child'),
+      }],
+      delegation: { childRunsMayRequestApproval: false },
+      runStore,
+    });
+
+    const result = await agent.run({ goal: 'Fail closed' });
+    expect(result).toMatchObject({ status: 'failure', error: expect.stringContaining('approval') });
+    expect(await runStore.getRun(result.runId)).toMatchObject({ status: 'failed', errorCode: 'TOOL_ERROR' });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
   it('maps delegated child completion back to the parent run', async () => {
     const runStore = new InMemoryRunStore();
     const eventStore = new InMemoryEventStore();
@@ -5147,7 +5280,7 @@ describe('AdaptiveAgent', () => {
       toolName: 'secure.write',
     });
 
-    await agent.resolveApproval(firstResult.runId, true);
+    await agent.resolveApproval(firstResult.runId, firstResult.approvalId, true);
 
     const approvedSnapshot = await snapshotStore.getLatest(firstResult.runId);
     expect(approvedSnapshot?.status).toBe('running');
@@ -5238,7 +5371,7 @@ describe('AdaptiveAgent', () => {
       }),
     );
 
-    await agent.resolveApproval(firstResult.runId, true);
+    await agent.resolveApproval(firstResult.runId, firstResult.approvalId, true);
     const completed = await agent.resume(firstResult.runId);
     expect(completed).toMatchObject({
       status: 'success',
@@ -5275,6 +5408,88 @@ describe('AdaptiveAgent', () => {
         }),
       }),
     );
+  });
+
+  it('persists rejection decisions and treats duplicate identical decisions as idempotent', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const agent = new AdaptiveAgent({
+      model: new SequenceModel([{ finishReason: 'tool_calls', toolCalls: [{ id: 'reject-1', name: 'secure', input: {} }] }]),
+      tools: [{ name: 'secure', description: 'secure', inputSchema: { type: 'object' }, requiresApproval: true, execute: vi.fn() }],
+      runStore, eventStore, snapshotStore,
+    });
+    const result = await agent.run({ goal: 'reject' });
+    expect(result.status).toBe('approval_requested');
+    if (result.status !== 'approval_requested') return;
+    await agent.resolveApproval(result.runId, result.approvalId, false);
+    await agent.resolveApproval(result.runId, result.approvalId, false);
+    await expect(agent.resolveApproval(result.runId, result.approvalId, true)).rejects.toThrow('conflicting decision');
+    expect(await runStore.getRun(result.runId)).toMatchObject({ status: 'failed', errorCode: 'APPROVAL_REJECTED' });
+    const events = await eventStore.listByRun(result.runId);
+    expect(events.filter((event) => event.type === 'approval.resolved')).toHaveLength(1);
+    expect(events.filter((event) => event.type === 'run.failed')).toHaveLength(1);
+  });
+
+  it('keeps sequential approval decisions separate and ignores a stale identical decision', async () => {
+    const runStore = new InMemoryRunStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const execute = vi.fn(async () => ({ ok: true }));
+    const agent = new AdaptiveAgent({
+      model: new SequenceModel([
+        { finishReason: 'tool_calls', toolCalls: [{ id: 'cycle-1', name: 'secure', input: {} }] },
+        { finishReason: 'tool_calls', toolCalls: [{ id: 'cycle-1', name: 'secure', input: {} }] },
+        { finishReason: 'stop', structuredOutput: { done: true } },
+      ]),
+      tools: [{ name: 'secure', description: 'secure', inputSchema: { type: 'object' }, requiresApproval: true, execute }],
+      runStore, snapshotStore,
+    });
+    const first = await agent.run({ goal: 'twice' });
+    if (first.status !== 'approval_requested') throw new Error('expected approval');
+    await agent.resolveApproval(first.runId, first.approvalId, true);
+    const second = await agent.resume(first.runId);
+    if (second.status !== 'approval_requested') throw new Error('expected second approval');
+    expect(second.approvalId).not.toBe(first.approvalId);
+    await agent.resolveApproval(first.runId, first.approvalId, true);
+    expect((await runStore.getRun(first.runId))?.status).toBe('awaiting_approval');
+    await agent.resolveApproval(second.runId, second.approvalId, true);
+    expect(await agent.resume(second.runId)).toMatchObject({ status: 'success', output: { done: true } });
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
+
+  it('serializes concurrent approval decisions and emits one resolution boundary', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const agent = new AdaptiveAgent({
+      model: new SequenceModel([
+        { finishReason: 'tool_calls', toolCalls: [{ id: 'concurrent-1', name: 'secure', input: {} }] },
+        { finishReason: 'tool_calls', toolCalls: [{ id: 'concurrent-2', name: 'secure', input: {} }] },
+      ]),
+      tools: [{ name: 'secure', description: 'secure', inputSchema: { type: 'object' }, requiresApproval: true, execute: vi.fn() }],
+      runStore, eventStore, snapshotStore,
+    });
+    const result = await agent.run({ goal: 'concurrent approval' });
+    if (result.status !== 'approval_requested') throw new Error('expected approval');
+
+    await Promise.all([
+      agent.resolveApproval(result.runId, result.approvalId, true),
+      agent.resolveApproval(result.runId, result.approvalId, true),
+    ]);
+    const events = await eventStore.listByRun(result.runId);
+    expect(events.filter((event) => event.type === 'approval.resolved')).toHaveLength(1);
+    expect(events.filter((event) => event.type === 'run.status_changed'
+      && (event.payload as { fromStatus?: string }).fromStatus === 'awaiting_approval'
+      && (event.payload as { toStatus?: string }).toStatus === 'running')).toHaveLength(1);
+
+    const contradictory = await agent.run({ goal: 'contradictory approval' });
+    if (contradictory.status !== 'approval_requested') throw new Error('expected approval');
+    const decisions = await Promise.allSettled([
+      agent.resolveApproval(contradictory.runId, contradictory.approvalId, true),
+      agent.resolveApproval(contradictory.runId, contradictory.approvalId, false),
+    ]);
+    expect(decisions.filter((decision) => decision.status === 'fulfilled')).toHaveLength(1);
+    expect(decisions.filter((decision) => decision.status === 'rejected')).toHaveLength(1);
   });
 
   it('continues a clarification-requested run after resolveClarification()', async () => {
@@ -5711,6 +5926,33 @@ describe('AdaptiveAgent', () => {
 
     const runEvents = await eventStore.listByRun(result.runId);
     expect(runEvents.some((event) => event.type === 'replan.required')).toBe(true);
+  });
+
+  it('returns REPLAN_REQUIRED instead of advertising persisted-plan manual approval', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const planStore = new InMemoryPlanStore();
+    const plan = await planStore.createPlan({
+      id: crypto.randomUUID(), version: 1, status: 'approved', goal: 'Protected plan',
+      summary: 'Requires unsupported manual approval', toolsetHash: 'test',
+      steps: [{ id: 'protected-step', title: 'Protected lookup', toolName: 'protected.lookup', inputTemplate: {}, onFailure: 'stop' }],
+    });
+    const agent = new AdaptiveAgent({
+      model: new SequenceModel([]),
+      tools: [{
+        name: 'protected.lookup', description: 'Protected', inputSchema: { type: 'object' },
+        requiresApproval: true, execute: vi.fn(),
+      }],
+      runStore, eventStore, planStore,
+    });
+
+    const result = await agent.executePlan({ planId: plan.id });
+    expect(result).toMatchObject({
+      status: 'failure', code: 'REPLAN_REQUIRED', error: expect.stringContaining('manual approval is unsupported'),
+    });
+    const events = await eventStore.listByRun(result.runId);
+    expect(events.filter((event) => event.type === 'approval.requested')).toHaveLength(0);
+    expect(events.filter((event) => event.type === 'replan.required')).toHaveLength(1);
   });
 
   it('injects delegate instructions into the child run system prompt', async () => {

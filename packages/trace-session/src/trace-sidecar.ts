@@ -25,6 +25,7 @@ interface SidecarOptions extends TraceConfigOptions, TraceSidecarPolicy {
 const USAGE = `Usage: trace-session-sidecar [database options] [policy options]
 
 Database options (trusted process startup only):
+  --sqlite-path <path>       Exact runtime SQLite path (read-only inspection).
   --settings <path>          Agent settings used to select SQLite or PostgreSQL.
   --config <path>            PostgreSQL trace config.
   --database-url <url>       PostgreSQL connection string.
@@ -81,6 +82,7 @@ export function parseSidecarArgs(argv: string[]): SidecarOptions {
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]!;
     switch (arg) {
+      case '--sqlite-path': selectBackend(arg); options.sqlitePath = requiredValue(arg, argv[++index]); break;
       case '--settings': selectBackend(arg); options.settingsPath = requiredValue(arg, argv[++index]); break;
       case '--config': selectBackend(arg); options.configPath = requiredValue(arg, argv[++index]); break;
       case '--database-url': selectBackend(arg); options.databaseUrl = requiredValue(arg, argv[++index]); break;
@@ -94,7 +96,7 @@ export function parseSidecarArgs(argv: string[]): SidecarOptions {
       default: throw new Error(`Unexpected argument: ${arg}\n\n${USAGE}`);
     }
   }
-  if (backendSelectors.size > 1) throw new Error('Select exactly one backend source: --settings, --config, --database-url, or --database-url-env.');
+  if (backendSelectors.size > 1) throw new Error('Select exactly one backend source: --sqlite-path, --settings, --config, --database-url, or --database-url-env.');
   return options;
 }
 

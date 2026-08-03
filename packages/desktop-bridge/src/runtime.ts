@@ -7,6 +7,7 @@ import {
   type ManualTestCliOptions,
 } from '@adaptive-agent/agent-sdk/cli';
 import type { AgentEvent, JsonValue, UUID } from '@adaptive-agent/core';
+import { createHash } from 'node:crypto';
 import {
   GatewayClient,
   type InferenceMode,
@@ -53,7 +54,7 @@ export interface CliExecutor {
 }
 
 export interface SafeResolvedConfiguration {
-  agent: { id: string; name: string; description?: string; defaultInvocationMode: string };
+  agent: { id: string; name: string; configurationFingerprint: string; description?: string; defaultInvocationMode: string };
   model: { provider: string; model: string; credentialAvailable: boolean };
   inference: { mode: string; tier: string };
   runtime: { mode: string; sqlitePath?: string };
@@ -116,6 +117,9 @@ export class DesktopRuntime {
     if (this.negotiatedProtocolVersion === '1.10' && request.method === 'auth/updateAccessToken') {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', 'auth/updateAccessToken requires desktop protocol 1.11.', JSON_RPC_ERROR_CODES.methodNotFound);
     }
+    if (this.negotiatedProtocolVersion !== DESKTOP_PROTOCOL_VERSION && request.method.startsWith('history/')) {
+      throw new DesktopProtocolError('METHOD_NOT_FOUND', `${request.method} requires desktop protocol 1.12.`, JSON_RPC_ERROR_CODES.methodNotFound);
+    }
 
     switch (request.method) {
       case 'runtime/initialize':
@@ -133,8 +137,8 @@ export class DesktopRuntime {
         const params = request.params!;
         this.validateExecutionSelection(params);
         const sdk = this.requireSdk();
-        const run = this.configurationDriven ? sdk.run.bind(sdk) : sdk.runRaw.bind(sdk);
-        return asJsonValue(await run(params.goal, {
+        return asJsonValue(await sdk.runRaw(params.goal, {
+          runId: asRunId(params.runId),
           ...(params.sessionId ? { sessionId: params.sessionId } : {}),
           ...(params.input === undefined ? {} : { input: params.input }),
           ...(params.inferenceTier ? { inferenceTier: params.inferenceTier } : {}),
@@ -143,7 +147,8 @@ export class DesktopRuntime {
       case 'agent/chat': {
         const params = request.params!;
         this.validateExecutionSelection(params);
-        return asJsonValue(await this.requireSdk().chatRaw(params.message, {
+        return asJsonValue(await this.requireSdk().chatRaw(params.transcript, {
+          runId: asRunId(params.runId),
           ...(params.sessionId ? { sessionId: params.sessionId } : {}),
           ...(params.inferenceTier ? { inferenceTier: params.inferenceTier } : {}),
         }));
@@ -180,12 +185,16 @@ export class DesktopRuntime {
         return { runId: params.runId, accepted: true };
       }
       case 'interaction/resolveApproval':
-        return this.resolveApproval(request.params!.runId, request.params!.approved);
+        return this.resolveApproval(request.params!.runId, request.params!.approvalId, request.params!.approved);
       case 'interaction/resolveClarification':
         return asJsonValue(await this.requireSdk().agent.resolveClarification(
           asRunId(request.params!.runId),
           request.params!.answer,
         ));
+      case 'history/previewDeletion':
+        return asJsonValue(await this.requireMaintenanceStore().previewDeletion(request.params!.target));
+      case 'history/delete':
+        return asJsonValue(await this.requireMaintenanceStore().deleteHistory(request.params!.target));
       case 'cli/commands':
         return this.cliCommands();
       case 'cli/execute':
@@ -233,7 +242,11 @@ export class DesktopRuntime {
       bridgeVersion: DESKTOP_BRIDGE_VERSION,
       serverInfo: { name: '@adaptive-agent/desktop-bridge', version: DESKTOP_BRIDGE_VERSION },
       capabilities: {
-        methods: DESKTOP_RPC_METHODS.filter((method) => this.negotiatedProtocolVersion === '1.11' || method !== 'auth/updateAccessToken'),
+        methods: DESKTOP_RPC_METHODS.filter((method) => {
+          if (this.negotiatedProtocolVersion === '1.10' && method === 'auth/updateAccessToken') return false;
+          if (this.negotiatedProtocolVersion !== DESKTOP_PROTOCOL_VERSION && method.startsWith('history/')) return false;
+          return true;
+        }),
         notifications: ['runtime/ready', 'agent/event', 'cli/output'],
         cli: {
           commands: [...ADAPTIVE_AGENT_CLI_COMMANDS],
@@ -416,11 +429,22 @@ export class DesktopRuntime {
     this.write({ jsonrpc: '2.0', method: 'agent/event', params: asJsonValue(event) });
   }
 
-  private async resolveApproval(runId: string, approved: boolean): Promise<JsonValue> {
+  private async resolveApproval(runId: string, approvalId: string, approved: boolean): Promise<JsonValue> {
     const sdk = this.requireSdk();
-    await sdk.agent.resolveApproval(asRunId(runId), approved);
-    if (!approved) return asJsonValue(await sdk.inspect(asRunId(runId)));
-    return asJsonValue(await sdk.resumeRaw(asRunId(runId)));
+    await sdk.agent.resolveApproval(asRunId(runId), approvalId, approved);
+    return { runId, approvalId, approved, resolved: true };
+  }
+
+  private requireMaintenanceStore() {
+    const store = this.requireSdk().created.runtime.maintenanceStore;
+    if (!store) {
+      throw new DesktopProtocolError(
+        'COMMAND_REJECTED',
+        'History deletion is available only for the SQLite runtime.',
+        JSON_RPC_ERROR_CODES.commandRejected,
+      );
+    }
+    return store;
   }
 
   private cliCommands(): JsonValue {
@@ -544,6 +568,7 @@ export function safeResolvedConfiguration(config: ResolvedAgentSdkConfig): SafeR
     agent: {
       id: config.agent.id,
       name: config.agent.name,
+      configurationFingerprint: agentConfigurationFingerprint(config),
       ...(config.agent.description ? { description: config.agent.description } : {}),
       defaultInvocationMode: config.agent.defaultInvocationMode,
     },
@@ -581,12 +606,15 @@ function hasConfigurationOverrides(params: RuntimeInitializeParams): boolean {
 
 export function validateRestrictedDesktopConfiguration(config: ResolvedAgentSdkConfig): void {
   const errors: string[] = [];
+  if (config.runtime.mode !== 'sqlite') {
+    errors.push(`runtime.mode must be "sqlite" (resolved: "${config.runtime.mode}")`);
+  }
+  if (config.runtime.mode === 'sqlite' && !config.runtime.sqlitePath?.trim()) {
+    errors.push('runtime.sqlitePath must be a non-empty exact path');
+  }
   if (config.inference.mode !== 'byok') errors.push(`inference.mode must be "byok" (resolved: "${config.inference.mode}")`);
   if (!config.agent.invocationModes.includes('run') || config.agent.defaultInvocationMode !== 'run') {
     errors.push('the selected agent must support run and set defaultInvocationMode to "run"');
-  }
-  if (config.interaction.approvalMode === 'manual') {
-    errors.push('interaction.approvalMode must be "auto" or "reject"; manual approval is not available in the desktop MVP');
   }
   if (config.interaction.approvalMode === 'reject' && config.settings.defaults?.autoApproveAll === true) {
     errors.push('interaction.approvalMode "reject" conflicts with defaults.autoApproveAll true; remove autoApproveAll or set it to false');
@@ -604,6 +632,36 @@ export function validateRestrictedDesktopConfiguration(config: ResolvedAgentSdkC
       JSON_RPC_ERROR_CODES.invalidParams,
     );
   }
+}
+
+/** Hash execution-defining values without returning configuration or credentials to the host. */
+function agentConfigurationFingerprint(config: ResolvedAgentSdkConfig): string {
+  const executionConfiguration = {
+    agent: omitSecrets(config.agent),
+    model: { provider: config.model.provider, model: config.model.model },
+    inference: config.inference,
+    interaction: config.interaction,
+  };
+  return createHash('sha256').update(stableJson(executionConfiguration)).digest('hex');
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => `${JSON.stringify(key)}:${stableJson(child)}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+function omitSecrets(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(omitSecrets);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+    .filter(([key]) => !/(api[-_]?key|access[-_]?token|credential|password|secret)/i.test(key))
+    .map(([key, child]) => [key, omitSecrets(child)]));
 }
 
 function asRunId(runId: string): UUID {

@@ -39,12 +39,28 @@ describe('desktop runtime protocol', () => {
     } as ResolvedAgentSdkConfig);
 
     expect(summary).toMatchObject({
-      agent: { id: 'agent-1', name: 'Researcher', defaultInvocationMode: 'run' },
+      agent: { id: 'agent-1', name: 'Researcher', defaultInvocationMode: 'run', configurationFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/) },
       model: { provider: 'openrouter', model: 'test-model', credentialAvailable: true },
       inference: { mode: 'byok' },
       interaction: { approvalMode: 'reject', clarificationMode: 'fail' },
     });
     expect(JSON.stringify(summary)).not.toContain('never-expose-this');
+  });
+
+  it('produces a deterministic, change-sensitive fingerprint without hashing credential values into output', () => {
+    const base = {
+      agent: { id: 'agent-1', name: 'Researcher', description: 'Be precise', invocationModes: ['run'], defaultInvocationMode: 'run' },
+      model: { provider: 'openrouter', model: 'test-model', apiKey: 'first-secret' },
+      inference: { mode: 'byok', tier: 'medium' },
+      runtime: { requestedMode: 'sqlite', mode: 'sqlite', autoMigrate: true, sqlitePath: '/tmp/runtime.sqlite' },
+      workspaceRoot: '/workspace', shellCwd: '/workspace',
+      interaction: { approvalMode: 'reject', clarificationMode: 'fail' },
+    } as unknown as ResolvedAgentSdkConfig;
+    const first = safeResolvedConfiguration(base).agent.configurationFingerprint;
+    const credentialChanged = safeResolvedConfiguration({ ...base, model: { ...base.model, apiKey: 'second-secret' } }).agent.configurationFingerprint;
+    const instructionsChanged = safeResolvedConfiguration({ ...base, agent: { ...base.agent, description: 'Be concise' } }).agent.configurationFingerprint;
+    expect(credentialChanged).toBe(first);
+    expect(instructionsChanged).not.toBe(first);
   });
 
   it('rejects conflicting reject and auto-approve settings for restricted desktop runs', () => {
@@ -57,6 +73,29 @@ describe('desktop runtime protocol', () => {
       workspaceRoot: '/workspace', shellCwd: '/workspace',
       interaction: { approvalMode: 'reject', clarificationMode: 'fail' },
     } as ResolvedAgentSdkConfig)).toThrow(/conflicts with defaults\.autoApproveAll true/);
+  });
+
+  it('fails closed unless restricted desktop execution resolves an exact SQLite path', () => {
+    const config = {
+      agent: { id: 'agent-1', name: 'Researcher', invocationModes: ['run'], defaultInvocationMode: 'run' },
+      settings: {}, model: { provider: 'ollama', model: 'test-model' },
+      inference: { mode: 'byok', tier: 'medium' }, workspaceRoot: '/workspace', shellCwd: '/workspace',
+      interaction: { approvalMode: 'reject', clarificationMode: 'fail' },
+    } as ResolvedAgentSdkConfig;
+    expect(() => validateRestrictedDesktopConfiguration({ ...config, runtime: { requestedMode: 'memory', mode: 'memory', autoMigrate: true } })).toThrow(/runtime\.mode must be "sqlite"/);
+    expect(() => validateRestrictedDesktopConfiguration({ ...config, runtime: { requestedMode: 'sqlite', mode: 'sqlite', autoMigrate: true, sqlitePath: '  ' } })).toThrow(/non-empty exact path/);
+    expect(() => validateRestrictedDesktopConfiguration({ ...config, runtime: { requestedMode: 'sqlite', mode: 'sqlite', autoMigrate: true, sqlitePath: '/exact/runtime.sqlite' } })).not.toThrow();
+  });
+
+  it('permits manual approval but rejects interactive clarification', () => {
+    const config = {
+      agent: { id: 'agent-1', name: 'Researcher', invocationModes: ['run'], defaultInvocationMode: 'run' }, settings: {},
+      model: { provider: 'ollama', model: 'test-model' }, inference: { mode: 'byok', tier: 'medium' },
+      runtime: { requestedMode: 'sqlite', mode: 'sqlite', autoMigrate: true, sqlitePath: '/exact/runtime.sqlite' },
+      workspaceRoot: '/workspace', shellCwd: '/workspace', interaction: { approvalMode: 'manual', clarificationMode: 'fail' },
+    } as ResolvedAgentSdkConfig;
+    expect(() => validateRestrictedDesktopConfiguration(config)).not.toThrow();
+    expect(() => validateRestrictedDesktopConfiguration({ ...config, interaction: { ...config.interaction, clarificationMode: 'interactive' } })).toThrow(/clarificationMode must be "fail"/);
   });
 
   it('requires and negotiates the JSON-RPC protocol handshake', async () => {
@@ -82,7 +121,7 @@ describe('desktop runtime protocol', () => {
       params: { protocolVersion: '2.0', clientInfo: { name: 'desktop' } },
     }))).rejects.toMatchObject({
       code: 'UNSUPPORTED_PROTOCOL_VERSION',
-      data: { supportedProtocolVersions: ['1.10', '1.11'] },
+      data: { supportedProtocolVersions: ['1.10', '1.11', '1.12'] },
     });
   });
 
@@ -120,6 +159,31 @@ describe('desktop runtime protocol', () => {
       method: 'auth/updateAccessToken',
       params: { accessToken: 'secret' },
     }))).rejects.toMatchObject({ code: 'METHOD_NOT_FOUND' });
+  });
+
+  it('exposes typed history maintenance only in protocol 1.12 with SQLite support', async () => {
+    const previewDeletion = vi.fn(async (target) => ({ target, runIds: ['root'], rootRunIds: ['root'], ownedPlanIds: [], preservedPlanIds: [] }));
+    const deleteHistory = vi.fn(async (target) => ({ target, runIds: ['root'], rootRunIds: ['root'], ownedPlanIds: [], preservedPlanIds: [] }));
+    const { runtime } = createRuntime();
+    const initialized = await runtime.handleRpc(request({
+      id: 'init', method: 'initialize', params: { protocolVersion: '1.12', clientInfo: { name: 'desktop' } },
+    })) as { capabilities: { methods: string[] } };
+    expect(initialized.capabilities.methods).toEqual(expect.arrayContaining(['history/previewDeletion', 'history/delete']));
+    (runtime as unknown as { sdk: unknown }).sdk = { created: { runtime: { maintenanceStore: { previewDeletion, deleteHistory } } } };
+
+    await expect(runtime.handleRpc(request({
+      id: 'preview', method: 'history/previewDeletion', params: { target: { kind: 'root-run', rootRunId: 'root' } },
+    }))).resolves.toMatchObject({ runIds: ['root'] });
+    await expect(runtime.handleRpc(request({
+      id: 'delete', method: 'history/delete', params: { target: { kind: 'session', sessionId: 'session' } },
+    }))).resolves.toMatchObject({ runIds: ['root'] });
+    expect(previewDeletion).toHaveBeenCalledWith({ kind: 'root-run', rootRunId: 'root' });
+    expect(deleteHistory).toHaveBeenCalledWith({ kind: 'session', sessionId: 'session' });
+
+    (runtime as unknown as { sdk: unknown }).sdk = { created: { runtime: {} } };
+    await expect(runtime.handleRpc(request({
+      id: 'unsupported', method: 'history/delete', params: { target: { kind: 'root-run', rootRunId: 'root' } },
+    }))).rejects.toMatchObject({ code: 'COMMAND_REJECTED' });
   });
 
   it('lists the complete CLI command surface and its execution restrictions', async () => {
