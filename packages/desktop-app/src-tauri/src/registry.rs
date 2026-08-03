@@ -1,3 +1,4 @@
+use crate::workbench::PendingApproval;
 use std::collections::HashMap;
 
 pub const CAPACITY: usize = 3;
@@ -24,6 +25,7 @@ pub struct RunRecord {
     pub request_active: bool,
     pub revision: u64,
     pub pending_interaction: Option<String>,
+    pub pending_approval: Option<PendingApproval>,
     pub occupies_slot: bool,
 }
 
@@ -141,6 +143,7 @@ pub(crate) fn tests_record_for_transition() -> RunRecord {
         request_active: false,
         revision: 0,
         pending_interaction: None,
+        pending_approval: None,
         occupies_slot: true,
     }
 }
@@ -163,6 +166,7 @@ mod tests {
             request_active: false,
             revision: 0,
             pending_interaction: None,
+            pending_approval: None,
             occupies_slot: true,
         }
     }

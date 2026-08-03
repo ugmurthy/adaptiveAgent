@@ -19,7 +19,7 @@ use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent},
     ShellExt,
 };
-use workbench::{ChatItem, ChatMessage, Reservation, WorkbenchDb};
+use workbench::{ChatItem, ChatMessage, PendingApproval, Reservation, WorkbenchDb};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -93,6 +93,8 @@ struct RunSummary {
     status: String,
     cancel_requested: bool,
     occupies_slot: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending_approval: Option<PendingApproval>,
 }
 
 #[derive(Serialize)]
@@ -339,11 +341,22 @@ impl Bridge {
                 request_active: false,
                 revision: 0,
                 pending_interaction: None,
+                pending_approval: None,
                 occupies_slot: !matches!(
                     saved.submission_state.as_str(),
                     "terminal" | "submission_failed"
                 ),
             });
+        }
+        for approval in bridge.workbench.load_pending_approvals()? {
+            if let Some(root) = bridge
+                .registry
+                .lock()
+                .unwrap()
+                .get_mut(&approval.root_run_id)
+            {
+                root.pending_approval = Some(approval);
+            }
         }
         let reader = bridge.clone();
         tauri::async_runtime::spawn(async move {
@@ -389,6 +402,7 @@ impl Bridge {
         *self.configuration.lock().unwrap() = Some(configuration);
         *self.initialization_error.lock().unwrap() = None;
         self.reconcile_saved_runs();
+        self.recover_pending_approval_operations();
         Ok(())
     }
 
@@ -438,6 +452,7 @@ impl Bridge {
                     definitely_absent,
                 );
                 let result = recovered_result(&inspection);
+                let recovered_approval = bridge.discover_pending_approval(&run_id, &inspection);
                 let chat_success = bridge
                     .registry
                     .lock()
@@ -450,13 +465,12 @@ impl Bridge {
                         .as_ref()
                         .ok_or_else(|| "A succeeded chat has no durable /run/result.".to_string())
                         .and_then(|result| {
+                            let output = response_assistant_value(result).ok_or_else(|| {
+                                "A succeeded chat has no durable output.".to_string()
+                            })?;
                             bridge
                                 .workbench
-                                .finalize_chat_success(
-                                    &run_id,
-                                    result,
-                                    &durable_assistant_output(result),
-                                )
+                                .finalize_chat_success(&run_id, result, &value_as_content(&output))
                                 .map(|_| ())
                         });
                     if let Err(error) = finalized {
@@ -467,11 +481,27 @@ impl Bridge {
                 let mut applied_quiescent = false;
                 let mut stale = false;
                 let mut persisted = None;
+                let mut persist_approval = None;
+                let mut clear_approval_id = None;
                 let mut should_interrupt = false;
                 if let Some(record) = bridge.registry.lock().unwrap().get_mut(&run_id) {
                     match apply_run_state(record, &state, Some(revision)) {
                         ApplyState::Accepted => {
                             applied_quiescent = !state.occupies_slot;
+                            if let Some(mut approval) = recovered_approval.clone() {
+                                preserve_approval_operation(
+                                    &mut approval,
+                                    record.pending_approval.as_ref(),
+                                );
+                                record.pending_approval = Some(approval.clone());
+                                persist_approval = Some(approval);
+                            } else if applied_quiescent {
+                                clear_approval_id = record
+                                    .pending_approval
+                                    .as_ref()
+                                    .map(|approval| approval.approval_id.clone());
+                                record.pending_approval = None;
+                            }
                             persisted = Some((
                                 record.cached_status.clone(),
                                 record.submission_state.clone(),
@@ -488,6 +518,13 @@ impl Bridge {
                 }
                 if let Some((status, submission)) = persisted {
                     let _ = bridge.workbench.update_run(&run_id, &status, &submission);
+                }
+                if let Some(approval) = persist_approval {
+                    let _ = bridge.workbench.save_pending_approval(&approval);
+                } else if let Some(approval_id) = clear_approval_id {
+                    let _ = bridge
+                        .workbench
+                        .clear_pending_approval(&run_id, Some(&approval_id));
                 }
                 if applied_quiescent && result.is_some() && !chat_success {
                     if let Err(error) = bridge
@@ -658,6 +695,9 @@ impl Bridge {
             .and_then(Value::as_str)
             .unwrap_or("run.progress");
         let root_created = is_root_run_created(event);
+        if kind == "approval.requested" {
+            self.capture_pending_approval(event, run_id);
+        }
         if root_created {
             let cancel = {
                 let mut registry = self.registry.lock().unwrap();
@@ -754,6 +794,192 @@ impl Bridge {
         );
     }
 
+    fn capture_pending_approval(&self, value: &Value, fallback_root: &str) {
+        let payload = value.get("payload").unwrap_or(value);
+        let owner = value
+            .get("runId")
+            .or_else(|| payload.get("runId"))
+            .and_then(Value::as_str)
+            .unwrap_or(fallback_root);
+        let root = payload
+            .get("rootRunId")
+            .and_then(Value::as_str)
+            .unwrap_or(fallback_root);
+        let Some(approval_id) = payload.get("approvalId").and_then(Value::as_str) else {
+            return;
+        };
+        let mut approval = PendingApproval {
+            root_run_id: root.into(),
+            approval_run_id: owner.into(),
+            approval_id: approval_id.into(),
+            parent_run_id: payload
+                .get("parentRunId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            tool_name: payload
+                .get("toolName")
+                .and_then(Value::as_str)
+                .unwrap_or("Tool")
+                .into(),
+            message: payload
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Approve this tool call?")
+                .into(),
+            decision_in_flight: false,
+            decision: None,
+            operation_state: "awaiting_decision".into(),
+        };
+        {
+            let mut registry = self.registry.lock().unwrap();
+            let Some(record) = registry.get_mut(root) else {
+                return;
+            };
+            preserve_approval_operation(&mut approval, record.pending_approval.as_ref());
+            record.revision += 1;
+        }
+        if self.workbench.save_pending_approval(&approval).is_ok() {
+            if let Some(record) = self.registry.lock().unwrap().get_mut(root) {
+                record.pending_approval = Some(approval);
+                record.revision += 1;
+            }
+            self.emit_state();
+        }
+    }
+
+    fn resolve_approval(
+        self: &Arc<Self>,
+        root_run_id: String,
+        approval_run_id: String,
+        approval_id: String,
+        approved: bool,
+    ) -> Result<(), String> {
+        if !self.workbench.begin_approval_decision(
+            &root_run_id,
+            &approval_run_id,
+            &approval_id,
+            approved,
+        )? {
+            return Err("Approval is stale or a decision is already in flight.".into());
+        }
+        if let Some(p) = self
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&root_run_id)
+            .and_then(|r| r.pending_approval.as_mut())
+        {
+            p.decision_in_flight = true;
+            p.decision = Some(approved);
+            p.operation_state = "resolving".into();
+        }
+        if let Some(record) = self.registry.lock().unwrap().get_mut(&root_run_id) {
+            record.revision += 1;
+        }
+        self.emit_state();
+        self.drive_approval_operation(PendingApproval {
+            root_run_id,
+            approval_run_id,
+            approval_id,
+            parent_run_id: None,
+            tool_name: String::new(),
+            message: String::new(),
+            decision_in_flight: true,
+            decision: Some(approved),
+            operation_state: "resolving".into(),
+        });
+        Ok(())
+    }
+
+    fn recover_pending_approval_operations(self: &Arc<Self>) {
+        if let Ok(approvals) = self.workbench.load_pending_approvals() {
+            for approval in approvals
+                .into_iter()
+                .filter(|approval| approval.operation_state != "awaiting_decision")
+            {
+                self.drive_approval_operation(approval);
+            }
+        }
+    }
+
+    fn drive_approval_operation(self: &Arc<Self>, approval: PendingApproval) {
+        let bridge = self.clone();
+        std::thread::spawn(move || {
+            let root_run_id = approval.root_run_id;
+            let approval_run_id = approval.approval_run_id;
+            let approval_id = approval.approval_id;
+            let Some(approved) = approval.decision else {
+                return;
+            };
+            if approval.operation_state == "resolving" {
+                let resolved = bridge.request_wait(
+                    "interaction/resolveApproval",
+                    json!({"runId":approval_run_id,"approvalId":approval_id,"approved":approved}),
+                    REQUEST_TIMEOUT,
+                );
+                if let Err(error) = resolved {
+                    let _ = bridge.app.emit(
+                        "adaptive-agent://control-error",
+                        json!({"runId":root_run_id,"error":format!("Approval outcome is unknown and will be retried after runtime restart: {error}")}),
+                    );
+                    bridge.reconcile_run(root_run_id.clone());
+                    bridge.emit_state();
+                    return;
+                }
+                let _ = bridge.workbench.mark_approval_resolved(
+                    &root_run_id,
+                    &approval_run_id,
+                    &approval_id,
+                    approved,
+                );
+                if let Some(p) = bridge
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .get_mut(&root_run_id)
+                    .and_then(|record| record.pending_approval.as_mut())
+                {
+                    p.operation_state = if approved {
+                        "resume_pending".into()
+                    } else {
+                        "rejection_pending".into()
+                    };
+                }
+            }
+            if approved {
+                match bridge.request("run/resume", json!({"runId":approval_run_id})) {
+                    Ok((_, receiver)) => {
+                        let bridge2 = bridge.clone();
+                        let root = root_run_id.clone();
+                        std::thread::spawn(move || {
+                            match receiver.recv() {
+                                Ok(Ok(_)) => bridge2.reconcile_run(root),
+                                Ok(Err(error)) => {
+                                    let _ = bridge2.app.emit(
+                                        "adaptive-agent://control-error",
+                                        json!({"runId":root,"error":error}),
+                                    );
+                                    bridge2.reconcile_run(root)
+                                }
+                                Err(_) => bridge2.reconcile_run(root),
+                            };
+                        });
+                    }
+                    Err(error) => {
+                        let _ = bridge.app.emit(
+                            "adaptive-agent://control-error",
+                            json!({"runId":root_run_id,"error":error}),
+                        );
+                        bridge.reconcile_run(root_run_id.clone());
+                    }
+                }
+            } else {
+                bridge.reconcile_run(root_run_id.clone());
+            }
+            bridge.emit_state();
+        });
+    }
+
     fn start_run(self: &Arc<Self>, task: String) -> Result<StartedRun, String> {
         let _submission = self.submission.lock().unwrap();
         if self.draining.load(Ordering::SeqCst) {
@@ -810,6 +1036,7 @@ impl Bridge {
             request_active: true,
             revision: 0,
             pending_interaction: None,
+            pending_approval: None,
             occupies_slot: true,
         });
         if let Err(error) = self.workbench.reserve_task(&reservation) {
@@ -857,7 +1084,8 @@ impl Bridge {
             match response {
                 Ok(result) => {
                     let state = state_for_execution_result(&result);
-                    let _ = bridge.workbench.store_result(&run_id, &result);
+                    let stored_result = canonical_workbench_result(&result);
+                    let _ = bridge.workbench.store_result(&run_id, &stored_result);
                     let mut accepted_quiescent = false;
                     if let Some(record) = bridge.registry.lock().unwrap().get_mut(&run_id) {
                         accepted_quiescent = apply_run_state(record, &state, None)
@@ -874,7 +1102,7 @@ impl Bridge {
                     if accepted_quiescent {
                         let _ = bridge.app.emit(
                             "adaptive-agent://run-finished",
-                            json!({ "runId": run_id, "result": result }),
+                            json!({ "runId": run_id, "result": stored_result }),
                         );
                     } else {
                         bridge.reconcile_run(run_id.clone());
@@ -972,6 +1200,7 @@ impl Bridge {
             request_active: true,
             revision: 0,
             pending_interaction: None,
+            pending_approval: None,
             occupies_slot: true,
         });
         drop(registry);
@@ -1027,8 +1256,9 @@ impl Bridge {
             match response {
                 Ok(result) => {
                     let state = state_for_execution_result(&result);
+                    let stored_result = canonical_workbench_result(&result);
                     if state.cached_status == "succeeded" {
-                        let finalized = response_assistant_value(&result)
+                        let finalized = response_assistant_value(&stored_result)
                             .ok_or_else(|| {
                                 "Successful chat response did not include output.".to_string()
                             })
@@ -1036,7 +1266,11 @@ impl Bridge {
                                 let content = value_as_content(&output);
                                 bridge
                                     .workbench
-                                    .finalize_chat_success(&response_run_id, &output, &content)
+                                    .finalize_chat_success(
+                                        &response_run_id,
+                                        &stored_result,
+                                        &content,
+                                    )
                                     .map(|_| ())
                             });
                         if let Err(error) = finalized {
@@ -1045,8 +1279,9 @@ impl Bridge {
                             bridge.emit_state();
                             return;
                         }
-                    } else if let Err(error) =
-                        bridge.workbench.store_result(&response_run_id, &result)
+                    } else if let Err(error) = bridge
+                        .workbench
+                        .store_result(&response_run_id, &stored_result)
                     {
                         let _ = bridge.app.emit(
                             "adaptive-agent://control-error",
@@ -1072,7 +1307,7 @@ impl Bridge {
                     if !state.occupies_slot {
                         let _ = bridge.app.emit(
                             "adaptive-agent://run-finished",
-                            json!({"runId":response_run_id,"result":result}),
+                            json!({"runId":response_run_id,"result":stored_result}),
                         );
                     }
                 }
@@ -1167,6 +1402,28 @@ impl Bridge {
         last
     }
 
+    fn discover_pending_approval(
+        &self,
+        root_run_id: &str,
+        root_inspection: &Response,
+    ) -> Option<PendingApproval> {
+        let mut inspection = root_inspection.as_ref().ok()?.clone();
+        for _ in 0..16 {
+            let run = inspection.get("run")?;
+            match run.get("status").and_then(Value::as_str)? {
+                "awaiting_approval" => {
+                    return pending_approval_from_inspection(root_run_id, &inspection)
+                }
+                "awaiting_subagent" => {
+                    let child_run_id = run.get("currentChildRunId").and_then(Value::as_str)?;
+                    inspection = self.inspect_for_recovery(child_run_id).ok()?;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
     fn snapshot(&self) -> DesktopState {
         let configuration = self.configuration.lock().unwrap().clone();
         let error = self.initialization_error.lock().unwrap().clone();
@@ -1182,6 +1439,7 @@ impl Bridge {
                 status: run.cached_status.clone(),
                 cancel_requested: run.cancel_requested,
                 occupies_slot: run.occupies_slot,
+                pending_approval: run.pending_approval.clone(),
             })
             .collect::<Vec<_>>();
         runs.sort_by(|left, right| left.run_id.cmp(&right.run_id));
@@ -1502,6 +1760,24 @@ fn get_run_result(
 }
 
 #[tauri::command]
+fn resolve_approval(
+    root_run_id: String,
+    approval_run_id: String,
+    approval_id: String,
+    approved: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or("Desktop runtime is starting.")?
+        .resolve_approval(root_run_id, approval_run_id, approval_id, approved)
+}
+
+#[tauri::command]
 fn create_chat(title: String, state: tauri::State<'_, AppState>) -> Result<ChatDto, String> {
     let _lifecycle = state.lifecycle.lock().unwrap();
     if state.quit.lock().unwrap().state() != QuitState::Idle {
@@ -1698,6 +1974,7 @@ pub fn run() {
             start_run,
             stop_run,
             get_run_result,
+            resolve_approval,
             create_chat,
             list_chats,
             load_chat,
@@ -1794,11 +2071,82 @@ fn submission_failed() -> RunState {
 }
 
 fn recovered_result(inspection: &Response) -> Option<Value> {
-    inspection
-        .as_ref()
-        .ok()
-        .and_then(|value| value.pointer("/run/result"))
-        .cloned()
+    let run = inspection.as_ref().ok()?.get("run")?;
+    let run_id = run.get("id")?.as_str()?;
+    match run.get("status")?.as_str()? {
+        "succeeded" => Some(json!({
+            "status": "success",
+            "runId": run_id,
+            "output": run.get("result").cloned().unwrap_or(Value::Null)
+        })),
+        "failed" | "interrupted" | "replan_required" | "cancelled" => Some(json!({
+            "status": "failure",
+            "runId": run_id,
+            "error": run.get("errorMessage").and_then(Value::as_str).unwrap_or_else(|| match run.get("status").and_then(Value::as_str) {
+                Some("interrupted") | Some("cancelled") => "Run interrupted",
+                Some("replan_required") => "Replan required",
+                _ => "Run failed",
+            }),
+            "code": run.get("errorCode").and_then(Value::as_str).unwrap_or_else(|| match run.get("status").and_then(Value::as_str) {
+                Some("interrupted") | Some("cancelled") => "INTERRUPTED",
+                Some("replan_required") => "REPLAN_REQUIRED",
+                _ => "MODEL_ERROR",
+            })
+        })),
+        _ => None,
+    }
+}
+
+fn pending_approval_from_inspection(
+    root_run_id: &str,
+    inspection: &Value,
+) -> Option<PendingApproval> {
+    let run = inspection.get("run")?;
+    let owner_run_id = run.get("id").and_then(Value::as_str)?;
+    let event = inspection
+        .get("events")?
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|event| event.get("type").and_then(Value::as_str) == Some("approval.requested"))?;
+    let payload = event.get("payload")?;
+    let approval_id = payload.get("approvalId").and_then(Value::as_str)?;
+    Some(PendingApproval {
+        root_run_id: root_run_id.into(),
+        approval_run_id: owner_run_id.into(),
+        approval_id: approval_id.into(),
+        parent_run_id: run
+            .get("parentRunId")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        tool_name: payload
+            .get("toolName")
+            .and_then(Value::as_str)
+            .unwrap_or("Tool")
+            .into(),
+        message: payload
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                let tool = payload
+                    .get("toolName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("this tool");
+                format!("Approval required before invoking {tool}")
+            }),
+        decision_in_flight: false,
+        decision: None,
+        operation_state: "awaiting_decision".into(),
+    })
+}
+
+fn preserve_approval_operation(approval: &mut PendingApproval, current: Option<&PendingApproval>) {
+    if let Some(current) = current.filter(|current| current.approval_id == approval.approval_id) {
+        approval.decision_in_flight = current.decision_in_flight;
+        approval.decision = current.decision;
+        approval.operation_state = current.operation_state.clone();
+    }
 }
 
 fn response_assistant_value(result: &Value) -> Option<Value> {
@@ -1808,8 +2156,25 @@ fn response_assistant_value(result: &Value) -> Option<Value> {
         .cloned()
 }
 
-fn durable_assistant_output(result: &Value) -> String {
-    value_as_content(result)
+fn canonical_workbench_result(result: &Value) -> Value {
+    match result.get("status").and_then(Value::as_str) {
+        Some("success") => json!({
+            "status": "success",
+            "runId": result.get("runId").cloned().unwrap_or(Value::Null),
+            "output": result.get("output").cloned().unwrap_or(Value::Null)
+        }),
+        Some("failure") => json!({
+            "status": "failure",
+            "runId": result.get("runId").cloned().unwrap_or(Value::Null),
+            "error": if result.get("code").and_then(Value::as_str) == Some("INTERRUPTED") {
+                Value::String("Run interrupted".into())
+            } else {
+                result.get("error").cloned().unwrap_or_else(|| Value::String("Run failed".into()))
+            },
+            "code": result.get("code").cloned().unwrap_or_else(|| Value::String("MODEL_ERROR".into()))
+        }),
+        _ => result.clone(),
+    }
 }
 
 fn value_as_content(value: &Value) -> String {
@@ -2066,8 +2431,67 @@ mod tests {
                 "result": { "answer": 42 }
             }
         }));
-        assert_eq!(recovered_result(&inspection), Some(json!({ "answer": 42 })));
+        assert_eq!(
+            recovered_result(&inspection),
+            Some(json!({
+                "status": "success",
+                "runId": "run-1",
+                "output": { "answer": 42 }
+            }))
+        );
         assert_eq!(recovered_result(&Err("transport unavailable".into())), None);
+
+        let interrupted = Ok(json!({
+            "run": { "id": "run-2", "status": "interrupted" }
+        }));
+        assert_eq!(
+            recovered_result(&interrupted),
+            Some(canonical_workbench_result(&json!({
+                "status": "failure",
+                "runId": "run-2",
+                "error": "Run interrupted",
+                "code": "INTERRUPTED",
+                "stepsUsed": 1,
+                "usage": {}
+            })))
+        );
+    }
+
+    #[test]
+    fn pending_approval_is_rebuilt_from_durable_inspection() {
+        let inspection = json!({
+            "run": {
+                "id": "child-run",
+                "rootRunId": "root-run",
+                "parentRunId": "root-run",
+                "status": "awaiting_approval"
+            },
+            "events": [{
+                "type": "approval.requested",
+                "runId": "child-run",
+                "payload": {
+                    "approvalId": "approval:child-run:step-1:call-1",
+                    "toolName": "secure.lookup",
+                    "rootRunId": "root-run",
+                    "parentRunId": "root-run"
+                }
+            }]
+        });
+
+        assert_eq!(
+            pending_approval_from_inspection("root-run", &inspection),
+            Some(PendingApproval {
+                root_run_id: "root-run".into(),
+                approval_run_id: "child-run".into(),
+                approval_id: "approval:child-run:step-1:call-1".into(),
+                parent_run_id: Some("root-run".into()),
+                tool_name: "secure.lookup".into(),
+                message: "Approval required before invoking secure.lookup".into(),
+                decision_in_flight: false,
+                decision: None,
+                operation_state: "awaiting_decision".into(),
+            })
+        );
     }
 
     #[test]

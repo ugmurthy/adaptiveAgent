@@ -182,7 +182,7 @@ export class DesktopRuntime {
         return { runId: params.runId, accepted: true };
       }
       case 'interaction/resolveApproval':
-        return this.resolveApproval(request.params!.runId, request.params!.approved);
+        return this.resolveApproval(request.params!.runId, request.params!.approvalId, request.params!.approved);
       case 'interaction/resolveClarification':
         return asJsonValue(await this.requireSdk().agent.resolveClarification(
           asRunId(request.params!.runId),
@@ -418,11 +418,10 @@ export class DesktopRuntime {
     this.write({ jsonrpc: '2.0', method: 'agent/event', params: asJsonValue(event) });
   }
 
-  private async resolveApproval(runId: string, approved: boolean): Promise<JsonValue> {
+  private async resolveApproval(runId: string, approvalId: string, approved: boolean): Promise<JsonValue> {
     const sdk = this.requireSdk();
-    await sdk.agent.resolveApproval(asRunId(runId), approved);
-    if (!approved) return asJsonValue(await sdk.inspect(asRunId(runId)));
-    return { runId, approved: true, resolved: true };
+    await sdk.agent.resolveApproval(asRunId(runId), approvalId, approved);
+    return { runId, approvalId, approved, resolved: true };
   }
 
   private cliCommands(): JsonValue {
@@ -593,9 +592,6 @@ export function validateRestrictedDesktopConfiguration(config: ResolvedAgentSdkC
   if (config.inference.mode !== 'byok') errors.push(`inference.mode must be "byok" (resolved: "${config.inference.mode}")`);
   if (!config.agent.invocationModes.includes('run') || config.agent.defaultInvocationMode !== 'run') {
     errors.push('the selected agent must support run and set defaultInvocationMode to "run"');
-  }
-  if (config.interaction.approvalMode === 'manual') {
-    errors.push('interaction.approvalMode must be "auto" or "reject"; manual approval is not available in the desktop MVP');
   }
   if (config.interaction.approvalMode === 'reject' && config.settings.defaults?.autoApproveAll === true) {
     errors.push('interaction.approvalMode "reject" conflicts with defaults.autoApproveAll true; remove autoApproveAll or set it to false');

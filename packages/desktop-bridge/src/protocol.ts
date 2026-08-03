@@ -140,6 +140,7 @@ export interface SteerParams extends RunIdParams {
 }
 
 export interface ApprovalParams extends RunIdParams {
+  approvalId: string;
   approved: boolean;
 }
 
@@ -328,6 +329,7 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
     case 'interaction/resolveApproval': {
       const value = requiredParams(method, params);
       requiredString(value, 'runId');
+      requiredString(value, 'approvalId');
       if (typeof value.approved !== 'boolean') invalidParams('approved must be a boolean.');
       return;
     }

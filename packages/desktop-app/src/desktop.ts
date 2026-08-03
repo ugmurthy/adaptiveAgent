@@ -24,7 +24,8 @@ export interface DesktopState {
   quitState: 'idle' | 'confirming' | 'draining' | 'approved';
 }
 
-export interface RunSummary { itemId: string; runId: string; status: string; cancelRequested: boolean; occupiesSlot: boolean; }
+export interface PendingApproval { rootRunId:string; approvalRunId:string; approvalId:string; parentRunId?:string; toolName:string; message:string; decisionInFlight:boolean; }
+export interface RunSummary { itemId: string; runId: string; status: string; cancelRequested: boolean; occupiesSlot: boolean; pendingApproval?:PendingApproval; }
 export interface StartedRun { itemId: string; runId: string; }
 export interface ChatMessage { id: string; ordinal: number; role: 'user'|'assistant'; content: string; runId?: string; }
 export interface Chat { itemId:string; title:string; sessionId:string; pinnedAgentId:string; pinnedAgentName:string; pinnedAgentFingerprint:string; messages:ChatMessage[]; readOnlyReason?:string; occupied:boolean; }
@@ -37,6 +38,7 @@ export const reloadSettings = () => invoke<DesktopState>('reload_settings');
 export const startRun = (task: string) => invoke<StartedRun>('start_run', { task });
 export const stopRun = (runId: string) => invoke<void>('stop_run', { runId });
 export const getRunResult = (runId: string) => invoke<unknown | null>('get_run_result', { runId });
+export const resolveApproval = (pending:PendingApproval,approved:boolean) => invoke<void>('resolve_approval',{rootRunId:pending.rootRunId,approvalRunId:pending.approvalRunId,approvalId:pending.approvalId,approved});
 export const createChat = (title:string) => invoke<Chat>('create_chat',{title});
 export const listChats = () => invoke<Chat[]>('list_chats');
 export const loadChat = (itemId:string) => invoke<Chat>('load_chat',{itemId});

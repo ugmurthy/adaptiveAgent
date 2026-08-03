@@ -87,6 +87,17 @@ describe('desktop runtime protocol', () => {
     expect(() => validateRestrictedDesktopConfiguration({ ...config, runtime: { requestedMode: 'sqlite', mode: 'sqlite', autoMigrate: true, sqlitePath: '/exact/runtime.sqlite' } })).not.toThrow();
   });
 
+  it('permits manual approval but rejects interactive clarification', () => {
+    const config = {
+      agent: { id: 'agent-1', name: 'Researcher', invocationModes: ['run'], defaultInvocationMode: 'run' }, settings: {},
+      model: { provider: 'ollama', model: 'test-model' }, inference: { mode: 'byok', tier: 'medium' },
+      runtime: { requestedMode: 'sqlite', mode: 'sqlite', autoMigrate: true, sqlitePath: '/exact/runtime.sqlite' },
+      workspaceRoot: '/workspace', shellCwd: '/workspace', interaction: { approvalMode: 'manual', clarificationMode: 'fail' },
+    } as ResolvedAgentSdkConfig;
+    expect(() => validateRestrictedDesktopConfiguration(config)).not.toThrow();
+    expect(() => validateRestrictedDesktopConfiguration({ ...config, interaction: { ...config.interaction, clarificationMode: 'interactive' } })).toThrow(/clarificationMode must be "fail"/);
+  });
+
   it('requires and negotiates the JSON-RPC protocol handshake', async () => {
     const { runtime } = createRuntime();
     await expect(runtime.handleRpc(request({ id: 1, method: 'runtime/info' }))).rejects.toMatchObject({

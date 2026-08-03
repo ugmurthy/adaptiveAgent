@@ -10,6 +10,7 @@
     quitWait,
     startRun,
     stopRun,
+    resolveApproval,
     subscribe,
     type DesktopState,
     type ProgressEvent,
@@ -114,6 +115,13 @@
     await refresh();
   }
 
+  async function decide(run: import('./desktop').RunSummary, approved:boolean) {
+    if (!run.pendingApproval) return;
+    controlPending=true; finalError='';
+    try { await resolveApproval(run.pendingApproval,approved); } catch(error) { finalError=String(error); }
+    controlPending=false; await refresh();
+  }
+
   async function selectRun(runId: string) {
     selectedRunId = runId;
     finalValue = resultsByRun[runId]?.result;
@@ -188,6 +196,7 @@
             <div>
               <button class:active={selectedRunId === run.runId} on:click={() => selectRun(run.runId)}>{run.runId.slice(0, 8)} · {run.status}</button>
               {#if run.occupiesSlot}<button disabled={controlPending} on:click={() => stop(run.runId)}>{run.cancelRequested ? 'Retry stop' : 'Stop'}</button>{/if}
+              {#if run.pendingApproval}<div class="alert"><strong>{run.pendingApproval.toolName}</strong><p>{run.pendingApproval.message}</p><button disabled={controlPending || run.pendingApproval.decisionInFlight} on:click={()=>decide(run,true)}>Approve</button><button disabled={controlPending || run.pendingApproval.decisionInFlight} on:click={()=>decide(run,false)}>Reject</button></div>{/if}
             </div>
           {/each}
         </div>
@@ -211,6 +220,7 @@
         <div class="progress" aria-live="polite">{#each selectedChat.messages as message}<div><strong>{message.role}</strong><span>{message.content}</span></div>{/each}</div>
         <label for="chat-message">Message</label><textarea id="chat-message" bind:value={chatMessage} disabled={!!selectedChat.readOnlyReason || selectedChat.occupied || desktop.quitState!=='idle'}></textarea>
         <div class="actions"><button class="primary" disabled={!chatMessage.trim() || !!selectedChat.readOnlyReason || selectedChat.occupied || startPending || desktop.occupiedSlotCount>=desktop.capacity} on:click={sendMessage}>Send</button><span>{selectedChat.occupied?'Turn in progress':'Ready'}</span></div>
+        {#each desktop.runs.filter(run=>run.itemId===selectedChat?.itemId && run.pendingApproval) as run}<div class="alert"><strong>{run.pendingApproval!.toolName}</strong><p>{run.pendingApproval!.message}</p><button disabled={controlPending || run.pendingApproval!.decisionInFlight} on:click={()=>decide(run,true)}>Approve</button><button disabled={controlPending || run.pendingApproval!.decisionInFlight} on:click={()=>decide(run,false)}>Reject</button></div>{/each}
       {/if}
       {#if finalError}<div class="result error"><pre>{finalError}</pre></div>{/if}
     </section>

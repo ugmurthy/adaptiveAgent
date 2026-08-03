@@ -117,6 +117,12 @@ describe('desktop bridge protocol', () => {
     }))).toThrowError(expect.objectContaining<Partial<DesktopProtocolError>>({ code: 'INVALID_PARAMS' }));
   });
 
+  it('requires the composite approval identity', () => {
+    const envelope = (params: object) => JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'interaction/resolveApproval', params });
+    expect(parseDesktopRpcRequest(envelope({ runId: 'child', approvalId: 'child:call', approved: true }))).toMatchObject({ method: 'interaction/resolveApproval' });
+    expect(() => parseDesktopRpcRequest(envelope({ runId: 'child', approved: true }))).toThrowError(expect.objectContaining<Partial<DesktopProtocolError>>({ code: 'INVALID_PARAMS' }));
+  });
+
   it('recovers JSON-RPC string and numeric ids without coercion', () => {
     expect(rpcIdFromUnknownLine('{"jsonrpc":"2.0","id":"rpc-1"}')).toBe('rpc-1');
     expect(rpcIdFromUnknownLine('{"jsonrpc":"2.0","id":42}')).toBe(42);

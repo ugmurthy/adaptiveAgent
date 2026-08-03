@@ -120,6 +120,14 @@ export class DelegationError extends Error {
   }
 }
 
+/** Internal control-flow signal used to preserve a delegated approval pause. */
+export class DelegatedApprovalRequiredError extends Error {
+  constructor(readonly result: Extract<RunResult, { status: 'approval_requested' }>) {
+    super(result.message);
+    this.name = 'DelegatedApprovalRequiredError';
+  }
+}
+
 export class DelegationExecutor {
   private readonly hostToolsByName = new Map<string, ToolDefinition>();
   private readonly delegatesByName = new Map<string, DelegateDefinition>();
@@ -276,6 +284,10 @@ export class DelegationExecutor {
         resultBytes: approximateSerializedByteLength(childResult),
       }),
     });
+
+    if (childResult.status === 'approval_requested' && this.policy.childRunsMayRequestApproval) {
+      throw new DelegatedApprovalRequiredError(childResult);
+    }
 
     await this.materializeChildTerminalState(childRunId, childResult);
 
@@ -857,7 +869,7 @@ export class DelegationExecutor {
       stepId,
       type: 'delegate.spawned',
       schemaVersion: 1,
-      payload,
+      payload: compactJsonObject({ ...payload }),
     };
   }
 
@@ -866,13 +878,13 @@ export class DelegationExecutor {
       runId: childRun.id,
       type: 'run.created',
       schemaVersion: 1,
-      payload: {
+      payload: compactJsonObject({
         rootRunId: childRun.rootRunId,
         parentRunId: childRun.parentRunId,
         parentStepId: childRun.parentStepId,
         delegateName: childRun.delegateName,
         delegationDepth: childRun.delegationDepth,
-      },
+      }),
     };
   }
 
@@ -1121,21 +1133,9 @@ export class DelegationExecutor {
     });
   }
 
-  private async emitRunEvent(event: {
-    runId: UUID;
-    type:
-      | 'run.created'
-      | 'run.status_changed'
-      | 'run.completed'
-      | 'run.failed'
-      | 'snapshot.created'
-      | 'delegate.spawned'
-      | 'tool.completed'
-      | 'tool.failed';
-    schemaVersion: number;
-    payload: JsonValue;
-    stepId?: string;
-  }): Promise<void> {
+  private async emitRunEvent(
+    event: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>,
+  ): Promise<void> {
     if (!this.options.eventSink) {
       return;
     }

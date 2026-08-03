@@ -19,7 +19,26 @@ create table deletion_jobs (id text primary key, item_id text, root_run_id text,
 ) ,(
     4,
     "create unique index chat_messages_assistant_run on chat_messages(run_id) where role='assistant' and run_id is not null;",
+), (
+    5,
+    "create table pending_approvals (root_run_id text primary key references workbench_runs(run_id) on delete cascade, approval_run_id text not null, approval_id text not null, parent_run_id text, tool_name text not null, message text not null, decision_in_flight integer not null default 0, decision integer, operation_state text not null default 'awaiting_decision' check(operation_state in ('awaiting_decision','resolving','resume_pending','rejection_pending')), updated_at text not null);",
 )];
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingApproval {
+    pub root_run_id: String,
+    pub approval_run_id: String,
+    pub approval_id: String,
+    pub parent_run_id: Option<String>,
+    pub tool_name: String,
+    pub message: String,
+    pub decision_in_flight: bool,
+    #[serde(skip)]
+    pub decision: Option<bool>,
+    #[serde(skip)]
+    pub operation_state: String,
+}
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -396,6 +415,75 @@ impl WorkbenchDb {
             .map_err(|e| e.to_string())?;
         Ok(rows)
     }
+
+    pub fn save_pending_approval(&self, value: &PendingApproval) -> Result<(), String> {
+        self.connection.lock().unwrap().execute("insert into pending_approvals(root_run_id,approval_run_id,approval_id,parent_run_id,tool_name,message,decision_in_flight,decision,operation_state,updated_at) values(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) on conflict(root_run_id) do update set approval_run_id=excluded.approval_run_id,approval_id=excluded.approval_id,parent_run_id=excluded.parent_run_id,tool_name=excluded.tool_name,message=excluded.message,decision_in_flight=case when pending_approvals.approval_id=excluded.approval_id then pending_approvals.decision_in_flight else excluded.decision_in_flight end,decision=case when pending_approvals.approval_id=excluded.approval_id then pending_approvals.decision else excluded.decision end,operation_state=case when pending_approvals.approval_id=excluded.approval_id then pending_approvals.operation_state else excluded.operation_state end,updated_at=excluded.updated_at", params![value.root_run_id,value.approval_run_id,value.approval_id,value.parent_run_id,value.tool_name,value.message,value.decision_in_flight,value.decision,value.operation_state,now()]).map_err(|e|e.to_string())?;
+        Ok(())
+    }
+
+    pub fn load_pending_approvals(&self) -> Result<Vec<PendingApproval>, String> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement=connection.prepare("select root_run_id,approval_run_id,approval_id,parent_run_id,tool_name,message,decision_in_flight,decision,operation_state from pending_approvals order by root_run_id").map_err(|e|e.to_string())?;
+        let rows = statement
+            .query_map([], |r| {
+                Ok(PendingApproval {
+                    root_run_id: r.get(0)?,
+                    approval_run_id: r.get(1)?,
+                    approval_id: r.get(2)?,
+                    parent_run_id: r.get(3)?,
+                    tool_name: r.get(4)?,
+                    message: r.get(5)?,
+                    decision_in_flight: r.get(6)?,
+                    decision: r.get(7)?,
+                    operation_state: r.get(8)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
+    pub fn begin_approval_decision(
+        &self,
+        root_run_id: &str,
+        approval_run_id: &str,
+        approval_id: &str,
+        approved: bool,
+    ) -> Result<bool, String> {
+        let changed=self.connection.lock().unwrap().execute("update pending_approvals set decision_in_flight=1,decision=?4,operation_state='resolving',updated_at=?5 where root_run_id=?1 and approval_run_id=?2 and approval_id=?3 and operation_state='awaiting_decision'",params![root_run_id,approval_run_id,approval_id,approved,now()]).map_err(|e|e.to_string())?;
+        Ok(changed == 1)
+    }
+    pub fn mark_approval_resolved(
+        &self,
+        root_run_id: &str,
+        approval_run_id: &str,
+        approval_id: &str,
+        approved: bool,
+    ) -> Result<(), String> {
+        let state = if approved {
+            "resume_pending"
+        } else {
+            "rejection_pending"
+        };
+        self.connection.lock().unwrap().execute("update pending_approvals set operation_state=?4,updated_at=?5 where root_run_id=?1 and approval_run_id=?2 and approval_id=?3 and operation_state='resolving'",params![root_run_id,approval_run_id,approval_id,state,now()]).map_err(|e|e.to_string())?;
+        Ok(())
+    }
+    pub fn clear_pending_approval(
+        &self,
+        root_run_id: &str,
+        approval_id: Option<&str>,
+    ) -> Result<(), String> {
+        self.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "delete from pending_approvals where root_run_id=?1 and (?2 is null or approval_id=?2)",
+                params![root_run_id, approval_id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
 }
 
 fn load_messages(connection: &Connection, item_id: &str) -> Result<Vec<ChatMessage>, String> {
@@ -462,6 +550,69 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+    #[test]
+    fn pending_approval_survives_reopen_and_decision_guard_is_atomic() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        {
+            let db = WorkbenchDb::open(file.path()).unwrap();
+            db.reserve_task(&reservation()).unwrap();
+            db.save_pending_approval(&PendingApproval {
+                root_run_id: "run".into(),
+                approval_run_id: "child".into(),
+                approval_id: "child:call".into(),
+                parent_run_id: Some("run".into()),
+                tool_name: "shell".into(),
+                message: "Allow?".into(),
+                decision_in_flight: false,
+                decision: None,
+                operation_state: "awaiting_decision".into(),
+            })
+            .unwrap();
+        }
+        let db = WorkbenchDb::open(file.path()).unwrap();
+        assert_eq!(
+            db.load_pending_approvals().unwrap()[0].approval_run_id,
+            "child"
+        );
+        assert!(db
+            .begin_approval_decision("run", "child", "child:call", true)
+            .unwrap());
+        assert!(!db
+            .begin_approval_decision("run", "child", "child:call", true)
+            .unwrap());
+        assert!(!db
+            .begin_approval_decision("run", "wrong", "child:call", true)
+            .unwrap());
+        let pending = &db.load_pending_approvals().unwrap()[0];
+        assert_eq!(pending.decision, Some(true));
+        assert_eq!(pending.operation_state, "resolving");
+        db.save_pending_approval(&PendingApproval {
+            root_run_id: "run".into(),
+            approval_run_id: "child".into(),
+            approval_id: "child:call".into(),
+            parent_run_id: Some("run".into()),
+            tool_name: "shell".into(),
+            message: "Allow?".into(),
+            decision_in_flight: false,
+            decision: None,
+            operation_state: "awaiting_decision".into(),
+        })
+        .unwrap();
+        let pending = &db.load_pending_approvals().unwrap()[0];
+        assert!(pending.decision_in_flight);
+        assert_eq!(pending.decision, Some(true));
+        assert_eq!(pending.operation_state, "resolving");
+        db.mark_approval_resolved("run", "child", "child:call", true)
+            .unwrap();
+        assert_eq!(
+            WorkbenchDb::open(file.path())
+                .unwrap()
+                .load_pending_approvals()
+                .unwrap()[0]
+                .operation_state,
+            "resume_pending"
         );
     }
     #[test]

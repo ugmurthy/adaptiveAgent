@@ -7,6 +7,7 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 
 import {
+  DelegatedApprovalRequiredError,
   DelegationError,
   DelegationExecutor,
   validateDelegateToolInput,
@@ -119,6 +120,7 @@ interface ExecutionState {
   outputSchema?: JsonSchema;
   pendingToolCalls: PendingToolCallState[];
   approvedToolCallIds: string[];
+  approvalDecisions: Record<string, boolean>;
   waitingOnChildRunId?: UUID;
   toolBudgetUsage: Record<string, ToolBudgetUsage>;
   exhaustedToolBudgetGroups: Record<string, true>;
@@ -601,43 +603,13 @@ export class AdaptiveAgent {
         });
 
         if ((tool.requiresApproval || step.requiresApproval) && !this.options.defaults?.autoApproveAll) {
-          currentRun = await this.transitionRun(currentRun, 'awaiting_approval');
-          currentExecution = await planStore.updateExecution(currentExecution.id, {
-            status: 'awaiting_approval',
-            currentStepId: step.id,
-            currentStepIndex: index,
-          });
-          const approvalInput = resolvePlanTemplate(step.inputTemplate, request.input, request.context, resolvedStepOutputs);
-          const eventInput = captureToolInputForLog(tool, approvalInput, this.defaultCaptureMode);
-
-          this.logLifecycle('warn', 'approval.requested', {
-            ...runLogBindings(currentRun),
-            planExecutionId: currentExecution.id,
-            stepId: step.id,
-            toolName: tool.name,
-            input: eventInput,
-          });
-
-          await this.emit({
-            runId: currentRun.id,
-            planExecutionId: currentExecution.id,
-            stepId: step.id,
-            type: 'approval.requested',
-            schemaVersion: 1,
-            payload: {
-              toolName: tool.name,
-              planId: plan.id,
-              planExecutionId: currentExecution.id,
-              ...(eventInput === undefined ? {} : { input: eventInput }),
-            },
-          });
-
-          return {
-            status: 'approval_requested',
-            runId: currentRun.id,
-            message: `Approval required before invoking ${tool.name}`,
-            toolName: tool.name,
-          };
+          return this.failPlanExecution(
+            currentRun,
+            currentExecution,
+            stepsUsed,
+            `Persisted-plan manual approval is unsupported for step ${step.id} (${tool.name}); replan without a manual approval boundary`,
+            'REPLAN_REQUIRED',
+          );
         }
 
         const input = resolvePlanTemplate(step.inputTemplate, request.input, request.context, resolvedStepOutputs);
@@ -1067,35 +1039,54 @@ export class AdaptiveAgent {
     return currentRun;
   }
 
-  async resolveApproval(runId: UUID, approved: boolean): Promise<void> {
+  async resolveApproval(runId: UUID, approvalId: string, approved: boolean): Promise<void> {
     const run = await this.options.runStore.getRun(runId);
     if (!run) {
       throw new Error(`Run ${runId} does not exist`);
+    }
+
+    const state = await this.loadExecutionState(run);
+    const priorDecision = state.approvalDecisions[approvalId];
+    if (priorDecision !== undefined) {
+      if (priorDecision !== approved) {
+        throw new Error(`Approval ${approvalId} was already resolved with a conflicting decision`);
+      }
+      if (!approved && run.parentRunId) {
+        await this.cascadeFromRun(run);
+      }
+      return;
     }
 
     if (run.status !== 'awaiting_approval') {
       throw new Error(`Run ${runId} is not awaiting approval`);
     }
 
-    const state = await this.loadExecutionState(run);
     const pendingToolCall = state.pendingToolCalls[0];
     if (!pendingToolCall) {
       throw new Error(
         `Run ${runId} is awaiting approval, but no pending tool call was found. Persisted plan approval resolution is not implemented yet.`,
       );
     }
+    const expectedApprovalId = approvalIdFor(run, pendingToolCall);
+    if (expectedApprovalId !== approvalId) {
+      throw new Error(`Run ${runId} is awaiting approval ${expectedApprovalId}, not ${approvalId}`);
+    }
 
-    await this.emit({
+    const resolvedEvent: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'> = {
       runId: run.id,
       stepId: pendingToolCall.stepId,
+      toolCallId: pendingToolCall.id,
       type: 'approval.resolved',
       schemaVersion: 1,
       payload: {
         toolName: pendingToolCall.name,
         ...(pendingToolCall.assistantContent === undefined ? {} : { assistantContent: pendingToolCall.assistantContent }),
         approved,
+        toolCallId: pendingToolCall.id,
+        approvalId,
+        ...runLineagePayload(run),
       },
-    });
+    };
 
     this.logLifecycle('info', 'approval.resolved', {
       ...runLogBindings(run),
@@ -1104,14 +1095,27 @@ export class AdaptiveAgent {
       approved,
     });
 
+    state.approvalDecisions[approvalId] = approved;
     if (!approved) {
-      await this.failRun(run, state, `Approval rejected for ${pendingToolCall.name}`, 'APPROVAL_REJECTED');
+      try {
+        await this.persistApprovalRejection(run, state, pendingToolCall, resolvedEvent);
+      } catch (error) {
+        if (await this.classifyConcurrentApproval(runId, approvalId, approved)) return;
+        throw error;
+      }
+      if (run.parentRunId) {
+        await this.cascadeFromRun(run);
+      }
       return;
     }
 
     state.approvedToolCallIds = addApprovedToolCallId(state.approvedToolCallIds, pendingToolCall.id);
-    const resumedRun = await this.transitionRun(run, 'running');
-    await this.saveExecutionSnapshot(resumedRun, state, resumedRun.status);
+    try {
+      await this.persistApprovalResolution(run, state, resolvedEvent);
+    } catch (error) {
+      if (await this.classifyConcurrentApproval(runId, approvalId, approved)) return;
+      throw error;
+    }
   }
 
   async resolveClarification(runId: UUID, message: string): Promise<RunResult> {
@@ -1169,28 +1173,142 @@ export class AdaptiveAgent {
       stepId: run.currentStepId,
     });
 
+    const targetAgent = this.createAgentForChildRun(run);
+    const result = await targetAgent.resumeSingleRun(run.id);
+    if (result.status === 'approval_requested') return result;
+    return this.cascadeFromRun(await this.refreshRun(run.id), result);
+  }
+
+  private async resumeSingleRun(runId: UUID): Promise<RunResult> {
+    const run = await this.refreshRun(runId);
     const state = await this.loadExecutionState(run);
-    if (TERMINAL_RUN_STATUSES.has(run.status)) {
-      return this.resultFromStoredRun(run, state.stepsUsed);
-    }
-
-    if (run.status === 'awaiting_approval') {
-      const pendingTool = state.pendingToolCalls[0];
-      return {
-        status: 'approval_requested',
-        runId: run.id,
-        message: pendingTool ? `Approval required before invoking ${pendingTool.name}` : 'Approval required',
-        toolName: pendingTool?.name ?? 'unknown',
-      };
-    }
-
+    if (TERMINAL_RUN_STATUSES.has(run.status)) return this.resultFromStoredRun(run, state.stepsUsed);
+    if (run.status === 'awaiting_approval') return approvalResult(run, state.pendingToolCalls[0]);
     await this.acquireLeaseOrThrow(run.id);
-
     try {
       return await this.continueRunFromState(await this.refreshRun(run.id), state, { retryFailedChild: true });
     } finally {
       await this.releaseLeaseQuietly(run.id);
     }
+  }
+
+  private async cascadeFromRun(run: AgentRun, result?: RunResult): Promise<RunResult> {
+    let current = run;
+    let currentResult = result ?? this.resultFromStoredRun(current, (await this.loadExecutionState(current)).stepsUsed);
+    while (current.parentRunId) {
+      const parent = await this.refreshRun(current.parentRunId);
+      const parentAgent = this.createAgentForChildRun(parent);
+      currentResult = await parentAgent.resumeSingleRun(parent.id);
+      if (currentResult.status === 'approval_requested') return currentResult;
+      current = await this.refreshRun(parent.id);
+    }
+    return currentResult;
+  }
+
+  private async persistApprovalRequest(
+    run: AgentRun,
+    state: ExecutionState,
+    requestedEvent: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>,
+  ): Promise<void> {
+    const transactionStore = this.options.transactionStore;
+    if (transactionStore?.eventStore && transactionStore.snapshotStore) {
+      const downstream: Array<Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>> = [];
+      await transactionStore.runInTransaction(async (stores) => {
+        if (!stores.eventStore || !stores.snapshotStore) throw new Error('Transactional approval stores unavailable');
+        const awaiting = await stores.runStore.updateRun(run.id, { status: 'awaiting_approval' }, run.version);
+        const statusEvent = runStatusChangedEvent(run, awaiting, 'awaiting_approval');
+        await stores.eventStore.append(statusEvent);
+        await stores.eventStore.append(requestedEvent);
+        const snapshotEvent = await this.saveExecutionSnapshotWithStores(stores, awaiting, state, awaiting.status);
+        downstream.push(statusEvent, requestedEvent, ...(snapshotEvent ? [snapshotEvent] : []));
+      });
+      await this.emitDownstreamOnly(downstream);
+      return;
+    }
+
+    const awaiting = await this.options.runStore.updateRun(run.id, { status: 'awaiting_approval' }, run.version);
+    await this.emit(runStatusChangedEvent(run, awaiting, 'awaiting_approval'));
+    await this.emit(requestedEvent);
+    await this.saveExecutionSnapshot(awaiting, state, awaiting.status);
+  }
+
+  private async persistApprovalResolution(
+    run: AgentRun,
+    state: ExecutionState,
+    event: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>,
+  ): Promise<void> {
+    const transactionStore = this.options.transactionStore;
+    if (transactionStore?.eventStore && transactionStore.snapshotStore) {
+      const snapshotEvents: Array<Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>> = [];
+      await transactionStore.runInTransaction(async (stores) => {
+        if (!stores.eventStore || !stores.snapshotStore) throw new Error('Transactional approval stores unavailable');
+        const resumed = await stores.runStore.updateRun(run.id, { status: 'running' }, run.version);
+        const statusEvent = runStatusChangedEvent(run, resumed, 'running');
+        await stores.eventStore.append(statusEvent);
+        await stores.eventStore.append(event);
+        const snapshotEvent = await this.saveExecutionSnapshotWithStores(stores, resumed, state, resumed.status);
+        snapshotEvents.push(statusEvent, event, ...(snapshotEvent ? [snapshotEvent] : []));
+      });
+      await this.emitDownstreamOnly(snapshotEvents);
+      return;
+    }
+    const resumed = await this.options.runStore.updateRun(run.id, { status: 'running' }, run.version);
+    await this.emit(runStatusChangedEvent(run, resumed, 'running'));
+    await this.emit(event);
+    await this.saveExecutionSnapshot(resumed, state, resumed.status);
+  }
+
+  private async persistApprovalRejection(
+    run: AgentRun,
+    state: ExecutionState,
+    pending: PendingToolCallState,
+    resolvedEvent: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>,
+  ): Promise<void> {
+    const error = `Approval rejected for ${pending.name}`;
+    const failedEvent = (failed: AgentRun): Omit<AgentEvent, 'id' | 'seq' | 'createdAt'> => ({
+      runId: failed.id, stepId: pending.stepId, type: 'run.failed', schemaVersion: 1,
+      payload: { error, code: 'APPROVAL_REJECTED', ...runLineagePayload(failed) },
+    });
+    const transactionStore = this.options.transactionStore;
+    if (transactionStore?.eventStore && transactionStore.snapshotStore) {
+      const downstream: Array<Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>> = [];
+      await transactionStore.runInTransaction(async (stores) => {
+        if (!stores.eventStore || !stores.snapshotStore) throw new Error('Transactional approval stores unavailable');
+        const failed = await stores.runStore.updateRun(run.id, { status: 'failed', errorCode: 'APPROVAL_REJECTED', errorMessage: error }, run.version);
+        await stores.eventStore.append(resolvedEvent);
+        const snapshotEvent = await this.saveExecutionSnapshotWithStores(stores, failed, state, failed.status);
+        const terminalEvent = failedEvent(failed);
+        await stores.eventStore.append(terminalEvent);
+        downstream.push(resolvedEvent, ...(snapshotEvent ? [snapshotEvent] : []), terminalEvent);
+      });
+      await this.emitDownstreamOnly(downstream);
+      return;
+    }
+    const failed = await this.options.runStore.updateRun(run.id, {
+      status: 'failed', errorCode: 'APPROVAL_REJECTED', errorMessage: error,
+    }, run.version);
+    await this.emit(resolvedEvent);
+    await this.saveExecutionSnapshot(failed, state, failed.status);
+    await this.emit(failedEvent(failed));
+  }
+
+  private async classifyConcurrentApproval(runId: UUID, approvalId: string, approved: boolean): Promise<boolean> {
+    // A nontransactional winner has completed its run CAS but may still be writing
+    // the matching snapshot. Yield briefly so losers classify against durable state.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const latest = await this.options.runStore.getRun(runId);
+      if (!latest) return false;
+      const latestState = await this.loadExecutionState(latest);
+      const persisted = latestState.approvalDecisions[approvalId];
+      if (persisted !== undefined) {
+        if (persisted !== approved) {
+          throw new Error(`Approval ${approvalId} was already resolved with a conflicting decision`);
+        }
+        return true;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    return false;
   }
 
   async retry(runId: UUID): Promise<RunResult> {
@@ -1239,7 +1357,7 @@ export class AdaptiveAgent {
             retryAttempts,
             lastRetryFailureKind: retryability.failureKind,
           },
-        } as Partial<AgentRun>,
+        } as unknown as Partial<AgentRun>,
         currentRun.version,
       );
 
@@ -1633,6 +1751,9 @@ export class AdaptiveAgent {
           linkedChild,
         );
       } catch (error) {
+        if (error instanceof DelegatedApprovalRequiredError) {
+          return error.result;
+        }
         if (error instanceof DelegationError) {
           return this.failRun(currentRun, state, error.message, error.code);
         }
@@ -1720,12 +1841,11 @@ export class AdaptiveAgent {
           toolExecutionResult = await this.executePendingToolCall(currentRun, state, pendingToolCall);
         } catch (error) {
           if (error instanceof ApprovalRequiredError) {
-            return {
-              status: 'approval_requested',
-              runId: currentRun.id,
-              message: error.message,
-              toolName: error.toolName,
-            };
+            return approvalResult(currentRun, state.pendingToolCalls[0]);
+          }
+
+          if (error instanceof DelegatedApprovalRequiredError) {
+            return error.result;
           }
 
           if (error instanceof DelegationError) {
@@ -2459,27 +2579,30 @@ export class AdaptiveAgent {
     }
 
     if (tool.requiresApproval && !this.options.defaults?.autoApproveAll && !state.approvedToolCallIds.includes(pendingToolCall.id)) {
-      const awaitingApprovalRun = await this.transitionRun(run, 'awaiting_approval');
       const eventInput = captureToolInputForLog(tool, pendingToolCall.input, this.defaultCaptureMode);
+      const approvalId = approvalIdFor(run, pendingToolCall);
       this.logLifecycle('warn', 'approval.requested', {
-        ...runLogBindings(awaitingApprovalRun),
+        ...runLogBindings(run),
         stepId: pendingToolCall.stepId,
         toolName: tool.name,
         input: eventInput,
       });
-      await this.emit({
+      const requestedEvent: Omit<AgentEvent, 'id' | 'seq' | 'createdAt'> = {
         runId: run.id,
         stepId: pendingToolCall.stepId,
+        toolCallId: pendingToolCall.id,
         type: 'approval.requested',
         schemaVersion: 1,
         payload: {
           toolName: tool.name,
+          toolCallId: pendingToolCall.id,
+          approvalId,
+          ...runLineagePayload(run),
           ...(pendingToolCall.assistantContent === undefined ? {} : { assistantContent: pendingToolCall.assistantContent }),
           ...(eventInput === undefined ? {} : { input: eventInput }),
         },
-      });
-
-      await this.saveExecutionSnapshot(awaitingApprovalRun, state, 'awaiting_approval');
+      };
+      await this.persistApprovalRequest(run, state, requestedEvent);
       throw new ApprovalRequiredError(tool.name);
     }
 
@@ -2632,7 +2755,7 @@ export class AdaptiveAgent {
         },
       };
     } catch (error) {
-      if (error instanceof ApprovalRequiredError) {
+      if (error instanceof ApprovalRequiredError || error instanceof DelegatedApprovalRequiredError) {
         throw error;
       }
 
@@ -2881,7 +3004,10 @@ export class AdaptiveAgent {
 
       if (!TERMINAL_RUN_STATUSES.has(childRun.status)) {
         const childAgent = this.createAgentForChildRun(childRun);
-        await childAgent.resume(childRun.id);
+        const childResult = await childAgent.resumeSingleRun(childRun.id);
+        if (childResult.status === 'approval_requested') {
+          throw new DelegatedApprovalRequiredError(childResult);
+        }
       } else if (retryFailedChild && childRun.status === 'failed') {
         const childAgent = this.createAgentForChildRun(childRun);
         const childState = await childAgent.loadExecutionState(childRun);
@@ -3240,6 +3366,7 @@ export class AdaptiveAgent {
       stepsUsed: 0,
       pendingToolCalls: [],
       approvedToolCallIds: [],
+      approvalDecisions: {},
       toolBudgetUsage: {},
       exhaustedToolBudgetGroups: {},
       pendingRuntimeMessages: [],
@@ -3412,7 +3539,7 @@ export class AdaptiveAgent {
         return message;
       }
       const content = await this.normalizeFileInputsForReadFile(message.content);
-      return content === message.content ? message : { ...message, content };
+      return !content || content === message.content ? message : { ...message, content };
     }));
     return normalized;
   }
@@ -5412,7 +5539,7 @@ async function materializeUrlFileInput(file: FileInput): Promise<string> {
   await mkdir(tempDir, { recursive: true });
   const extension = inferMaterializedFileExtension(file, response.headers.get('content-type'));
   const path = join(tempDir, `${Date.now()}-${crypto.randomUUID()}${extension}`);
-  await pipeline(Readable.fromWeb(response.body), createWriteStream(path));
+  await pipeline(Readable.fromWeb(response.body as never), createWriteStream(path));
   return path;
 }
 
@@ -5520,6 +5647,10 @@ function serializeExecutionState(state: ExecutionState): JsonObject {
     serialized.approvedToolCallIds = state.approvedToolCallIds;
   }
 
+  if (Object.keys(state.approvalDecisions).length > 0) {
+    serialized.approvalDecisions = state.approvalDecisions as unknown as JsonValue;
+  }
+
   if (state.waitingOnChildRunId) {
     serialized.waitingOnChildRunId = state.waitingOnChildRunId;
   }
@@ -5569,6 +5700,7 @@ function deserializeExecutionState(value: JsonValue): ExecutionState | null {
     outputSchema: isJsonObject(value.outputSchema) ? (value.outputSchema as unknown as JsonSchema) : undefined,
     pendingToolCalls,
     approvedToolCallIds: deserializeApprovedToolCallIds(value.approvedToolCallIds),
+    approvalDecisions: deserializeApprovalDecisions(value.approvalDecisions),
     waitingOnChildRunId: typeof value.waitingOnChildRunId === 'string' ? value.waitingOnChildRunId : undefined,
     toolBudgetUsage: deserializeToolBudgetUsage(value.toolBudgetUsage),
     exhaustedToolBudgetGroups: deserializeExhaustedToolBudgetGroups(value.exhaustedToolBudgetGroups),
@@ -5576,6 +5708,15 @@ function deserializeExecutionState(value: JsonValue): ExecutionState | null {
     invalidToolCallRepairAttempts: deserializeInvalidToolCallRepairAttempts(value.invalidToolCallRepairAttempts),
     visibleToolNames: deserializeStringArray(value.visibleToolNames),
   };
+}
+
+function deserializeApprovalDecisions(value: JsonValue | undefined): Record<string, boolean> {
+  if (!isJsonObject(value)) return {};
+  const decisions: Record<string, boolean> = {};
+  for (const [id, decision] of Object.entries(value)) {
+    if (typeof decision === 'boolean') decisions[id] = decision;
+  }
+  return decisions;
 }
 
 function deserializeStringArray(value: JsonValue | undefined): string[] | undefined {
@@ -5821,21 +5962,23 @@ function isAudioInput(value: unknown): boolean {
 }
 
 function isFileInputSource(value: unknown): boolean {
-  if (!isJsonObject(value)) {
+  if (!isJsonObject(value as JsonValue | undefined)) {
     return false;
   }
-  if (value.kind === 'path') return typeof value.path === 'string' && value.path.trim().length > 0;
-  if (value.kind === 'url') return typeof value.url === 'string' && isHttpUrl(value.url);
-  if (value.kind === 'file_id') return typeof value.fileId === 'string' && value.fileId.trim().length > 0;
+  const source = value as Record<string, unknown>;
+  if (source.kind === 'path') return typeof source.path === 'string' && source.path.trim().length > 0;
+  if (source.kind === 'url') return typeof source.url === 'string' && isHttpUrl(source.url);
+  if (source.kind === 'file_id') return typeof source.fileId === 'string' && source.fileId.trim().length > 0;
   return false;
 }
 
 function isAudioInputSource(value: unknown): boolean {
-  if (!isJsonObject(value)) {
+  if (!isJsonObject(value as JsonValue | undefined)) {
     return false;
   }
-  if (value.kind === 'data') return typeof value.data === 'string' && value.data.trim().length > 0 && !value.data.startsWith('data:');
-  return isFileInputSource(value) || value.kind === 'url';
+  const source = value as Record<string, unknown>;
+  if (source.kind === 'data') return typeof source.data === 'string' && source.data.trim().length > 0 && !source.data.startsWith('data:');
+  return isFileInputSource(value) || source.kind === 'url';
 }
 
 function isHttpUrl(value: string): boolean {
@@ -6173,6 +6316,39 @@ function runLineagePayload(
     delegateName: run.delegateName,
     delegationDepth: run.delegationDepth,
   });
+}
+
+function approvalResult(
+  run: AgentRun,
+  pendingToolCall: PendingToolCallState | undefined,
+): Extract<RunResult, { status: 'approval_requested' }> {
+  return {
+    status: 'approval_requested',
+    runId: run.id,
+    approvalId: pendingToolCall ? approvalIdFor(run, pendingToolCall) : 'unknown',
+    rootRunId: run.rootRunId,
+    ...(run.parentRunId ? { parentRunId: run.parentRunId } : {}),
+    message: pendingToolCall ? `Approval required before invoking ${pendingToolCall.name}` : 'Approval required',
+    toolName: pendingToolCall?.name ?? 'unknown',
+  };
+}
+
+function approvalIdFor(run: AgentRun, pending: PendingToolCallState): string {
+  return `approval:${run.id}:${pending.stepId}:${pending.id}`;
+}
+
+function runStatusChangedEvent(
+  from: AgentRun,
+  to: AgentRun,
+  toStatus: RunStatus,
+): Omit<AgentEvent, 'id' | 'seq' | 'createdAt'> {
+  return {
+    runId: from.id,
+    stepId: to.currentStepId,
+    type: 'run.status_changed',
+    schemaVersion: 1,
+    payload: { fromStatus: from.status, toStatus },
+  };
 }
 
 function runMetadataEventPayload(metadata: Record<string, JsonValue> | undefined): JsonObject {

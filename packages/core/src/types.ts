@@ -1147,6 +1147,9 @@ export type RunResult<T extends JsonValue = JsonValue> =
   | {
       status: 'approval_requested';
       runId: UUID;
+      approvalId: string;
+      rootRunId: UUID;
+      parentRunId?: UUID;
       message: string;
       toolName: string;
     };

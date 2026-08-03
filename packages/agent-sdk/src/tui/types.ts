@@ -46,6 +46,7 @@ export interface LiveAgentEventSummary {
 
 export interface ApprovalInfo {
   runId: string;
+  approvalId: string;
   toolName?: string;
   reason?: string;
 }

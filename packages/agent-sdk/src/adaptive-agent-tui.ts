@@ -261,7 +261,7 @@ async function runTui(sdkOptions: AgentSdkOptions, state: TuiClientState, cli: T
     }
     if (result.status === 'approval_requested') {
       state.pendingApprovalRunId = result.runId;
-      showApprovalModal({ runId: result.runId, toolName: result.toolName, reason: result.message });
+      showApprovalModal({ runId: result.runId, approvalId: result.approvalId, toolName: result.toolName, reason: result.message });
       invalidate();
       return;
     }
@@ -303,7 +303,7 @@ async function runTui(sdkOptions: AgentSdkOptions, state: TuiClientState, cli: T
       closeModal();
       state.pendingApprovalRunId = undefined;
       runTask('approval', async () => {
-        await sdk!.agent.resolveApproval(approvalInfo.runId, approved);
+        await sdk!.agent.resolveApproval(approvalInfo.runId, approvalInfo.approvalId, approved);
         return sdk!.resumeRaw(approvalInfo.runId);
       });
     };
