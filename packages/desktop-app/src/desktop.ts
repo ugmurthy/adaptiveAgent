@@ -16,6 +16,9 @@ export interface DesktopState {
   configuration?: ResolvedConfiguration;
   error?: string;
   activeRunId?: string;
+  executionHealth: 'ready' | 'error';
+  traceHealth: 'starting' | 'ready' | 'error';
+  traceError?: string;
 }
 
 export interface ProgressEvent { runId: string; kind: string; message: string; }

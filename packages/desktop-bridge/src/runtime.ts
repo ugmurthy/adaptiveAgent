@@ -7,6 +7,7 @@ import {
   type ManualTestCliOptions,
 } from '@adaptive-agent/agent-sdk/cli';
 import type { AgentEvent, JsonValue, UUID } from '@adaptive-agent/core';
+import { createHash } from 'node:crypto';
 import {
   GatewayClient,
   type InferenceMode,
@@ -53,7 +54,7 @@ export interface CliExecutor {
 }
 
 export interface SafeResolvedConfiguration {
-  agent: { id: string; name: string; description?: string; defaultInvocationMode: string };
+  agent: { id: string; name: string; configurationFingerprint: string; description?: string; defaultInvocationMode: string };
   model: { provider: string; model: string; credentialAvailable: boolean };
   inference: { mode: string; tier: string };
   runtime: { mode: string; sqlitePath?: string };
@@ -545,6 +546,7 @@ export function safeResolvedConfiguration(config: ResolvedAgentSdkConfig): SafeR
     agent: {
       id: config.agent.id,
       name: config.agent.name,
+      configurationFingerprint: agentConfigurationFingerprint(config),
       ...(config.agent.description ? { description: config.agent.description } : {}),
       defaultInvocationMode: config.agent.defaultInvocationMode,
     },
@@ -582,6 +584,12 @@ function hasConfigurationOverrides(params: RuntimeInitializeParams): boolean {
 
 export function validateRestrictedDesktopConfiguration(config: ResolvedAgentSdkConfig): void {
   const errors: string[] = [];
+  if (config.runtime.mode !== 'sqlite') {
+    errors.push(`runtime.mode must be "sqlite" (resolved: "${config.runtime.mode}")`);
+  }
+  if (config.runtime.mode === 'sqlite' && !config.runtime.sqlitePath?.trim()) {
+    errors.push('runtime.sqlitePath must be a non-empty exact path');
+  }
   if (config.inference.mode !== 'byok') errors.push(`inference.mode must be "byok" (resolved: "${config.inference.mode}")`);
   if (!config.agent.invocationModes.includes('run') || config.agent.defaultInvocationMode !== 'run') {
     errors.push('the selected agent must support run and set defaultInvocationMode to "run"');
@@ -605,6 +613,36 @@ export function validateRestrictedDesktopConfiguration(config: ResolvedAgentSdkC
       JSON_RPC_ERROR_CODES.invalidParams,
     );
   }
+}
+
+/** Hash execution-defining values without returning configuration or credentials to the host. */
+function agentConfigurationFingerprint(config: ResolvedAgentSdkConfig): string {
+  const executionConfiguration = {
+    agent: omitSecrets(config.agent),
+    model: { provider: config.model.provider, model: config.model.model },
+    inference: config.inference,
+    interaction: config.interaction,
+  };
+  return createHash('sha256').update(stableJson(executionConfiguration)).digest('hex');
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => `${JSON.stringify(key)}:${stableJson(child)}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+function omitSecrets(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(omitSecrets);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+    .filter(([key]) => !/(api[-_]?key|access[-_]?token|credential|password|secret)/i.test(key))
+    .map(([key, child]) => [key, omitSecrets(child)]));
 }
 
 function asRunId(runId: string): UUID {

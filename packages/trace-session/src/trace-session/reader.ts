@@ -52,12 +52,14 @@ export class PostgresTraceReader implements TraceReader {
 type Json = Record<string, any>;
 type DbRun = { id: string; session_id: string | null; root_run_id: string; record_json: string };
 
+export const SQLITE_TRACE_DATABASE_OPTIONS = Object.freeze({ readonly: true, strict: true });
+
 export class SqliteTraceReader implements TraceReader {
   private readonly db: Database;
   constructor(readonly path: string) {
     if (!existsSync(path)) throw new Error(`SQLite runtime database does not exist: ${path}`);
     const { Database } = require('bun:sqlite') as typeof import('bun:sqlite');
-    this.db = new Database(path, { readonly: true, strict: true });
+    this.db = new Database(path, SQLITE_TRACE_DATABASE_OPTIONS);
     try { this.db.exec('PRAGMA query_only=ON'); this.validate(); }
     catch (error) { this.db.close(); throw error; }
   }

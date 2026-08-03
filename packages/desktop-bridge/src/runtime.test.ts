@@ -39,12 +39,28 @@ describe('desktop runtime protocol', () => {
     } as ResolvedAgentSdkConfig);
 
     expect(summary).toMatchObject({
-      agent: { id: 'agent-1', name: 'Researcher', defaultInvocationMode: 'run' },
+      agent: { id: 'agent-1', name: 'Researcher', defaultInvocationMode: 'run', configurationFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/) },
       model: { provider: 'openrouter', model: 'test-model', credentialAvailable: true },
       inference: { mode: 'byok' },
       interaction: { approvalMode: 'reject', clarificationMode: 'fail' },
     });
     expect(JSON.stringify(summary)).not.toContain('never-expose-this');
+  });
+
+  it('produces a deterministic, change-sensitive fingerprint without hashing credential values into output', () => {
+    const base = {
+      agent: { id: 'agent-1', name: 'Researcher', description: 'Be precise', invocationModes: ['run'], defaultInvocationMode: 'run' },
+      model: { provider: 'openrouter', model: 'test-model', apiKey: 'first-secret' },
+      inference: { mode: 'byok', tier: 'medium' },
+      runtime: { requestedMode: 'sqlite', mode: 'sqlite', autoMigrate: true, sqlitePath: '/tmp/runtime.sqlite' },
+      workspaceRoot: '/workspace', shellCwd: '/workspace',
+      interaction: { approvalMode: 'reject', clarificationMode: 'fail' },
+    } as unknown as ResolvedAgentSdkConfig;
+    const first = safeResolvedConfiguration(base).agent.configurationFingerprint;
+    const credentialChanged = safeResolvedConfiguration({ ...base, model: { ...base.model, apiKey: 'second-secret' } }).agent.configurationFingerprint;
+    const instructionsChanged = safeResolvedConfiguration({ ...base, agent: { ...base.agent, description: 'Be concise' } }).agent.configurationFingerprint;
+    expect(credentialChanged).toBe(first);
+    expect(instructionsChanged).not.toBe(first);
   });
 
   it('rejects conflicting reject and auto-approve settings for restricted desktop runs', () => {
@@ -57,6 +73,18 @@ describe('desktop runtime protocol', () => {
       workspaceRoot: '/workspace', shellCwd: '/workspace',
       interaction: { approvalMode: 'reject', clarificationMode: 'fail' },
     } as ResolvedAgentSdkConfig)).toThrow(/conflicts with defaults\.autoApproveAll true/);
+  });
+
+  it('fails closed unless restricted desktop execution resolves an exact SQLite path', () => {
+    const config = {
+      agent: { id: 'agent-1', name: 'Researcher', invocationModes: ['run'], defaultInvocationMode: 'run' },
+      settings: {}, model: { provider: 'ollama', model: 'test-model' },
+      inference: { mode: 'byok', tier: 'medium' }, workspaceRoot: '/workspace', shellCwd: '/workspace',
+      interaction: { approvalMode: 'reject', clarificationMode: 'fail' },
+    } as ResolvedAgentSdkConfig;
+    expect(() => validateRestrictedDesktopConfiguration({ ...config, runtime: { requestedMode: 'memory', mode: 'memory', autoMigrate: true } })).toThrow(/runtime\.mode must be "sqlite"/);
+    expect(() => validateRestrictedDesktopConfiguration({ ...config, runtime: { requestedMode: 'sqlite', mode: 'sqlite', autoMigrate: true, sqlitePath: '  ' } })).toThrow(/non-empty exact path/);
+    expect(() => validateRestrictedDesktopConfiguration({ ...config, runtime: { requestedMode: 'sqlite', mode: 'sqlite', autoMigrate: true, sqlitePath: '/exact/runtime.sqlite' } })).not.toThrow();
   });
 
   it('requires and negotiates the JSON-RPC protocol handshake', async () => {

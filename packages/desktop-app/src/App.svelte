@@ -12,7 +12,7 @@
 
   let tab: 'run' | 'settings' = 'run';
   let task = '';
-  let desktop: DesktopState = { status: 'starting', configurationValid: false };
+  let desktop: DesktopState = { status: 'starting', configurationValid: false, executionHealth: 'error', traceHealth: 'starting' };
   let progress: ProgressEvent[] = [];
   let finalValue: unknown;
   let finalError = '';

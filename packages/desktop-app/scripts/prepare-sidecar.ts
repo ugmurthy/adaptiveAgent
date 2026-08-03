@@ -5,16 +5,17 @@ const packageRoot = resolve(import.meta.dirname, '..');
 const triple = process.argv[2] ?? process.env.TAURI_TARGET_TRIPLE ?? await hostTriple();
 const target = bunTarget(triple);
 const extension = triple.includes('windows') ? '.exe' : '';
-const output = resolve(packageRoot, 'src-tauri', 'binaries', `agent-runtime-${triple}${extension}`);
-
 await mkdir(resolve(packageRoot, 'src-tauri', 'binaries'), { recursive: true });
-const processResult = Bun.spawn([
-  'bun', 'build', resolve(packageRoot, '..', 'desktop-bridge', 'src', 'main.ts'),
-  '--compile', `--target=${target}`, `--outfile=${output}`,
-], { stdout: 'inherit', stderr: 'inherit' });
-const exitCode = await processResult.exited;
-if (exitCode !== 0) process.exit(exitCode);
-console.log(`Prepared agent-runtime sidecar for ${triple}`);
+for (const [name, entry] of [
+  ['agent-runtime', resolve(packageRoot, '..', 'desktop-bridge', 'src', 'main.ts')],
+  ['trace-session-sidecar', resolve(packageRoot, '..', 'trace-session', 'src', 'trace-sidecar.ts')],
+] as const) {
+  const output = resolve(packageRoot, 'src-tauri', 'binaries', `${name}-${triple}${extension}`);
+  const processResult = Bun.spawn(['bun', 'build', entry, '--compile', `--target=${target}`, `--outfile=${output}`], { stdout: 'inherit', stderr: 'inherit' });
+  const exitCode = await processResult.exited;
+  if (exitCode !== 0) process.exit(exitCode);
+  console.log(`Prepared ${name} sidecar for ${triple}`);
+}
 
 async function hostTriple(): Promise<string> {
   const result = Bun.spawnSync(['rustc', '--print', 'host-tuple']);

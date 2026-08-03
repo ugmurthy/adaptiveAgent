@@ -28,6 +28,6 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "externalBin": ["binaries/agent-runtime"]
+    "externalBin": ["binaries/agent-runtime", "binaries/trace-session-sidecar"]
   }
 }
