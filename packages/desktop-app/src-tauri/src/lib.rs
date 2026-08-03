@@ -19,7 +19,7 @@ use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent},
     ShellExt,
 };
-use workbench::{Reservation, WorkbenchDb};
+use workbench::{ChatItem, ChatMessage, Reservation, WorkbenchDb};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -100,6 +100,16 @@ struct RunSummary {
 struct StartedRun {
     item_id: String,
     run_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatDto {
+    #[serde(flatten)]
+    chat: ChatItem,
+    messages: Vec<ChatMessage>,
+    read_only_reason: Option<String>,
+    occupied: bool,
 }
 
 struct Bridge {
@@ -327,7 +337,6 @@ impl Bridge {
                 cancel_requested: saved.cancel_requested,
                 interrupt_pending: saved.interrupt_pending,
                 request_active: false,
-                startup_recovery: true,
                 revision: 0,
                 pending_interaction: None,
                 occupies_slot: !matches!(
@@ -412,8 +421,7 @@ impl Bridge {
                             record.revision,
                             record.occupies_slot,
                             record.root_created,
-                            record.startup_recovery
-                                && !record.request_active
+                            !record.request_active
                                 && !record.root_created
                                 && matches!(
                                     record.submission_state.as_str(),
@@ -423,13 +431,39 @@ impl Bridge {
                     })
                     .unwrap_or((0, false, false, false));
                 let inspection = bridge.inspect_for_recovery(&run_id);
-                let state = reconciliation_classification(
+                let mut state = reconciliation_classification(
                     &inspection,
                     previous,
                     root_created,
                     definitely_absent,
                 );
                 let result = recovered_result(&inspection);
+                let chat_success = bridge
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .get(&run_id)
+                    .is_some_and(|record| record.invocation_kind == "chat")
+                    && state.cached_status == "succeeded";
+                if chat_success {
+                    let finalized = result
+                        .as_ref()
+                        .ok_or_else(|| "A succeeded chat has no durable /run/result.".to_string())
+                        .and_then(|result| {
+                            bridge
+                                .workbench
+                                .finalize_chat_success(
+                                    &run_id,
+                                    result,
+                                    &durable_assistant_output(result),
+                                )
+                                .map(|_| ())
+                        });
+                    if let Err(error) = finalized {
+                        state = recovery_required(true);
+                        let _=bridge.app.emit("adaptive-agent://control-error",json!({"runId":run_id,"error":format!("Unable to reconcile successful chat turn: {error}")}));
+                    }
+                }
                 let mut applied_quiescent = false;
                 let mut stale = false;
                 let mut persisted = None;
@@ -455,10 +489,16 @@ impl Bridge {
                 if let Some((status, submission)) = persisted {
                     let _ = bridge.workbench.update_run(&run_id, &status, &submission);
                 }
-                if applied_quiescent && result.is_some() {
-                    let _ = bridge
+                if applied_quiescent && result.is_some() && !chat_success {
+                    if let Err(error) = bridge
                         .workbench
-                        .store_result(&run_id, result.as_ref().unwrap());
+                        .store_result(&run_id, result.as_ref().unwrap())
+                    {
+                        let _ = bridge.app.emit(
+                            "adaptive-agent://control-error",
+                            json!({"runId":run_id,"error":error}),
+                        );
+                    }
                 }
                 if applied_quiescent {
                     let _ = bridge.workbench.set_interrupt_pending(&run_id, false);
@@ -541,23 +581,25 @@ impl Bridge {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel();
         self.pending.lock().unwrap().insert(id, sender);
-        let mut bytes = serde_json::to_vec(
-            &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
-        )
-        .map_err(|error| error.to_string())?;
-        bytes.push(b'\n');
-        let write_result = self
-            .child
-            .lock()
-            .unwrap()
-            .as_mut()
-            .ok_or_else(|| "The agent runtime is not running.".to_string())?
-            .write(&bytes)
-            .map_err(|_| "Unable to write to the agent runtime.".to_string());
-        if write_result.is_err() {
+        let request = (|| {
+            let mut bytes = serde_json::to_vec(
+                &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
+            )
+            .map_err(|error| error.to_string())?;
+            bytes.push(b'\n');
+            self.child
+                .lock()
+                .unwrap()
+                .as_mut()
+                .ok_or_else(|| "The agent runtime is not running.".to_string())?
+                .write(&bytes)
+                .map_err(|_| "Unable to write to the agent runtime.".to_string())?;
+            Ok(())
+        })();
+        if request.is_err() {
             self.pending.lock().unwrap().remove(&id);
         }
-        write_result.map(|_| (id, receiver))
+        request.map(|_| (id, receiver))
     }
 
     fn request_wait(&self, method: &str, params: Value, timeout: Duration) -> Response {
@@ -652,6 +694,18 @@ impl Bridge {
         }
         if kind == "run.status_changed" {
             if let Some(status) = event.pointer("/payload/toStatus").and_then(Value::as_str) {
+                let chat_success = status == "succeeded"
+                    && self
+                        .registry
+                        .lock()
+                        .unwrap()
+                        .get(run_id)
+                        .is_some_and(|record| record.invocation_kind == "chat");
+                if chat_success {
+                    self.reconcile_run(run_id.to_owned());
+                    self.emit_state();
+                    return;
+                }
                 let mut registry = self.registry.lock().unwrap();
                 let persisted = if let Some(record) = registry.get_mut(run_id) {
                     let state = state_for_durable_status(status, record.occupies_slot);
@@ -754,7 +808,6 @@ impl Bridge {
             cancel_requested: false,
             interrupt_pending: false,
             request_active: true,
-            startup_recovery: false,
             revision: 0,
             pending_interaction: None,
             occupies_slot: true,
@@ -838,6 +891,202 @@ impl Bridge {
             bridge.emit_state();
         });
         Ok(started)
+    }
+
+    fn current_agent(&self) -> Result<(String, String, String), String> {
+        let configuration = self
+            .configuration
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or("Settings are invalid.")?;
+        let agent = configuration
+            .get("agent")
+            .ok_or("Resolved agent is missing.")?;
+        let value = |key: &str| {
+            agent
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|v| !v.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| format!("Resolved agent {key} is missing."))
+        };
+        Ok((
+            value("id")?,
+            value("name")?,
+            value("configurationFingerprint")?,
+        ))
+    }
+
+    fn chat_reason(&self, chat: &ChatItem) -> Option<String> {
+        match self.current_agent() {
+            Err(_) => Some("The pinned agent is not currently available; this chat is read-only.".into()),
+            Ok((id,_,_)) if id != chat.pinned_agent_id => Some("The resolved agent ID no longer matches this chat's pin; this chat is read-only.".into()),
+            Ok((_,_,fingerprint)) if fingerprint != chat.pinned_agent_fingerprint => Some("The resolved agent configuration fingerprint no longer matches this chat's pin; this chat is read-only.".into()),
+            _ => None,
+        }
+    }
+
+    fn chat_dto(&self, item_id: &str) -> Result<ChatDto, String> {
+        let (chat, messages) = self.workbench.load_chat(item_id)?;
+        Ok(ChatDto {
+            read_only_reason: self.chat_reason(&chat),
+            occupied: self.registry.lock().unwrap().item_is_occupied(item_id),
+            chat,
+            messages,
+        })
+    }
+
+    fn send_chat(self: &Arc<Self>, item_id: String, content: String) -> Result<StartedRun, String> {
+        let _submission = self.submission.lock().unwrap();
+        if self.draining.load(Ordering::SeqCst) {
+            return Err("The desktop is draining and cannot start new runs.".into());
+        }
+        let mut registry = self.registry.lock().unwrap();
+        if !registry.has_capacity() {
+            return Err(
+                "All 3 task slots are occupied. Stop or wait for a run, then try again.".into(),
+            );
+        }
+        if registry.item_is_occupied(&item_id) {
+            return Err("This chat already has a turn in progress.".into());
+        }
+        let (chat, _) = self.workbench.load_chat(&item_id)?;
+        if let Some(reason) = self.chat_reason(&chat) {
+            return Err(reason);
+        }
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let messages = self
+            .workbench
+            .reserve_chat_turn(&item_id, &run_id, &content)?;
+        registry.insert(RunRecord {
+            run_id: run_id.clone(),
+            item_id: item_id.clone(),
+            session_id: Some(chat.session_id.clone()),
+            invocation_kind: "chat".into(),
+            submission_state: "submitted".into(),
+            cached_status: "submitted".into(),
+            root_created: false,
+            cancel_requested: false,
+            interrupt_pending: false,
+            request_active: true,
+            revision: 0,
+            pending_interaction: None,
+            occupies_slot: true,
+        });
+        drop(registry);
+        if let Err(error) = self.workbench.update_run(&run_id, "submitted", "submitted") {
+            let _ = self.app.emit("adaptive-agent://control-error", json!({"runId":run_id,"error":format!("The chat reservation is durable, but its redundant submitted update failed: {error}")}));
+        }
+        let transcript = messages
+            .iter()
+            .map(|message| json!({"role":message.role,"content":message.content}))
+            .collect::<Vec<_>>();
+        let receiver = match self.request(
+            "agent/chat",
+            chat_request_params(&run_id, &chat.session_id, transcript),
+        ) {
+            Ok((_, receiver)) => receiver,
+            Err(error) => {
+                if let Some(record) = self.registry.lock().unwrap().get_mut(&run_id) {
+                    record.request_active = false;
+                    record.revision += 1;
+                }
+                if self.workbench.mark_submission_failed(&run_id).is_ok() {
+                    if let Some(record) = self.registry.lock().unwrap().get_mut(&run_id) {
+                        let state = submission_failed();
+                        apply_run_state(record, &state, None);
+                    }
+                } else {
+                    let _=self.app.emit("adaptive-agent://control-error",json!({"runId":run_id,"error":"Unable to persist submission failure; retaining the occupied slot for recovery."}));
+                    self.reconcile_run(run_id.clone());
+                }
+                self.emit_state();
+                return Err(error);
+            }
+        };
+        self.emit_state();
+        let bridge = self.clone();
+        let response_run_id = run_id.clone();
+        std::thread::spawn(move || {
+            let response = loop {
+                match receiver.recv_timeout(Duration::from_secs(30)) {
+                    Ok(response) => break response,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        bridge.reconcile_run(response_run_id.clone())
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        break Err("The agent runtime exited before returning a result.".into())
+                    }
+                }
+            };
+            if let Some(record) = bridge.registry.lock().unwrap().get_mut(&response_run_id) {
+                record.request_active = false;
+                record.revision += 1;
+            }
+            match response {
+                Ok(result) => {
+                    let state = state_for_execution_result(&result);
+                    if state.cached_status == "succeeded" {
+                        let finalized = response_assistant_value(&result)
+                            .ok_or_else(|| {
+                                "Successful chat response did not include output.".to_string()
+                            })
+                            .and_then(|output| {
+                                let content = value_as_content(&output);
+                                bridge
+                                    .workbench
+                                    .finalize_chat_success(&response_run_id, &output, &content)
+                                    .map(|_| ())
+                            });
+                        if let Err(error) = finalized {
+                            let _=bridge.app.emit("adaptive-agent://control-error",json!({"runId":response_run_id,"error":format!("Unable to finalize successful chat turn: {error}")}));
+                            bridge.reconcile_run(response_run_id.clone());
+                            bridge.emit_state();
+                            return;
+                        }
+                    } else if let Err(error) =
+                        bridge.workbench.store_result(&response_run_id, &result)
+                    {
+                        let _ = bridge.app.emit(
+                            "adaptive-agent://control-error",
+                            json!({"runId":response_run_id,"error":error}),
+                        );
+                    }
+                    if let Some(record) = bridge.registry.lock().unwrap().get_mut(&response_run_id)
+                    {
+                        let _ = apply_run_state(record, &state, None);
+                        if state.cached_status != "succeeded" {
+                            if let Err(error) = bridge.workbench.update_run(
+                                &response_run_id,
+                                &record.cached_status,
+                                &record.submission_state,
+                            ) {
+                                let _ = bridge.app.emit(
+                                    "adaptive-agent://control-error",
+                                    json!({"runId":response_run_id,"error":error}),
+                                );
+                            }
+                        }
+                    }
+                    if !state.occupies_slot {
+                        let _ = bridge.app.emit(
+                            "adaptive-agent://run-finished",
+                            json!({"runId":response_run_id,"result":result}),
+                        );
+                    }
+                }
+                Err(error) => {
+                    let _ = bridge.app.emit(
+                        "adaptive-agent://control-error",
+                        json!({"runId":response_run_id,"error":error}),
+                    );
+                    bridge.reconcile_run(response_run_id.clone());
+                }
+            }
+            bridge.emit_state();
+        });
+        Ok(StartedRun { item_id, run_id })
     }
 
     fn stop_run(self: &Arc<Self>, run_id: &str) -> Result<(), String> {
@@ -1252,6 +1501,88 @@ fn get_run_result(
         .get_result(&run_id)
 }
 
+#[tauri::command]
+fn create_chat(title: String, state: tauri::State<'_, AppState>) -> Result<ChatDto, String> {
+    let _lifecycle = state.lifecycle.lock().unwrap();
+    if state.quit.lock().unwrap().state() != QuitState::Idle {
+        return Err("The desktop is quitting and cannot create chats.".into());
+    }
+    let bridge = state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or("Desktop runtime is starting.")?;
+    let (id, name, fingerprint) = bridge.current_agent()?;
+    let chat = ChatItem {
+        item_id: uuid::Uuid::new_v4().to_string(),
+        title: if title.trim().is_empty() {
+            "New chat".into()
+        } else {
+            title.trim().into()
+        },
+        session_id: uuid::Uuid::new_v4().to_string(),
+        pinned_agent_id: id,
+        pinned_agent_name: name,
+        pinned_agent_fingerprint: fingerprint,
+    };
+    bridge.workbench.create_chat(&chat)?;
+    bridge.chat_dto(&chat.item_id)
+}
+
+#[tauri::command]
+fn list_chats(state: tauri::State<'_, AppState>) -> Result<Vec<ChatDto>, String> {
+    let bridge = state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or("Desktop runtime is starting.")?;
+    bridge
+        .workbench
+        .list_chats()?
+        .iter()
+        .map(|chat| bridge.chat_dto(&chat.item_id))
+        .collect()
+}
+
+#[tauri::command]
+fn load_chat(item_id: String, state: tauri::State<'_, AppState>) -> Result<ChatDto, String> {
+    state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or("Desktop runtime is starting.")?
+        .chat_dto(&item_id)
+}
+
+#[tauri::command]
+fn send_chat_turn(
+    item_id: String,
+    content: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<StartedRun, String> {
+    if content.trim().is_empty() {
+        return Err("Message is required.".into());
+    }
+    let _lifecycle = state.lifecycle.lock().unwrap();
+    if state.quit.lock().unwrap().state() != QuitState::Idle {
+        return Err("The desktop is quitting and cannot start new runs.".into());
+    }
+    state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or("Desktop runtime is starting.")?
+        .send_chat(item_id, content.trim().into())
+}
+
 #[derive(Clone, Copy)]
 enum DrainMode {
     Wait,
@@ -1367,6 +1698,10 @@ pub fn run() {
             start_run,
             stop_run,
             get_run_result,
+            create_chat,
+            list_chats,
+            load_chat,
+            send_chat_turn,
             quit_wait,
             quit_terminate,
             quit_cancel
@@ -1464,6 +1799,28 @@ fn recovered_result(inspection: &Response) -> Option<Value> {
         .ok()
         .and_then(|value| value.pointer("/run/result"))
         .cloned()
+}
+
+fn response_assistant_value(result: &Value) -> Option<Value> {
+    (result.get("status").and_then(Value::as_str) == Some("success"))
+        .then(|| result.get("output"))
+        .flatten()
+        .cloned()
+}
+
+fn durable_assistant_output(result: &Value) -> String {
+    value_as_content(result)
+}
+
+fn value_as_content(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn chat_request_params(run_id: &str, session_id: &str, transcript: Vec<Value>) -> Value {
+    json!({"runId":run_id,"sessionId":session_id,"transcript":transcript})
 }
 
 fn recovery_required(previous_occupancy: bool) -> RunState {
@@ -1711,5 +2068,17 @@ mod tests {
         }));
         assert_eq!(recovered_result(&inspection), Some(json!({ "answer": 42 })));
         assert_eq!(recovered_result(&Err("transport unavailable".into())), None);
+    }
+
+    #[test]
+    fn chat_payload_uses_only_transcript_and_preserves_complete_history() {
+        let history = vec![
+            json!({"role":"user","content":"one"}),
+            json!({"role":"assistant","content":"two"}),
+            json!({"role":"user","content":"three"}),
+        ];
+        let payload = chat_request_params("run", "session", history.clone());
+        assert_eq!(payload.get("transcript"), Some(&Value::Array(history)));
+        assert!(payload.get("messages").is_none());
     }
 }

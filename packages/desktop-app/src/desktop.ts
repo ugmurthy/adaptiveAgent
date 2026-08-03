@@ -2,7 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
 export interface ResolvedConfiguration {
-  agent: { id: string; name: string; description?: string; defaultInvocationMode: string };
+  agent: { id: string; name: string; description?: string; defaultInvocationMode: string; configurationFingerprint: string };
   model: { provider: string; model: string; credentialAvailable: boolean };
   inference: { mode: string; tier: string };
   runtime: { mode: string; sqlitePath?: string };
@@ -26,6 +26,8 @@ export interface DesktopState {
 
 export interface RunSummary { itemId: string; runId: string; status: string; cancelRequested: boolean; occupiesSlot: boolean; }
 export interface StartedRun { itemId: string; runId: string; }
+export interface ChatMessage { id: string; ordinal: number; role: 'user'|'assistant'; content: string; runId?: string; }
+export interface Chat { itemId:string; title:string; sessionId:string; pinnedAgentId:string; pinnedAgentName:string; pinnedAgentFingerprint:string; messages:ChatMessage[]; readOnlyReason?:string; occupied:boolean; }
 
 export interface ProgressEvent { runId: string; kind: string; message: string; }
 export interface RunFinishedEvent { runId: string; result?: unknown; error?: string; }
@@ -35,6 +37,10 @@ export const reloadSettings = () => invoke<DesktopState>('reload_settings');
 export const startRun = (task: string) => invoke<StartedRun>('start_run', { task });
 export const stopRun = (runId: string) => invoke<void>('stop_run', { runId });
 export const getRunResult = (runId: string) => invoke<unknown | null>('get_run_result', { runId });
+export const createChat = (title:string) => invoke<Chat>('create_chat',{title});
+export const listChats = () => invoke<Chat[]>('list_chats');
+export const loadChat = (itemId:string) => invoke<Chat>('load_chat',{itemId});
+export const sendChatTurn = (itemId:string,content:string) => invoke<StartedRun>('send_chat_turn',{itemId,content});
 export const quitWait = () => invoke<DesktopState>('quit_wait');
 export const quitTerminate = () => invoke<DesktopState>('quit_terminate');
 export const quitCancel = () => invoke<DesktopState>('quit_cancel');

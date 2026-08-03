@@ -22,7 +22,6 @@ pub struct RunRecord {
     pub cancel_requested: bool,
     pub interrupt_pending: bool,
     pub request_active: bool,
-    pub startup_recovery: bool,
     pub revision: u64,
     pub pending_interaction: Option<String>,
     pub occupies_slot: bool,
@@ -50,6 +49,11 @@ impl RunRegistry {
     }
     pub fn has_capacity(&self) -> bool {
         self.occupied_slot_count() < CAPACITY
+    }
+    pub fn item_is_occupied(&self, item_id: &str) -> bool {
+        self.records
+            .values()
+            .any(|record| record.item_id == item_id && record.occupies_slot)
     }
     pub fn records(&self) -> impl Iterator<Item = &RunRecord> {
         self.records.values()
@@ -135,7 +139,6 @@ pub(crate) fn tests_record_for_transition() -> RunRecord {
         cancel_requested: false,
         interrupt_pending: false,
         request_active: false,
-        startup_recovery: false,
         revision: 0,
         pending_interaction: None,
         occupies_slot: true,
@@ -158,7 +161,6 @@ mod tests {
             cancel_requested: false,
             interrupt_pending: false,
             request_active: false,
-            startup_recovery: false,
             revision: 0,
             pending_interaction: None,
             occupies_slot: true,

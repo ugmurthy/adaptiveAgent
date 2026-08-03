@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import {
     getDesktopState,
+    createChat, listChats, loadChat, sendChatTurn,
     getRunResult,
     reloadSettings,
     quitCancel,
@@ -12,9 +13,10 @@
     subscribe,
     type DesktopState,
     type ProgressEvent,
+    type Chat,
   } from './desktop';
 
-  let tab: 'run' | 'settings' = 'run';
+  let tab: 'run' | 'chat' | 'settings' = 'run';
   let task = '';
   let desktop: DesktopState = { status: 'starting', configurationValid: false, runs: [], occupiedSlotCount: 0, capacity: 3, executionHealth: 'error', traceHealth: 'starting', quitState: 'idle' };
   let progress: ProgressEvent[] = [];
@@ -24,12 +26,19 @@
   let controlPending = false;
   let selectedRunId = '';
   let resultsByRun: Record<string, { result?: unknown; error?: string }> = {};
+  let chats: Chat[] = [];
+  let selectedChat: Chat | undefined;
+  let chatMessage = '';
+  let refreshGeneration = 0;
+  let refreshScheduled = false;
 
   const canSend = () => desktop.quitState === 'idle' && desktop.configurationValid && desktop.status !== 'error' && desktop.occupiedSlotCount < desktop.capacity && task.trim().length > 0 && !startPending;
 
   onMount(() => {
     let unlisten = () => {};
-    void subscribe(
+    let cancelled = false;
+    void (async () => {
+    unlisten = await subscribe(
       (event) => { progress = [...progress.slice(-19), event]; },
       (event) => {
         const previous = resultsByRun[event.runId];
@@ -44,17 +53,39 @@
           finalValue = resultsByRun[event.runId]?.result;
           finalError = resultsByRun[event.runId]?.error ?? '';
         }
-        void refresh();
+        scheduleRefresh();
       },
-      (state) => { desktop = state; },
-    ).then((fn) => { unlisten = fn; });
-    void refresh();
-    return () => unlisten();
+      (state) => { desktop = state; scheduleRefresh(); },
+    );
+    if (cancelled) unlisten(); else await refresh();
+    })().catch((error) => { finalError = String(error); });
+    return () => { cancelled = true; unlisten(); };
   });
 
-  async function refresh() {
-    desktop = await getDesktopState();
+  function scheduleRefresh() {
+    if (refreshScheduled) return;
+    refreshScheduled = true;
+    queueMicrotask(() => { refreshScheduled = false; void refresh(); });
   }
+
+  async function refresh() {
+    const generation = ++refreshGeneration;
+    const selectedId = selectedChat?.itemId;
+    try {
+      const [nextDesktop, nextChats, nextChat] = await Promise.all([
+        getDesktopState(), listChats(), selectedId ? loadChat(selectedId) : Promise.resolve(undefined),
+      ]);
+      if (generation !== refreshGeneration) return;
+      desktop = nextDesktop; chats = nextChats;
+      if (selectedId && selectedChat?.itemId === selectedId) selectedChat = nextChat;
+    } catch (error) {
+      if (generation === refreshGeneration) finalError = String(error);
+    }
+  }
+
+  async function newChat() { try { selectedChat=await createChat('New chat'); chats=await listChats(); tab='chat'; } catch(error){finalError=String(error);} }
+  async function selectChat(itemId:string){selectedChat=await loadChat(itemId);}
+  async function sendMessage(){if(!selectedChat||!chatMessage.trim())return; startPending=true; finalError=''; try{await sendChatTurn(selectedChat.itemId,chatMessage.trim());chatMessage='';selectedChat=await loadChat(selectedChat.itemId);}catch(error){finalError=String(error);}startPending=false;await refresh();}
 
   async function send() {
     if (!canSend()) return;
@@ -130,6 +161,7 @@
 
   <nav aria-label="Application sections">
     <button class:active={tab === 'run'} on:click={() => tab = 'run'}>Run</button>
+    <button class:active={tab === 'chat'} on:click={() => tab = 'chat'}>Chat</button>
     <button class:active={tab === 'settings'} on:click={() => tab = 'settings'}>Settings</button>
   </nav>
 
@@ -168,6 +200,19 @@
       {/if}
       {#if finalError}<div class="result error"><h2>Error</h2><pre>{finalError}</pre></div>{/if}
       {#if finalValue !== undefined}<div class="result"><h2>Result</h2><pre>{typeof finalValue === 'string' ? finalValue : JSON.stringify(finalValue, null, 2)}</pre></div>{/if}
+    </section>
+  {:else if tab === 'chat'}
+    <section class="panel">
+      <div class="settings-title"><div><h2>Chats</h2><p>Persistent transcripts pinned to their creating agent.</p></div><button disabled={!desktop.configurationValid || desktop.quitState !== 'idle'} on:click={newChat}>New chat</button></div>
+      <div class="progress">{#each chats as chat}<button class:active={selectedChat?.itemId===chat.itemId} on:click={()=>selectChat(chat.itemId)}>{chat.title} · {chat.pinnedAgentName}</button>{/each}</div>
+      {#if selectedChat}
+        <div class="summary"><strong>{selectedChat.title}</strong><span>Pinned: {selectedChat.pinnedAgentName}</span><span>Session {selectedChat.sessionId.slice(0,8)}</span></div>
+        {#if selectedChat.readOnlyReason}<div class="alert">{selectedChat.readOnlyReason}</div>{/if}
+        <div class="progress" aria-live="polite">{#each selectedChat.messages as message}<div><strong>{message.role}</strong><span>{message.content}</span></div>{/each}</div>
+        <label for="chat-message">Message</label><textarea id="chat-message" bind:value={chatMessage} disabled={!!selectedChat.readOnlyReason || selectedChat.occupied || desktop.quitState!=='idle'}></textarea>
+        <div class="actions"><button class="primary" disabled={!chatMessage.trim() || !!selectedChat.readOnlyReason || selectedChat.occupied || startPending || desktop.occupiedSlotCount>=desktop.capacity} on:click={sendMessage}>Send</button><span>{selectedChat.occupied?'Turn in progress':'Ready'}</span></div>
+      {/if}
+      {#if finalError}<div class="result error"><pre>{finalError}</pre></div>{/if}
     </section>
   {:else}
     <section class="panel settings">
