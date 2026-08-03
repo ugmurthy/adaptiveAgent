@@ -161,6 +161,31 @@ describe('desktop runtime protocol', () => {
     }))).rejects.toMatchObject({ code: 'METHOD_NOT_FOUND' });
   });
 
+  it('exposes typed history maintenance only in protocol 1.12 with SQLite support', async () => {
+    const previewDeletion = vi.fn(async (target) => ({ target, runIds: ['root'], rootRunIds: ['root'], ownedPlanIds: [], preservedPlanIds: [] }));
+    const deleteHistory = vi.fn(async (target) => ({ target, runIds: ['root'], rootRunIds: ['root'], ownedPlanIds: [], preservedPlanIds: [] }));
+    const { runtime } = createRuntime();
+    const initialized = await runtime.handleRpc(request({
+      id: 'init', method: 'initialize', params: { protocolVersion: '1.12', clientInfo: { name: 'desktop' } },
+    })) as { capabilities: { methods: string[] } };
+    expect(initialized.capabilities.methods).toEqual(expect.arrayContaining(['history/previewDeletion', 'history/delete']));
+    (runtime as unknown as { sdk: unknown }).sdk = { created: { runtime: { maintenanceStore: { previewDeletion, deleteHistory } } } };
+
+    await expect(runtime.handleRpc(request({
+      id: 'preview', method: 'history/previewDeletion', params: { target: { kind: 'root-run', rootRunId: 'root' } },
+    }))).resolves.toMatchObject({ runIds: ['root'] });
+    await expect(runtime.handleRpc(request({
+      id: 'delete', method: 'history/delete', params: { target: { kind: 'session', sessionId: 'session' } },
+    }))).resolves.toMatchObject({ runIds: ['root'] });
+    expect(previewDeletion).toHaveBeenCalledWith({ kind: 'root-run', rootRunId: 'root' });
+    expect(deleteHistory).toHaveBeenCalledWith({ kind: 'session', sessionId: 'session' });
+
+    (runtime as unknown as { sdk: unknown }).sdk = { created: { runtime: {} } };
+    await expect(runtime.handleRpc(request({
+      id: 'unsupported', method: 'history/delete', params: { target: { kind: 'root-run', rootRunId: 'root' } },
+    }))).rejects.toMatchObject({ code: 'COMMAND_REJECTED' });
+  });
+
   it('lists the complete CLI command surface and its execution restrictions', async () => {
     const { runtime } = createRuntime({ execute: vi.fn() });
     await initialize(runtime);

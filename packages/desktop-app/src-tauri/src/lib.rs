@@ -6,7 +6,7 @@ mod workbench;
 use registry::{CancelAction, RunRecord, RunRegistry, CAPACITY};
 use shutdown::{CloseDecision, QuitCoordinator, QuitState};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
@@ -113,6 +113,29 @@ struct ChatDto {
     messages: Vec<ChatMessage>,
     read_only_reason: Option<String>,
     occupied: bool,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+enum ProductDeletionTarget {
+    Item { item_id: String },
+    Run { run_id: String },
+    ChatTurn { item_id: String, ordinal: i64 },
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeletionPreview {
+    target: ProductDeletionTarget,
+    label: String,
+    run_count: usize,
+    plan_count: usize,
+    occupied: bool,
+    warning: &'static str,
 }
 
 struct Bridge {
@@ -496,7 +519,19 @@ impl Bridge {
         self.prime_run_roots();
         self.reconcile_saved_runs();
         self.recover_pending_approval_operations();
+        self.recover_deletion_jobs();
         Ok(())
+    }
+
+    fn recover_deletion_jobs(self: &Arc<Self>) {
+        let Ok(jobs) = self.workbench.load_deletion_jobs() else {
+            return;
+        };
+        for job in jobs {
+            if let Err(error) = self.execute_deletion_job(&job) {
+                let _ = self.workbench.fail_deletion_job(&job.id, &error);
+            }
+        }
     }
 
     fn reconcile_saved_runs(self: &Arc<Self>) {
@@ -1332,6 +1367,140 @@ impl Bridge {
             chat,
             messages,
         })
+    }
+
+    fn deletion_operation(&self, target: &ProductDeletionTarget) -> Result<Value, String> {
+        match target {
+            ProductDeletionTarget::Item { item_id } => {
+                self.workbench.item_deletion_operation(item_id)
+            }
+            ProductDeletionTarget::Run { run_id } => self.workbench.run_deletion_operation(run_id),
+            ProductDeletionTarget::ChatTurn { item_id, ordinal } => self
+                .workbench
+                .chat_turn_deletion_operation(item_id, *ordinal),
+        }
+    }
+
+    fn preview_deletion(
+        self: &Arc<Self>,
+        target: ProductDeletionTarget,
+    ) -> Result<DeletionPreview, String> {
+        let operation = self.deletion_operation(&target)?;
+        let mut run_ids = HashSet::new();
+        let mut plan_ids = HashSet::new();
+        for runtime_target in operation["runtimeTargets"]
+            .as_array()
+            .ok_or("Deletion operation has no runtime targets.")?
+        {
+            let (_, receiver) =
+                self.request("history/previewDeletion", json!({"target":runtime_target}))?;
+            let response = receiver
+                .recv_timeout(REQUEST_TIMEOUT)
+                .map_err(|_| "History preview timed out.".to_string())??;
+            for id in response["runIds"].as_array().into_iter().flatten() {
+                if let Some(id) = id.as_str() {
+                    run_ids.insert(id.to_owned());
+                }
+            }
+            for field in ["ownedPlanIds", "preservedPlanIds"] {
+                for id in response[field].as_array().into_iter().flatten() {
+                    if let Some(id) = id.as_str() {
+                        plan_ids.insert(id.to_owned());
+                    }
+                }
+            }
+        }
+        let registry = self.registry.lock().unwrap();
+        let occupied = run_ids
+            .iter()
+            .any(|id| registry.get(id).is_some_and(|record| record.occupies_slot));
+        drop(registry);
+        let label = match &target {
+            ProductDeletionTarget::Item { .. } => operation["label"]
+                .as_str()
+                .ok_or("History item has no label.")?
+                .to_owned(),
+            ProductDeletionTarget::Run { run_id } => format!("run {run_id}"),
+            ProductDeletionTarget::ChatTurn { ordinal, .. } => {
+                format!("chat from turn {} onward", ordinal / 2 + 1)
+            }
+        };
+        Ok(DeletionPreview {
+            target,
+            label,
+            run_count: run_ids.len(),
+            plan_count: plan_ids.len(),
+            occupied,
+            warning: "This permanently deletes the selected history and its runtime evidence. This cannot be undone.",
+        })
+    }
+
+    fn execute_deletion_job(self: &Arc<Self>, job: &workbench::DeletionJob) -> Result<(), String> {
+        for runtime_target in job.operation["runtimeTargets"]
+            .as_array()
+            .ok_or("Deletion operation has no runtime targets.")?
+        {
+            let (_, receiver) = self.request("history/delete", json!({"target":runtime_target}))?;
+            receiver
+                .recv_timeout(REQUEST_TIMEOUT)
+                .map_err(|_| "History deletion timed out.".to_string())??;
+        }
+        self.workbench.complete_deletion_job(job)?;
+        let roots = job.operation["workbenchRunIds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect::<HashSet<_>>();
+        let affected = self
+            .run_roots
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(run_id, root_run_id)| roots.contains(*run_id) || roots.contains(*root_run_id))
+            .map(|(run_id, _)| run_id.clone())
+            .chain(roots.iter().cloned())
+            .collect::<HashSet<_>>();
+        let mut registry = self.registry.lock().unwrap();
+        for run_id in &affected {
+            registry.remove(run_id);
+        }
+        drop(registry);
+        self.run_roots
+            .lock()
+            .unwrap()
+            .retain(|run_id, _| !affected.contains(run_id));
+        self.run_delegates
+            .lock()
+            .unwrap()
+            .retain(|run_id, _| !affected.contains(run_id));
+        self.reconciling
+            .lock()
+            .unwrap()
+            .retain(|run_id, _| !affected.contains(run_id));
+        Ok(())
+    }
+
+    fn delete_history(self: &Arc<Self>, target: ProductDeletionTarget) -> Result<(), String> {
+        let preview = self.preview_deletion(target.clone())?;
+        if preview.occupied {
+            return Err("Stop or wait for every affected run before deleting history.".into());
+        }
+        let operation = self.deletion_operation(&target)?;
+        let job = self.workbench.create_deletion_job(&operation)?;
+        match self.execute_deletion_job(&job) {
+            Ok(()) => {
+                self.emit_state();
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.workbench.fail_deletion_job(&job.id, &error);
+                Err(format!(
+                    "Deletion is incomplete and will be retried safely: {error}"
+                ))
+            }
+        }
     }
 
     fn send_chat(self: &Arc<Self>, item_id: String, content: String) -> Result<StartedRun, String> {
@@ -2356,6 +2525,40 @@ fn load_chat(item_id: String, state: tauri::State<'_, AppState>) -> Result<ChatD
 }
 
 #[tauri::command]
+fn preview_history_deletion(
+    target: ProductDeletionTarget,
+    state: tauri::State<'_, AppState>,
+) -> Result<DeletionPreview, String> {
+    state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or("Desktop runtime is starting.")?
+        .preview_deletion(target)
+}
+
+#[tauri::command]
+fn delete_history(
+    target: ProductDeletionTarget,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let _lifecycle = state.lifecycle.lock().unwrap();
+    if state.quit.lock().unwrap().state() != QuitState::Idle {
+        return Err("The desktop is quitting and cannot delete history.".into());
+    }
+    state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or("Desktop runtime is starting.")?
+        .delete_history(target)
+}
+
+#[tauri::command]
 fn send_chat_turn(
     item_id: String,
     content: String,
@@ -2497,6 +2700,8 @@ pub fn run() {
             create_chat,
             list_chats,
             load_chat,
+            preview_history_deletion,
+            delete_history,
             send_chat_turn,
             select_trace,
             get_trace_privacy,

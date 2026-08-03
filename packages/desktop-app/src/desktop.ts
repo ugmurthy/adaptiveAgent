@@ -30,6 +30,8 @@ export interface RunSummary { itemId: string; runId: string; status: string; can
 export interface StartedRun { itemId: string; runId: string; }
 export interface ChatMessage { id: string; ordinal: number; role: 'user'|'assistant'; content: string; runId?: string; }
 export interface Chat { itemId:string; title:string; sessionId:string; pinnedAgentId:string; pinnedAgentName:string; pinnedAgentFingerprint:string; messages:ChatMessage[]; readOnlyReason?:string; occupied:boolean; }
+export type ProductDeletionTarget = {kind:'item';itemId:string}|{kind:'run';runId:string}|{kind:'chat-turn';itemId:string;ordinal:number};
+export interface DeletionPreview { target:ProductDeletionTarget; label:string; runCount:number; planCount:number; occupied:boolean; warning:string; }
 
 export interface TracePrivacy { messages:boolean; reasoning:boolean; rawToolPayloads:boolean; }
 export interface TraceReport {
@@ -57,6 +59,8 @@ export const createChat = (title:string) => invoke<Chat>('create_chat',{title});
 export const listChats = () => invoke<Chat[]>('list_chats');
 export const loadChat = (itemId:string) => invoke<Chat>('load_chat',{itemId});
 export const sendChatTurn = (itemId:string,content:string) => invoke<StartedRun>('send_chat_turn',{itemId,content});
+export const previewHistoryDeletion = (target:ProductDeletionTarget) => invoke<DeletionPreview>('preview_history_deletion',{target});
+export const deleteHistory = (target:ProductDeletionTarget) => invoke<void>('delete_history',{target});
 export const selectTrace = (rootRunId?:string) => invoke<number>('select_trace',{rootRunId});
 export const getTracePrivacy = () => invoke<TracePrivacy>('get_trace_privacy');
 export const setTracePrivacy = (privacy:TracePrivacy) => invoke<TracePrivacy>('set_trace_privacy',{privacy});

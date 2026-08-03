@@ -16,6 +16,7 @@ import type {
   EventStore,
   ModelAdapter,
   PlanStore,
+  RuntimeMaintenanceStore,
   RuntimeTransactionStore,
   RunStore,
   SnapshotStore,
@@ -38,6 +39,7 @@ export interface AdaptiveAgentRuntime<
   continuationStore: TContinuationStore;
   toolExecutionStore?: ToolExecutionStore;
   transactionStore?: RuntimeTransactionStore;
+  maintenanceStore?: RuntimeMaintenanceStore;
 }
 
 export interface AdaptiveAgentRuntimeOptions<
@@ -54,6 +56,7 @@ export interface AdaptiveAgentRuntimeOptions<
   continuationStore?: TContinuationStore;
   toolExecutionStore?: ToolExecutionStore;
   transactionStore?: RuntimeTransactionStore;
+  maintenanceStore?: RuntimeMaintenanceStore;
 }
 
 export interface CreateAdaptiveAgentOptions<
@@ -112,6 +115,7 @@ export function createAdaptiveAgentRuntime<
     continuationStore: (options.continuationStore ?? new InMemoryContinuationStore()) as TContinuationStore,
     toolExecutionStore: options.toolExecutionStore,
     transactionStore,
+    maintenanceStore: options.maintenanceStore,
   };
 }
 

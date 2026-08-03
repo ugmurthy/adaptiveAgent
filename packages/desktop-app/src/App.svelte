@@ -4,6 +4,7 @@
   import {
     getDesktopState,
     createChat, listChats, loadChat, sendChatTurn,
+    previewHistoryDeletion, deleteHistory,
     getRunResult,
     reloadSettings,
     quitCancel,
@@ -16,6 +17,7 @@
     subscribe,
     type DesktopState,
     type Chat,
+    type DeletionPreview, type ProductDeletionTarget,
     type TracePrivacy, type TraceReport,
   } from './desktop';
 
@@ -41,6 +43,8 @@
   let traceView: 'overview'|'timeline'|'agents'|'tools'|'usage'|'diagnostics'|'sensitive' = 'overview';
   let tracePrivacy: TracePrivacy = { messages:false, reasoning:false, rawToolPayloads:false };
   let privacyPending = false;
+  let deletionPreview: DeletionPreview | undefined;
+  let deletionPending = false;
   $: selectedActivity = selectedRunId ? activityByRoot[selectedRunId] ?? [] : [];
   $: selectedTiming = modelTiming(selectedActivity, now);
 
@@ -138,6 +142,30 @@
     controlPending=false; await refresh();
   }
 
+  async function requestDeletion(target:ProductDeletionTarget) {
+    deletionPending=true; finalError='';
+    try { deletionPreview=await previewHistoryDeletion(target); }
+    catch(error) { finalError=String(error); }
+    deletionPending=false;
+  }
+
+  async function confirmDeletion() {
+    if (!deletionPreview || deletionPreview.occupied) return;
+    deletionPending=true; finalError='';
+    const target=deletionPreview.target;
+    try {
+      await deleteHistory(target);
+      deletionPreview=undefined;
+      if (target.kind==='item') {
+        if (selectedChat?.itemId===target.itemId) selectedChat=undefined;
+        if (desktop.runs.some((run)=>run.itemId===target.itemId && run.runId===selectedRunId)) selectedRunId='';
+      } else if (target.kind==='run' && selectedRunId===target.runId) selectedRunId='';
+      else if (target.kind==='chat-turn' && selectedChat?.itemId===target.itemId) selectedChat=await loadChat(target.itemId);
+      await refresh();
+    } catch(error) { finalError=String(error); }
+    deletionPending=false;
+  }
+
   async function selectRun(runId: string) {
     selectedRunId = runId;
     finalValue = resultsByRun[runId]?.result;
@@ -208,6 +236,21 @@
   </div>
 {/if}
 
+{#if deletionPreview}
+  <div class="quit-backdrop" role="presentation">
+    <div class="quit-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-title">
+      <h2 id="delete-title">Delete {deletionPreview.label}?</h2>
+      <p>{deletionPreview.warning}</p>
+      <p>{deletionPreview.runCount} run{deletionPreview.runCount===1?'':'s'} and {deletionPreview.planCount} related plan{deletionPreview.planCount===1?'':'s'} are included.</p>
+      {#if deletionPreview.occupied}<div class="alert">Stop or wait for every affected run before deleting this history.</div>{/if}
+      <div class="actions">
+        <button disabled={deletionPending} on:click={()=>deletionPreview=undefined}>Cancel</button>
+        <button class="danger" disabled={deletionPending || deletionPreview.occupied} on:click={confirmDeletion}>Delete permanently</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <main>
   <header>
     <div><span class="mark">A</span><div><h1>AdaptiveAgent</h1><p>Desktop runtime</p></div></div>
@@ -244,6 +287,10 @@
             <div>
               <button class:active={selectedRunId === run.runId} on:click={() => selectRun(run.runId)}>{run.runId.slice(0, 8)} · {run.status}</button>
               {#if run.occupiesSlot}<button disabled={controlPending} on:click={() => stop(run.runId)}>{run.cancelRequested ? 'Retry stop' : 'Stop'}</button>{/if}
+              {#if !chats.some((chat)=>chat.itemId===run.itemId)}
+                <button class="danger" disabled={deletionPending || run.occupiesSlot} on:click={()=>requestDeletion({kind:'run',runId:run.runId})}>Delete run</button>
+                <button class="danger" disabled={deletionPending || desktop.runs.some((candidate)=>candidate.itemId===run.itemId && candidate.occupiesSlot)} on:click={()=>requestDeletion({kind:'item',itemId:run.itemId})}>Delete task</button>
+              {/if}
               {#if run.pendingApproval}<div class="alert"><strong>{run.pendingApproval.toolName}</strong><p>{run.pendingApproval.message}</p><button disabled={controlPending || run.pendingApproval.decisionInFlight} on:click={()=>decide(run,true)}>Approve</button><button disabled={controlPending || run.pendingApproval.decisionInFlight} on:click={()=>decide(run,false)}>Reject</button></div>{/if}
             </div>
           {/each}
@@ -270,9 +317,9 @@
       <div class="settings-title"><div><h2>Chats</h2><p>Persistent transcripts pinned to their creating agent.</p></div><button disabled={!desktop.configurationValid || desktop.quitState !== 'idle'} on:click={newChat}>New chat</button></div>
       <div class="progress">{#each chats as chat}<button class:active={selectedChat?.itemId===chat.itemId} on:click={()=>selectChat(chat.itemId)}>{chat.title} · {chat.pinnedAgentName}</button>{/each}</div>
       {#if selectedChat}
-        <div class="summary"><strong>{selectedChat.title}</strong><span>Pinned: {selectedChat.pinnedAgentName}</span><span>Session {selectedChat.sessionId.slice(0,8)}</span></div>
+        <div class="summary"><strong>{selectedChat.title}</strong><span>Pinned: {selectedChat.pinnedAgentName}</span><span>Session {selectedChat.sessionId.slice(0,8)}</span><button class="danger" disabled={deletionPending || selectedChat.occupied} on:click={()=>requestDeletion({kind:'item',itemId:selectedChat!.itemId})}>Delete chat</button></div>
         {#if selectedChat.readOnlyReason}<div class="alert">{selectedChat.readOnlyReason}</div>{/if}
-        <div class="progress" aria-live="polite">{#each selectedChat.messages as message}<div><strong>{message.role}</strong><span>{message.content}</span></div>{/each}</div>
+        <div class="progress" aria-live="polite">{#each selectedChat.messages as message}<div><strong>{message.role}</strong><span>{message.content}</span>{#if message.role==='user'}<button class="danger" disabled={deletionPending || selectedChat.occupied} on:click={()=>requestDeletion({kind:'chat-turn',itemId:selectedChat!.itemId,ordinal:message.ordinal})}>Delete from here</button>{/if}</div>{/each}</div>
         <label for="chat-message">Message</label><textarea id="chat-message" bind:value={chatMessage} disabled={!!selectedChat.readOnlyReason || selectedChat.occupied || desktop.quitState!=='idle'}></textarea>
         <div class="actions"><button class="primary" disabled={!chatMessage.trim() || !!selectedChat.readOnlyReason || selectedChat.occupied || startPending || desktop.occupiedSlotCount>=desktop.capacity} on:click={sendMessage}>Send</button><span>{selectedChat.occupied?'Turn in progress':'Ready'}</span></div>
         {#each desktop.runs.filter(run=>run.itemId===selectedChat?.itemId && run.pendingApproval) as run}<div class="alert"><strong>{run.pendingApproval!.toolName}</strong><p>{run.pendingApproval!.message}</p><button disabled={controlPending || run.pendingApproval!.decisionInFlight} on:click={()=>decide(run,true)}>Approve</button><button disabled={controlPending || run.pendingApproval!.decisionInFlight} on:click={()=>decide(run,false)}>Reject</button></div>{/each}

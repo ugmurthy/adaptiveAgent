@@ -123,6 +123,19 @@ describe('desktop bridge protocol', () => {
     expect(() => parseDesktopRpcRequest(envelope({ runId: 'child', approved: true }))).toThrowError(expect.objectContaining<Partial<DesktopProtocolError>>({ code: 'INVALID_PARAMS' }));
   });
 
+  it('accepts only typed root-run and session history deletion targets', () => {
+    const envelope = (method: 'history/previewDeletion' | 'history/delete', target: object) =>
+      JSON.stringify({ jsonrpc: '2.0', id: 1, method, params: { target } });
+    expect(parseDesktopRpcRequest(envelope('history/previewDeletion', { kind: 'root-run', rootRunId: 'root' })))
+      .toMatchObject({ method: 'history/previewDeletion' });
+    expect(parseDesktopRpcRequest(envelope('history/delete', { kind: 'session', sessionId: 'session' })))
+      .toMatchObject({ method: 'history/delete' });
+    for (const target of [{ kind: 'root-run' }, { kind: 'session' }, { kind: 'sql', statement: 'delete' }]) {
+      expect(() => parseDesktopRpcRequest(envelope('history/delete', target)))
+        .toThrowError(expect.objectContaining<Partial<DesktopProtocolError>>({ code: 'INVALID_PARAMS' }));
+    }
+  });
+
   it('recovers JSON-RPC string and numeric ids without coercion', () => {
     expect(rpcIdFromUnknownLine('{"jsonrpc":"2.0","id":"rpc-1"}')).toBe('rpc-1');
     expect(rpcIdFromUnknownLine('{"jsonrpc":"2.0","id":42}')).toBe(42);

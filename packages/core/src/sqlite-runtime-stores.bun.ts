@@ -197,6 +197,63 @@ describe('SQLite runtime stores', () => {
     await expect(create).resolves.toMatchObject({ id: 'before-close' });
     await expect(bundle.runStore.getRun('before-close')).rejects.toThrow('SQLite runtime is closed');
   });
+
+  it('transactionally deletes complete root trees, cascaded evidence, and only unshared owned plans', async () => {
+    const database = new Database(':memory:', { strict: true });
+    const bundle = createSqliteRuntimeStores({ database });
+    openBundles.push(bundle);
+    await bundle.runStore.createRun({ id: 'root', sessionId: 'session', goal: 'Root', status: 'succeeded' });
+    await bundle.runStore.createRun({ id: 'child', sessionId: 'child-session', rootRunId: 'root', parentRunId: 'root', goal: 'Child', status: 'failed' });
+    await bundle.runStore.createRun({ id: 'unrelated', sessionId: 'other', goal: 'Keep', status: 'succeeded' });
+    await bundle.eventStore.append({ runId: 'child', type: 'run.failed', schemaVersion: 1, payload: {} });
+    await bundle.snapshotStore.save({ runId: 'child', snapshotSeq: 1, status: 'failed', state: {} });
+    await bundle.toolExecutionStore.markStarted({ runId: 'child', stepId: 'step', toolCallId: 'call', toolName: 'tool', idempotencyKey: 'tool-key', inputHash: 'hash' });
+    await bundle.continuationStore.createContinuation({ sourceRunId: 'root', continuationRunId: 'child', strategy: 'latest_snapshot', sourceSnapshotId: 'snapshot' });
+    await bundle.planStore.createPlan({ id: 'owned-plan', status: 'approved', objective: 'Delete', toolsetHash: 'tools', createdFromRunId: 'root', steps: [] });
+    await bundle.planStore.createPlan({ id: 'shared-plan', status: 'approved', objective: 'Keep', toolsetHash: 'tools', createdFromRunId: 'root', steps: [] });
+    await bundle.planStore.createExecution({ id: 'shared-execution', planId: 'shared-plan', runId: 'unrelated', attempt: 1, status: 'succeeded' });
+
+    await expect(bundle.maintenanceStore.previewDeletion({ kind: 'root-run', rootRunId: 'root' })).resolves.toEqual({
+      target: { kind: 'root-run', rootRunId: 'root' },
+      runIds: ['child', 'root'],
+      rootRunIds: ['root'],
+      ownedPlanIds: ['owned-plan'],
+      preservedPlanIds: ['shared-plan'],
+    });
+    await expect(bundle.maintenanceStore.previewDeletion({ kind: 'session', sessionId: 'session' })).resolves.toMatchObject({
+      runIds: ['child', 'root'],
+      rootRunIds: ['root'],
+    });
+    await bundle.maintenanceStore.deleteHistory({ kind: 'root-run', rootRunId: 'root' });
+
+    expect(await bundle.runStore.getRun('root')).toBeNull();
+    expect(await bundle.runStore.getRun('child')).toBeNull();
+    expect(await bundle.runStore.getRun('unrelated')).not.toBeNull();
+    expect(await bundle.planStore.getPlan('owned-plan')).toBeNull();
+    expect(await bundle.planStore.getPlan('shared-plan')).not.toBeNull();
+    expect(database.query('select count(*) as count from agent_events').get()).toEqual({ count: 0 });
+    expect(database.query('select count(*) as count from run_snapshots').get()).toEqual({ count: 0 });
+    expect(database.query('select count(*) as count from tool_executions').get()).toEqual({ count: 0 });
+    expect(database.query('select count(*) as count from run_continuations').get()).toEqual({ count: 0 });
+    expect(database.query('pragma foreign_key_check').all()).toEqual([]);
+  });
+
+  it('rejects occupied trees and rolls back an injected deletion failure', async () => {
+    const database = new Database(':memory:', { strict: true });
+    const bundle = createSqliteRuntimeStores({ database });
+    openBundles.push(bundle);
+    await bundle.runStore.createRun({ id: 'active', goal: 'Active', status: 'awaiting_approval' });
+    await expect(bundle.maintenanceStore.deleteHistory({ kind: 'root-run', rootRunId: 'active' }))
+      .rejects.toThrow('occupy execution slots');
+    expect(await bundle.runStore.getRun('active')).not.toBeNull();
+
+    await bundle.runStore.createRun({ id: 'rollback', goal: 'Rollback', status: 'failed' });
+    database.exec("create trigger inject_deletion_failure before delete on agent_runs when old.id='rollback' begin select raise(abort, 'injected failure'); end");
+    await expect(bundle.maintenanceStore.deleteHistory({ kind: 'root-run', rootRunId: 'rollback' }))
+      .rejects.toThrow('injected failure');
+    expect(await bundle.runStore.getRun('rollback')).not.toBeNull();
+    expect(database.query('pragma foreign_key_check').all()).toEqual([]);
+  });
 });
 
 async function temporaryDirectory(): Promise<string> {

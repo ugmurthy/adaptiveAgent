@@ -1,4 +1,4 @@
-import type { ChatMessage, JsonValue } from '@adaptive-agent/core';
+import type { ChatMessage, JsonValue, RuntimeDeletionTarget } from '@adaptive-agent/core';
 import type { InferenceMode, InferenceTier, ProfileRef } from '@adaptive-agent/gateway-client';
 
 export {
@@ -148,6 +148,10 @@ export interface ClarificationParams extends RunIdParams {
   answer: string;
 }
 
+export interface HistoryDeletionParams {
+  target: RuntimeDeletionTarget;
+}
+
 type RpcRequest<TMethod extends string, TParams> = JsonRpcRequest<TMethod, TParams>;
 type RpcRequestWithoutParams<TMethod extends string> = JsonRpcRequest<TMethod, never>;
 
@@ -169,6 +173,8 @@ export type DesktopRpcRequest =
   | RpcRequest<'run/steer', SteerParams>
   | RpcRequest<'interaction/resolveApproval', ApprovalParams>
   | RpcRequest<'interaction/resolveClarification', ClarificationParams>
+  | RpcRequest<'history/previewDeletion', HistoryDeletionParams>
+  | RpcRequest<'history/delete', HistoryDeletionParams>
   | RpcRequestWithoutParams<'cli/commands'>
   | RpcRequest<'cli/execute', CliExecuteParams>;
 
@@ -190,6 +196,8 @@ export const DESKTOP_RPC_METHODS = [
   'run/steer',
   'interaction/resolveApproval',
   'interaction/resolveClarification',
+  'history/previewDeletion',
+  'history/delete',
   'cli/commands',
   'cli/execute',
 ] as const satisfies readonly DesktopRpcRequest['method'][];
@@ -337,6 +345,22 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
       const value = requiredParams(method, params);
       requiredString(value, 'runId');
       requiredString(value, 'answer');
+      return;
+    }
+    case 'history/previewDeletion':
+    case 'history/delete': {
+      const value = requiredParams(method, params);
+      requiredObject(value, 'target');
+      const target = value.target as Record<string, unknown>;
+      requiredString(target, 'kind');
+      const kind = target.kind;
+      if (kind === 'root-run') {
+        requiredString(target, 'rootRunId');
+      } else if (kind === 'session') {
+        requiredString(target, 'sessionId');
+      } else {
+        invalidParams('target.kind must be root-run or session.');
+      }
       return;
     }
     case 'cli/execute': {

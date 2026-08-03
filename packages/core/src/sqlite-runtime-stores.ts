@@ -18,6 +18,9 @@ import type {
   RunStatus,
   RunStore,
   RuntimeRecoveryCandidate,
+  RuntimeDeletionPreview,
+  RuntimeDeletionTarget,
+  RuntimeMaintenanceStore,
   RuntimeStores,
   RuntimeTransactionStore,
   SnapshotStore,
@@ -38,6 +41,15 @@ const TERMINAL_RUN_STATUSES = new Set<RunStatus>([
 const TERMINAL_PLAN_EXECUTION_STATUSES = new Set<PlanExecutionStatus>([
   'succeeded',
   'failed',
+  'replan_required',
+  'cancelled',
+]);
+
+const DELETABLE_RUN_STATUSES = new Set<RunStatus>([
+  'interrupted',
+  'succeeded',
+  'failed',
+  'clarification_requested',
   'replan_required',
   'cancelled',
 ]);
@@ -846,6 +858,71 @@ export class SqliteRecoveryScanner {
   }
 }
 
+export class SqliteRuntimeMaintenanceStore implements RuntimeMaintenanceStore {
+  constructor(
+    private readonly database: Database,
+    private readonly executor: StoreExecutor = DIRECT_EXECUTOR,
+  ) {}
+
+  previewDeletion(target: RuntimeDeletionTarget): Promise<RuntimeDeletionPreview> {
+    return this.executor.run(() => this.inImmediateTransaction(() => previewRuntimeDeletion(this.database, target)));
+  }
+
+  deleteHistory(target: RuntimeDeletionTarget): Promise<RuntimeDeletionPreview> {
+    return this.executor.run(() => this.inImmediateTransaction(() => {
+      const preview = previewRuntimeDeletion(this.database, target);
+      if (preview.runIds.length === 0) return preview;
+
+      const runs = this.database
+        .query(`select id, status from agent_runs where id in (${placeholders(preview.runIds.length)})`)
+        .all(...preview.runIds) as Array<{ id: string; status: RunStatus }>;
+      const occupied = runs.filter((run) => !DELETABLE_RUN_STATUSES.has(run.status));
+      if (occupied.length > 0) {
+        throw new Error(`Cannot delete history while runs occupy execution slots: ${occupied.map((run) => run.id).sort().join(', ')}`);
+      }
+
+      if (preview.ownedPlanIds.length > 0) {
+        this.database.run(
+          `delete from plans where id in (${placeholders(preview.ownedPlanIds.length)})`,
+          preview.ownedPlanIds,
+        );
+      }
+      this.database.run(
+        `update agent_runs set parent_run_id = null, current_child_run_id = null where id in (${placeholders(preview.runIds.length)})`,
+        preview.runIds,
+      );
+      const childRunIds = preview.runIds.filter((runId) => !preview.rootRunIds.includes(runId));
+      if (childRunIds.length > 0) {
+        this.database.run(
+          `delete from agent_runs where id in (${placeholders(childRunIds.length)})`,
+          childRunIds,
+        );
+      }
+      if (preview.rootRunIds.length > 0) {
+        this.database.run(
+          `delete from agent_runs where id in (${placeholders(preview.rootRunIds.length)})`,
+          preview.rootRunIds,
+        );
+      }
+      const foreignKeyFailures = this.database.query('pragma foreign_key_check').all();
+      if (foreignKeyFailures.length > 0) throw new Error('Runtime deletion failed foreign key verification.');
+      return preview;
+    }));
+  }
+
+  private inImmediateTransaction<T>(operation: () => T): T {
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const result = operation();
+      this.database.exec('COMMIT');
+      return result;
+    } catch (error) {
+      if (this.database.inTransaction) this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+}
+
 export class SqliteRuntimeStoreBundle implements RuntimeTransactionStore {
   readonly runStore: SqliteRunStore;
   readonly eventStore: SqliteEventStore;
@@ -854,6 +931,7 @@ export class SqliteRuntimeStoreBundle implements RuntimeTransactionStore {
   readonly continuationStore: SqliteContinuationStore;
   readonly toolExecutionStore: SqliteToolExecutionStore;
   readonly recoveryScanner: SqliteRecoveryScanner;
+  readonly maintenanceStore: SqliteRuntimeMaintenanceStore;
   private readonly executor = new SerializedStoreExecutor();
 
   constructor(
@@ -869,6 +947,7 @@ export class SqliteRuntimeStoreBundle implements RuntimeTransactionStore {
     this.continuationStore = new SqliteContinuationStore(database, this.executor);
     this.toolExecutionStore = new SqliteToolExecutionStore(database, this.executor);
     this.recoveryScanner = new SqliteRecoveryScanner(database, this.executor);
+    this.maintenanceStore = new SqliteRuntimeMaintenanceStore(database, this.executor);
   }
 
   runInTransaction<T>(operation: (stores: RuntimeStores) => Promise<T>): Promise<T> {
@@ -917,6 +996,37 @@ function createTransactionStores(database: Database): RuntimeStores {
     continuationStore: new SqliteContinuationStore(database),
     toolExecutionStore: new SqliteToolExecutionStore(database),
   };
+}
+
+function previewRuntimeDeletion(database: Database, target: RuntimeDeletionTarget): RuntimeDeletionPreview {
+  const rootRunIds = target.kind === 'root-run'
+    ? database.query('select id from agent_runs where id = ? and root_run_id = id').all(target.rootRunId).map((row) => (row as { id: string }).id)
+    : database.query('select distinct root_run_id as id from agent_runs where session_id = ? order by root_run_id').all(target.sessionId).map((row) => (row as { id: string }).id);
+  if (rootRunIds.length === 0) return { target, runIds: [], rootRunIds: [], ownedPlanIds: [], preservedPlanIds: [] };
+  const rows = database.query(
+    `select id, root_run_id from agent_runs where root_run_id in (${placeholders(rootRunIds.length)}) order by created_at, id`,
+  ).all(...rootRunIds);
+  const runs = rows as Array<{ id: string; root_run_id: string }>;
+  const roots = new Set(rootRunIds);
+  const runIds = runs.filter((run) => !roots.has(run.id)).map((run) => run.id)
+    .concat(runs.filter((run) => roots.has(run.id)).map((run) => run.id));
+
+  const candidatePlans = database.query(
+    `select id from plans where created_from_run_id in (${placeholders(runIds.length)}) order by id`,
+  ).all(...runIds) as Array<{ id: string }>;
+  const ownedPlanIds: string[] = [];
+  const preservedPlanIds: string[] = [];
+  for (const { id } of candidatePlans) {
+    const unrelated = database.query(
+      `select exists(select 1 from plan_executions where plan_id = ? and run_id not in (${placeholders(runIds.length)})) as value`,
+    ).get(id, ...runIds) as { value: number };
+    (unrelated.value ? preservedPlanIds : ownedPlanIds).push(id);
+  }
+  return { target, runIds, rootRunIds, ownedPlanIds, preservedPlanIds };
+}
+
+function placeholders(count: number): string {
+  return Array.from({ length: count }, () => '?').join(',');
 }
 
 function configureSqliteDatabase(database: Database, busyTimeoutMs = 5_000): void {

@@ -117,6 +117,9 @@ export class DesktopRuntime {
     if (this.negotiatedProtocolVersion === '1.10' && request.method === 'auth/updateAccessToken') {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', 'auth/updateAccessToken requires desktop protocol 1.11.', JSON_RPC_ERROR_CODES.methodNotFound);
     }
+    if (this.negotiatedProtocolVersion !== DESKTOP_PROTOCOL_VERSION && request.method.startsWith('history/')) {
+      throw new DesktopProtocolError('METHOD_NOT_FOUND', `${request.method} requires desktop protocol 1.12.`, JSON_RPC_ERROR_CODES.methodNotFound);
+    }
 
     switch (request.method) {
       case 'runtime/initialize':
@@ -188,6 +191,10 @@ export class DesktopRuntime {
           asRunId(request.params!.runId),
           request.params!.answer,
         ));
+      case 'history/previewDeletion':
+        return asJsonValue(await this.requireMaintenanceStore().previewDeletion(request.params!.target));
+      case 'history/delete':
+        return asJsonValue(await this.requireMaintenanceStore().deleteHistory(request.params!.target));
       case 'cli/commands':
         return this.cliCommands();
       case 'cli/execute':
@@ -235,7 +242,11 @@ export class DesktopRuntime {
       bridgeVersion: DESKTOP_BRIDGE_VERSION,
       serverInfo: { name: '@adaptive-agent/desktop-bridge', version: DESKTOP_BRIDGE_VERSION },
       capabilities: {
-        methods: DESKTOP_RPC_METHODS.filter((method) => this.negotiatedProtocolVersion !== '1.10' || method !== 'auth/updateAccessToken'),
+        methods: DESKTOP_RPC_METHODS.filter((method) => {
+          if (this.negotiatedProtocolVersion === '1.10' && method === 'auth/updateAccessToken') return false;
+          if (this.negotiatedProtocolVersion !== DESKTOP_PROTOCOL_VERSION && method.startsWith('history/')) return false;
+          return true;
+        }),
         notifications: ['runtime/ready', 'agent/event', 'cli/output'],
         cli: {
           commands: [...ADAPTIVE_AGENT_CLI_COMMANDS],
@@ -422,6 +433,18 @@ export class DesktopRuntime {
     const sdk = this.requireSdk();
     await sdk.agent.resolveApproval(asRunId(runId), approvalId, approved);
     return { runId, approvalId, approved, resolved: true };
+  }
+
+  private requireMaintenanceStore() {
+    const store = this.requireSdk().created.runtime.maintenanceStore;
+    if (!store) {
+      throw new DesktopProtocolError(
+        'COMMAND_REJECTED',
+        'History deletion is available only for the SQLite runtime.',
+        JSON_RPC_ERROR_CODES.commandRejected,
+      );
+    }
+    return store;
   }
 
   private cliCommands(): JsonValue {

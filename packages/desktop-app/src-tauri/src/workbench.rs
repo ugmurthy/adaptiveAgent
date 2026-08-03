@@ -23,6 +23,9 @@ create table deletion_jobs (id text primary key, item_id text, root_run_id text,
 ), (
     5,
     "create table pending_approvals (root_run_id text primary key references workbench_runs(run_id) on delete cascade, approval_run_id text not null, approval_id text not null, parent_run_id text, tool_name text not null, message text not null, decision_in_flight integer not null default 0, decision integer, operation_state text not null default 'awaiting_decision' check(operation_state in ('awaiting_decision','resolving','resume_pending','rejection_pending')), updated_at text not null);",
+), (
+    6,
+    "alter table deletion_jobs add column operation_json text;",
 )];
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -76,6 +79,14 @@ pub struct Reservation {
     pub submission_state: String,
     pub cancel_requested: bool,
     pub interrupt_pending: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletionJob {
+    pub id: String,
+    pub operation: Value,
+    pub last_error: Option<String>,
 }
 
 pub struct WorkbenchDb {
@@ -321,6 +332,194 @@ impl WorkbenchDb {
             .execute("delete from workbench_items where id=?1", [item_id])
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    pub fn item_deletion_operation(&self, item_id: &str) -> Result<Value, String> {
+        let connection = self.connection.lock().unwrap();
+        let (kind, title, session_id): (String, String, Option<String>) = connection
+            .query_row(
+                "select kind,title,session_id from workbench_items where id=?1",
+                [item_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or("History item was not found.")?;
+        let mut statement = connection
+            .prepare(
+                "select run_id from workbench_runs where item_id=?1 order by created_at,run_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let run_ids = statement
+            .query_map([item_id], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let targets = if kind == "chat" {
+            vec![
+                serde_json::json!({"kind":"session","sessionId":session_id.ok_or("Chat session is missing.")?}),
+            ]
+        } else {
+            run_ids
+                .iter()
+                .map(|run_id| serde_json::json!({"kind":"root-run","rootRunId":run_id}))
+                .collect()
+        };
+        Ok(
+            serde_json::json!({"kind":"item","itemId":item_id,"label":title,"workbenchRunIds":run_ids,"runtimeTargets":targets}),
+        )
+    }
+
+    pub fn run_deletion_operation(&self, run_id: &str) -> Result<Value, String> {
+        let connection = self.connection.lock().unwrap();
+        let (item_id, invocation_kind): (String, String) = connection
+            .query_row(
+                "select item_id,invocation_kind from workbench_runs where run_id=?1",
+                [run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or("Run history was not found.")?;
+        if invocation_kind == "chat" {
+            return Err("Delete a chat turn instead of deleting its run directly.".into());
+        }
+        Ok(
+            serde_json::json!({"kind":"run","itemId":item_id,"runId":run_id,"workbenchRunIds":[run_id],"runtimeTargets":[{"kind":"root-run","rootRunId":run_id}]}),
+        )
+    }
+
+    pub fn chat_turn_deletion_operation(
+        &self,
+        item_id: &str,
+        ordinal: i64,
+    ) -> Result<Value, String> {
+        let connection = self.connection.lock().unwrap();
+        let role: Option<String> = connection
+            .query_row(
+                "select role from chat_messages where item_id=?1 and ordinal=?2",
+                params![item_id, ordinal],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if role.as_deref() != Some("user") {
+            return Err("Chat deletion must begin at a user turn.".into());
+        }
+        let mut statement = connection
+            .prepare("select run_id from workbench_runs where item_id=?1 and invocation_kind='chat' and turn_index>=?2 order by turn_index desc")
+            .map_err(|error| error.to_string())?;
+        let targets = statement
+            .query_map(params![item_id, ordinal], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|run_id| serde_json::json!({"kind":"root-run","rootRunId":run_id}))
+            .collect::<Vec<_>>();
+        Ok(
+            serde_json::json!({"kind":"chat-turn","itemId":item_id,"fromOrdinal":ordinal,"workbenchRunIds":targets.iter().filter_map(|target|target.get("rootRunId").and_then(Value::as_str)).collect::<Vec<_>>(),"runtimeTargets":targets}),
+        )
+    }
+
+    pub fn create_deletion_job(&self, operation: &Value) -> Result<DeletionJob, String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let timestamp = now();
+        self.connection.lock().unwrap().execute(
+            "insert into deletion_jobs(id,item_id,root_run_id,state,last_error,created_at,updated_at,operation_json) values(?1,?2,null,'pending',null,?3,?3,?4)",
+            params![id, operation.get("itemId").and_then(Value::as_str), timestamp, operation.to_string()],
+        ).map_err(|error| error.to_string())?;
+        Ok(DeletionJob {
+            id,
+            operation: operation.clone(),
+            last_error: None,
+        })
+    }
+
+    pub fn load_deletion_jobs(&self) -> Result<Vec<DeletionJob>, String> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare("select id,operation_json,last_error from deletion_jobs where state='pending' and operation_json is not null order by created_at,id").map_err(|error|error.to_string())?;
+        let jobs = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .map(|row| {
+                let (id, operation, last_error) = row.map_err(|error| error.to_string())?;
+                Ok(DeletionJob {
+                    id,
+                    operation: serde_json::from_str(&operation)
+                        .map_err(|error| error.to_string())?,
+                    last_error,
+                })
+            })
+            .collect();
+        jobs
+    }
+
+    pub fn fail_deletion_job(&self, id: &str, error: &str) -> Result<(), String> {
+        self.connection.lock().unwrap().execute("update deletion_jobs set last_error=?2,updated_at=?3 where id=?1 and state='pending'",params![id,error,now()]).map_err(|error|error.to_string())?;
+        Ok(())
+    }
+
+    pub fn complete_deletion_job(&self, job: &DeletionJob) -> Result<(), String> {
+        let mut connection = self.connection.lock().unwrap();
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        match job.operation.get("kind").and_then(Value::as_str) {
+            Some("item") => {
+                tx.execute(
+                    "delete from workbench_items where id=?1",
+                    [job.operation
+                        .get("itemId")
+                        .and_then(Value::as_str)
+                        .ok_or("Deletion item is missing.")?],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            Some("run") => {
+                tx.execute(
+                    "delete from workbench_runs where run_id=?1",
+                    [job.operation
+                        .get("runId")
+                        .and_then(Value::as_str)
+                        .ok_or("Deletion run is missing.")?],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            Some("chat-turn") => {
+                let item_id = job
+                    .operation
+                    .get("itemId")
+                    .and_then(Value::as_str)
+                    .ok_or("Deletion item is missing.")?;
+                let ordinal = job
+                    .operation
+                    .get("fromOrdinal")
+                    .and_then(Value::as_i64)
+                    .ok_or("Deletion ordinal is missing.")?;
+                tx.execute(
+                    "delete from chat_messages where item_id=?1 and ordinal>=?2",
+                    params![item_id, ordinal],
+                )
+                .map_err(|error| error.to_string())?;
+                tx.execute("delete from workbench_runs where item_id=?1 and invocation_kind='chat' and turn_index>=?2",params![item_id,ordinal]).map_err(|error|error.to_string())?;
+                tx.execute(
+                    "update workbench_items set updated_at=?2 where id=?1",
+                    params![item_id, now()],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            _ => return Err("Deletion operation is invalid.".into()),
+        }
+        tx.execute("delete from deletion_jobs where id=?1", [job.id.as_str()])
+            .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())
     }
 
     pub fn update_run(
@@ -806,5 +1005,66 @@ mod tests {
             Some(serde_json::json!({"messages":true,"reasoning":false,"rawToolPayloads":true}))
         );
         assert_eq!(db.load_setting("missing").unwrap(), None);
+    }
+
+    #[test]
+    fn deletion_operations_cover_task_attempts_and_chat_context_suffixes() {
+        let db = WorkbenchDb::open_in_memory().unwrap();
+        db.reserve_task(&reservation()).unwrap();
+        db.connection.lock().unwrap().execute("insert into workbench_runs(run_id,item_id,invocation_kind,cached_status,submission_state,created_at,updated_at) values('retry','item','run','failed','terminal','later','later')",[]).unwrap();
+        let task = db.item_deletion_operation("item").unwrap();
+        assert_eq!(
+            task["runtimeTargets"],
+            serde_json::json!([
+                {"kind":"root-run","rootRunId":"run"},
+                {"kind":"root-run","rootRunId":"retry"}
+            ])
+        );
+
+        db.create_chat(&chat()).unwrap();
+        db.reserve_chat_turn("chat", "chat-run-1", "one").unwrap();
+        db.finalize_chat_success("chat-run-1", &serde_json::json!("one"), "answer one")
+            .unwrap();
+        db.reserve_chat_turn("chat", "chat-run-2", "two").unwrap();
+        db.finalize_chat_success("chat-run-2", &serde_json::json!("two"), "answer two")
+            .unwrap();
+        let operation = db.chat_turn_deletion_operation("chat", 2).unwrap();
+        assert_eq!(
+            operation["runtimeTargets"],
+            serde_json::json!([{"kind":"root-run","rootRunId":"chat-run-2"}])
+        );
+        let job = db.create_deletion_job(&operation).unwrap();
+        db.complete_deletion_job(&job).unwrap();
+        assert_eq!(
+            db.load_chat("chat")
+                .unwrap()
+                .1
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one", "answer one"]
+        );
+        assert!(db.run_deletion_operation("chat-run-1").is_err());
+    }
+
+    #[test]
+    fn deletion_tombstone_survives_atomic_local_failure_and_retry_is_idempotent() {
+        let db = WorkbenchDb::open_in_memory().unwrap();
+        db.reserve_task(&reservation()).unwrap();
+        let operation = db.item_deletion_operation("item").unwrap();
+        let job = db.create_deletion_job(&operation).unwrap();
+        db.connection.lock().unwrap().execute_batch("create trigger fail_local_deletion before delete on workbench_items begin select raise(abort, 'injected local failure'); end;").unwrap();
+        assert!(db.complete_deletion_job(&job).is_err());
+        assert_eq!(db.load_deletion_jobs().unwrap(), vec![job.clone()]);
+        assert_eq!(db.load_runs().unwrap().len(), 1);
+        db.connection
+            .lock()
+            .unwrap()
+            .execute_batch("drop trigger fail_local_deletion;")
+            .unwrap();
+        db.complete_deletion_job(&job).unwrap();
+        assert!(db.load_deletion_jobs().unwrap().is_empty());
+        assert!(db.load_runs().unwrap().is_empty());
+        assert!(db.complete_deletion_job(&job).is_ok());
     }
 }

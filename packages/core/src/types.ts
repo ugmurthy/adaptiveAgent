@@ -972,6 +972,23 @@ export interface RuntimeStores {
   toolExecutionStore?: ToolExecutionStore;
 }
 
+export type RuntimeDeletionTarget =
+  | { kind: 'root-run'; rootRunId: UUID }
+  | { kind: 'session'; sessionId: string };
+
+export interface RuntimeDeletionPreview {
+  target: RuntimeDeletionTarget;
+  runIds: UUID[];
+  rootRunIds: UUID[];
+  ownedPlanIds: UUID[];
+  preservedPlanIds: UUID[];
+}
+
+export interface RuntimeMaintenanceStore {
+  previewDeletion(target: RuntimeDeletionTarget): Promise<RuntimeDeletionPreview>;
+  deleteHistory(target: RuntimeDeletionTarget): Promise<RuntimeDeletionPreview>;
+}
+
 export interface OrchestrationMetadata {
   kind: 'swarm';
   coordinatorRunId: UUID;
