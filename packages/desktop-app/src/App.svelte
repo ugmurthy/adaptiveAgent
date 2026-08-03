@@ -1,131 +1,277 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { addActivity, formatDuration, modelTiming, type ActivityEvent } from './activity';
-  import ResultRenderer from './ResultRenderer.svelte';
+  import { addActivity, type ActivityEvent } from './activity';
+  import ChatWorkspace from './ChatWorkspace.svelte';
+  import NewComposer from './NewComposer.svelte';
+  import RunInspector from './RunInspector.svelte';
+  import SettingsPanel from './SettingsPanel.svelte';
+  import TaskWorkspace from './TaskWorkspace.svelte';
+  import WorkbenchRail from './WorkbenchRail.svelte';
   import {
+    createChat,
+    deleteHistory,
     getDesktopState,
-    createChat, listChats, loadChat, sendChatTurn,
-    previewHistoryDeletion, deleteHistory,
     getRunResult,
-    reloadSettings,
+    getTracePrivacy,
+    listChats,
+    loadChat,
+    previewHistoryDeletion,
     quitCancel,
     quitTerminate,
     quitWait,
+    reloadSettings,
+    resolveApproval,
+    selectTrace,
+    sendChatTurn,
+    setTracePrivacy,
     startRun,
     stopRun,
-    resolveApproval,
-    selectTrace, getTracePrivacy, setTracePrivacy,
     subscribe,
-    type DesktopState,
     type Chat,
-    type DeletionPreview, type ProductDeletionTarget,
-    type TracePrivacy, type TraceReport,
+    type DeletionPreview,
+    type DesktopState,
+    type ProductDeletionTarget,
+    type RunSummary,
+    type TracePrivacy,
+    type TraceReport,
   } from './desktop';
+  import {
+    inspectorOpen,
+    mobileRailOpen,
+    buildRailItems,
+    workbenchSelection,
+    type RailItem,
+  } from './workbench-state';
 
-  let tab: 'run' | 'chat' | 'inspect' | 'settings' = 'run';
+  const emptyDesktop: DesktopState = {
+    status: 'starting',
+    configurationValid: false,
+    runs: [],
+    occupiedSlotCount: 0,
+    capacity: 3,
+    executionHealth: 'error',
+    traceHealth: 'starting',
+    quitState: 'idle',
+  };
+
+  let desktop = emptyDesktop;
+  let chats: Chat[] = [];
+  let selectedChat: Chat | undefined;
+  let selectedRunId = '';
   let task = '';
-  let desktop: DesktopState = { status: 'starting', configurationValid: false, runs: [], occupiedSlotCount: 0, capacity: 3, executionHealth: 'error', traceHealth: 'starting', quitState: 'idle' };
+  let chatMessage = '';
   let activityByRoot: Record<string, ActivityEvent[]> = {};
-  let now = Date.now();
+  let resultsByRun: Record<string, { result?: unknown; error?: string }> = {};
   let finalValue: unknown;
   let finalError = '';
   let startPending = false;
   let controlPending = false;
-  let selectedRunId = '';
-  let resultsByRun: Record<string, { result?: unknown; error?: string }> = {};
-  let chats: Chat[] = [];
-  let selectedChat: Chat | undefined;
-  let chatMessage = '';
+  let deletionPending = false;
+  let deletionPreview: DeletionPreview | undefined;
   let refreshGeneration = 0;
   let refreshScheduled = false;
+  let now = Date.now();
   let traceRoot = '';
   let traceReport: TraceReport | undefined;
   let traceError = '';
-  let traceView: 'overview'|'timeline'|'agents'|'tools'|'usage'|'diagnostics'|'sensitive' = 'overview';
-  let tracePrivacy: TracePrivacy = { messages:false, reasoning:false, rawToolPayloads:false };
+  let tracePrivacy: TracePrivacy = { messages: false, reasoning: false, rawToolPayloads: false };
   let privacyPending = false;
-  let deletionPreview: DeletionPreview | undefined;
-  let deletionPending = false;
-  $: selectedActivity = selectedRunId ? activityByRoot[selectedRunId] ?? [] : [];
-  $: selectedTiming = modelTiming(selectedActivity, now);
 
-  const canSend = () => desktop.quitState === 'idle' && desktop.configurationValid && desktop.status !== 'error' && desktop.occupiedSlotCount < desktop.capacity && task.trim().length > 0 && !startPending;
+  $: railItems = buildRailItems(desktop.runs, chats);
+  $: selectedRun = desktop.runs.find((run) => run.runId === selectedRunId);
+  $: selectedActivity = selectedRunId ? activityByRoot[selectedRunId] ?? [] : [];
+  $: inspectionRoot = $inspectorOpen ? selectedRunId : '';
+  $: if (inspectionRoot !== traceRoot) {
+    traceRoot = inspectionRoot;
+    traceReport = undefined;
+    traceError = '';
+    void selectTrace(traceRoot || undefined).catch((error) => { traceError = String(error); });
+  }
 
   onMount(() => {
     let unlisten = () => {};
     let cancelled = false;
     const timer = window.setInterval(() => { now = Date.now(); }, 100);
     void (async () => {
-    unlisten = await subscribe(
-      (event) => { activityByRoot = addActivity(activityByRoot, event); },
-      (event) => {
-        const previous = resultsByRun[event.runId];
-        resultsByRun = {
+      unlisten = await subscribe(
+        (event) => { activityByRoot = addActivity(activityByRoot, event); },
+        (event) => {
+          const previous = resultsByRun[event.runId];
+          resultsByRun = {
             ...resultsByRun,
             [event.runId]: {
               result: event.result === undefined ? previous?.result : event.result,
               error: event.error === undefined ? previous?.error : event.error,
             },
           };
-        if (event.runId === selectedRunId) {
-          finalValue = resultsByRun[event.runId]?.result;
-          finalError = resultsByRun[event.runId]?.error ?? '';
-        }
-        scheduleRefresh();
-      },
-      (state) => { desktop = state; scheduleRefresh(); },
-      (event) => {
-        if (event.rootRunId !== traceRoot || privacyPending) return;
-        traceReport = event.report;
-        traceError = event.error ?? '';
-      },
-    );
-    if (cancelled) unlisten(); else { await refresh(); tracePrivacy = await getTracePrivacy(); }
+          if (event.runId === selectedRunId) {
+            finalValue = resultsByRun[event.runId]?.result;
+            finalError = resultsByRun[event.runId]?.error ?? '';
+          }
+          scheduleRefresh();
+        },
+        (state) => { desktop = state; scheduleRefresh(); },
+        (event) => {
+          if (event.rootRunId !== traceRoot || privacyPending) return;
+          traceReport = event.report;
+          traceError = event.error ?? '';
+        },
+      );
+      if (cancelled) unlisten();
+      else {
+        await refresh();
+        tracePrivacy = await getTracePrivacy();
+      }
     })().catch((error) => { finalError = String(error); });
-    return () => { cancelled = true; window.clearInterval(timer); unlisten(); };
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      unlisten();
+    };
   });
 
   function scheduleRefresh() {
     if (refreshScheduled) return;
     refreshScheduled = true;
-    queueMicrotask(() => { refreshScheduled = false; void refresh(); });
+    queueMicrotask(() => {
+      refreshScheduled = false;
+      void refresh();
+    });
   }
 
   async function refresh() {
     const generation = ++refreshGeneration;
-    const selectedId = selectedChat?.itemId;
+    const selectedChatId = selectedChat?.itemId;
     try {
       const [nextDesktop, nextChats, nextChat] = await Promise.all([
-        getDesktopState(), listChats(), selectedId ? loadChat(selectedId) : Promise.resolve(undefined),
+        getDesktopState(),
+        listChats(),
+        selectedChatId ? loadChat(selectedChatId) : Promise.resolve(undefined),
       ]);
       if (generation !== refreshGeneration) return;
-      desktop = nextDesktop; chats = nextChats;
-      if (selectedId && selectedChat?.itemId === selectedId) selectedChat = nextChat;
+      desktop = nextDesktop;
+      chats = nextChats;
+      if (selectedChatId && selectedChat?.itemId === selectedChatId) selectedChat = nextChat;
+      if (selectedRunId && !nextDesktop.runs.some((run) => run.runId === selectedRunId)) {
+        selectedRunId = '';
+        finalValue = undefined;
+        if ($workbenchSelection.kind === 'task') $workbenchSelection = { kind: 'new-task' };
+      }
     } catch (error) {
       if (generation === refreshGeneration) finalError = String(error);
     }
   }
 
-  async function newChat() { try { selectedChat=await createChat('New chat'); selectedRunId=''; chats=await listChats(); tab='chat'; } catch(error){finalError=String(error);} }
-  async function selectChat(itemId:string){selectedChat=await loadChat(itemId);selectedRunId=[...selectedChat.messages].reverse().find((message)=>message.runId)?.runId ?? '';}
-  async function sendMessage(){if(!selectedChat||!chatMessage.trim())return; startPending=true; finalError=''; try{const started=await sendChatTurn(selectedChat.itemId,chatMessage.trim());selectedRunId=started.runId;chatMessage='';selectedChat=await loadChat(selectedChat.itemId);}catch(error){finalError=String(error);}startPending=false;await refresh();}
+  async function selectRail(item: RailItem) {
+    $mobileRailOpen = false;
+    finalError = '';
+    if (item.kind === 'chat') {
+      await selectChat(item.id);
+      return;
+    }
+    if (!item.runId) return;
+    $workbenchSelection = { kind: 'task', itemId: item.id, runId: item.runId };
+    selectedChat = undefined;
+    await selectTaskRun(item.runId);
+  }
 
-  async function send() {
-    if (!canSend()) return;
+  function showNewTask() {
+    $workbenchSelection = { kind: 'new-task' };
+    $mobileRailOpen = false;
+    selectedChat = undefined;
+    selectedRunId = '';
+    task = '';
+    finalValue = undefined;
+    finalError = '';
+  }
+
+  function showNewChat() {
+    $workbenchSelection = { kind: 'new-chat' };
+    $mobileRailOpen = false;
+    selectedChat = undefined;
+    selectedRunId = '';
+    task = '';
+    finalValue = undefined;
+    finalError = '';
+  }
+
+  function showSettings() {
+    $workbenchSelection = { kind: 'settings' };
+    $mobileRailOpen = false;
+  }
+
+  async function selectChat(itemId: string) {
+    selectedChat = await loadChat(itemId);
+    $workbenchSelection = { kind: 'chat', itemId };
+    const latestRun = desktop.runs.find((run) => run.itemId === itemId && run.occupiesSlot)
+      ?? [...desktop.runs].reverse().find((run) => run.itemId === itemId);
+    selectedRunId = latestRun?.runId
+      ?? [...selectedChat.messages].reverse().find((message) => message.runId)?.runId
+      ?? '';
+  }
+
+  async function newChat() {
+    try {
+      selectedChat = await createChat(task.trim() || 'New chat');
+      task = '';
+      chats = await listChats();
+      selectedRunId = '';
+      $workbenchSelection = { kind: 'chat', itemId: selectedChat.itemId };
+    } catch (error) {
+      finalError = String(error);
+    }
+  }
+
+  async function sendTask() {
+    if (!task.trim()) return;
     finalValue = undefined;
     finalError = '';
     startPending = true;
     try {
       const started = await startRun(task.trim());
+      task = '';
       selectedRunId = started.runId;
+      $workbenchSelection = { kind: 'task', itemId: started.itemId, runId: started.runId };
       const early = resultsByRun[started.runId];
       finalValue = early?.result ?? await getRunResult(started.runId);
       finalError = early?.error ?? '';
-      task = '';
+    } catch (error) {
+      finalError = String(error);
     }
-    catch (error) { finalError = String(error); }
     startPending = false;
     await refresh();
+  }
+
+  async function sendMessage() {
+    if (!selectedChat || !chatMessage.trim()) return;
+    startPending = true;
+    finalError = '';
+    try {
+      const started = await sendChatTurn(selectedChat.itemId, chatMessage.trim());
+      selectedRunId = started.runId;
+      chatMessage = '';
+      selectedChat = await loadChat(selectedChat.itemId);
+    } catch (error) {
+      finalError = String(error);
+    }
+    startPending = false;
+    await refresh();
+  }
+
+  async function selectTaskRun(runId: string) {
+    selectedRunId = runId;
+    const run = desktop.runs.find((candidate) => candidate.runId === runId);
+    if (run && $workbenchSelection.kind === 'task') {
+      $workbenchSelection = { kind: 'task', itemId: run.itemId, runId };
+    }
+    finalValue = resultsByRun[runId]?.result;
+    finalError = resultsByRun[runId]?.error ?? '';
+    try {
+      const result = await getRunResult(runId);
+      if (selectedRunId === runId) finalValue = result ?? resultsByRun[runId]?.result;
+    } catch (error) {
+      if (selectedRunId === runId) finalError = String(error);
+    }
   }
 
   async function stop(runId: string) {
@@ -136,43 +282,63 @@
     await refresh();
   }
 
-  async function decide(run: import('./desktop').RunSummary, approved:boolean) {
+  async function decide(run: RunSummary, approved: boolean) {
     if (!run.pendingApproval) return;
-    controlPending=true; finalError='';
-    try { await resolveApproval(run.pendingApproval,approved); } catch(error) { finalError=String(error); }
-    controlPending=false; await refresh();
+    controlPending = true;
+    finalError = '';
+    try { await resolveApproval(run.pendingApproval, approved); }
+    catch (error) { finalError = String(error); }
+    controlPending = false;
+    await refresh();
   }
 
-  async function requestDeletion(target:ProductDeletionTarget) {
-    deletionPending=true; finalError='';
-    try { deletionPreview=await previewHistoryDeletion(target); }
-    catch(error) { finalError=String(error); }
-    deletionPending=false;
+  async function requestDeletion(target: ProductDeletionTarget) {
+    deletionPending = true;
+    finalError = '';
+    try { deletionPreview = await previewHistoryDeletion(target); }
+    catch (error) { finalError = String(error); }
+    deletionPending = false;
   }
 
   async function confirmDeletion() {
     if (!deletionPreview || deletionPreview.occupied) return;
-    deletionPending=true; finalError='';
-    const target=deletionPreview.target;
+    deletionPending = true;
+    finalError = '';
+    const target = deletionPreview.target;
+    const deletedRunItemId = target.kind === 'run'
+      ? desktop.runs.find((run) => run.runId === target.runId)?.itemId
+      : undefined;
     try {
       await deleteHistory(target);
-      deletionPreview=undefined;
-      if (target.kind==='item') {
-        if (selectedChat?.itemId===target.itemId) selectedChat=undefined;
-        if (desktop.runs.some((run)=>run.itemId===target.itemId && run.runId===selectedRunId)) selectedRunId='';
-      } else if (target.kind==='run' && selectedRunId===target.runId) selectedRunId='';
-      else if (target.kind==='chat-turn' && selectedChat?.itemId===target.itemId) selectedChat=await loadChat(target.itemId);
+      deletionPreview = undefined;
+      if (target.kind === 'item') {
+        if (selectedChat?.itemId === target.itemId) selectedChat = undefined;
+        if ($workbenchSelection.kind !== 'settings') $workbenchSelection = { kind: 'new-task' };
+        selectedRunId = '';
+      } else if (target.kind === 'run' && selectedRunId === target.runId) {
+        selectedRunId = '';
+        finalValue = undefined;
+      } else if (target.kind === 'chat-turn' && selectedChat?.itemId === target.itemId) {
+        selectedChat = await loadChat(target.itemId);
+        selectedRunId = [...selectedChat.messages].reverse().find((message) => message.runId)?.runId ?? '';
+      }
       await refresh();
-    } catch(error) { finalError=String(error); }
-    deletionPending=false;
-  }
-
-  async function selectRun(runId: string) {
-    selectedRunId = runId;
-    finalValue = resultsByRun[runId]?.result;
-    finalError = resultsByRun[runId]?.error ?? '';
-    const result = await getRunResult(runId);
-    if (selectedRunId === runId) finalValue = result ?? resultsByRun[runId]?.result;
+      if (deletedRunItemId && target.kind === 'run') {
+        const attempts = desktop.runs.filter((run) => run.itemId === deletedRunItemId);
+        const next = attempts.find((run) => run.occupiesSlot)
+          ?? attempts.find((run) => run.pendingApproval)
+          ?? attempts.at(-1);
+        if (next) {
+          $workbenchSelection = { kind: 'task', itemId: next.itemId, runId: next.runId };
+          await selectTaskRun(next.runId);
+        } else {
+          $workbenchSelection = { kind: 'new-task' };
+        }
+      }
+    } catch (error) {
+      finalError = String(error);
+    }
+    deletionPending = false;
   }
 
   async function reload() {
@@ -186,53 +352,39 @@
   async function quit(action: 'wait' | 'terminate' | 'cancel') {
     controlPending = true;
     try {
-      desktop = await (action === 'wait' ? quitWait() : action === 'terminate' ? quitTerminate() : quitCancel());
-    } catch (error) { finalError = String(error); }
+      desktop = await (action === 'wait'
+        ? quitWait()
+        : action === 'terminate'
+          ? quitTerminate()
+          : quitCancel());
+    } catch (error) {
+      finalError = String(error);
+    }
     controlPending = false;
   }
 
-  function chatActivity(itemId:string): ActivityEvent[] {
-    const occupied = desktop.runs.find((run) => run.itemId === itemId && run.occupiesSlot);
-    const latestMessage = selectedChat?.itemId === itemId
-      ? [...selectedChat.messages].reverse().find((message) => message.runId)
-      : undefined;
-    const root = occupied?.runId ?? latestMessage?.runId;
-    return root ? activityByRoot[root] ?? [] : [];
-  }
-
   async function savePrivacy(next: TracePrivacy) {
-    privacyPending=true; traceReport=undefined; traceError='';
-    try { tracePrivacy=await setTracePrivacy(next); }
-    catch(error) { traceError=String(error); }
-    privacyPending=false;
+    privacyPending = true;
+    traceReport = undefined;
+    traceError = '';
+    try { tracePrivacy = await setTracePrivacy(next); }
+    catch (error) { traceError = String(error); }
+    privacyPending = false;
   }
 
-  function costSummary(report: TraceReport): string {
-    const total=report.usage?.total;
-    const unpriced=report.diagnostics?.performance?.toolAccounting?.unpricedRequests ?? report.usage?.toolAccounting?.unpricedRequests ?? 0;
-    const estimate=total?.estimatedCostUSD ?? 0;
-    if (unpriced>0) return `${unpriced} unpriced request${unpriced===1?'':'s'}; $${estimate.toFixed(4)} is a partial estimate`;
-    if ((total?.totalTokens ?? 0)>0 || estimate>0) return `Estimated cost $${estimate.toFixed(4)}`;
-    return 'No priced usage recorded';
-  }
-
-  function resultOutput(value: unknown): unknown {
-    if (value && typeof value === 'object' && 'status' in value && 'output' in value && value.status === 'success') {
-      return value.output;
-    }
-    return value;
-  }
-
-  $: inspectionRoot = selectedRunId;
-  $: if (inspectionRoot !== traceRoot) {
-    traceRoot=inspectionRoot; traceReport=undefined; traceError='';
-    void selectTrace(traceRoot || undefined).catch((error)=>{traceError=String(error);});
+  function chatActivity(itemId: string): ActivityEvent[] {
+    const root = desktop.runs.find((run) => run.itemId === itemId && run.occupiesSlot)?.runId
+      ?? [...desktop.runs].reverse().find((run) => run.itemId === itemId)?.runId
+      ?? (selectedChat?.itemId === itemId
+        ? [...selectedChat.messages].reverse().find((message) => message.runId)?.runId
+        : undefined);
+    return root ? activityByRoot[root] ?? [] : [];
   }
 </script>
 
 {#if desktop.quitState === 'confirming'}
-  <div class="quit-backdrop" role="presentation">
-    <div class="quit-dialog" role="dialog" aria-modal="true" aria-labelledby="quit-title">
+  <div class="modal-backdrop" role="presentation">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="quit-title">
       <h2 id="quit-title">Runs are still active</h2>
       <p>Choose how AdaptiveAgent should finish before quitting.</p>
       <div class="actions">
@@ -245,153 +397,137 @@
 {/if}
 
 {#if deletionPreview}
-  <div class="quit-backdrop" role="presentation">
-    <div class="quit-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-title">
+  <div class="modal-backdrop" role="presentation">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="delete-title">
       <h2 id="delete-title">Delete {deletionPreview.label}?</h2>
       <p>{deletionPreview.warning}</p>
-      <p>{deletionPreview.runCount} run{deletionPreview.runCount===1?'':'s'} and {deletionPreview.planCount} related plan{deletionPreview.planCount===1?'':'s'} are included.</p>
-      {#if deletionPreview.occupied}<div class="alert">Stop or wait for every affected run before deleting this history.</div>{/if}
+      <p>{deletionPreview.runCount} run{deletionPreview.runCount === 1 ? '' : 's'} and {deletionPreview.planCount} related plan{deletionPreview.planCount === 1 ? '' : 's'} are included.</p>
+      {#if deletionPreview.occupied}
+        <div class="alert">Stop or wait for every affected run before deleting this history.</div>
+      {/if}
       <div class="actions">
-        <button disabled={deletionPending} on:click={()=>deletionPreview=undefined}>Cancel</button>
+        <button disabled={deletionPending} on:click={() => { deletionPreview = undefined; }}>Cancel</button>
         <button class="danger" disabled={deletionPending || deletionPreview.occupied} on:click={confirmDeletion}>Delete permanently</button>
       </div>
     </div>
   </div>
 {/if}
 
-<main>
-  <header>
-    <div><span class="mark">A</span><div><h1>AdaptiveAgent</h1><p>Desktop runtime</p></div></div>
-    <span class:good={desktop.status === 'ready'} class="status-dot">{desktop.status}</span>
-  </header>
+<div class:open={$mobileRailOpen} class="rail-drawer">
+  <WorkbenchRail
+    items={railItems}
+    selection={$workbenchSelection}
+    occupied={desktop.occupiedSlotCount}
+    capacity={desktop.capacity}
+    mobileOpen={true}
+    onselect={selectRail}
+    onnewtask={showNewTask}
+    onnewchat={showNewChat}
+    onsettings={showSettings}
+    onclose={() => { $mobileRailOpen = false; }}
+  />
+</div>
+{#if $mobileRailOpen}
+  <button class="drawer-backdrop rail-backdrop" aria-label="Close task rail" on:click={() => { $mobileRailOpen = false; }}></button>
+{/if}
 
-  <nav aria-label="Application sections">
-    <button class:active={tab === 'run'} on:click={() => tab = 'run'}>Run</button>
-    <button class:active={tab === 'chat'} on:click={() => tab = 'chat'}>Chat</button>
-    <button class:active={tab === 'inspect'} on:click={() => tab = 'inspect'}>Inspector</button>
-    <button class:active={tab === 'settings'} on:click={() => tab = 'settings'}>Settings</button>
-  </nav>
+<main class:inspector-open={$inspectorOpen} class="workbench">
+  <aside class="desktop-rail">
+    <WorkbenchRail
+      items={railItems}
+      selection={$workbenchSelection}
+      occupied={desktop.occupiedSlotCount}
+      capacity={desktop.capacity}
+      onselect={selectRail}
+      onnewtask={showNewTask}
+      onnewchat={showNewChat}
+      onsettings={showSettings}
+      onclose={() => { $mobileRailOpen = false; }}
+    />
+  </aside>
 
-  {#if tab === 'run'}
-    <section class="panel">
-      {#if desktop.configuration}
-        <div class="summary">
-          <strong>{desktop.configuration.agent.name}</strong>
-          <span>{desktop.configuration.model.provider} / {desktop.configuration.model.model}</span>
-          <span>{desktop.configuration.runtime.mode} · {desktop.configuration.inference.mode}</span>
-        </div>
-      {/if}
-      {#if desktop.error}<div class="alert">{desktop.error}</div>{/if}
-      <label for="task">Task</label>
-      <textarea id="task" bind:value={task} disabled={!desktop.configurationValid || desktop.quitState !== 'idle'} placeholder="Describe the task for AdaptiveAgent…"></textarea>
-      <div class="actions">
-        <button class="primary" disabled={!canSend()} on:click={send}>Send</button>
-        <span class="run-status">{desktop.occupiedSlotCount}/{desktop.capacity} slots occupied</span>
+  <section class="workspace-shell">
+    <header class="workbench-header">
+      <button class="icon-button rail-toggle" aria-label="Open task rail" on:click={() => { $mobileRailOpen = true; }}>☰</button>
+      <div class="brand"><span class="mark">A</span><div><strong>AdaptiveAgent</strong><span>Workbench</span></div></div>
+      <div class="health-strip" aria-label="Runtime health">
+        <span class:good={desktop.executionHealth === 'ready'} class="health-pill">Runtime {desktop.executionHealth}</span>
+        <span class:good={desktop.traceHealth === 'ready'} class="health-pill">Trace {desktop.traceHealth}</span>
+        <span class="slot-pill">{desktop.occupiedSlotCount}/{desktop.capacity} active</span>
       </div>
+      <button class:active={$inspectorOpen} class="icon-button inspector-toggle" aria-label="Toggle run inspector" on:click={() => { $inspectorOpen = !$inspectorOpen; }}>Inspect</button>
+    </header>
 
-      {#if desktop.runs.length}
-        <div class="progress">
-          {#each desktop.runs as run}
-            <div>
-              <button class:active={selectedRunId === run.runId} on:click={() => selectRun(run.runId)}>{run.runId.slice(0, 8)} · {run.status}</button>
-              {#if run.occupiesSlot}<button disabled={controlPending} on:click={() => stop(run.runId)}>{run.cancelRequested ? 'Retry stop' : 'Stop'}</button>{/if}
-              {#if !chats.some((chat)=>chat.itemId===run.itemId)}
-                <button class="danger" disabled={deletionPending || run.occupiesSlot} on:click={()=>requestDeletion({kind:'run',runId:run.runId})}>Delete run</button>
-                <button class="danger" disabled={deletionPending || desktop.runs.some((candidate)=>candidate.itemId===run.itemId && candidate.occupiesSlot)} on:click={()=>requestDeletion({kind:'item',itemId:run.itemId})}>Delete task</button>
-              {/if}
-              {#if run.pendingApproval}<div class="alert"><strong>{run.pendingApproval.toolName}</strong><p>{run.pendingApproval.message}</p><button disabled={controlPending || run.pendingApproval.decisionInFlight} on:click={()=>decide(run,true)}>Approve</button><button disabled={controlPending || run.pendingApproval.decisionInFlight} on:click={()=>decide(run,false)}>Reject</button></div>{/if}
-            </div>
-          {/each}
-        </div>
-      {/if}
+    {#if desktop.error && $workbenchSelection.kind !== 'settings'}
+      <div class="shell-alert alert">{desktop.error}</div>
+    {/if}
 
-      {#if selectedActivity.length}
-        <div class="model-timer" aria-live="polite">
-          {#if selectedTiming.current}
-            <strong>{selectedTiming.current.delegateName ?? 'Agent'} · {selectedTiming.current.provider ?? 'model'} / {selectedTiming.current.model ?? 'unknown'}</strong>
-            <span>{formatDuration(selectedTiming.current.elapsedMs)} in progress</span>
-          {:else}<strong>Model idle</strong>{/if}
-          <span>{formatDuration(selectedTiming.completedMs)} completed model time</span>
+    <div class="workspace-content">
+      {#if $workbenchSelection.kind === 'new-task' || $workbenchSelection.kind === 'new-chat'}
+        <NewComposer
+          kind={$workbenchSelection.kind === 'new-task' ? 'task' : 'chat'}
+          bind:value={task}
+          pending={startPending}
+          disabled={!desktop.configurationValid || desktop.quitState !== 'idle' || ($workbenchSelection.kind === 'new-task' && desktop.occupiedSlotCount >= desktop.capacity)}
+          status={`${desktop.occupiedSlotCount}/${desktop.capacity} execution slots occupied`}
+          onsubmit={$workbenchSelection.kind === 'new-task' ? sendTask : newChat}
+        />
+      {:else if $workbenchSelection.kind === 'task' && selectedRun}
+        <TaskWorkspace
+          attempts={desktop.runs.filter((run) => run.itemId === selectedRun?.itemId)}
+          {selectedRun}
+          activity={selectedActivity}
+          {now}
+          result={finalValue}
+          error={finalError}
+          pending={controlPending || deletionPending}
+          onselectrun={selectTaskRun}
+          onstop={stop}
+          ondecision={decide}
+          ondelete={requestDeletion}
+          oninspect={() => { $inspectorOpen = true; }}
+        />
+      {:else if $workbenchSelection.kind === 'chat' && selectedChat}
+        <ChatWorkspace
+          chat={selectedChat}
+          runs={desktop.runs.filter((run) => run.itemId === selectedChat?.itemId)}
+          bind:message={chatMessage}
+          activity={chatActivity(selectedChat.itemId)}
+          {now}
+          error={finalError}
+          pending={startPending || controlPending || deletionPending}
+          capacityAvailable={desktop.occupiedSlotCount < desktop.capacity && desktop.quitState === 'idle'}
+          onsend={sendMessage}
+          onstop={stop}
+          ondecision={decide}
+          ondelete={requestDeletion}
+          oninspect={() => { $inspectorOpen = true; }}
+        />
+      {:else if $workbenchSelection.kind === 'settings'}
+        <SettingsPanel {desktop} pending={controlPending} onreload={reload} />
+      {:else}
+        <div class="empty-state">
+          <h2>History unavailable</h2>
+          <p>This item may have been deleted. Choose another item from the rail.</p>
+          <button on:click={showNewTask}>New task</button>
         </div>
-        <div class="progress narrative" aria-live="polite">
-          {#each selectedActivity as event (event.eventId)}<div><span>{event.runId === event.rootRunId ? 'Agent' : event.delegateName ?? 'Delegate'}</span>{event.message}{event.durationMs !== undefined ? ` · ${formatDuration(event.durationMs)}` : ''}</div>{/each}
-        </div>
       {/if}
-      {#if finalError}<div class="result error"><h2>Error</h2><pre>{finalError}</pre></div>{/if}
-      {#if finalValue !== undefined}<div class="result"><h2>Result</h2><ResultRenderer value={resultOutput(finalValue)} /></div>{/if}
-    </section>
-  {:else if tab === 'chat'}
-    <section class="panel">
-      <div class="settings-title"><div><h2>Chats</h2><p>Persistent transcripts pinned to their creating agent.</p></div><button disabled={!desktop.configurationValid || desktop.quitState !== 'idle'} on:click={newChat}>New chat</button></div>
-      <div class="progress">{#each chats as chat}<button class:active={selectedChat?.itemId===chat.itemId} on:click={()=>selectChat(chat.itemId)}>{chat.title} · {chat.pinnedAgentName}</button>{/each}</div>
-      {#if selectedChat}
-        <div class="summary"><strong>{selectedChat.title}</strong><span>Pinned: {selectedChat.pinnedAgentName}</span><span>Session {selectedChat.sessionId.slice(0,8)}</span><button class="danger" disabled={deletionPending || selectedChat.occupied} on:click={()=>requestDeletion({kind:'item',itemId:selectedChat!.itemId})}>Delete chat</button></div>
-        {#if selectedChat.readOnlyReason}<div class="alert">{selectedChat.readOnlyReason}</div>{/if}
-        <div class="progress" aria-live="polite">{#each selectedChat.messages as message}<div><strong>{message.role}</strong><span>{message.content}</span>{#if message.role==='user'}<button class="danger" disabled={deletionPending || selectedChat.occupied} on:click={()=>requestDeletion({kind:'chat-turn',itemId:selectedChat!.itemId,ordinal:message.ordinal})}>Delete from here</button>{/if}</div>{/each}</div>
-        <label for="chat-message">Message</label><textarea id="chat-message" bind:value={chatMessage} disabled={!!selectedChat.readOnlyReason || selectedChat.occupied || desktop.quitState!=='idle'}></textarea>
-        <div class="actions"><button class="primary" disabled={!chatMessage.trim() || !!selectedChat.readOnlyReason || selectedChat.occupied || startPending || desktop.occupiedSlotCount>=desktop.capacity} on:click={sendMessage}>Send</button><span>{selectedChat.occupied?'Turn in progress':'Ready'}</span></div>
-        {#each desktop.runs.filter(run=>run.itemId===selectedChat?.itemId && run.pendingApproval) as run}<div class="alert"><strong>{run.pendingApproval!.toolName}</strong><p>{run.pendingApproval!.message}</p><button disabled={controlPending || run.pendingApproval!.decisionInFlight} on:click={()=>decide(run,true)}>Approve</button><button disabled={controlPending || run.pendingApproval!.decisionInFlight} on:click={()=>decide(run,false)}>Reject</button></div>{/each}
-        {@const activity = chatActivity(selectedChat.itemId)}
-        {@const timing = modelTiming(activity, now)}
-        {#if activity.length}<div class="model-timer">{#if timing.current}<strong>{timing.current.delegateName ?? 'Agent'} · {timing.current.provider ?? 'model'} / {timing.current.model ?? 'unknown'}</strong><span>{formatDuration(timing.current.elapsedMs)} in progress</span>{/if}<span>{formatDuration(timing.completedMs)} completed model time</span></div><div class="progress narrative">{#each activity as event (event.eventId)}<div><span>{event.runId===event.rootRunId?'Agent':event.delegateName??'Delegate'}</span>{event.message}</div>{/each}</div>{/if}
-      {/if}
-      {#if finalError}<div class="result error"><pre>{finalError}</pre></div>{/if}
-    </section>
-  {:else if tab === 'inspect'}
-    <section class="panel inspector">
-      <div class="settings-title"><div><h2>Trace inspector</h2><p>Read-only durable execution evidence for {traceRoot ? traceRoot.slice(0,8) : 'the selected run'}.</p></div><span class:good={desktop.traceHealth==='ready'} class="status-dot">{desktop.traceHealth}</span></div>
-      {#if desktop.traceError}<div class="alert">{desktop.traceError}</div>{/if}
-      {#if traceError}<div class="alert">{traceError}</div>{/if}
-      {#if !traceRoot}<div class="alert">Select a run or start a chat turn to inspect its trace.</div>{/if}
-      <div class="inspector-tabs">
-        {#each [['overview','Overview'],['timeline','Timeline'],['agents','Agents / run tree'],['tools','Tools'],['usage','Tokens and cost'],['diagnostics','Diagnostics'],['sensitive','Sensitive data']] as item}
-          <button class:active={traceView===item[0]} on:click={()=>traceView=item[0] as typeof traceView}>{item[1]}</button>
-        {/each}
-      </div>
-      {#if traceReport}
-        {#if traceView==='overview'}
-          <div class="summary"><strong>{traceReport.summary?.status ?? 'unknown'}</strong><span>{traceReport.summary?.reason ?? 'No summary available.'}</span></div>
-          <pre>{JSON.stringify({rootRuns:traceReport.rootRuns,performance:traceReport.performance},null,2)}</pre>
-        {:else if traceView==='timeline'}
-          <pre>{JSON.stringify(traceReport.timeline ?? [],null,2)}</pre>
-        {:else if traceView==='agents'}
-          <pre>{JSON.stringify(traceReport.runTree ?? [],null,2)}</pre>
-        {:else if traceView==='tools'}
-          <pre>{JSON.stringify((traceReport.timeline ?? []).filter((entry)=>typeof entry.toolName==='string'),null,2)}</pre>
-        {:else if traceView==='usage'}
-          {@const total=traceReport.usage?.total}
-          <div class="summary"><strong>{total?.totalTokens ?? 0} tokens</strong><span>{total?.promptTokens ?? 0} prompt · {total?.completionTokens ?? 0} completion · {total?.reasoningTokens ?? 0} reasoning</span><span>{costSummary(traceReport)}</span></div>
-          <pre>{JSON.stringify(traceReport.usage,null,2)}</pre>
-        {:else if traceView==='diagnostics'}
-          <pre>{JSON.stringify(traceReport.diagnostics ?? {warnings:traceReport.warnings ?? [],performance:traceReport.performance},null,2)}</pre>
-        {:else}
-          <div class="privacy-controls">
-            <label><input type="checkbox" checked={tracePrivacy.messages} disabled={privacyPending || tracePrivacy.reasoning} on:change={(event)=>savePrivacy({...tracePrivacy,messages:event.currentTarget.checked})}> Messages</label>
-            <label><input type="checkbox" checked={tracePrivacy.reasoning} disabled={privacyPending} on:change={(event)=>savePrivacy({...tracePrivacy,reasoning:event.currentTarget.checked,messages:event.currentTarget.checked || tracePrivacy.messages})}> Reasoning</label>
-            <label><input type="checkbox" checked={tracePrivacy.rawToolPayloads} disabled={privacyPending} on:change={(event)=>savePrivacy({...tracePrivacy,rawToolPayloads:event.currentTarget.checked})}> Raw tool payloads</label>
-          </div>
-          <pre>{JSON.stringify({messages:tracePrivacy.messages ? traceReport.llmMessages ?? [] : 'Disabled',reasoning:tracePrivacy.reasoning ? 'Included in authorized messages' : 'Disabled',rawToolPayloads:tracePrivacy.rawToolPayloads ? (traceReport.timeline ?? []).map(({params,output,eventType,runId,toolName})=>({eventType,runId,toolName,params,output})) : 'Disabled'},null,2)}</pre>
-        {/if}
-      {/if}
-    </section>
-  {:else}
-    <section class="panel settings">
-      <div class="settings-title"><div><h2>Resolved configuration</h2><p>Read-only values loaded by the supervised runtime.</p></div><button disabled={controlPending || desktop.status === 'running'} on:click={reload}>Reload Settings</button></div>
-      <div class:valid={desktop.configurationValid} class="validity">{desktop.configurationValid ? 'Configuration valid' : 'Configuration invalid'}</div>
-      {#if desktop.error}<div class="alert">{desktop.error}</div>{/if}
-      {#if desktop.configuration}
-        <dl>
-          <dt>Agent</dt><dd>{desktop.configuration.agent.name} <small>{desktop.configuration.agent.id}</small></dd>
-          <dt>Provider / model</dt><dd>{desktop.configuration.model.provider} / {desktop.configuration.model.model}</dd>
-          <dt>Credential</dt><dd>{desktop.configuration.model.credentialAvailable ? 'Available' : 'Unavailable'} <small>value never exposed</small></dd>
-          <dt>Inference</dt><dd>{desktop.configuration.inference.mode} · {desktop.configuration.inference.tier}</dd>
-          <dt>Runtime</dt><dd>{desktop.configuration.runtime.mode}</dd>
-          <dt>Workspace</dt><dd>{desktop.configuration.workspace.root}</dd>
-          <dt>Shell directory</dt><dd>{desktop.configuration.workspace.shellCwd}</dd>
-          <dt>Approval</dt><dd>{desktop.configuration.interaction.approvalMode}</dd>
-          <dt>Clarification</dt><dd>{desktop.configuration.interaction.clarificationMode}</dd>
-        </dl>
-      {/if}
-    </section>
+    </div>
+  </section>
+
+  <aside class:open={$inspectorOpen} class="inspector-drawer">
+    <RunInspector
+      {desktop}
+      root={selectedRunId}
+      report={traceReport}
+      error={traceError || desktop.traceError || ''}
+      privacy={tracePrivacy}
+      {privacyPending}
+      onprivacy={savePrivacy}
+      onclose={() => { $inspectorOpen = false; }}
+    />
+  </aside>
+  {#if $inspectorOpen}
+    <button class="drawer-backdrop inspector-backdrop" aria-label="Close run inspector" on:click={() => { $inspectorOpen = false; }}></button>
   {/if}
 </main>

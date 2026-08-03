@@ -91,6 +91,8 @@ struct DesktopState {
 struct RunSummary {
     item_id: String,
     run_id: String,
+    title: String,
+    invocation_kind: String,
     status: String,
     cancel_requested: bool,
     occupies_slot: bool,
@@ -434,6 +436,7 @@ impl Bridge {
             bridge.registry.lock().unwrap().insert(RunRecord {
                 run_id: saved.run_id,
                 item_id: saved.item_id,
+                title: saved.title,
                 session_id: saved.session_id,
                 invocation_kind: saved.invocation_kind,
                 submission_state: saved.submission_state.clone(),
@@ -1230,6 +1233,7 @@ impl Bridge {
         self.registry.lock().unwrap().insert(RunRecord {
             run_id: run_id.clone(),
             item_id: item_id.clone(),
+            title: task.clone(),
             session_id: None,
             invocation_kind: "run".into(),
             submission_state: "submitted".into(),
@@ -1528,6 +1532,7 @@ impl Bridge {
         registry.insert(RunRecord {
             run_id: run_id.clone(),
             item_id: item_id.clone(),
+            title: chat.title.clone(),
             session_id: Some(chat.session_id.clone()),
             invocation_kind: "chat".into(),
             submission_state: "submitted".into(),
@@ -1786,6 +1791,8 @@ impl Bridge {
             .map(|run| RunSummary {
                 item_id: run.item_id.clone(),
                 run_id: run.run_id.clone(),
+                title: run.title.clone(),
+                invocation_kind: run.invocation_kind.clone(),
                 status: run.cached_status.clone(),
                 cancel_requested: run.cancel_requested,
                 occupies_slot: run.occupies_slot,

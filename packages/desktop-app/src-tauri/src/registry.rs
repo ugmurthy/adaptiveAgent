@@ -15,6 +15,7 @@ pub enum CancelAction {
 pub struct RunRecord {
     pub run_id: String,
     pub item_id: String,
+    pub title: String,
     pub session_id: Option<String>,
     pub invocation_kind: String,
     pub submission_state: String,
@@ -133,6 +134,7 @@ pub(crate) fn tests_record_for_transition() -> RunRecord {
     RunRecord {
         run_id: "transition".into(),
         item_id: "item-transition".into(),
+        title: "Transition task".into(),
         session_id: None,
         invocation_kind: "run".into(),
         submission_state: "submitted".into(),
@@ -156,6 +158,7 @@ mod tests {
         RunRecord {
             run_id: id.into(),
             item_id: format!("i-{id}"),
+            title: format!("Task {id}"),
             session_id: None,
             invocation_kind: "run".into(),
             submission_state: "submitted".into(),
