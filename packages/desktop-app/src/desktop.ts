@@ -15,19 +15,25 @@ export interface DesktopState {
   configurationValid: boolean;
   configuration?: ResolvedConfiguration;
   error?: string;
-  activeRunId?: string;
+  runs: RunSummary[];
+  occupiedSlotCount: number;
+  capacity: 3;
   executionHealth: 'ready' | 'error';
   traceHealth: 'starting' | 'ready' | 'error';
   traceError?: string;
 }
 
+export interface RunSummary { itemId: string; runId: string; status: string; cancelRequested: boolean; occupiesSlot: boolean; }
+export interface StartedRun { itemId: string; runId: string; }
+
 export interface ProgressEvent { runId: string; kind: string; message: string; }
-export interface RunFinishedEvent { runId?: string; result?: unknown; error?: string; }
+export interface RunFinishedEvent { runId: string; result?: unknown; error?: string; }
 
 export const getDesktopState = () => invoke<DesktopState>('desktop_state');
 export const reloadSettings = () => invoke<DesktopState>('reload_settings');
-export const startRun = (task: string) => invoke<void>('start_run', { task });
-export const stopRun = () => invoke<void>('stop_run');
+export const startRun = (task: string) => invoke<StartedRun>('start_run', { task });
+export const stopRun = (runId: string) => invoke<void>('stop_run', { runId });
+export const getRunResult = (runId: string) => invoke<unknown | null>('get_run_result', { runId });
 
 export async function subscribe(
   progress: (event: ProgressEvent) => void,
@@ -36,7 +42,9 @@ export async function subscribe(
 ): Promise<UnlistenFn> {
   const unlisten = await Promise.all([
     listen<ProgressEvent>('adaptive-agent://progress', ({ payload }) => progress(payload)),
-    listen<RunFinishedEvent>('adaptive-agent://run-finished', ({ payload }) => finished(payload)),
+    listen<RunFinishedEvent>('adaptive-agent://run-finished', ({ payload }) => {
+      if (payload && typeof payload.runId === 'string' && payload.runId.length > 0) finished(payload);
+    }),
     listen<DesktopState>('adaptive-agent://state', ({ payload }) => state(payload)),
   ]);
   return () => unlisten.forEach((fn) => fn());

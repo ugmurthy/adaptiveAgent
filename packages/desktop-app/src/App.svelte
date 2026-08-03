@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import {
     getDesktopState,
+    getRunResult,
     reloadSettings,
     startRun,
     stopRun,
@@ -12,22 +13,34 @@
 
   let tab: 'run' | 'settings' = 'run';
   let task = '';
-  let desktop: DesktopState = { status: 'starting', configurationValid: false, executionHealth: 'error', traceHealth: 'starting' };
+  let desktop: DesktopState = { status: 'starting', configurationValid: false, runs: [], occupiedSlotCount: 0, capacity: 3, executionHealth: 'error', traceHealth: 'starting' };
   let progress: ProgressEvent[] = [];
   let finalValue: unknown;
   let finalError = '';
-  let busyAction = false;
+  let startPending = false;
+  let controlPending = false;
+  let selectedRunId = '';
+  let resultsByRun: Record<string, { result?: unknown; error?: string }> = {};
 
-  const canSend = () => desktop.configurationValid && desktop.status === 'ready' && task.trim().length > 0 && !busyAction;
+  const canSend = () => desktop.configurationValid && desktop.status !== 'error' && desktop.occupiedSlotCount < desktop.capacity && task.trim().length > 0 && !startPending;
 
   onMount(() => {
     let unlisten = () => {};
     void subscribe(
       (event) => { progress = [...progress.slice(-19), event]; },
       (event) => {
-        finalValue = event.result;
-        finalError = event.error ?? '';
-        busyAction = false;
+        const previous = resultsByRun[event.runId];
+        resultsByRun = {
+            ...resultsByRun,
+            [event.runId]: {
+              result: event.result === undefined ? previous?.result : event.result,
+              error: event.error === undefined ? previous?.error : event.error,
+            },
+          };
+        if (event.runId === selectedRunId) {
+          finalValue = resultsByRun[event.runId]?.result;
+          finalError = resultsByRun[event.runId]?.error ?? '';
+        }
         void refresh();
       },
       (state) => { desktop = state; },
@@ -45,26 +58,42 @@
     progress = [];
     finalValue = undefined;
     finalError = '';
-    busyAction = true;
-    try { await startRun(task.trim()); }
-    catch (error) { finalError = String(error); busyAction = false; }
+    startPending = true;
+    try {
+      const started = await startRun(task.trim());
+      selectedRunId = started.runId;
+      const early = resultsByRun[started.runId];
+      finalValue = early?.result ?? await getRunResult(started.runId);
+      finalError = early?.error ?? '';
+      task = '';
+    }
+    catch (error) { finalError = String(error); }
+    startPending = false;
     await refresh();
   }
 
-  async function stop() {
-    busyAction = true;
-    try { await stopRun(); }
+  async function stop(runId: string) {
+    controlPending = true;
+    try { await stopRun(runId); }
     catch (error) { finalError = String(error); }
-    busyAction = false;
+    controlPending = false;
     await refresh();
+  }
+
+  async function selectRun(runId: string) {
+    selectedRunId = runId;
+    finalValue = resultsByRun[runId]?.result;
+    finalError = resultsByRun[runId]?.error ?? '';
+    const result = await getRunResult(runId);
+    if (selectedRunId === runId) finalValue = result ?? resultsByRun[runId]?.result;
   }
 
   async function reload() {
-    busyAction = true;
+    controlPending = true;
     finalError = '';
     try { desktop = await reloadSettings(); }
     catch (error) { finalError = String(error); }
-    busyAction = false;
+    controlPending = false;
   }
 </script>
 
@@ -90,16 +119,26 @@
       {/if}
       {#if desktop.error}<div class="alert">{desktop.error}</div>{/if}
       <label for="task">Task</label>
-      <textarea id="task" bind:value={task} disabled={!desktop.configurationValid || desktop.status !== 'ready'} placeholder="Describe the task for AdaptiveAgent…"></textarea>
+      <textarea id="task" bind:value={task} disabled={!desktop.configurationValid} placeholder="Describe the task for AdaptiveAgent…"></textarea>
       <div class="actions">
         <button class="primary" disabled={!canSend()} on:click={send}>Send</button>
-        <button disabled={desktop.status !== 'running' && desktop.status !== 'stopping'} on:click={stop}>Stop</button>
-        <span class="run-status">{desktop.activeRunId ? `Run ${desktop.activeRunId}` : desktop.status}</span>
+        <span class="run-status">{desktop.occupiedSlotCount}/{desktop.capacity} slots occupied</span>
       </div>
+
+      {#if desktop.runs.length}
+        <div class="progress">
+          {#each desktop.runs as run}
+            <div>
+              <button class:active={selectedRunId === run.runId} on:click={() => selectRun(run.runId)}>{run.runId.slice(0, 8)} · {run.status}</button>
+              {#if run.occupiesSlot}<button disabled={controlPending} on:click={() => stop(run.runId)}>{run.cancelRequested ? 'Retry stop' : 'Stop'}</button>{/if}
+            </div>
+          {/each}
+        </div>
+      {/if}
 
       {#if progress.length}
         <div class="progress" aria-live="polite">
-          {#each progress as event}<div><span>{event.kind}</span>{event.message}</div>{/each}
+          {#each progress.filter((event) => !selectedRunId || event.runId === selectedRunId) as event}<div><span>{event.kind}</span>{event.message}</div>{/each}
         </div>
       {/if}
       {#if finalError}<div class="result error"><h2>Error</h2><pre>{finalError}</pre></div>{/if}
@@ -107,7 +146,7 @@
     </section>
   {:else}
     <section class="panel settings">
-      <div class="settings-title"><div><h2>Resolved configuration</h2><p>Read-only values loaded by the supervised runtime.</p></div><button disabled={busyAction || desktop.status === 'running'} on:click={reload}>Reload Settings</button></div>
+      <div class="settings-title"><div><h2>Resolved configuration</h2><p>Read-only values loaded by the supervised runtime.</p></div><button disabled={controlPending || desktop.status === 'running'} on:click={reload}>Reload Settings</button></div>
       <div class:valid={desktop.configurationValid} class="validity">{desktop.configurationValid ? 'Configuration valid' : 'Configuration invalid'}</div>
       {#if desktop.error}<div class="alert">{desktop.error}</div>{/if}
       {#if desktop.configuration}

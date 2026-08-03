@@ -10,6 +10,12 @@ create table chat_messages (id text primary key, item_id text not null reference
 create table desktop_settings (key text primary key, value_json text not null);
 create table deletion_jobs (id text primary key, item_id text, root_run_id text, state text not null, last_error text, created_at text not null, updated_at text not null);
 "#,
+), (
+    2,
+    "alter table workbench_runs add column cancel_requested integer not null default 0; alter table workbench_runs add column result_json text;",
+) ,(
+    3,
+    "alter table workbench_runs add column interrupt_pending integer not null default 0;",
 )];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -24,6 +30,8 @@ pub struct Reservation {
     pub invocation_kind: String,
     pub cached_status: String,
     pub submission_state: String,
+    pub cancel_requested: bool,
+    pub interrupt_pending: bool,
 }
 
 pub struct WorkbenchDb {
@@ -98,6 +106,15 @@ impl WorkbenchDb {
         tx.commit().map_err(|e| e.to_string())
     }
 
+    pub fn delete_item(&self, item_id: &str) -> Result<(), String> {
+        self.connection
+            .lock()
+            .unwrap()
+            .execute("delete from workbench_items where id=?1", [item_id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn update_run(
         &self,
         run_id: &str,
@@ -108,9 +125,67 @@ impl WorkbenchDb {
         Ok(())
     }
 
+    pub fn set_cancel_requested(&self, run_id: &str) -> Result<(), String> {
+        let changed = self
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "update workbench_runs set cancel_requested=1,updated_at=?2 where run_id=?1",
+                params![run_id, now()],
+            )
+            .map_err(|e| e.to_string())?;
+        if changed == 0 {
+            return Err("Run is not known.".into());
+        }
+        Ok(())
+    }
+
+    pub fn store_result(&self, run_id: &str, result: &serde_json::Value) -> Result<(), String> {
+        self.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "update workbench_runs set result_json=?2,updated_at=?3 where run_id=?1",
+                params![run_id, result.to_string(), now()],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn get_result(&self, run_id: &str) -> Result<Option<serde_json::Value>, String> {
+        use rusqlite::OptionalExtension;
+        let json: Option<Option<String>> = self
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "select result_json from workbench_runs where run_id=?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        json.flatten()
+            .map(|value| serde_json::from_str(&value).map_err(|e| e.to_string()))
+            .transpose()
+    }
+
+    pub fn set_interrupt_pending(&self, run_id: &str, pending: bool) -> Result<(), String> {
+        self.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "update workbench_runs set interrupt_pending=?2,updated_at=?3 where run_id=?1",
+                params![run_id, pending, now()],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn load_runs(&self) -> Result<Vec<Reservation>, String> {
         let connection = self.connection.lock().unwrap();
-        let mut statement = connection.prepare("select i.id,r.run_id,i.title,i.session_id,i.pinned_agent_id,i.pinned_agent_name,i.pinned_agent_fingerprint,r.invocation_kind,r.cached_status,r.submission_state from workbench_runs r join workbench_items i on i.id=r.item_id order by r.created_at,r.run_id").map_err(|e| e.to_string())?;
+        let mut statement = connection.prepare("select i.id,r.run_id,i.title,i.session_id,i.pinned_agent_id,i.pinned_agent_name,i.pinned_agent_fingerprint,r.invocation_kind,r.cached_status,r.submission_state,r.cancel_requested,r.interrupt_pending from workbench_runs r join workbench_items i on i.id=r.item_id order by r.created_at,r.run_id").map_err(|e| e.to_string())?;
         let rows = statement
             .query_map([], |r| {
                 Ok(Reservation {
@@ -124,6 +199,8 @@ impl WorkbenchDb {
                     invocation_kind: r.get(7)?,
                     cached_status: r.get(8)?,
                     submission_state: r.get(9)?,
+                    cancel_requested: r.get(10)?,
+                    interrupt_pending: r.get(11)?,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -159,6 +236,8 @@ mod tests {
             invocation_kind: "run".into(),
             cached_status: "reserved".into(),
             submission_state: "reserved".into(),
+            cancel_requested: false,
+            interrupt_pending: false,
         }
     }
     #[test]
@@ -187,7 +266,7 @@ mod tests {
             .lock()
             .unwrap()
             .execute(
-                "insert into workbench_runs values('r','missing',null,'run','x','x','x','x')",
+                "insert into workbench_runs(run_id,item_id,turn_index,invocation_kind,cached_status,submission_state,created_at,updated_at) values('r','missing',null,'run','x','x','x','x')",
                 [],
             )
             .unwrap_err();

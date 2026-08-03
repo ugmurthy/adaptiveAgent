@@ -2,7 +2,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 mod registry;
 mod workbench;
-use registry::{RunRecord, RunRegistry};
+use registry::{CancelAction, RunRecord, RunRegistry, CAPACITY};
 use std::{
     collections::HashMap,
     sync::{
@@ -73,12 +73,30 @@ struct DesktopState {
     configuration: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    active_run_id: Option<String>,
+    runs: Vec<RunSummary>,
+    occupied_slot_count: usize,
+    capacity: usize,
     execution_health: &'static str,
     trace_health: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     trace_error: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunSummary {
+    item_id: String,
+    run_id: String,
+    status: String,
+    cancel_requested: bool,
+    occupies_slot: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StartedRun {
+    item_id: String,
+    run_id: String,
 }
 
 struct Bridge {
@@ -96,6 +114,9 @@ struct Bridge {
     initialization_error: Mutex<Option<String>>,
     trace_healthy: Arc<AtomicBool>,
     trace_error: Arc<Mutex<Option<String>>>,
+    draining: AtomicBool,
+    // false means running; true means one more pass was requested while running.
+    reconciling: Mutex<HashMap<String, bool>>,
 }
 
 #[derive(Default)]
@@ -277,6 +298,8 @@ impl Bridge {
             initialization_error: Mutex::new(None),
             trace_healthy: Arc::new(AtomicBool::new(false)),
             trace_error: Arc::new(Mutex::new(None)),
+            draining: AtomicBool::new(false),
+            reconciling: Mutex::new(HashMap::new()),
         });
         for saved in bridge.workbench.load_runs()? {
             bridge.registry.lock().unwrap().insert(RunRecord {
@@ -286,10 +309,18 @@ impl Bridge {
                 invocation_kind: saved.invocation_kind,
                 submission_state: saved.submission_state.clone(),
                 cached_status: saved.cached_status.clone(),
-                root_created: false,
-                cancel_requested: false,
+                root_created: saved.submission_state == "durable"
+                    || saved.submission_state == "created",
+                cancel_requested: saved.cancel_requested,
+                interrupt_pending: saved.interrupt_pending,
+                request_active: false,
+                startup_recovery: true,
+                revision: 0,
                 pending_interaction: None,
-                occupies_slot: false,
+                occupies_slot: !matches!(
+                    saved.submission_state.as_str(),
+                    "terminal" | "submission_failed"
+                ),
             });
         }
         let reader = bridge.clone();
@@ -313,7 +344,7 @@ impl Bridge {
         Ok(bridge)
     }
 
-    fn initialize(&self) -> Result<(), String> {
+    fn initialize(self: &Arc<Self>) -> Result<(), String> {
         let negotiated = self.request_wait(
             "initialize",
             json!({ "protocolVersion": "1.12", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }),
@@ -339,20 +370,140 @@ impl Bridge {
         Ok(())
     }
 
-    fn reconcile_saved_runs(&self) {
+    fn reconcile_saved_runs(self: &Arc<Self>) {
         let ids = self.registry.lock().unwrap().ids_requiring_reconciliation();
         for run_id in ids {
-            let inspection =
-                self.request_wait("run/inspect", json!({ "runId": run_id }), REQUEST_TIMEOUT);
-            let classification = reconciliation_classification(&inspection);
-            if let Some(record) = self.registry.lock().unwrap().get_mut(&run_id) {
-                record.cached_status = classification.0.into();
-                record.submission_state = classification.1.into();
-                record.occupies_slot = false;
+            self.reconcile_run(run_id);
+        }
+    }
+
+    fn reconcile_run(self: &Arc<Self>, run_id: String) {
+        let mut reconciling = self.reconciling.lock().unwrap();
+        if let Some(rerun) = reconciling.get_mut(&run_id) {
+            *rerun = true;
+            return;
+        }
+        reconciling.insert(run_id.clone(), false);
+        drop(reconciling);
+        let bridge = self.clone();
+        std::thread::spawn(move || {
+            let mut attempted_interrupt = false;
+            loop {
+                let (revision, previous, root_created, definitely_absent) = bridge
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .get(&run_id)
+                    .map(|record| {
+                        (
+                            record.revision,
+                            record.occupies_slot,
+                            record.root_created,
+                            record.startup_recovery
+                                && !record.request_active
+                                && !record.root_created
+                                && matches!(
+                                    record.submission_state.as_str(),
+                                    "reserved" | "submitted"
+                                ),
+                        )
+                    })
+                    .unwrap_or((0, false, false, false));
+                let inspection = bridge.inspect_for_recovery(&run_id);
+                let state = reconciliation_classification(
+                    &inspection,
+                    previous,
+                    root_created,
+                    definitely_absent,
+                );
+                let result = recovered_result(&inspection);
+                let mut applied_quiescent = false;
+                let mut stale = false;
+                let mut persisted = None;
+                let mut should_interrupt = false;
+                if let Some(record) = bridge.registry.lock().unwrap().get_mut(&run_id) {
+                    match apply_run_state(record, &state, Some(revision)) {
+                        ApplyState::Accepted => {
+                            applied_quiescent = !state.occupies_slot;
+                            persisted = Some((
+                                record.cached_status.clone(),
+                                record.submission_state.clone(),
+                            ));
+                        }
+                        ApplyState::Stale => stale = true,
+                        ApplyState::Rejected => {}
+                    }
+                    should_interrupt = !attempted_interrupt
+                        && !stale
+                        && record.occupies_slot
+                        && record.root_created
+                        && record.interrupt_pending;
+                }
+                if let Some((status, submission)) = persisted {
+                    let _ = bridge.workbench.update_run(&run_id, &status, &submission);
+                }
+                if applied_quiescent && result.is_some() {
+                    let _ = bridge
+                        .workbench
+                        .store_result(&run_id, result.as_ref().unwrap());
+                }
+                if stale {
+                    if let Some(rerun) = bridge.reconciling.lock().unwrap().get_mut(&run_id) {
+                        *rerun = true;
+                    }
+                }
+                if should_interrupt {
+                    attempted_interrupt = true;
+                    if bridge.issue_interrupt(&run_id) {
+                        if let Some(rerun) = bridge.reconciling.lock().unwrap().get_mut(&run_id) {
+                            *rerun = true;
+                        }
+                    }
+                }
+                if applied_quiescent {
+                    let _ = bridge.app.emit(
+                        "adaptive-agent://run-finished",
+                        json!({ "runId": run_id, "result": result }),
+                    );
+                }
+                bridge.emit_state();
+                let mut active = bridge.reconciling.lock().unwrap();
+                if active.get(&run_id).copied().unwrap_or(false) {
+                    active.insert(run_id.clone(), false);
+                    continue;
+                }
+                active.remove(&run_id);
+                break;
             }
-            let _ = self
-                .workbench
-                .update_run(&run_id, classification.0, classification.1);
+        });
+    }
+
+    fn issue_interrupt(&self, run_id: &str) -> bool {
+        if let Some(record) = self.registry.lock().unwrap().get_mut(run_id) {
+            record.interrupt_pending = true;
+            record.revision += 1;
+        }
+        let result = self.request_wait(
+            "run/interrupt",
+            json!({ "runId": run_id }),
+            Duration::from_secs(10),
+        );
+        if result.is_ok() {
+            // Acceptance is not quiescence. Keep retry intent durable until inspection proves it.
+            let _ = self.workbench.set_interrupt_pending(run_id, true);
+            if let Some(record) = self.registry.lock().unwrap().get_mut(run_id) {
+                // This process has delivered the interrupt. A manual retry or restart can arm it again.
+                record.interrupt_pending = false;
+                record.revision += 1;
+            }
+            true
+        } else {
+            let _ = self.workbench.set_interrupt_pending(run_id, true);
+            let _ = self.app.emit(
+                "adaptive-agent://control-error",
+                json!({ "runId": run_id, "error": result.unwrap_err() }),
+            );
+            false
         }
     }
 
@@ -442,40 +593,59 @@ impl Bridge {
                     return;
                 };
                 record.root_created = true;
+                record.revision += 1;
                 record.cancel_requested
             };
-            let _ = self.workbench.update_run(run_id, "running", "created");
+            let persisted = self.registry.lock().unwrap().get(run_id).map(|record| {
+                (
+                    record.cached_status.clone(),
+                    record.submission_state.clone(),
+                )
+            });
+            if let Some((status, submission)) = persisted {
+                let _ = self.workbench.update_run(run_id, &status, &submission);
+            }
             self.emit_state();
             if cancel {
                 let bridge = self.clone();
                 let run_id = run_id.to_string();
                 std::thread::spawn(move || {
-                    if let Err(error) = bridge.request_wait(
-                        "run/interrupt",
-                        json!({ "runId": run_id }),
-                        Duration::from_secs(10),
-                    ) {
-                        let _ = bridge
-                            .app
-                            .emit("adaptive-agent://run-finished", json!({ "error": error }));
+                    if bridge.issue_interrupt(&run_id) {
+                        bridge.reconcile_run(run_id);
                     }
                 });
             }
         }
         if kind == "run.status_changed" {
             if let Some(status) = event.pointer("/payload/toStatus").and_then(Value::as_str) {
-                let state = state_for_durable_status(status);
-                if let Some(record) = self.registry.lock().unwrap().get_mut(run_id) {
-                    record.cached_status = state.cached_status.into();
-                    record.submission_state = state.submission_state.into();
-                    record.pending_interaction = state.pending_interaction.map(str::to_owned);
-                    record.occupies_slot = state.occupies_slot;
+                let mut registry = self.registry.lock().unwrap();
+                let persisted = if let Some(record) = registry.get_mut(run_id) {
+                    let state = state_for_durable_status(status, record.occupies_slot);
+                    if apply_run_state(record, &state, None) == ApplyState::Accepted {
+                        Some((
+                            record.cached_status.clone(),
+                            record.submission_state.clone(),
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                drop(registry);
+                if let Some((cached_status, submission_state)) = persisted {
+                    let _ = self
+                        .workbench
+                        .update_run(run_id, &cached_status, &submission_state);
                 }
-                let _ =
-                    self.workbench
-                        .update_run(run_id, state.cached_status, state.submission_state);
                 self.emit_state();
             }
+        }
+        if matches!(
+            kind,
+            "run.completed" | "run.failed" | "run.interrupted" | "replan.required"
+        ) {
+            self.reconcile_run(run_id.to_owned());
         }
         let message = match kind {
             "run.created" => "Run started",
@@ -496,10 +666,15 @@ impl Bridge {
         );
     }
 
-    fn start_run(self: &Arc<Self>, task: String) -> Result<(), String> {
+    fn start_run(self: &Arc<Self>, task: String) -> Result<StartedRun, String> {
         let _submission = self.submission.lock().unwrap();
-        if self.registry.lock().unwrap().any_active() {
-            return Err("A run is already active.".into());
+        if self.draining.load(Ordering::SeqCst) {
+            return Err("The desktop is draining and cannot start new runs.".into());
+        }
+        if !self.registry.lock().unwrap().has_capacity() {
+            return Err(
+                "All 3 task slots are occupied. Stop or wait for a run, then try again.".into(),
+            );
         }
         let run_id = uuid::Uuid::new_v4().to_string();
         let item_id = uuid::Uuid::new_v4().to_string();
@@ -531,102 +706,178 @@ impl Bridge {
             invocation_kind: "run".into(),
             cached_status: "reserved".into(),
             submission_state: "reserved".into(),
+            cancel_requested: false,
+            interrupt_pending: false,
         };
-        self.workbench.reserve_task(&reservation)?;
         self.registry.lock().unwrap().insert(RunRecord {
             run_id: run_id.clone(),
-            item_id,
+            item_id: item_id.clone(),
             session_id: None,
             invocation_kind: "run".into(),
             submission_state: "submitted".into(),
             cached_status: "submitted".into(),
             root_created: false,
             cancel_requested: false,
+            interrupt_pending: false,
+            request_active: true,
+            startup_recovery: false,
+            revision: 0,
             pending_interaction: None,
             occupies_slot: true,
         });
-        self.workbench
-            .update_run(&run_id, "submitted", "submitted")?;
-        let (_, receiver) =
+        if let Err(error) = self.workbench.reserve_task(&reservation) {
+            self.registry.lock().unwrap().remove(&run_id);
+            return Err(error);
+        }
+        if let Err(error) = self.workbench.update_run(&run_id, "submitted", "submitted") {
+            self.registry.lock().unwrap().remove(&run_id);
+            let _ = self.workbench.delete_item(&item_id);
+            return Err(error);
+        }
+        let (_request_id, receiver) =
             match self.request("agent/run", json!({ "runId": run_id, "goal": task })) {
                 Ok(request) => request,
                 Err(error) => {
                     self.registry.lock().unwrap().terminal(&run_id, "failed");
-                    let _ = self.workbench.update_run(&run_id, "failed", "write_failed");
+                    self.registry.lock().unwrap().remove(&run_id);
+                    let _ = self.workbench.delete_item(&item_id);
                     return Err(error);
                 }
             };
         self.emit_state();
         let bridge = self.clone();
+        let started = StartedRun {
+            item_id,
+            run_id: run_id.clone(),
+        };
         std::thread::spawn(move || {
-            let response = receiver.recv().unwrap_or_else(|_| {
-                Err("The agent runtime exited before returning a result.".into())
-            });
-            let state = match &response {
-                Ok(result) => state_for_execution_result(result),
-                Err(_) => RunState {
-                    cached_status: "failed",
-                    submission_state: "terminal",
-                    pending_interaction: None,
-                    occupies_slot: false,
-                },
+            let response = match receiver.recv_timeout(Duration::from_secs(30)) {
+                Ok(response) => response,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    bridge.reconcile_run(run_id.clone());
+                    receiver.recv().unwrap_or_else(|_| {
+                        Err("The agent runtime exited before returning a result.".into())
+                    })
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    Err("The agent runtime exited before returning a result.".into())
+                }
             };
             if let Some(record) = bridge.registry.lock().unwrap().get_mut(&run_id) {
-                record.cached_status = state.cached_status.into();
-                record.submission_state = state.submission_state.into();
-                record.pending_interaction = state.pending_interaction.map(str::to_owned);
-                record.occupies_slot = state.occupies_slot;
+                record.request_active = false;
+                record.revision += 1;
             }
-            let _ =
-                bridge
-                    .workbench
-                    .update_run(&run_id, state.cached_status, state.submission_state);
-            let payload = match response {
-                Ok(result) => json!({ "runId": run_id, "result": result }),
-                Err(error) => json!({ "runId": run_id, "error": error }),
-            };
-            let _ = bridge.app.emit("adaptive-agent://run-finished", payload);
+            match response {
+                Ok(result) => {
+                    let state = state_for_execution_result(&result);
+                    let _ = bridge.workbench.store_result(&run_id, &result);
+                    let mut accepted_quiescent = false;
+                    if let Some(record) = bridge.registry.lock().unwrap().get_mut(&run_id) {
+                        accepted_quiescent = apply_run_state(record, &state, None)
+                            == ApplyState::Accepted
+                            && !state.occupies_slot;
+                    }
+                    if let Some(record) = bridge.registry.lock().unwrap().get(&run_id) {
+                        let _ = bridge.workbench.update_run(
+                            &run_id,
+                            &record.cached_status,
+                            &record.submission_state,
+                        );
+                    }
+                    if accepted_quiescent {
+                        let _ = bridge.app.emit(
+                            "adaptive-agent://run-finished",
+                            json!({ "runId": run_id, "result": result }),
+                        );
+                    } else {
+                        bridge.reconcile_run(run_id.clone());
+                    }
+                }
+                Err(error) => {
+                    let _ = bridge.app.emit(
+                        "adaptive-agent://control-error",
+                        json!({ "runId": run_id, "error": error }),
+                    );
+                    bridge.reconcile_run(run_id.clone());
+                }
+            }
             bridge.emit_state();
         });
-        Ok(())
+        Ok(started)
     }
 
-    fn stop_run(&self) -> Result<(), String> {
-        let run_id = self
+    fn stop_run(self: &Arc<Self>, run_id: &str) -> Result<(), String> {
+        let action = self
             .registry
             .lock()
             .unwrap()
-            .active_id()
-            .ok_or("No run is active.")?;
-        let root_created = {
-            let mut registry = self.registry.lock().unwrap();
-            let record = registry.get_mut(&run_id).unwrap();
-            record.cancel_requested = true;
-            record.root_created
-        };
+            .request_cancel(run_id)
+            .map_err(str::to_owned)?;
+        if action == CancelAction::Quiescent {
+            return Ok(());
+        }
+        if action == CancelAction::AlreadyRequested {
+            self.reconcile_run(run_id.to_owned());
+            return Ok(());
+        }
+        if let Err(error) = self.workbench.set_cancel_requested(run_id) {
+            if let Some(record) = self.registry.lock().unwrap().get_mut(run_id) {
+                record.cancel_requested = false;
+            }
+            return Err(error);
+        }
         self.emit_state();
-        if root_created {
-            self.request_wait(
-                "run/interrupt",
-                json!({ "runId": run_id }),
-                Duration::from_secs(10),
-            )
-            .map(|_| ())
+        if action == CancelAction::Interrupt {
+            let _ = self.workbench.set_interrupt_pending(run_id, true);
+            if self.issue_interrupt(run_id) {
+                self.reconcile_run(run_id.to_owned());
+            }
+            Ok(())
         } else {
             Ok(())
         }
+    }
+
+    fn inspect_for_recovery(&self, run_id: &str) -> Response {
+        let mut last = Err("Inspection unavailable.".into());
+        for _ in 0..3 {
+            last = self.request_wait(
+                "run/inspect",
+                json!({ "runId": run_id }),
+                Duration::from_secs(3),
+            );
+            if last.is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        last
     }
 
     fn snapshot(&self) -> DesktopState {
         let configuration = self.configuration.lock().unwrap().clone();
         let error = self.initialization_error.lock().unwrap().clone();
         let execution_health = if error.is_some() { "error" } else { "ready" };
+        let registry = self.registry.lock().unwrap();
+        let any_stopping = registry.any_stopping();
+        let any_active = registry.any_active();
+        let mut runs = registry
+            .records()
+            .map(|run| RunSummary {
+                item_id: run.item_id.clone(),
+                run_id: run.run_id.clone(),
+                status: run.cached_status.clone(),
+                cancel_requested: run.cancel_requested,
+                occupies_slot: run.occupies_slot,
+            })
+            .collect::<Vec<_>>();
+        runs.sort_by(|left, right| left.run_id.cmp(&right.run_id));
         DesktopState {
             status: if error.is_some() {
                 "error"
-            } else if self.registry.lock().unwrap().any_stopping() {
+            } else if any_stopping {
                 "stopping"
-            } else if self.registry.lock().unwrap().any_active() {
+            } else if any_active {
                 "running"
             } else {
                 "ready"
@@ -634,7 +885,9 @@ impl Bridge {
             configuration_valid: error.is_none() && configuration.is_some(),
             configuration,
             error,
-            active_run_id: self.registry.lock().unwrap().active_id(),
+            runs,
+            occupied_slot_count: registry.occupied_slot_count(),
+            capacity: CAPACITY,
             execution_health,
             trace_health: if self.trace_healthy.load(Ordering::SeqCst) {
                 "ready"
@@ -730,6 +983,8 @@ fn replace_bridge(app: &AppHandle) -> Arc<Bridge> {
                 initialization_error: Mutex::new(Some(error)),
                 trace_healthy: Arc::new(AtomicBool::new(false)),
                 trace_error: Arc::new(Mutex::new(None)),
+                draining: AtomicBool::new(false),
+                reconciling: Mutex::new(HashMap::new()),
             })
         }
     };
@@ -817,7 +1072,7 @@ fn reload_settings(
 }
 
 #[tauri::command]
-fn start_run(task: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+fn start_run(task: String, state: tauri::State<'_, AppState>) -> Result<StartedRun, String> {
     if task.trim().is_empty() {
         return Err("Task description is required.".into());
     }
@@ -838,7 +1093,7 @@ fn start_run(task: String, state: tauri::State<'_, AppState>) -> Result<(), Stri
 }
 
 #[tauri::command]
-fn stop_run(state: tauri::State<'_, AppState>) -> Result<(), String> {
+fn stop_run(run_id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     state
         .bridge
         .lock()
@@ -846,7 +1101,23 @@ fn stop_run(state: tauri::State<'_, AppState>) -> Result<(), String> {
         .as_ref()
         .cloned()
         .ok_or_else(|| "Desktop runtime is not available.".to_string())?
-        .stop_run()
+        .stop_run(&run_id)
+}
+
+#[tauri::command]
+fn get_run_result(
+    run_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<Value>, String> {
+    state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "Desktop runtime is not available.".to_string())?
+        .workbench
+        .get_result(&run_id)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -858,7 +1129,8 @@ pub fn run() {
             desktop_state,
             reload_settings,
             start_run,
-            stop_run
+            stop_run,
+            get_run_result
         ])
         .setup(|app| {
             replace_bridge(app.handle());
@@ -889,21 +1161,65 @@ fn is_root_run_created(event: &Value) -> bool {
             == event.get("runId").and_then(Value::as_str)
 }
 
-fn reconciliation_classification(inspection: &Response) -> (&'static str, &'static str) {
+fn reconciliation_classification(
+    inspection: &Response,
+    previous_occupancy: bool,
+    root_created: bool,
+    definitely_absent: bool,
+) -> RunState {
     match inspection {
-        Ok(value) => match value.pointer("/run/status").and_then(Value::as_str) {
-            Some("succeeded") => ("succeeded", "terminal"),
-            Some("failed") => ("failed", "terminal"),
-            Some("cancelled") => ("cancelled", "terminal"),
-            Some("interrupted") => ("interrupted", "terminal"),
-            Some("clarification_requested") => ("clarification_requested", "terminal"),
-            Some("replan_required") => ("replan_required", "terminal"),
-            Some(_) | None => ("recovery_required", "recovery_required"),
-        },
-        Err(error) if error.to_ascii_lowercase().contains("not found") => {
-            ("submission_failed", "submission_failed")
+        Ok(value)
+            if value.get("run").is_some_and(Value::is_null)
+                && value
+                    .get("events")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty)
+                && !root_created
+                && definitely_absent =>
+        {
+            submission_failed()
         }
-        Err(_) => ("recovery_required", "recovery_required"),
+        Ok(value) => value
+            .pointer("/run/status")
+            .and_then(Value::as_str)
+            .map(|status| state_for_durable_status(status, previous_occupancy))
+            .unwrap_or_else(|| recovery_required(previous_occupancy)),
+        Err(error)
+            if !root_created
+                && definitely_absent
+                && error.to_ascii_lowercase().contains("not found") =>
+        {
+            submission_failed()
+        }
+        Err(_) => recovery_required(previous_occupancy),
+    }
+}
+
+fn submission_failed() -> RunState {
+    RunState {
+        cached_status: "submission_failed",
+        submission_state: "submission_failed",
+        pending_interaction: None,
+        occupies_slot: false,
+        proves_existing: false,
+    }
+}
+
+fn recovered_result(inspection: &Response) -> Option<Value> {
+    inspection
+        .as_ref()
+        .ok()
+        .and_then(|value| value.pointer("/run/result"))
+        .cloned()
+}
+
+fn recovery_required(previous_occupancy: bool) -> RunState {
+    RunState {
+        cached_status: "recovery_required",
+        submission_state: "recovery_required",
+        pending_interaction: None,
+        occupies_slot: previous_occupancy,
+        proves_existing: false,
     }
 }
 
@@ -912,28 +1228,56 @@ struct RunState {
     submission_state: &'static str,
     pending_interaction: Option<&'static str>,
     occupies_slot: bool,
+    proves_existing: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApplyState {
+    Accepted,
+    Stale,
+    Rejected,
+}
+
+fn apply_run_state(
+    record: &mut RunRecord,
+    state: &RunState,
+    expected_revision: Option<u64>,
+) -> ApplyState {
+    if expected_revision.is_some_and(|revision| revision != record.revision) {
+        return ApplyState::Stale;
+    }
+    // Once quiescent evidence has been accepted, delayed active/recovery evidence cannot revive it.
+    if !record.occupies_slot && state.occupies_slot {
+        return ApplyState::Rejected;
+    }
+    record.cached_status = state.cached_status.into();
+    record.submission_state = state.submission_state.into();
+    record.pending_interaction = state.pending_interaction.map(str::to_owned);
+    record.occupies_slot = state.occupies_slot;
+    if state.proves_existing {
+        record.root_created = true;
+    }
+    record.revision += 1;
+    ApplyState::Accepted
 }
 
 fn state_for_execution_result(result: &Value) -> RunState {
     match result.get("status").and_then(Value::as_str) {
-        Some("success") => state_for_durable_status("succeeded"),
+        Some("success") => state_for_durable_status("succeeded", true),
         Some("failure") => match result.get("code").and_then(Value::as_str) {
-            Some("INTERRUPTED") => state_for_durable_status("interrupted"),
-            Some("REPLAN_REQUIRED") => state_for_durable_status("replan_required"),
-            _ => state_for_durable_status("failed"),
+            Some("INTERRUPTED") => state_for_durable_status("interrupted", true),
+            Some("REPLAN_REQUIRED") => state_for_durable_status("replan_required", true),
+            _ => state_for_durable_status("failed", true),
         },
-        Some("approval_requested") => state_for_durable_status("awaiting_approval"),
-        Some("clarification_requested") => state_for_durable_status("clarification_requested"),
-        _ => RunState {
-            cached_status: "recovery_required",
-            submission_state: "recovery_required",
-            pending_interaction: None,
-            occupies_slot: false,
-        },
+        Some("approval_requested") => state_for_durable_status("awaiting_approval", true),
+        Some("clarification_requested") => {
+            state_for_durable_status("clarification_requested", true)
+        }
+        _ => recovery_required(true),
     }
 }
 
-fn state_for_durable_status(status: &str) -> RunState {
+fn state_for_durable_status(status: &str, previous_occupancy: bool) -> RunState {
     let quiescent = matches!(
         status,
         "succeeded"
@@ -958,9 +1302,32 @@ fn state_for_durable_status(status: &str) -> RunState {
             "replan_required" => "replan_required",
             _ => "recovery_required",
         },
-        submission_state: if quiescent { "terminal" } else { "durable" },
+        submission_state: if quiescent {
+            "terminal"
+        } else if matches!(
+            status,
+            "queued" | "planning" | "running" | "awaiting_subagent" | "awaiting_approval"
+        ) {
+            "durable"
+        } else {
+            "recovery_required"
+        },
         pending_interaction: (status == "awaiting_approval").then_some("approval"),
-        occupies_slot: !quiescent,
+        occupies_slot: if quiescent {
+            false
+        } else if matches!(
+            status,
+            "queued" | "planning" | "running" | "awaiting_subagent" | "awaiting_approval"
+        ) {
+            true
+        } else {
+            previous_occupancy
+        },
+        proves_existing: quiescent
+            || matches!(
+                status,
+                "queued" | "planning" | "running" | "awaiting_subagent" | "awaiting_approval"
+            ),
     }
 }
 
@@ -1003,22 +1370,64 @@ mod tests {
 
     #[test]
     fn reconciliation_classifies_missing_terminal_and_nonterminal_runs_as_quiescent() {
-        assert_eq!(
-            reconciliation_classification(&Err("Run not found".into())),
-            ("submission_failed", "submission_failed")
+        let missing =
+            reconciliation_classification(&Err("Run not found".into()), true, false, true);
+        assert_eq!(missing.cached_status, "submission_failed");
+        let succeeded = reconciliation_classification(
+            &Ok(json!({ "run": { "status": "succeeded", "result": "done" } })),
+            true,
+            true,
+            false,
         );
-        assert_eq!(
-            reconciliation_classification(&Ok(json!({ "run": { "status": "succeeded" } }))),
-            ("succeeded", "terminal")
+        assert_eq!(succeeded.cached_status, "succeeded");
+        assert!(!succeeded.occupies_slot);
+        let running = reconciliation_classification(
+            &Ok(json!({ "run": { "status": "running" } })),
+            true,
+            true,
+            false,
         );
+        assert_eq!(running.cached_status, "running");
+        assert!(running.occupies_slot);
+        let unavailable =
+            reconciliation_classification(&Err("transport unavailable".into()), true, true, false);
+        assert_eq!(unavailable.cached_status, "recovery_required");
+        assert!(unavailable.occupies_slot);
+    }
+
+    #[test]
+    fn unknown_and_absent_inspection_semantics() {
+        assert!(state_for_durable_status("future_status", true).occupies_slot);
+        assert!(!state_for_durable_status("future_status", false).occupies_slot);
+        let absent = Ok(json!({ "run": null, "events": [] }));
+        assert!(reconciliation_classification(&absent, true, false, false).occupies_slot);
+        let startup = reconciliation_classification(&absent, true, false, true);
+        assert_eq!(startup.submission_state, "submission_failed");
+        assert!(!startup.occupies_slot);
+        assert!(reconciliation_classification(&absent, true, true, true).occupies_slot);
+    }
+
+    #[test]
+    fn guarded_state_application_is_revision_checked_and_monotonic() {
+        let mut record = registry::tests_record_for_transition();
+        let revision = record.revision;
+        record.revision += 1;
+        let terminal = state_for_durable_status("succeeded", true);
         assert_eq!(
-            reconciliation_classification(&Ok(json!({ "run": { "status": "running" } }))),
-            ("recovery_required", "recovery_required")
+            apply_run_state(&mut record, &terminal, Some(revision)),
+            ApplyState::Stale
         );
+        assert!(record.occupies_slot);
         assert_eq!(
-            reconciliation_classification(&Err("transport unavailable".into())),
-            ("recovery_required", "recovery_required")
+            apply_run_state(&mut record, &terminal, None),
+            ApplyState::Accepted
         );
+        let running = state_for_durable_status("running", false);
+        assert_eq!(
+            apply_run_state(&mut record, &running, None),
+            ApplyState::Rejected
+        );
+        assert_eq!(record.cached_status, "succeeded");
     }
 
     #[test]
@@ -1036,5 +1445,18 @@ mod tests {
             state_for_execution_result(&json!({ "status": "failure", "code": "INTERRUPTED" }));
         assert_eq!(interrupted.cached_status, "interrupted");
         assert!(!interrupted.occupies_slot);
+    }
+
+    #[test]
+    fn lost_response_recovery_reads_final_output_from_execution_inspection() {
+        let inspection = Ok(json!({
+            "run": {
+                "id": "run-1",
+                "status": "succeeded",
+                "result": { "answer": 42 }
+            }
+        }));
+        assert_eq!(recovered_result(&inspection), Some(json!({ "answer": 42 })));
+        assert_eq!(recovered_result(&Err("transport unavailable".into())), None);
     }
 }
