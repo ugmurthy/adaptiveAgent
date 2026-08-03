@@ -34,8 +34,8 @@ describe('desktop bridge protocol', () => {
     );
   });
 
-  it('uses a string for protocol 1.11', () => {
-    expect(DESKTOP_PROTOCOL_VERSION).toBe('1.11');
+  it('uses a string for protocol 1.12', () => {
+    expect(DESKTOP_PROTOCOL_VERSION).toBe('1.12');
   });
 
   it('uses standard JSON-RPC parse, request, method, and params error codes', () => {
@@ -75,7 +75,7 @@ describe('desktop bridge protocol', () => {
       jsonrpc: '2.0',
       id: 'run',
       method: 'agent/run',
-      params: { goal: 'Research', inferenceMode: 'gateway', inferenceTier: 'high', profileRef },
+      params: { runId: 'run-1', goal: 'Research', inferenceMode: 'gateway', inferenceTier: 'high', profileRef },
     }))).toMatchObject({ method: 'agent/run' });
     expect(parseDesktopRpcRequest(JSON.stringify({
       jsonrpc: '2.0',
@@ -87,8 +87,19 @@ describe('desktop bridge protocol', () => {
       jsonrpc: '2.0',
       id: 'bad-profile',
       method: 'agent/chat',
-      params: { message: 'Hello', profileRef: { source: 'server', id: 'missing-fields' } },
+      params: { runId: 'run-2', transcript: [{ role: 'user', content: 'Hello' }], profileRef: { source: 'server', id: 'missing-fields' } },
     }))).toThrowError(expect.objectContaining<Partial<DesktopProtocolError>>({ code: 'INVALID_PARAMS' }));
+  });
+
+  it('requires host run identity and validates complete chat transcripts', () => {
+    for (const params of [{ goal: 'missing id' }, { runId: 'chat-1', message: 'legacy singular message' }]) {
+      expect(() => parseDesktopRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'agent/chat', params })))
+        .toThrowError(expect.objectContaining<Partial<DesktopProtocolError>>({ code: 'INVALID_PARAMS' }));
+    }
+    expect(parseDesktopRpcRequest(JSON.stringify({
+      jsonrpc: '2.0', id: 2, method: 'agent/chat',
+      params: { runId: 'chat-2', sessionId: 'session-1', transcript: [{ role: 'user', content: 'first' }, { role: 'assistant', content: 'reply' }, { role: 'user', content: 'next' }] },
+    }))).toMatchObject({ method: 'agent/chat' });
   });
 
   it('validates configuration-driven runtime initialization', () => {

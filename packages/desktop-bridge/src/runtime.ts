@@ -133,8 +133,8 @@ export class DesktopRuntime {
         const params = request.params!;
         this.validateExecutionSelection(params);
         const sdk = this.requireSdk();
-        const run = this.configurationDriven ? sdk.run.bind(sdk) : sdk.runRaw.bind(sdk);
-        return asJsonValue(await run(params.goal, {
+        return asJsonValue(await sdk.runRaw(params.goal, {
+          runId: asRunId(params.runId),
           ...(params.sessionId ? { sessionId: params.sessionId } : {}),
           ...(params.input === undefined ? {} : { input: params.input }),
           ...(params.inferenceTier ? { inferenceTier: params.inferenceTier } : {}),
@@ -143,7 +143,8 @@ export class DesktopRuntime {
       case 'agent/chat': {
         const params = request.params!;
         this.validateExecutionSelection(params);
-        return asJsonValue(await this.requireSdk().chatRaw(params.message, {
+        return asJsonValue(await this.requireSdk().chatRaw(params.transcript, {
+          runId: asRunId(params.runId),
           ...(params.sessionId ? { sessionId: params.sessionId } : {}),
           ...(params.inferenceTier ? { inferenceTier: params.inferenceTier } : {}),
         }));
@@ -233,7 +234,7 @@ export class DesktopRuntime {
       bridgeVersion: DESKTOP_BRIDGE_VERSION,
       serverInfo: { name: '@adaptive-agent/desktop-bridge', version: DESKTOP_BRIDGE_VERSION },
       capabilities: {
-        methods: DESKTOP_RPC_METHODS.filter((method) => this.negotiatedProtocolVersion === '1.11' || method !== 'auth/updateAccessToken'),
+        methods: DESKTOP_RPC_METHODS.filter((method) => this.negotiatedProtocolVersion !== '1.10' || method !== 'auth/updateAccessToken'),
         notifications: ['runtime/ready', 'agent/event', 'cli/output'],
         cli: {
           commands: [...ADAPTIVE_AGENT_CLI_COMMANDS],
@@ -420,7 +421,7 @@ export class DesktopRuntime {
     const sdk = this.requireSdk();
     await sdk.agent.resolveApproval(asRunId(runId), approved);
     if (!approved) return asJsonValue(await sdk.inspect(asRunId(runId)));
-    return asJsonValue(await sdk.resumeRaw(asRunId(runId)));
+    return { runId, approved: true, resolved: true };
   }
 
   private cliCommands(): JsonValue {

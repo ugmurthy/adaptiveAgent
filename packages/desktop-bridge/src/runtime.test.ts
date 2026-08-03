@@ -82,7 +82,7 @@ describe('desktop runtime protocol', () => {
       params: { protocolVersion: '2.0', clientInfo: { name: 'desktop' } },
     }))).rejects.toMatchObject({
       code: 'UNSUPPORTED_PROTOCOL_VERSION',
-      data: { supportedProtocolVersions: ['1.10', '1.11'] },
+      data: { supportedProtocolVersions: ['1.10', '1.11', '1.12'] },
     });
   });
 

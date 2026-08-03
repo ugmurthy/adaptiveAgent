@@ -15,7 +15,7 @@ describe('desktop bridge process', () => {
         jsonrpc: '2.0',
         id: 'initialize',
         method: 'initialize',
-        params: { protocolVersion: '1.11', clientInfo: { name: 'integration-test' } },
+        params: { protocolVersion: '1.12', clientInfo: { name: 'integration-test' } },
       }),
       JSON.stringify({
         jsonrpc: '2.0',
@@ -39,7 +39,7 @@ describe('desktop bridge process', () => {
     expect(messages[0]).toMatchObject({
       jsonrpc: '2.0',
       method: 'runtime/ready',
-      params: { protocolVersion: '1.11' },
+      params: { protocolVersion: '1.12' },
     });
     expect(messages).toContainEqual(expect.objectContaining({
       jsonrpc: '2.0',

@@ -17,8 +17,37 @@ use tauri_plugin_shell::{
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_NDJSON_FRAME_SIZE: usize = 1024 * 1024;
 
 type Response = Result<Value, String>;
+
+struct NdjsonDecoder {
+    buffer: Vec<u8>,
+    max_frame_size: usize,
+}
+
+impl NdjsonDecoder {
+    fn new(max_frame_size: usize) -> Self { Self { buffer: Vec::new(), max_frame_size } }
+
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<Value>, String> {
+        self.buffer.extend_from_slice(bytes);
+        let mut frames = Vec::new();
+        while let Some(end) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            if end > self.max_frame_size {
+                self.buffer.drain(..=end);
+                return Err("Agent runtime NDJSON frame exceeded the maximum size.".into());
+            }
+            let line: Vec<u8> = self.buffer.drain(..=end).take(end).collect();
+            if line.iter().all(u8::is_ascii_whitespace) { continue; }
+            frames.push(serde_json::from_slice(&line).map_err(|_| "Agent runtime emitted invalid NDJSON.".to_string())?);
+        }
+        if self.buffer.len() > self.max_frame_size {
+            self.buffer.clear();
+            return Err("Agent runtime NDJSON frame exceeded the maximum size.".into());
+        }
+        Ok(frames)
+    }
+}
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,6 +66,8 @@ struct Bridge {
     app: AppHandle,
     child: Mutex<Option<CommandChild>>,
     pending: Mutex<HashMap<u64, Sender<Response>>>,
+    decoder: Mutex<NdjsonDecoder>,
+    generation: u64,
     next_id: AtomicU64,
     active: AtomicBool,
     stopping: AtomicBool,
@@ -64,6 +95,8 @@ impl Bridge {
             app: app.clone(),
             child: Mutex::new(Some(child)),
             pending: Mutex::new(HashMap::new()),
+            decoder: Mutex::new(NdjsonDecoder::new(MAX_NDJSON_FRAME_SIZE)),
+            generation: 1,
             next_id: AtomicU64::new(1),
             active: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
@@ -77,7 +110,7 @@ impl Bridge {
         tauri::async_runtime::spawn(async move {
             while let Some(event) = events.recv().await {
                 match event {
-                    CommandEvent::Stdout(bytes) => reader.handle_stdout(&bytes),
+                    CommandEvent::Stdout(bytes) => reader.handle_stdout(1, &bytes),
                     CommandEvent::Stderr(_) => {
                         // Sidecar diagnostics stay native and are deliberately not logged or sent to the webview.
                     }
@@ -97,11 +130,11 @@ impl Bridge {
     fn initialize(&self) -> Result<(), String> {
         let negotiated = self.request_wait(
             "initialize",
-            json!({ "protocolVersion": "1.11", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }),
+            json!({ "protocolVersion": "1.12", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }),
             REQUEST_TIMEOUT,
         )?;
-        if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.11") {
-            return Err("The sidecar did not negotiate desktop protocol 1.11.".into());
+        if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.12") {
+            return Err("The sidecar did not negotiate desktop protocol 1.12.".into());
         }
         let initialized = self.request_wait(
             "runtime/initialize",
@@ -142,8 +175,16 @@ impl Bridge {
         })?
     }
 
-    fn handle_stdout(self: &Arc<Self>, bytes: &[u8]) {
-        let Ok(message) = serde_json::from_slice::<Value>(bytes) else { return };
+    fn handle_stdout(self: &Arc<Self>, generation: u64, bytes: &[u8]) {
+        if generation != self.generation { return; }
+        let messages = match self.decoder.lock().unwrap().push(bytes) {
+            Ok(messages) => messages,
+            Err(error) => { self.fail_all(&error); return; }
+        };
+        for message in messages { self.handle_message(message); }
+    }
+
+    fn handle_message(self: &Arc<Self>, message: Value) {
         if message.get("method").and_then(Value::as_str) == Some("agent/event") {
             self.handle_agent_event(message.get("params").unwrap_or(&Value::Null));
             return;
@@ -195,8 +236,9 @@ impl Bridge {
         if self.active.swap(true, Ordering::SeqCst) {
             return Err("A run is already active.".into());
         }
-        *self.active_run_id.lock().unwrap() = None;
-        let (_, receiver) = match self.request("agent/run", json!({ "goal": task })) {
+        let run_id = uuid::Uuid::new_v4().to_string();
+        *self.active_run_id.lock().unwrap() = Some(run_id.clone());
+        let (_, receiver) = match self.request("agent/run", json!({ "runId": run_id, "goal": task })) {
             Ok(request) => request,
             Err(error) => { self.active.store(false, Ordering::SeqCst); return Err(error); }
         };
@@ -278,7 +320,7 @@ fn replace_bridge(app: &AppHandle) -> Arc<Bridge> {
         Err(error) => {
             // A non-running placeholder keeps renderer state and errors restricted to the same API.
             Arc::new(Bridge {
-                app: app.clone(), child: Mutex::new(None), pending: Mutex::new(HashMap::new()), next_id: AtomicU64::new(1),
+                app: app.clone(), child: Mutex::new(None), pending: Mutex::new(HashMap::new()), decoder: Mutex::new(NdjsonDecoder::new(MAX_NDJSON_FRAME_SIZE)), generation: 1, next_id: AtomicU64::new(1),
                 active: AtomicBool::new(false), stopping: AtomicBool::new(false), queued_stop: AtomicBool::new(false),
                 expected_shutdown: AtomicBool::new(true), active_run_id: Mutex::new(None),
                 configuration: Mutex::new(None), initialization_error: Mutex::new(Some(error)),
@@ -353,5 +395,21 @@ mod tests {
         let child = json!({ "type": "run.created", "runId": "child", "payload": { "rootRunId": "root", "delegationDepth": 1 } });
         assert!(is_root_run_created(&root));
         assert!(!is_root_run_created(&child));
+    }
+
+    #[test]
+    fn ndjson_decoder_handles_partial_and_multiple_out_of_order_frames() {
+        let mut decoder = NdjsonDecoder::new(128);
+        assert!(decoder.push(b"{\"id\":2").unwrap().is_empty());
+        let frames = decoder.push(b"}\n{\"id\":1}\n").unwrap();
+        assert_eq!(frames, vec![json!({ "id": 2 }), json!({ "id": 1 })]);
+    }
+
+    #[test]
+    fn ndjson_decoder_rejects_oversized_frames_and_recovers() {
+        let mut decoder = NdjsonDecoder::new(8);
+        assert!(decoder.push(b"123456789").unwrap_err().contains("maximum size"));
+        assert_eq!(decoder.push(b"{\"a\":1}\n").unwrap(), vec![json!({ "a": 1 })]);
+        assert!(decoder.push(b"{}\n123456789").unwrap_err().contains("maximum size"));
     }
 }
