@@ -102,6 +102,24 @@ describe('desktop bridge protocol', () => {
     }))).toMatchObject({ method: 'agent/chat' });
   });
 
+  it('accepts a caller-selected continuation run identity', () => {
+    expect(parseDesktopRpcRequest(JSON.stringify({
+      jsonrpc: '2.0',
+      id: 'continue',
+      method: 'run/continue',
+      params: { runId: 'source-run', continuationRunId: 'continuation-run' },
+    }))).toMatchObject({
+      method: 'run/continue',
+      params: { runId: 'source-run', continuationRunId: 'continuation-run' },
+    });
+    expect(() => parseDesktopRpcRequest(JSON.stringify({
+      jsonrpc: '2.0',
+      id: 'bad-continue',
+      method: 'run/continue',
+      params: { runId: 'source-run', continuationRunId: '' },
+    }))).toThrowError(expect.objectContaining<Partial<DesktopProtocolError>>({ code: 'INVALID_PARAMS' }));
+  });
+
   it('validates configuration-driven runtime initialization', () => {
     expect(parseDesktopRpcRequest(JSON.stringify({
       jsonrpc: '2.0',

@@ -880,13 +880,17 @@ describe('AdaptiveAgent', () => {
       },
     });
 
-    const continuedResult = await agent.continueRun({ fromRunId: failedResult.runId });
+    const continuationRunId = '00000000-0000-4000-8000-000000000042';
+    const continuedResult = await agent.continueRun({
+      fromRunId: failedResult.runId,
+      continuationRunId,
+    });
     expect(continuedResult).toMatchObject({
       status: 'success',
       output: 'Recovered from the prior lookup result.',
       stepsUsed: 2,
     });
-    expect(continuedResult.runId).not.toBe(failedResult.runId);
+    expect(continuedResult.runId).toBe(continuationRunId);
 
     const sourceRun = await runStore.getRun(failedResult.runId);
     const continuationRun = await runStore.getRun(continuedResult.runId);

@@ -422,14 +422,13 @@ async function refreshMeshModelRates(
 }
 
 function toMeshModelRate(model: ModelInfo): MeshModelRate | undefined {
-  const promptUsdPer1k = readFiniteNumber(
-    model.pricing.prompt_usd_per_1k_discounted,
-    model.pricing.prompt_usd_per_1k,
-  );
-  const completionUsdPer1k = readFiniteNumber(
-    model.pricing.completion_usd_per_1k_discounted,
-    model.pricing.completion_usd_per_1k,
-  );
+  const pricing = model.pricing as unknown as Record<string, unknown>;
+  const discountPct = readFiniteNumber(pricing.discount_pct);
+  const discountMultiplier = discountPct !== undefined && discountPct >= 0 && discountPct <= 100
+    ? 1 - discountPct / 100
+    : 1;
+  const promptUsdPer1k = readMeshTokenRatePer1k(pricing, 'prompt', discountMultiplier);
+  const completionUsdPer1k = readMeshTokenRatePer1k(pricing, 'completion', discountMultiplier);
 
   if (promptUsdPer1k === undefined || completionUsdPer1k === undefined) {
     if (model.is_free) {
@@ -439,6 +438,30 @@ function toMeshModelRate(model: ModelInfo): MeshModelRate | undefined {
   }
 
   return { promptUsdPer1k, completionUsdPer1k };
+}
+
+function readMeshTokenRatePer1k(
+  pricing: Record<string, unknown>,
+  kind: 'prompt' | 'completion',
+  discountMultiplier: number,
+): number | undefined {
+  const discountedPer1k = readFiniteNumber(pricing[`${kind}_usd_per_1k_discounted`]);
+  if (discountedPer1k !== undefined) {
+    return discountedPer1k;
+  }
+
+  const discountedPer1m = readFiniteNumber(pricing[`${kind}_usd_per_1m_discounted`]);
+  if (discountedPer1m !== undefined) {
+    return discountedPer1m / 1000;
+  }
+
+  const per1k = readFiniteNumber(pricing[`${kind}_usd_per_1k`]);
+  if (per1k !== undefined) {
+    return per1k * discountMultiplier;
+  }
+
+  const per1m = readFiniteNumber(pricing[`${kind}_usd_per_1m`]);
+  return per1m === undefined ? undefined : (per1m / 1000) * discountMultiplier;
 }
 
 function estimateCostFromRate(

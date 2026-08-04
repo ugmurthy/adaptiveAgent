@@ -1971,6 +1971,39 @@ describe('MeshAdapter', () => {
     expect(fetchSpy.mock.calls.filter((call) => call[0] === 'https://api.meshapi.ai/v1/models')).toHaveLength(1);
   });
 
+  it('estimates Mesh usage from per-million-token catalog pricing', async () => {
+    const adapter = new MeshAdapter({ model: 'anthropic/claude-haiku-4.5', apiKey: 'mesh-pricing-key-per-1m' });
+    mockFetchSseResponse([
+      meshDelta({ content: 'priced' }, { model: 'anthropic/claude-haiku-4.5' }),
+      meshDelta(
+        {},
+        {
+          finishReason: 'stop',
+          model: 'anthropic/claude-haiku-4.5',
+          usage: { prompt_tokens: 1_000_000, completion_tokens: 100_000, total_tokens: 1_100_000 },
+        },
+      ),
+    ]);
+    mockFetchResponse([
+      {
+        id: 'anthropic/claude-haiku-4.5',
+        name: 'Claude Haiku 4.5',
+        context_length: 200000,
+        is_free: false,
+        pricing: {
+          pricing_unit: 'per_1m_tokens',
+          prompt_usd_per_1m: '1.00',
+          completion_usd_per_1m: '5.00',
+          discount_pct: '15.00',
+        },
+      },
+    ]);
+
+    const result = await adapter.generate(simpleRequest());
+
+    expect(result.usage?.estimatedCostUSD).toBeCloseTo(1.275);
+  });
+
   it('falls back to configured Mesh model id when the streamed model id is shortened', async () => {
     const adapter = new MeshAdapter({ model: 'qwen/qwen3.5-27b', apiKey: 'mesh-pricing-key-4' });
     mockFetchSseResponse([

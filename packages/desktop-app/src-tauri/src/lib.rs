@@ -19,7 +19,9 @@ use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent},
     ShellExt,
 };
-use workbench::{ChatItem, ChatMessage, PendingApproval, Reservation, WorkbenchDb};
+use workbench::{
+    now, ChatItem, ChatMessage, PendingApproval, PendingRunRecovery, Reservation, WorkbenchDb,
+};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -92,10 +94,12 @@ struct RunSummary {
     item_id: String,
     run_id: String,
     title: String,
+    created_at: String,
     invocation_kind: String,
     status: String,
     cancel_requested: bool,
     occupies_slot: bool,
+    steerable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pending_approval: Option<PendingApproval>,
 }
@@ -437,6 +441,7 @@ impl Bridge {
                 run_id: saved.run_id,
                 item_id: saved.item_id,
                 title: saved.title,
+                created_at: saved.created_at,
                 session_id: saved.session_id,
                 invocation_kind: saved.invocation_kind,
                 submission_state: saved.submission_state.clone(),
@@ -521,6 +526,7 @@ impl Bridge {
         *self.initialization_error.lock().unwrap() = None;
         self.prime_run_roots();
         self.reconcile_saved_runs();
+        self.recover_pending_run_operations();
         self.recover_pending_approval_operations();
         self.recover_deletion_jobs();
         Ok(())
@@ -534,6 +540,65 @@ impl Bridge {
             if let Err(error) = self.execute_deletion_job(&job) {
                 let _ = self.workbench.fail_deletion_job(&job.id, &error);
             }
+        }
+    }
+
+    fn recover_pending_run_operations(self: &Arc<Self>) {
+        let Ok(operations) = self.workbench.load_run_recovery_operations() else {
+            return;
+        };
+        for operation in operations {
+            let bridge = self.clone();
+            std::thread::spawn(move || bridge.recover_pending_run_operation(operation));
+        }
+    }
+
+    fn recover_pending_run_operation(self: &Arc<Self>, operation: PendingRunRecovery) {
+        let inspection = match self.inspect_for_recovery(&operation.run_id) {
+            Ok(inspection) => inspection,
+            Err(error) => {
+                let _ = self.app.emit(
+                    "adaptive-agent://control-error",
+                    json!({"runId":operation.run_id,"error":format!("Unable to inspect pending recovery: {error}")}),
+                );
+                return;
+            }
+        };
+        let status = inspection
+            .pointer("/run/status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let accepted = recovery_operation_was_accepted(&inspection, &operation);
+        if accepted
+            && matches!(
+                status,
+                "succeeded" | "failed" | "cancelled" | "interrupted" | "replan_required"
+            )
+        {
+            self.reconcile_run(operation.run_id);
+            return;
+        }
+        if matches!(status, "awaiting_approval" | "clarification_requested") {
+            self.reconcile_run(operation.run_id);
+            return;
+        }
+        let method = match (accepted, operation.requested_action.as_str(), status) {
+            (true, _, _) => "run/resume",
+            (false, "retry", "failed") => "run/retry",
+            (false, "resume", "interrupted") => "run/resume",
+            _ => {
+                let _ = self.app.emit(
+                    "adaptive-agent://control-error",
+                    json!({"runId":operation.run_id,"error":format!("Pending {} recovery requires reconciliation from runtime status {status}.",operation.requested_action)}),
+                );
+                return;
+            }
+        };
+        if let Err(error) = self.dispatch_same_run_recovery(&operation.run_id, method) {
+            let _ = self.app.emit(
+                "adaptive-agent://control-error",
+                json!({"runId":operation.run_id,"error":format!("Unable to restore pending recovery: {error}")}),
+            );
         }
     }
 
@@ -618,6 +683,24 @@ impl Bridge {
                     root_created,
                     definitely_absent,
                 );
+                match bridge.workbench.get_run_recovery_operation(&run_id) {
+                    Ok(Some(operation)) => {
+                        let accepted = inspection
+                            .as_ref()
+                            .is_ok_and(|value| recovery_operation_was_accepted(value, &operation));
+                        if !accepted && !state.occupies_slot {
+                            state = recovery_required(true);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        state = recovery_required(true);
+                        let _ = bridge.app.emit(
+                            "adaptive-agent://control-error",
+                            json!({"runId":run_id,"error":format!("Unable to read pending recovery state: {error}")}),
+                        );
+                    }
+                }
                 let result = recovered_result(&inspection);
                 let recovered_approval = bridge.discover_pending_approval(&run_id, &inspection);
                 let chat_success = bridge
@@ -643,6 +726,26 @@ impl Bridge {
                     if let Err(error) = finalized {
                         state = recovery_required(true);
                         let _=bridge.app.emit("adaptive-agent://control-error",json!({"runId":run_id,"error":format!("Unable to reconcile successful chat turn: {error}")}));
+                    }
+                }
+                let mut task_terminal_finalized = false;
+                if !chat_success && !state.occupies_slot {
+                    if let Some(result) = result.as_ref() {
+                        match bridge.workbench.finalize_recovered_run(
+                            &run_id,
+                            result,
+                            state.cached_status,
+                            state.submission_state,
+                        ) {
+                            Ok(()) => task_terminal_finalized = true,
+                            Err(error) => {
+                                state = recovery_required(true);
+                                let _ = bridge.app.emit(
+                                    "adaptive-agent://control-error",
+                                    json!({"runId":run_id,"error":format!("Unable to persist terminal run state: {error}")}),
+                                );
+                            }
+                        }
                     }
                 }
                 let mut applied_quiescent = false;
@@ -683,9 +786,14 @@ impl Bridge {
                         && record.root_created
                         && record.interrupt_pending;
                 }
-                if let Some((status, submission)) = persisted {
-                    let _ = bridge.workbench.update_run(&run_id, &status, &submission);
-                }
+                let state_persisted = persisted
+                    .map(|(status, submission)| {
+                        bridge
+                            .workbench
+                            .update_run(&run_id, &status, &submission)
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
                 if let Some(approval) = persist_approval {
                     let _ = bridge.workbench.save_pending_approval(&approval);
                 } else if let Some(approval_id) = clear_approval_id {
@@ -693,18 +801,27 @@ impl Bridge {
                         .workbench
                         .clear_pending_approval(&run_id, Some(&approval_id));
                 }
+                let mut result_persisted = chat_success || task_terminal_finalized;
                 if applied_quiescent && result.is_some() && !chat_success {
-                    if let Err(error) = bridge
-                        .workbench
-                        .store_result(&run_id, result.as_ref().unwrap())
-                    {
-                        let _ = bridge.app.emit(
-                            "adaptive-agent://control-error",
-                            json!({"runId":run_id,"error":error}),
-                        );
+                    if !task_terminal_finalized {
+                        match bridge
+                            .workbench
+                            .store_result(&run_id, result.as_ref().unwrap())
+                        {
+                            Ok(()) => result_persisted = true,
+                            Err(error) => {
+                                let _ = bridge.app.emit(
+                                    "adaptive-agent://control-error",
+                                    json!({"runId":run_id,"error":error}),
+                                );
+                            }
+                        }
                     }
                 }
                 if applied_quiescent {
+                    if state_persisted && result_persisted {
+                        let _ = bridge.workbench.clear_run_recovery_operation(&run_id);
+                    }
                     let _ = bridge.workbench.set_interrupt_pending(&run_id, false);
                     if let Some(record) = bridge.registry.lock().unwrap().get_mut(&run_id) {
                         record.interrupt_pending = false;
@@ -757,6 +874,33 @@ impl Bridge {
             );
             false
         }
+    }
+
+    fn recovery_plan(&self, run_id: &str) -> Result<Value, String> {
+        self.request_wait(
+            "run/recover",
+            json!({ "runId": run_id, "dryRun": true }),
+            Duration::from_secs(10),
+        )
+    }
+
+    fn steer_run(&self, run_id: &str, message: &str) -> Result<(), String> {
+        let registry = self.registry.lock().unwrap();
+        let run = registry.get(run_id).ok_or("Run is not known.")?;
+        if run.invocation_kind != "run"
+            || !run.root_created
+            || !run.occupies_slot
+            || run.cancel_requested
+        {
+            return Err("Only an active task run can be steered.".into());
+        }
+        drop(registry);
+        self.request_wait(
+            "run/steer",
+            json!({ "runId": run_id, "message": message }),
+            Duration::from_secs(10),
+        )?;
+        Ok(())
     }
 
     fn arm_interrupt(&self, run_id: &str, retry: bool) -> Result<(), String> {
@@ -1199,6 +1343,7 @@ impl Bridge {
         }
         let run_id = uuid::Uuid::new_v4().to_string();
         let item_id = uuid::Uuid::new_v4().to_string();
+        let created_at = now();
         let configuration = self
             .configuration
             .lock()
@@ -1220,6 +1365,7 @@ impl Bridge {
             item_id: item_id.clone(),
             run_id: run_id.clone(),
             title: task.clone(),
+            created_at: created_at.clone(),
             session_id: None,
             agent_id: required_agent_value("id")?,
             agent_name: required_agent_value("name")?,
@@ -1234,6 +1380,7 @@ impl Bridge {
             run_id: run_id.clone(),
             item_id: item_id.clone(),
             title: task.clone(),
+            created_at,
             session_id: None,
             invocation_kind: "run".into(),
             submission_state: "submitted".into(),
@@ -1533,6 +1680,7 @@ impl Bridge {
             run_id: run_id.clone(),
             item_id: item_id.clone(),
             title: chat.title.clone(),
+            created_at: chat.created_at.clone(),
             session_id: Some(chat.session_id.clone()),
             invocation_kind: "chat".into(),
             submission_state: "submitted".into(),
@@ -1704,6 +1852,196 @@ impl Bridge {
         }
     }
 
+    fn recover_run(self: &Arc<Self>, run_id: &str) -> Result<(), String> {
+        let _submission = self.submission.lock().unwrap();
+        if self.draining.load(Ordering::SeqCst) {
+            return Err("The desktop is draining and cannot recover runs.".into());
+        }
+        if !self.registry.lock().unwrap().has_capacity() {
+            return Err(
+                "All 3 task slots are occupied. Stop or wait for a run, then try again.".into(),
+            );
+        }
+
+        let plan = self.recovery_plan(run_id)?;
+        if plan.get("executable").and_then(Value::as_bool) != Some(true) {
+            return Err(plan
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("Run cannot be recovered.")
+                .into());
+        }
+        let (action, method) = match plan.get("action").and_then(Value::as_str) {
+            Some("resume_same_run") => ("resume", "run/resume"),
+            Some("retry_same_run") => ("retry", "run/retry"),
+            Some("continue_new_run") => {
+                return Err("Continue as a new run is not yet available in the desktop.".into())
+            }
+            _ => {
+                return Err(plan
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Run cannot be recovered.")
+                    .into())
+            }
+        };
+
+        let previous = self
+            .registry
+            .lock()
+            .unwrap()
+            .get(run_id)
+            .cloned()
+            .ok_or("Run is not known.")?;
+        if previous.invocation_kind != "run" {
+            return Err("Only task runs can currently be recovered.".into());
+        }
+        let inspection = self.inspect_for_recovery(run_id)?;
+        let baseline_event_seq = latest_inspection_event_seq(&inspection);
+        self.workbench
+            .begin_same_run_recovery(run_id, action, baseline_event_seq)?;
+        if let Err(error) = self
+            .registry
+            .lock()
+            .unwrap()
+            .begin_same_run_recovery(run_id)
+        {
+            let _ = self.workbench.update_run(
+                run_id,
+                &previous.cached_status,
+                &previous.submission_state,
+            );
+            return Err(error.into());
+        }
+
+        self.dispatch_same_run_recovery(run_id, method)
+    }
+
+    fn dispatch_same_run_recovery(
+        self: &Arc<Self>,
+        run_id: &str,
+        method: &'static str,
+    ) -> Result<(), String> {
+        let needs_activation = self
+            .registry
+            .lock()
+            .unwrap()
+            .get(run_id)
+            .is_some_and(|record| !record.occupies_slot);
+        if needs_activation {
+            self.workbench.activate_pending_run_recovery(run_id)?;
+            self.registry
+                .lock()
+                .unwrap()
+                .begin_same_run_recovery(run_id)
+                .map_err(str::to_owned)?;
+        }
+        {
+            let mut registry = self.registry.lock().unwrap();
+            let record = registry.get_mut(run_id).ok_or("Run is not known.")?;
+            if record.request_active {
+                return Err("Run recovery is already active.".into());
+            }
+            record.request_active = true;
+            record.revision += 1;
+        }
+        let receiver = match self.request(method, json!({ "runId": run_id })) {
+            Ok((_request_id, receiver)) => receiver,
+            Err(error) => {
+                if let Some(record) = self.registry.lock().unwrap().get_mut(run_id) {
+                    record.request_active = false;
+                    record.revision += 1;
+                }
+                return Err(error);
+            }
+        };
+        self.emit_state();
+        let bridge = self.clone();
+        let run_id = run_id.to_owned();
+        std::thread::spawn(move || {
+            let response = match receiver.recv_timeout(Duration::from_secs(30)) {
+                Ok(response) => response,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    bridge.reconcile_run(run_id.clone());
+                    receiver.recv().unwrap_or_else(|_| {
+                        Err("The agent runtime exited before returning a result.".into())
+                    })
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    Err("The agent runtime exited before returning a result.".into())
+                }
+            };
+            if let Some(record) = bridge.registry.lock().unwrap().get_mut(&run_id) {
+                record.request_active = false;
+                record.revision += 1;
+            }
+            match response {
+                Ok(result) => {
+                    let state = state_for_execution_result(&result);
+                    let stored_result = canonical_workbench_result(&result);
+                    if !state.occupies_slot {
+                        match bridge.workbench.finalize_recovered_run(
+                            &run_id,
+                            &stored_result,
+                            state.cached_status,
+                            state.submission_state,
+                        ) {
+                            Ok(()) => {
+                                if let Some(record) =
+                                    bridge.registry.lock().unwrap().get_mut(&run_id)
+                                {
+                                    let _ = apply_run_state(record, &state, None);
+                                }
+                                let _ = bridge.app.emit(
+                                    "adaptive-agent://run-finished",
+                                    json!({ "runId": run_id, "result": stored_result }),
+                                );
+                            }
+                            Err(error) => {
+                                let _ = bridge.app.emit(
+                                    "adaptive-agent://control-error",
+                                    json!({"runId":run_id,"error":format!("Unable to persist recovered run: {error}")}),
+                                );
+                                bridge.reconcile_run(run_id.clone());
+                            }
+                        }
+                        bridge.emit_state();
+                        return;
+                    }
+                    let _ = bridge.workbench.store_result(&run_id, &stored_result);
+                    let mut accepted_quiescent = false;
+                    if let Some(record) = bridge.registry.lock().unwrap().get_mut(&run_id) {
+                        accepted_quiescent = apply_run_state(record, &state, None)
+                            == ApplyState::Accepted
+                            && !state.occupies_slot;
+                    }
+                    let state_persisted = if let Some(record) =
+                        bridge.registry.lock().unwrap().get(&run_id)
+                    {
+                        bridge
+                            .workbench
+                            .update_run(&run_id, &record.cached_status, &record.submission_state)
+                            .is_ok()
+                    } else {
+                        false
+                    };
+                    if !accepted_quiescent || !state_persisted {
+                        bridge.reconcile_run(run_id.clone());
+                    }
+                }
+                Err(error) => {
+                    let _ = bridge.app.emit(
+                        "adaptive-agent://control-error",
+                        json!({ "runId": run_id, "error": error }),
+                    );
+                    bridge.reconcile_run(run_id.clone());
+                }
+            }
+            bridge.emit_state();
+        });
+        Ok(())
+    }
+
     fn arm_cancellations(self: &Arc<Self>, run_ids: &[String]) {
         for run_id in run_ids {
             loop {
@@ -1792,10 +2130,15 @@ impl Bridge {
                 item_id: run.item_id.clone(),
                 run_id: run.run_id.clone(),
                 title: run.title.clone(),
+                created_at: run.created_at.clone(),
                 invocation_kind: run.invocation_kind.clone(),
                 status: run.cached_status.clone(),
                 cancel_requested: run.cancel_requested,
                 occupies_slot: run.occupies_slot,
+                steerable: run.invocation_kind == "run"
+                    && run.root_created
+                    && run.occupies_slot
+                    && !run.cancel_requested,
                 pending_approval: run.pending_approval.clone(),
             })
             .collect::<Vec<_>>();
@@ -2439,6 +2782,55 @@ fn stop_run(run_id: String, state: tauri::State<'_, AppState>) -> Result<(), Str
 }
 
 #[tauri::command]
+fn get_run_recovery_plan(
+    run_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Value, String> {
+    state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "Desktop runtime is not available.".to_string())?
+        .recovery_plan(&run_id)
+}
+
+#[tauri::command]
+fn recover_run(run_id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    if state.quit.lock().unwrap().state() != QuitState::Idle {
+        return Err("The desktop is quitting and cannot recover runs.".into());
+    }
+    state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "Desktop runtime is not available.".to_string())?
+        .recover_run(&run_id)
+}
+
+#[tauri::command]
+fn steer_run(
+    run_id: String,
+    message: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    if message.trim().is_empty() {
+        return Err("A steering message is required.".into());
+    }
+    state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "Desktop runtime is not available.".to_string())?
+        .steer_run(&run_id, message.trim())
+}
+
+#[tauri::command]
 fn get_run_result(
     run_id: String,
     state: tauri::State<'_, AppState>,
@@ -2493,6 +2885,7 @@ fn create_chat(title: String, state: tauri::State<'_, AppState>) -> Result<ChatD
         } else {
             title.trim().into()
         },
+        created_at: now(),
         session_id: uuid::Uuid::new_v4().to_string(),
         pinned_agent_id: id,
         pinned_agent_name: name,
@@ -2702,6 +3095,9 @@ pub fn run() {
             reload_settings,
             start_run,
             stop_run,
+            get_run_recovery_plan,
+            recover_run,
+            steer_run,
             get_run_result,
             resolve_approval,
             create_chat,
@@ -2831,6 +3227,34 @@ fn recovered_result(inspection: &Response) -> Option<Value> {
     }
 }
 
+fn latest_inspection_event_seq(inspection: &Value) -> i64 {
+    inspection
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|event| event.get("seq").and_then(Value::as_i64))
+        .max()
+        .unwrap_or(0)
+}
+
+fn recovery_operation_was_accepted(inspection: &Value, operation: &PendingRunRecovery) -> bool {
+    let accepted_event = if operation.requested_action == "retry" {
+        "run.retry_started"
+    } else {
+        "run.resumed"
+    };
+    inspection
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|event| {
+            event.get("seq").and_then(Value::as_i64).unwrap_or(0) > operation.baseline_event_seq
+                && event.get("type").and_then(Value::as_str) == Some(accepted_event)
+        })
+}
+
 fn project_activity_event(
     event: &Value,
     root_run_id: &str,
@@ -2913,6 +3337,19 @@ fn project_activity_event(
                 projected.insert(key.into(), Value::String(value.into()));
             }
         }
+        if !projected.contains_key("toolName") {
+            if let Some(value) = payload.get("requestedToolName").and_then(Value::as_str) {
+                projected.insert("toolName".into(), Value::String(value.into()));
+            }
+        }
+        if let Some(value) = payload.get("assistantContent").and_then(Value::as_str) {
+            if !value.trim().is_empty() {
+                projected.insert("assistantContent".into(), Value::String(value.into()));
+            }
+        }
+        if let Some(context) = activity_tool_context(payload) {
+            projected.insert("toolContext".into(), Value::String(context));
+        }
         for key in [
             "durationMs",
             "attempt",
@@ -2948,6 +3385,100 @@ fn project_activity_event(
         }
     }
     Some(Value::Object(projected))
+}
+
+fn activity_tool_context(payload: &serde_json::Map<String, Value>) -> Option<String> {
+    let tool_name = payload
+        .get("toolName")
+        .or_else(|| payload.get("requestedToolName"))
+        .and_then(Value::as_str)?
+        .split('@')
+        .next()?;
+    let input = payload.get("input")?.as_object()?;
+    let input = input
+        .get("preview")
+        .and_then(Value::as_object)
+        .unwrap_or(input);
+
+    let field = |key: &str| {
+        input.get(key).and_then(|value| {
+            value.as_str().or_else(|| {
+                value
+                    .as_object()
+                    .and_then(|summary| summary.get("preview"))
+                    .and_then(Value::as_str)
+            })
+        })
+    };
+
+    match tool_name {
+        "web_search" => compact_activity_context(field("query"), 64),
+        "read_web_page" | "fetch_page" => field("url").and_then(activity_domain),
+        "shell_exec" => compact_activity_context(field("command"), 64),
+        name if is_file_activity_tool(name) => field("path")
+            .or_else(|| field("filePath"))
+            .and_then(activity_basename),
+        _ => None,
+    }
+}
+
+fn is_file_activity_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file"
+            | "write_file"
+            | "edit_file"
+            | "apply_patch"
+            | "search_files"
+            | "list_directory"
+            | "create_file"
+            | "delete_file"
+    )
+}
+
+fn compact_activity_context(value: Option<&str>, max_chars: usize) -> Option<String> {
+    let compact = value?.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return None;
+    }
+    if compact.chars().count() <= max_chars {
+        return Some(compact);
+    }
+    Some(format!(
+        "{}...",
+        compact.chars().take(max_chars).collect::<String>()
+    ))
+}
+
+fn activity_basename(value: &str) -> Option<String> {
+    let compact = value.trim().trim_end_matches(['/', '\\']);
+    let path = compact
+        .rsplit_once('#')
+        .map(|(_, suffix)| suffix.trim())
+        .filter(|suffix| !suffix.is_empty())
+        .unwrap_or(compact);
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path).trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn activity_domain(value: &str) -> Option<String> {
+    let compact = value.trim();
+    if compact.is_empty() {
+        return None;
+    }
+    let authority = compact
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(compact)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(compact)
+        .rsplit('@')
+        .next()
+        .unwrap_or(compact);
+    let host = authority.split(':').next().unwrap_or(authority);
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 fn activity_message(kind: &str, payload: Option<&serde_json::Map<String, Value>>) -> String {
@@ -3368,6 +3899,29 @@ mod tests {
     }
 
     #[test]
+    fn pending_recovery_acceptance_uses_events_after_the_durable_baseline() {
+        let operation = PendingRunRecovery {
+            run_id: "run-1".into(),
+            requested_action: "retry".into(),
+            baseline_event_seq: 7,
+        };
+        let inspection = json!({
+            "events": [
+                {"seq": 5, "type": "run.retry_started"},
+                {"seq": 8, "type": "run.status_changed"},
+                {"seq": 9, "type": "run.retry_started"}
+            ]
+        });
+        assert_eq!(latest_inspection_event_seq(&inspection), 9);
+        assert!(recovery_operation_was_accepted(&inspection, &operation));
+        let before_acceptance = json!({"events":[{"seq":5,"type":"run.retry_started"}]});
+        assert!(!recovery_operation_was_accepted(
+            &before_acceptance,
+            &operation
+        ));
+    }
+
+    #[test]
     fn pending_approval_is_rebuilt_from_durable_inspection() {
         let inspection = json!({
             "run": {
@@ -3436,16 +3990,66 @@ mod tests {
         assert_eq!(projected.get("callId"), Some(&json!("call-1")));
         assert_eq!(projected.get("provider"), Some(&json!("openai")));
         assert_eq!(projected.get("delegateName"), Some(&json!("researcher")));
-        for forbidden in [
-            "input",
-            "output",
-            "assistantContent",
-            "messages",
-            "reasoning",
-            "payload",
-        ] {
+        assert_eq!(
+            projected.get("assistantContent"),
+            Some(&json!("private assistant content"))
+        );
+        for forbidden in ["input", "output", "messages", "reasoning", "payload"] {
             assert!(projected.get(forbidden).is_none(), "leaked {forbidden}");
         }
+    }
+
+    #[test]
+    fn activity_projection_exposes_only_concise_tool_context() {
+        let projected = project_activity_event(
+            &json!({
+                "id": "event-2",
+                "runId": "root-run",
+                "seq": 5,
+                "type": "tool.started",
+                "stepId": "step-1",
+                "toolCallId": "call-1",
+                "createdAt": "2026-01-01T00:00:00.000Z",
+                "payload": {
+                    "toolName": "read_web_page@1",
+                    "input": { "url": "https://www.example.com/private/path?token=secret", "objective": "private" }
+                }
+            }),
+            "root-run",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(projected.get("stepId"), Some(&json!("step-1")));
+        assert_eq!(projected.get("toolCallId"), Some(&json!("call-1")));
+        assert_eq!(projected.get("toolContext"), Some(&json!("example.com")));
+        assert!(projected.get("input").is_none());
+    }
+
+    #[test]
+    fn activity_tool_context_formats_search_file_and_shell_inputs() {
+        let context = |payload: Value| activity_tool_context(payload.as_object().unwrap());
+        assert_eq!(
+            context(json!({
+                "toolName": "web_search",
+                "input": { "preview": { "query": "  adaptive   agent runtime  " } }
+            })),
+            Some("adaptive agent runtime".into())
+        );
+        assert_eq!(
+            context(json!({
+                "toolName": "write_file",
+                "input": { "path": "/workspace/packages/core/src/index.ts" }
+            })),
+            Some("index.ts".into())
+        );
+        assert_eq!(
+            context(json!({
+                "toolName": "shell_exec",
+                "input": { "command": "bun   test ./src/activity.bun.ts" }
+            })),
+            Some("bun test ./src/activity.bun.ts".into())
+        );
     }
 
     #[test]

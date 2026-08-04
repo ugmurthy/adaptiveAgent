@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { RailGroup, RailItem, WorkbenchSelection } from './workbench-state';
+  import { filterRailItems, type RailGroup, type RailItem, type WorkbenchSelection } from './workbench-state';
 
   export let items: RailItem[] = [];
   export let selection: WorkbenchSelection;
@@ -12,9 +12,18 @@
   export let onsettings: () => void;
   export let onclose: () => void;
   const groups: RailGroup[] = ['Active', 'Needs input', 'History'];
+  let query = '';
+  $: filteredItems = filterRailItems(items, query);
 
   function selected(item: RailItem): boolean {
     return (selection.kind === 'task' || selection.kind === 'chat') && selection.itemId === item.id;
+  }
+
+  function historyDate(item: RailItem): string {
+    const date = new Date(Number(item.createdAt));
+    return Number.isNaN(date.valueOf())
+      ? 'Earlier'
+      : new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(date);
   }
 </script>
 
@@ -25,22 +34,30 @@
     <button on:click={onnewchat}>+ New chat</button>
   </div>
   <div class="slot-meter"><span>{occupied}/{capacity} slots</span><progress max={capacity} value={occupied}></progress></div>
+  <label class="rail-search">
+    <span class="sr-only">Search task and chat descriptions</span>
+    <input bind:value={query} type="search" placeholder="Search history" aria-label="Search task and chat descriptions" />
+  </label>
   <div class="rail-groups">
     {#each groups as group}
-      {@const grouped = items.filter((item) => item.group === group)}
+      {@const grouped = filteredItems.filter((item) => item.group === group)}
       {#if grouped.length}
         <section>
           <h2>{group}</h2>
-          {#each grouped as item (item.id)}
-            <button class:active={selected(item)} class="rail-item" on:click={() => onselect(item)}>
-              <span class:item-active={item.group === 'Active'} class:item-input={item.group === 'Needs input'} class="item-dot"></span>
-              <span><strong>{item.title}</strong><small>{item.kind} · {item.status}</small></span>
-            </button>
-          {/each}
+          {#each grouped as item, index (item.id)}
+            {#if group === 'History' && (index === 0 || historyDate(item) !== historyDate(grouped[index - 1]))}
+              <h3 class="rail-date">{historyDate(item)}</h3>
+            {/if}
+              <button class:active={selected(item)} class="rail-item" on:click={() => onselect(item)}>
+                <span class:item-active={item.group === 'Active'} class:item-input={item.group === 'Needs input'} class="item-dot"></span>
+                <span><strong>{item.title}</strong><small>{item.kind} · {item.status}</small></span>
+              </button>
+            {/each}
         </section>
       {/if}
     {/each}
-    {#if !items.length}<p class="empty-copy">Tasks and conversations will stay here.</p>{/if}
+    {#if !items.length}<p class="empty-copy">Tasks and conversations will stay here.</p>
+    {:else if !filteredItems.length}<p class="empty-copy">No tasks or chats match “{query}”.</p>{/if}
   </div>
   <button class:active={selection.kind === 'settings'} class="rail-settings" on:click={onsettings}>Settings & health</button>
 </aside>

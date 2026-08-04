@@ -26,6 +26,9 @@ create table deletion_jobs (id text primary key, item_id text, root_run_id text,
 ), (
     6,
     "alter table deletion_jobs add column operation_json text;",
+) ,(
+    7,
+    "create table run_recovery_operations (run_id text primary key references workbench_runs(run_id) on delete cascade, requested_action text not null check(requested_action in ('resume','retry')), baseline_event_seq integer not null, updated_at text not null);",
 )];
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -49,6 +52,7 @@ pub struct PendingApproval {
 pub struct ChatItem {
     pub item_id: String,
     pub title: String,
+    pub created_at: String,
     pub session_id: String,
     pub pinned_agent_id: String,
     pub pinned_agent_name: String,
@@ -70,6 +74,7 @@ pub struct Reservation {
     pub item_id: String,
     pub run_id: String,
     pub title: String,
+    pub created_at: String,
     pub session_id: Option<String>,
     pub agent_id: String,
     pub agent_name: String,
@@ -79,6 +84,13 @@ pub struct Reservation {
     pub submission_state: String,
     pub cancel_requested: bool,
     pub interrupt_pending: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingRunRecovery {
+    pub run_id: String,
+    pub requested_action: String,
+    pub baseline_event_seq: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -151,34 +163,33 @@ impl WorkbenchDb {
     }
 
     pub fn reserve_task(&self, reservation: &Reservation) -> Result<(), String> {
-        let now = now();
         let mut connection = self.connection.lock().unwrap();
         let tx = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
-        tx.execute("insert into workbench_items(id,kind,title,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,created_at,updated_at) values(?1,'task',?2,?3,?4,?5,?6,?7,?7)", params![reservation.item_id,reservation.title,reservation.session_id,reservation.agent_id,reservation.agent_name,reservation.agent_fingerprint,now]).map_err(|e| e.to_string())?;
-        tx.execute("insert into workbench_runs(run_id,item_id,invocation_kind,cached_status,submission_state,created_at,updated_at) values(?1,?2,?3,?4,?5,?6,?6)", params![reservation.run_id,reservation.item_id,reservation.invocation_kind,reservation.cached_status,reservation.submission_state,now]).map_err(|e| e.to_string())?;
+        tx.execute("insert into workbench_items(id,kind,title,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,created_at,updated_at) values(?1,'task',?2,?3,?4,?5,?6,?7,?7)", params![reservation.item_id,reservation.title,reservation.session_id,reservation.agent_id,reservation.agent_name,reservation.agent_fingerprint,reservation.created_at]).map_err(|e| e.to_string())?;
+        tx.execute("insert into workbench_runs(run_id,item_id,invocation_kind,cached_status,submission_state,created_at,updated_at) values(?1,?2,?3,?4,?5,?6,?6)", params![reservation.run_id,reservation.item_id,reservation.invocation_kind,reservation.cached_status,reservation.submission_state,reservation.created_at]).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
     }
 
     pub fn create_chat(&self, chat: &ChatItem) -> Result<(), String> {
-        let now = now();
-        self.connection.lock().unwrap().execute("insert into workbench_items(id,kind,title,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,created_at,updated_at) values(?1,'chat',?2,?3,?4,?5,?6,?7,?7)", params![chat.item_id,chat.title,chat.session_id,chat.pinned_agent_id,chat.pinned_agent_name,chat.pinned_agent_fingerprint,now]).map_err(|e| e.to_string())?;
+        self.connection.lock().unwrap().execute("insert into workbench_items(id,kind,title,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,created_at,updated_at) values(?1,'chat',?2,?3,?4,?5,?6,?7,?7)", params![chat.item_id,chat.title,chat.session_id,chat.pinned_agent_id,chat.pinned_agent_name,chat.pinned_agent_fingerprint,chat.created_at]).map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub fn list_chats(&self) -> Result<Vec<ChatItem>, String> {
         let connection = self.connection.lock().unwrap();
-        let mut statement = connection.prepare("select id,title,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint from workbench_items where kind='chat' order by updated_at desc,id").map_err(|e| e.to_string())?;
+        let mut statement = connection.prepare("select id,title,created_at,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint from workbench_items where kind='chat' order by updated_at desc,id").map_err(|e| e.to_string())?;
         let chats = statement
             .query_map([], |r| {
                 Ok(ChatItem {
                     item_id: r.get(0)?,
                     title: r.get(1)?,
-                    session_id: r.get(2)?,
-                    pinned_agent_id: r.get(3)?,
-                    pinned_agent_name: r.get(4)?,
-                    pinned_agent_fingerprint: r.get(5)?,
+                    created_at: r.get(2)?,
+                    session_id: r.get(3)?,
+                    pinned_agent_id: r.get(4)?,
+                    pinned_agent_name: r.get(5)?,
+                    pinned_agent_fingerprint: r.get(6)?,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -190,7 +201,7 @@ impl WorkbenchDb {
     pub fn load_chat(&self, item_id: &str) -> Result<(ChatItem, Vec<ChatMessage>), String> {
         use rusqlite::OptionalExtension;
         let connection = self.connection.lock().unwrap();
-        let chat = connection.query_row("select id,title,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint from workbench_items where id=?1 and kind='chat'", [item_id], |r| Ok(ChatItem { item_id:r.get(0)?, title:r.get(1)?, session_id:r.get(2)?, pinned_agent_id:r.get(3)?, pinned_agent_name:r.get(4)?, pinned_agent_fingerprint:r.get(5)? })).optional().map_err(|e| e.to_string())?.ok_or("Chat was not found.")?;
+        let chat = connection.query_row("select id,title,created_at,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint from workbench_items where id=?1 and kind='chat'", [item_id], |r| Ok(ChatItem { item_id:r.get(0)?, title:r.get(1)?, created_at:r.get(2)?, session_id:r.get(3)?, pinned_agent_id:r.get(4)?, pinned_agent_name:r.get(5)?, pinned_agent_fingerprint:r.get(6)? })).optional().map_err(|e| e.to_string())?.ok_or("Chat was not found.")?;
         let mut statement = connection.prepare("select id,ordinal,role,content_json,run_id from chat_messages where item_id=?1 order by ordinal").map_err(|e| e.to_string())?;
         let messages = statement
             .query_map([item_id], |r| {
@@ -532,6 +543,135 @@ impl WorkbenchDb {
         Ok(())
     }
 
+    pub fn begin_same_run_recovery(
+        &self,
+        run_id: &str,
+        requested_action: &str,
+        baseline_event_seq: i64,
+    ) -> Result<(), String> {
+        let mut connection = self.connection.lock().unwrap();
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let changed = tx
+            .execute(
+                "update workbench_runs set cached_status='recovering',submission_state='submitted',cancel_requested=0,interrupt_pending=0,updated_at=?2 where run_id=?1 and submission_state='terminal'",
+                params![run_id, now()],
+            )
+            .map_err(|e| e.to_string())?;
+        if changed == 0 {
+            return Err("Run is not in a recoverable workbench state.".into());
+        }
+        tx.execute(
+            "delete from pending_approvals where root_run_id=?1",
+            [run_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "insert into run_recovery_operations(run_id,requested_action,baseline_event_seq,updated_at) values(?1,?2,?3,?4)",
+            params![run_id, requested_action, baseline_event_seq, now()],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn load_run_recovery_operations(&self) -> Result<Vec<PendingRunRecovery>, String> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection
+            .prepare("select run_id,requested_action,baseline_event_seq from run_recovery_operations order by updated_at,run_id")
+            .map_err(|e| e.to_string())?;
+        let operations = statement
+            .query_map([], |row| {
+                Ok(PendingRunRecovery {
+                    run_id: row.get(0)?,
+                    requested_action: row.get(1)?,
+                    baseline_event_seq: row.get(2)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(operations)
+    }
+
+    pub fn get_run_recovery_operation(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<PendingRunRecovery>, String> {
+        self.connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "select run_id,requested_action,baseline_event_seq from run_recovery_operations where run_id=?1",
+                [run_id],
+                |row| {
+                    Ok(PendingRunRecovery {
+                        run_id: row.get(0)?,
+                        requested_action: row.get(1)?,
+                        baseline_event_seq: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn activate_pending_run_recovery(&self, run_id: &str) -> Result<(), String> {
+        let changed = self
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "update workbench_runs set cached_status='recovering',submission_state='submitted',cancel_requested=0,interrupt_pending=0,updated_at=?2 where run_id=?1 and exists(select 1 from run_recovery_operations where run_id=?1)",
+                params![run_id, now()],
+            )
+            .map_err(|e| e.to_string())?;
+        if changed == 0 {
+            return Err("Pending run recovery is not known.".into());
+        }
+        Ok(())
+    }
+
+    pub fn clear_run_recovery_operation(&self, run_id: &str) -> Result<(), String> {
+        self.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "delete from run_recovery_operations where run_id=?1",
+                [run_id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn finalize_recovered_run(
+        &self,
+        run_id: &str,
+        result: &serde_json::Value,
+        cached_status: &str,
+        submission_state: &str,
+    ) -> Result<(), String> {
+        let mut connection = self.connection.lock().unwrap();
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let changed = tx
+            .execute(
+                "update workbench_runs set result_json=?2,cached_status=?3,submission_state=?4,interrupt_pending=0,updated_at=?5 where run_id=?1",
+                params![run_id, result.to_string(), cached_status, submission_state, now()],
+            )
+            .map_err(|e| e.to_string())?;
+        if changed == 0 {
+            return Err("Run is not known.".into());
+        }
+        tx.execute(
+            "delete from run_recovery_operations where run_id=?1",
+            [run_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
     pub fn set_cancel_requested(&self, run_id: &str) -> Result<(), String> {
         let changed = self
             .connection
@@ -592,22 +732,23 @@ impl WorkbenchDb {
 
     pub fn load_runs(&self) -> Result<Vec<Reservation>, String> {
         let connection = self.connection.lock().unwrap();
-        let mut statement = connection.prepare("select i.id,r.run_id,i.title,i.session_id,i.pinned_agent_id,i.pinned_agent_name,i.pinned_agent_fingerprint,r.invocation_kind,r.cached_status,r.submission_state,r.cancel_requested,r.interrupt_pending from workbench_runs r join workbench_items i on i.id=r.item_id order by r.created_at,r.run_id").map_err(|e| e.to_string())?;
+        let mut statement = connection.prepare("select i.id,r.run_id,i.title,i.created_at,i.session_id,i.pinned_agent_id,i.pinned_agent_name,i.pinned_agent_fingerprint,r.invocation_kind,r.cached_status,r.submission_state,r.cancel_requested,r.interrupt_pending from workbench_runs r join workbench_items i on i.id=r.item_id order by r.created_at,r.run_id").map_err(|e| e.to_string())?;
         let rows = statement
             .query_map([], |r| {
                 Ok(Reservation {
                     item_id: r.get(0)?,
                     run_id: r.get(1)?,
                     title: r.get(2)?,
-                    session_id: r.get(3)?,
-                    agent_id: r.get(4)?,
-                    agent_name: r.get(5)?,
-                    agent_fingerprint: r.get(6)?,
-                    invocation_kind: r.get(7)?,
-                    cached_status: r.get(8)?,
-                    submission_state: r.get(9)?,
-                    cancel_requested: r.get(10)?,
-                    interrupt_pending: r.get(11)?,
+                    created_at: r.get(3)?,
+                    session_id: r.get(4)?,
+                    agent_id: r.get(5)?,
+                    agent_name: r.get(6)?,
+                    agent_fingerprint: r.get(7)?,
+                    invocation_kind: r.get(8)?,
+                    cached_status: r.get(9)?,
+                    submission_state: r.get(10)?,
+                    cancel_requested: r.get(11)?,
+                    interrupt_pending: r.get(12)?,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -733,7 +874,7 @@ fn load_messages(connection: &Connection, item_id: &str) -> Result<Vec<ChatMessa
     Ok(messages)
 }
 
-fn now() -> String {
+pub(crate) fn now() -> String {
     format!(
         "{}",
         std::time::SystemTime::now()
@@ -752,6 +893,7 @@ mod tests {
             item_id: "item".into(),
             run_id: "run".into(),
             title: "Task".into(),
+            created_at: "100".into(),
             session_id: None,
             agent_id: "agent".into(),
             agent_name: "Agent".into(),
@@ -877,10 +1019,55 @@ mod tests {
         assert!(count.is_none());
     }
 
+    #[test]
+    fn same_run_recovery_is_an_atomic_terminal_to_submitted_transition() {
+        let db = WorkbenchDb::open_in_memory().unwrap();
+        db.reserve_task(&reservation()).unwrap();
+        assert!(db.begin_same_run_recovery("run", "resume", 4).is_err());
+        db.update_run("run", "interrupted", "terminal").unwrap();
+        db.set_cancel_requested("run").unwrap();
+        db.set_interrupt_pending("run", true).unwrap();
+        db.store_result("run", &serde_json::json!({"status":"failure"}))
+            .unwrap();
+        db.begin_same_run_recovery("run", "resume", 4).unwrap();
+        let recovered = &db.load_runs().unwrap()[0];
+        assert_eq!(recovered.cached_status, "recovering");
+        assert_eq!(recovered.submission_state, "submitted");
+        assert!(!recovered.cancel_requested);
+        assert!(!recovered.interrupt_pending);
+        assert_eq!(
+            db.get_result("run").unwrap(),
+            Some(serde_json::json!({"status":"failure"}))
+        );
+        assert_eq!(
+            db.load_run_recovery_operations().unwrap(),
+            vec![PendingRunRecovery {
+                run_id: "run".into(),
+                requested_action: "resume".into(),
+                baseline_event_seq: 4,
+            }]
+        );
+        assert!(db.begin_same_run_recovery("run", "resume", 4).is_err());
+        db.finalize_recovered_run(
+            "run",
+            &serde_json::json!({"status":"success","output":"done"}),
+            "succeeded",
+            "terminal",
+        )
+        .unwrap();
+        assert!(db.load_run_recovery_operations().unwrap().is_empty());
+        assert_eq!(db.load_runs().unwrap()[0].cached_status, "succeeded");
+        assert_eq!(
+            db.get_result("run").unwrap(),
+            Some(serde_json::json!({"status":"success","output":"done"}))
+        );
+    }
+
     fn chat() -> ChatItem {
         ChatItem {
             item_id: "chat".into(),
             title: "Chat".into(),
+            created_at: "100".into(),
             session_id: "session-stable".into(),
             pinned_agent_id: "agent".into(),
             pinned_agent_name: "Agent".into(),

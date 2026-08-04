@@ -128,6 +128,10 @@ export interface RunIdParams {
   runId: string;
 }
 
+export interface ContinueParams extends RunIdParams {
+  continuationRunId?: string;
+}
+
 export interface RecoverParams extends RunIdParams {
   strategy?: 'auto' | 'resume' | 'retry' | 'continue';
   dryRun?: boolean;
@@ -166,7 +170,7 @@ export type DesktopRpcRequest =
   | RpcRequest<'run/resume', RunIdParams>
   | RpcRequest<'run/retry', RunIdParams>
   | RpcRequest<'run/recover', RecoverParams>
-  | RpcRequest<'run/continue', RunIdParams>
+  | RpcRequest<'run/continue', ContinueParams>
   | RpcRequest<'run/interrupt', RunIdParams>
   | RpcRequest<'run/inspect', RunIdParams>
   | RpcRequest<'run/replay', RunIdParams>
@@ -313,12 +317,17 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
     }
     case 'run/resume':
     case 'run/retry':
-    case 'run/continue':
     case 'run/interrupt':
     case 'run/inspect':
     case 'run/replay':
       requiredString(requiredParams(method, params), 'runId');
       return;
+    case 'run/continue': {
+      const value = requiredParams(method, params);
+      requiredString(value, 'runId');
+      optionalString(value, 'continuationRunId');
+      return;
+    }
     case 'run/recover': {
       const value = requiredParams(method, params);
       requiredString(value, 'runId');

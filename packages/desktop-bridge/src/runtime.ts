@@ -163,8 +163,13 @@ export class DesktopRuntime {
         if (params.dryRun) return asJsonValue(await sdk.getRecoveryPlan(asRunId(params.runId)));
         return asJsonValue(await sdk.recoverRaw({ runId: asRunId(params.runId), strategy: params.strategy ?? 'auto' }));
       }
-      case 'run/continue':
-        return asJsonValue(await this.requireSdk().continueRunRaw({ fromRunId: asRunId(request.params!.runId) }));
+      case 'run/continue': {
+        const params = request.params!;
+        return asJsonValue(await this.requireSdk().continueRunRaw({
+          fromRunId: asRunId(params.runId),
+          ...(params.continuationRunId ? { continuationRunId: asRunId(params.continuationRunId) } : {}),
+        }));
+      }
       case 'run/interrupt':
         await this.requireSdk().interrupt(asRunId(request.params!.runId));
         return { runId: request.params!.runId, interrupted: true };

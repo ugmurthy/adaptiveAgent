@@ -18,12 +18,13 @@
   export let ondelete: (target: {kind:'item';itemId:string}|{kind:'chat-turn';itemId:string;ordinal:number}) => void;
   export let ondecision: (run: RunSummary, approved: boolean) => void;
   export let oninspect: () => void;
+  export let onshowtitle: (kind: 'task' | 'chat', title: string) => void;
   $: activeRun = runs.find((run)=>run.occupiesSlot);
 </script>
 
 <section class="center-card chat-view">
   <div class="view-heading">
-    <div><span>Chat · {chat.pinnedAgentName}</span><h2>{chat.title}</h2><p>Session {chat.sessionId.slice(0,8)} · {chat.occupied?'Turn in progress':'Ready'}</p></div>
+    <div><span>Chat · {chat.pinnedAgentName}</span><h2><button class="title-trigger" aria-label="View full chat description" on:click={() => onshowtitle('chat', chat.title)}>{chat.title}</button></h2><p>Session {chat.sessionId.slice(0,8)} · {chat.occupied?'Turn in progress':'Ready'}</p></div>
     <div class="heading-actions"><button on:click={oninspect}>Inspector</button><button class="danger ghost" disabled={pending || chat.occupied} on:click={()=>ondelete({kind:'item',itemId:chat.itemId})}>Delete chat</button></div>
   </div>
   {#if chat.readOnlyReason}<div class="alert">{chat.readOnlyReason}</div>{/if}

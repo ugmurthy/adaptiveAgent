@@ -236,6 +236,12 @@ describe('Agent SDK SQLite runtime', () => {
       await sdk.close();
 
       expect(result).toMatchObject({ status: 'success', output: 'gateway complete' });
+      expect(result.usage).toMatchObject({
+        promptTokens: 8,
+        completionTokens: 4,
+        totalTokens: 12,
+        estimatedCostUSD: 0.004,
+      });
       expect(localToolCalls).toBe(1);
       expect(providerRequests).toHaveLength(2);
       expect(providerRequests[1]?.messages.some(
@@ -253,6 +259,14 @@ describe('Agent SDK SQLite runtime', () => {
       expect(inspection.run).toMatchObject({
         id: result.runId,
         status: 'succeeded',
+        usage: {
+          promptTokens: 8,
+          completionTokens: 4,
+          totalTokens: 12,
+          estimatedCostUSD: 0.004,
+          provider: 'ollama',
+          model: 'sqlite-gateway-model',
+        },
         executionContext: {
           inferenceMode: 'gateway',
           inferenceTier: 'medium',

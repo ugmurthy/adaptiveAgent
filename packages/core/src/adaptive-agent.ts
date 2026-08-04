@@ -1344,22 +1344,47 @@ export class AdaptiveAgent {
       }
 
       const retryAttempts = readRetryAttempts(currentRun.metadata) + 1;
-      const retryingRun = await this.options.runStore.updateRun(
-        currentRun.id,
-        {
-          status: 'running',
-          errorCode: undefined,
-          errorMessage: undefined,
-          result: undefined,
-          completedAt: null,
-          metadata: {
-            ...(currentRun.metadata ?? {}),
-            retryAttempts,
-            lastRetryFailureKind: retryability.failureKind,
-          },
-        } as unknown as Partial<AgentRun>,
-        currentRun.version,
-      );
+      if (retryability.retryAction === 'repair_invalid_tool_call') {
+        await this.prepareInvalidToolCallRepairRetry(currentRun, state);
+      }
+      const retryPatch = {
+        status: 'running',
+        errorCode: undefined,
+        errorMessage: undefined,
+        result: undefined,
+        completedAt: null,
+        metadata: {
+          ...(currentRun.metadata ?? {}),
+          retryAttempts,
+          lastRetryFailureKind: retryability.failureKind,
+        },
+      } as unknown as Partial<AgentRun>;
+      const transactionStore = this.options.transactionStore;
+      let retryingRun: AgentRun;
+      if (transactionStore?.eventStore && transactionStore.snapshotStore) {
+        const downstream: AgentEvent[] = [];
+        retryingRun = await transactionStore.runInTransaction(async (stores) => {
+          if (!stores.eventStore || !stores.snapshotStore) {
+            throw new Error('Transactional retry stores unavailable');
+          }
+          const updated = await stores.runStore.updateRun(currentRun.id, retryPatch, currentRun.version);
+          const persistedRetryEvent = await stores.eventStore.append(
+            runRetryStartedEvent(updated, retryability.failureKind, retryAttempts),
+          );
+          const snapshotEvent = await this.saveExecutionSnapshotWithStores(stores, updated, state, updated.status);
+          downstream.push(persistedRetryEvent, ...(snapshotEvent ? [snapshotEvent] : []));
+          return updated;
+        });
+        await this.emitDownstreamOnly(downstream);
+      } else {
+        retryingRun = await this.options.runStore.updateRun(
+          currentRun.id,
+          retryPatch,
+          currentRun.version,
+        );
+        await this.saveExecutionSnapshot(retryingRun, state, retryingRun.status);
+        await this.emit(runRetryStartedEvent(retryingRun, retryability.failureKind, retryAttempts));
+      }
 
       this.logLifecycle('info', 'run.retry_started', {
         ...runLogBindings(retryingRun),
@@ -1367,24 +1392,6 @@ export class AdaptiveAgent {
         failureKind: retryability.failureKind,
         retryAttempts,
       });
-
-      await this.emit({
-        runId,
-        stepId: retryingRun.currentStepId,
-        type: 'run.retry_started',
-        schemaVersion: 1,
-        payload: {
-          status: 'running',
-          failureKind: retryability.failureKind,
-          retryAttempts,
-        },
-      });
-
-      if (retryability.retryAction === 'repair_invalid_tool_call') {
-        await this.prepareInvalidToolCallRepairRetry(retryingRun, state);
-      }
-
-      await this.saveExecutionSnapshot(retryingRun, state, retryingRun.status);
 
       return await this.continueRunFromState(await this.refreshRun(runId), state, { retryFailedChild: true });
     } finally {
@@ -1638,6 +1645,7 @@ export class AdaptiveAgent {
 
     const { run: continuationRun } = await this.createRunWithInitialSnapshot(
       {
+        id: options.continuationRunId,
         sessionId: sourceRun.sessionId,
         goal: sourceRun.goal,
         input: sourceRun.input,
@@ -6348,6 +6356,24 @@ function runStatusChangedEvent(
     type: 'run.status_changed',
     schemaVersion: 1,
     payload: { fromStatus: from.status, toStatus },
+  };
+}
+
+function runRetryStartedEvent(
+  run: AgentRun,
+  failureKind: FailureKind,
+  retryAttempts: number,
+): Omit<AgentEvent, 'id' | 'seq' | 'createdAt'> {
+  return {
+    runId: run.id,
+    stepId: run.currentStepId,
+    type: 'run.retry_started',
+    schemaVersion: 1,
+    payload: {
+      status: 'running',
+      failureKind,
+      retryAttempts,
+    },
   };
 }
 

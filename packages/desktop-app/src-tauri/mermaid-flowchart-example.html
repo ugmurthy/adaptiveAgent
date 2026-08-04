@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Styled Mermaid Flowchart Example</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            padding: 40px;
+            max-width: 1000px;
+            width: 100%;
+        }
+        h1 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 2em;
+        }
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 1.1em;
+        }
+        .mermaid {
+            display: flex;
+            justify-content: center;
+            margin: 20px auto;
+        }
+        .legend {
+            margin-top: 30px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 10px;
+        }
+        .legend h3 {
+            margin-top: 0;
+            color: #333;
+        }
+        .legend-item {
+            display: inline-block;
+            margin-right: 20px;
+            margin-bottom: 10px;
+            font-size: 0.9em;
+        }
+        .legend-color {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border-radius: 4px;
+            margin-right: 8px;
+            vertical-align: middle;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📊 Order Processing Workflow</h1>
+        <p class="subtitle">A color-coded example demonstrating effective visual hierarchy in Mermaid diagrams</p>
+        
+        <div class="mermaid">
+flowchart TD
+    %% Main styling configuration
+    linkStyle default stroke:#666,stroke-width:2px
+    
+    %% Start Node - Green (positive/action)
+    Start([("🚀 Customer Places<br/>Order")]):::startNode
+    
+    %% Process Nodes - Blue (standard processing)
+    Validate[("📝 Validate<br/>Order Details")]:::processNode
+    CheckStock{"📦 Stock<br/>Available?"}:::decisionNode
+    Inventory[("🔍 Update<br/>Inventory")]:::processNode
+    Payment{"💳 Payment<br/>Successful?"}:::decisionNode
+    Charge[("💰 Process<br/>Payment")]:::processNode
+    Refund(("❌ Initiate<br/>Refund")):::errorNode
+    
+    %% Success Path - Green shades
+    Prepare[("📋 Prepare<br/>Shipment")]:::successNode
+    Ship(("✈️ Ship<br/>Package")):::successNode
+    Confirm([("✅ Send<br/>Confirmation")]):::endNode
+    
+    %% Error/Waiting states - Orange/Yellow
+    NotifyLowStock([("⚠️ Notify<br/>Low Stock")]):::warningNode
+    RetryPayment([("🔄 Retry<br/>Payment")]):::warningNode
+    Cancel((("❌ Order<br/>Cancelled"))):::endNode
+    
+    %% Connections
+    Start --> Validate
+    Validate --> CheckStock
+    
+    CheckStock -- "Yes ✅" --> Inventory
+    CheckStock -- "No ❌" --> NotifyLowStock
+    
+    Inventory --> Charge
+    Charge --> Payment
+    
+    Payment -- "Success ✅" --> Prepare
+    Payment -- "Failed ❌" --> RetryPayment
+    
+    Prepare --> Ship
+    Ship --> Confirm
+    
+    RetryPayment -- "Success ✅" --> Prepare
+    RetryPayment -- "Still Failed ❌" --> Refund
+    Refund --> Cancel
+    
+    NotifyLowStock -.->|Restock| CheckStock
+    
+    %% Node Style Classes
+    classDef startNode fill:#4CAF50,stroke:#2E7D32,stroke-width:3px,color:white,rx:10,ry:10
+    classDef endNode fill:#2196F3,stroke:#1565C0,stroke-width:3px,color:white,rx:10,ry:10
+    classDef processNode fill:#BBDEFB,stroke:#1976D2,stroke-width:2px,color:#1a237e
+    classDef decisionNode fill:#FFF9C4,stroke:#FBC02D,stroke-width:2px,color:#333,shape:rhombus
+    classDef successNode fill:#C8E6C9,stroke:#388E3C,stroke-width:2px,color:#1b5e20
+    classDef warningNode fill:#FFECB3,stroke:#FFA000,stroke-width:2px,color:#333
+    classDef errorNode fill:#FFCDD2,stroke:#C62828,stroke-width:2px,color:#b71c1c
+        </div>
+        
+        <div class="legend">
+            <h3>🎨 Color Legend</h3>
+            <div class="legend-item">
+                <span class="legend-color" style="background: #4CAF50;"></span>
+                <strong>Start:</strong> Entry point / Action
+            </div>
+            <div class="legend-item">
+                <span class="legend-color" style="background: #BBDEFB;"></span>
+                <strong>Process:</strong> Standard operations
+            </div>
+            <div class="legend-item">
+                <span class="legend-color" style="background: #FFF9C4; border: 1px solid #FBC02D;"></span>
+                <strong>Decision:</strong> Conditional branches
+            </div>
+            <div class="legend-item">
+                <span class="legend-color" style="background: #C8E6C9;"></span>
+                <strong>Success:</strong> Positive outcomes
+            </div>
+            <div class="legend-item">
+                <span class="legend-color" style="background: #FFECB3;"></span>
+                <strong>Warning:</strong> Alerts & retries
+            </div>
+            <div class="legend-item">
+                <span class="legend-color" style="background: #FFCDD2;"></span>
+                <strong>Error:</strong> Negative outcomes
+            </div>
+            <div class="legend-item">
+                <span class="legend-color" style="background: #2196F3;"></span>
+                <strong>End:</strong> Terminal states
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'base',
+            themeVariables: {
+                fontFamily: 'Segoe UI, sans-serif',
+                fontSize: '14px'
+            },
+            flowchart: {
+                useMaxWidth: true,
+                htmlLabels: true,
+                curve: 'basis'
+            }
+        });
+    </script>
+</body>
+</html>

@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'bun:test';
 import type { Chat, RunSummary } from './desktop';
-import { buildRailItems } from './workbench-state';
+import { buildRailItems, filterRailItems } from './workbench-state';
 
 function run(overrides: Partial<RunSummary> = {}): RunSummary {
-  return { itemId:'task',runId:'run',title:'Task',invocationKind:'run',status:'succeeded',cancelRequested:false,occupiesSlot:false,...overrides };
+  return { itemId:'task',runId:'run',title:'Task',createdAt:'100',invocationKind:'run',status:'succeeded',cancelRequested:false,occupiesSlot:false,steerable:false,...overrides };
 }
 
 describe('workbench rail grouping', () => {
@@ -21,8 +21,17 @@ describe('workbench rail grouping', () => {
   });
 
   it('includes empty and active chats without inventing task entries', () => {
-    const chats=[{itemId:'chat',title:'Conversation',sessionId:'session',pinnedAgentId:'agent',pinnedAgentName:'Agent',pinnedAgentFingerprint:'fp',messages:[],occupied:false}] satisfies Chat[];
+    const chats=[{itemId:'chat',title:'Conversation',createdAt:'100',sessionId:'session',pinnedAgentId:'agent',pinnedAgentName:'Agent',pinnedAgentFingerprint:'fp',messages:[],occupied:false}] satisfies Chat[];
     expect(buildRailItems([],chats)).toMatchObject([{id:'chat',kind:'chat',status:'ready',group:'History'}]);
     expect(buildRailItems([run({itemId:'chat',invocationKind:'chat',status:'running',occupiesSlot:true})],chats)[0]).toMatchObject({id:'chat',group:'Active',status:'running'});
+  });
+
+  it('sorts history newest first and filters partial terms in task and chat text', () => {
+    const chats=[{itemId:'chat',title:'Release notes',createdAt:'200',sessionId:'session',pinnedAgentId:'agent',pinnedAgentName:'Agent',pinnedAgentFingerprint:'fp',messages:[{id:'m',ordinal:0,role:'user',content:'Investigate websocket reconnect behavior'}],occupied:false}] satisfies Chat[];
+    const items=buildRailItems([run({itemId:'older',title:'Database migration',createdAt:'100'})],chats);
+    expect(items.map((item)=>item.id)).toEqual(['chat','older']);
+    expect(filterRailItems(items,'websock recon')).toHaveLength(1);
+    expect(filterRailItems(items,'BASE migr')[0]?.id).toBe('older');
+    expect(filterRailItems(items,'missing')).toEqual([]);
   });
 });

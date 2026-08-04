@@ -6,6 +6,12 @@ export interface ActivityEvent {
   kind: string;
   message: string;
   createdAt: string;
+  stepId?: string;
+  toolCallId?: string;
+  toolName?: string;
+  toolContext?: string;
+  assistantContent?: string;
+  approved?: boolean;
   startedAt?: string;
   callId?: string;
   provider?: string;
@@ -18,6 +24,13 @@ export interface ActivityEvent {
   retryDelayMs?: number;
   retryable?: boolean;
 }
+
+export type ToolActivityState = 'Approval' | 'Running' | 'Done' | 'Failed' | 'Skipped';
+
+export type ActivityItem =
+  | { key: string; type: 'assistant'; actor: string; content: string; durationMs?: number }
+  | { key: string; type: 'tool'; actor: string; toolName: string; toolContext?: string; state: ToolActivityState; durationMs?: number }
+  | { key: string; type: 'event'; actor: string; content: string; durationMs?: number };
 
 export interface ModelTiming {
   current?: {
@@ -51,6 +64,101 @@ export function addActivity(
   }
 
   return { ...activity, [event.rootRunId]: next };
+}
+
+const HIDDEN_NARRATIVE_EVENTS = new Set([
+  'model.started',
+  'model.completed',
+  'model.failed',
+  'step.started',
+  'step.completed',
+  'usage.updated',
+  'snapshot.created',
+]);
+
+export function activityItems(events: ActivityEvent[]): ActivityItem[] {
+  const items: ActivityItem[] = [];
+  const itemIndex = new Map<string, number>();
+  const assistantIndex = new Map<string, number>();
+
+  for (const event of events) {
+    const actor = event.runId === event.rootRunId ? 'Agent' : event.delegateName ?? 'Delegate';
+    const assistantContent = event.assistantContent?.trim();
+    if (assistantContent) {
+      const assistantKey = event.stepId
+        ? `${event.runId}:${event.stepId}`
+        : `${event.runId}:${assistantContent}`;
+      const existingIndex = assistantIndex.get(assistantKey);
+      if (existingIndex === undefined) {
+        assistantIndex.set(assistantKey, items.length);
+        items.push({ key: `assistant:${assistantKey}`, type: 'assistant', actor, content: assistantContent });
+      } else {
+        items[existingIndex] = { key: `assistant:${assistantKey}`, type: 'assistant', actor, content: assistantContent };
+      }
+    }
+
+    if (event.toolCallId && toolState(event)) {
+      const key = `tool:${event.runId}:${event.toolCallId}`;
+      const next: ActivityItem = {
+        key,
+        type: 'tool',
+        actor,
+        toolName: canonicalToolName(event.toolName ?? 'tool'),
+        ...(event.toolContext ? { toolContext: event.toolContext } : {}),
+        state: toolState(event)!,
+        ...(event.durationMs === undefined ? {} : { durationMs: event.durationMs }),
+      };
+      const existingIndex = itemIndex.get(key);
+      if (existingIndex === undefined) {
+        itemIndex.set(key, items.length);
+        items.push(next);
+      } else {
+        const existing = items[existingIndex];
+        if (existing?.type === 'tool') {
+          items[existingIndex] = {
+            ...existing,
+            ...next,
+            toolName: next.toolName === 'tool' ? existing.toolName : next.toolName,
+            toolContext: next.toolContext ?? existing.toolContext,
+          };
+        }
+      }
+      continue;
+    }
+
+    if (!HIDDEN_NARRATIVE_EVENTS.has(event.kind)) {
+      items.push({
+        key: `event:${event.eventId}`,
+        type: 'event',
+        actor,
+        content: event.message,
+        ...(event.durationMs === undefined ? {} : { durationMs: event.durationMs }),
+      });
+    }
+  }
+  return items;
+}
+
+export function toolSymbol(toolName: string): string {
+  if (toolName === 'web_search') return '⌕';
+  if (toolName === 'read_web_page' || toolName === 'fetch_page') return '↗';
+  if (toolName === 'shell_exec') return '›_';
+  if (/(?:^|_)(?:read|write|edit|file|directory)(?:_|$)/.test(toolName) || toolName === 'apply_patch') return '▤';
+  return '◆';
+}
+
+function canonicalToolName(toolName: string): string {
+  return toolName.replace(/@\d+$/, '');
+}
+
+function toolState(event: ActivityEvent): ToolActivityState | undefined {
+  if (event.kind === 'approval.requested') return 'Approval';
+  if (event.kind === 'approval.resolved') return event.approved === false ? 'Skipped' : 'Running';
+  if (event.kind === 'tool.started') return 'Running';
+  if (event.kind === 'tool.completed') return 'Done';
+  if (event.kind === 'tool.failed') return 'Failed';
+  if (event.kind === 'model.tool_call_rejected') return 'Skipped';
+  return undefined;
 }
 
 export function modelTiming(events: ActivityEvent[], now: number): ModelTiming {

@@ -810,6 +810,7 @@ export interface RecoverRunResult {
 
 export interface ContinueRunOptions {
   fromRunId: UUID;
+  continuationRunId?: UUID;
   strategy?: ContinuationStrategy;
   provider?: string;
   model?: string;

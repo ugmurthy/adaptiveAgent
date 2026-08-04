@@ -26,10 +26,11 @@ export interface DesktopState {
 }
 
 export interface PendingApproval { rootRunId:string; approvalRunId:string; approvalId:string; parentRunId?:string; toolName:string; message:string; decisionInFlight:boolean; }
-export interface RunSummary { itemId: string; runId: string; title: string; invocationKind: 'run'|'chat'; status: string; cancelRequested: boolean; occupiesSlot: boolean; pendingApproval?:PendingApproval; }
+export interface RunSummary { itemId: string; runId: string; title: string; createdAt: string; invocationKind: 'run'|'chat'; status: string; cancelRequested: boolean; occupiesSlot: boolean; steerable: boolean; pendingApproval?:PendingApproval; }
+export interface RunRecoveryPlan { runId:string; status:string; action:'resume_same_run'|'retry_same_run'|'continue_new_run'|'requires_user_action'|'requires_reconciliation'|'not_recoverable'; executable:boolean; reason:string; }
 export interface StartedRun { itemId: string; runId: string; }
 export interface ChatMessage { id: string; ordinal: number; role: 'user'|'assistant'; content: string; runId?: string; }
-export interface Chat { itemId:string; title:string; sessionId:string; pinnedAgentId:string; pinnedAgentName:string; pinnedAgentFingerprint:string; messages:ChatMessage[]; readOnlyReason?:string; occupied:boolean; }
+export interface Chat { itemId:string; title:string; createdAt:string; sessionId:string; pinnedAgentId:string; pinnedAgentName:string; pinnedAgentFingerprint:string; messages:ChatMessage[]; readOnlyReason?:string; occupied:boolean; }
 export type ProductDeletionTarget = {kind:'item';itemId:string}|{kind:'run';runId:string}|{kind:'chat-turn';itemId:string;ordinal:number};
 export interface DeletionPreview { target:ProductDeletionTarget; label:string; runCount:number; planCount:number; occupied:boolean; warning:string; }
 
@@ -53,6 +54,9 @@ export const getDesktopState = () => invoke<DesktopState>('desktop_state');
 export const reloadSettings = () => invoke<DesktopState>('reload_settings');
 export const startRun = (task: string) => invoke<StartedRun>('start_run', { task });
 export const stopRun = (runId: string) => invoke<void>('stop_run', { runId });
+export const getRunRecoveryPlan = (runId:string) => invoke<RunRecoveryPlan>('get_run_recovery_plan',{runId});
+export const recoverRun = (runId:string) => invoke<void>('recover_run',{runId});
+export const steerRun = (runId:string,message:string) => invoke<void>('steer_run',{runId,message});
 export const getRunResult = (runId: string) => invoke<unknown | null>('get_run_result', { runId });
 export const resolveApproval = (pending:PendingApproval,approved:boolean) => invoke<void>('resolve_approval',{rootRunId:pending.rootRunId,approvalRunId:pending.approvalRunId,approvalId:pending.approvalId,approved});
 export const createChat = (title:string) => invoke<Chat>('create_chat',{title});

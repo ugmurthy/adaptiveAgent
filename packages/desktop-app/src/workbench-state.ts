@@ -14,6 +14,8 @@ export interface RailItem {
   id: string;
   kind: 'task' | 'chat';
   title: string;
+  searchableText: string;
+  createdAt: string;
   status: string;
   group: RailGroup;
   runId?: string;
@@ -35,6 +37,8 @@ export function buildRailItems(runs: RunSummary[], chats: Chat[]): RailItem[] {
       id: itemId,
       kind: 'task',
       title: selected.title,
+      searchableText: selected.title,
+      createdAt: selected.createdAt,
       status: selected.status,
       group: groupForRuns(attempts),
       runId: selected.runId,
@@ -47,13 +51,28 @@ export function buildRailItems(runs: RunSummary[], chats: Chat[]): RailItem[] {
       id: chat.itemId,
       kind: 'chat',
       title: chat.title,
+      searchableText: [chat.title, ...chat.messages.map((message) => message.content)].join('\n'),
+      createdAt: chat.createdAt,
       status: chat.readOnlyReason ? 'read only' : selected?.status ?? 'ready',
       group: groupForRuns(chatRuns),
       runId: selected?.runId,
     });
   }
   const groupOrder: Record<RailGroup, number> = { Active: 0, 'Needs input': 1, History: 2 };
-  return items.sort((left, right) => groupOrder[left.group] - groupOrder[right.group] || left.title.localeCompare(right.title));
+  return items.sort((left, right) =>
+    groupOrder[left.group] - groupOrder[right.group]
+    || (left.group === 'History' ? Number(right.createdAt) - Number(left.createdAt) : left.title.localeCompare(right.title))
+    || left.title.localeCompare(right.title),
+  );
+}
+
+export function filterRailItems(items: RailItem[], query: string): RailItem[] {
+  const terms = query.toLocaleLowerCase().trim().split(/\s+/).filter(Boolean);
+  if (!terms.length) return items;
+  return items.filter((item) => {
+    const text = item.searchableText.toLocaleLowerCase();
+    return terms.every((term) => text.includes(term));
+  });
 }
 
 function groupForRuns(runs: RunSummary[]): RailGroup {

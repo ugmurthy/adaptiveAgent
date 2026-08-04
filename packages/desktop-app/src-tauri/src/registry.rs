@@ -16,6 +16,7 @@ pub struct RunRecord {
     pub run_id: String,
     pub item_id: String,
     pub title: String,
+    pub created_at: String,
     pub session_id: Option<String>,
     pub invocation_kind: String,
     pub submission_state: String,
@@ -127,6 +128,23 @@ impl RunRegistry {
         r.submission_state = "terminal".into();
         true
     }
+
+    pub fn begin_same_run_recovery(&mut self, id: &str) -> Result<(), &'static str> {
+        let record = self.records.get_mut(id).ok_or("Run is not known.")?;
+        if record.occupies_slot || record.submission_state != "terminal" {
+            return Err("Run is not in a recoverable state.");
+        }
+        record.cached_status = "recovering".into();
+        record.submission_state = "submitted".into();
+        record.cancel_requested = false;
+        record.interrupt_pending = false;
+        record.request_active = false;
+        record.pending_interaction = None;
+        record.pending_approval = None;
+        record.occupies_slot = true;
+        record.revision += 1;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -135,6 +153,7 @@ pub(crate) fn tests_record_for_transition() -> RunRecord {
         run_id: "transition".into(),
         item_id: "item-transition".into(),
         title: "Transition task".into(),
+        created_at: "100".into(),
         session_id: None,
         invocation_kind: "run".into(),
         submission_state: "submitted".into(),
@@ -159,6 +178,7 @@ mod tests {
             run_id: id.into(),
             item_id: format!("i-{id}"),
             title: format!("Task {id}"),
+            created_at: "100".into(),
             session_id: None,
             invocation_kind: "run".into(),
             submission_state: "submitted".into(),
@@ -206,6 +226,28 @@ mod tests {
 
         registry.terminal("a", "succeeded");
         assert_eq!(registry.request_cancel("a"), Ok(CancelAction::Quiescent));
+    }
+
+    #[test]
+    fn same_run_recovery_revives_only_a_quiescent_terminal_run() {
+        let mut registry = RunRegistry::default();
+        registry.insert(rec("run"));
+        assert_eq!(
+            registry.begin_same_run_recovery("run"),
+            Err("Run is not in a recoverable state.")
+        );
+        assert!(registry.terminal("run", "interrupted"));
+        let record = registry.get_mut("run").unwrap();
+        record.cancel_requested = true;
+        record.interrupt_pending = true;
+        assert_eq!(registry.begin_same_run_recovery("run"), Ok(()));
+        let recovered = registry.get("run").unwrap();
+        assert!(recovered.occupies_slot);
+        assert!(!recovered.request_active);
+        assert!(!recovered.cancel_requested);
+        assert!(!recovered.interrupt_pending);
+        assert_eq!(recovered.cached_status, "recovering");
+        assert_eq!(recovered.submission_state, "submitted");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 
-import { addActivity, formatDuration, modelTiming, type ActivityEvent } from './activity';
+import { activityItems, addActivity, formatDuration, modelTiming, toolSymbol, type ActivityEvent } from './activity';
 
 const event = (value: Partial<ActivityEvent> & Pick<ActivityEvent, 'eventId'|'runId'|'seq'|'kind'>): ActivityEvent => ({
   rootRunId: 'root',
@@ -73,5 +73,28 @@ describe('activity narrative', () => {
     expect(formatDuration(38_000)).toBe('38s');
     expect(formatDuration(128_000)).toBe('2m 08s');
     expect(formatDuration(3_840_000)).toBe('1h 04m');
+  });
+
+  it('deduplicates assistant prose per model step and updates tools in place', () => {
+    const events = [
+      event({ eventId: 'approval', runId: 'root', seq: 1, kind: 'approval.requested', stepId: 'step-1', toolCallId: 'call-1', toolName: 'web_search@1', toolContext: 'adaptive agents', assistantContent: 'I will research this.' }),
+      event({ eventId: 'started', runId: 'root', seq: 2, kind: 'tool.started', stepId: 'step-1', toolCallId: 'call-1', toolName: 'web_search@1', toolContext: 'adaptive agents', assistantContent: 'I will research this.' }),
+      event({ eventId: 'done', runId: 'root', seq: 3, kind: 'tool.completed', stepId: 'step-1', toolCallId: 'call-1', toolName: 'web_search@1', durationMs: 240, assistantContent: 'I will research this.' }),
+    ];
+
+    expect(activityItems(events)).toEqual([
+      { key: 'assistant:root:step-1', type: 'assistant', actor: 'Agent', content: 'I will research this.' },
+      { key: 'tool:root:call-1', type: 'tool', actor: 'Agent', toolName: 'web_search', toolContext: 'adaptive agents', state: 'Done', durationMs: 240 },
+    ]);
+  });
+
+  it('maps approval rejection and invalid tool calls to skipped', () => {
+    const events = [
+      event({ eventId: 'rejected', runId: 'root', seq: 1, kind: 'approval.resolved', toolCallId: 'call-1', toolName: 'write_file', approved: false }),
+      event({ eventId: 'invalid', runId: 'root', seq: 2, kind: 'model.tool_call_rejected', toolCallId: 'call-2', toolName: 'fetch_page' }),
+    ];
+    expect(activityItems(events).filter((item) => item.type === 'tool').map((item) => item.state)).toEqual(['Skipped', 'Skipped']);
+    expect(toolSymbol('write_file')).toBe('▤');
+    expect(toolSymbol('fetch_page')).toBe('↗');
   });
 });

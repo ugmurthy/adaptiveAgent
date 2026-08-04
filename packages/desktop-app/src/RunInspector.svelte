@@ -10,12 +10,17 @@
   export let onclose: () => void;
   let view: 'overview'|'timeline'|'agents'|'tools'|'usage'|'diagnostics'|'sensitive' = 'overview';
 
+  function formatCost(estimate: number): string {
+    return estimate < 0.0001 ? '<$0.0001' : `$${estimate.toFixed(4)}`;
+  }
+
   function costSummary(value: TraceReport): string {
     const total=value.usage?.total;
     const unpriced=value.diagnostics?.performance?.toolAccounting?.unpricedRequests ?? value.usage?.toolAccounting?.unpricedRequests ?? 0;
     const estimate=total?.estimatedCostUSD ?? 0;
-    if (unpriced>0) return `${unpriced} unpriced request${unpriced===1?'':'s'}; $${estimate.toFixed(4)} partial estimate`;
-    if ((total?.totalTokens ?? 0)>0 || estimate>0) return `Estimated cost $${estimate.toFixed(4)}`;
+    if (unpriced>0) return `${unpriced} unpriced request${unpriced===1?'':'s'}; ${estimate>0 ? `${formatCost(estimate)} partial estimate` : 'no priced cost recorded'}`;
+    if (estimate>0) return `Estimated cost ${formatCost(estimate)}`;
+    if ((total?.totalTokens ?? 0)>0) return 'Usage recorded; no priced cost recorded';
     return 'No priced usage recorded';
   }
 </script>

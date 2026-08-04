@@ -11,6 +11,7 @@
     createChat,
     deleteHistory,
     getDesktopState,
+    getRunRecoveryPlan,
     getRunResult,
     getTracePrivacy,
     listChats,
@@ -20,17 +21,20 @@
     quitTerminate,
     quitWait,
     reloadSettings,
+    recoverRun,
     resolveApproval,
     selectTrace,
     sendChatTurn,
     setTracePrivacy,
     startRun,
+    steerRun,
     stopRun,
     subscribe,
     type Chat,
     type DeletionPreview,
     type DesktopState,
     type ProductDeletionTarget,
+    type RunRecoveryPlan,
     type RunSummary,
     type TracePrivacy,
     type TraceReport,
@@ -58,6 +62,7 @@
   let chats: Chat[] = [];
   let selectedChat: Chat | undefined;
   let selectedRunId = '';
+  let selectedRecoveryPlan: RunRecoveryPlan | undefined;
   let task = '';
   let chatMessage = '';
   let activityByRoot: Record<string, ActivityEvent[]> = {};
@@ -69,6 +74,7 @@
   let deletionPending = false;
   let deletionPreview: DeletionPreview | undefined;
   let refreshGeneration = 0;
+  let recoveryPlanGeneration = 0;
   let refreshScheduled = false;
   let now = Date.now();
   let traceRoot = '';
@@ -76,6 +82,7 @@
   let traceError = '';
   let tracePrivacy: TracePrivacy = { messages: false, reasoning: false, rawToolPayloads: false };
   let privacyPending = false;
+  let titlePreview: { kind: 'task' | 'chat'; title: string } | undefined;
 
   $: railItems = buildRailItems(desktop.runs, chats);
   $: selectedRun = desktop.runs.find((run) => run.runId === selectedRunId);
@@ -109,8 +116,15 @@
             finalError = resultsByRun[event.runId]?.error ?? '';
           }
           scheduleRefresh();
+          if (event.runId === selectedRunId) void loadRecoveryPlan(event.runId);
         },
-        (state) => { desktop = state; scheduleRefresh(); },
+        (state) => {
+          desktop = state;
+          const run = state.runs.find((candidate) => candidate.runId === selectedRunId);
+          if (run?.occupiesSlot) selectedRecoveryPlan = undefined;
+          else if (run) void loadRecoveryPlan(run.runId);
+          scheduleRefresh();
+        },
         (event) => {
           if (event.rootRunId !== traceRoot || privacyPending) return;
           traceReport = event.report;
@@ -259,6 +273,8 @@
   }
 
   async function selectTaskRun(runId: string) {
+    recoveryPlanGeneration += 1;
+    selectedRecoveryPlan = undefined;
     selectedRunId = runId;
     const run = desktop.runs.find((candidate) => candidate.runId === runId);
     if (run && $workbenchSelection.kind === 'task') {
@@ -267,7 +283,7 @@
     finalValue = resultsByRun[runId]?.result;
     finalError = resultsByRun[runId]?.error ?? '';
     try {
-      const result = await getRunResult(runId);
+      const [result] = await Promise.all([getRunResult(runId), loadRecoveryPlan(runId)]);
       if (selectedRunId === runId) finalValue = result ?? resultsByRun[runId]?.result;
     } catch (error) {
       if (selectedRunId === runId) finalError = String(error);
@@ -280,6 +296,53 @@
     catch (error) { finalError = String(error); }
     controlPending = false;
     await refresh();
+  }
+
+  async function loadRecoveryPlan(runId: string) {
+    const generation = ++recoveryPlanGeneration;
+    const run = desktop.runs.find((candidate) => candidate.runId === runId);
+    if (!run || run.occupiesSlot) {
+      if (selectedRunId === runId) selectedRecoveryPlan = undefined;
+      return;
+    }
+    try {
+      const plan = await getRunRecoveryPlan(runId);
+      const current = desktop.runs.find((candidate) => candidate.runId === runId);
+      if (generation === recoveryPlanGeneration
+        && selectedRunId === runId
+        && current
+        && !current.occupiesSlot
+        && plan.runId === runId
+        && plan.status === current.status) selectedRecoveryPlan = plan;
+    } catch {
+      if (generation === recoveryPlanGeneration && selectedRunId === runId) selectedRecoveryPlan = undefined;
+    }
+  }
+
+  async function recover(runId: string) {
+    controlPending = true;
+    finalError = '';
+    finalValue = undefined;
+    selectedRecoveryPlan = undefined;
+    try { await recoverRun(runId); }
+    catch (error) { finalError = String(error); }
+    controlPending = false;
+    await refresh();
+  }
+
+  async function steer(runId: string, message: string) {
+    controlPending = true;
+    finalError = '';
+    try {
+      await steerRun(runId, message);
+      return true;
+    }
+    catch (error) {
+      finalError = String(error);
+      return false;
+    } finally {
+      controlPending = false;
+    }
   }
 
   async function decide(run: RunSummary, approved: boolean) {
@@ -382,6 +445,8 @@
   }
 </script>
 
+<svelte:window on:keydown={(event) => { if (event.key === 'Escape') titlePreview = undefined; }} />
+
 {#if desktop.quitState === 'confirming'}
   <div class="modal-backdrop" role="presentation">
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="quit-title">
@@ -409,6 +474,18 @@
         <button disabled={deletionPending} on:click={() => { deletionPreview = undefined; }}>Cancel</button>
         <button class="danger" disabled={deletionPending || deletionPreview.occupied} on:click={confirmDeletion}>Delete permanently</button>
       </div>
+    </div>
+  </div>
+{/if}
+
+{#if titlePreview}
+  <div class="modal-backdrop" role="presentation">
+    <div class="modal title-modal" role="dialog" aria-modal="true" aria-labelledby="description-title">
+      <header>
+        <div><span>{titlePreview.kind}</span><h2 id="description-title">Full description</h2></div>
+        <button aria-label="Close description" on:click={() => { titlePreview = undefined; }}>×</button>
+      </header>
+      <p>{titlePreview.title}</p>
     </div>
   </div>
 {/if}
@@ -481,11 +558,15 @@
           result={finalValue}
           error={finalError}
           pending={controlPending || deletionPending}
+          recoveryPlan={selectedRecoveryPlan}
           onselectrun={selectTaskRun}
           onstop={stop}
+          onrecover={recover}
+          onsteer={steer}
           ondecision={decide}
           ondelete={requestDeletion}
           oninspect={() => { $inspectorOpen = true; }}
+          onshowtitle={(kind, title) => { titlePreview = { kind, title }; }}
         />
       {:else if $workbenchSelection.kind === 'chat' && selectedChat}
         <ChatWorkspace
@@ -502,6 +583,7 @@
           ondecision={decide}
           ondelete={requestDeletion}
           oninspect={() => { $inspectorOpen = true; }}
+          onshowtitle={(kind, title) => { titlePreview = { kind, title }; }}
         />
       {:else if $workbenchSelection.kind === 'settings'}
         <SettingsPanel {desktop} pending={controlPending} onreload={reload} />
