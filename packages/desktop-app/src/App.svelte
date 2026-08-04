@@ -83,6 +83,7 @@
   let tracePrivacy: TracePrivacy = { messages: false, reasoning: false, rawToolPayloads: false };
   let privacyPending = false;
   let titlePreview: { kind: 'task' | 'chat'; title: string } | undefined;
+  let inspectorWidth = 380;
 
   $: railItems = buildRailItems(desktop.runs, chats);
   $: selectedRun = desktop.runs.find((run) => run.runId === selectedRunId);
@@ -98,6 +99,8 @@
   onMount(() => {
     let unlisten = () => {};
     let cancelled = false;
+    const storedWidth = Number(localStorage.getItem('adaptiveAgent.inspectorWidth'));
+    if (storedWidth >= 320 && storedWidth <= 720) inspectorWidth = storedWidth;
     const timer = window.setInterval(() => { now = Date.now(); }, 100);
     void (async () => {
       unlisten = await subscribe(
@@ -234,6 +237,10 @@
     } catch (error) {
       finalError = String(error);
     }
+  }
+
+  function submitNew(kind: 'task' | 'chat') {
+    return kind === 'task' ? void sendTask() : void newChat();
   }
 
   async function sendTask() {
@@ -443,6 +450,13 @@
         : undefined);
     return root ? activityByRoot[root] ?? [] : [];
   }
+
+  function resizeInspector(event: PointerEvent) {
+    const startX = event.clientX; const startWidth = inspectorWidth;
+    const move = (next: PointerEvent) => { inspectorWidth = Math.max(320, Math.min(720, startWidth + startX - next.clientX)); };
+    const up = () => { localStorage.setItem('adaptiveAgent.inspectorWidth', String(inspectorWidth)); window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
+    window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
+  }
 </script>
 
 <svelte:window on:keydown={(event) => { if (event.key === 'Escape') titlePreview = undefined; }} />
@@ -499,7 +513,6 @@
     mobileOpen={true}
     onselect={selectRail}
     onnewtask={showNewTask}
-    onnewchat={showNewChat}
     onsettings={showSettings}
     onclose={() => { $mobileRailOpen = false; }}
   />
@@ -508,7 +521,7 @@
   <button class="drawer-backdrop rail-backdrop" aria-label="Close task rail" on:click={() => { $mobileRailOpen = false; }}></button>
 {/if}
 
-<main class:inspector-open={$inspectorOpen} class="workbench">
+<main class:inspector-open={$inspectorOpen} class="workbench" style={`--inspector-width:${inspectorWidth}px`}>
   <aside class="desktop-rail">
     <WorkbenchRail
       items={railItems}
@@ -517,7 +530,6 @@
       capacity={desktop.capacity}
       onselect={selectRail}
       onnewtask={showNewTask}
-      onnewchat={showNewChat}
       onsettings={showSettings}
       onclose={() => { $mobileRailOpen = false; }}
     />
@@ -542,12 +554,13 @@
     <div class="workspace-content">
       {#if $workbenchSelection.kind === 'new-task' || $workbenchSelection.kind === 'new-chat'}
         <NewComposer
-          kind={$workbenchSelection.kind === 'new-task' ? 'task' : 'chat'}
           bind:value={task}
           pending={startPending}
-          disabled={!desktop.configurationValid || desktop.quitState !== 'idle' || ($workbenchSelection.kind === 'new-task' && desktop.occupiedSlotCount >= desktop.capacity)}
+          disabled={!desktop.configurationValid || desktop.quitState !== 'idle'}
           status={`${desktop.occupiedSlotCount}/${desktop.capacity} execution slots occupied`}
-          onsubmit={$workbenchSelection.kind === 'new-task' ? sendTask : newChat}
+          configuration={desktop.configuration}
+          capacityAvailable={desktop.occupiedSlotCount < desktop.capacity}
+          onsubmit={submitNew}
         />
       {:else if $workbenchSelection.kind === 'task' && selectedRun}
         <TaskWorkspace
@@ -598,6 +611,7 @@
   </section>
 
   <aside class:open={$inspectorOpen} class="inspector-drawer">
+    <button class="inspector-resizer" aria-label="Resize inspector" on:pointerdown={resizeInspector}></button>
     <RunInspector
       {desktop}
       root={selectedRunId}

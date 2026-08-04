@@ -28,6 +28,27 @@ places it under Tauri's target-triple sidecar name. Native macOS (arm64/x64), Li
 (arm64/x64), and Windows x64 targets are mapped. CI can set `TAURI_TARGET_TRIPLE` or
 pass a triple to `bun run sidecar:prepare -- <triple>`.
 
-The renderer has only four application commands: state, reload settings, start run,
-and stop run. It receives simplified progress/final events. No shell capability or
-generic JSON-RPC command is granted to the webview.
+The renderer uses a narrow set of typed workbench commands for runs, chats, approvals,
+recovery, history, trace privacy, and shutdown. It receives simplified progress/final
+events. No shell capability or generic JSON-RPC command is granted to the webview.
+
+## Product decisions and current limitations
+
+- **Create / Auto:** Auto is deterministic: prompts beginning with `chat:`, `discuss:`,
+  or `talk about` create a chat; everything else starts a task. Explicit Task and Chat
+  modes bypass this heuristic. Attachments are unavailable.
+- **Steering and recovery:** steering appears only while a run is steerable and affects
+  the next model step. Recovery is offered only when the runtime marks it executable;
+  `continue_new_run` is labeled “Continue in new run” and uses the existing recovery command.
+- **Results:** Artifacts are inferred only from structured `files`/`artifacts` arrays or
+  recognizable filenames in the result. The backend has no structured artifact store,
+  source provenance, or share service. Export is a local browser download; raw result
+  source remains available in the renderer.
+- **Search:** history search covers task titles and chat titles/messages already loaded
+  by the desktop app; it is not a backend-wide or file-content search. Artifacts and Saved
+  navigation are shown as unavailable until backing models exist.
+- **Privacy:** sensitive messages, reasoning, and raw tool payloads are opt-in under
+  Inspector Diagnostics and may expose private data locally.
+- **Capacity and windows:** the slot meter reports runtime execution capacity. A task may
+  start only when capacity is available; chats remain persistent but turns also consume a
+  slot. On narrow windows navigation and Inspector become overlay drawers.
