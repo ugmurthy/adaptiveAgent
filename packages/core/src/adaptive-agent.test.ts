@@ -1256,6 +1256,36 @@ describe('AdaptiveAgent', () => {
     });
   });
 
+  it('offers Retry for provider output data-inspection failures', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const model = new SequenceModel([
+      new Error('<400> InternalError.Algo.DataInspectionFailed: Output data may contain inappropriate content.'),
+      { finishReason: 'stop', text: 'Recovered with provider-approved output.' },
+    ]);
+    const agent = new AdaptiveAgent({ model, tools: [], runStore, eventStore, snapshotStore });
+
+    const failed = await agent.run({ goal: 'Give me world news headlines' });
+    expect(failed).toMatchObject({ status: 'failure', code: 'MODEL_ERROR' });
+    await expect(agent.getRecoveryPlan(failed.runId)).resolves.toMatchObject({
+      runId: failed.runId,
+      status: 'failed',
+      action: 'retry_same_run',
+      executable: true,
+      retryability: { retryable: true, failureKind: 'provider_error' },
+    });
+
+    await expect(agent.recover({ runId: failed.runId })).resolves.toMatchObject({
+      action: 'retry_same_run',
+      result: {
+        status: 'success',
+        runId: failed.runId,
+        output: 'Recovered with provider-approved output.',
+      },
+    });
+  });
+
   it('allows repeated retries for timeout and Cloudflare 524 model failures', async () => {
     const runStore = new InMemoryRunStore();
     const eventStore = new InMemoryEventStore();
@@ -5652,6 +5682,136 @@ describe('AdaptiveAgent', () => {
       result: { status: 'success', runId: run.id, output: 'Recovered.' },
     });
     expect((await eventStore.listByRun(run.id)).some((event) => event.type === 'run.resumed')).toBe(true);
+  });
+
+  it('preserves an in-flight interrupt and resumes from the persisted state', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const runId = crypto.randomUUID();
+    let releaseFirstResponse: ((response: ModelResponse) => void) | undefined;
+    let markFirstRequestStarted: (() => void) | undefined;
+    const firstRequestStarted = new Promise<void>((resolve) => { markFirstRequestStarted = resolve; });
+    let requestCount = 0;
+    const model: ModelAdapter = {
+      provider: 'test',
+      model: 'interrupt-resume',
+      capabilities: { toolCalling: true, jsonOutput: true, streaming: false, usage: false },
+      generate: async () => {
+        requestCount += 1;
+        if (requestCount === 1) {
+          markFirstRequestStarted?.();
+          return new Promise<ModelResponse>((resolve) => { releaseFirstResponse = resolve; });
+        }
+        return { finishReason: 'stop', text: 'Completed after resume.' };
+      },
+    };
+    const agent = new AdaptiveAgent({ model, tools: [], runStore, eventStore, snapshotStore });
+
+    const initialExecution = agent.run({ runId, goal: 'Interrupt this model request' });
+    await firstRequestStarted;
+    await agent.interrupt(runId);
+    await expect(agent.recover({ runId })).rejects.toThrow('already has an active execution');
+    releaseFirstResponse?.({ finishReason: 'stop', text: 'This in-flight response must be discarded.' });
+
+    await expect(initialExecution).resolves.toMatchObject({
+      status: 'failure',
+      runId,
+      code: 'INTERRUPTED',
+    });
+    await expect(runStore.getRun(runId)).resolves.toMatchObject({ status: 'interrupted' });
+    await expect(agent.getRecoveryPlan(runId)).resolves.toMatchObject({
+      status: 'interrupted',
+      action: 'resume_same_run',
+      executable: true,
+    });
+    await expect(agent.recover({ runId })).resolves.toMatchObject({
+      action: 'resume_same_run',
+      result: { status: 'success', runId, output: 'Completed after resume.' },
+    });
+    expect(requestCount).toBe(2);
+    expect((await eventStore.listByRun(runId)).map((event) => event.type)).toEqual(expect.arrayContaining([
+      'run.interrupted',
+      'run.resumed',
+      'run.completed',
+    ]));
+  });
+
+  it('does not let a terminal write overwrite a concurrently persisted interrupt', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const runId = crypto.randomUUID();
+    const updateRun = runStore.updateRun.bind(runStore);
+    let interruptBeforeTerminalWrite: (() => Promise<void>) | undefined;
+    runStore.updateRun = async (id, patch, expectedVersion) => {
+      if (patch.status === 'succeeded' && interruptBeforeTerminalWrite) {
+        const interrupt = interruptBeforeTerminalWrite;
+        interruptBeforeTerminalWrite = undefined;
+        await interrupt();
+      }
+      return updateRun(id, patch, expectedVersion);
+    };
+    const agent = new AdaptiveAgent({
+      model: new SequenceModel([{ finishReason: 'stop', text: 'Late terminal response.' }]),
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+    interruptBeforeTerminalWrite = () => agent.interrupt(runId);
+
+    await expect(agent.run({ runId, goal: 'Race interrupt with completion' })).resolves.toMatchObject({
+      status: 'failure',
+      runId,
+      code: 'INTERRUPTED',
+    });
+    await expect(runStore.getRun(runId)).resolves.toMatchObject({ status: 'interrupted' });
+    const eventTypes = (await eventStore.listByRun(runId)).map((event) => event.type);
+    expect(eventTypes).toContain('run.interrupted');
+    expect(eventTypes).not.toContain('run.completed');
+    expect(eventTypes).not.toContain('run.failed');
+  });
+
+  it('does not overwrite an interrupt observed immediately before a late model failure', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const runId = crypto.randomUUID();
+    const getRun = runStore.getRun.bind(runStore);
+    let interruptBeforeFailureRefresh: (() => Promise<void>) | undefined;
+    runStore.getRun = async (id) => {
+      const run = await getRun(id);
+      if (run?.status === 'running' && interruptBeforeFailureRefresh) {
+        const interrupt = interruptBeforeFailureRefresh;
+        interruptBeforeFailureRefresh = undefined;
+        await interrupt();
+      }
+      return run;
+    };
+    let releaseModelFailure: ((error: Error) => void) | undefined;
+    let markRequestStarted: (() => void) | undefined;
+    const requestStarted = new Promise<void>((resolve) => { markRequestStarted = resolve; });
+    const model: ModelAdapter = {
+      provider: 'test',
+      model: 'late-failure',
+      capabilities: { toolCalling: true, jsonOutput: true, streaming: false, usage: false },
+      generate: async () => {
+        markRequestStarted?.();
+        return new Promise<ModelResponse>((_resolve, reject) => { releaseModelFailure = reject; });
+      },
+    };
+    const agent = new AdaptiveAgent({ model, tools: [], runStore, eventStore, snapshotStore });
+    const execution = agent.run({ runId, goal: 'Race interrupt with failure' });
+    await requestStarted;
+    interruptBeforeFailureRefresh = () => agent.interrupt(runId);
+    releaseModelFailure?.(new Error('Late provider failure'));
+
+    await expect(execution).resolves.toMatchObject({ status: 'failure', runId, code: 'INTERRUPTED' });
+    await expect(runStore.getRun(runId)).resolves.toMatchObject({ status: 'interrupted' });
+    const eventTypes = (await eventStore.listByRun(runId)).map((event) => event.type);
+    expect(eventTypes).toContain('run.interrupted');
+    expect(eventTypes).not.toContain('run.failed');
   });
 
   it('reuses a completed tool execution ledger entry during resume', async () => {

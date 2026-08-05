@@ -271,6 +271,7 @@ export class AdaptiveAgent {
   };
   private readonly defaultCaptureMode: CaptureMode;
   private readonly leaseOwner = `adaptive-agent:${crypto.randomUUID()}`;
+  private readonly activeRunIds = new Set<UUID>();
   private readonly eventEmitter: EventSink;
   private readonly delegationExecutor: DelegationExecutor;
   private readonly recoveryAnalyzer: RunRecoveryAnalyzer;
@@ -1938,6 +1939,9 @@ export class AdaptiveAgent {
           response = await this.generateModelResponse(currentRun, state);
         } catch (error) {
           currentRun = await this.refreshRun(currentRun.id);
+          if (currentRun.status === 'interrupted') {
+            return interruptResult(currentRun.id, state.stepsUsed, currentRun.usage, 'Run interrupted cooperatively');
+          }
           return this.failRun(
             currentRun,
             state,
@@ -1947,6 +1951,9 @@ export class AdaptiveAgent {
         }
 
         currentRun = await this.refreshRun(currentRun.id);
+        if (currentRun.status === 'interrupted') {
+          return interruptResult(currentRun.id, state.stepsUsed, currentRun.usage, 'Run interrupted cooperatively');
+        }
 
         if (response.finishReason === 'error') {
           return this.failRun(currentRun, state, 'Model returned finishReason=error', 'MODEL_ERROR');
@@ -3990,54 +3997,65 @@ export class AdaptiveAgent {
     patch: Partial<AgentRun>;
     event: (run: AgentRun) => Omit<AgentEvent, 'id' | 'seq' | 'createdAt'>;
   }): Promise<AgentRun> {
+    if (params.run.status === 'interrupted') return params.run;
     const transactionStore = this.options.transactionStore;
     if (transactionStore?.eventStore && transactionStore.snapshotStore) {
       const downstreamEvents: AgentEvent[] = [];
-      const terminalRun = await transactionStore.runInTransaction(async (stores) => {
-        if (!stores.eventStore || !stores.snapshotStore) {
-          throw new Error('Transactional terminal transition requires eventStore and snapshotStore');
+      try {
+        const terminalRun = await transactionStore.runInTransaction(async (stores) => {
+          if (!stores.eventStore || !stores.snapshotStore) {
+            throw new Error('Transactional terminal transition requires eventStore and snapshotStore');
+          }
+
+          const updatedRun = await stores.runStore.updateRun(params.run.id, params.patch, params.run.version);
+          const snapshotEvent = await this.saveExecutionSnapshotWithStores(
+            stores,
+            updatedRun,
+            params.state,
+            updatedRun.status,
+          );
+          if (snapshotEvent) {
+            downstreamEvents.push(snapshotEvent);
+          }
+
+          const terminalEvent = this.withEventPayloadPerformance(params.event(updatedRun));
+          downstreamEvents.push(await stores.eventStore.append(terminalEvent));
+          return updatedRun;
+        });
+
+        await this.emitDownstreamOnly(downstreamEvents);
+        return terminalRun;
+      } catch (error) {
+        if (isOptimisticConcurrencyError(error)) {
+          const refreshedRun = await this.refreshRun(params.run.id);
+          if (refreshedRun.status === 'interrupted') return refreshedRun;
         }
-
-        const updatedRun = await stores.runStore.updateRun(params.run.id, params.patch, params.run.version);
-        const snapshotEvent = await this.saveExecutionSnapshotWithStores(
-          stores,
-          updatedRun,
-          params.state,
-          updatedRun.status,
-        );
-        if (snapshotEvent) {
-          downstreamEvents.push(snapshotEvent);
-        }
-
-        const terminalEvent = this.withEventPayloadPerformance(params.event(updatedRun));
-        downstreamEvents.push(await stores.eventStore.append(terminalEvent));
-        return updatedRun;
-      });
-
-      await this.emitDownstreamOnly(downstreamEvents);
-      return terminalRun;
+        throw error;
+      }
     }
 
     const terminalRun = await this.updateRunForTerminalTransition(params.run, params.patch);
+    if (terminalRun.status === 'interrupted') return terminalRun;
     await this.saveExecutionSnapshot(terminalRun, params.state, terminalRun.status);
     await this.emit(params.event(terminalRun));
     return terminalRun;
   }
 
   private async updateRunForTerminalTransition(run: AgentRun, patch: Partial<AgentRun>): Promise<AgentRun> {
-    try {
-      return await this.options.runStore.updateRun(run.id, patch, run.version);
-    } catch (error) {
-      if (!isOptimisticConcurrencyError(error)) {
-        throw error;
-      }
+    let currentRun = run;
+    while (true) {
+      try {
+        return await this.options.runStore.updateRun(currentRun.id, patch, currentRun.version);
+      } catch (error) {
+        if (!isOptimisticConcurrencyError(error)) {
+          throw error;
+        }
 
-      const refreshedRun = await this.refreshRun(run.id);
-      if (TERMINAL_RUN_STATUSES.has(refreshedRun.status)) {
-        return refreshedRun;
+        currentRun = await this.refreshRun(run.id);
+        if (TERMINAL_RUN_STATUSES.has(currentRun.status) || currentRun.status === 'interrupted') {
+          return currentRun;
+        }
       }
-
-      return this.options.runStore.updateRun(refreshedRun.id, patch, refreshedRun.version);
     }
   }
 
@@ -4556,6 +4574,9 @@ export class AdaptiveAgent {
         },
       }),
     });
+    if (completedRun.status === 'interrupted') {
+      return interruptResult(completedRun.id, state.stepsUsed, completedRun.usage, 'Run interrupted cooperatively');
+    }
 
     this.logLifecycle('info', 'run.completed', {
       ...runLogBindings(completedRun),
@@ -4605,6 +4626,9 @@ export class AdaptiveAgent {
         },
       }),
     });
+    if (failedRun.status === 'interrupted') {
+      return interruptResult(failedRun.id, state.stepsUsed, failedRun.usage, 'Run interrupted cooperatively');
+    }
 
     this.logLifecycle(code === 'REPLAN_REQUIRED' ? 'warn' : 'error', code === 'REPLAN_REQUIRED' ? 'replan.required' : 'run.failed', {
       ...runLogBindings(failedRun),
@@ -4765,14 +4789,26 @@ export class AdaptiveAgent {
   }
 
   private async acquireLeaseOrThrow(runId: UUID): Promise<void> {
-    const acquired = await this.options.runStore.tryAcquireLease({
-      runId,
-      owner: this.leaseOwner,
-      ttlMs: this.defaults.modelTimeoutMs,
-      now: new Date(),
-    });
+    if (this.activeRunIds.has(runId)) {
+      throw new Error(`Run ${runId} already has an active execution`);
+    }
+    this.activeRunIds.add(runId);
+
+    let acquired: boolean;
+    try {
+      acquired = await this.options.runStore.tryAcquireLease({
+        runId,
+        owner: this.leaseOwner,
+        ttlMs: this.defaults.modelTimeoutMs,
+        now: new Date(),
+      });
+    } catch (error) {
+      this.activeRunIds.delete(runId);
+      throw error;
+    }
 
     if (!acquired) {
+      this.activeRunIds.delete(runId);
       const run = await this.options.runStore.getRun(runId);
       const details = run
         ? [
@@ -4790,6 +4826,8 @@ export class AdaptiveAgent {
       await this.options.runStore.releaseLease(runId, this.leaseOwner);
     } catch {
       // Release is best effort in this scaffold so resumed/terminal paths remain simple.
+    } finally {
+      this.activeRunIds.delete(runId);
     }
   }
 
@@ -6895,6 +6933,10 @@ function classifyFailureKind(code?: RunFailureCode, message?: string): FailureKi
 
   if (normalized.includes('rate limit') || normalized.includes('429')) {
     return 'rate_limit';
+  }
+
+  if (normalized.includes('internalerror.algo.datainspectionfailed')) {
+    return 'provider_error';
   }
 
   if (
