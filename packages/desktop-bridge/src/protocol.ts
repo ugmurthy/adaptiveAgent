@@ -133,7 +133,7 @@ export interface ContinueParams extends RunIdParams {
 }
 
 export interface RecoverParams extends RunIdParams {
-  strategy?: 'auto' | 'resume' | 'retry' | 'continue';
+  strategy?: 'auto' | 'same_run' | 'resume' | 'retry' | 'continue';
   dryRun?: boolean;
 }
 
@@ -331,7 +331,7 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
     case 'run/recover': {
       const value = requiredParams(method, params);
       requiredString(value, 'runId');
-      optionalEnum(value, 'strategy', ['auto', 'resume', 'retry', 'continue']);
+      optionalEnum(value, 'strategy', ['auto', 'same_run', 'resume', 'retry', 'continue']);
       optionalBoolean(value, 'dryRun');
       return;
     }

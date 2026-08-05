@@ -1568,6 +1568,13 @@ export class AdaptiveAgent {
 
   async recover(options: RecoverRunOptions): Promise<RecoverRunResult> {
     const plan = await this.getRecoveryPlan(options.runId);
+    if (
+      options.strategy === 'same_run'
+      && plan.action !== 'resume_same_run'
+      && plan.action !== 'retry_same_run'
+    ) {
+      throw new Error(`Run ${options.runId} has no executable same-run recovery: ${plan.reason}`);
+    }
     const action = resolveRecoveryActionOverride(plan.action, options.strategy);
     if (action !== plan.action) {
       return this.recoverWithAction(options, plan, action);
@@ -7006,7 +7013,7 @@ function resolveRecoveryActionOverride(
   action: RunRecoveryPlan['action'],
   strategy: RecoverRunOptions['strategy'],
 ): RunRecoveryPlan['action'] {
-  if (!strategy || strategy === 'auto') {
+  if (!strategy || strategy === 'auto' || strategy === 'same_run') {
     return action;
   }
 

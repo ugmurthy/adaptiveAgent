@@ -796,7 +796,7 @@ export interface RunRecoveryPlan {
 
 export interface RecoverRunOptions {
   runId: UUID;
-  strategy?: 'auto' | 'resume' | 'retry' | 'continue';
+  strategy?: 'auto' | 'same_run' | 'resume' | 'retry' | 'continue';
   requireApproval?: boolean;
   metadata?: Record<string, JsonValue>;
 }

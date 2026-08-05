@@ -179,6 +179,18 @@ describe('desktop runtime protocol', () => {
     expect(retryRaw).toHaveBeenCalledWith('failed-run');
   });
 
+  it('dispatches constrained same-run recovery to core', async () => {
+    const recoverRaw = vi.fn(async (options: { runId: string }) => ({ runId: options.runId, action: 'retry_same_run' }));
+    const { runtime } = createRuntime();
+    await initialize(runtime);
+    (runtime as unknown as { sdk: unknown }).sdk = { recoverRaw };
+
+    await expect(runtime.handleRpc(request({
+      id: 'recover', method: 'run/recover', params: { runId: 'failed-run', strategy: 'same_run' },
+    }))).resolves.toMatchObject({ runId: 'failed-run', action: 'retry_same_run' });
+    expect(recoverRaw).toHaveBeenCalledWith({ runId: 'failed-run', strategy: 'same_run' });
+  });
+
   it('exposes typed history maintenance only in protocol 1.12 with SQLite support', async () => {
     const previewDeletion = vi.fn(async (target) => ({ target, runIds: ['root'], rootRunIds: ['root'], ownedPlanIds: [], preservedPlanIds: [] }));
     const deleteHistory = vi.fn(async (target) => ({ target, runIds: ['root'], rootRunIds: ['root'], ownedPlanIds: [], preservedPlanIds: [] }));

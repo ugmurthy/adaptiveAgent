@@ -39,7 +39,7 @@ export function extractResultArtifacts(value: unknown): ResultArtifact[] {
 
 export function recoveryActionLabel(plan?: RunRecoveryPlan): string {
   if (!plan?.executable) return '';
-  if (plan.status === 'failed' && plan.action === 'retry_same_run') return 'Retry run';
-  if (plan.status === 'interrupted' && plan.action === 'resume_same_run') return 'Resume run';
+  if (plan.status === 'failed' && plan.action === 'retry_same_run') return 'Recover run';
+  if (plan.status === 'interrupted' && plan.action === 'resume_same_run') return 'Recover run';
   return '';
 }

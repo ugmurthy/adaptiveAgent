@@ -582,19 +582,14 @@ impl Bridge {
             self.reconcile_run(operation.run_id);
             return;
         }
-        let method = match (accepted, operation.requested_action.as_str(), status) {
-            (true, _, _) => "run/resume",
-            (false, "retry", "failed") => "run/retry",
-            (false, "resume", "interrupted") => "run/resume",
-            _ => {
-                let _ = self.app.emit(
+        if !pending_recovery_can_dispatch(accepted, &operation.requested_action, status) {
+            let _ = self.app.emit(
                     "adaptive-agent://control-error",
                     json!({"runId":operation.run_id,"error":format!("Pending {} recovery requires reconciliation from runtime status {status}.",operation.requested_action)}),
                 );
-                return;
-            }
-        };
-        if let Err(error) = self.dispatch_same_run_recovery(&operation.run_id, method) {
+            return;
+        }
+        if let Err(error) = self.dispatch_same_run_recovery(&operation.run_id) {
             let _ = self.app.emit(
                 "adaptive-agent://control-error",
                 json!({"runId":operation.run_id,"error":format!("Unable to restore pending recovery: {error}")}),
@@ -1869,7 +1864,7 @@ impl Bridge {
         }
 
         let plan = self.recovery_plan(run_id)?;
-        let (action, method) = same_run_recovery_dispatch(&plan, expected_status, expected_action)?;
+        let action = same_run_recovery_action(&plan, expected_status, expected_action)?;
 
         let previous = self
             .registry
@@ -1899,14 +1894,10 @@ impl Bridge {
             return Err(error.into());
         }
 
-        self.dispatch_same_run_recovery(run_id, method)
+        self.dispatch_same_run_recovery(run_id)
     }
 
-    fn dispatch_same_run_recovery(
-        self: &Arc<Self>,
-        run_id: &str,
-        method: &'static str,
-    ) -> Result<(), String> {
+    fn dispatch_same_run_recovery(self: &Arc<Self>, run_id: &str) -> Result<(), String> {
         let needs_activation = self
             .registry
             .lock()
@@ -1930,7 +1921,10 @@ impl Bridge {
             record.request_active = true;
             record.revision += 1;
         }
-        let receiver = match self.request(method, json!({ "runId": run_id })) {
+        let receiver = match self.request(
+            "run/recover",
+            json!({ "runId": run_id, "strategy": "same_run" }),
+        ) {
             Ok((_request_id, receiver)) => receiver,
             Err(error) => {
                 if let Some(record) = self.registry.lock().unwrap().get_mut(run_id) {
@@ -3245,11 +3239,21 @@ fn recovery_operation_was_accepted(inspection: &Value, operation: &PendingRunRec
         })
 }
 
-fn same_run_recovery_dispatch(
+fn pending_recovery_can_dispatch(accepted: bool, requested_action: &str, status: &str) -> bool {
+    accepted
+        || matches!(
+            (requested_action, status),
+            ("retry", "failed")
+                | ("resume", "interrupted")
+                | (_, "queued" | "planning" | "running" | "awaiting_subagent")
+        )
+}
+
+fn same_run_recovery_action(
     plan: &Value,
     expected_status: &str,
     expected_action: &str,
-) -> Result<(&'static str, &'static str), String> {
+) -> Result<&'static str, String> {
     if plan.get("executable").and_then(Value::as_bool) != Some(true) {
         return Err(plan
             .get("reason")
@@ -3265,8 +3269,8 @@ fn same_run_recovery_dispatch(
         );
     }
     match (status, action) {
-        (Some("interrupted"), Some("resume_same_run")) => Ok(("resume", "run/resume")),
-        (Some("failed"), Some("retry_same_run")) => Ok(("retry", "run/retry")),
+        (Some("interrupted"), Some("resume_same_run")) => Ok("resume"),
+        (Some("failed"), Some("retry_same_run")) => Ok("retry"),
         (_, Some("continue_new_run")) => {
             Err("Continue as a new run is not available as a failed-run recovery control.".into())
         }
@@ -3941,28 +3945,46 @@ mod tests {
     }
 
     #[test]
-    fn same_run_recovery_dispatch_is_capability_and_status_gated() {
+    fn pending_recovery_dispatches_across_the_status_event_crash_window() {
+        assert!(pending_recovery_can_dispatch(
+            false,
+            "resume",
+            "interrupted"
+        ));
+        assert!(pending_recovery_can_dispatch(false, "retry", "failed"));
+        assert!(pending_recovery_can_dispatch(false, "resume", "running"));
+        assert!(pending_recovery_can_dispatch(false, "retry", "planning"));
+        assert!(!pending_recovery_can_dispatch(false, "retry", "cancelled"));
+        assert!(!pending_recovery_can_dispatch(
+            false,
+            "resume",
+            "awaiting_approval"
+        ));
+    }
+
+    #[test]
+    fn same_run_recovery_action_is_capability_and_status_gated() {
         assert_eq!(
-            same_run_recovery_dispatch(
+            same_run_recovery_action(
                 &json!({
                     "status":"failed","action":"retry_same_run","executable":true
                 }),
                 "failed",
                 "retry_same_run"
             ),
-            Ok(("retry", "run/retry"))
+            Ok("retry")
         );
         assert_eq!(
-            same_run_recovery_dispatch(
+            same_run_recovery_action(
                 &json!({
                     "status":"interrupted","action":"resume_same_run","executable":true
                 }),
                 "interrupted",
                 "resume_same_run"
             ),
-            Ok(("resume", "run/resume"))
+            Ok("resume")
         );
-        assert!(same_run_recovery_dispatch(
+        assert!(same_run_recovery_action(
             &json!({
                 "status":"failed","action":"continue_new_run","executable":true
             }),
@@ -3971,7 +3993,7 @@ mod tests {
         )
         .unwrap_err()
         .contains("not available"));
-        assert!(same_run_recovery_dispatch(
+        assert!(same_run_recovery_action(
             &json!({
                 "status":"failed","action":"resume_same_run","executable":true
             }),
@@ -3981,7 +4003,7 @@ mod tests {
         .unwrap_err()
         .contains("no longer matches"));
         assert_eq!(
-            same_run_recovery_dispatch(
+            same_run_recovery_action(
                 &json!({
                     "status":"failed","action":"retry_same_run","executable":false,
                     "reason":"Failure is not retryable"
@@ -3991,7 +4013,7 @@ mod tests {
             ),
             Err("Failure is not retryable".into())
         );
-        assert!(same_run_recovery_dispatch(
+        assert!(same_run_recovery_action(
             &json!({
                 "status":"interrupted","action":"resume_same_run","executable":true
             }),

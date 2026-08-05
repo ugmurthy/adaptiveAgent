@@ -18,9 +18,9 @@ describe('workbench UX decisions', () => {
     expect(resultDisplayContent(result)).toBe('# Readiness report');
     expect(resultDisplayContent({ arbitrary: true })).toEqual({ arbitrary: true });
   });
-  it('exposes only status-matched Retry and Resume recovery controls', () => {
-    expect(recoveryActionLabel({runId:'failed',status:'failed',action:'retry_same_run',executable:true,reason:'retryable'})).toBe('Retry run');
-    expect(recoveryActionLabel({runId:'interrupted',status:'interrupted',action:'resume_same_run',executable:true,reason:'resumable'})).toBe('Resume run');
+  it('exposes one status-matched Recover control', () => {
+    expect(recoveryActionLabel({runId:'failed',status:'failed',action:'retry_same_run',executable:true,reason:'retryable'})).toBe('Recover run');
+    expect(recoveryActionLabel({runId:'interrupted',status:'interrupted',action:'resume_same_run',executable:true,reason:'resumable'})).toBe('Recover run');
     expect(recoveryActionLabel({runId:'continue',status:'failed',action:'continue_new_run',executable:true,reason:'continuable'})).toBe('');
     expect(recoveryActionLabel({runId:'mismatch',status:'failed',action:'resume_same_run',executable:true,reason:'stale plan'})).toBe('');
     expect(recoveryActionLabel({runId:'disabled',status:'failed',action:'retry_same_run',executable:false,reason:'not retryable'})).toBe('');

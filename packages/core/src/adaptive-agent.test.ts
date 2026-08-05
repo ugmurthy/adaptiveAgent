@@ -1256,6 +1256,26 @@ describe('AdaptiveAgent', () => {
     });
   });
 
+  it('prevents constrained automatic recovery from continuing as a new run', async () => {
+    const agent = new AdaptiveAgent({
+      model: new SequenceModel([]),
+      tools: [],
+      runStore: new InMemoryRunStore(),
+    });
+    const runId = crypto.randomUUID();
+    vi.spyOn(agent, 'getRecoveryPlan').mockResolvedValue({
+      runId,
+      status: 'failed',
+      action: 'continue_new_run',
+      executable: true,
+      reason: 'Only new-run continuation is safe.',
+    });
+
+    await expect(agent.recover({ runId, strategy: 'same_run' })).rejects.toThrow(
+      'has no executable same-run recovery',
+    );
+  });
+
   it('offers Retry for provider output data-inspection failures', async () => {
     const runStore = new InMemoryRunStore();
     const eventStore = new InMemoryEventStore();
