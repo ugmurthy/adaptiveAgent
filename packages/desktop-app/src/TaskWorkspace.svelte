@@ -58,7 +58,7 @@
 
 <section class="center-card task-view">
   <div class="view-heading task-header">
-    <div><span>{selectedRun.occupiesSlot ? 'Live task' : 'Completed task'}</span><h2><button class="title-trigger" aria-label="View full task description" on:click={() => onshowtitle('task', selectedRun.title)}>{selectedRun.title}</button></h2><p>Run {selectedRun.runId.slice(0,8)} · <strong class="status-label">{selectedRun.status}</strong></p></div>
+    <div><span>{selectedRun.occupiesSlot ? 'Live task' : 'Completed task'}</span><h2><button class="title-trigger" title={selectedRun.title} aria-label={`View full task description: ${selectedRun.title}`} on:click={() => onshowtitle('task', selectedRun.title)}>{selectedRun.title}</button></h2><p>Run {selectedRun.runId.slice(0,8)} · <strong class="status-label">{selectedRun.status}</strong></p></div>
     <div class="heading-actions"><button on:click={oninspect}>Inspector</button>{#if result !== undefined}<button on:click={exportResult}>Export</button><button disabled title="Sharing requires a share backend">Share</button>{/if}</div>
   </div>
   {#if attempts.length > 1}

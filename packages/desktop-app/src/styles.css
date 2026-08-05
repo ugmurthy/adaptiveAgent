@@ -78,7 +78,7 @@ pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.5 
 .view-heading > div:first-child { min-width: 0; flex: 1; }
 .view-heading span { color: #63d8b7; font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
 .view-heading h2 { min-width: 0; margin: 5px 0; font-size: clamp(20px, 3vw, 28px); }
-.title-trigger { display: block; width: 100%; border: 0; border-radius: 4px; background: transparent; padding: 0; color: inherit; font: inherit; font-weight: inherit; line-height: 1.2; text-align: left; white-space: normal; }
+.title-trigger { display: block; width: 100%; overflow: hidden; border: 0; border-radius: 4px; background: transparent; padding: 0; color: inherit; font: inherit; font-weight: inherit; line-height: 1.2; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
 .title-trigger:hover:not(:disabled) { border-color: transparent; background: transparent; color: #74dfbd; }
 .view-heading p { margin: 0; color: #8799a3; font-size: 12px; }
 .heading-actions, .context-actions, .actions, .attempt-tabs { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }

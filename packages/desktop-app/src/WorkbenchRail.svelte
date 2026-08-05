@@ -44,7 +44,7 @@
             {#if group === 'History' && (index === 0 || historyDate(item) !== historyDate(grouped[index - 1]))}
               <h3 class="rail-date">{historyDate(item)}</h3>
             {/if}
-              <button class:active={selected(item)} class="rail-item" on:click={() => onselect(item)}>
+              <button class:active={selected(item)} class="rail-item" title={item.title} aria-label={`${item.kind === 'task' ? 'Task' : 'Chat'}: ${item.title}`} on:click={() => onselect(item)}>
                 <span class:item-active={item.group === 'Active'} class:item-input={item.group === 'Needs input'} class="item-dot"></span>
                 <span><strong>{item.title}</strong><small>{item.status === 'succeeded' ? 'Completed' : item.status === 'running' ? 'Running now' : `${item.kind} · ${item.status}`}</small></span>
               </button>
