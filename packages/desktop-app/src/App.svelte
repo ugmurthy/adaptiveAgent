@@ -312,6 +312,7 @@
       if (selectedRunId === runId) selectedRecoveryPlan = undefined;
       return;
     }
+    if (selectedRunId === runId) selectedRecoveryPlan = undefined;
     try {
       const plan = await getRunRecoveryPlan(runId);
       const current = desktop.runs.find((candidate) => candidate.runId === runId);
@@ -326,12 +327,12 @@
     }
   }
 
-  async function recover(runId: string) {
+  async function recover(plan: RunRecoveryPlan) {
     controlPending = true;
     finalError = '';
     finalValue = undefined;
     selectedRecoveryPlan = undefined;
-    try { await recoverRun(runId); }
+    try { await recoverRun(plan); }
     catch (error) { finalError = String(error); }
     controlPending = false;
     await refresh();

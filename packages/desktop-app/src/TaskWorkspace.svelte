@@ -16,7 +16,7 @@
   export let recoveryPlan: RunRecoveryPlan | undefined;
   export let onselectrun: (runId: string) => void;
   export let onstop: (runId: string) => void;
-  export let onrecover: (runId: string) => void;
+  export let onrecover: (plan: RunRecoveryPlan) => void;
   export let onsteer: (runId: string, message: string) => Promise<boolean>;
   export let ondelete: (target: {kind:'item';itemId:string}|{kind:'run';runId:string}) => void;
   export let ondecision: (run: RunSummary, approved: boolean) => void;
@@ -31,7 +31,9 @@
     steerMessage = '';
   }
 
-  $: recoveryLabel = recoveryActionLabel(recoveryPlan);
+  $: recoveryLabel = recoveryPlan?.runId === selectedRun.runId && recoveryPlan.status === selectedRun.status
+    ? recoveryActionLabel(recoveryPlan)
+    : '';
   $: resultValue = output(result);
   $: artifacts = extractResultArtifacts(resultValue);
   $: displayedResult = resultDisplayContent(resultValue);
@@ -66,7 +68,7 @@
   {/if}
   <div class="context-actions">
     {#if selectedRun.occupiesSlot}<button disabled={pending} on:click={()=>onstop(selectedRun.runId)}>{selectedRun.cancelRequested?'Retry stop':'Stop run'}</button>{/if}
-    {#if !selectedRun.occupiesSlot && recoveryPlan?.executable && recoveryLabel}<button class="primary" disabled={pending} on:click={()=>onrecover(selectedRun.runId)}>{recoveryLabel}</button>{/if}
+    {#if !selectedRun.occupiesSlot && recoveryPlan?.executable && recoveryLabel}<button class="primary" disabled={pending} on:click={()=>onrecover(recoveryPlan)}>{recoveryLabel}</button>{/if}
     <button class="danger ghost" disabled={pending || selectedRun.occupiesSlot} on:click={()=>ondelete({kind:'run',runId:selectedRun.runId})}>Delete run</button>
     <button class="danger ghost" disabled={pending || attempts.some((run)=>run.occupiesSlot)} on:click={()=>ondelete({kind:'item',itemId:selectedRun.itemId})}>Delete task</button>
   </div>

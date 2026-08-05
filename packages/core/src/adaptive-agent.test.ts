@@ -1219,7 +1219,15 @@ describe('AdaptiveAgent', () => {
       stepsUsed: 0,
     });
 
-    const retried = await agent.retry(failed.runId);
+    await expect(agent.getRecoveryPlan(failed.runId)).resolves.toMatchObject({
+      runId: failed.runId,
+      status: 'failed',
+      action: 'retry_same_run',
+      executable: true,
+    });
+    const recovery = await agent.recover({ runId: failed.runId });
+    expect(recovery.action).toBe('retry_same_run');
+    const retried = recovery.result;
 
     expect(retried).toMatchObject({
       status: 'success',
@@ -5592,7 +5600,58 @@ describe('AdaptiveAgent', () => {
       snapshotStore,
     });
 
+    await expect(agent.getRecoveryPlan(run.id)).resolves.toMatchObject({
+      runId: run.id,
+      status: 'interrupted',
+      action: 'not_recoverable',
+      executable: false,
+      reason: expect.stringContaining('latest snapshot state is not compatible'),
+    });
     await expect(agent.resume(run.id)).rejects.toThrow('latest snapshot state is not compatible');
+  });
+
+  it('plans and executes Resume for an interrupted run', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const run = await runStore.createRun({
+      goal: 'Resume interrupted work',
+      status: 'interrupted',
+    });
+    await snapshotStore.save({
+      runId: run.id,
+      snapshotSeq: 1,
+      status: 'interrupted',
+      summary: { status: 'interrupted', stepsUsed: 0 },
+      state: {
+        schemaVersion: 1,
+        messages: [
+          { role: 'system', content: 'You are AdaptiveAgent.' },
+          { role: 'user', content: '{"goal":"Resume interrupted work"}' },
+        ],
+        stepsUsed: 0,
+      },
+    });
+    const agent = new AdaptiveAgent({
+      model: new SequenceModel([{ finishReason: 'stop', text: 'Recovered.' }]),
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore,
+    });
+
+    await expect(agent.getRecoveryPlan(run.id)).resolves.toMatchObject({
+      runId: run.id,
+      status: 'interrupted',
+      action: 'resume_same_run',
+      executable: true,
+    });
+    await expect(agent.recover({ runId: run.id })).resolves.toMatchObject({
+      runId: run.id,
+      action: 'resume_same_run',
+      result: { status: 'success', runId: run.id, output: 'Recovered.' },
+    });
+    expect((await eventStore.listByRun(run.id)).some((event) => event.type === 'run.resumed')).toBe(true);
   });
 
   it('reuses a completed tool execution ledger entry during resume', async () => {

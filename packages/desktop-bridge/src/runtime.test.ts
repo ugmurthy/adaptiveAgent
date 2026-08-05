@@ -161,6 +161,24 @@ describe('desktop runtime protocol', () => {
     }))).rejects.toMatchObject({ code: 'METHOD_NOT_FOUND' });
   });
 
+  it('dispatches Resume and Retry to their distinct runtime methods', async () => {
+    const resumeRaw = vi.fn(async (runId: string) => ({ status: 'success', runId, output: 'resumed', stepsUsed: 1, usage: {} }));
+    const retryRaw = vi.fn(async (runId: string) => ({ status: 'success', runId, output: 'retried', stepsUsed: 1, usage: {} }));
+    const { runtime } = createRuntime();
+    await initialize(runtime);
+    (runtime as unknown as { sdk: unknown }).sdk = { resumeRaw, retryRaw };
+
+    await expect(runtime.handleRpc(request({
+      id: 'resume', method: 'run/resume', params: { runId: 'interrupted-run' },
+    }))).resolves.toMatchObject({ runId: 'interrupted-run', output: 'resumed' });
+    await expect(runtime.handleRpc(request({
+      id: 'retry', method: 'run/retry', params: { runId: 'failed-run' },
+    }))).resolves.toMatchObject({ runId: 'failed-run', output: 'retried' });
+
+    expect(resumeRaw).toHaveBeenCalledWith('interrupted-run');
+    expect(retryRaw).toHaveBeenCalledWith('failed-run');
+  });
+
   it('exposes typed history maintenance only in protocol 1.12 with SQLite support', async () => {
     const previewDeletion = vi.fn(async (target) => ({ target, runIds: ['root'], rootRunIds: ['root'], ownedPlanIds: [], preservedPlanIds: [] }));
     const deleteHistory = vi.fn(async (target) => ({ target, runIds: ['root'], rootRunIds: ['root'], ownedPlanIds: [], preservedPlanIds: [] }));

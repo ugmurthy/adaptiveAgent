@@ -38,8 +38,9 @@ events. No shell capability or generic JSON-RPC command is granted to the webvie
   or `talk about` create a chat; everything else starts a task. Explicit Task and Chat
   modes bypass this heuristic. Attachments are unavailable.
 - **Steering and recovery:** steering appears only while a run is steerable and affects
-  the next model step. Recovery is offered only when the runtime marks it executable;
-  `continue_new_run` is labeled “Continue in new run” and uses the existing recovery command.
+  the next model step. Failed runs expose Retry only when same-run retry is executable,
+  and interrupted runs expose Resume only when same-run resume is executable. New-run
+  continuation is not exposed as a desktop failed-run recovery control.
 - **Results:** Artifacts are inferred only from structured `files`/`artifacts` arrays or
   recognizable filenames in the result. The backend has no structured artifact store,
   source provenance, or share service. Export is a local browser download; raw result

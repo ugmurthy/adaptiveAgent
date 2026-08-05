@@ -55,7 +55,11 @@ export const reloadSettings = () => invoke<DesktopState>('reload_settings');
 export const startRun = (task: string) => invoke<StartedRun>('start_run', { task });
 export const stopRun = (runId: string) => invoke<void>('stop_run', { runId });
 export const getRunRecoveryPlan = (runId:string) => invoke<RunRecoveryPlan>('get_run_recovery_plan',{runId});
-export const recoverRun = (runId:string) => invoke<void>('recover_run',{runId});
+export const recoverRun = (plan:RunRecoveryPlan) => invoke<void>('recover_run',{
+  runId:plan.runId,
+  expectedStatus:plan.status,
+  expectedAction:plan.action,
+});
 export const steerRun = (runId:string,message:string) => invoke<void>('steer_run',{runId,message});
 export const getRunResult = (runId: string) => invoke<unknown | null>('get_run_result', { runId });
 export const resolveApproval = (pending:PendingApproval,approved:boolean) => invoke<void>('resolve_approval',{rootRunId:pending.rootRunId,approvalRunId:pending.approvalRunId,approvalId:pending.approvalId,approved});

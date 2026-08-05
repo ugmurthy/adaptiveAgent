@@ -1470,6 +1470,20 @@ export class AdaptiveAgent {
         };
       }
 
+      if (run.status === 'interrupted') {
+        try {
+          await this.loadExecutionState(run);
+        } catch (error) {
+          return {
+            runId,
+            status: run.status,
+            action: 'not_recoverable',
+            executable: false,
+            reason: `Run ${runId} cannot resume: ${error instanceof Error ? error.message : String(error)}`,
+          };
+        }
+      }
+
       return {
         runId,
         status: run.status,

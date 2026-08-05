@@ -1852,7 +1852,12 @@ impl Bridge {
         }
     }
 
-    fn recover_run(self: &Arc<Self>, run_id: &str) -> Result<(), String> {
+    fn recover_run(
+        self: &Arc<Self>,
+        run_id: &str,
+        expected_status: &str,
+        expected_action: &str,
+    ) -> Result<(), String> {
         let _submission = self.submission.lock().unwrap();
         if self.draining.load(Ordering::SeqCst) {
             return Err("The desktop is draining and cannot recover runs.".into());
@@ -1864,27 +1869,7 @@ impl Bridge {
         }
 
         let plan = self.recovery_plan(run_id)?;
-        if plan.get("executable").and_then(Value::as_bool) != Some(true) {
-            return Err(plan
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("Run cannot be recovered.")
-                .into());
-        }
-        let (action, method) = match plan.get("action").and_then(Value::as_str) {
-            Some("resume_same_run") => ("resume", "run/resume"),
-            Some("retry_same_run") => ("retry", "run/retry"),
-            Some("continue_new_run") => {
-                return Err("Continue as a new run is not yet available in the desktop.".into())
-            }
-            _ => {
-                return Err(plan
-                    .get("reason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Run cannot be recovered.")
-                    .into())
-            }
-        };
+        let (action, method) = same_run_recovery_dispatch(&plan, expected_status, expected_action)?;
 
         let previous = self
             .registry
@@ -2797,7 +2782,12 @@ fn get_run_recovery_plan(
 }
 
 #[tauri::command]
-fn recover_run(run_id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+fn recover_run(
+    run_id: String,
+    expected_status: String,
+    expected_action: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
     if state.quit.lock().unwrap().state() != QuitState::Idle {
         return Err("The desktop is quitting and cannot recover runs.".into());
     }
@@ -2808,7 +2798,7 @@ fn recover_run(run_id: String, state: tauri::State<'_, AppState>) -> Result<(), 
         .as_ref()
         .cloned()
         .ok_or_else(|| "Desktop runtime is not available.".to_string())?
-        .recover_run(&run_id)
+        .recover_run(&run_id, &expected_status, &expected_action)
 }
 
 #[tauri::command]
@@ -3253,6 +3243,35 @@ fn recovery_operation_was_accepted(inspection: &Value, operation: &PendingRunRec
             event.get("seq").and_then(Value::as_i64).unwrap_or(0) > operation.baseline_event_seq
                 && event.get("type").and_then(Value::as_str) == Some(accepted_event)
         })
+}
+
+fn same_run_recovery_dispatch(
+    plan: &Value,
+    expected_status: &str,
+    expected_action: &str,
+) -> Result<(&'static str, &'static str), String> {
+    if plan.get("executable").and_then(Value::as_bool) != Some(true) {
+        return Err(plan
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("Run cannot be recovered.")
+            .into());
+    }
+    let status = plan.get("status").and_then(Value::as_str);
+    let action = plan.get("action").and_then(Value::as_str);
+    if status != Some(expected_status) || action != Some(expected_action) {
+        return Err(
+            "Run recovery capability changed; review the refreshed run before trying again.".into(),
+        );
+    }
+    match (status, action) {
+        (Some("interrupted"), Some("resume_same_run")) => Ok(("resume", "run/resume")),
+        (Some("failed"), Some("retry_same_run")) => Ok(("retry", "run/retry")),
+        (_, Some("continue_new_run")) => {
+            Err("Continue as a new run is not available as a failed-run recovery control.".into())
+        }
+        _ => Err("Run recovery capability no longer matches its status.".into()),
+    }
 }
 
 fn project_activity_event(
@@ -3919,6 +3938,68 @@ mod tests {
             &before_acceptance,
             &operation
         ));
+    }
+
+    #[test]
+    fn same_run_recovery_dispatch_is_capability_and_status_gated() {
+        assert_eq!(
+            same_run_recovery_dispatch(
+                &json!({
+                    "status":"failed","action":"retry_same_run","executable":true
+                }),
+                "failed",
+                "retry_same_run"
+            ),
+            Ok(("retry", "run/retry"))
+        );
+        assert_eq!(
+            same_run_recovery_dispatch(
+                &json!({
+                    "status":"interrupted","action":"resume_same_run","executable":true
+                }),
+                "interrupted",
+                "resume_same_run"
+            ),
+            Ok(("resume", "run/resume"))
+        );
+        assert!(same_run_recovery_dispatch(
+            &json!({
+                "status":"failed","action":"continue_new_run","executable":true
+            }),
+            "failed",
+            "continue_new_run"
+        )
+        .unwrap_err()
+        .contains("not available"));
+        assert!(same_run_recovery_dispatch(
+            &json!({
+                "status":"failed","action":"resume_same_run","executable":true
+            }),
+            "failed",
+            "resume_same_run"
+        )
+        .unwrap_err()
+        .contains("no longer matches"));
+        assert_eq!(
+            same_run_recovery_dispatch(
+                &json!({
+                    "status":"failed","action":"retry_same_run","executable":false,
+                    "reason":"Failure is not retryable"
+                }),
+                "failed",
+                "retry_same_run"
+            ),
+            Err("Failure is not retryable".into())
+        );
+        assert!(same_run_recovery_dispatch(
+            &json!({
+                "status":"interrupted","action":"resume_same_run","executable":true
+            }),
+            "failed",
+            "retry_same_run"
+        )
+        .unwrap_err()
+        .contains("capability changed"));
     }
 
     #[test]
