@@ -1,303 +1,217 @@
-> Explore the AdaptiveAgent Showcase: https://ugmurthy.github.io/showcase.html
+# AdaptiveAgent
 
-# Adaptive Agent CLI
+## What is AdaptiveAgent?
 
-Installable command-line tools for running Adaptive Agent profiles and inspecting their durable execution traces.
+AdaptiveAgent is the operating layer for reliable AI agents.
 
-This npm package installs two binaries:
+It is a Bun + TypeScript runtime and CLI stack for running goal-oriented agents with typed tools, structured events, approvals, resumable runs, retries, child-run delegation, and multi-model support. It helps teams move from fragile agent demos to controlled, inspectable, recoverable production workflows.
 
-- `adaptive-agent` - initialize, configure, run, chat with, evaluate, retry, and orchestrate agents.
-- `trace-session` - inspect SQLite- or Postgres-backed sessions, runs, messages, timelines, usage, and trace reports created by Adaptive Agent.
+> **[Read the changelog](CHANGELOG.md).** Since release `v0.1.36`, the repository has
+> added decision-oriented trace reporting, an embedded SQLite runtime, and two
+> host-facing JSON-RPC 2.0 sidecars: `desktop-bridge` for agent execution and
+> `trace-session-sidecar` for read-only trace access. A Tauri desktop app uses
+> the desktop sidecar, while the capability gateway and its shared protocol/client
+> packages provide authenticated remote inference and tools. The legacy hosted
+> service stack was removed; durable runtime semantics remain in core.
 
-The package is a small JavaScript wrapper around platform-specific native binaries. It installs the right binary package for macOS, Linux, or Windows through optional dependencies.
+## Getting Started in 60secs
 
-## Install
+### 1. Install
+
+macOS:
 
 ```bash
-npm install -g @adaptive-agent/cli
-
-adaptive-agent --version
-adaptive-agent --help
-trace-session --help
+curl -fsSL https://github.com/ugmurthy/adaptiveAgent/releases/latest/download/install.sh | sh
 ```
 
-You can also run with `npx`:
+Linux:
 
 ```bash
-npx -p @adaptive-agent/cli adaptive-agent --help
-npx -p @adaptive-agent/cli trace-session --help
+curl -fsSL https://github.com/ugmurthy/adaptiveAgent/releases/latest/download/install.sh | sh
 ```
 
-## Quick start: initialize, check, run
+Windows PowerShell:
 
-Create a default home config, verify it, inspect the resolved catalog, then run one goal.
-
-```bash
-adaptive-agent init --yes
-
-# Confirm the active agent, model, runtime, workspace, tools, and delegates.
-adaptive-agent config
-
-# List available agents, tools, and delegate skills.
-adaptive-agent catalog
-
-# Validate install, config lookup, model provider setup, and runtime settings.
-adaptive-agent doctor --runtime memory
-
-adaptive-agent run --runtime memory \
-  "Summarize this repository in five bullets."
+```powershell
+irm https://github.com/ugmurthy/adaptiveAgent/releases/latest/download/install.ps1 | iex
 ```
 
-Use `--output json` or `--output jsonl` with `config`, `catalog`, `doctor`, and run commands when wiring the CLI into scripts.
+If the installer says `adaptive-agent` is not on your `PATH`, run the exact PATH command it prints.
 
-## API keys and provider setup
+### 2. Add an API key
 
-At least one model provider is required. Ollama works locally without an API key; hosted providers use environment variables referenced by your `agent.json` model config.
-
-Common model keys:
+The default quickstart calls OpenRouter directly:
 
 ```bash
-# OpenRouter
-export OPENROUTER_API_KEY="<your-openrouter-key>"
-
-# Mistral
-export MISTRAL_API_KEY="<your-mistral-key>"
-
-# Mesh
-export MESH_API_KEY="<your-mesh-key>"
+export OPENROUTER_API_KEY="<your-key>"
 ```
 
-Optional web-tool keys:
+Windows PowerShell:
+
+```powershell
+$env:OPENROUTER_API_KEY = "<your-key>"
+```
+
+Other supported providers use their own keys:
+
+- OpenRouter: `OPENROUTER_API_KEY`
+- Mistral: `MISTRAL_API_KEY`
+- Mesh: `MESH_API_KEY`
+- Ollama: no API key, but Ollama must be running locally
+
+Optional web tool providers are configured independently:
 
 ```bash
-# Use Parallel for both search and page extraction.
-export PARALLEL_API_KEY="<your-parallel-key>"
+export PARALLEL_API_KEY="<your-key>"
 export WEB_SEARCH_PROVIDER=parallel
 export WEB_READ_PAGE_PROVIDER=parallel
-
-# Or use another search provider.
-export BRAVE_SEARCH_API_KEY="<your-brave-key>"
-export SERPER_API_KEY="<your-serper-key>"
 ```
 
-Check what the CLI resolved before spending model tokens:
+`web_search` defaults to DuckDuckGo unless an API-backed provider is configured. `read_web_page` defaults to direct HTTP fetch unless `WEB_READ_PAGE_PROVIDER=parallel` is set with `PARALLEL_API_KEY`.
+
+### 3. Init and run
 
 ```bash
-adaptive-agent config --output json
-adaptive-agent catalog
+adaptive-agent init
 adaptive-agent doctor --provider-check
+adaptive-agent run "Hello, confirm you are working"
 ```
 
-For durable sessions, retries, and trace inspection, point both commands at the same Postgres database:
+That is it. You now have a configured local agent that can run goals, use tools, and produce inspectable runtime history.
+
+### Choose the right CLI command
+
+Use `run` for a one-shot goal. The command accepts the goal directly or reads
+it from a file:
 
 ```bash
-export DATABASE_URL="postgres://localhost:5432/adaptive_agent"
-
-adaptive-agent doctor --runtime postgres
+adaptive-agent run "Summarize this repository and identify the main packages"
+adaptive-agent run --file ./prompts/release-notes.md
 ```
 
-## Running agents
-
-Run a one-shot goal with the active agent:
+Use `chat` for an interactive conversation, or provide the first message on
+the command line:
 
 ```bash
-adaptive-agent run \
-  --provider openrouter \
-  --model qwen/qwen3.5-27b \
-  --runtime memory \
-  --output pretty \
-  "Draft a migration checklist for this TypeScript package."
+adaptive-agent chat
+adaptive-agent chat "Help me refine this implementation plan"
 ```
 
-Chat with the same profile:
+Use `spec` when the request is already described by an AdaptiveAgent JSON spec:
 
 ```bash
-adaptive-agent chat "What files should I inspect first?"
+adaptive-agent spec ./task.json
 ```
 
-Use explicit project-local config files:
+Use `swarm-run` when a top-level objective should be decomposed into bounded
+worker runs and synthesized into one result:
 
 ```bash
-adaptive-agent run \
-  --agent .adaptive-agent/reviewer.agent.json \
-  --settings .adaptive-agent/settings.json \
-  --input-json '{"focus":["runtime safety","tests"]}' \
-  --file-attachment ./bun.lock \
-  --inspect \
-  "Review the current changes."
-```
-
-Inspect the request without executing it:
-
-```bash
-adaptive-agent run --dry-run "Summarize the repo architecture."
-```
-
-## Orchestrated runs and retry
-
-Use `swarm-run` when one top-level objective should be decomposed into worker runs, quality checked, and synthesized into one result.
-
-```bash
-export DATABASE_URL="postgres://localhost:5432/adaptive_agent"
-export MESH_API_KEY="<your-mesh-key>"
-
 adaptive-agent swarm-run \
-  --runtime postgres \
-  --agent agents/coordinator.json \
-  --worker-catalog agents/market.json,agents/pricing.json,agents/regulatory.json \
-  --quality-agent agents/quality.json \
-  --synthesizer-agent agents/synthesizer.json \
-  --max-workers 3 \
-  --session-id ev-market-entry-2027 \
-  --events \
-  --output json \
-  "Create an India market-entry strategy for a premium electric two-wheeler startup launching in 2027."
+  --agent coordinator-agent \
+  --worker-catalog researcher.json,writer.json \
+  --max-workers 2 \
+  "Research the market and produce a launch brief"
 ```
 
-Retry a durable session after fixing a provider, network, or tool issue:
+Use `ambient start` to run a foreground supervisor that turns configured
+filesystem inbox or cron triggers into durable agent runs:
 
 ```bash
-adaptive-agent retry \
-  --runtime postgres \
-  --agent agents/coordinator.json \
-  --worker-catalog agents/market.json,agents/pricing.json,agents/regulatory.json \
-  ev-market-entry-2027
+adaptive-agent ambient start --config ./ambient.config.json
 ```
 
-Or retry one failed run directly:
+For persisted runs, choose the control command based on what you need:
+
+- `inspect <runId>`: show the current run state and a compact event summary.
+- `replay <runId>`: render stored events without running the agent or its tools again.
+- `interrupt <runId>`: request that an active run stop; use a durable runtime
+  such as Postgres when controlling a run from another process.
+- `resume <runId>`: continue an interrupted or waiting run in place.
+- `retry --run-id <runId>`: make another attempt after a failed run.
+- `continue <runId>`: create a new, auditable continuation linked to a failed
+  source run while leaving that source run unchanged.
+- `recover <runId>`: let the runtime choose the cheapest safe action among
+  resume, retry, and continue. Add `--dry-run` to inspect the recovery plan first.
+
+For example:
 
 ```bash
-adaptive-agent retry --runtime postgres --agent agents/market.json --run-id <failed-run-id>
+adaptive-agent inspect <runId>
+adaptive-agent recover <runId> --dry-run
+adaptive-agent recover <runId>
 ```
 
-## Trace sessions
-
-`trace-session` reads core runtime tables from embedded SQLite or the same
-Postgres store used by `adaptive-agent --runtime postgres`; gateway session
-tables are optional. Use it to discover traces, assess
-runtime reliability, investigate causal findings, inspect operations and model
-context, compare exact runs, or aggregate trends. Reports can be rendered for
-the terminal, as JSON, or as self-contained HTML.
-
-Discover recent traces and copy a complete run ID:
+Use `agent-create` to generate an agent profile from a description. It previews
+the generated profile and asks for confirmation before writing it:
 
 ```bash
-trace-session list traces --limit 20
-trace-session list sessions --since 24h
-trace-session list sessionless-runs
+adaptive-agent agent-create \
+  --id release-notes-writer \
+  "Create an agent that turns changelog entries into concise release notes"
 ```
 
-The default report is a decision-oriented summary. Targets can be a session, a
-root run, or any child run:
+Use `context` to create and manage project-scoped bundles of prior run and
+session evidence:
 
 ```bash
-trace-session view session ev-market-entry-2027
-trace-session view root-run <root-run-id>
-trace-session view run <run-id>
+adaptive-agent context create release-evidence \
+  --ref run:550e8400-e29b-41d4-a716-446655440000 \
+  --description "Evidence for the next release"
+adaptive-agent context list
+adaptive-agent context show release-evidence
 ```
 
-Use focused reports to explain reliability, follow the primary cause and
-recovery evidence, inspect operations, or load snapshot-backed model context:
+### Reuse prior evidence with a named context bundle
+
+Create a project-scoped bundle of existing run and session outputs, then reuse
+it in direct run or chat requests:
 
 ```bash
-trace-session view run <run-id> --report reliability
-trace-session view run <run-id> --report investigate
-trace-session view run <run-id> --report operations
-trace-session view run <run-id> --report timeline --include-plans
-trace-session view run <run-id> --report messages --messages-view delta
-trace-session usage session ev-market-entry-2027
+adaptive-agent context create migration-research \
+  --ref run:550e8400-e29b-41d4-a716-446655440000 \
+  --ref session:session_456
+
+adaptive-agent run \
+  --context-bundle migration-research \
+  "Draft the migration plan"
 ```
 
-Runtime reliability and answer quality are separate: without a persisted
-evaluator result, the report says that output quality was not evaluated.
-Missing evidence lowers data confidence rather than being guessed. Cost output
-also keeps model/tool-output cost and external tool-provider cost separate.
+Bundles are stored under `.adaptiveAgent/context-bundles` in the selected
+`--cwd`. Use `adaptive-agent context list`, `context show <name>`, and
+`context delete <name>` to manage them. Bundle names, canonical digests, and the
+exact expanded refs are persisted in consuming run metadata for inspection.
+Values after `run:` must be complete run UUIDs; session IDs remain free-form
+strings.
 
-Write a portable HTML report or consume the same structured diagnostics as
-JSON:
+## Repository packages
+
+The current workspace packages are:
+
+- `@adaptive-agent/core` in `packages/core`: runtime semantics, durable stores, events, snapshots, tools, delegation, retry, and continuation.
+- `@adaptive-agent/agent-sdk` in `packages/agent-sdk`: user-facing `adaptive-agent` CLI, config loading, built-in tool registration, install/update flows, and evaluation helpers.
+- `@adaptive-agent/trace-session` in `packages/trace-session`: decision-oriented SQLite/Postgres trace reporter with a read-only NDJSON JSON-RPC 2.0 stdio sidecar for native and desktop trace consumers.
+- `@adaptive-agent/trace-workbench` in `packages/trace-workbench`: Bun + Svelte trace workbench for choosing persisted sessions/runs, exploring timelines, resource spend, messages, diagnostics, and exporting markdown/PDF reports.
+- `@adaptive-agent/gateway-protocol`, `@adaptive-agent/gateway-client`, and `@adaptive-agent/capability-gateway`: shared JSON-RPC contracts, client integration, and the authenticated capability/inference gateway.
+- `@adaptive-agent/desktop-bridge`: the NDJSON JSON-RPC 2.0 stdio sidecar for runtime initialization, agent execution, run control, interactions, events, and safe CLI access.
+- `@adaptive-agent/desktop-app`: the Tauri 2 + Svelte desktop client backed by `desktop-bridge`.
+
+Useful local commands:
 
 ```bash
-trace-session view session ev-market-entry-2027 \
-  --report all \
-  --messages \
-  --html artifacts/ev-market-entry-2027.html
-
-trace-session view run <run-id> --json
+bun run core:test
+bun run agent:build
+bun run trace-session list traces --limit 20
+bun run trace-session view run <run-id>
+bun run trace-session compare <baseline-run-id> <candidate-run-id>
+bun run trace-session aggregate model --since 7d
+bun run trace-workbench:dev
 ```
 
-Compare the operational analysis of two exact runs, or group root-trace trends
-by model, terminal status, or UTC start day:
-
-```bash
-trace-session compare <baseline-run-id> <candidate-run-id>
-trace-session compare <baseline-run-id> <candidate-run-id> \
-  --html artifacts/comparison.html
-
-trace-session aggregate model --since 7d
-trace-session aggregate status --since 24h --json
-trace-session aggregate day --since 30d --html artifacts/trends.html
-```
-
-Comparison deltas are candidate minus baseline. Aggregate duration
-distributions include p50, p90, and p95; missing usage, cost, or context values
-remain missing instead of becoming zero.
-
-If your trace database is not in `DATABASE_URL`, pass it explicitly:
-
-```bash
-trace-session list traces \
-  --database-url "postgres://localhost:5432/adaptive_agent"
-
-cat > trace-session.json <<'JSON'
-{
-  "urlEnv": "TRACE_DATABASE_URL",
-  "ssl": false
-}
-JSON
-
-export TRACE_DATABASE_URL="postgres://localhost:5432/adaptive_agent"
-trace-session list traces --config trace-session.json
-```
-
-Terminal trace and usage reports are cached for five minutes by default.
-Bypass or disable the persistent cache when inspecting changing data:
-
-```bash
-trace-session view run <run-id> --fresh
-trace-session view run <run-id> --no-cache
-trace-session view run <run-id> --cache-ttl 30s
-```
-
-## Common commands
-
-```bash
-adaptive-agent init --yes
-adaptive-agent config [--output pretty|json|jsonl]
-adaptive-agent catalog [--output pretty|json|jsonl]
-adaptive-agent doctor [--runtime memory|sqlite|postgres] [--provider-check]
-adaptive-agent run [options] <goal...>
-adaptive-agent chat [options] [message...]
-adaptive-agent swarm-run --agent <agent> --worker-catalog <agents> <objective...>
-adaptive-agent retry --run-id <runId>
-
-trace-session list sessions
-trace-session list traces
-trace-session list sessionless-runs
-trace-session view session <sessionId> [--report <name>]
-trace-session view root-run <rootRunId> [--report <name>]
-trace-session view run <runId> [--report <name>]
-trace-session usage session <sessionId>
-trace-session usage root-run <rootRunId>
-trace-session usage run <runId>
-trace-session compare <baselineRunId> <candidateRunId>
-trace-session aggregate model [--since <time>] [--until <time>]
-trace-session aggregate status [--since <time>] [--until <time>]
-trace-session aggregate day [--since <time>] [--until <time>]
-```
-
-## Links
-
-- Source: https://github.com/ugmurthy/adaptiveAgent
-- Changelog: https://github.com/ugmurthy/adaptiveAgent/blob/main/CHANGELOG.md
-- Issues: https://github.com/ugmurthy/adaptiveAgent/issues
-- License: MIT
+`trace-session` reads core SQLite or Postgres runtime tables directly; gateway
+session tables are optional. Its default `summary` report separates runtime
+reliability from answer quality, reports missing evidence as uncertainty, and
+keeps model/tool output cost separate from external tool-provider cost. See
+[`packages/trace-session/README.md`](packages/trace-session/README.md) for the
+report model, investigation workflow, cache controls, and complete command
+examples.
