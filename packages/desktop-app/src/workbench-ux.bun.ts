@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { extractResultArtifacts, recoveryActionLabel, resolveComposerMode, resolveResultArtifactPaths, resultDisplayContent } from './workbench-ux';
+import { extractResultArtifacts, historyResultArtifacts, recoveryActionLabel, resolveComposerMode, resolveResultArtifactPaths, resultDisplayContent } from './workbench-ux';
 
 describe('workbench UX decisions', () => {
   it('uses explicit modes and a narrow transparent Auto heuristic', () => {
@@ -25,6 +25,16 @@ describe('workbench UX decisions', () => {
       { path: '/workspace/plots/chart.png' },
     ]);
     expect(resolveResultArtifactPaths([{ path: 'report.md' }], [...workspace, { path: '/workspace/archive/report.md' }])).toEqual([{ path: 'report.md' }]);
+  });
+  it('collects and deduplicates artifacts from only the supplied history results', () => {
+    const workspace = [{ path: '/workspace/one/report.html' }, { path: '/workspace/two/chart.png' }];
+    expect(historyResultArtifacts([
+      { artifacts: ['one/report.html', 'two/chart.png'] },
+      'Updated `two/chart.png`.',
+    ], workspace)).toEqual([
+      { path: '/workspace/one/report.html' },
+      { path: '/workspace/two/chart.png' },
+    ]);
   });
   it('exposes one status-matched Recover control', () => {
     expect(recoveryActionLabel({runId:'failed',status:'failed',action:'retry_same_run',executable:true,reason:'retryable'})).toBe('Recover run');

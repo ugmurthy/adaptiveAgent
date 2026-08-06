@@ -33,7 +33,7 @@ export function extractResultArtifacts(value: unknown): ResultArtifact[] {
     });
   }
   if (typeof unwrapped !== 'string') return [];
-  const matches = unwrapped.match(/(?:^|[\s`'"(])([\w./-]+\.(?:pdf|csv|json|md|markdown|txt|log|xml|ya?ml|png|jpe?g|gif|webp|bmp|svg|html|docx?|xlsx?|zip|mp4|webm|mov|m4v|ogv))(?:$|[\s`'"),.:;])/g) ?? [];
+  const matches = unwrapped.match(/(?:^|[\s`'"(])([\w./-]+\.(?:pdf|csv|json|md|markdown|txt|log|xml|ya?ml|png|jpe?g|gif|webp|bmp|svg|html?|docx?|xlsx?|zip|mp4|webm|mov|m4v|ogv))(?:$|[\s`'"),.:;])/g) ?? [];
   return [...new Set(matches.map((match) => match.trim().replace(/^[`'"(]|[`'"),.:;]$/g, '')))].map((path) => ({ path }));
 }
 
@@ -49,6 +49,17 @@ export function resolveResultArtifactPaths(
     });
     return matches.length === 1 ? { ...artifact, path: matches[0]!.path } : artifact;
   });
+}
+
+export function historyResultArtifacts(
+  results: unknown[],
+  workspaceArtifacts: Array<{ path: string }>,
+): ResultArtifact[] {
+  const resolved = resolveResultArtifactPaths(results.flatMap(extractResultArtifacts), workspaceArtifacts);
+  const available = new Set(workspaceArtifacts.map((artifact) => artifact.path));
+  return [...new Map(
+    resolved.filter((artifact) => available.has(artifact.path)).map((artifact) => [artifact.path, artifact]),
+  ).values()];
 }
 
 export function recoveryActionLabel(plan?: RunRecoveryPlan): string {

@@ -59,6 +59,7 @@
         {#if loading}<p>Loading preview…</p>
         {:else if previewError}<div class="alert">{previewError}</div>
         {:else if preview?.kind === 'markdown'}<ResultRenderer value={preview.content}/>
+        {:else if preview?.kind === 'html'}<iframe class="artifact-html-preview" srcdoc={preview.content} sandbox="" title={preview.name}></iframe>
         {:else if preview?.kind === 'json'}<pre>{JSON.stringify(jsonValue(preview.content), null, 2)}</pre>
         {:else if preview?.kind === 'text'}<pre>{preview.content}</pre>
         {:else if preview?.kind === 'image'}<img src={`data:${preview.mimeType};base64,${preview.content}`} alt={preview.name} />

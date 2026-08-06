@@ -2878,7 +2878,7 @@ fn get_run_overview(run_id: String, state: tauri::State<'_, AppState>) -> Result
 
 const ARTIFACT_EXTENSIONS: &[&str] = &[
     "pdf", "csv", "json", "md", "markdown", "txt", "log", "xml", "yaml", "yml", "png", "jpg",
-    "jpeg", "svg", "html", "doc", "docx", "xls", "xlsx", "zip", "gif", "webp", "bmp", "mp4",
+    "jpeg", "svg", "htm", "html", "doc", "docx", "xls", "xlsx", "zip", "gif", "webp", "bmp", "mp4",
     "webm", "mov", "m4v", "ogv",
 ];
 const MAX_TEXT_PREVIEW_BYTES: u64 = 5 * 1024 * 1024;
@@ -3008,8 +3008,9 @@ fn artifact_preview(path: &Path) -> Result<ArtifactPreview, String> {
         .ok_or("This artifact type cannot be previewed.")?;
     let (kind, mime_type, binary) = match extension.as_str() {
         "md" | "markdown" => ("markdown", "text/markdown", false),
+        "htm" | "html" => ("html", "text/html", false),
         "json" => ("json", "application/json", false),
-        "txt" | "csv" | "html" | "log" | "xml" | "yaml" | "yml" => ("text", "text/plain", false),
+        "txt" | "csv" | "log" | "xml" | "yaml" | "yml" => ("text", "text/plain", false),
         "png" => ("image", "image/png", true),
         "jpg" | "jpeg" => ("image", "image/jpeg", true),
         "gif" => ("image", "image/gif", true),
@@ -4023,6 +4024,14 @@ mod tests {
         assert_eq!(preview.kind, "markdown");
         assert_eq!(preview.mime_type, "text/markdown");
         assert_eq!(preview.content, "report");
+        std::fs::write(
+            nested.join("page.htm"),
+            "<style>h1{color:red}</style><h1>Hello</h1>",
+        )
+        .unwrap();
+        let html = artifact_preview(&nested.join("page.htm")).unwrap();
+        assert_eq!(html.kind, "html");
+        assert_eq!(html.mime_type, "text/html");
         std::fs::write(nested.join("image.png"), [1, 2]).unwrap();
         let image = artifact_preview(&nested.join("image.png")).unwrap();
         assert_eq!(image.kind, "image");

@@ -6,13 +6,13 @@
   export let occupied = 0;
   export let capacity = 3;
   export let mobileOpen = false;
+  export let query = '';
   export let onselect: (item: RailItem) => void;
   export let onnewtask: () => void;
   export let onartifacts: () => void;
   export let onsettings: () => void;
   export let onclose: () => void;
   const groups: RailGroup[] = ['Active', 'Needs input', 'History'];
-  let query = '';
   $: filteredItems = filterRailItems(items, query);
 
   function selected(item: RailItem): boolean {

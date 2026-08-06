@@ -34,7 +34,7 @@ export interface Chat { itemId:string; title:string; createdAt:string; sessionId
 export type ProductDeletionTarget = {kind:'item';itemId:string}|{kind:'run';runId:string}|{kind:'chat-turn';itemId:string;ordinal:number};
 export interface DeletionPreview { target:ProductDeletionTarget; label:string; runCount:number; planCount:number; occupied:boolean; warning:string; }
 export interface WorkspaceArtifact { path:string; }
-export interface ArtifactPreview { name:string; kind:'text'|'markdown'|'json'|'image'|'video'; mimeType:string; content:string; }
+export interface ArtifactPreview { name:string; kind:'text'|'markdown'|'html'|'json'|'image'|'video'; mimeType:string; content:string; }
 
 export interface TracePrivacy { messages:boolean; reasoning:boolean; rawToolPayloads:boolean; }
 export interface TraceReport {

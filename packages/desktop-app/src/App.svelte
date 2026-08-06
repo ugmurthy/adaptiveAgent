@@ -40,15 +40,16 @@
     type RunSummary,
     type TracePrivacy,
     type TraceReport,
-    type WorkspaceArtifact,
   } from './desktop';
   import {
     inspectorOpen,
     mobileRailOpen,
     buildRailItems,
+    filterRailItems,
     workbenchSelection,
     type RailItem,
   } from './workbench-state';
+  import { historyResultArtifacts, type ResultArtifact } from './workbench-ux';
 
   const emptyDesktop: DesktopState = {
     status: 'starting',
@@ -87,11 +88,20 @@
   let privacyPending = false;
   let titlePreview: { kind: 'task' | 'chat'; title: string } | undefined;
   let inspectorWidth = 380;
-  let workspaceArtifacts: WorkspaceArtifact[] = [];
+  let historyArtifacts: ResultArtifact[] = [];
   let artifactsPending = false;
   let artifactsError = '';
+  let historyQuery = '';
+  let loadedArtifactsFilterKey = '';
+  let artifactsGeneration = 0;
 
   $: railItems = buildRailItems(desktop.runs, chats);
+  $: filteredHistoryItems = filterRailItems(railItems, historyQuery).filter((item) => item.group === 'History');
+  $: artifactsFilterKey = filteredHistoryItems.map((item) => item.id).join('\n');
+  $: if ($workbenchSelection.kind === 'artifacts' && artifactsFilterKey !== loadedArtifactsFilterKey) {
+    loadedArtifactsFilterKey = artifactsFilterKey;
+    void loadArtifacts(filteredHistoryItems);
+  }
   $: selectedRun = desktop.runs.find((run) => run.runId === selectedRunId);
   $: selectedActivity = selectedRunId ? activityByRoot[selectedRunId] ?? [] : [];
   $: inspectionRoot = $inspectorOpen ? selectedRunId : '';
@@ -223,14 +233,39 @@
     $mobileRailOpen = false;
   }
 
-  async function showArtifacts() {
+  function showArtifacts() {
+    loadedArtifactsFilterKey = artifactsFilterKey;
     $workbenchSelection = { kind: 'artifacts' };
     $mobileRailOpen = false;
+    void loadArtifacts(filteredHistoryItems);
+  }
+
+  async function loadArtifacts(items: RailItem[]) {
+    const generation = ++artifactsGeneration;
     artifactsPending = true;
     artifactsError = '';
-    try { workspaceArtifacts = await listWorkspaceArtifacts(); }
-    catch (error) { artifactsError = String(error); }
-    artifactsPending = false;
+    try {
+      const itemIds = new Set(items.map((item) => item.id));
+      const runs = desktop.runs.filter((run) => itemIds.has(run.itemId) && !run.occupiesSlot);
+      const [workspace, results] = await Promise.all([
+        listWorkspaceArtifacts(),
+        Promise.all(runs.map((run) => getRunResult(run.runId))),
+      ]);
+      if (generation !== artifactsGeneration) return;
+      historyArtifacts = historyResultArtifacts(results.filter((result) => result !== null), workspace);
+    } catch (error) {
+      if (generation === artifactsGeneration) {
+        artifactsError = String(error);
+        historyArtifacts = [];
+      }
+    } finally {
+      if (generation === artifactsGeneration) artifactsPending = false;
+    }
+  }
+
+  function refreshArtifacts() {
+    loadedArtifactsFilterKey = artifactsFilterKey;
+    void loadArtifacts(filteredHistoryItems);
   }
 
   async function selectChat(itemId: string) {
@@ -528,6 +563,7 @@
     occupied={desktop.occupiedSlotCount}
     capacity={desktop.capacity}
     mobileOpen={true}
+    bind:query={historyQuery}
     onselect={selectRail}
     onnewtask={showNewTask}
     onartifacts={showArtifacts}
@@ -546,6 +582,7 @@
       selection={$workbenchSelection}
       occupied={desktop.occupiedSlotCount}
       capacity={desktop.capacity}
+      bind:query={historyQuery}
       onselect={selectRail}
       onnewtask={showNewTask}
       onartifacts={showArtifacts}
@@ -621,12 +658,12 @@
       {:else if $workbenchSelection.kind === 'artifacts'}
         <section class="center-card">
           <div class="view-heading">
-            <div><span>Workspace</span><h2>Artifacts</h2><p>Files recognized as artifacts in {desktop.configuration?.workspace.root ?? 'the workspace'}.</p></div>
-            <button disabled={artifactsPending} on:click={showArtifacts}>{artifactsPending ? 'Refreshing…' : 'Refresh'}</button>
+            <div><span>Filtered history</span><h2>Artifacts</h2><p>Artifacts from {filteredHistoryItems.length} history item{filteredHistoryItems.length === 1 ? '' : 's'}{historyQuery.trim() ? ` matching “${historyQuery.trim()}”` : ''}.</p></div>
+            <button disabled={artifactsPending} on:click={refreshArtifacts}>{artifactsPending ? 'Refreshing…' : 'Refresh'}</button>
           </div>
           {#if artifactsError}<div class="alert">{artifactsError}</div>{/if}
-          {#if workspaceArtifacts.length}<ArtifactList artifacts={workspaceArtifacts}/>
-          {:else if !artifactsPending && !artifactsError}<div class="empty-state"><strong>No artifacts found</strong><p>The workspace does not contain any recognized artifact files.</p></div>{/if}
+          {#if historyArtifacts.length}<ArtifactList artifacts={historyArtifacts}/>
+          {:else if !artifactsPending && !artifactsError}<div class="empty-state"><strong>No artifacts found</strong><p>The filtered history does not reference any available artifact files.</p></div>{/if}
         </section>
       {:else}
         <div class="empty-state">
