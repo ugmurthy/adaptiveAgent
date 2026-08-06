@@ -37,6 +37,20 @@ export function extractResultArtifacts(value: unknown): ResultArtifact[] {
   return [...new Set(matches.map((match) => match.trim().replace(/^[`'"(]|[`'"),.:;]$/g, '')))].map((path) => ({ path }));
 }
 
+export function resolveResultArtifactPaths(
+  artifacts: ResultArtifact[],
+  workspaceArtifacts: Array<{ path: string }>,
+): ResultArtifact[] {
+  return artifacts.map((artifact) => {
+    const reference = artifact.path.replaceAll('\\', '/');
+    const matches = workspaceArtifacts.filter(({ path }) => {
+      const candidate = path.replaceAll('\\', '/');
+      return candidate === reference || candidate.endsWith(`/${reference}`);
+    });
+    return matches.length === 1 ? { ...artifact, path: matches[0]!.path } : artifact;
+  });
+}
+
 export function recoveryActionLabel(plan?: RunRecoveryPlan): string {
   if (!plan?.executable) return '';
   if (plan.status === 'failed' && plan.action === 'retry_same_run') return 'Recover run';

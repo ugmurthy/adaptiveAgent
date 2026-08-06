@@ -1,8 +1,14 @@
 <script lang="ts">
-  import { openArtifact, revealArtifact } from './desktop';
+  import { onMount } from 'svelte';
+  import { getArtifactRevealLabel, openArtifact, revealArtifact } from './desktop';
 
   export let artifacts: Array<{ path: string; detail?: string }> = [];
   let actionError = '';
+  let revealLabel = 'Show in folder';
+
+  onMount(() => {
+    void getArtifactRevealLabel().then((label) => { revealLabel = label; }).catch(() => {});
+  });
 
   function baseName(path: string): string {
     return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
@@ -26,7 +32,7 @@
       {#if artifact.detail}<small>{artifact.detail}</small>{/if}
       <div class="artifact-actions">
         <button on:click={() => act('open', artifact.path)}>Open</button>
-        <button on:click={() => act('reveal', artifact.path)}>Show in Finder</button>
+        <button on:click={() => act('reveal', artifact.path)}>{revealLabel}</button>
       </div>
     </article>
   {/each}

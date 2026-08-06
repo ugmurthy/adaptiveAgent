@@ -2381,6 +2381,22 @@ fn load_trace_privacy(workbench: &WorkbenchDb) -> Result<TracePrivacy, String> {
     Ok(privacy)
 }
 
+fn request_trace_report(trace: &TraceBridge, privacy: TracePrivacy, root_run_id: &str) -> Response {
+    trace.request_wait(
+        "trace/get",
+        Some(json!({
+            "target": { "kind": "root-run", "rootRunId": root_run_id },
+            "include": {
+                "plans": true,
+                "messages": privacy.messages,
+                "reasoning": privacy.reasoning,
+                "rawToolPayloads": privacy.raw_tool_payloads
+            }
+        })),
+        REQUEST_TIMEOUT,
+    )
+}
+
 fn queue_trace_refresh(
     refreshes: &mut HashMap<String, TraceRefreshState>,
     root_run_id: &str,
@@ -2450,19 +2466,7 @@ fn schedule_trace_refresh(app: &AppHandle, root_run_id: String, final_refresh: b
             (privacy, trace, request_revision)
         };
         let response = match (privacy, trace.as_ref()) {
-            (Some(privacy), Some(trace)) => trace.request_wait(
-                "trace/get",
-                Some(json!({
-                    "target": { "kind": "root-run", "rootRunId": root_run_id },
-                    "include": {
-                        "plans": true,
-                        "messages": privacy.messages,
-                        "reasoning": privacy.reasoning,
-                        "rawToolPayloads": privacy.raw_tool_payloads
-                    }
-                })),
-                REQUEST_TIMEOUT,
-            ),
+            (Some(privacy), Some(trace)) => request_trace_report(trace, privacy, &root_run_id),
             _ => Err("Trace inspector is not ready.".into()),
         };
         let state = app.state::<AppState>();
@@ -2836,6 +2840,32 @@ fn get_run_result(
         .get_result(&run_id)
 }
 
+#[tauri::command]
+fn get_run_overview(run_id: String, state: tauri::State<'_, AppState>) -> Result<Value, String> {
+    let (privacy, trace) = {
+        let bridge = state
+            .bridge
+            .lock()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .ok_or("Desktop runtime is starting.")?;
+        if bridge.registry.lock().unwrap().get(&run_id).is_none() {
+            return Err("Run was not found.".into());
+        }
+        let privacy = load_trace_privacy(&bridge.workbench)?;
+        let trace = state
+            .trace
+            .lock()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .ok_or("Trace inspector is not ready.")?;
+        (privacy, trace)
+    };
+    request_trace_report(&trace, privacy, &run_id)
+}
+
 const ARTIFACT_EXTENSIONS: &[&str] = &[
     "pdf", "csv", "json", "md", "txt", "png", "jpg", "jpeg", "svg", "html", "doc", "docx", "xls",
     "xlsx", "zip",
@@ -2911,14 +2941,24 @@ fn resolve_artifact_path(
     } else {
         vec![shell_cwd.join(requested), root.join(requested)]
     };
-    let path = candidates
-        .into_iter()
-        .find_map(|candidate| {
-            let candidate = candidate.canonicalize().ok()?;
-            (candidate.starts_with(&root) && candidate.is_file()).then_some(candidate)
-        })
-        .ok_or("Artifact file was not found.")?;
-    Ok(path)
+    if let Some(path) = candidates.into_iter().find_map(|candidate| {
+        let candidate = candidate.canonicalize().ok()?;
+        (candidate.starts_with(&root) && candidate.is_file()).then_some(candidate)
+    }) {
+        return Ok(path);
+    }
+    if requested.components().count() == 1 {
+        let mut artifacts = Vec::new();
+        collect_workspace_artifacts(&root, &mut artifacts);
+        let matches = artifacts
+            .into_iter()
+            .filter(|artifact| Path::new(&artifact.path).file_name() == requested.file_name())
+            .collect::<Vec<_>>();
+        if matches.len() == 1 {
+            return Ok(PathBuf::from(&matches[0].path));
+        }
+    }
+    Err("Artifact file was not found.".into())
 }
 
 #[tauri::command]
@@ -2981,6 +3021,16 @@ fn open_artifact(path: String, state: tauri::State<'_, AppState>) -> Result<(), 
 fn reveal_artifact(path: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let (root, shell_cwd) = workspace_paths(&state)?;
     launch_artifact(&resolve_artifact_path(&root, &shell_cwd, &path)?, true)
+}
+
+#[tauri::command]
+fn artifact_reveal_label() -> &'static str {
+    #[cfg(target_os = "macos")]
+    return "Show in Finder";
+    #[cfg(target_os = "windows")]
+    return "Show in File Explorer";
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    return "Show in File Manager";
 }
 
 #[tauri::command]
@@ -3236,9 +3286,11 @@ pub fn run() {
             recover_run,
             steer_run,
             get_run_result,
+            get_run_overview,
             list_workspace_artifacts,
             open_artifact,
             reveal_artifact,
+            artifact_reveal_label,
             resolve_approval,
             create_chat,
             list_chats,
@@ -3948,6 +4000,13 @@ mod tests {
             resolve_artifact_path(workspace.path(), workspace.path(), "output/report.md").unwrap(),
             nested.join("report.md").canonicalize().unwrap()
         );
+        assert_eq!(
+            resolve_artifact_path(workspace.path(), workspace.path(), "report.md").unwrap(),
+            nested.join("report.md").canonicalize().unwrap()
+        );
+        std::fs::create_dir(workspace.path().join("archive")).unwrap();
+        std::fs::write(workspace.path().join("archive/report.md"), "old report").unwrap();
+        assert!(resolve_artifact_path(workspace.path(), workspace.path(), "report.md").is_err());
 
         let outside = tempfile::NamedTempFile::new().unwrap();
         assert!(resolve_artifact_path(

@@ -63,6 +63,7 @@ export const recoverRun = (plan:RunRecoveryPlan) => invoke<void>('recover_run',{
 });
 export const steerRun = (runId:string,message:string) => invoke<void>('steer_run',{runId,message});
 export const getRunResult = (runId: string) => invoke<unknown | null>('get_run_result', { runId });
+export const getRunOverview = (runId: string) => invoke<TraceReport>('get_run_overview', { runId });
 export const resolveApproval = (pending:PendingApproval,approved:boolean) => invoke<void>('resolve_approval',{rootRunId:pending.rootRunId,approvalRunId:pending.approvalRunId,approvalId:pending.approvalId,approved});
 export const createChat = (title:string) => invoke<Chat>('create_chat',{title});
 export const listChats = () => invoke<Chat[]>('list_chats');
@@ -73,6 +74,7 @@ export const deleteHistory = (target:ProductDeletionTarget) => invoke<void>('del
 export const listWorkspaceArtifacts = () => invoke<WorkspaceArtifact[]>('list_workspace_artifacts');
 export const openArtifact = (path:string) => invoke<void>('open_artifact',{path});
 export const revealArtifact = (path:string) => invoke<void>('reveal_artifact',{path});
+export const getArtifactRevealLabel = () => invoke<string>('artifact_reveal_label');
 export const selectTrace = (rootRunId?:string) => invoke<number>('select_trace',{rootRunId});
 export const getTracePrivacy = () => invoke<TracePrivacy>('get_trace_privacy');
 export const setTracePrivacy = (privacy:TracePrivacy) => invoke<TracePrivacy>('set_trace_privacy',{privacy});
