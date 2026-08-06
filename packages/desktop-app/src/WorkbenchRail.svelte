@@ -8,6 +8,7 @@
   export let mobileOpen = false;
   export let onselect: (item: RailItem) => void;
   export let onnewtask: () => void;
+  export let onartifacts: () => void;
   export let onsettings: () => void;
   export let onclose: () => void;
   const groups: RailGroup[] = ['Active', 'Needs input', 'History'];
@@ -28,7 +29,7 @@
 
 <aside class:mobile-open={mobileOpen} class="workbench-rail" aria-label="Tasks and chats">
   <div class="rail-heading"><div><span class="mark">A</span><strong>AdaptiveAgent</strong></div><button class="rail-close" aria-label="Close navigation" on:click={onclose}>×</button></div>
-  <nav class="primary-nav" aria-label="Primary"><button class:active={selection.kind==='new-task'||selection.kind==='new-chat'} on:click={onnewtask}>＋ <span>Create</span></button><a href="#recent-runs">Runs</a><button disabled title="Artifact library is not available">Artifacts <small>Unavailable</small></button><button disabled title="Saved items are not available">Saved <small>Unavailable</small></button></nav>
+  <nav class="primary-nav" aria-label="Primary"><button class:active={selection.kind==='new-task'||selection.kind==='new-chat'} on:click={onnewtask}>＋ <span>Create</span></button><a href="#recent-runs">Runs</a><button class:active={selection.kind==='artifacts'} on:click={onartifacts}>Artifacts</button></nav>
   <div class="slot-meter"><span>{occupied}/{capacity} slots</span><progress max={capacity} value={occupied}></progress></div>
   <label class="rail-search">
     <span class="sr-only">Search task and chat descriptions</span>

@@ -7,6 +7,7 @@ use registry::{CancelAction, RunRecord, RunRegistry, CAPACITY};
 use shutdown::{CloseDecision, QuitCoordinator, QuitState};
 use std::{
     collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
@@ -142,6 +143,11 @@ struct DeletionPreview {
     plan_count: usize,
     occupied: bool,
     warning: &'static str,
+}
+
+#[derive(Serialize)]
+struct WorkspaceArtifact {
+    path: String,
 }
 
 struct Bridge {
@@ -2830,6 +2836,153 @@ fn get_run_result(
         .get_result(&run_id)
 }
 
+const ARTIFACT_EXTENSIONS: &[&str] = &[
+    "pdf", "csv", "json", "md", "txt", "png", "jpg", "jpeg", "svg", "html", "doc", "docx", "xls",
+    "xlsx", "zip",
+];
+
+fn workspace_paths(state: &tauri::State<'_, AppState>) -> Result<(PathBuf, PathBuf), String> {
+    let bridge = state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or("Desktop runtime is starting.")?;
+    let configuration = bridge.configuration.lock().unwrap();
+    let root = configuration
+        .as_ref()
+        .and_then(|value| value.pointer("/workspace/root"))
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or("The configured workspace root is unavailable.")?;
+    let shell_cwd = configuration
+        .as_ref()
+        .and_then(|value| value.pointer("/workspace/shellCwd"))
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.clone());
+    Ok((root, shell_cwd))
+}
+
+fn collect_workspace_artifacts(directory: &Path, artifacts: &mut Vec<WorkspaceArtifact>) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            if matches!(
+                entry.file_name().to_str(),
+                Some(".git" | "node_modules" | "target")
+            ) {
+                continue;
+            }
+            collect_workspace_artifacts(&path, artifacts);
+        } else if file_type.is_file()
+            && path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    ARTIFACT_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+                })
+        {
+            artifacts.push(WorkspaceArtifact {
+                path: path.to_string_lossy().into_owned(),
+            });
+        }
+    }
+}
+
+fn resolve_artifact_path(
+    root: &Path,
+    shell_cwd: &Path,
+    requested: &str,
+) -> Result<PathBuf, String> {
+    let root = root
+        .canonicalize()
+        .map_err(|_| "The configured workspace is unavailable.".to_string())?;
+    let requested = Path::new(requested);
+    let candidates = if requested.is_absolute() {
+        vec![requested.to_path_buf()]
+    } else {
+        vec![shell_cwd.join(requested), root.join(requested)]
+    };
+    let path = candidates
+        .into_iter()
+        .find_map(|candidate| {
+            let candidate = candidate.canonicalize().ok()?;
+            (candidate.starts_with(&root) && candidate.is_file()).then_some(candidate)
+        })
+        .ok_or("Artifact file was not found.")?;
+    Ok(path)
+}
+
+#[tauri::command]
+fn list_workspace_artifacts(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<WorkspaceArtifact>, String> {
+    let (root, _) = workspace_paths(&state)?;
+    let root = root
+        .canonicalize()
+        .map_err(|_| "The configured workspace is unavailable.".to_string())?;
+    let mut artifacts = Vec::new();
+    collect_workspace_artifacts(&root, &mut artifacts);
+    artifacts.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(artifacts)
+}
+
+fn launch_artifact(path: &Path, reveal: bool) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = std::process::Command::new("open");
+        if reveal {
+            command.arg("-R");
+        }
+        command.arg(path);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("explorer");
+        if reveal {
+            command.arg(format!("/select,{}", path.display()));
+        } else {
+            command.arg(path);
+        }
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(if reveal {
+            path.parent().unwrap_or(path)
+        } else {
+            path
+        });
+        command
+    };
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| "Unable to launch the platform file manager.".into())
+}
+
+#[tauri::command]
+fn open_artifact(path: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let (root, shell_cwd) = workspace_paths(&state)?;
+    launch_artifact(&resolve_artifact_path(&root, &shell_cwd, &path)?, false)
+}
+
+#[tauri::command]
+fn reveal_artifact(path: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let (root, shell_cwd) = workspace_paths(&state)?;
+    launch_artifact(&resolve_artifact_path(&root, &shell_cwd, &path)?, true)
+}
+
 #[tauri::command]
 fn resolve_approval(
     root_run_id: String,
@@ -3083,6 +3236,9 @@ pub fn run() {
             recover_run,
             steer_run,
             get_run_result,
+            list_workspace_artifacts,
+            open_artifact,
+            reveal_artifact,
             resolve_approval,
             create_chat,
             list_chats,
@@ -3773,6 +3929,34 @@ fn state_for_durable_status(status: &str, previous_occupancy: bool) -> RunState 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_artifacts_are_filtered_and_confined_to_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let nested = workspace.path().join("output");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("report.md"), "report").unwrap();
+        std::fs::write(nested.join("source.ts"), "source").unwrap();
+        std::fs::create_dir(workspace.path().join("node_modules")).unwrap();
+        std::fs::write(workspace.path().join("node_modules/ignored.json"), "{}").unwrap();
+
+        let mut artifacts = Vec::new();
+        collect_workspace_artifacts(workspace.path(), &mut artifacts);
+        assert_eq!(artifacts.len(), 1);
+        assert!(artifacts[0].path.ends_with("report.md"));
+        assert_eq!(
+            resolve_artifact_path(workspace.path(), workspace.path(), "output/report.md").unwrap(),
+            nested.join("report.md").canonicalize().unwrap()
+        );
+
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        assert!(resolve_artifact_path(
+            workspace.path(),
+            workspace.path(),
+            outside.path().to_str().unwrap()
+        )
+        .is_err());
+    }
 
     #[test]
     fn identifies_only_top_level_run_creation() {

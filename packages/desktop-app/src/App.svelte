@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { addActivity, type ActivityEvent } from './activity';
+  import ArtifactList from './ArtifactList.svelte';
   import ChatWorkspace from './ChatWorkspace.svelte';
   import NewComposer from './NewComposer.svelte';
   import RunInspector from './RunInspector.svelte';
@@ -14,6 +15,7 @@
     getRunRecoveryPlan,
     getRunResult,
     getTracePrivacy,
+    listWorkspaceArtifacts,
     listChats,
     loadChat,
     previewHistoryDeletion,
@@ -38,6 +40,7 @@
     type RunSummary,
     type TracePrivacy,
     type TraceReport,
+    type WorkspaceArtifact,
   } from './desktop';
   import {
     inspectorOpen,
@@ -84,6 +87,9 @@
   let privacyPending = false;
   let titlePreview: { kind: 'task' | 'chat'; title: string } | undefined;
   let inspectorWidth = 380;
+  let workspaceArtifacts: WorkspaceArtifact[] = [];
+  let artifactsPending = false;
+  let artifactsError = '';
 
   $: railItems = buildRailItems(desktop.runs, chats);
   $: selectedRun = desktop.runs.find((run) => run.runId === selectedRunId);
@@ -215,6 +221,16 @@
   function showSettings() {
     $workbenchSelection = { kind: 'settings' };
     $mobileRailOpen = false;
+  }
+
+  async function showArtifacts() {
+    $workbenchSelection = { kind: 'artifacts' };
+    $mobileRailOpen = false;
+    artifactsPending = true;
+    artifactsError = '';
+    try { workspaceArtifacts = await listWorkspaceArtifacts(); }
+    catch (error) { artifactsError = String(error); }
+    artifactsPending = false;
   }
 
   async function selectChat(itemId: string) {
@@ -514,6 +530,7 @@
     mobileOpen={true}
     onselect={selectRail}
     onnewtask={showNewTask}
+    onartifacts={showArtifacts}
     onsettings={showSettings}
     onclose={() => { $mobileRailOpen = false; }}
   />
@@ -531,6 +548,7 @@
       capacity={desktop.capacity}
       onselect={selectRail}
       onnewtask={showNewTask}
+      onartifacts={showArtifacts}
       onsettings={showSettings}
       onclose={() => { $mobileRailOpen = false; }}
     />
@@ -579,7 +597,6 @@
           onsteer={steer}
           ondecision={decide}
           ondelete={requestDeletion}
-          oninspect={() => { $inspectorOpen = true; }}
           onshowtitle={(kind, title) => { titlePreview = { kind, title }; }}
         />
       {:else if $workbenchSelection.kind === 'chat' && selectedChat}
@@ -601,6 +618,16 @@
         />
       {:else if $workbenchSelection.kind === 'settings'}
         <SettingsPanel {desktop} pending={controlPending} onreload={reload} />
+      {:else if $workbenchSelection.kind === 'artifacts'}
+        <section class="center-card">
+          <div class="view-heading">
+            <div><span>Workspace</span><h2>Artifacts</h2><p>Files recognized as artifacts in {desktop.configuration?.workspace.root ?? 'the workspace'}.</p></div>
+            <button disabled={artifactsPending} on:click={showArtifacts}>{artifactsPending ? 'Refreshing…' : 'Refresh'}</button>
+          </div>
+          {#if artifactsError}<div class="alert">{artifactsError}</div>{/if}
+          {#if workspaceArtifacts.length}<ArtifactList artifacts={workspaceArtifacts}/>
+          {:else if !artifactsPending && !artifactsError}<div class="empty-state"><strong>No artifacts found</strong><p>The workspace does not contain any recognized artifact files.</p></div>{/if}
+        </section>
       {:else}
         <div class="empty-state">
           <h2>History unavailable</h2>

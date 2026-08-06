@@ -9,8 +9,8 @@ describe('workbench UX decisions', () => {
     expect(resolveComposerMode('task', 'chat: hello')).toBe('task');
   });
   it('extracts only recognizable structured or textual artifacts', () => {
-    expect(extractResultArtifacts({ files: [{ path: 'out/report.pdf', type: 'PDF' }, 'data.csv'] })).toEqual([{ name: 'out/report.pdf', detail: 'PDF' }, { name: 'data.csv' }]);
-    expect(extractResultArtifacts('Saved `notes.md` and image.png.')).toEqual([{ name: 'notes.md' }, { name: 'image.png' }]);
+    expect(extractResultArtifacts({ files: [{ path: 'out/report.pdf', type: 'PDF' }, 'data.csv'] })).toEqual([{ path: 'out/report.pdf', detail: 'PDF' }, { path: 'data.csv' }]);
+    expect(extractResultArtifacts('Saved `notes.md` and image.png.')).toEqual([{ path: 'notes.md' }, { path: 'image.png' }]);
     expect(extractResultArtifacts('A prose-only answer.')).toEqual([]);
   });
   it('promotes a structured report summary without hiding the full export payload', () => {

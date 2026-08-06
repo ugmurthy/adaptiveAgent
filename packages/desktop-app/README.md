@@ -41,13 +41,14 @@ events. No shell capability or generic JSON-RPC command is granted to the webvie
   the next model step. Eligible failed and interrupted runs expose one Recover action;
   core selects the safe same-run recovery strategy from current durable state. New-run
   continuation is not exposed as a desktop recovery control.
-- **Results:** Artifacts are inferred only from structured `files`/`artifacts` arrays or
-  recognizable filenames in the result. The backend has no structured artifact store,
-  source provenance, or share service. Export is a local browser download; raw result
-  source remains available in the renderer.
+- **Results:** Run artifacts are inferred from structured `files`/`artifacts` arrays or
+  recognizable filenames in the result. The workspace artifact library scans the configured
+  workspace for the same recognized file types. Both views can open files or reveal them in
+  the platform file manager. Export downloads either the complete output as JSON or the final
+  displayed result as Markdown.
 - **Search:** history search covers task titles and chat titles/messages already loaded
-  by the desktop app; it is not a backend-wide or file-content search. Artifacts and Saved
-  navigation are shown as unavailable until backing models exist.
+  by the desktop app; it is not a backend-wide or file-content search. Saved items are not
+  modeled or shown.
 - **Privacy:** sensitive messages, reasoning, and raw tool payloads are opt-in under
   Inspector Diagnostics and may expose private data locally.
 - **Capacity and windows:** the slot meter reports runtime execution capacity. A task may

@@ -6,6 +6,7 @@ export type WorkbenchSelection =
   | { kind: 'new-chat' }
   | { kind: 'task'; itemId: string; runId: string }
   | { kind: 'chat'; itemId: string }
+  | { kind: 'artifacts' }
   | { kind: 'settings' };
 
 export type RailGroup = 'Active' | 'Needs input' | 'History';
