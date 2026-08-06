@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>World News Bulletin - August 4, 2026</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Georgia', 'Times New Roman', serif;
+            background-color: #f5f5f5;
+            color: #333;
+            line-height: 1.6;
+            padding: 20px;
+        }
+        
+        .newspaper-container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            box-shadow: 0 0 20px rgba(0,0,0,0.1);
+            min-height: 100vh;
+        }
+        
+        /* Header Styles */
+        header {
+            border-bottom: 3px double #000;
+            padding: 20px 40px;
+            text-align: center;
+        }
+        
+        .masthead {
+            font-size: 72px;
+            font-weight: bold;
+            letter-spacing: 3px;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+        }
+        
+        .subheader {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-top: 1px solid #ccc;
+            border-bottom: 1px solid #ccc;
+            padding: 10px 0;
+            margin-top: 15px;
+            font-size: 14px;
+        }
+        
+        .date-line {
+            font-style: italic;
+        }
+        
+        .edition {
+            font-weight: bold;
+        }
+        
+        /* Main Content */
+        .main-content {
+            padding: 30px 40px;
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 30px;
+        }
+        
+        /* Article Sections */
+        .region-section {
+            grid-column: span 2;
+            border-bottom: 2px solid #e0e0e0;
+            padding-bottom: 30px;
+            margin-bottom: 30px;
+        }
+        
+        .region-title {
+            font-size: 28px;
+            font-weight: bold;
+            color: #1a1a1a;
+            margin-bottom: 20px;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            border-left: 4px solid #b91c1c;
+            padding-left: 15px;
+        }
+        
+        .section-label {
+            font-size: 12px;
+            color: #b91c1c;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 5px;
+        }
+        
+        /* Article Card Styles */
+        .article-card {
+            margin-bottom: 25px;
+            padding: 15px;
+            background: #fafafa;
+            border-left: 3px solid #000;
+        }
+        
+        .article-headline {
+            font-size: 20px;
+            font-weight: bold;
+            margin-bottom: 10px;
+            line-height: 1.3;
+        }
+        
+        .article-summary {
+            font-size: 15px;
+            color: #555;
+            margin-bottom: 8px;
+            line-height: 1.5;
+        }
+        
+        .article-meta {
+            font-size: 12px;
+            color: #777;
+            font-style: italic;
+        }
+        
+        .article-source {
+            color: #b91c1c;
+            font-weight: bold;
+        }
+        
+        /* Category divider */
+        .category-divider {
+            font-size: 18px;
+            font-weight: bold;
+            color: #333;
+            margin: 20px 0 15px 0;
+            padding: 5px 0;
+            border-bottom: 1px solid #ddd;
+            text-transform: uppercase;
+        }
+        
+        /* Footer */
+        footer {
+            border-top: 3px double #000;
+            padding: 20px 40px;
+            text-align: center;
+            font-size: 12px;
+            color: #666;
+            background: #f9f9f9;
+        }
+        
+        .footer-disclaimer {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        
+        /* Responsive Design */
+        @media (max-width: 768px) {
+            .main-content {
+                grid-template-columns: 1fr;
+                padding: 20px;
+            }
+            
+            .region-section {
+                grid-column: span 1;
+            }
+            
+            .masthead {
+                font-size: 42px;
+            }
+            
+            header, footer {
+                padding: 20px;
+            }
+            
+            .subheader {
+                flex-direction: column;
+                gap: 10px;
+                text-align: center;
+            }
+        }
+        
+        /* Link styling for URLs */
+        a.article-link {
+            color: #0066cc;
+            text-decoration: none;
+            word-break: break-all;
+        }
+        
+        a.article-link:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <div class="newspaper-container">
+        <!-- Header -->
+        <header>
+            <div class="masthead">The Global Times</div>
+            <div class="subheader">
+                <span class="date-line">Tuesday, August 4, 2026</span>
+                <span>INTERNATIONAL EDITION</span>
+                <span class="edition">Vol. CXCVII, No. 139 • $5.00</span>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <div class="main-content">
+            
+            <!-- USA Section -->
+            <section class="region-section">
+                <h2 class="region-title">United States of America</h2>
+                
+                <div class="category-divider">Politics</div>
+                
+                <article class="article-card">
+                    <div class="article-headline">Trump Cancels Planned Attacks on Iran Pending Rapid Deal in Strait of Hormuz Talks</div>
+                    <p class="article-summary">President Trump agreed to requests from Iran and other Middle Eastern countries to cancel planned attacks, citing progress in negotiations regarding regional tensions.</p>
+                    <div class="article-meta"><span class="article-source">CNN</span> | <a href="https://www.cnn.com/2026/08/01/world/live-news/iran-war-trump" class="article-link" target="_blank">Read More →</a></div>
+                </article>
+                
+                <article class="article-card">
+                    <div class="article-headline">State Department Warns US Citizens Across Middle East Amid Escalating Tensions</div>
+                    <p class="article-summary">US embassies in Jordan and Israel urged Americans to consider departing the Middle East as regional tensions remain high and Iranian regime behavior deemed unpredictable.</p>
+                    <div class="article-meta"><span class="article-source">CNN</span> | <a href="https://www.cnn.com/2026/08/01/world/live-news/iran-war-trump" class="article-link" target="_blank">Read More →</a></div>
+                </article>
+                
+                <article class="article-card">
+                    <div class="article-headline">Intersection of War, Private Business, Law and Social Media Dominates National News</div>
+                    <p class="article-summary">Presidential posts now potentially communicate military decisions, move oil prices, influence securities, and shape international negotiations simultaneously.</p>
+                    <div class="article-meta"><span class="article-source">Midtown Tribune</span> | <a href="https://midtowntribune.com/major-u-s-stories-august-2-2026-what-happened-and-law/" class="article-link" target="_blank">Read More →</a></div>
+                </article>
+                
+                <div class="category-divider">Technology</div>
+                
+                <article class="article-card">
+                    <div class="article-headline">New State AI Laws Take Effect in California, Texas, Illinois, and Utah</div>
+                    <p class="article-summary">August 2026 brings new state-level AI regulations across major states, creating a complex regulatory landscape alongside federal enforcement changes.</p>
+                    <div class="article-meta"><span class="article-source">Vorp Labs</span> | <a href="https://vorplabs.com/ai-regulatory-updates/united-states" class="article-link" target="_blank">Read More →</a></div>
+                </article>
+                
+                <article class="article-card">
+                    <div class="article-headline">AI Regulation Moves from Policy Papers to Real Enforcement Nationwide</div>
+                    <p class="article-summary">Deepfake and copyright laws are reshaping what can be legally built and deployed as US states clash with federal policy approaches.</p>
+                    <div class="article-meta"><span class="article-source">The Modern Blog</span> | <a href="https://www.themodernblog.com/ai-regulation-news/" class="article-link" target="_blank">Read More →</a></div>
+                </article>
+                
+                <article class="article-card">
+                    <div class="article-headline">Tech Stocks Flirt with Records as AI Profits Continue Piling Up</div>
+                    <p class="article-summary">Economy and retirement accounts increasingly entangled with giant bets on artificial intelligence by leading tech firms.</p>
+                    <div class="article-meta"><span class="article-source">The Washington Post</span> | <a href="https://www.washingtonpost.com/technology/innovations/" class="article-link" target="_blank">Read More →</a></div>
+                </article>
+            </section>
+            
+            <!-- Middle East Section -->
+            <section class="region-section">
+                <h2 class="region-title">Middle East</h2>
+                
+                <div class="category-divider">Politics</div>
+                
+                <article class="article-card">
+                    <div class="article-headline">Pakistan Confirmed as Primary Intermediary Between Tehran and Washington</div>
+                    <p class="article-summary">Iran said Pakistan remains the primary intermediary between Tehran and Washington, rejecting suggestions that China had become a formal mediator in Strait of Hormuz talks.</p>
+                    <div class="article-meta"><span class="article-source">The National News</span> | <a href="https://www.thenationalnews.com/news/mena/2026/08/04/live-trump-us-talks-with-iran-deal/" class="article-link" target="_blank">Read More →</a></div>
+                </article>
+                
+                <article class="article-card">
+                    <div class="article-headline">Israel Poised to Return to Iran War in Heaviest US Strikes Yet</div>
+                    <p class="article-summary">Iran's military accused the US of escalating tensions in the Middle East and warned regional countries against cooperating with Washington.</p>
+                    <div class="article-meta"><span class="article-source">Daily Telegraph</span> | <a href="https://www.telegraph.co.uk/world-news/2026/08/01/israel-poised-return-iran-war-heaviest-us-strikes/" class="article-link" target="_blank">Read More →</a></div>
+                </article>
+                
+                <article class="article-card">
+                    <div class="article-headline">Regional Mobilizations Intensify Across Arab Nations Amid 2026 Iran War</div>
+                    <p class="article-summary">Surrounding nations began military mobilizations to secure borders and maritime trade across Arabian Sea, Red Sea, and Eastern Mediterranean amid conflict.</p>
+                    <div class="article-meta"><span class="article-source">Geostrategic Media</span> | <a href="https://en.wikipedia.org/wiki/2026_Iran_war_regional_mobilizations" class="article-link" target="_blank">Read More →</a></div>
+                </article>
+                
+                <div class="category-divider">Technology</div>
+                
+                <article class="article-card">
+                    <div class="article-headline">Saudi Arabia Announces $100 Billion AI Investment Drive in 2026</div>
+                    <p class="article-summary">Major investments in data centers through Humain and ACWA, PIF portfolio moves, and partnerships with NVIDIA/AMD under Vision 2030 targets.</p>
+                    <div class="article-meta"><span class="article-source">The Middle East Insider</span> | <a href="https://themiddleeastinsider.com/2026/04/02/saudi-arabia-100b-ai-investment-2026-data-centers/" class="article-link" target="_blank">Read More →</a></div>
+                </article>
+                
+                <article class="article-card">
+                    <div class="article-headline">UAE Declares 2026 as 'Performance Year' for Digital Transformation</div>
+                    <p class="article-summary">After building capacity in 2025, UAE focuses on execution quality, unified data and human-centered AI implementation across sectors.</p>
+                    <div class="article-meta"><span class="article-source">Khaleej Times</span> | <a href="https://www.khaleejtimes.com/business/tech/uaes-digital-transformation-in-2026-the-performance-year" class="article-link" target="_blank">Read More →</a></div>
+                </article>
+                
+                <article class="article-card">
+                    <div class="article-headline">GCC Digital Transformation Market Reaches $71.64 Billion in 2026</div>
+                    <p class="article-summary">Market driven by Saudi Arabia's SAR 113 billion investment focus on AI, cloud infrastructure, cybersecurity, and smart technologies.</p>
+                    <div class="article-meta"><span class="article-source">AgamiSoft</span> | <a href="https://www.agamisoft.com/middle-east-digital-transformation-report-2026" class="article-link" target="_blank">Read More →</a></div>
+                </article>
+            </section>
+            
+            <!-- China Section -->
+            <section class="region-section">
+                <h2 class="region-title">China</h2>
+                
+                <div class="category-divider">Politics</div>
+                
+                <article class="article-card">
+                    <div class="article-headline">Analysts Question Whether China Has Really 'Won' in Iran War Context</div>
+                    <p class="article-summary">While Iran war boosted China's leverage in energy sector and deepened commercial Gulf presence, regional states want China to be more proactive stakeholder.</p>
+                    <div class="article-meta"><span class="article-source">ThinkChina</span> | <a href="https://www.thinkchina.sg/politics" class="article-link" target="_blank">Read More →</a></div>
+                </article>
+                
+                <article class="article-card">
+                    <div class="article-headline">2026 Government Work Report Signals Continued Support for Innovation and Digital Transformation</div>
+                    <p class="article-summary">Policy environment remains supportive of innovation, digital transformation, and industrial upgrading for domestic companies.</p>
+                    <div class="article-meta"><span class="article-source">China Insights</span> | <a href="https://china-insights.org/2026/03/chinas-2026-government-work-report-policy-priorities-and-economic-direction/" class="article-link" target="_blank">Read More →</a></div>
+                </article>
+                
+                <div class="category-divider">Technology</div>
+                
+                <article class="article-card">
+                    <div class="article-headline">China Achieves Breakthrough in AI Chip Technology Overcoming US Restrictions</div>
+                    <p class="article-summary">China developed technology crucial to AI boom, overcoming US efforts to limit Beijing's access to advanced systems.</p>
+                    <div class="article-meta"><span class="article-source">Daily Telegraph</span> | <a href="https://www.telegraph.co.uk/business/2026/07/28/chinas-chip-breakthrough-triggers-global-tech-rout/" class="article-link" target="_blank">Read More →</a></div>
+                </article>
+                
+                <article class="article-card">
+                    <div class="article-headline">Chinese Semiconductor Companies Accelerate IPOs Amid Surging AI Computing Demand</div>
+                    <p class="article-summary">This year's IPO boom across domestic chip sector mirrors vibrant demand for AI computing power in 2026.</p>
+                    <div class="article-meta"><span class="article-source">Global Times</span> | <a href="https://www.globaltimes.cn/page/202607/1364870.shtml" class="article-link" target="_blank">Read More →</a></div>
+                </article>
+                
+                <article class="article-card">
+                    <div class="article-headline">US Imposes 25% Tariff on Nvidia H200 AI Chips Bound for China</div>
+                    <p class="article-summary">Despite having licenses, almost no H200 chips shipped to China; timeline shows Huawei's rising position in domestic market.</p>
+                    <div class="article-meta"><span class="article-source">Tech Journal</span> | <a href="https://techjournal.org/us-imposes-25-tariff-on-nvidia-h200-ai-chips-bound-for-china" class="article-link" target="_blank">Read More →</a></div>
+                </article>
+            </section>
+            
+            <!-- India Section -->
+            <section class="region-section">
+                <h2 class="region-title">India</h2>
+                
+                <div class="category-divider">Politics</div>
+                
+                <article class="article-card">
+                    <div class="article-headline">PM Modi Forgives Youth Who Abused Him During CJP Protests</div>
+                    <p class="article-summary">Prime Minister Modi stated he forgives the youth involved in recent protests while addressing national audience.</p>
+                    <div class="article-meta"><span class="article-source">The Indian Express</span> | <a href="https://indianexpress.com/article/india/today-india-breaking-news-live-updates-1-august-2026-lpg-price-cut-pm-modi-forgives-youth-delhi-riots-life-sentence-10812950/" class="article-link" target="_blank">Read More →</a></div>
+                </article>
+                
+                <article class="article-card">
+                    <div class="article-headline">Former AAP Leader Awarded Life Sentence in 2020 Delhi Riots IB Officer Killing Case</div>
+                    <p class="article-summary">Court delivers significant verdict in one of India's most contentious political cases from the Delhi riot incidents.</p>
+                    <div class="article-meta"><span class="article-source">The Indian Express</span> | <a href="https://indianexpress.com/article/india/today-india-breaking-news-live-updates-1-august-2026-lpg-price-cut-pm-modi-forgives-youth-delhi-riots-life-sentence-10812950/" class="article-link" target="_blank">Read More →</a></div>
+                </article>
+                
+                <article class="article-card">
+                    <div class="article-headline">Delhi Assembly Elections 2026: Alliances and Polls Shape Political Future</div>
+                    <p class="article-summary">Multiple assembly elections set for 2026 with heavy electoral calendar shaping New Delhi's political and diplomatic priorities.</p>
+                    <div class="article-meta"><span class="article-source">WeRIndia/Moneycontrol</span> | <a href="https://werindia.com/elections2026" class="article-link" target="_blank">Read More →</a></div>
+                </article>
+                
+                <article class="article-card">
+                    <div class="article-headline">Commercial LPG Cylinder Prices Cut by Rs 202 in Delhi, Rs 209 in Kolkata</div>
+                    <p class="article-summary">Government announces significant fuel subsidy relief affecting households across major Indian cities.</p>
+                    <div class="article-meta"><span class="article-source">The Indian Express</span> | <a href="https://indianexpress.com/article/india/today-india-breaking-news-live-updates-1-august-2026-lpg-price-cut-pm-modi-forgives-youth-delhi-riots-life-sentence-10812950/" class="article-link" target="_blank">Read More →</a></div>
+                </article>
+                
+                <div class="category-divider">Technology</div>
+                
+                <article class="article-card">
+                    <div class="article-headline">Google Selects 20 Indian AI Startups from Over 2,000 Applicants for 2026 Accelerator</div>
+                    <p class="article-summary">Selected startups showcase innovative solutions with potential impact across healthcare, fintech, logistics, and consumer sectors.</p>
+                    <div class="article-meta"><span class="article-source">Deccan Herald/Analytics India Magazine</span> | <a href="https://www.deccanherald.com/technology/artificial-intelligence/startups-accelerator-google-picks-20-indian-ai-firms-for-2026-batch-4066655" class="article-link" target="_blank">Read More →</a></div>
+                </article>
+                
+                <article class="article-card">
+                    <div class="article-headline">Karnataka Chief Minister Launches Plan for India's First AI Varsity and AI-Native State Status</div>
+                    <p class="article-summary">State aims to integrate AI into governance, education, healthcare, agriculture and public services at Google I/O Connect India 2026.</p>
+                    <div class="article-meta"><span class="article-source">News18</span> | <a href="https://www.news18.com/cities/bengaluru-news/after-it-city-karnataka-aims-to-be-ai-hub-state-to-get-indias-1st-artificial-intelligence-varsity-says-cm-ws-l-10210130.html" class="article-link" target="_blank">Read More →</a></div>
+                </article>
+                
+                <article class="article-card">
+                    <div class="article-headline">Bangalore Boasts 32 Unicorns as Deep Tech and AI Growth Position City Among Global Top 10</div>
+                    <p class="article-summary">Startup ecosystem powered by government grants continues to transform India's Silicon Valley into global innovation powerhouse.</p>
+                    <div class="article-meta"><span class="article-source">ForgeUp</span> | <a href="https://forgeup.in/news/startup-news/startups-in-bangalore-2026-innovation-capital/" class="article-link" target="_blank">Read More →</a></div>
+                </article>
+                
+                <article class="article-card">
+                    <div class="article-headline">Sarvam AI Commits to Pre-Training Trillion-Parameter Model</div>
+                    <p class="article-summary">Indian startup chooses to build model from scratch rather than post-training open-weight models, signaling confidence in domestic AI capability.</p>
+                    <div class="article-meta"><span class="article-source">Analytics India Magazine</span> | <a href="https://analyticsindiamag.com/ai-news/google-picks-20-ai-startups-for-india-accelerator-from-2500-applications" class="article-link" target="_blank">Read More →</a></div>
+                </article>
+            </section>
+            
+        </div>
+
+        <!-- Footer -->
+        <footer>
+            <div class="footer-disclaimer">
+                <p><strong>The Global Times</strong> | International Edition | Tuesday, August 4, 2026</p>
+                <p style="margin-top: 10px; font-size: 11px; color: #888;">
+                    This bulletin compiles headlines from various news sources across the USA, Middle East, China, and India. 
+                    Headlines are curated from local newspapers and official news agencies for balanced international coverage. 
+                    For complete articles, please visit the original source links provided.
+                </p>
+                <p style="margin-top: 10px;">
+                    © 2026 The Global Times. All rights reserved. Generated using AI research tools.
+                </p>
+            </div>
+        </footer>
+    </div>
+</body>
+</html>

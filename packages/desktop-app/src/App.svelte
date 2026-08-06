@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { addActivity, type ActivityEvent } from './activity';
   import ArtifactList from './ArtifactList.svelte';
+  import BrandMark from './BrandMark.svelte';
   import ChatWorkspace from './ChatWorkspace.svelte';
   import NewComposer from './NewComposer.svelte';
   import RunInspector from './RunInspector.svelte';
@@ -594,7 +595,7 @@
   <section class="workspace-shell">
     <header class="workbench-header">
       <button class="icon-button rail-toggle" aria-label="Open task rail" on:click={() => { $mobileRailOpen = true; }}>☰</button>
-      <div class="brand"><span class="mark">A</span><div><strong>AdaptiveAgent</strong><span>Workbench</span></div></div>
+      <div class="brand"><BrandMark /><div><strong>AdaptiveAgent</strong><span>Workbench</span></div></div>
       <div class="health-strip" aria-label="Runtime health">
         <span class:good={desktop.executionHealth === 'ready'} class="health-pill">Runtime {desktop.executionHealth}</span>
         <span class:good={desktop.traceHealth === 'ready'} class="health-pill">Trace {desktop.traceHealth}</span>

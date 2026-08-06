@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>The World Gazette - International News Bulletin</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Georgia', 'Times New Roman', serif;
+            background-color: #f5f5f5;
+            color: #1a1a1a;
+            line-height: 1.6;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            box-shadow: 0 0 20px rgba(0,0,0,0.1);
+        }
+        
+        /* Header */
+        header {
+            text-align: center;
+            border-bottom: 4px solid #1a1a1a;
+            padding: 30px 20px;
+            background: linear-gradient(to bottom, #ffffff, #f9f9f9);
+        }
+        
+        .masthead {
+            font-size: 82px;
+            font-weight: bold;
+            letter-spacing: 3px;
+            font-style: italic;
+            color: #1a1a1a;
+            margin-bottom: 10px;
+        }
+        
+        .date-line {
+            font-size: 14px;
+            color: #666;
+            border-top: 1px solid #ccc;
+            border-bottom: 1px solid #ccc;
+            padding: 8px 0;
+            margin-top: 15px;
+            font-family: 'Arial', sans-serif;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+        
+        .tagline {
+            font-size: 12px;
+            color: #888;
+            margin-top: 8px;
+            font-style: italic;
+        }
+        
+        /* Breaking Banner */
+        .breaking-banner {
+            background: #c41e3a;
+            color: white;
+            padding: 12px 20px;
+            font-family: 'Arial', sans-serif;
+            font-weight: bold;
+            font-size: 16px;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.85; }
+        }
+        
+        /* Main Layout */
+        .main-content {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 30px;
+            padding: 30px;
+        }
+        
+        @media (max-width: 900px) {
+            .main-content {
+                grid-template-columns: 1fr;
+            }
+        }
+        
+        /* Articles */
+        article {
+            margin-bottom: 30px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid #eee;
+        }
+        
+        article:last-child {
+            border-bottom: none;
+        }
+        
+        .section-header {
+            font-size: 14px;
+            color: #c41e3a;
+            font-family: 'Arial', sans-serif;
+            font-weight: bold;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 8px;
+        }
+        
+        h1.lede-headline {
+            font-size: 42px;
+            line-height: 1.1;
+            margin-bottom: 15px;
+            font-weight: bold;
+        }
+        
+        h2.sub-headline {
+            font-size: 20px;
+            font-weight: normal;
+            color: #333;
+            margin-bottom: 15px;
+        }
+        
+        .article-summary {
+            font-size: 16px;
+            color: #333;
+            line-height: 1.7;
+            margin-bottom: 10px;
+        }
+        
+        .byline {
+            font-size: 12px;
+            color: #666;
+            font-family: 'Arial', sans-serif;
+            margin-top: 12px;
+        }
+        
+        .location {
+            font-weight: bold;
+            text-transform: uppercase;
+            font-size: 11px;
+            color: #888;
+            margin-right: 10px;
+        }
+        
+        /* Sidebar */
+        aside {
+            background: #fafafa;
+            padding: 20px;
+            border-left: 1px solid #e0e0e0;
+        }
+        
+        aside h3 {
+            font-size: 16px;
+            border-bottom: 2px solid #c41e3a;
+            padding-bottom: 8px;
+            margin-bottom: 15px;
+            font-family: 'Arial', sans-serif;
+        }
+        
+        .sidebar-item {
+            margin-bottom: 15px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid #ddd;
+        }
+        
+        .sidebar-item h4 {
+            font-size: 14px;
+            margin-bottom: 5px;
+            color: #1a1a1a;
+        }
+        
+        .sidebar-item p {
+            font-size: 13px;
+            color: #666;
+        }
+        
+        /* Footer */
+        footer {
+            background: #1a1a1a;
+            color: white;
+            text-align: center;
+            padding: 30px;
+            font-size: 12px;
+        }
+        
+        footer .footer-masthead {
+            font-size: 36px;
+            font-style: italic;
+            margin-bottom: 15px;
+            font-weight: bold;
+        }
+        
+        footer p {
+            color: #999;
+            margin: 5px 0;
+        }
+        
+        /* Special Styles */
+        .urgent {
+            border-left: 3px solid #c41e3a;
+            padding-left: 15px;
+        }
+        
+        .tech-news {
+            border-left: 3px solid #2563eb;
+            padding-left: 15px;
+        }
+        
+        .world-news {
+            border-left: 3px solid #16a34a;
+            padding-left: 15px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header>
+            <div class="masthead">THE WORLD GAZETTE</div>
+            <div class="date-line">Wednesday, August 5, 2026 | International Edition Vol. CXXIV No. 124</div>
+            <div class="tagline">All The World's News — From Capitals to Boardrooms</div>
+        </header>
+        
+        <!-- Breaking News Banner -->
+        <div class="breaking-banner">
+            🚨 BREAKING: Iran and Oman Finalize Strait of Hormuz Shipping Route Coordinates as Tensions Ease
+        </div>
+        
+        <!-- Main Content -->
+        <div class="main-content">
+            <!-- Left Column - Main Stories -->
+            <main>
+                <!-- Lead Story -->
+                <article class="urgent">
+                    <span class="section-header">Middle East Crisis</span>
+                    <h1 class="lede-headline">Iran Agrees to Hormuz Shipping Corridor With Oman in Bid to Defuse Regional Crisis</h1>
+                    <h2 class="sub-headline">Tehran announces breakthrough coordination with Muscat; U.S. and Israel remain cautious about broader security implications</h2>
+                    <p class="article-summary">
+                        In a significant diplomatic development that could stabilize one of the world's most critical maritime chokepoints, Iran's Foreign Ministry announced Wednesday that it has agreed upon coordinates for a commercial shipping route through the Strait of Hormuz with neighboring Oman. The agreement marks a potential de-escalation in weeks of heightened tension between Tehran and Washington-Jerusalem coalitions, though officials from both countries maintain vigilance over broader military concerns. The announcement came as reports surfaced of another vessel being targeted in the Red Sea, underscoring the precarious nature of regional navigation.
+                    </p>
+                    <div class="byline">
+                        <span class="location">TEHRAN / MUSCAT •</span>
+                        By Our Correspondents | Al Jazeera
+                    </div>
+                </article>
+                
+                <!-- U.S. Politics -->
+                <article class="urgent">
+                    <span class="section-header">United States — Political Wire</span>
+                    <h1 class="lede-headline">Midterm Election Polling Intensifies as Congress Races Toward November 2026 Vote</h1>
+                    <h2 class="sub-headline">Latest congressional ballot surveys show tight races nationwide; cybersecurity legislation remains top legislative priority heading into fall campaign season</h2>
+                    <p class="article-summary">
+                        With less than three months until the midterm elections, new polling data shows American voters closely divided on their preferences for House seats. Congress passed bipartisan cybersecurity legislation in 2022 requiring critical infrastructure operators to report significant hacks within 72 hours, but fresh debates continue over AI regulation and federal oversight. The Biden Administration faces scrutiny over technology policy decisions, including recent moves to exempt certain open-source AI systems from mandatory security reviews—a move praised by tech advocates but criticized by national security experts concerned about dual-use applications.
+                    </p>
+                    <div class="byline">
+                        <span class="location">WASHINGTON D.C. •</span>
+                        By Political Desk | Associated Press / NY Times
+                    </div>
+                </article>
+                
+                <!-- China Technology & Politics -->
+                <article class="tech-news">
+                    <span class="section-header">China — Technology & Governance</span>
+                    <h1 class="lede-headline">Beijing's AI Ambition Creates Dual-Challenge for Communist Party Leadership</h1>
+                    <h2 class="sub-headline">As Chinese artificial intelligence models compete globally, officials grapple with balancing innovation incentives against political control and ideological security</h2>
+                    <p class="article-summary">
+                        China's rapid ascent in artificial intelligence is presenting Beijing with an unprecedented paradox. While government-backed AI models gain international influence and market share—particularly through low-cost, open-source alternatives to Western offerings—the same technologies pose risks to the Communist Party's tight grip on information control and ideological conformity. At last month's Shanghai Forum, President Xi Jinping outlined an ambitious AI diplomacy vision aimed at exporting China's governance model while bridging the global digital divide. Under the current Five-Year Plan (2026-2030), Beijing forecasts AI-related industries will exceed 10 trillion yuan in value, backed by state investment representing approximately 60% of the sector's 700 billion yuan annual capital spending.
+                    </p>
+                    <div class="byline">
+                        <span class="location">BEIJING / SHANGHAI •</span>
+                        By Asia Bureau | Reuters / The Diplomat
+                    </div>
+                </article>
+                
+                <!-- India Technology -->
+                <article class="tech-news">
+                    <span class="section-header">India — Digital Economy Report</span>
+                    <h1 class="lede-headline">India's Union Budget 2026 Anchors Historic Investment in Semiconductors, AI Infrastructure</h1>
+                    <h2 class="sub-headline">Delhi unveils Semiconductor Mission 2.0, cloud tax incentives, and farmer-focused AI tools as nation pursues trillion-dollar economy targets</h2>
+                    <p class="article-summary">
+                        The Indian government's Union Budget for fiscal year 2026-27 represents a watershed moment in Delhi's technology policy, signaling long-term strategic commitments to artificial intelligence, chip manufacturing, and digital infrastructure development. Key announcements include enhanced tax breaks for cloud service providers, expansion of the semiconductor fabrication initiative, and deployment of AI-powered agricultural assistance programs targeting rural populations. India's digital economy continues explosive growth—with the UPI payment system processing over 16 billion monthly transactions—and advertising revenues approaching $8.6 billion annually. State governments, led by Maharashtra's drive toward becoming a $1 trillion economy, are positioning energy and digital transformation as twin engines of competitiveness.
+                    </p>
+                    <div class="byline">
+                        <span class="location">NEW DELHI •</span>
+                        By Economics Bureau | Economic Times / Indian Express
+                    </div>
+                </article>
+                
+                <!-- Secondary Regional Stories -->
+                <article class="world-news">
+                    <span class="section-header">Regional Update</span>
+                    <h1 class="lede-headline">Israel Orders Evacuations in Southern Lebanon Village Amid Ongoing Border Tensions</h1>
+                    <p class="article-summary">
+                        Israeli military authorities instructed residents of a southern Lebanon village to evacuate as part of ongoing security operations along the contested border region. The evacuation order comes amid continued exchanges of fire and diplomatic efforts to prevent broader regional escalation following months of cross-border violence.
+                    </p>
+                    <div class="byline">
+                        <span class="location">SOUTHERN LEBANON •</span>
+                        By Middle East Correspondent
+                    </div>
+                </article>
+            </main>
+            
+            <!-- Right Sidebar -->
+            <aside>
+                <h3>In Brief</h3>
+                
+                <div class="sidebar-item">
+                    <h4>🇺🇸 Open AI Systems Exemption</h4>
+                    <p>White House announces exemption for "open" artificial intelligence systems from mandatory security review process. Tech community divided on implications.</p>
+                </div>
+                
+                <div class="sidebar-item">
+                    <h4>🇨🇳 APEC Digital Statement Released</h4>
+                    <p>2026 APEC Digital and AI Ministerial held in Chengdu issued "Chengdu Statement" calling for regional cooperation on empowering Asia-Pacific through digital technologies.</p>
+                </div>
+                
+                <div class="sidebar-item">
+                    <h4>🇮🇳 Gaming & Digital Ads Surge</h4>
+                    <p>India's gaming sector and digital advertising markets show robust growth as smartphone penetration reaches new highs across tier-2 and tier-3 cities.</p>
+                </div>
+                
+                <div class="sidebar-item">
+                    <h4>⚠️ Red Sea Security Concerns</h4>
+                    <p>Another vessel reported hit in Red Sea waters despite improved Horn of Africa conditions, complicating shipping insurance calculations.</p>
+                </div>
+                
+                <div class="sidebar-item">
+                    <h4>🇮🇱🇮🇷 Energy Infrastructure Watch</h4>
+                    <p>Iran reportedly preparing response plans for potential U.S.-Israeli strikes on energy facilities according to Jerusalem Post sources.</p>
+                </div>
+                
+                <hr style="margin: 20px 0; border: none; border-top: 1px solid #ddd;">
+                
+                <h3>Markets & Business</h3>
+                
+                <div class="sidebar-item">
+                    <h4>Tech Investment Flows</h4>
+                    <p>U.S. Q4 AI investments exceeded $20 billion while China maintains lead in government-directed technology funding.</p>
+                </div>
+                
+                <div class="sidebar-item">
+                    <h4>Rare Earth Export Controls</h4>
+                    <p>China's rare earth export restrictions continue to disrupt global supply chains, prompting Western nations to seek alternative sourcing.</p>
+                </div>
+                
+                <h3>Up This Week</h3>
+                
+                <div class="sidebar-item">
+                    <h4>August 3-9, 2026</h4>
+                    <p>Key dates: Congressional fundraising deadlines, Mid-term debate cycles accelerate, OPEC+ meeting preview.</p>
+                </div>
+            </aside>
+        </div>
+        
+        <!-- Footer -->
+        <footer>
+            <div class="footer-masthead">THE WORLD GAZETTE</div>
+            <p>"All the News That's Fit to Print — Globally"</p>
+            <p>Copyright © 2026 The World Gazette International Editions</p>
+            <p>Sources: AP, Reuters, Bloomberg, NY Times, Washington Post, Al Jazeera, Economic Times, Indian Express</p>
+            <p>Published digitally for worldwide distribution</p>
+        </footer>
+    </div>
+</body>
+</html>

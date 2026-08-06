@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Maui Family Vacation Guide - August 2026</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+            padding: 40px;
+            text-align: center;
+        }
+
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            font-size: 1.2em;
+            opacity: 0.9;
+        }
+
+        .tabs {
+            display: flex;
+            background: #f8f9fa;
+            border-bottom: 3px solid #e9ecef;
+            flex-wrap: wrap;
+        }
+
+        .tab-btn {
+            padding: 20px 30px;
+            border: none;
+            background: transparent;
+            cursor: pointer;
+            font-size: 1em;
+            font-weight: 600;
+            color: #6c757d;
+            transition: all 0.3s ease;
+            border-bottom: 3px solid transparent;
+        }
+
+        .tab-btn:hover {
+            background: #e9ecef;
+            color: #333;
+        }
+
+        .tab-btn.active {
+            color: #667eea;
+            border-bottom-color: #667eea;
+            background: white;
+        }
+
+        .tab-content {
+            display: none;
+            padding: 40px;
+            animation: fadeIn 0.5s ease;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        h2 {
+            color: #333;
+            font-size: 1.8em;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 3px solid #667eea;
+        }
+
+        h3 {
+            color: #444;
+            font-size: 1.3em;
+            margin-top: 25px;
+            margin-bottom: 15px;
+        }
+
+        p {
+            color: #555;
+            line-height: 1.7;
+            margin-bottom: 15px;
+        }
+
+        ul {
+            list-style: none;
+            margin-bottom: 20px;
+        }
+
+        ul li {
+            padding: 12px 15px;
+            margin-bottom: 10px;
+            background: #f8f9fa;
+            border-left: 4px solid #667eea;
+            border-radius: 5px;
+            color: #333;
+            line-height: 1.6;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+
+        th, td {
+            padding: 15px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+
+        th {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            font-weight: 600;
+        }
+
+        tr:nth-child(even) {
+            background: #f8f9fa;
+        }
+
+        tr:hover {
+            background: #e9ecef;
+        }
+
+        .emoji {
+            font-size: 1.5em;
+            margin-right: 10px;
+        }
+
+        .price-box {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 10px;
+            margin: 20px 0;
+        }
+
+        .price-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 10px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.3);
+        }
+
+        .price-item:last-child {
+            border-bottom: none;
+        }
+
+        .highlight {
+            background: #fff3cd;
+            padding: 15px;
+            border-radius: 10px;
+            margin: 20px 0;
+            border-left: 4px solid #ffc107;
+        }
+
+        .recommendation {
+            background: #d4edda;
+            padding: 20px;
+            border-radius: 10px;
+            margin: 20px 0;
+            border-left: 4px solid #28a745;
+        }
+
+        .itinerary-day {
+            background: linear-gradient(135deg, #a8edea 0%, #fed6e3 100%);
+            padding: 15px 20px;
+            margin: 10px 0;
+            border-radius: 10px;
+            font-weight: 600;
+        }
+
+        @media (max-width: 768px) {
+            .tabs {
+                flex-direction: column;
+            }
+            
+            .tab-btn {
+                width: 100%;
+                text-align: left;
+            }
+            
+            .header h1 {
+                font-size: 1.8em;
+            }
+            
+            table {
+                font-size: 0.9em;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🌺 Maui Family Vacation Guide 🌺</h1>
+            <p>August 8-13, 2026 | Lahaina, Hawaii</p>
+        </div>
+
+        <div class="tabs">
+            <button class="tab-btn active" onclick="openTab(event, 'vacation')">✈️ Vacation & Activities</button>
+            <button class="tab-btn" onclick="openTab(event, 'weather')">🌤️ Weather Forecast</button>
+            <button class="tab-btn" onclick="openTab(event, 'surfing')">🏄‍♂️ Surfing Lessons</button>
+            <button class="tab-btn" onclick="openTab(event, 'food')">🥗 Food & Drinks</button>
+        </div>
+
+        <!-- Tab 1: Vacation & Activities -->
+        <div id="vacation" class="tab-content active">
+            <h2>🏖️ Recommended Family Activities</h2>
+            
+            <h3><span class="emoji">🏖️</span> Best Beaches for Young Kids (Near Lahaina)</h3>
+            <ul>
+                <li><strong>Baby Beach (Pu'unoa Beach)</strong> - The #1 recommended beach for families with young children
+                    <br>• Protected by offshore reef, calm shallow waters
+                    <br>• No strong currents or big waves
+                    <br>• Located right in Lahaina along Front Street
+                </li>
+                <li><strong>Launiupoko Beach Park</strong> - Another excellent option with gentle waves and shallow entry points</li>
+            </ul>
+
+            <h3><span class="emoji">🎯</span> Top Attractions & Activities</h3>
+            <ul>
+                <li><strong>Maui Ocean Center</strong> - One of the best aquariums in the US
+                    <br>• Perfect for all ages, great educational experience
+                    <br>• World's largest collection of live Pacific corals
+                </li>
+                <li><strong>Sunset Boat Tours</strong> - Barefoot sailing with live Hawaiian music
+                    <br>• Magical, mellow activity perfect for families
+                </li>
+                <li><strong>Ululani's Shave Ice</strong> - Famous Hawaii tradition (5 locations on Maui)
+                    <br>• Must-do treat for kids!
+                </li>
+                <li><strong>Local Farmers Markets</strong> - Budget-friendly, authentic Hawaiian experience</li>
+            </ul>
+
+            <h3><span class="emoji">📋</span> Sample 5-Day Itinerary</h3>
+            <div class="itinerary-day">Day 1 (Aug 8): Arrive + settle in, afternoon at Baby Beach</div>
+            <div class="itinerary-day">Day 2 (Aug 9): Maui Ocean Center morning, sunset boat tour evening</div>
+            <div class="itinerary-day">Day 3 (Aug 10): Farmers market morning, beach day afternoon, shave ice</div>
+            <div class="itinerary-day">Day 4 (Aug 11): Explore Lahaina town, Launiupoko Beach Park</div>
+            <div class="itinerary-day">Day 5 (Aug 12): Relaxed beach day, favorite activities</div>
+            <div class="itinerary-day">Day 6 (Aug 13): Departure</div>
+        </div>
+
+        <!-- Tab 2: Weather Forecast -->
+        <div id="weather" class="tab-content">
+            <h2>🌤️ Weather Expectations (August 8-13, 2026)</h2>
+            
+            <div class="highlight">
+                <strong>Note:</strong> Detailed daily forecasts are only accurate ~7-10 days before travel. 
+                Based on historical August patterns for Lahaina:
+            </div>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Day</th>
+                        <th>Date</th>
+                        <th>Expected High</th>
+                        <th>Expected Low</th>
+                        <th>Conditions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Friday</td>
+                        <td>Aug 8</td>
+                        <td>83-88°F</td>
+                        <td>71-74°F</td>
+                        <td>Sunny/hot, possible brief showers</td>
+                    </tr>
+                    <tr>
+                        <td>Saturday</td>
+                        <td>Aug 9</td>
+                        <td>83-88°F</td>
+                        <td>71-74°F</td>
+                        <td>Sunny/hot, possible brief showers</td>
+                    </tr>
+                    <tr>
+                        <td>Sunday</td>
+                        <td>Aug 10</td>
+                        <td>83-88°F</td>
+                        <td>71-74°F</td>
+                        <td>Sunny/hot, possible brief showers</td>
+                    </tr>
+                    <tr>
+                        <td>Monday</td>
+                        <td>Aug 11</td>
+                        <td>83-88°F</td>
+                        <td>71-74°F</td>
+                        <td>Sunny/hot, possible brief showers</td>
+                    </tr>
+                    <tr>
+                        <td>Tuesday</td>
+                        <td>Aug 12</td>
+                        <td>83-88°F</td>
+                        <td>71-74°F</td>
+                        <td>Sunny/hot, possible brief showers</td>
+                    </tr>
+                    <tr>
+                        <td>Wednesday</td>
+                        <td>Aug 13</td>
+                        <td>83-88°F</td>
+                        <td>71-74°F</td>
+                        <td>Sunny/hot, possible brief showers</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <div class="recommendation">
+                <strong>What to expect:</strong><br>
+                • Very hot weather (average temps 85°F high, 73°F low)<br>
+                • About 7-8 days per month see some rain (typically light, brief showers)<br>
+                • Most days will be sunny and comfortable<br>
+                • Bring sunscreen, hats, and stay hydrated! ☀️
+            </div>
+        </div>
+
+        <!-- Tab 3: Surfing Lessons -->
+        <div id="surfing" class="tab-content">
+            <h2>🏄‍♂️ Surfing Lesson Costs in Maui</h2>
+
+            <h3><span class="emoji">👥</span> Group Lessons (Most Budget-Friendly)</h3>
+            <ul>
+                <li><strong>$88-$135 per person</strong> for group lessons (2 hours)
+                    <br>• Best value: $88/person at places like Surf Shack Maui
+                    <br>• Typical group size: 6-8 people with one instructor
+                </li>
+            </ul>
+
+            <h3><span class="emoji">👨‍👩‍👧</span> Semi-Private/Small Group Lessons</h3>
+            <ul>
+                <li>2 people: ~$260 total ($130 each)</li>
+                <li>3 people: ~$335 total (~$112 each)</li>
+                <li>4 people: ~$410 total (~$103 each)</li>
+                <li>3-6 people: $119/person (Rivers To The Sea)</li>
+            </ul>
+
+            <h3><span class="emoji">⭐</span> Private Lessons (Best for Young Kids/Nervous Surfers)</h3>
+            <ul>
+                <li>1 person: $150-$250 (2 hours)</li>
+                <li>2 people: ~$125 each</li>
+                <li>3+ people: ~$100 each</li>
+            </ul>
+
+            <h3>✅ What's Typically Included:</h3>
+            <ul>
+                <li>Surfboard and all gear</li>
+                <li>Rash guard (protective shirt)</li>
+                <li>Reef shoes/booties (protects feet)</li>
+                <li>Safety briefing & land instruction</li>
+                <li>In-water instruction (1.5-2 hours)</li>
+                <li>CPR/first aid certified instructors</li>
+            </ul>
+
+            <div class="price-box">
+                <h3 style="color: white; margin-top: 0;">💰 Budget Estimate for Family of 4:</h3>
+                <div class="price-item">
+                    <span>Group Lesson</span>
+                    <span>~$350-475 total</span>
+                </div>
+                <div class="price-item">
+                    <span>Semi-Private</span>
+                    <span>~$410-480 total</span>
+                </div>
+                <div class="price-item">
+                    <span>Private Lesson</span>
+                    <span>~$400-500 total</span>
+                </div>
+            </div>
+
+            <h3><span class="emoji">🏆</span> Popular Options Near Lahaina:</h3>
+            <ul>
+                <li><strong>Maui Surfer Girls</strong> - Great reviews, family-friendly</li>
+                <li><strong>Surf Shack Maui</strong> - Most affordable at $88/person</li>
+                <li><strong>Sea Maui Surf</strong> - Specializes in semi-private family sessions</li>
+            </ul>
+
+            <div class="recommendation">
+                <strong>Recommendation:</strong><br>
+                • For young kids (ages 5-10): Consider <strong>private or semi-private lessons</strong> (~$100-130/person) for less crowded, personalized attention<br>
+                • For older kids (10+): <strong>Group lessons</strong> at $88-119/person offer great value and fun social experience
+            </div>
+        </div>
+
+        <!-- Tab 4: Food & Drinks -->
+        <div id="food" class="tab-content">
+            <h2>🥗 Vegetarian Dining Options in Lahaina</h2>
+
+            <h3><span class="emoji">🥬</span> Best Vegetarian/Vegan Restaurants for Lunch/Dinner</h3>
+
+            <div class="recommendation">
+                <strong>1. A'A Roots ⭐ Top Pick</strong><br>
+                📍 Location: 5095 Napilihau St, Lahaina<br>
+                🌱 Style: 100% Vegan<br>
+                🕒 Hours: Mon/Tue/Thu-Fri/Sat/Sun: 8am-3:30pm (Closed Wednesdays)<br>
+                📞 Phone: (808) 298-2499<br>
+                ✨ Best for: Quick lunches, healthy meals, great smoothie bowls and plant-based bowls
+            </div>
+
+            <ul>
+                <li><strong>Govinda's Vegetarian Buffet</strong>
+                    <br>• Traditional vegetarian Indian buffet
+                    <br>• Great for families, variety of dishes, affordable all-you-can-eat
+                </li>
+                <li><strong>The Wooden Crate at Lumeria Maui</strong>
+                    <br>• Farm-to-table restaurant with grown-on-site fruits (mango, lilikoi, papaya, avocado)
+                    <br>• Accommodates vegan, paleo, vegetarian, and various dietary needs
+                    <br>• Best for: Dinner with scenic views, romantic setting
+                </li>
+                <li><strong>Earth Aloha Eats</strong>
+                    <br>📍 Location: 1221 HI-30, Lahaina
+                    <br>• Casual vegetarian meals, family-friendly
+                </li>
+            </ul>
+
+            <h3><span class="emoji">👨‍👩‍👧</span> Family-Friendly Options with Great Veggie Choices:</h3>
+            <ul>
+                <li><strong>Leoda's Kitchen and Pie Shop</strong> - Homestyle cooking</li>
+                <li><strong>Duke's Beach House Maui</strong> - Oceanfront dining with good vegetarian options</li>
+                <li><strong>The Plantation House</strong> - Upscale with vegetarian selections</li>
+            </ul>
+
+            <h2 style="margin-top: 40px;">🍹 Local Hawaiian Alcoholic Beverages to Try</h2>
+
+            <div class="recommendation">
+                <strong>1. Ocean Organic Vodka 🥇 Top Recommendation</strong><br>
+                🏭 Made by: Hawaii Sea Spirits Organic Farm & Distillery<br>
+                📍 Location: Kula, Upcountry Maui (short drive from Lahaina)<br>
+                🌊 Unique Feature: Made from organic sugarcane + deep ocean water sourced 3,000 ft below sea level<br>
+                🎟️ Experience: Tours available daily 9:30am-5pm (recommend booking ahead, tiny tasting room)<br>
+                💰 Price: Premium pricing but unique taste experience
+            </div>
+
+            <div class="recommendation">
+                <strong>2. Maui Brewing Company 🍺 Most Accessible</strong><br>
+                🏭 Hawaii's largest craft brewery<br>
+                📍 Location: Restaurant in Lahaina (Kihei production facility)<br>
+                🍻 Popular Beers: Hono Kölsch, Island IPA, Tropical variations with pineapple/passionfruit<br>
+                ✨ Best bet: Easy to find on tap at restaurants across Maui
+            </div>
+
+            <h3>🏪 Where to Buy Local Drinks:</h3>
+            <ul>
+                <li><strong>ABC Stores</strong> throughout Lahaina - carry local beers and rums</li>
+                <li><strong>Maui Liquor Stores</strong> - well-stocked with island products</li>
+                <li>Many resorts/restaurants serve these locally-made beverages</li>
+            </ul>
+
+            <div class="price-box">
+                <h3 style="color: white; margin-top: 0;">🍸 Recommended Orders at Restaurants:</h3>
+                <div class="price-item">
+                    <span>1️⃣ Ask for Maui Brewing Company draft beer</span>
+                    <span>🍺</span>
+                </div>
+                <div class="price-item">
+                    <span>2️⃣ Try cocktails made with Ocean Vodka or Kuleana Rum</span>
+                    <span>🍹</span>
+                </div>
+                <div class="price-item">
+                    <span>3️⃣ Ask bartenders for locally-sourced spirit recommendations</span>
+                    <span>🤙</span>
+                </div>
+            </div>
+
+            <h3 style="margin-top: 30px;"><span class="emoji">💡</span> Quick Tips:</h3>
+            <ul>
+                <li><strong>Lahaina Farmers Markets</strong> - Great for grabbing fresh, vegetarian breakfast/snacks</li>
+                <li>Call ahead for <strong>reservations</strong> at popular spots like The Wooden Crate</li>
+                <li>Most restaurants are happy to <strong>modify dishes</strong> to be vegetarian - just ask!</li>
+            </ul>
+        </div>
+    </div>
+
+    <script>
+        function openTab(evt, tabName) {
+            // Get all tab content elements
+            var tabContents = document.getElementsByClassName("tab-content");
+            
+            // Hide all tab contents by removing active class
+            for (var i = 0; i < tabContents.length; i++) {
+                tabContents[i].classList.remove("active");
+            }
+
+            // Get all tab buttons
+            var tabBtns = document.getElementsByClassName("tab-btn");
+            
+            // Remove active class from all buttons
+            for (var i = 0; i < tabBtns.length; i++) {
+                tabBtns[i].classList.remove("active");
+            }
+
+            // Show the clicked tab by adding active class
+            document.getElementById(tabName).classList.add("active");
+            
+            // Add active class to the clicked button
+            evt.currentTarget.classList.add("active");
+        }
+    </script>
+</body>
+</html>

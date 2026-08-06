@@ -1,4 +1,5 @@
 <script lang="ts">
+  import BrandMark from './BrandMark.svelte';
   import { filterRailItems, type RailGroup, type RailItem, type WorkbenchSelection } from './workbench-state';
 
   export let items: RailItem[] = [];
@@ -28,7 +29,7 @@
 </script>
 
 <aside class:mobile-open={mobileOpen} class="workbench-rail" aria-label="Tasks and chats">
-  <div class="rail-heading"><div><span class="mark">A</span><strong>AdaptiveAgent</strong></div><button class="rail-close" aria-label="Close navigation" on:click={onclose}>×</button></div>
+  <div class="rail-heading"><div><BrandMark /><strong>AdaptiveAgent</strong></div><button class="rail-close" aria-label="Close navigation" on:click={onclose}>×</button></div>
   <nav class="primary-nav" aria-label="Primary"><button class:active={selection.kind==='new-task'||selection.kind==='new-chat'} on:click={onnewtask}>＋ <span>Create</span></button><a href="#recent-runs">Runs</a><button class:active={selection.kind==='artifacts'} on:click={onartifacts}>Artifacts</button></nav>
   <div class="slot-meter"><span>{occupied}/{capacity} slots</span><progress max={capacity} value={occupied}></progress></div>
   <label class="rail-search">
