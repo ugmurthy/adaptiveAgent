@@ -33,7 +33,7 @@ export function extractResultArtifacts(value: unknown): ResultArtifact[] {
     });
   }
   if (typeof unwrapped !== 'string') return [];
-  const matches = unwrapped.match(/(?:^|[\s`'"(])([\w./-]+\.(?:pdf|csv|json|md|txt|png|jpe?g|svg|html|docx?|xlsx?|zip))(?:$|[\s`'"),.:;])/g) ?? [];
+  const matches = unwrapped.match(/(?:^|[\s`'"(])([\w./-]+\.(?:pdf|csv|json|md|markdown|txt|log|xml|ya?ml|png|jpe?g|gif|webp|bmp|svg|html|docx?|xlsx?|zip|mp4|webm|mov|m4v|ogv))(?:$|[\s`'"),.:;])/g) ?? [];
   return [...new Set(matches.map((match) => match.trim().replace(/^[`'"(]|[`'"),.:;]$/g, '')))].map((path) => ({ path }));
 }
 

@@ -10,7 +10,7 @@ describe('workbench UX decisions', () => {
   });
   it('extracts only recognizable structured or textual artifacts', () => {
     expect(extractResultArtifacts({ files: [{ path: 'out/report.pdf', type: 'PDF' }, 'data.csv'] })).toEqual([{ path: 'out/report.pdf', detail: 'PDF' }, { path: 'data.csv' }]);
-    expect(extractResultArtifacts('Saved `notes.md` and image.png.')).toEqual([{ path: 'notes.md' }, { path: 'image.png' }]);
+    expect(extractResultArtifacts('Saved `notes.md`, image.png, and demo.webm.')).toEqual([{ path: 'notes.md' }, { path: 'image.png' }, { path: 'demo.webm' }]);
     expect(extractResultArtifacts('A prose-only answer.')).toEqual([]);
   });
   it('promotes a structured report summary without hiding the full export payload', () => {

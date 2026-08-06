@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 mod registry;
@@ -148,6 +149,15 @@ struct DeletionPreview {
 #[derive(Serialize)]
 struct WorkspaceArtifact {
     path: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ArtifactPreview {
+    name: String,
+    kind: &'static str,
+    mime_type: &'static str,
+    content: String,
 }
 
 struct Bridge {
@@ -2867,9 +2877,12 @@ fn get_run_overview(run_id: String, state: tauri::State<'_, AppState>) -> Result
 }
 
 const ARTIFACT_EXTENSIONS: &[&str] = &[
-    "pdf", "csv", "json", "md", "txt", "png", "jpg", "jpeg", "svg", "html", "doc", "docx", "xls",
-    "xlsx", "zip",
+    "pdf", "csv", "json", "md", "markdown", "txt", "log", "xml", "yaml", "yml", "png", "jpg",
+    "jpeg", "svg", "html", "doc", "docx", "xls", "xlsx", "zip", "gif", "webp", "bmp", "mp4",
+    "webm", "mov", "m4v", "ogv",
 ];
+const MAX_TEXT_PREVIEW_BYTES: u64 = 5 * 1024 * 1024;
+const MAX_MEDIA_PREVIEW_BYTES: u64 = 32 * 1024 * 1024;
 
 fn workspace_paths(state: &tauri::State<'_, AppState>) -> Result<(PathBuf, PathBuf), String> {
     let bridge = state
@@ -2975,62 +2988,74 @@ fn list_workspace_artifacts(
     Ok(artifacts)
 }
 
-fn launch_artifact(path: &Path, reveal: bool) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = std::process::Command::new("open");
-        if reveal {
-            command.arg("-R");
-        }
-        command.arg(path);
-        command
-    };
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = std::process::Command::new("explorer");
-        if reveal {
-            command.arg(format!("/select,{}", path.display()));
-        } else {
-            command.arg(path);
-        }
-        command
-    };
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let mut command = {
-        let mut command = std::process::Command::new("xdg-open");
-        command.arg(if reveal {
-            path.parent().unwrap_or(path)
-        } else {
-            path
-        });
-        command
-    };
-    command
-        .spawn()
-        .map(|_| ())
-        .map_err(|_| "Unable to launch the platform file manager.".into())
-}
-
 #[tauri::command]
-fn open_artifact(path: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn read_artifact(
+    path: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<ArtifactPreview, String> {
     let (root, shell_cwd) = workspace_paths(&state)?;
-    launch_artifact(&resolve_artifact_path(&root, &shell_cwd, &path)?, false)
+    let path = resolve_artifact_path(&root, &shell_cwd, &path)?;
+    tauri::async_runtime::spawn_blocking(move || artifact_preview(&path))
+        .await
+        .map_err(|_| "Artifact preview could not be prepared.".to_string())?
 }
 
-#[tauri::command]
-fn reveal_artifact(path: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let (root, shell_cwd) = workspace_paths(&state)?;
-    launch_artifact(&resolve_artifact_path(&root, &shell_cwd, &path)?, true)
-}
-
-#[tauri::command]
-fn artifact_reveal_label() -> &'static str {
-    #[cfg(target_os = "macos")]
-    return "Show in Finder";
-    #[cfg(target_os = "windows")]
-    return "Show in File Explorer";
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    return "Show in File Manager";
+fn artifact_preview(path: &Path) -> Result<ArtifactPreview, String> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .ok_or("This artifact type cannot be previewed.")?;
+    let (kind, mime_type, binary) = match extension.as_str() {
+        "md" | "markdown" => ("markdown", "text/markdown", false),
+        "json" => ("json", "application/json", false),
+        "txt" | "csv" | "html" | "log" | "xml" | "yaml" | "yml" => ("text", "text/plain", false),
+        "png" => ("image", "image/png", true),
+        "jpg" | "jpeg" => ("image", "image/jpeg", true),
+        "gif" => ("image", "image/gif", true),
+        "webp" => ("image", "image/webp", true),
+        "bmp" => ("image", "image/bmp", true),
+        "svg" => ("image", "image/svg+xml", true),
+        "mp4" | "m4v" => ("video", "video/mp4", true),
+        "webm" => ("video", "video/webm", true),
+        "mov" => ("video", "video/quicktime", true),
+        "ogv" => ("video", "video/ogg", true),
+        _ => return Err("This artifact type cannot be previewed in the app.".into()),
+    };
+    let max_size = if binary {
+        MAX_MEDIA_PREVIEW_BYTES
+    } else {
+        MAX_TEXT_PREVIEW_BYTES
+    };
+    if path
+        .metadata()
+        .map_err(|_| "Artifact file was not found.")?
+        .len()
+        > max_size
+    {
+        return Err(if binary {
+            "Media preview is limited to 32 MiB."
+        } else {
+            "Text preview is limited to 5 MiB."
+        }
+        .into());
+    }
+    let bytes = std::fs::read(path).map_err(|_| "Artifact file could not be read.")?;
+    let content = if binary {
+        BASE64.encode(bytes)
+    } else {
+        String::from_utf8(bytes).map_err(|_| "Artifact is not valid UTF-8 text.")?
+    };
+    Ok(ArtifactPreview {
+        name: path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("Artifact")
+            .to_owned(),
+        kind,
+        mime_type,
+        content,
+    })
 }
 
 #[tauri::command]
@@ -3288,9 +3313,7 @@ pub fn run() {
             get_run_result,
             get_run_overview,
             list_workspace_artifacts,
-            open_artifact,
-            reveal_artifact,
-            artifact_reveal_label,
+            read_artifact,
             resolve_approval,
             create_chat,
             list_chats,
@@ -3996,6 +4019,15 @@ mod tests {
         collect_workspace_artifacts(workspace.path(), &mut artifacts);
         assert_eq!(artifacts.len(), 1);
         assert!(artifacts[0].path.ends_with("report.md"));
+        let preview = artifact_preview(&nested.join("report.md")).unwrap();
+        assert_eq!(preview.kind, "markdown");
+        assert_eq!(preview.mime_type, "text/markdown");
+        assert_eq!(preview.content, "report");
+        std::fs::write(nested.join("image.png"), [1, 2]).unwrap();
+        let image = artifact_preview(&nested.join("image.png")).unwrap();
+        assert_eq!(image.kind, "image");
+        assert_eq!(image.mime_type, "image/png");
+        assert_eq!(image.content, "AQI=");
         assert_eq!(
             resolve_artifact_path(workspace.path(), workspace.path(), "output/report.md").unwrap(),
             nested.join("report.md").canonicalize().unwrap()

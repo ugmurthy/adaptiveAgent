@@ -34,6 +34,7 @@ export interface Chat { itemId:string; title:string; createdAt:string; sessionId
 export type ProductDeletionTarget = {kind:'item';itemId:string}|{kind:'run';runId:string}|{kind:'chat-turn';itemId:string;ordinal:number};
 export interface DeletionPreview { target:ProductDeletionTarget; label:string; runCount:number; planCount:number; occupied:boolean; warning:string; }
 export interface WorkspaceArtifact { path:string; }
+export interface ArtifactPreview { name:string; kind:'text'|'markdown'|'json'|'image'|'video'; mimeType:string; content:string; }
 
 export interface TracePrivacy { messages:boolean; reasoning:boolean; rawToolPayloads:boolean; }
 export interface TraceReport {
@@ -72,9 +73,7 @@ export const sendChatTurn = (itemId:string,content:string) => invoke<StartedRun>
 export const previewHistoryDeletion = (target:ProductDeletionTarget) => invoke<DeletionPreview>('preview_history_deletion',{target});
 export const deleteHistory = (target:ProductDeletionTarget) => invoke<void>('delete_history',{target});
 export const listWorkspaceArtifacts = () => invoke<WorkspaceArtifact[]>('list_workspace_artifacts');
-export const openArtifact = (path:string) => invoke<void>('open_artifact',{path});
-export const revealArtifact = (path:string) => invoke<void>('reveal_artifact',{path});
-export const getArtifactRevealLabel = () => invoke<string>('artifact_reveal_label');
+export const readArtifact = (path:string) => invoke<ArtifactPreview>('read_artifact',{path});
 export const selectTrace = (rootRunId?:string) => invoke<number>('select_trace',{rootRunId});
 export const getTracePrivacy = () => invoke<TracePrivacy>('get_trace_privacy');
 export const setTracePrivacy = (privacy:TracePrivacy) => invoke<TracePrivacy>('set_trace_privacy',{privacy});

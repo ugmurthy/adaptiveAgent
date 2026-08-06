@@ -43,9 +43,9 @@ events. No shell capability or generic JSON-RPC command is granted to the webvie
   continuation is not exposed as a desktop recovery control.
 - **Results:** Run artifacts are inferred from structured `files`/`artifacts` arrays or
   recognizable filenames in the result. The workspace artifact library scans the configured
-  workspace for the same recognized file types. Both views can open files or reveal them in
-  the platform file manager. Export downloads either the privacy-projected Inspector Overview
-  as JSON or the final displayed result as Markdown.
+  workspace for the same recognized file types. Clicking a filename opens a confined in-app
+  preview for text, Markdown, JSON, images, and supported videos. Export downloads either the
+  privacy-projected Inspector Overview as JSON or the final displayed result as Markdown.
 - **Search:** history search covers task titles and chat titles/messages already loaded
   by the desktop app; it is not a backend-wide or file-content search. Saved items are not
   modeled or shown.
