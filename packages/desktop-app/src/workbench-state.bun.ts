@@ -3,7 +3,7 @@ import type { Chat, RunSummary } from './desktop';
 import { buildRailItems, filterRailItems } from './workbench-state';
 
 function run(overrides: Partial<RunSummary> = {}): RunSummary {
-  return { itemId:'task',runId:'run',title:'Task',createdAt:'100',invocationKind:'run',status:'succeeded',cancelRequested:false,occupiesSlot:false,steerable:false,...overrides };
+  return { itemId:'task',runId:'run',title:'Task',createdAt:'100',invocationKind:'run',status:'succeeded',cancelRequested:false,occupiesSlot:false,steerable:false,artifactsAvailable:true,...overrides };
 }
 
 describe('workbench rail grouping', () => {

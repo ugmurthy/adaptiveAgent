@@ -88,6 +88,7 @@ export interface RuntimeInitializeParams {
 }
 
 export interface EditableDesktopSettings {
+  agent: { configPath?: string; id: string };
   inference: { mode: InferenceMode; tier: InferenceTier };
   workspace: { root: string; shellCwd: string };
   interaction: { approvalMode: ApprovalMode; clarificationMode: ClarificationMode };
@@ -315,6 +316,10 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
       const request = requiredParams(method, params);
       requiredObject(request, 'settings');
       const settings = request.settings as Record<string, unknown>;
+      requiredObject(settings, 'agent');
+      const agent = settings.agent as Record<string, unknown>;
+      optionalStringAllowEmpty(agent, 'configPath');
+      requiredString(agent, 'id');
       requiredObject(settings, 'inference');
       const inference = settings.inference as Record<string, unknown>;
       optionalEnum(inference, 'mode', ['gateway', 'local', 'byok']);

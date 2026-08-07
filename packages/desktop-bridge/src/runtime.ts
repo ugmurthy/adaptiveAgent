@@ -1,6 +1,6 @@
 import {
   AgentSdk,
-  loadAgentSdkConfig,
+  inspectAgentSdkResolution,
   resolveRuntimeTarget,
   type AgentSdkOptions,
   type AgentSettingsFile,
@@ -64,7 +64,7 @@ export interface CliExecutor {
 }
 
 export interface SafeResolvedConfiguration {
-  agent: { id: string; name: string; configurationFingerprint: string; description?: string; defaultInvocationMode: string };
+  agent: { id: string; configPath?: string; name: string; configurationFingerprint: string; description?: string; defaultInvocationMode: string };
   model: { provider: string; model: string; credentialAvailable: boolean };
   inference: { mode: string; tier: string };
   runtime: { mode: string; sqlitePath?: string };
@@ -457,8 +457,8 @@ export class DesktopRuntime {
     try {
       const current = await readSettingsFile(this.settingsPath);
       const updated = updateDesktopSettings(current, settings);
-      const config = await loadAgentSdkConfig({ cwd: this.settingsCwd, settingsConfig: updated });
-      validateRestrictedDesktopConfiguration(config);
+      const inspection = await inspectAgentSdkResolution({ cwd: this.settingsCwd, settingsConfig: updated });
+      validateRestrictedDesktopConfiguration(inspection.config);
       await atomicWriteJson(this.settingsPath, updated);
       return { saved: true };
     } finally {
@@ -624,6 +624,11 @@ export function updateDesktopSettings(
 ): AgentSettingsFile {
   return {
     ...current,
+    agent: {
+      ...current.agent,
+      ...(settings.agent.configPath?.trim() ? { configPath: settings.agent.configPath.trim() } : { configPath: undefined }),
+      id: settings.agent.id.trim(),
+    },
     inference: { ...current.inference, ...settings.inference },
     workspace: {
       ...current.workspace,
@@ -638,6 +643,7 @@ export function safeResolvedConfiguration(config: ResolvedAgentSdkConfig): SafeR
   return {
     agent: {
       id: config.agent.id,
+      ...(config.settings?.agent?.configPath ? { configPath: config.settings.agent.configPath } : {}),
       name: config.agent.name,
       configurationFingerprint: agentConfigurationFingerprint(config),
       ...(config.agent.description ? { description: config.agent.description } : {}),

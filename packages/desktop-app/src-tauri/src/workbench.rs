@@ -29,6 +29,9 @@ create table deletion_jobs (id text primary key, item_id text, root_run_id text,
 ) ,(
     7,
     "create table run_recovery_operations (run_id text primary key references workbench_runs(run_id) on delete cascade, requested_action text not null check(requested_action in ('resume','retry')), baseline_event_seq integer not null, updated_at text not null);",
+), (
+    8,
+    "alter table workbench_runs add column workspace_root text; alter table workbench_runs add column shell_cwd text;",
 )];
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -84,6 +87,8 @@ pub struct Reservation {
     pub submission_state: String,
     pub cancel_requested: bool,
     pub interrupt_pending: bool,
+    pub workspace_root: Option<String>,
+    pub shell_cwd: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -168,7 +173,7 @@ impl WorkbenchDb {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         tx.execute("insert into workbench_items(id,kind,title,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,created_at,updated_at) values(?1,'task',?2,?3,?4,?5,?6,?7,?7)", params![reservation.item_id,reservation.title,reservation.session_id,reservation.agent_id,reservation.agent_name,reservation.agent_fingerprint,reservation.created_at]).map_err(|e| e.to_string())?;
-        tx.execute("insert into workbench_runs(run_id,item_id,invocation_kind,cached_status,submission_state,created_at,updated_at) values(?1,?2,?3,?4,?5,?6,?6)", params![reservation.run_id,reservation.item_id,reservation.invocation_kind,reservation.cached_status,reservation.submission_state,reservation.created_at]).map_err(|e| e.to_string())?;
+        tx.execute("insert into workbench_runs(run_id,item_id,invocation_kind,cached_status,submission_state,created_at,updated_at,workspace_root,shell_cwd) values(?1,?2,?3,?4,?5,?6,?6,?7,?8)", params![reservation.run_id,reservation.item_id,reservation.invocation_kind,reservation.cached_status,reservation.submission_state,reservation.created_at,reservation.workspace_root,reservation.shell_cwd]).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -732,7 +737,7 @@ impl WorkbenchDb {
 
     pub fn load_runs(&self) -> Result<Vec<Reservation>, String> {
         let connection = self.connection.lock().unwrap();
-        let mut statement = connection.prepare("select i.id,r.run_id,i.title,i.created_at,i.session_id,i.pinned_agent_id,i.pinned_agent_name,i.pinned_agent_fingerprint,r.invocation_kind,r.cached_status,r.submission_state,r.cancel_requested,r.interrupt_pending from workbench_runs r join workbench_items i on i.id=r.item_id order by r.created_at,r.run_id").map_err(|e| e.to_string())?;
+        let mut statement = connection.prepare("select i.id,r.run_id,i.title,i.created_at,i.session_id,i.pinned_agent_id,i.pinned_agent_name,i.pinned_agent_fingerprint,r.invocation_kind,r.cached_status,r.submission_state,r.cancel_requested,r.interrupt_pending,r.workspace_root,r.shell_cwd from workbench_runs r join workbench_items i on i.id=r.item_id order by r.created_at,r.run_id").map_err(|e| e.to_string())?;
         let rows = statement
             .query_map([], |r| {
                 Ok(Reservation {
@@ -749,6 +754,8 @@ impl WorkbenchDb {
                     submission_state: r.get(10)?,
                     cancel_requested: r.get(11)?,
                     interrupt_pending: r.get(12)?,
+                    workspace_root: r.get(13)?,
+                    shell_cwd: r.get(14)?,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -903,6 +910,8 @@ mod tests {
             submission_state: "reserved".into(),
             cancel_requested: false,
             interrupt_pending: false,
+            workspace_root: Some("/workspace".into()),
+            shell_cwd: Some("/workspace/project".into()),
         }
     }
     #[test]

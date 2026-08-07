@@ -11,6 +11,7 @@
   $: if (desktop.configuration && desktop.configuration !== loadedConfiguration) {
     loadedConfiguration = desktop.configuration;
     settings = {
+      agent: { configPath: desktop.configuration.agent.configPath ?? '', id: desktop.configuration.agent.id },
       inference: {
         mode: desktop.configuration.inference.mode as EditableDesktopSettings['inference']['mode'],
         tier: desktop.configuration.inference.tier as EditableDesktopSettings['inference']['tier'],
@@ -50,6 +51,9 @@
         <span>Credential</span><strong>{desktop.configuration.model.credentialAvailable ? 'Available' : 'Unavailable'}</strong><small>value never exposed</small>
       </div>
       <div class="settings-grid">
+        <label class="settings-wide"><span>Agent config path</span><input bind:value={settings.agent.configPath} disabled={pending} /></label>
+        <label class="settings-wide"><span>Agent ID</span><input required bind:value={settings.agent.id} disabled={pending} /></label>
+        <label><span>Inference mode</span><select bind:value={settings.inference.mode} disabled={pending}><option value="byok">BYOK</option><option value="local">Local</option><option value="gateway">Gateway</option></select></label>
         <label><span>Inference tier</span><select bind:value={settings.inference.tier} disabled={pending}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xtra-high">Extra high</option></select></label>
         <label><span>Approval mode</span><select bind:value={settings.interaction.approvalMode} disabled={pending}><option value="auto">Auto</option><option value="manual">Manual</option><option value="reject">Reject</option></select></label>
         <label class="settings-wide"><span>Workspace root</span><input required bind:value={settings.workspace.root} disabled={pending} /></label>
