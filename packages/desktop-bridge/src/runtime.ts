@@ -1,4 +1,11 @@
-import { AgentSdk, type AgentSdkOptions, type ResolvedAgentSdkConfig } from '@adaptive-agent/agent-sdk';
+import {
+  AgentSdk,
+  loadAgentSdkConfig,
+  resolveRuntimeTarget,
+  type AgentSdkOptions,
+  type AgentSettingsFile,
+  type ResolvedAgentSdkConfig,
+} from '@adaptive-agent/agent-sdk';
 import {
   ADAPTIVE_AGENT_CLI_COMMANDS,
   ADAPTIVE_AGENT_CLI_SUBCOMMANDS,
@@ -8,6 +15,8 @@ import {
 } from '@adaptive-agent/agent-sdk/cli';
 import type { AgentEvent, JsonValue, UUID } from '@adaptive-agent/core';
 import { createHash } from 'node:crypto';
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
 import {
   GatewayClient,
   type InferenceMode,
@@ -27,6 +36,7 @@ import {
   type DesktopMessage,
   type DesktopProtocolVersion,
   type DesktopRpcRequest,
+  type EditableDesktopSettings,
   type JsonRpcId,
   type RuntimeInitializeParams,
 } from './protocol.js';
@@ -87,6 +97,9 @@ export class DesktopRuntime {
   private gatewayClient: GatewayClient | undefined;
   private executionSelection: { inferenceMode: InferenceMode; inferenceTier: InferenceTier; profileRef?: ProfileRef } | undefined;
   private configurationDriven = false;
+  private settingsPath: string | undefined;
+  private settingsCwd = process.cwd();
+  private settingsUpdateInProgress = false;
 
   constructor(
     private readonly write: DesktopMessageWriter,
@@ -117,7 +130,8 @@ export class DesktopRuntime {
     if (this.negotiatedProtocolVersion === '1.10' && request.method === 'auth/updateAccessToken') {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', 'auth/updateAccessToken requires desktop protocol 1.11.', JSON_RPC_ERROR_CODES.methodNotFound);
     }
-    if (this.negotiatedProtocolVersion !== DESKTOP_PROTOCOL_VERSION && request.method.startsWith('history/')) {
+    if (this.negotiatedProtocolVersion !== DESKTOP_PROTOCOL_VERSION
+      && (request.method.startsWith('history/') || request.method === 'settings/update')) {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', `${request.method} requires desktop protocol 1.12.`, JSON_RPC_ERROR_CODES.methodNotFound);
     }
 
@@ -129,6 +143,8 @@ export class DesktopRuntime {
       case 'runtime/shutdown':
         await this.close();
         return { shutdown: true };
+      case 'settings/update':
+        return this.updateSettings(request.params!.settings);
       case 'auth/updateAccessToken':
         this.accessToken = request.params!.accessToken;
         await this.gatewayClient?.reconnect();
@@ -370,6 +386,12 @@ export class DesktopRuntime {
     const initialization = AgentSdk.create(options);
     this.sdkInitialization = initialization;
     try {
+      this.settingsCwd = params.cwd ?? process.cwd();
+      const runtimeTarget = await resolveRuntimeTarget({
+        cwd: this.settingsCwd,
+        ...(params.settingsConfigPath ? { settingsPath: params.settingsConfigPath } : {}),
+      });
+      this.settingsPath = runtimeTarget.settingsPath ?? resolve(this.settingsCwd, 'agent.settings.json');
       const sdk = await initialization;
       if (params.configurationDriven) {
         try {
@@ -413,6 +435,34 @@ export class DesktopRuntime {
       throw error;
     } finally {
       this.sdkInitialization = undefined;
+    }
+  }
+
+  private async updateSettings(settings: EditableDesktopSettings): Promise<JsonValue> {
+    if (!this.configurationDriven || !this.sdk || !this.settingsPath) {
+      throw new DesktopProtocolError(
+        'COMMAND_REJECTED',
+        'Settings can only be updated after configuration-driven runtime initialization.',
+        JSON_RPC_ERROR_CODES.commandRejected,
+      );
+    }
+    if (this.settingsUpdateInProgress) {
+      throw new DesktopProtocolError(
+        'COMMAND_REJECTED',
+        'A settings update is already in progress.',
+        JSON_RPC_ERROR_CODES.commandRejected,
+      );
+    }
+    this.settingsUpdateInProgress = true;
+    try {
+      const current = await readSettingsFile(this.settingsPath);
+      const updated = updateDesktopSettings(current, settings);
+      const config = await loadAgentSdkConfig({ cwd: this.settingsCwd, settingsConfig: updated });
+      validateRestrictedDesktopConfiguration(config);
+      await atomicWriteJson(this.settingsPath, updated);
+      return { saved: true };
+    } finally {
+      this.settingsUpdateInProgress = false;
     }
   }
 
@@ -568,6 +618,22 @@ export class DesktopRuntime {
   }
 }
 
+export function updateDesktopSettings(
+  current: AgentSettingsFile,
+  settings: EditableDesktopSettings,
+): AgentSettingsFile {
+  return {
+    ...current,
+    inference: { ...current.inference, ...settings.inference },
+    workspace: {
+      ...current.workspace,
+      overrideRoot: settings.workspace.root.trim(),
+      overrideShellCwd: settings.workspace.shellCwd.trim(),
+    },
+    interaction: { ...current.interaction, ...settings.interaction },
+  };
+}
+
 export function safeResolvedConfiguration(config: ResolvedAgentSdkConfig): SafeResolvedConfiguration {
   return {
     agent: {
@@ -667,6 +733,39 @@ function omitSecrets(value: unknown): unknown {
   return Object.fromEntries(Object.entries(value as Record<string, unknown>)
     .filter(([key]) => !/(api[-_]?key|access[-_]?token|credential|password|secret)/i.test(key))
     .map(([key, child]) => [key, omitSecrets(child)]));
+}
+
+async function readSettingsFile(path: string): Promise<AgentSettingsFile> {
+  try {
+    const value = JSON.parse(await readFile(path, 'utf8')) as unknown;
+    if (!value || Array.isArray(value) || typeof value !== 'object') {
+      throw new Error('settings root must be an object');
+    }
+    return value as AgentSettingsFile;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {};
+    throw new DesktopProtocolError(
+      'COMMAND_FAILED',
+      `Unable to read agent settings: ${safeErrorMessage(error)}`,
+      JSON_RPC_ERROR_CODES.commandFailed,
+    );
+  }
+}
+
+async function atomicWriteJson(path: string, value: AgentSettingsFile): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    await rename(temporary, path);
+  } catch (error) {
+    await unlink(temporary).catch(() => undefined);
+    throw new DesktopProtocolError(
+      'COMMAND_FAILED',
+      `Unable to save agent settings: ${safeErrorMessage(error)}`,
+      JSON_RPC_ERROR_CODES.commandFailed,
+    );
+  }
 }
 
 function asRunId(runId: string): UUID {

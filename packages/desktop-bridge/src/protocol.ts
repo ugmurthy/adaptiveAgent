@@ -87,6 +87,16 @@ export interface RuntimeInitializeParams {
   requireRunPermit?: boolean;
 }
 
+export interface EditableDesktopSettings {
+  inference: { mode: InferenceMode; tier: InferenceTier };
+  workspace: { root: string; shellCwd: string };
+  interaction: { approvalMode: ApprovalMode; clarificationMode: ClarificationMode };
+}
+
+export interface SettingsUpdateParams {
+  settings: EditableDesktopSettings;
+}
+
 export interface InitializeParams {
   protocolVersion: string;
   clientInfo: DesktopClientInfo;
@@ -164,6 +174,7 @@ export type DesktopRpcRequest =
   | RpcRequest<'runtime/initialize', RuntimeInitializeParams>
   | RpcRequestWithoutParams<'runtime/info'>
   | RpcRequestWithoutParams<'runtime/shutdown'>
+  | RpcRequest<'settings/update', SettingsUpdateParams>
   | RpcRequest<'auth/updateAccessToken', UpdateAccessTokenParams>
   | RpcRequest<'agent/run', RunParams>
   | RpcRequest<'agent/chat', ChatParams>
@@ -187,6 +198,7 @@ export const DESKTOP_RPC_METHODS = [
   'runtime/initialize',
   'runtime/info',
   'runtime/shutdown',
+  'settings/update',
   'auth/updateAccessToken',
   'agent/run',
   'agent/chat',
@@ -299,6 +311,28 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
     case 'runtime/initialize':
       validateRuntimeInitializeParams(params ?? {});
       return;
+    case 'settings/update': {
+      const request = requiredParams(method, params);
+      requiredObject(request, 'settings');
+      const settings = request.settings as Record<string, unknown>;
+      requiredObject(settings, 'inference');
+      const inference = settings.inference as Record<string, unknown>;
+      optionalEnum(inference, 'mode', ['gateway', 'local', 'byok']);
+      if (inference.mode === undefined) invalidParams('settings.inference.mode is required.');
+      optionalEnum(inference, 'tier', ['low', 'medium', 'high', 'xtra-high']);
+      if (inference.tier === undefined) invalidParams('settings.inference.tier is required.');
+      requiredObject(settings, 'workspace');
+      const workspace = settings.workspace as Record<string, unknown>;
+      requiredString(workspace, 'root');
+      requiredString(workspace, 'shellCwd');
+      requiredObject(settings, 'interaction');
+      const interaction = settings.interaction as Record<string, unknown>;
+      optionalEnum(interaction, 'approvalMode', ['auto', 'manual', 'reject']);
+      if (interaction.approvalMode === undefined) invalidParams('settings.interaction.approvalMode is required.');
+      optionalEnum(interaction, 'clarificationMode', ['interactive', 'fail']);
+      if (interaction.clarificationMode === undefined) invalidParams('settings.interaction.clarificationMode is required.');
+      return;
+    }
     case 'agent/run': {
       const value = requiredParams(method, params);
       requiredString(value, 'runId');

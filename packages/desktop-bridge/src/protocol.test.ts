@@ -135,6 +135,20 @@ describe('desktop bridge protocol', () => {
     }))).toThrowError(expect.objectContaining<Partial<DesktopProtocolError>>({ code: 'INVALID_PARAMS' }));
   });
 
+  it('accepts only complete editable desktop settings', () => {
+    const settings = {
+      inference: { mode: 'byok', tier: 'medium' },
+      workspace: { root: '/workspace', shellCwd: '/workspace/project' },
+      interaction: { approvalMode: 'manual', clarificationMode: 'fail' },
+    };
+    expect(parseDesktopRpcRequest(JSON.stringify({
+      jsonrpc: '2.0', id: 'settings', method: 'settings/update', params: { settings },
+    }))).toMatchObject({ method: 'settings/update', params: { settings } });
+    expect(() => parseDesktopRpcRequest(JSON.stringify({
+      jsonrpc: '2.0', id: 'settings', method: 'settings/update', params: { settings: { ...settings, workspace: { root: '', shellCwd: '/workspace' } } },
+    }))).toThrowError(expect.objectContaining<Partial<DesktopProtocolError>>({ code: 'INVALID_PARAMS' }));
+  });
+
   it('requires the composite approval identity', () => {
     const envelope = (params: object) => JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'interaction/resolveApproval', params });
     expect(parseDesktopRpcRequest(envelope({ runId: 'child', approvalId: 'child:call', approved: true }))).toMatchObject({ method: 'interaction/resolveApproval' });

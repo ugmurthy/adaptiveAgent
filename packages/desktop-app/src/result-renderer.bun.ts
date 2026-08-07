@@ -79,6 +79,16 @@ describe('secure result renderer', () => {
     expect(oversized.html).toContain('<pre>');
   });
 
+  it('syntax-highlights supported fenced code and safely escapes unknown languages', async () => {
+    const render = createResultRenderer(purifier(), { initialize() {}, async render() { return { svg: '<svg></svg>' }; } });
+    const highlighted = await render('```ts\nconst answer: number = 42;\n```');
+    expect(highlighted.html).toContain('class="hljs language-typescript"');
+    expect(highlighted.html).toContain('hljs-keyword');
+    const unknown = await render('```made-up\n<script>alert(1)</script>\n```');
+    expect(unknown.html).toContain('&lt;script&gt;');
+    expect(unknown.html).not.toContain('<script>');
+  });
+
   it('rejects active protocols and external references from SVG', () => {
     expect(sanitizeSvg(purifier(), '<svg><a href="javascript:alert(1)"><text>x</text></a><use href="https://example.com/x.svg#x"/></svg>'))
       .not.toMatch(/javascript|https|<a|<use/i);

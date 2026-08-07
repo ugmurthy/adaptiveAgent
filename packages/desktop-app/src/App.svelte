@@ -24,6 +24,7 @@
     quitTerminate,
     quitWait,
     reloadSettings,
+    saveSettings,
     recoverRun,
     resolveApproval,
     selectTrace,
@@ -74,6 +75,7 @@
   let resultsByRun: Record<string, { result?: unknown; error?: string }> = {};
   let finalValue: unknown;
   let finalError = '';
+  let settingsError = '';
   let startPending = false;
   let controlPending = false;
   let deletionPending = false;
@@ -466,9 +468,17 @@
 
   async function reload() {
     controlPending = true;
-    finalError = '';
+    settingsError = '';
     try { desktop = await reloadSettings(); }
-    catch (error) { finalError = String(error); }
+    catch (error) { settingsError = String(error); }
+    controlPending = false;
+  }
+
+  async function save(settings: import('./desktop').EditableDesktopSettings) {
+    controlPending = true;
+    settingsError = '';
+    try { desktop = await saveSettings(settings); }
+    catch (error) { settingsError = String(error); }
     controlPending = false;
   }
 
@@ -655,7 +665,7 @@
           onshowtitle={(kind, title) => { titlePreview = { kind, title }; }}
         />
       {:else if $workbenchSelection.kind === 'settings'}
-        <SettingsPanel {desktop} pending={controlPending} onreload={reload} />
+        <SettingsPanel {desktop} pending={controlPending} error={settingsError} onreload={reload} onsave={save} />
       {:else if $workbenchSelection.kind === 'artifacts'}
         <section class="center-card">
           <div class="view-heading">

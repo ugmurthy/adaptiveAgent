@@ -11,6 +11,12 @@ export interface ResolvedConfiguration {
   interaction: { approvalMode: string; clarificationMode: string };
 }
 
+export interface EditableDesktopSettings {
+  inference: { mode: 'byok' | 'local' | 'gateway'; tier: 'low' | 'medium' | 'high' | 'xtra-high' };
+  workspace: { root: string; shellCwd: string };
+  interaction: { approvalMode: 'auto' | 'manual' | 'reject'; clarificationMode: 'interactive' | 'fail' };
+}
+
 export interface DesktopState {
   status: 'starting' | 'ready' | 'running' | 'stopping' | 'error';
   configurationValid: boolean;
@@ -54,6 +60,7 @@ export interface RunFinishedEvent { runId: string; result?: unknown; error?: str
 
 export const getDesktopState = () => invoke<DesktopState>('desktop_state');
 export const reloadSettings = () => invoke<DesktopState>('reload_settings');
+export const saveSettings = (settings: EditableDesktopSettings) => invoke<DesktopState>('save_settings', { settings });
 export const startRun = (task: string) => invoke<StartedRun>('start_run', { task });
 export const stopRun = (runId: string) => invoke<void>('stop_run', { runId });
 export const getRunRecoveryPlan = (runId:string) => invoke<RunRecoveryPlan>('get_run_recovery_plan',{runId});

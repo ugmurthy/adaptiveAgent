@@ -4,7 +4,7 @@ import { ADAPTIVE_AGENT_CLI_COMMANDS } from '@adaptive-agent/agent-sdk/cli';
 import type { ResolvedAgentSdkConfig } from '@adaptive-agent/agent-sdk';
 
 import { JSON_RPC_ERROR_CODES, type DesktopMessage, type DesktopRpcRequest } from './protocol.js';
-import { DesktopRuntime, safeResolvedConfiguration, validateRestrictedDesktopConfiguration, type CliExecutor } from './runtime.js';
+import { DesktopRuntime, safeResolvedConfiguration, updateDesktopSettings, validateRestrictedDesktopConfiguration, type CliExecutor } from './runtime.js';
 
 function request(value: Omit<DesktopRpcRequest, 'jsonrpc'>): DesktopRpcRequest {
   return { jsonrpc: '2.0', ...value } as DesktopRpcRequest;
@@ -27,6 +27,25 @@ async function initialize(runtime: DesktopRuntime): Promise<void> {
 }
 
 describe('desktop runtime protocol', () => {
+  it('updates editable settings without dropping advanced configuration', () => {
+    const updated = updateDesktopSettings(
+      { env: { EXISTING: 'value' }, gateway: { url: 'ws://gateway' }, model: { overrideBaseUrl: 'https://models' } },
+      {
+        inference: { mode: 'byok', tier: 'high' },
+        workspace: { root: ' /workspace ', shellCwd: ' /workspace/project ' },
+        interaction: { approvalMode: 'manual', clarificationMode: 'fail' },
+      },
+    );
+    expect(updated).toMatchObject({
+      env: { EXISTING: 'value' },
+      gateway: { url: 'ws://gateway' },
+      model: { overrideBaseUrl: 'https://models' },
+      inference: { mode: 'byok', tier: 'high' },
+      workspace: { overrideRoot: '/workspace', overrideShellCwd: '/workspace/project' },
+      interaction: { approvalMode: 'manual', clarificationMode: 'fail' },
+    });
+  });
+
   it('projects only allowlisted resolved settings and credential availability', () => {
     const summary = safeResolvedConfiguration({
       agent: { id: 'agent-1', name: 'Researcher', description: 'Finds facts', invocationModes: ['run'], defaultInvocationMode: 'run' },

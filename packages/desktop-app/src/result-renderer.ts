@@ -1,5 +1,25 @@
 import createDOMPurify, { type DOMPurify, type WindowLike } from 'dompurify';
+import hljs from 'highlight.js/lib/core';
+import bash from 'highlight.js/lib/languages/bash';
+import css from 'highlight.js/lib/languages/css';
+import javascript from 'highlight.js/lib/languages/javascript';
+import json from 'highlight.js/lib/languages/json';
+import markdown from 'highlight.js/lib/languages/markdown';
+import python from 'highlight.js/lib/languages/python';
+import sql from 'highlight.js/lib/languages/sql';
+import typescript from 'highlight.js/lib/languages/typescript';
+import xml from 'highlight.js/lib/languages/xml';
 import { marked, Renderer } from 'marked';
+
+hljs.registerLanguage('bash', bash);
+hljs.registerLanguage('css', css);
+hljs.registerLanguage('javascript', javascript);
+hljs.registerLanguage('json', json);
+hljs.registerLanguage('markdown', markdown);
+hljs.registerLanguage('python', python);
+hljs.registerLanguage('sql', sql);
+hljs.registerLanguage('typescript', typescript);
+hljs.registerLanguage('xml', xml);
 
 export const MAX_RESULT_SOURCE_SIZE = 256 * 1024;
 export const MAX_MERMAID_SOURCE_SIZE = 64 * 1024;
@@ -66,7 +86,7 @@ export function createResultRenderer(purifier: DOMPurify, mermaid: MermaidApi) {
     const renderer = new Renderer();
     renderer.code = ({ text, lang }) => {
       if (lang?.trim().toLowerCase() !== 'mermaid') {
-        return `<pre><code>${escapeHtml(text)}</code></pre>`;
+        return highlightedCode(text, lang);
       }
       const index = diagrams.push(text) - 1;
       return `<div data-mermaid-placeholder="${index}"></div>`;
@@ -113,6 +133,20 @@ export function createResultRenderer(purifier: DOMPurify, mermaid: MermaidApi) {
     }
     return { format: resolvedFormat, source, html, warnings };
   };
+}
+
+function highlightedCode(source: string, language?: string): string {
+  const requested = language?.trim().toLowerCase().split(/\s+/)[0];
+  const aliases: Record<string, string> = {
+    cjs: 'javascript', html: 'xml', js: 'javascript', jsx: 'javascript', md: 'markdown',
+    py: 'python', sh: 'bash', shell: 'bash', ts: 'typescript', tsx: 'typescript',
+  };
+  const resolved = requested ? (aliases[requested] ?? requested) : undefined;
+  if (!resolved || !hljs.getLanguage(resolved)) {
+    return `<pre><code>${escapeHtml(source)}</code></pre>`;
+  }
+  const highlighted = hljs.highlight(source, { language: resolved, ignoreIllegals: true }).value;
+  return `<pre><code class="hljs language-${escapeHtml(resolved)}">${highlighted}</code></pre>`;
 }
 
 export function sanitizeHtml(purifier: DOMPurify, html: string): string {

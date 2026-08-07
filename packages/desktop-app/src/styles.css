@@ -8,10 +8,10 @@
 * { box-sizing: border-box; }
 html, body, #app { min-height: 100%; }
 body { margin: 0; min-width: 0; min-height: 100vh; overflow: hidden; background: #081015; }
-button, textarea, input { font: inherit; }
+button, textarea, input, select { font: inherit; }
 button { border: 1px solid #35444d; border-radius: 8px; background: #19252c; color: #e5ecef; padding: 8px 12px; cursor: pointer; }
 button:hover:not(:disabled) { border-color: #59707c; background: #22313a; }
-button:focus-visible, textarea:focus-visible, input:focus-visible { outline: 2px solid #56d6b2; outline-offset: 2px; }
+button:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid #56d6b2; outline-offset: 2px; }
 button:disabled { opacity: .42; cursor: not-allowed; }
 button.primary { border-color: #56d6b2; background: #56d6b2; color: #07120f; font-weight: 750; }
 button.danger { border-color: #87454a; background: #63272c; }
@@ -94,8 +94,9 @@ pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.5 
 .attempt-tabs button.active { border-color: #3d665b; color: #74dfbd; }
 label { display: block; margin-bottom: 8px; font-size: 12px; font-weight: 700; }
 textarea, input { width: 100%; border: 1px solid #35444d; border-radius: 9px; background: #091116; color: #edf4f5; padding: 13px; line-height: 1.5; }
+select { width: 100%; border: 1px solid #35444d; border-radius: 9px; background: #091116; color: #edf4f5; padding: 13px; line-height: 1.5; }
 textarea { min-height: 150px; resize: vertical; }
-textarea:disabled, input:disabled { opacity: .55; }
+textarea:disabled, input:disabled, select:disabled { opacity: .55; }
 .composer-view textarea { min-height: 240px; }
 .segmented { display: inline-flex; margin-bottom: 20px; border: 1px solid #35444d; border-radius: 9px; padding: 3px; }
 .segmented button { border: 0; background: transparent; text-transform: capitalize; }
@@ -176,6 +177,14 @@ textarea:disabled, input:disabled { opacity: .55; }
 .health-grid > div { display: flex; min-width: 0; flex-direction: column; gap: 4px; border: 1px solid #2d3c44; border-radius: 9px; background: #0c151a; padding: 12px; }
 .health-grid span, .health-grid small { color: #71848e; font-size: 10px; }
 .health-grid strong { text-transform: capitalize; }
+.settings-form { display: grid; gap: 20px; }
+.settings-summary { display: grid; grid-template-columns: max-content 1fr; gap: 5px 16px; border-bottom: 1px solid #2d3c44; padding-bottom: 18px; }
+.settings-summary span { color: #71848e; font-size: 11px; }
+.settings-summary small { grid-column: 2; color: #71848e; }
+.settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.settings-grid label { display: grid; gap: 6px; margin: 0; color: #8fa0a8; font-size: 11px; }
+.settings-grid .settings-wide { grid-column: 1 / -1; }
+.settings-form .actions { justify-content: flex-end; }
 dl { display: grid; grid-template-columns: 150px minmax(0, 1fr); margin: 0; }
 dt, dd { margin: 0; border-bottom: 1px solid #26343c; padding: 11px 0; }
 dt { color: #81919b; font-size: 12px; }
@@ -214,6 +223,16 @@ dd small { display: block; margin-top: 3px; }
 .rendered-result > :first-child { margin-top: 0; }
 .rendered-result > :last-child { margin-bottom: 0; }
 .rendered-result pre { padding: 12px; border-radius: 7px; background: #081014; }
+.rendered-result code.hljs { display: block; overflow-x: auto; color: #dce5e8; }
+.rendered-result .hljs-comment, .rendered-result .hljs-quote { color: #71848e; font-style: italic; }
+.rendered-result .hljs-keyword, .rendered-result .hljs-selector-tag, .rendered-result .hljs-literal { color: #d78df0; }
+.rendered-result .hljs-string, .rendered-result .hljs-regexp, .rendered-result .hljs-addition { color: #74dfbd; }
+.rendered-result .hljs-number, .rendered-result .hljs-symbol, .rendered-result .hljs-bullet { color: #e3b354; }
+.rendered-result .hljs-title, .rendered-result .hljs-section, .rendered-result .hljs-selector-id { color: #75bfff; }
+.rendered-result .hljs-built_in, .rendered-result .hljs-type, .rendered-result .hljs-attribute { color: #69d9df; }
+.rendered-result .hljs-variable, .rendered-result .hljs-template-variable, .rendered-result .hljs-params { color: #f0b7bf; }
+.rendered-result .hljs-meta { color: #a9a0e8; }
+.rendered-result .hljs-deletion { color: #ff9ca8; }
 .rendered-result table { width: 100%; border-collapse: collapse; }
 .rendered-result th, .rendered-result td { border: 1px solid #34434a; padding: 7px; text-align: left; }
 .rendered-result a { color: #6ee7c4; }

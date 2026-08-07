@@ -185,9 +185,11 @@ struct Bridge {
 #[derive(Default)]
 struct AppState {
     lifecycle: Mutex<()>,
+    reconfiguring: AtomicBool,
     bridge: Mutex<Option<Arc<Bridge>>>,
     trace: Mutex<Option<Arc<TraceBridge>>>,
     generation: AtomicU64,
+    trace_generation: AtomicU64,
     quit: Mutex<QuitCoordinator>,
     shutdown_started: AtomicBool,
     trace_selection: Mutex<TraceSelection>,
@@ -2209,6 +2211,7 @@ fn replace_bridge(app: &AppHandle) -> Result<Arc<Bridge>, String> {
         return Err("Settings cannot be reloaded while quitting.".into());
     }
     let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let trace_generation = state.trace_generation.fetch_add(1, Ordering::SeqCst) + 1;
     let previous_bridge = state.bridge.lock().unwrap().clone();
     let previous_trace = state.trace.lock().unwrap().clone();
     drop(lifecycle);
@@ -2319,9 +2322,11 @@ fn replace_bridge(app: &AppHandle) -> Result<Arc<Bridge>, String> {
                 if state.shutdown_started.load(Ordering::SeqCst)
                     || state.quit.lock().unwrap().state() != QuitState::Idle
                     || state.generation.load(Ordering::SeqCst) != generation
+                    || state.trace_generation.load(Ordering::SeqCst) != trace_generation
                 {
                     return;
                 }
+                drop(lifecycle);
                 match TraceBridge::spawn_process(
                     &app,
                     &path,
@@ -2330,34 +2335,41 @@ fn replace_bridge(app: &AppHandle) -> Result<Arc<Bridge>, String> {
                     target.trace_error.clone(),
                 ) {
                     Ok(trace) => {
-                        *state.trace.lock().unwrap() = Some(trace.clone());
-                        drop(lifecycle);
                         if let Err(error) = trace.initialize(privacy) {
-                            let removed = {
-                                let _lifecycle = state.lifecycle.lock().unwrap();
-                                let mut slot = state.trace.lock().unwrap();
-                                if slot
-                                    .as_ref()
-                                    .is_some_and(|current| Arc::ptr_eq(current, &trace))
-                                {
-                                    slot.take();
-                                    true
-                                } else {
-                                    false
-                                }
-                            };
-                            if removed {
-                                trace.shutdown();
-                            }
-                            if state.generation.load(Ordering::SeqCst) == generation {
+                            trace.shutdown();
+                            if state.generation.load(Ordering::SeqCst) == generation
+                                && state.trace_generation.load(Ordering::SeqCst) == trace_generation
+                            {
                                 *target.trace_error.lock().unwrap() = Some(error);
                                 target.emit_state();
                             }
+                            return;
+                        }
+                        let published = {
+                            let _lifecycle = state.lifecycle.lock().unwrap();
+                            if state.shutdown_started.load(Ordering::SeqCst)
+                                || state.quit.lock().unwrap().state() != QuitState::Idle
+                                || state.generation.load(Ordering::SeqCst) != generation
+                                || state.trace_generation.load(Ordering::SeqCst) != trace_generation
+                                || state.trace.lock().unwrap().is_some()
+                            {
+                                false
+                            } else {
+                                *state.trace.lock().unwrap() = Some(trace.clone());
+                                true
+                            }
+                        };
+                        if !published {
+                            trace.shutdown();
+                        } else {
+                            target.emit_state();
                         }
                     }
                     Err(error) => {
-                        drop(lifecycle);
-                        if app.state::<AppState>().generation.load(Ordering::SeqCst) == generation {
+                        let state = app.state::<AppState>();
+                        if state.generation.load(Ordering::SeqCst) == generation
+                            && state.trace_generation.load(Ordering::SeqCst) == trace_generation
+                        {
                             *target.trace_error.lock().unwrap() = Some(error);
                             target.emit_state();
                         }
@@ -2607,8 +2619,14 @@ fn set_trace_privacy(mut privacy: TracePrivacy, app: AppHandle) -> Result<TraceP
         privacy.messages = true;
     }
     let state = app.state::<AppState>();
-    let (bridge, sqlite_path, old_trace) = {
+    let (bridge, sqlite_path, old_trace, trace_generation) = {
         let _lifecycle = state.lifecycle.lock().unwrap();
+        if state.reconfiguring.load(Ordering::SeqCst) {
+            return Err(
+                "Trace privacy cannot be changed while settings are being reloaded.".into(),
+            );
+        }
+        let trace_generation = state.trace_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let bridge = state
             .bridge
             .lock()
@@ -2626,7 +2644,7 @@ fn set_trace_privacy(mut privacy: TracePrivacy, app: AppHandle) -> Result<TraceP
             .map(str::to_owned)
             .ok_or("Trace requires an exact SQLite path.")?;
         let old_trace = state.trace.lock().unwrap().as_ref().cloned();
-        (bridge, sqlite_path, old_trace)
+        (bridge, sqlite_path, old_trace, trace_generation)
     };
     if load_trace_privacy(&bridge.workbench)? == privacy && old_trace.is_some() {
         return Ok(privacy);
@@ -2639,6 +2657,7 @@ fn set_trace_privacy(mut privacy: TracePrivacy, app: AppHandle) -> Result<TraceP
             .unwrap()
             .as_ref()
             .is_none_or(|current| !Arc::ptr_eq(current, &bridge))
+            || state.trace_generation.load(Ordering::SeqCst) != trace_generation
         {
             return Err("Execution runtime changed while trace privacy was updating.".into());
         }
@@ -2689,6 +2708,7 @@ fn set_trace_privacy(mut privacy: TracePrivacy, app: AppHandle) -> Result<TraceP
             .unwrap()
             .as_ref()
             .is_none_or(|current| !Arc::ptr_eq(current, &bridge))
+            || state.trace_generation.load(Ordering::SeqCst) != trace_generation
         {
             true
         } else {
@@ -2725,7 +2745,14 @@ fn reload_settings(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<DesktopState, String> {
+    if state
+        .reconfiguring
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
     {
+        return Err("Settings are already being reloaded.".into());
+    }
+    let result = (|| {
         let _lifecycle = state.lifecycle.lock().unwrap();
         if state.quit.lock().unwrap().state() != QuitState::Idle {
             return Err("Settings cannot be reloaded while quitting.".into());
@@ -2739,8 +2766,51 @@ fn reload_settings(
         {
             return Err("Stop the active run before reloading settings.".into());
         }
+        drop(_lifecycle);
+        Ok(replace_bridge(&app)?.snapshot())
+    })();
+    state.reconfiguring.store(false, Ordering::SeqCst);
+    result
+}
+
+#[tauri::command]
+fn save_settings(
+    settings: Value,
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<DesktopState, String> {
+    if state
+        .reconfiguring
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("Settings are already being reloaded.".into());
     }
-    Ok(replace_bridge(&app)?.snapshot())
+    let result = (|| {
+        let _lifecycle = state.lifecycle.lock().unwrap();
+        if state.quit.lock().unwrap().state() != QuitState::Idle {
+            return Err("Settings cannot be saved while quitting.".into());
+        }
+        let bridge = state
+            .bridge
+            .lock()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "Desktop runtime is not available.".to_string())?;
+        if bridge.registry.lock().unwrap().any_active() {
+            return Err("Stop the active run before saving settings.".into());
+        }
+        drop(_lifecycle);
+        bridge.request_wait(
+            "settings/update",
+            json!({ "settings": settings }),
+            REQUEST_TIMEOUT,
+        )?;
+        Ok(replace_bridge(&app)?.snapshot())
+    })();
+    state.reconfiguring.store(false, Ordering::SeqCst);
+    result
 }
 
 #[tauri::command]
@@ -2749,6 +2819,9 @@ fn start_run(task: String, state: tauri::State<'_, AppState>) -> Result<StartedR
         return Err("Task description is required.".into());
     }
     let _lifecycle = state.lifecycle.lock().unwrap();
+    if state.reconfiguring.load(Ordering::SeqCst) {
+        return Err("Settings are being reloaded; try again when the runtime is ready.".into());
+    }
     if state.quit.lock().unwrap().state() != QuitState::Idle {
         return Err("The desktop is quitting and cannot start new runs.".into());
     }
@@ -2802,6 +2875,10 @@ fn recover_run(
     expected_action: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    let _lifecycle = state.lifecycle.lock().unwrap();
+    if state.reconfiguring.load(Ordering::SeqCst) {
+        return Err("Settings are being reloaded; try again when the runtime is ready.".into());
+    }
     if state.quit.lock().unwrap().state() != QuitState::Idle {
         return Err("The desktop is quitting and cannot recover runs.".into());
     }
@@ -3080,6 +3157,9 @@ fn resolve_approval(
 #[tauri::command]
 fn create_chat(title: String, state: tauri::State<'_, AppState>) -> Result<ChatDto, String> {
     let _lifecycle = state.lifecycle.lock().unwrap();
+    if state.reconfiguring.load(Ordering::SeqCst) {
+        return Err("Settings are being reloaded; try again when the runtime is ready.".into());
+    }
     if state.quit.lock().unwrap().state() != QuitState::Idle {
         return Err("The desktop is quitting and cannot create chats.".into());
     }
@@ -3181,6 +3261,9 @@ fn send_chat_turn(
         return Err("Message is required.".into());
     }
     let _lifecycle = state.lifecycle.lock().unwrap();
+    if state.reconfiguring.load(Ordering::SeqCst) {
+        return Err("Settings are being reloaded; try again when the runtime is ready.".into());
+    }
     if state.quit.lock().unwrap().state() != QuitState::Idle {
         return Err("The desktop is quitting and cannot start new runs.".into());
     }
@@ -3306,6 +3389,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             desktop_state,
             reload_settings,
+            save_settings,
             start_run,
             stop_run,
             get_run_recovery_plan,
