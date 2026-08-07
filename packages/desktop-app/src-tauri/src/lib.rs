@@ -102,6 +102,9 @@ struct RunSummary {
     cancel_requested: bool,
     occupies_slot: bool,
     steerable: bool,
+    artifacts_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    artifacts_unavailable_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pending_approval: Option<PendingApproval>,
 }
@@ -476,6 +479,8 @@ impl Bridge {
                     saved.submission_state.as_str(),
                     "terminal" | "submission_failed"
                 ),
+                workspace_root: saved.workspace_root,
+                shell_cwd: saved.shell_cwd,
             });
         }
         for approval in bridge.workbench.load_pending_approvals()? {
@@ -1388,6 +1393,14 @@ impl Bridge {
             submission_state: "reserved".into(),
             cancel_requested: false,
             interrupt_pending: false,
+            workspace_root: configuration
+                .pointer("/workspace/root")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            shell_cwd: configuration
+                .pointer("/workspace/shellCwd")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         };
         self.registry.lock().unwrap().insert(RunRecord {
             run_id: run_id.clone(),
@@ -1406,6 +1419,8 @@ impl Bridge {
             pending_interaction: None,
             pending_approval: None,
             occupies_slot: true,
+            workspace_root: reservation.workspace_root.clone(),
+            shell_cwd: reservation.shell_cwd.clone(),
         });
         if let Err(error) = self.workbench.reserve_task(&reservation) {
             self.registry.lock().unwrap().remove(&run_id);
@@ -1706,6 +1721,8 @@ impl Bridge {
             pending_interaction: None,
             pending_approval: None,
             occupies_slot: true,
+            workspace_root: None,
+            shell_cwd: None,
         });
         drop(registry);
         if let Err(error) = self.workbench.update_run(&run_id, "submitted", "submitted") {
@@ -2119,24 +2136,39 @@ impl Bridge {
         let error = self.initialization_error.lock().unwrap().clone();
         let execution_health = if error.is_some() { "error" } else { "ready" };
         let registry = self.registry.lock().unwrap();
+        let current_workspace = configuration.as_ref().and_then(|value| {
+            Some((
+                value.pointer("/workspace/root")?.as_str()?,
+                value.pointer("/workspace/shellCwd")?.as_str()?,
+            ))
+        });
         let any_stopping = registry.any_stopping();
         let any_active = registry.any_active();
         let mut runs = registry
             .records()
-            .map(|run| RunSummary {
-                item_id: run.item_id.clone(),
-                run_id: run.run_id.clone(),
-                title: run.title.clone(),
-                created_at: run.created_at.clone(),
-                invocation_kind: run.invocation_kind.clone(),
-                status: run.cached_status.clone(),
-                cancel_requested: run.cancel_requested,
-                occupies_slot: run.occupies_slot,
-                steerable: run.invocation_kind == "run"
-                    && run.root_created
-                    && run.occupies_slot
-                    && !run.cancel_requested,
-                pending_approval: run.pending_approval.clone(),
+            .map(|run| {
+                let (artifacts_available, artifacts_unavailable_reason) = match (&run.workspace_root, &run.shell_cwd, current_workspace) {
+                    (None, _, _) | (_, None, _) => (false, Some("Artifacts are unavailable because this legacy run has no workspace provenance.".into())),
+                    (Some(root), Some(cwd), Some((current_root, current_cwd))) if root == current_root && cwd == current_cwd => (true, None),
+                    (Some(_), Some(_), _) => (false, Some("Artifacts are unavailable because this run used different workspace paths.".into())),
+                };
+                RunSummary {
+                    item_id: run.item_id.clone(),
+                    run_id: run.run_id.clone(),
+                    title: run.title.clone(),
+                    created_at: run.created_at.clone(),
+                    invocation_kind: run.invocation_kind.clone(),
+                    status: run.cached_status.clone(),
+                    cancel_requested: run.cancel_requested,
+                    occupies_slot: run.occupies_slot,
+                    steerable: run.invocation_kind == "run"
+                        && run.root_created
+                        && run.occupies_slot
+                        && !run.cancel_requested,
+                    artifacts_available,
+                    artifacts_unavailable_reason,
+                    pending_approval: run.pending_approval.clone(),
+                }
             })
             .collect::<Vec<_>>();
         runs.sort_by(|left, right| left.run_id.cmp(&right.run_id));

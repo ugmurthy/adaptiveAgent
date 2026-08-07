@@ -3,7 +3,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type { ActivityEvent } from './activity';
 
 export interface ResolvedConfiguration {
-  agent: { id: string; name: string; description?: string; defaultInvocationMode: string; configurationFingerprint: string };
+  agent: { id: string; configPath?: string; name: string; description?: string; defaultInvocationMode: string; configurationFingerprint: string };
   model: { provider: string; model: string; credentialAvailable: boolean };
   inference: { mode: string; tier: string };
   runtime: { mode: string; sqlitePath?: string };
@@ -12,6 +12,7 @@ export interface ResolvedConfiguration {
 }
 
 export interface EditableDesktopSettings {
+  agent: { configPath?: string; id: string };
   inference: { mode: 'byok' | 'local' | 'gateway'; tier: 'low' | 'medium' | 'high' | 'xtra-high' };
   workspace: { root: string; shellCwd: string };
   interaction: { approvalMode: 'auto' | 'manual' | 'reject'; clarificationMode: 'interactive' | 'fail' };
@@ -32,7 +33,7 @@ export interface DesktopState {
 }
 
 export interface PendingApproval { rootRunId:string; approvalRunId:string; approvalId:string; parentRunId?:string; toolName:string; message:string; decisionInFlight:boolean; }
-export interface RunSummary { itemId: string; runId: string; title: string; createdAt: string; invocationKind: 'run'|'chat'; status: string; cancelRequested: boolean; occupiesSlot: boolean; steerable: boolean; pendingApproval?:PendingApproval; }
+export interface RunSummary { itemId: string; runId: string; title: string; createdAt: string; invocationKind: 'run'|'chat'; status: string; cancelRequested: boolean; occupiesSlot: boolean; steerable: boolean; artifactsAvailable: boolean; artifactsUnavailableReason?: string; pendingApproval?:PendingApproval; }
 export interface RunRecoveryPlan { runId:string; status:string; action:'resume_same_run'|'retry_same_run'|'continue_new_run'|'requires_user_action'|'requires_reconciliation'|'not_recoverable'; executable:boolean; reason:string; }
 export interface StartedRun { itemId: string; runId: string; }
 export interface ChatMessage { id: string; ordinal: number; role: 'user'|'assistant'; content: string; runId?: string; }

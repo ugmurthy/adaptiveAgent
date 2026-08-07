@@ -137,6 +137,7 @@ describe('desktop bridge protocol', () => {
 
   it('accepts only complete editable desktop settings', () => {
     const settings = {
+      agent: { configPath: './agent.json', id: 'agent-1' },
       inference: { mode: 'byok', tier: 'medium' },
       workspace: { root: '/workspace', shellCwd: '/workspace/project' },
       interaction: { approvalMode: 'manual', clarificationMode: 'fail' },
@@ -144,8 +145,14 @@ describe('desktop bridge protocol', () => {
     expect(parseDesktopRpcRequest(JSON.stringify({
       jsonrpc: '2.0', id: 'settings', method: 'settings/update', params: { settings },
     }))).toMatchObject({ method: 'settings/update', params: { settings } });
+    expect(parseDesktopRpcRequest(JSON.stringify({
+      jsonrpc: '2.0', id: 'settings', method: 'settings/update', params: { settings: { ...settings, agent: { configPath: '', id: 'agent-1' } } },
+    }))).toMatchObject({ method: 'settings/update' });
     expect(() => parseDesktopRpcRequest(JSON.stringify({
       jsonrpc: '2.0', id: 'settings', method: 'settings/update', params: { settings: { ...settings, workspace: { root: '', shellCwd: '/workspace' } } },
+    }))).toThrowError(expect.objectContaining<Partial<DesktopProtocolError>>({ code: 'INVALID_PARAMS' }));
+    expect(() => parseDesktopRpcRequest(JSON.stringify({
+      jsonrpc: '2.0', id: 'settings', method: 'settings/update', params: { settings: { ...settings, agent: { configPath: './agent.json', id: '' } } },
     }))).toThrowError(expect.objectContaining<Partial<DesktopProtocolError>>({ code: 'INVALID_PARAMS' }));
   });
 

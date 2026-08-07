@@ -31,6 +31,7 @@ describe('desktop runtime protocol', () => {
     const updated = updateDesktopSettings(
       { env: { EXISTING: 'value' }, gateway: { url: 'ws://gateway' }, model: { overrideBaseUrl: 'https://models' } },
       {
+        agent: { configPath: ' ./agents/researcher.json ', id: 'researcher' },
         inference: { mode: 'byok', tier: 'high' },
         workspace: { root: ' /workspace ', shellCwd: ' /workspace/project ' },
         interaction: { approvalMode: 'manual', clarificationMode: 'fail' },
@@ -40,6 +41,7 @@ describe('desktop runtime protocol', () => {
       env: { EXISTING: 'value' },
       gateway: { url: 'ws://gateway' },
       model: { overrideBaseUrl: 'https://models' },
+      agent: { configPath: './agents/researcher.json', id: 'researcher' },
       inference: { mode: 'byok', tier: 'high' },
       workspace: { overrideRoot: '/workspace', overrideShellCwd: '/workspace/project' },
       interaction: { approvalMode: 'manual', clarificationMode: 'fail' },

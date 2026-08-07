@@ -29,6 +29,8 @@ pub struct RunRecord {
     pub pending_interaction: Option<String>,
     pub pending_approval: Option<PendingApproval>,
     pub occupies_slot: bool,
+    pub workspace_root: Option<String>,
+    pub shell_cwd: Option<String>,
 }
 
 #[derive(Default)]
@@ -166,6 +168,8 @@ pub(crate) fn tests_record_for_transition() -> RunRecord {
         pending_interaction: None,
         pending_approval: None,
         occupies_slot: true,
+        workspace_root: Some("/workspace".into()),
+        shell_cwd: Some("/workspace".into()),
     }
 }
 
@@ -191,6 +195,8 @@ mod tests {
             pending_interaction: None,
             pending_approval: None,
             occupies_slot: true,
+            workspace_root: Some("/workspace".into()),
+            shell_cwd: Some("/workspace".into()),
         }
     }
     #[test]

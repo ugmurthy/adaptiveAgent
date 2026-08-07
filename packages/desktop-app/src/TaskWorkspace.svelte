@@ -28,12 +28,21 @@
   let resolvedArtifacts: ResultArtifact[] = [];
   let artifactRunId = '';
   let artifactError = '';
+  let artifactGeneration = 0;
   let exportOpen = false;
   let exportError = '';
 
   $: if (steerRunId !== selectedRun.runId) {
+    artifactGeneration += 1;
     steerRunId = selectedRun.runId;
     steerMessage = '';
+    reportTab = 'result';
+    artifactRunId = '';
+    resolvedArtifacts = [];
+    artifactError = '';
+  }
+  $: if (!selectedRun.artifactsAvailable && (reportTab === 'artifacts' || artifactRunId)) {
+    artifactGeneration += 1;
     reportTab = 'result';
     artifactRunId = '';
     resolvedArtifacts = [];
@@ -83,13 +92,19 @@
   }
 
   async function selectReportTab(tab: typeof reportTab) {
+    if (tab === 'artifacts' && !selectedRun.artifactsAvailable) return;
     reportTab = tab;
     if (tab !== 'artifacts' || artifactRunId === selectedRun.runId) return;
-    artifactRunId = selectedRun.runId;
+    const requestedRunId = selectedRun.runId;
+    const generation = ++artifactGeneration;
+    artifactRunId = requestedRunId;
     artifactError = '';
     try {
-      resolvedArtifacts = resolveResultArtifactPaths(artifacts, await listWorkspaceArtifacts());
+      const loaded = resolveResultArtifactPaths(artifacts, await listWorkspaceArtifacts());
+      if (generation !== artifactGeneration || selectedRun.runId !== requestedRunId) return;
+      resolvedArtifacts = loaded;
     } catch (error) {
+      if (generation !== artifactGeneration || selectedRun.runId !== requestedRunId) return;
       artifactError = String(error);
       resolvedArtifacts = [];
     }
@@ -118,7 +133,8 @@
   {#each attempts.filter((run)=>run.pendingApproval) as run}<ApprovalCard {run} {pending} {ondecision}/>{/each}
   {#if error}<div class="result error"><h3>Error</h3><pre>{error}</pre></div>{/if}
   {#if !selectedRun.occupiesSlot && result !== undefined}
-    <div class="report-tabs">{#each ['result','artifacts'] as tab}<button class:active={reportTab===tab} on:click={() => selectReportTab(tab as typeof reportTab)}>{tab}</button>{/each}</div>
+    <div class="report-tabs">{#each ['result','artifacts'] as tab}<button class:active={reportTab===tab} disabled={tab==='artifacts' && !selectedRun.artifactsAvailable} title={tab==='artifacts' ? selectedRun.artifactsUnavailableReason : undefined} on:click={() => selectReportTab(tab as typeof reportTab)}>{tab}</button>{/each}</div>
+    {#if !selectedRun.artifactsAvailable}<div class="run-status">{selectedRun.artifactsUnavailableReason}</div>{/if}
     <div class="completed-report">
       {#if reportTab==='result'}<ResultRenderer value={displayedResult}/>
       {:else if artifactError}<div class="alert">{artifactError}</div>
