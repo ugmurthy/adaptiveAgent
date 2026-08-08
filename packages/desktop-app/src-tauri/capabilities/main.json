@@ -3,5 +3,5 @@
   "identifier": "main",
   "description": "Restricted AdaptiveAgent desktop renderer",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "dialog:allow-open"]
 }

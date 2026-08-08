@@ -3416,6 +3416,7 @@ fn quit_cancel(state: tauri::State<'_, AppState>) -> Result<DesktopState, String
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
