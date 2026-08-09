@@ -7,8 +7,8 @@ export {
 } from '@adaptive-agent/agent-sdk/cli';
 
 /** Keep versions as strings: JSON numbers cannot distinguish 1.10 from 1.1. */
-export const DESKTOP_PROTOCOL_VERSION = '1.12' as const;
-export const SUPPORTED_DESKTOP_PROTOCOL_VERSIONS = ['1.10', '1.11', DESKTOP_PROTOCOL_VERSION] as const;
+export const DESKTOP_PROTOCOL_VERSION = '1.13' as const;
+export const SUPPORTED_DESKTOP_PROTOCOL_VERSIONS = ['1.10', '1.11', '1.12', DESKTOP_PROTOCOL_VERSION] as const;
 export const DESKTOP_BRIDGE_VERSION = '0.1.0';
 
 export type DesktopProtocolVersion = (typeof SUPPORTED_DESKTOP_PROTOCOL_VERSIONS)[number];
@@ -85,6 +85,20 @@ export interface RuntimeInitializeParams {
   profileRef?: ProfileRef;
   gatewayUrl?: string;
   requireRunPermit?: boolean;
+  managedAttachmentRoot?: string;
+}
+
+export type DesktopAttachmentKind = 'file' | 'image' | 'audio';
+export type DesktopAudioFormat = 'wav' | 'mp3' | 'flac' | 'm4a' | 'ogg' | 'aac' | 'aiff' | 'pcm16' | 'pcm24';
+export interface DesktopAttachmentInput {
+  attachmentId: string;
+  kind: DesktopAttachmentKind;
+  stagedRelativePath: string;
+  name: string;
+  mimeType?: string;
+  sizeBytes: number;
+  sha256: string;
+  audioFormat?: DesktopAudioFormat;
 }
 
 export interface EditableDesktopSettings {
@@ -113,23 +127,29 @@ export interface CliExecuteParams {
 }
 
 export interface RunParams {
-  runId: string;
+  runId?: string;
+  executionId?: string;
   goal: string;
   sessionId?: string;
   input?: JsonValue;
   inferenceMode?: InferenceMode;
   inferenceTier?: InferenceTier;
   profileRef?: ProfileRef;
+  attachments?: DesktopAttachmentInput[];
 }
 
 export interface ChatParams {
-  runId: string;
-  transcript: ChatMessage[];
+  runId?: string;
+  executionId?: string;
+  transcript: ChatMessage[] | DesktopChatMessage[];
   sessionId?: string;
+  chatSessionId?: string;
   inferenceMode?: InferenceMode;
   inferenceTier?: InferenceTier;
   profileRef?: ProfileRef;
 }
+
+export interface DesktopChatMessage { role: 'user' | 'assistant'; text: string; attachments?: DesktopAttachmentInput[] }
 
 export interface UpdateAccessTokenParams {
   accessToken: string;
@@ -187,6 +207,7 @@ export type DesktopRpcRequest =
   | RpcRequest<'run/inspect', RunIdParams>
   | RpcRequest<'run/replay', RunIdParams>
   | RpcRequest<'run/steer', SteerParams>
+  | RpcRequest<'execution/inspect' | 'execution/interrupt' | 'execution/resume', { executionId: string }>
   | RpcRequest<'interaction/resolveApproval', ApprovalParams>
   | RpcRequest<'interaction/resolveClarification', ClarificationParams>
   | RpcRequest<'history/previewDeletion', HistoryDeletionParams>
@@ -211,6 +232,9 @@ export const DESKTOP_RPC_METHODS = [
   'run/inspect',
   'run/replay',
   'run/steer',
+  'execution/inspect',
+  'execution/interrupt',
+  'execution/resume',
   'interaction/resolveApproval',
   'interaction/resolveClarification',
   'history/previewDeletion',
@@ -340,20 +364,38 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
     }
     case 'agent/run': {
       const value = requiredParams(method, params);
-      requiredString(value, 'runId');
+      if (value.executionId === undefined) requiredString(value, 'runId');
+      else {
+        requiredString(value, 'executionId');
+        if (value.runId !== undefined) invalidParams('runId and executionId are mutually exclusive.');
+      }
       requiredString(value, 'goal');
       optionalString(value, 'sessionId');
       validateExecutionSelection(value);
+      optionalAttachments(value, 'attachments');
       return;
     }
     case 'agent/chat': {
       const value = requiredParams(method, params);
-      requiredString(value, 'runId');
-      validateTranscript(value.transcript);
+      if (value.executionId === undefined) {
+        requiredString(value, 'runId');
+        validateTranscript(value.transcript);
+      } else {
+        requiredString(value, 'executionId');
+        if (value.runId !== undefined) invalidParams('runId and executionId are mutually exclusive.');
+        requiredString(value, 'chatSessionId');
+        if (value.sessionId !== undefined) invalidParams('sessionId and chatSessionId are mutually exclusive.');
+        validateDesktopTranscript(value.transcript);
+      }
       optionalString(value, 'sessionId');
       validateExecutionSelection(value);
       return;
     }
+    case 'execution/inspect':
+    case 'execution/interrupt':
+    case 'execution/resume':
+      requiredString(requiredParams(method, params), 'executionId');
+      return;
     case 'run/resume':
     case 'run/retry':
     case 'run/interrupt':
@@ -440,8 +482,14 @@ function validateTranscript(value: unknown): asserts value is ChatMessage[] {
     if (Array.isArray(message.content) && (message.content.length === 0 || message.content.some((part) => !isRecord(part)))) {
       invalidParams(`transcript[${index}].content must contain valid content parts.`);
     }
+    if (Array.isArray(message.content) && message.content.some((part) => isRecord(part) && (part.type === 'image' || part.type === 'audio'))) {
+      invalidParams('Legacy agent/chat image and audio inputs are unavailable; use managed desktop attachments.');
+    }
     if (message.images !== undefined && !Array.isArray(message.images)) {
       invalidParams(`transcript[${index}].images must be an array.`);
+    }
+    if (Array.isArray(message.images) && message.images.length > 0) {
+      invalidParams('Legacy agent/chat image inputs are unavailable; use managed desktop attachments.');
     }
   }
 }
@@ -462,6 +510,48 @@ function validateRuntimeInitializeParams(value: Record<string, unknown>): void {
   optionalProfileRef(value, 'profileRef');
   optionalString(value, 'gatewayUrl');
   optionalBoolean(value, 'requireRunPermit');
+  optionalString(value, 'managedAttachmentRoot');
+}
+
+const ATTACHMENT_KEYS = new Set(['attachmentId', 'kind', 'stagedRelativePath', 'name', 'mimeType', 'sizeBytes', 'sha256', 'audioFormat']);
+function optionalAttachments(value: Record<string, unknown>, field: string): void {
+  if (value[field] === undefined) return;
+  if (!Array.isArray(value[field]) || value[field].length > 8) invalidParams(`${field} must be an array of at most 8 attachments.`);
+  const ids = new Set<string>();
+  for (const [index, raw] of (value[field] as unknown[]).entries()) {
+    if (!isRecord(raw)) invalidParams(`${field}[${index}] must be an object.`);
+    for (const key of Object.keys(raw)) if (!ATTACHMENT_KEYS.has(key)) invalidParams(`${field}[${index}].${key} is not allowed.`);
+    for (const key of ['attachmentId', 'stagedRelativePath', 'name', 'sha256']) requiredString(raw, key);
+    optionalEnum(raw, 'kind', ['file', 'image', 'audio']);
+    if (raw.kind === undefined) invalidParams(`${field}[${index}].kind is required.`);
+    optionalString(raw, 'mimeType');
+    optionalEnum(raw, 'audioFormat', ['wav', 'mp3', 'flac', 'm4a', 'ogg', 'aac', 'aiff', 'pcm16', 'pcm24']);
+    if (raw.kind !== 'audio' && raw.audioFormat !== undefined) invalidParams(`${field}[${index}].audioFormat is valid only for audio.`);
+    if (!Number.isSafeInteger(raw.sizeBytes) || (raw.sizeBytes as number) < 0 || (raw.sizeBytes as number) > 10 * 1024 * 1024) invalidParams(`${field}[${index}].sizeBytes is invalid.`);
+    if (!/^[a-f0-9]{64}$/.test(String(raw.sha256))) invalidParams(`${field}[${index}].sha256 must be lowercase SHA-256 hex.`);
+    if (ids.has(raw.attachmentId as string)) invalidParams(`Duplicate attachmentId: ${raw.attachmentId}.`);
+    ids.add(raw.attachmentId as string);
+  }
+  const total = (value[field] as DesktopAttachmentInput[]).reduce((sum, item) => sum + item.sizeBytes, 0);
+  if (total > 40 * 1024 * 1024) invalidParams(`${field} exceeds the submission byte limit.`);
+}
+
+function validateDesktopTranscript(value: unknown): asserts value is DesktopChatMessage[] {
+  if (!Array.isArray(value) || value.length === 0) invalidParams('transcript must be non-empty.');
+  const ids = new Set<string>();
+  for (const [index, raw] of value.entries()) {
+    if (!isRecord(raw)) invalidParams(`transcript[${index}] must be an object.`);
+    for (const key of Object.keys(raw)) if (!['role', 'text', 'attachments'].includes(key)) invalidParams(`transcript[${index}].${key} is not allowed.`);
+    optionalEnum(raw, 'role', ['user', 'assistant']);
+    if (raw.role === undefined) invalidParams(`transcript[${index}].role is required.`);
+    requiredString(raw, 'text');
+    if (raw.role !== 'user' && raw.attachments !== undefined) invalidParams(`transcript[${index}] assistant messages cannot have attachments.`);
+    optionalAttachments(raw, 'attachments');
+    for (const attachment of (raw.attachments ?? []) as DesktopAttachmentInput[]) {
+      if (ids.has(attachment.attachmentId)) invalidParams(`Duplicate attachmentId: ${attachment.attachmentId}.`);
+      ids.add(attachment.attachmentId);
+    }
+  }
 }
 
 function validateExecutionSelection(value: Record<string, unknown>): void {

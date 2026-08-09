@@ -316,6 +316,26 @@ export interface AgentDefaults {
 
 export type FileInputPolicy = 'provider_native' | 'read_file' | 'auto';
 
+/** Host-owned, execution-scoped authority for local attachment files.
+ * Attachment roots must be absolute canonical directories. This object is
+ * persisted/inherited as runtime policy and is never included in model context.
+ */
+export interface FileAccessExecutionContext {
+  version: 1;
+  /** Canonical configured workspace root used as the primary read authority. */
+  workspaceRoot: string;
+  attachmentRoots: string[];
+  files?: Array<{
+    path: string;
+    sizeBytes: number;
+    sha256: string;
+  }>;
+}
+
+export type ExecutionContext = JsonObject & {
+  fileAccess?: FileAccessExecutionContext;
+};
+
 export interface ToolBudget {
   maxCalls?: number;
   maxConsecutiveCalls?: number;
@@ -373,7 +393,7 @@ export interface RunRequest {
   contextRefs?: ContextRef[];
   context?: Record<string, JsonValue>;
   /** Opaque host-owned policy inherited by derived runs and never added to model-visible context. */
-  executionContext?: JsonObject;
+  executionContext?: ExecutionContext;
   allowedTools?: string[];
   forbiddenTools?: string[];
   outputSchema?: JsonSchema;
@@ -394,7 +414,7 @@ export interface ChatRequest {
   contextRefs?: ContextRef[];
   context?: Record<string, JsonValue>;
   /** Opaque host-owned policy inherited by derived runs and never added to model-visible context. */
-  executionContext?: JsonObject;
+  executionContext?: ExecutionContext;
   outputSchema?: JsonSchema;
   metadata?: Record<string, JsonValue>;
 }
@@ -403,7 +423,7 @@ export interface PlanRequest {
   goal: string;
   input?: JsonValue;
   context?: Record<string, JsonValue>;
-  executionContext?: JsonObject;
+  executionContext?: ExecutionContext;
   allowedTools?: string[];
   forbiddenTools?: string[];
   inputSchema?: JsonSchema;
@@ -415,7 +435,7 @@ export interface ExecutePlanRequest {
   planId: UUID;
   input?: JsonValue;
   context?: Record<string, JsonValue>;
-  executionContext?: JsonObject;
+  executionContext?: ExecutionContext;
   metadata?: Record<string, JsonValue>;
 }
 
@@ -512,7 +532,7 @@ export interface ToolContext {
   input?: JsonValue;
   context?: Record<string, JsonValue>;
   /** Opaque host-owned policy. Tools may read it but model output cannot replace it. */
-  executionContext?: JsonObject;
+  executionContext?: ExecutionContext;
   idempotencyKey: string;
   /** Effective runtime timeout for this tool call. A value <= 0 means disabled. */
   timeoutMs?: number;

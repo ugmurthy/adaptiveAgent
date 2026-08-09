@@ -1,10 +1,11 @@
 import type { Logger } from 'pino';
 import { createHash } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
-import { mkdir } from 'node:fs/promises';
-import { basename, extname, join } from 'node:path';
+import { mkdir, readFile, realpath, stat } from 'node:fs/promises';
+import { basename, extname, isAbsolute, join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { isPathWithinRoot, resolvePathWithinRoots } from './tools/path-utils.js';
 
 import {
   DelegatedApprovalRequiredError,
@@ -346,6 +347,7 @@ export class AdaptiveAgent {
 
   async run(request: RunRequest): Promise<RunResult> {
     assertValidExecutionContext(request.executionContext);
+    request = await authorizeRunFileInputs(request, this.resolveFileInputPolicy() === 'provider_native');
     if (request.outputSchema !== undefined) {
       assertValidOutputSchema(request.outputSchema);
     }
@@ -400,6 +402,7 @@ export class AdaptiveAgent {
 
   async chat(request: ChatRequest): Promise<ChatResult> {
     assertValidExecutionContext(request.executionContext);
+    request = await authorizeChatFileInputs(request, this.resolveFileInputPolicy() === 'provider_native');
     if (request.outputSchema !== undefined) {
       assertValidOutputSchema(request.outputSchema);
     }
@@ -1185,6 +1188,7 @@ export class AdaptiveAgent {
     const state = await this.loadExecutionState(run);
     if (TERMINAL_RUN_STATUSES.has(run.status)) return this.resultFromStoredRun(run, state.stepsUsed);
     if (run.status === 'awaiting_approval') return approvalResult(run, state.pendingToolCalls[0]);
+    await reauthorizeExecutionStateFileInputs(state, run.executionContext);
     await this.acquireLeaseOrThrow(run.id);
     try {
       return await this.continueRunFromState(await this.refreshRun(run.id), state, { retryFailedChild: true });
@@ -1330,6 +1334,7 @@ export class AdaptiveAgent {
     if (run.status !== 'failed') {
       throw new Error(`Run ${runId} is ${run.status}; only failed runs can be retried`);
     }
+    await reauthorizeExecutionStateFileInputs(state, run.executionContext);
 
     const retryability = await this.checkFailedRunRetryability(run, state);
     if (!retryability.retryable) {
@@ -1751,6 +1756,7 @@ export class AdaptiveAgent {
     if (TERMINAL_RUN_STATUSES.has(run.status)) {
       return this.resultFromStoredRun(run, state.stepsUsed);
     }
+    await reauthorizeExecutionStateFileInputs(state, run.executionContext);
 
     await this.acquireLeaseOrThrow(run.id);
 
@@ -5666,7 +5672,6 @@ function summarizeContentPartsForLog(contentParts: ModelContentPart[]): JsonValu
 function summarizeInputSource(source: { kind: string; path?: string; url?: string; fileId?: string }): JsonObject {
   return {
     kind: source.kind,
-    ...(source.path ? { path: source.path } : {}),
     ...(source.url ? { url: source.url } : {}),
     ...(source.fileId ? { fileId: source.fileId } : {}),
   };
@@ -6360,6 +6365,160 @@ export function assertValidExecutionContext(value: unknown): asserts value is Js
   if (!isPlainJsonObject(value) || !isJsonValue(value)) {
     throw new TypeError('executionContext must be a plain JSON object containing only finite JSON values');
   }
+  if ('fileAccess' in value) {
+    const fileAccess = value.fileAccess;
+    if (
+      !isPlainJsonObject(fileAccess) ||
+      fileAccess.version !== 1 ||
+      typeof fileAccess.workspaceRoot !== 'string' || fileAccess.workspaceRoot.length === 0 ||
+      !Array.isArray(fileAccess.attachmentRoots) ||
+      !fileAccess.attachmentRoots.every((root) => typeof root === 'string' && root.length > 0) ||
+      (fileAccess.files !== undefined && (!Array.isArray(fileAccess.files) || !fileAccess.files.every((file) =>
+        isPlainJsonObject(file)
+        && typeof file.path === 'string'
+        && Number.isSafeInteger(file.sizeBytes)
+        && (file.sizeBytes as number) >= 0
+        && typeof file.sha256 === 'string'
+        && /^[a-f0-9]{64}$/.test(file.sha256)
+      )))
+    ) {
+      throw new TypeError('executionContext.fileAccess must have version 1, workspaceRoot, and a string attachmentRoots array');
+    }
+  }
+}
+
+async function authorizeRunFileInputs(request: RunRequest, snapshotAttachments: boolean): Promise<RunRequest> {
+  if (!request.executionContext?.fileAccess) return request;
+  const authority = await resolveExecutionFileAuthority(request.executionContext);
+  return {
+    ...request,
+    images: request.images ? await Promise.all(request.images.map((image) => authorizeImageInput(image, authority))) : undefined,
+    contentParts: request.contentParts ? await authorizeContentParts(request.contentParts, authority, snapshotAttachments) : undefined,
+  };
+}
+
+async function authorizeChatFileInputs(request: ChatRequest, snapshotAttachments: boolean): Promise<ChatRequest> {
+  if (!request.executionContext?.fileAccess) return request;
+  const authority = await resolveExecutionFileAuthority(request.executionContext);
+  return {
+    ...request,
+    messages: await Promise.all(request.messages.map(async (message) => ({
+      ...message,
+      images: message.images ? await Promise.all(message.images.map((image) => authorizeImageInput(image, authority))) : undefined,
+      content: Array.isArray(message.content) ? await authorizeContentParts(message.content, authority, snapshotAttachments) : message.content,
+    }))),
+  };
+}
+
+interface ExecutionFileAuthority {
+  roots: string[];
+  expectedFiles: Map<string, { sizeBytes: number; sha256: string }>;
+}
+
+async function resolveExecutionFileAuthority(executionContext: RunRequest['executionContext']): Promise<ExecutionFileAuthority> {
+  const configuredWorkspaceRoot = executionContext?.fileAccess?.workspaceRoot;
+  if (!configuredWorkspaceRoot || !isAbsolute(configuredWorkspaceRoot) || resolve(configuredWorkspaceRoot) !== configuredWorkspaceRoot) {
+    throw new TypeError('executionContext.fileAccess workspaceRoot must be an absolute canonical path');
+  }
+  const workspaceRoot = await realpath(configuredWorkspaceRoot);
+  if (workspaceRoot !== configuredWorkspaceRoot || !(await stat(workspaceRoot)).isDirectory()) {
+    throw new TypeError('executionContext.fileAccess workspaceRoot must be a canonical directory');
+  }
+  const attachmentRoots = executionContext?.fileAccess?.attachmentRoots ?? [];
+  const canonicalAttachments: string[] = [];
+  for (const root of attachmentRoots) {
+    if (!isAbsolute(root) || resolve(root) !== root) {
+      throw new TypeError('executionContext.fileAccess attachment roots must be absolute canonical paths');
+    }
+    const canonical = await realpath(root);
+    if (canonical !== root || !(await stat(canonical)).isDirectory()) {
+      throw new TypeError('executionContext.fileAccess attachment roots must be canonical directories');
+    }
+    canonicalAttachments.push(canonical);
+  }
+  const expectedFiles = new Map<string, { sizeBytes: number; sha256: string }>();
+  for (const file of executionContext?.fileAccess?.files ?? []) {
+    if (!isAbsolute(file.path) || resolve(file.path) !== file.path) {
+      throw new TypeError('executionContext.fileAccess file paths must be absolute canonical paths');
+    }
+    const canonical = await realpath(file.path);
+    if (canonical !== file.path || !canonicalAttachments.some((root) => isPathWithinRoot(root, canonical))) {
+      throw new TypeError('executionContext.fileAccess files must be canonical paths within attachment roots');
+    }
+    expectedFiles.set(canonical, { sizeBytes: file.sizeBytes, sha256: file.sha256 });
+  }
+  return { roots: [workspaceRoot, ...canonicalAttachments], expectedFiles };
+}
+
+async function authorizeImageInput(image: ImageInput, authority: ExecutionFileAuthority): Promise<ImageInput> {
+  if (!image.path) return image;
+  const authorized = await authorizeInputPath(image.path, authority);
+  if (authorized.attachmentBytes) {
+    const { path: _path, ...rest } = image;
+    return { ...rest, url: toDataUrl(authorized.attachmentBytes, image.mimeType) };
+  }
+  return { ...image, path: authorized.path };
+}
+
+async function authorizeContentParts(parts: ModelContentPart[], authority: ExecutionFileAuthority, snapshotAttachments = false): Promise<ModelContentPart[]> {
+  return Promise.all(parts.map(async (part): Promise<ModelContentPart> => {
+    if (part.type === 'image') return { ...part, image: await authorizeImageInput(part.image, authority) };
+    if (part.type === 'file' && part.file.source.kind === 'path') {
+      const authorized = await authorizeInputPath(part.file.source.path, authority);
+      const source = snapshotAttachments && authorized.attachmentBytes
+        ? { kind: 'url' as const, url: toDataUrl(authorized.attachmentBytes, part.file.mimeType) }
+        : { kind: 'path' as const, path: authorized.path };
+      return { ...part, file: { ...part.file, source } };
+    }
+    if (part.type === 'audio' && part.audio.source.kind === 'path') {
+      const authorized = await authorizeInputPath(part.audio.source.path, authority);
+      const source = authorized.attachmentBytes
+        ? { kind: 'data' as const, data: authorized.attachmentBytes.toString('base64') }
+        : { kind: 'path' as const, path: authorized.path };
+      return { ...part, audio: { ...part.audio, source } };
+    }
+    return part;
+  }));
+}
+
+async function authorizeInputPath(path: string, authority: ExecutionFileAuthority): Promise<{ path: string; attachmentBytes?: Buffer }> {
+  const canonical = await resolvePathWithinRoots(authority.roots, path);
+  const metadata = await stat(canonical);
+  if (!metadata.isFile()) throw new TypeError(`Path-backed model input is not a file: ${path}`);
+  if (authority.roots.slice(1).some((root) => isPathWithinRoot(root, canonical))) {
+    const expected = authority.expectedFiles.get(canonical);
+    if (!expected || metadata.size !== expected.sizeBytes) {
+      throw new TypeError(`Execution attachment changed or lacks integrity metadata: ${path}`);
+    }
+    const attachmentBytes = await readFile(canonical);
+    const actualHash = createHash('sha256').update(attachmentBytes).digest('hex');
+    if (attachmentBytes.byteLength !== expected.sizeBytes) throw new TypeError(`Execution attachment changed: ${path}`);
+    if (actualHash !== expected.sha256) throw new TypeError(`Execution attachment changed: ${path}`);
+    return { path: canonical, attachmentBytes };
+  }
+  return { path: canonical };
+}
+
+function toDataUrl(content: Buffer, mimeType?: string): string {
+  return `data:${mimeType?.trim() || 'application/octet-stream'};base64,${content.toString('base64')}`;
+}
+
+async function reauthorizeExecutionStateFileInputs(
+  state: ExecutionState,
+  executionContext: AgentRun['executionContext'],
+): Promise<void> {
+  if (!executionContext?.fileAccess) return;
+  const authority = await resolveExecutionFileAuthority(executionContext);
+  const authorizeMessages = async (messages: ModelMessage[]): Promise<ModelMessage[]> => Promise.all(
+    messages.map(async (message) => ({
+      ...message,
+      content: Array.isArray(message.content)
+        ? await authorizeContentParts(message.content, authority, true)
+        : message.content,
+    })),
+  );
+  state.messages = await authorizeMessages(state.messages);
+  state.pendingRuntimeMessages = await authorizeMessages(state.pendingRuntimeMessages);
 }
 
 function removeUndefinedJsonFields(value: Record<string, JsonValue | undefined>): JsonObject {

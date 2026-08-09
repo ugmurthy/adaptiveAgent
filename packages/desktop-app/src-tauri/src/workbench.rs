@@ -1,3 +1,4 @@
+use crate::attachments::AttachmentDraft;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::Value;
 use std::{path::Path, sync::Mutex};
@@ -32,6 +33,19 @@ create table deletion_jobs (id text primary key, item_id text, root_run_id text,
 ), (
     8,
     "alter table workbench_runs add column workspace_root text; alter table workbench_runs add column shell_cwd text;",
+), (
+    9,
+    r#"alter table workbench_items add column workspace_root text;
+alter table workbench_items add column shell_cwd text;
+alter table workbench_runs add column execution_mode text not null default 'direct' check(execution_mode in ('direct','catalog'));
+alter table workbench_runs add column final_run_id text;
+alter table workbench_runs add column trace_target_json text;
+create table attachments (attachment_id text primary key, staged_relative_path text not null unique, display_name text not null, kind text not null check(kind in ('file','image','audio')), mime_type text, audio_format text, size_bytes integer not null, sha256 text not null, state text not null check(state in ('draft','owned','delete_pending')), created_at text not null, claimed_at text);
+create table task_attachments (item_id text not null references workbench_items(id) on delete cascade, attachment_id text not null unique references attachments(attachment_id), ordinal integer not null, primary key(item_id,ordinal));
+create table message_attachments (message_id text not null references chat_messages(id) on delete cascade, attachment_id text not null unique references attachments(attachment_id), ordinal integer not null, primary key(message_id,ordinal));
+create trigger task_attachment_delete before delete on task_attachments begin update attachments set state='delete_pending' where attachment_id=old.attachment_id; end;
+create trigger message_attachment_delete before delete on message_attachments begin update attachments set state='delete_pending' where attachment_id=old.attachment_id; end;
+update workbench_runs set final_run_id=run_id,trace_target_json=json_object('kind','root-run','rootRunId',run_id);"#,
 )];
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -60,6 +74,8 @@ pub struct ChatItem {
     pub pinned_agent_id: String,
     pub pinned_agent_name: String,
     pub pinned_agent_fingerprint: String,
+    pub workspace_root: Option<String>,
+    pub shell_cwd: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -70,6 +86,7 @@ pub struct ChatMessage {
     pub role: String,
     pub content: String,
     pub run_id: Option<String>,
+    pub attachments: Vec<AttachmentDraft>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -111,6 +128,104 @@ pub struct WorkbenchDb {
 }
 
 impl WorkbenchDb {
+    pub fn insert_draft(&self, draft: &AttachmentDraft) -> Result<(), String> {
+        self.connection.lock().unwrap().execute("insert into attachments(attachment_id,staged_relative_path,display_name,kind,mime_type,audio_format,size_bytes,sha256,state,created_at) values(?1,?2,?3,?4,?5,?6,?7,?8,'draft',?9)",params![draft.id,draft.staged_relative_path,draft.name,draft.kind,draft.mime_type,draft.audio_format,draft.size_bytes,draft.sha256,now()]).map_err(|e|e.to_string())?;
+        Ok(())
+    }
+
+    pub fn get_drafts(&self, ids: &[String]) -> Result<Vec<AttachmentDraft>, String> {
+        let connection = self.connection.lock().unwrap();
+        let mut output = Vec::new();
+        for id in ids {
+            let draft=connection.query_row("select attachment_id,display_name,kind,size_bytes,mime_type,staged_relative_path,sha256,audio_format from attachments where attachment_id=?1 and state='draft'",[id],|r|Ok(AttachmentDraft{id:r.get(0)?,name:r.get(1)?,kind:r.get(2)?,size_bytes:r.get(3)?,mime_type:r.get(4)?,staged_relative_path:r.get(5)?,sha256:r.get(6)?,audio_format:r.get(7)?})).optional().map_err(|e|e.to_string())?.ok_or("ATTACHMENT_NOT_FOUND")?;
+            output.push(draft);
+        }
+        Ok(output)
+    }
+
+    pub fn task_attachments_for_run(&self, run_id: &str) -> Result<Vec<AttachmentDraft>, String> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare("select a.attachment_id,a.display_name,a.kind,a.size_bytes,a.mime_type,a.staged_relative_path,a.sha256,a.audio_format from workbench_runs r join task_attachments t on t.item_id=r.item_id join attachments a on a.attachment_id=t.attachment_id where r.run_id=?1 and a.state='owned' order by t.ordinal").map_err(|e|e.to_string())?;
+        let attachments = statement
+            .query_map([run_id], |r| {
+                Ok(AttachmentDraft {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    kind: r.get(2)?,
+                    size_bytes: r.get(3)?,
+                    mime_type: r.get(4)?,
+                    staged_relative_path: r.get(5)?,
+                    sha256: r.get(6)?,
+                    audio_format: r.get(7)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(attachments)
+    }
+
+    pub fn discard_draft(&self, id: &str) -> Result<Option<String>, String> {
+        let connection = self.connection.lock().unwrap();
+        let path=connection.query_row("select staged_relative_path from attachments where attachment_id=?1 and state='draft'",[id],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+        if path.is_some() {
+            connection
+                .execute(
+                    "update attachments set state='delete_pending' where attachment_id=?1 and state='draft'",
+                    [id],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(path)
+    }
+
+    pub fn attachment_cleanup_candidates(&self) -> Result<Vec<(String, String)>, String> {
+        let mut connection = self.connection.lock().unwrap();
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        tx.execute("update attachments set state='delete_pending' where state='draft' and cast(created_at as integer) < unixepoch('now') * 1000 - 86400000", []).map_err(|e|e.to_string())?;
+        let mut statement = tx.prepare("select attachment_id,staged_relative_path from attachments where state='delete_pending'").map_err(|e|e.to_string())?;
+        let candidates = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        drop(statement);
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(candidates)
+    }
+
+    pub fn attachment_managed_directories(&self) -> Result<Vec<String>, String> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection
+            .prepare("select staged_relative_path from attachments")
+            .map_err(|e| e.to_string())?;
+        let paths = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(paths
+            .into_iter()
+            .filter_map(|path| {
+                Path::new(&path)
+                    .components()
+                    .next()
+                    .and_then(|component| match component {
+                        std::path::Component::Normal(directory) => {
+                            Some(directory.to_string_lossy().into_owned())
+                        }
+                        _ => None,
+                    })
+            })
+            .collect())
+    }
+
+    pub fn finish_attachment_cleanup(&self, id: &str) -> Result<(), String> {
+        self.connection.lock().unwrap().execute("delete from attachments where attachment_id=?1 and (state='delete_pending' or state='draft')", [id]).map_err(|e|e.to_string())?;
+        Ok(())
+    }
     pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -168,23 +283,38 @@ impl WorkbenchDb {
     }
 
     pub fn reserve_task(&self, reservation: &Reservation) -> Result<(), String> {
+        self.reserve_task_with_attachments(reservation, &[])
+    }
+
+    pub fn reserve_task_with_attachments(
+        &self,
+        reservation: &Reservation,
+        attachment_ids: &[String],
+    ) -> Result<(), String> {
         let mut connection = self.connection.lock().unwrap();
         let tx = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         tx.execute("insert into workbench_items(id,kind,title,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,created_at,updated_at) values(?1,'task',?2,?3,?4,?5,?6,?7,?7)", params![reservation.item_id,reservation.title,reservation.session_id,reservation.agent_id,reservation.agent_name,reservation.agent_fingerprint,reservation.created_at]).map_err(|e| e.to_string())?;
-        tx.execute("insert into workbench_runs(run_id,item_id,invocation_kind,cached_status,submission_state,created_at,updated_at,workspace_root,shell_cwd) values(?1,?2,?3,?4,?5,?6,?6,?7,?8)", params![reservation.run_id,reservation.item_id,reservation.invocation_kind,reservation.cached_status,reservation.submission_state,reservation.created_at,reservation.workspace_root,reservation.shell_cwd]).map_err(|e| e.to_string())?;
+        tx.execute("insert into workbench_runs(run_id,item_id,invocation_kind,cached_status,submission_state,created_at,updated_at,workspace_root,shell_cwd,execution_mode,final_run_id,trace_target_json) values(?1,?2,?3,?4,?5,?6,?6,?7,?8,'direct',?1,json_object('kind','root-run','rootRunId',?1))", params![reservation.run_id,reservation.item_id,reservation.invocation_kind,reservation.cached_status,reservation.submission_state,reservation.created_at,reservation.workspace_root,reservation.shell_cwd]).map_err(|e| e.to_string())?;
+        claim_attachments(
+            &tx,
+            attachment_ids,
+            "task_attachments",
+            "item_id",
+            &reservation.item_id,
+        )?;
         tx.commit().map_err(|e| e.to_string())
     }
 
     pub fn create_chat(&self, chat: &ChatItem) -> Result<(), String> {
-        self.connection.lock().unwrap().execute("insert into workbench_items(id,kind,title,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,created_at,updated_at) values(?1,'chat',?2,?3,?4,?5,?6,?7,?7)", params![chat.item_id,chat.title,chat.session_id,chat.pinned_agent_id,chat.pinned_agent_name,chat.pinned_agent_fingerprint,chat.created_at]).map_err(|e| e.to_string())?;
+        self.connection.lock().unwrap().execute("insert into workbench_items(id,kind,title,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,created_at,updated_at,workspace_root,shell_cwd) values(?1,'chat',?2,?3,?4,?5,?6,?7,?7,?8,?9)", params![chat.item_id,chat.title,chat.session_id,chat.pinned_agent_id,chat.pinned_agent_name,chat.pinned_agent_fingerprint,chat.created_at,chat.workspace_root,chat.shell_cwd]).map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub fn list_chats(&self) -> Result<Vec<ChatItem>, String> {
         let connection = self.connection.lock().unwrap();
-        let mut statement = connection.prepare("select id,title,created_at,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint from workbench_items where kind='chat' order by updated_at desc,id").map_err(|e| e.to_string())?;
+        let mut statement = connection.prepare("select id,title,created_at,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,workspace_root,shell_cwd from workbench_items where kind='chat' order by updated_at desc,id").map_err(|e| e.to_string())?;
         let chats = statement
             .query_map([], |r| {
                 Ok(ChatItem {
@@ -195,6 +325,8 @@ impl WorkbenchDb {
                     pinned_agent_id: r.get(4)?,
                     pinned_agent_name: r.get(5)?,
                     pinned_agent_fingerprint: r.get(6)?,
+                    workspace_root: r.get(7)?,
+                    shell_cwd: r.get(8)?,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -206,7 +338,7 @@ impl WorkbenchDb {
     pub fn load_chat(&self, item_id: &str) -> Result<(ChatItem, Vec<ChatMessage>), String> {
         use rusqlite::OptionalExtension;
         let connection = self.connection.lock().unwrap();
-        let chat = connection.query_row("select id,title,created_at,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint from workbench_items where id=?1 and kind='chat'", [item_id], |r| Ok(ChatItem { item_id:r.get(0)?, title:r.get(1)?, created_at:r.get(2)?, session_id:r.get(3)?, pinned_agent_id:r.get(4)?, pinned_agent_name:r.get(5)?, pinned_agent_fingerprint:r.get(6)? })).optional().map_err(|e| e.to_string())?.ok_or("Chat was not found.")?;
+        let chat = connection.query_row("select id,title,created_at,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,workspace_root,shell_cwd from workbench_items where id=?1 and kind='chat'", [item_id], |r| Ok(ChatItem { item_id:r.get(0)?, title:r.get(1)?, created_at:r.get(2)?, session_id:r.get(3)?, pinned_agent_id:r.get(4)?, pinned_agent_name:r.get(5)?, pinned_agent_fingerprint:r.get(6)?, workspace_root:r.get(7)?, shell_cwd:r.get(8)? })).optional().map_err(|e| e.to_string())?.ok_or("Chat was not found.")?;
         let mut statement = connection.prepare("select id,ordinal,role,content_json,run_id from chat_messages where item_id=?1 order by ordinal").map_err(|e| e.to_string())?;
         let messages = statement
             .query_map([item_id], |r| {
@@ -218,11 +350,16 @@ impl WorkbenchDb {
                     role: r.get(2)?,
                     content,
                     run_id: r.get(4)?,
+                    attachments: Vec::new(),
                 })
             })
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
+        let mut messages = messages;
+        for message in &mut messages {
+            message.attachments = load_message_attachments(&connection, &message.id)?;
+        }
         Ok((chat, messages))
     }
 
@@ -231,6 +368,16 @@ impl WorkbenchDb {
         item_id: &str,
         run_id: &str,
         content: &str,
+    ) -> Result<Vec<ChatMessage>, String> {
+        self.reserve_chat_turn_with_attachments(item_id, run_id, content, &[])
+    }
+
+    pub fn reserve_chat_turn_with_attachments(
+        &self,
+        item_id: &str,
+        run_id: &str,
+        content: &str,
+        attachment_ids: &[String],
     ) -> Result<Vec<ChatMessage>, String> {
         let mut connection = self.connection.lock().unwrap();
         let tx = connection
@@ -248,8 +395,16 @@ impl WorkbenchDb {
             )
             .map_err(|e| e.to_string())?;
         let now = now();
-        tx.execute("insert into workbench_runs(run_id,item_id,turn_index,invocation_kind,cached_status,submission_state,created_at,updated_at) values(?1,?2,?3,'chat','reserved','reserved',?4,?4)",params![run_id,item_id,ordinal,now]).map_err(|e|e.to_string())?;
-        tx.execute("insert into chat_messages(id,item_id,ordinal,role,content_json,run_id,created_at) values(?1,?2,?3,'user',?4,?5,?6)",params![uuid::Uuid::new_v4().to_string(),item_id,ordinal,serde_json::to_string(content).map_err(|e|e.to_string())?,run_id,now]).map_err(|e|e.to_string())?;
+        tx.execute("insert into workbench_runs(run_id,item_id,turn_index,invocation_kind,cached_status,submission_state,created_at,updated_at,execution_mode,final_run_id,trace_target_json,workspace_root,shell_cwd) select ?1,?2,?3,'chat','reserved','reserved',?4,?4,'direct',?1,json_object('kind','root-run','rootRunId',?1),workspace_root,shell_cwd from workbench_items where id=?2",params![run_id,item_id,ordinal,now]).map_err(|e|e.to_string())?;
+        let message_id = uuid::Uuid::new_v4().to_string();
+        tx.execute("insert into chat_messages(id,item_id,ordinal,role,content_json,run_id,created_at) values(?1,?2,?3,'user',?4,?5,?6)",params![message_id,item_id,ordinal,serde_json::to_string(content).map_err(|e|e.to_string())?,run_id,now]).map_err(|e|e.to_string())?;
+        claim_attachments(
+            &tx,
+            attachment_ids,
+            "message_attachments",
+            "message_id",
+            &message_id,
+        )?;
         tx.execute(
             "update workbench_items set updated_at=?2 where id=?1",
             params![item_id, now],
@@ -873,12 +1028,62 @@ fn load_messages(connection: &Connection, item_id: &str) -> Result<Vec<ChatMessa
                 role: r.get(2)?,
                 content: serde_json::from_str::<String>(&encoded).unwrap_or(encoded),
                 run_id: r.get(4)?,
+                attachments: Vec::new(),
             })
         })
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
+    let mut messages = messages;
+    for message in &mut messages {
+        message.attachments = load_message_attachments(connection, &message.id)?;
+    }
     Ok(messages)
+}
+
+fn load_message_attachments(
+    connection: &Connection,
+    message_id: &str,
+) -> Result<Vec<AttachmentDraft>, String> {
+    let mut statement=connection.prepare("select a.attachment_id,a.display_name,a.kind,a.size_bytes,a.mime_type,a.staged_relative_path,a.sha256,a.audio_format from message_attachments m join attachments a on a.attachment_id=m.attachment_id where m.message_id=?1 order by m.ordinal").map_err(|e|e.to_string())?;
+    let attachments = statement
+        .query_map([message_id], |r| {
+            Ok(AttachmentDraft {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                kind: r.get(2)?,
+                size_bytes: r.get(3)?,
+                mime_type: r.get(4)?,
+                staged_relative_path: r.get(5)?,
+                sha256: r.get(6)?,
+                audio_format: r.get(7)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(attachments)
+}
+
+fn claim_attachments(
+    tx: &rusqlite::Transaction<'_>,
+    ids: &[String],
+    join_table: &str,
+    owner_column: &str,
+    owner: &str,
+) -> Result<(), String> {
+    for (ordinal, id) in ids.iter().enumerate() {
+        let changed=tx.execute("update attachments set state='owned',claimed_at=?2 where attachment_id=?1 and state='draft'",params![id,now()]).map_err(|e|e.to_string())?;
+        if changed != 1 {
+            return Err("ATTACHMENT_NOT_FOUND: Draft was already claimed or discarded.".into());
+        }
+        let sql = format!(
+            "insert into {join_table}({owner_column},attachment_id,ordinal) values(?1,?2,?3)"
+        );
+        tx.execute(&sql, params![owner, id, ordinal as i64])
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 pub(crate) fn now() -> String {
@@ -1081,6 +1286,8 @@ mod tests {
             pinned_agent_id: "agent".into(),
             pinned_agent_name: "Agent".into(),
             pinned_agent_fingerprint: "fingerprint".into(),
+            workspace_root: Some("/workspace".into()),
+            shell_cwd: Some("/workspace".into()),
         }
     }
 
@@ -1112,6 +1319,63 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["hello", "hi"]
         );
+    }
+
+    #[test]
+    fn chat_attachment_claim_is_atomic_and_replays_owned_descriptors() {
+        let db = WorkbenchDb::open_in_memory().unwrap();
+        db.create_chat(&chat()).unwrap();
+        let draft = AttachmentDraft {
+            id: "attachment".into(),
+            name: "notes.txt".into(),
+            kind: "file".into(),
+            size_bytes: 5,
+            mime_type: Some("text/plain".into()),
+            staged_relative_path: "attachment/notes.txt".into(),
+            sha256: "a".repeat(64),
+            audio_format: None,
+        };
+        db.insert_draft(&draft).unwrap();
+        let messages = db
+            .reserve_chat_turn_with_attachments(
+                "chat",
+                "run-with-attachment",
+                "read this",
+                &[draft.id.clone()],
+            )
+            .unwrap();
+        assert_eq!(messages[0].attachments, vec![draft.clone()]);
+        assert_eq!(db.load_chat("chat").unwrap().1[0].attachments, vec![draft]);
+        assert!(db.discard_draft("attachment").unwrap().is_none());
+
+        let second = AttachmentDraft {
+            id: "second".into(),
+            name: "second.txt".into(),
+            kind: "file".into(),
+            size_bytes: 1,
+            mime_type: None,
+            staged_relative_path: "second/second.txt".into(),
+            sha256: "b".repeat(64),
+            audio_format: None,
+        };
+        db.insert_draft(&second).unwrap();
+        assert!(db
+            .reserve_chat_turn_with_attachments(
+                "chat",
+                "overlap",
+                "must roll back",
+                &[second.id.clone()],
+            )
+            .is_err());
+        assert_eq!(db.get_drafts(&[second.id]).unwrap().len(), 1);
+        assert!(db.attachment_cleanup_candidates().unwrap().is_empty());
+        assert!(db.discard_draft("second").unwrap().is_some());
+        assert_eq!(
+            db.attachment_cleanup_candidates().unwrap(),
+            vec![("second".into(), "second/second.txt".into())]
+        );
+        db.finish_attachment_cleanup("second").unwrap();
+        assert!(db.attachment_cleanup_candidates().unwrap().is_empty());
     }
 
     #[test]

@@ -1,4 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
+import { createHash } from 'node:crypto';
+import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 import { ADAPTIVE_AGENT_CLI_COMMANDS } from '@adaptive-agent/agent-sdk/cli';
 import type { ResolvedAgentSdkConfig } from '@adaptive-agent/agent-sdk';
@@ -142,7 +146,84 @@ describe('desktop runtime protocol', () => {
       params: { protocolVersion: '2.0', clientInfo: { name: 'desktop' } },
     }))).rejects.toMatchObject({
       code: 'UNSUPPORTED_PROTOCOL_VERSION',
-      data: { supportedProtocolVersions: ['1.10', '1.11', '1.12'] },
+      data: { supportedProtocolVersions: ['1.10', '1.11', '1.12', '1.13'] },
+    });
+  });
+
+  it('translates only immutable files contained by the managed attachment root', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'desktop-attachments-'));
+    const workspace = await mkdtemp(join(tmpdir(), 'desktop-workspace-'));
+    await mkdir(join(root, 'attachment-1'));
+    const content = Buffer.from('attachment contents');
+    await writeFile(join(root, 'attachment-1', 'note.txt'), content);
+    const attachment = {
+      attachmentId: 'attachment-1',
+      kind: 'file' as const,
+      stagedRelativePath: 'attachment-1/note.txt',
+      name: 'note.txt',
+      mimeType: 'text/plain',
+      sizeBytes: content.length,
+      sha256: createHash('sha256').update(content).digest('hex'),
+    };
+    const runRaw = vi.fn(async () => ({ status: 'success', runId: 'execution-1', output: 'done', stepsUsed: 1, usage: {} }));
+    const { runtime } = createRuntime();
+    await runtime.handleRpc(request({
+      id: 'init', method: 'initialize', params: { protocolVersion: '1.13', clientInfo: { name: 'desktop' } },
+    }));
+    Object.assign(runtime as unknown as Record<string, unknown>, {
+      managedAttachmentRoot: root,
+      sdk: { runRaw, config: { workspaceRoot: workspace } },
+    });
+
+    await expect(runtime.handleRpc(request({
+      id: 'run', method: 'agent/run', params: { executionId: 'execution-1', goal: 'read it', attachments: [attachment] },
+    }))).resolves.toMatchObject({ executionId: 'execution-1', mode: 'direct', result: { status: 'success' } });
+    expect(runRaw).toHaveBeenCalledWith('read it', expect.objectContaining({
+      contentParts: [expect.objectContaining({ type: 'file', file: expect.objectContaining({ name: 'note.txt' }) })],
+      executionContext: { fileAccess: {
+        version: 1,
+        workspaceRoot: workspace,
+        attachmentRoots: [join(root, 'attachment-1')],
+        files: [{ path: join(root, 'attachment-1', 'note.txt'), sizeBytes: content.length, sha256: attachment.sha256 }],
+      } },
+    }));
+
+    const outside = `${root}-outside.txt`;
+    await writeFile(outside, content);
+    await mkdir(join(root, 'attachment-2'));
+    await symlink(outside, join(root, 'attachment-2', 'note.txt'));
+    await expect(runtime.handleRpc(request({
+      id: 'escape', method: 'agent/run', params: { executionId: 'execution-2', goal: 'read it', attachments: [{ ...attachment, attachmentId: 'attachment-2', stagedRelativePath: 'attachment-2/note.txt' }] },
+    }))).rejects.toMatchObject({ code: 'ATTACHMENT_PATH_INVALID' });
+    await rm(root, { recursive: true });
+    await rm(workspace, { recursive: true });
+    await rm(outside);
+  });
+
+  it('redacts managed paths and file authority from inspect responses', async () => {
+    const managedRoot = '/private/app/attachments/attachment-1';
+    const inspect = vi.fn(async () => ({
+      run: {
+        id: 'run-1',
+        status: 'succeeded',
+        executionContext: {
+          authorizationRef: 'retained-policy',
+          fileAccess: { version: 1, workspaceRoot: '/workspace', attachmentRoots: [managedRoot] },
+        },
+      },
+      events: [{ payload: { input: { path: `${managedRoot}/notes.txt` } } }],
+    }));
+    const { runtime } = createRuntime();
+    await initialize(runtime);
+    (runtime as unknown as { sdk: unknown }).sdk = { inspect };
+
+    const replay = await runtime.handleRpc(request({
+      id: 'replay', method: 'run/replay', params: { runId: 'run-1' },
+    }));
+    expect(JSON.stringify(replay)).not.toContain(managedRoot);
+    expect(replay).toMatchObject({
+      run: { executionContext: { authorizationRef: 'retained-policy' } },
+      events: [{ payload: { input: { path: '[MANAGED_ATTACHMENT]/notes.txt' } } }],
     });
   });
 
@@ -175,10 +256,16 @@ describe('desktop runtime protocol', () => {
       params: { protocolVersion: '1.10', clientInfo: { name: 'legacy-host' } },
     })) as { capabilities: { methods: string[] } };
     expect(initialized.capabilities.methods).not.toContain('auth/updateAccessToken');
+    expect(initialized.capabilities.methods).not.toContain('history/delete');
     await expect(runtime.handleRpc(request({
       id: 'token',
       method: 'auth/updateAccessToken',
       params: { accessToken: 'secret' },
+    }))).rejects.toMatchObject({ code: 'METHOD_NOT_FOUND' });
+    await expect(runtime.handleRpc(request({
+      id: 'history',
+      method: 'history/delete',
+      params: { target: { kind: 'root-run', rootRunId: 'root' } },
     }))).rejects.toMatchObject({ code: 'METHOD_NOT_FOUND' });
   });
 
@@ -292,6 +379,16 @@ describe('desktop runtime protocol', () => {
       id: 2,
       method: 'cli/execute',
       params: { argv: ['chat'] },
+    }))).rejects.toMatchObject({ code: 'COMMAND_REJECTED' });
+    await expect(runtime.handleRpc(request({
+      id: 3,
+      method: 'cli/execute',
+      params: { argv: ['run', 'describe it', '--image', '/tmp/image.png'] },
+    }))).rejects.toMatchObject({ code: 'COMMAND_REJECTED' });
+    await expect(runtime.handleRpc(request({
+      id: 4,
+      method: 'cli/execute',
+      params: { argv: ['run', 'transcribe it', '--audio', '/tmp/audio.mp3'] },
     }))).rejects.toMatchObject({ code: 'COMMAND_REJECTED' });
   });
 });

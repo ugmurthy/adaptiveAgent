@@ -304,3 +304,9 @@ dd small { display: block; margin-top: 3px; }
   .activity-window-label small { max-width: 48%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .run-status { width: 100%; max-width: none; margin-left: 0; }
 }
+
+.attachment-chips { display: flex; flex-wrap: wrap; gap: .45rem; margin: .5rem 0; }
+.attachment-chip { display: inline-flex; align-items: center; gap: .45rem; border: 1px solid var(--border); border-radius: 999px; padding: .35rem .55rem; background: var(--surface); }
+.attachment-chip small { opacity: .7; }
+.attachment-chip button { border: 0; padding: 0 .2rem; }
+.attachment-control > button { margin-top: .45rem; }

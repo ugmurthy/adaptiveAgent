@@ -1,16 +1,19 @@
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, extname, join } from 'node:path';
 import JSZip from 'jszip';
 
-import type { ToolDefinition } from '../types.js';
-import { buildWorkspacePathRecovery, PathOutsideRootError, resolvePathWithinRoot } from './path-utils.js';
+import type { ToolContext, ToolDefinition } from '../types.js';
+import { buildWorkspacePathRecovery, isPathWithinRoot, PathOutsideRootError, resolvePathWithinRoots } from './path-utils.js';
 import { extractPdfTextWithPdfJs } from './pdf-text.js';
 
 export interface ReadFileToolConfig {
   /** Restrict reads to paths under this root. Defaults to `process.cwd()`. */
   allowedRoot?: string;
+  /** Canonical read roots, or a per-tool-call resolver. Mutually exclusive with allowedRoot. */
+  allowedRoots?: readonly string[] | ((context: ToolContext) => readonly string[]);
   /** Maximum file size in bytes. Defaults to 10 MiB. */
   maxSizeBytes?: number;
   /** Maximum Parquet rows to include in extracted samples. Defaults to 50. */
@@ -290,6 +293,9 @@ const PANDOC_INPUT_FORMAT_BY_EXTENSION: Record<string, string> = {
 };
 
 export function createReadFileTool(config?: ReadFileToolConfig): ToolDefinition {
+  if (config?.allowedRoot !== undefined && config.allowedRoots !== undefined) {
+    throw new TypeError('read_file allowedRoot and allowedRoots are mutually exclusive');
+  }
   const allowedRoot = config?.allowedRoot ?? process.cwd();
   const maxSizeBytes = config?.maxSizeBytes ?? DEFAULT_MAX_SIZE;
   const parquetOptions = {
@@ -337,6 +343,7 @@ export function createReadFileTool(config?: ReadFileToolConfig): ToolDefinition 
         },
       },
     },
+    redact: { inputPaths: ['path'], outputPaths: ['path'] },
     summarizeResult(output) {
       return summarizeReadFileOutput(output as ReadFileOutput);
     },
@@ -359,7 +366,11 @@ export function createReadFileTool(config?: ReadFileToolConfig): ToolDefinition 
       const readInput = input as unknown as ReadFileInput;
       const { path: filePath } = readInput;
       const zipPath = parseZipMemberPath(filePath);
-      const resolved = resolvePathWithinRoot(allowedRoot, zipPath?.archivePath ?? filePath);
+      const configuredRoots = typeof config?.allowedRoots === 'function'
+        ? config.allowedRoots(context)
+        : config?.allowedRoots;
+      const roots = configuredRoots ?? [allowedRoot];
+      const resolved = await resolvePathWithinRoots(roots, zipPath?.archivePath ?? filePath);
 
       const fileStats = await stat(resolved);
       if (fileStats.size > maxSizeBytes) {
@@ -369,6 +380,14 @@ export function createReadFileTool(config?: ReadFileToolConfig): ToolDefinition 
       const contentBuffer = await readFile(resolved);
       if (contentBuffer.byteLength > maxSizeBytes) {
         throw new Error(`File ${resolved} exceeds maximum size of ${maxSizeBytes} bytes`);
+      }
+      const attachmentRoots = context.executionContext?.fileAccess?.attachmentRoots ?? [];
+      if (attachmentRoots.some((root) => isPathWithinRoot(root, resolved))) {
+        const expected = context.executionContext?.fileAccess?.files?.find((file) => file.path === resolved);
+        const hash = createHash('sha256').update(contentBuffer).digest('hex');
+        if (!expected || expected.sizeBytes !== contentBuffer.byteLength || expected.sha256 !== hash) {
+          throw new Error(`Execution attachment changed or lacks integrity metadata: ${filePath}`);
+        }
       }
 
       const content = await readContentAsText(
@@ -422,11 +441,11 @@ async function readContentAsText(
   }
 
   if (pandocInputFormat) {
-    return extractWithPandoc(resolvedPath, pandocInputFormat, signal);
+    return extractFromVerifiedCopy(resolvedPath, contentBuffer, (path) => extractWithPandoc(path, pandocInputFormat, signal));
   }
 
   if (extension === '.parquet') {
-    return extractParquet(resolvedPath, parquetOptions, signal);
+    return extractFromVerifiedCopy(resolvedPath, contentBuffer, (path) => extractParquet(path, parquetOptions, signal));
   }
 
   if (DIRECT_TEXT_EXTENSIONS.has(extension) || isLikelyUtf8Text(contentBuffer)) {
@@ -434,6 +453,21 @@ async function readContentAsText(
   }
 
   throw new Error(`Unsupported binary file format for read_file: ${extension || resolvedPath}`);
+}
+
+async function extractFromVerifiedCopy<T>(
+  sourcePath: string,
+  contentBuffer: Buffer,
+  extract: (path: string) => Promise<T>,
+): Promise<T> {
+  const directory = await mkdtemp(join(tmpdir(), 'adaptive-agent-read-file-'));
+  const path = join(directory, `verified${extname(sourcePath)}`);
+  try {
+    await writeFile(path, contentBuffer, { mode: 0o600 });
+    return await extract(path);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 }
 
 function parseZipMemberPath(filePath: string): { archivePath: string; entryPath: string } | undefined {

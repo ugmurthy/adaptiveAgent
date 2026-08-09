@@ -34,8 +34,16 @@ describe('desktop bridge protocol', () => {
     );
   });
 
-  it('uses a string for protocol 1.12', () => {
-    expect(DESKTOP_PROTOCOL_VERSION).toBe('1.12');
+  it('uses a string for protocol 1.13', () => {
+    expect(DESKTOP_PROTOCOL_VERSION).toBe('1.13');
+  });
+
+  it('strictly validates managed attachment descriptors', () => {
+    const attachment = { attachmentId: 'a1', kind: 'file', stagedRelativePath: 'a1/note.txt', name: 'note.txt', sizeBytes: 3, sha256: 'a'.repeat(64), mimeType: 'text/plain' };
+    expect(parseDesktopRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'agent/run', params: { executionId: 'e1', goal: 'read', attachments: [attachment] } }))).toMatchObject({ method: 'agent/run' });
+    for (const invalid of [{ ...attachment, source: { kind: 'url' } }, { ...attachment, audioFormat: 'wav' }, { ...attachment, sha256: 'bad' }]) {
+      expect(() => parseDesktopRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'agent/run', params: { executionId: 'e1', goal: 'read', attachments: [invalid] } }))).toThrowError(expect.objectContaining({ code: 'INVALID_PARAMS' }));
+    }
   });
 
   it('uses standard JSON-RPC parse, request, method, and params error codes', () => {
@@ -100,6 +108,15 @@ describe('desktop bridge protocol', () => {
       jsonrpc: '2.0', id: 2, method: 'agent/chat',
       params: { runId: 'chat-2', sessionId: 'session-1', transcript: [{ role: 'user', content: 'first' }, { role: 'assistant', content: 'reply' }, { role: 'user', content: 'next' }] },
     }))).toMatchObject({ method: 'agent/chat' });
+    for (const message of [
+      { role: 'user', content: 'describe', images: [{ path: '/tmp/image.png' }] },
+      { role: 'user', content: [{ type: 'image', image: { path: '/tmp/image.png' } }] },
+      { role: 'user', content: [{ type: 'audio', audio: { source: { kind: 'path', path: '/tmp/audio.mp3' } } }] },
+    ]) {
+      expect(() => parseDesktopRpcRequest(JSON.stringify({
+        jsonrpc: '2.0', id: 3, method: 'agent/chat', params: { runId: 'chat-media', transcript: [message] },
+      }))).toThrowError(expect.objectContaining<Partial<DesktopProtocolError>>({ code: 'INVALID_PARAMS' }));
+    }
   });
 
   it('accepts a caller-selected continuation run identity', () => {

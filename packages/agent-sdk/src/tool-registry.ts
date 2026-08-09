@@ -59,7 +59,12 @@ export async function resolveToolsAndDelegates(config: ResolvedAgentSdkConfig, o
 
 function createBuiltinTools(workspaceRoot: string, shellCwd: string, env: NodeJS.ProcessEnv): Map<string, ToolDefinition<any, any>> {
   const tools = new Map<string, ToolDefinition<any, any>>();
-  tools.set('read_file', createReadFileTool({ allowedRoot: workspaceRoot }));
+  tools.set('read_file', createReadFileTool({
+    allowedRoots: (context) => [
+      context.executionContext?.fileAccess?.workspaceRoot ?? workspaceRoot,
+      ...(context.executionContext?.fileAccess?.attachmentRoots ?? []),
+    ],
+  }));
   tools.set('list_directory', createListDirectoryTool({ allowedRoot: workspaceRoot }));
   tools.set('search_files', createSearchFilesTool({ allowedRoot: workspaceRoot }));
   tools.set('write_file', createWriteFileTool({ allowedRoot: workspaceRoot }));

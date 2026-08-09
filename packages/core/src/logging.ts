@@ -218,7 +218,6 @@ function summarizeModelContentPartForLog(part: ModelContentPart) {
   return {
     type: part.type,
     image: {
-      path: part.image.path,
       url: part.image.url,
       mimeType: part.image.mimeType,
       detail: part.image.detail,
@@ -230,7 +229,6 @@ function summarizeModelContentPartForLog(part: ModelContentPart) {
 function summarizeInputSourceForLog(source: { kind: string; path?: string; url?: string; fileId?: string }) {
   return {
     kind: source.kind,
-    path: source.path,
     url: source.url,
     fileId: source.fileId,
   };

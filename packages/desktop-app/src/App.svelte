@@ -35,6 +35,7 @@
     stopRun,
     subscribe,
     type Chat,
+    type AttachmentDraft,
     type DeletionPreview,
     type DesktopState,
     type ProductDeletionTarget,
@@ -71,6 +72,8 @@
   let selectedRecoveryPlan: RunRecoveryPlan | undefined;
   let task = '';
   let chatMessage = '';
+  let taskAttachments: AttachmentDraft[] = [];
+  let chatAttachments: AttachmentDraft[] = [];
   let activityByRoot: Record<string, ActivityEvent[]> = {};
   let resultsByRun: Record<string, { result?: unknown; error?: string }> = {};
   let finalValue: unknown;
@@ -303,8 +306,9 @@
     finalError = '';
     startPending = true;
     try {
-      const started = await startRun(task.trim());
+      const started = await startRun(task.trim(), taskAttachments.map(({ id }) => id));
       task = '';
+      taskAttachments = [];
       selectedRunId = started.runId;
       $workbenchSelection = { kind: 'task', itemId: started.itemId, runId: started.runId };
       const early = resultsByRun[started.runId];
@@ -312,6 +316,7 @@
       finalError = early?.error ?? '';
     } catch (error) {
       finalError = String(error);
+      if (finalError.includes('SUBMISSION_CLAIMED:')) taskAttachments = [];
     }
     startPending = false;
     await refresh();
@@ -322,12 +327,14 @@
     startPending = true;
     finalError = '';
     try {
-      const started = await sendChatTurn(selectedChat.itemId, chatMessage.trim());
+      const started = await sendChatTurn(selectedChat.itemId, chatMessage.trim(), chatAttachments.map(({ id }) => id));
       selectedRunId = started.runId;
       chatMessage = '';
+      chatAttachments = [];
       selectedChat = await loadChat(selectedChat.itemId);
     } catch (error) {
       finalError = String(error);
+      if (finalError.includes('SUBMISSION_CLAIMED:')) chatAttachments = [];
     }
     startPending = false;
     await refresh();
@@ -628,6 +635,9 @@
           configuration={desktop.configuration}
           capacityAvailable={desktop.occupiedSlotCount < desktop.capacity}
           onsubmit={submitNew}
+          attachments={taskAttachments}
+          onattachments={(value) => taskAttachments = value}
+          onerror={(message)=>finalError=message}
         />
       {:else if $workbenchSelection.kind === 'task' && selectedRun}
         <TaskWorkspace
@@ -663,6 +673,9 @@
           ondelete={requestDeletion}
           oninspect={() => { $inspectorOpen = true; }}
           onshowtitle={(kind, title) => { titlePreview = { kind, title }; }}
+          attachments={chatAttachments}
+          onattachments={(value) => chatAttachments = value}
+          onerror={(message)=>finalError=message}
         />
       {:else if $workbenchSelection.kind === 'settings'}
         <SettingsPanel {desktop} pending={controlPending} error={settingsError} onreload={reload} onsave={save} />
