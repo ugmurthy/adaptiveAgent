@@ -13,10 +13,10 @@ import {
   type AdaptiveAgentCliCommand,
   type ManualTestCliOptions,
 } from '@adaptive-agent/agent-sdk/cli';
-import type { AgentEvent, JsonValue, UUID } from '@adaptive-agent/core';
+import type { AgentEvent, ChatMessage, JsonValue, ModelContentPart, UUID } from '@adaptive-agent/core';
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { mkdir, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { dirname, isAbsolute, relative, resolve } from 'node:path';
 import {
   GatewayClient,
   type InferenceMode,
@@ -33,6 +33,8 @@ import {
   DesktopProtocolError,
   type CliExecuteParams,
   type DesktopClientInfo,
+  type DesktopAttachmentInput,
+  type DesktopChatMessage,
   type DesktopMessage,
   type DesktopProtocolVersion,
   type DesktopRpcRequest,
@@ -90,6 +92,7 @@ const RUN_REFERENCING_CLI_COMMANDS = new Set<ManualTestCliOptions['command']>([
 export class DesktopRuntime {
   private sdk: AgentSdk | undefined;
   private sdkInitialization: Promise<AgentSdk> | undefined;
+  private managedAttachmentRoot: string | undefined;
   private rpcInitialized = false;
   private clientInfo: DesktopClientInfo | undefined;
   private negotiatedProtocolVersion: DesktopProtocolVersion = DESKTOP_PROTOCOL_VERSION;
@@ -130,9 +133,16 @@ export class DesktopRuntime {
     if (this.negotiatedProtocolVersion === '1.10' && request.method === 'auth/updateAccessToken') {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', 'auth/updateAccessToken requires desktop protocol 1.11.', JSON_RPC_ERROR_CODES.methodNotFound);
     }
-    if (this.negotiatedProtocolVersion !== DESKTOP_PROTOCOL_VERSION
+    if ((this.negotiatedProtocolVersion === '1.10' || this.negotiatedProtocolVersion === '1.11')
       && (request.method.startsWith('history/') || request.method === 'settings/update')) {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', `${request.method} requires desktop protocol 1.12.`, JSON_RPC_ERROR_CODES.methodNotFound);
+    }
+    if (this.negotiatedProtocolVersion !== DESKTOP_PROTOCOL_VERSION
+      && request.method.startsWith('execution/')) {
+      throw new DesktopProtocolError('METHOD_NOT_FOUND', `${request.method} requires desktop protocol 1.13.`, JSON_RPC_ERROR_CODES.methodNotFound);
+    }
+    if (this.negotiatedProtocolVersion !== '1.13' && hasV113Fields(request)) {
+      throw new DesktopProtocolError('INVALID_PARAMS', 'Attachment and execution-envelope fields require desktop protocol 1.13.', JSON_RPC_ERROR_CODES.invalidParams);
     }
 
     switch (request.method) {
@@ -153,21 +163,50 @@ export class DesktopRuntime {
         const params = request.params!;
         this.validateExecutionSelection(params);
         const sdk = this.requireSdk();
-        return asJsonValue(await sdk.runRaw(params.goal, {
-          runId: asRunId(params.runId),
+        const executionId = params.executionId ?? params.runId!;
+        rejectUnsupportedMedia(params.attachments ?? []);
+        const parts = await this.validateAndTranslateAttachments(params.attachments ?? []);
+        const fileAccess = this.fileAccessContext(params.attachments ?? []);
+        const result = await sdk.runRaw(params.goal, {
+          runId: asRunId(executionId),
           ...(params.sessionId ? { sessionId: params.sessionId } : {}),
           ...(params.input === undefined ? {} : { input: params.input }),
+          ...(parts.length ? { contentParts: parts } : {}),
+          ...(fileAccess ? { executionContext: { fileAccess } } : {}),
           ...(params.inferenceTier ? { inferenceTier: params.inferenceTier } : {}),
-        }));
+        });
+        return params.executionId ? executionResult(executionId, 'direct', result) : asJsonValue(result);
       }
       case 'agent/chat': {
         const params = request.params!;
         this.validateExecutionSelection(params);
-        return asJsonValue(await this.requireSdk().chatRaw(params.transcript, {
-          runId: asRunId(params.runId),
+        const executionId = params.executionId ?? params.runId!;
+        const attachments = params.executionId ? desktopTranscriptAttachments(params.transcript as DesktopChatMessage[]) : [];
+        rejectUnsupportedMedia(attachments);
+        const transcript = params.executionId ? await this.translateDesktopTranscript(params.transcript as DesktopChatMessage[]) : params.transcript as ChatMessage[];
+        const fileAccess = this.fileAccessContext(attachments);
+        const result = await this.requireSdk().chatRaw(transcript, {
+          runId: asRunId(executionId),
+          ...(params.chatSessionId ? { sessionId: params.chatSessionId } : {}),
           ...(params.sessionId ? { sessionId: params.sessionId } : {}),
           ...(params.inferenceTier ? { inferenceTier: params.inferenceTier } : {}),
-        }));
+          ...(fileAccess ? { executionContext: { fileAccess } } : {}),
+        });
+        return params.executionId ? executionResult(executionId, 'direct', result) : asJsonValue(result);
+      }
+      case 'execution/inspect': {
+        const id = request.params!.executionId;
+        const run = await this.requireSdk().inspect(asRunId(id));
+        return asJsonValue({ executionId: id, mode: 'direct', status: run.run?.status ?? 'not_found', finalRunId: run.run?.id, traceTarget: { kind: 'root-run', rootRunId: id } });
+      }
+      case 'execution/interrupt': {
+        const id = request.params!.executionId;
+        await this.requireSdk().interrupt(asRunId(id));
+        return { executionId: id, interrupted: true };
+      }
+      case 'execution/resume': {
+        const id = request.params!.executionId;
+        return asJsonValue(executionResult(id, 'direct', await this.requireSdk().resumeRaw(asRunId(id))));
       }
       case 'run/resume':
         return asJsonValue(await this.requireSdk().resumeRaw(asRunId(request.params!.runId)));
@@ -190,11 +229,11 @@ export class DesktopRuntime {
         await this.requireSdk().interrupt(asRunId(request.params!.runId));
         return { runId: request.params!.runId, interrupted: true };
       case 'run/inspect':
-        return asJsonValue(await this.requireSdk().inspect(asRunId(request.params!.runId)));
+        return sanitizeInspection(await this.requireSdk().inspect(asRunId(request.params!.runId)));
       case 'run/replay': {
         const runId = asRunId(request.params!.runId);
         const inspection = await this.requireSdk().inspect(runId);
-        return asJsonValue({ runId, run: inspection.run, eventCount: inspection.events.length, events: inspection.events });
+        return sanitizeInspection({ runId, run: inspection.run, eventCount: inspection.events.length, events: inspection.events });
       }
       case 'run/steer': {
         const params = request.params!;
@@ -265,7 +304,8 @@ export class DesktopRuntime {
       capabilities: {
         methods: DESKTOP_RPC_METHODS.filter((method) => {
           if (this.negotiatedProtocolVersion === '1.10' && method === 'auth/updateAccessToken') return false;
-          if (this.negotiatedProtocolVersion !== DESKTOP_PROTOCOL_VERSION && method.startsWith('history/')) return false;
+          if (this.negotiatedProtocolVersion === '1.10' || this.negotiatedProtocolVersion === '1.11') if (method.startsWith('history/') || method === 'settings/update') return false;
+          if (this.negotiatedProtocolVersion !== '1.13' && method.startsWith('execution/')) return false;
           return true;
         }),
         notifications: ['runtime/ready', 'agent/event', 'cli/output'],
@@ -275,6 +315,7 @@ export class DesktopRuntime {
           transport: 'child-process',
           output: 'streamed-notifications',
         },
+        ...(this.negotiatedProtocolVersion === '1.13' ? { attachments: attachmentCapabilities(false, 'Initialize the runtime with managedAttachmentRoot.') } : {}),
       },
     };
   }
@@ -318,6 +359,14 @@ export class DesktopRuntime {
     }
 
     const inferenceMode = params.inferenceMode ?? (params.profileRef?.source === 'server' ? 'gateway' : undefined);
+    if (params.managedAttachmentRoot) {
+      const requestedRoot = params.managedAttachmentRoot;
+      const canonicalRoot = await realpath(requestedRoot).catch(() => { throw new DesktopProtocolError('ATTACHMENTS_UNAVAILABLE', 'managedAttachmentRoot must be an existing canonical directory.', JSON_RPC_ERROR_CODES.invalidParams); });
+      if (!isAbsolute(requestedRoot) || resolve(requestedRoot) !== requestedRoot || canonicalRoot !== requestedRoot || !(await stat(canonicalRoot)).isDirectory()) {
+        throw new DesktopProtocolError('ATTACHMENTS_UNAVAILABLE', 'managedAttachmentRoot must be an existing canonical directory.', JSON_RPC_ERROR_CODES.invalidParams);
+      }
+      this.managedAttachmentRoot = canonicalRoot;
+    }
     if (params.profileRef?.source === 'local') {
       throw new DesktopProtocolError('INVALID_PARAMS', 'runtime/initialize profileRef currently supports exact server profile refs; use agentConfigPath for local profiles.', JSON_RPC_ERROR_CODES.invalidParams);
     }
@@ -426,6 +475,7 @@ export class DesktopRuntime {
           sqlite: sdk.config.runtime.mode === 'sqlite' ? 'connected' : 'not_configured',
           gateway: gatewayClient?.connectionState ?? 'not_configured',
         },
+        attachments: attachmentCapabilities(Boolean(this.managedAttachmentRoot), this.managedAttachmentRoot ? undefined : 'managedAttachmentRoot was not configured.'),
       };
     } catch (error) {
       await this.sdk?.close().catch(() => undefined);
@@ -546,6 +596,13 @@ export class DesktopRuntime {
         { command: parsed.command },
       );
     }
+    if (!parsed.help && (parsed.imagePaths.length > 0 || parsed.audioPaths.length > 0)) {
+      throw new DesktopProtocolError(
+        'COMMAND_REJECTED',
+        'cli/execute image and audio inputs are unavailable; use managed desktop attachments.',
+        JSON_RPC_ERROR_CODES.commandRejected,
+      );
+    }
     if (parsed.command === 'chat' && !parsed.help && !parsed.promptFilePath && parsed.goalArgs.length === 0 && params.stdin === undefined) {
       throw new DesktopProtocolError(
         'COMMAND_REJECTED',
@@ -616,6 +673,99 @@ export class DesktopRuntime {
     }
     return this.sdk;
   }
+
+  private async validateAndTranslateAttachments(inputs: DesktopAttachmentInput[]): Promise<ModelContentPart[]> {
+    if (!inputs.length) return [];
+    if (!this.managedAttachmentRoot) throw new DesktopProtocolError('ATTACHMENTS_UNAVAILABLE', 'managedAttachmentRoot is not configured.', JSON_RPC_ERROR_CODES.commandRejected);
+    return Promise.all(inputs.map(async (input) => {
+      if (isAbsolute(input.stagedRelativePath) || input.stagedRelativePath.split(/[\\/]/).includes('..')) throw attachmentError('ATTACHMENT_PATH_INVALID', input.attachmentId);
+      const components = input.stagedRelativePath.split(/[\\/]/);
+      if (components.length !== 2 || components[0] !== input.attachmentId || components[1] !== input.name) throw attachmentError('ATTACHMENT_PATH_INVALID', input.attachmentId);
+      const lexical = resolve(this.managedAttachmentRoot!, input.stagedRelativePath);
+      const canonical = await realpath(lexical).catch(() => { throw attachmentError('ATTACHMENT_NOT_FOUND', input.attachmentId); });
+      const rel = relative(this.managedAttachmentRoot!, canonical);
+      if (!rel || rel.startsWith('..') || isAbsolute(rel)) throw attachmentError('ATTACHMENT_PATH_INVALID', input.attachmentId);
+      const info = await stat(canonical);
+      if (!info.isFile() || info.size !== input.sizeBytes) throw attachmentError('ATTACHMENT_CHANGED', input.attachmentId);
+      const hash = createHash('sha256').update(await readFile(canonical)).digest('hex');
+      if (hash !== input.sha256) throw attachmentError('ATTACHMENT_CHANGED', input.attachmentId);
+      if (input.kind === 'image') return { type: 'image', image: { path: canonical, name: input.name, ...(input.mimeType ? { mimeType: input.mimeType } : {}) } };
+      if (input.kind === 'audio') return { type: 'audio', audio: { source: { kind: 'path', path: canonical }, name: input.name, ...(input.mimeType ? { mimeType: input.mimeType } : {}), ...(input.audioFormat ? { format: input.audioFormat } : {}) } };
+      return { type: 'file', file: { source: { kind: 'path', path: canonical }, name: input.name, ...(input.mimeType ? { mimeType: input.mimeType } : {}) } };
+    }));
+  }
+
+  private async translateDesktopTranscript(messages: DesktopChatMessage[]): Promise<ChatMessage[]> {
+    return Promise.all(messages.map(async (message) => ({ role: message.role, content: message.attachments?.length ? [{ type: 'text', text: message.text }, ...await this.validateAndTranslateAttachments(message.attachments)] : message.text })));
+  }
+
+  private fileAccessContext(inputs: DesktopAttachmentInput[]) {
+    if (!inputs.length || !this.managedAttachmentRoot) return undefined;
+    return {
+      version: 1 as const,
+      workspaceRoot: this.requireSdk().config.workspaceRoot,
+      attachmentRoots: [...new Set(inputs.map((input) => resolve(this.managedAttachmentRoot!, input.attachmentId)))],
+      files: inputs.map((input) => ({
+        path: resolve(this.managedAttachmentRoot!, input.stagedRelativePath),
+        sizeBytes: input.sizeBytes,
+        sha256: input.sha256,
+      })),
+    };
+  }
+}
+
+function desktopTranscriptAttachments(messages: DesktopChatMessage[]): DesktopAttachmentInput[] { return messages.flatMap((message) => message.attachments ?? []); }
+function attachmentError(code: string, id: string): DesktopProtocolError { return new DesktopProtocolError(code, `Attachment ${id} failed managed-file validation.`, JSON_RPC_ERROR_CODES.invalidParams); }
+function attachmentCapabilities(enabled: boolean, reason?: string): JsonValue { return { enabled, maxFileBytes: 10 * 1024 * 1024, maxAttachmentCount: 8, maxSubmissionBytes: 40 * 1024 * 1024, acceptedKinds: ['file'], supportedGenericMimeTypes: ['application/octet-stream', 'application/pdf', 'text/plain', 'application/json'], routing: { taskGeneric: 'direct', chatGeneric: 'direct' }, ...(reason ? { reason } : {}) }; }
+function rejectUnsupportedMedia(inputs: DesktopAttachmentInput[]): void {
+  if (inputs.some((input) => input.kind !== 'file')) throw new DesktopProtocolError('UNSUPPORTED_ATTACHMENT_KIND', 'Desktop protocol 1.13 currently supports generic file attachments only.', JSON_RPC_ERROR_CODES.commandRejected);
+}
+function executionResult(executionId: string, mode: 'direct' | 'catalog', result: any, stages?: any[]): JsonValue { return asJsonValue({ executionId, mode, status: result.status, finalRunId: result.runId, traceTarget: mode === 'direct' ? { kind: 'root-run', rootRunId: executionId } : { kind: 'session', sessionId: executionId }, ...(stages ? { stages } : {}), result }); }
+function hasV113Fields(request: DesktopRpcRequest): boolean {
+  const visit = (value: unknown): boolean => Array.isArray(value)
+    ? value.some(visit)
+    : Boolean(value && typeof value === 'object' && Object.entries(value).some(([key, nested]) => ['executionId', 'attachments', 'chatSessionId', 'managedAttachmentRoot'].includes(key) || visit(nested)));
+  return visit(request.params);
+}
+
+function sanitizeInspection(inspection: unknown): JsonValue {
+  const value = asJsonValue(inspection);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const run = value.run;
+  if (!run || typeof run !== 'object' || Array.isArray(run)) return value;
+  const executionContext = run.executionContext;
+  const fileAccess = executionContext && typeof executionContext === 'object' && !Array.isArray(executionContext)
+    ? executionContext.fileAccess
+    : undefined;
+  const roots = fileAccess && typeof fileAccess === 'object' && !Array.isArray(fileAccess) && Array.isArray(fileAccess.attachmentRoots)
+    ? fileAccess.attachmentRoots.filter((root): root is string => typeof root === 'string')
+    : [];
+  redactStrings(value, roots);
+  const sanitizedExecutionContext = run.executionContext;
+  if (sanitizedExecutionContext && typeof sanitizedExecutionContext === 'object' && !Array.isArray(sanitizedExecutionContext)) {
+    delete sanitizedExecutionContext.fileAccess;
+  }
+  return value;
+}
+
+function redactStrings(value: JsonValue, roots: readonly string[]): void {
+  if (!value || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      const item = value[index];
+      if (typeof item === 'string') value[index] = redactRootStrings(item, roots);
+      else redactStrings(item, roots);
+    }
+    return;
+  }
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item === 'string') value[key] = redactRootStrings(item, roots);
+    else redactStrings(item, roots);
+  }
+}
+
+function redactRootStrings(value: string, roots: readonly string[]): string {
+  return roots.reduce((text, root) => text.replaceAll(root, '[MANAGED_ATTACHMENT]'), value);
 }
 
 export function updateDesktopSettings(

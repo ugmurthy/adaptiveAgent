@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, writeFile, mkdir, rm, readFile, stat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdtemp, writeFile, mkdir, rm, readFile, stat, symlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import JSZip from 'jszip';
@@ -63,6 +64,45 @@ describe('createReadFileTool', () => {
     const result = (await tool.execute({ path: absPath } as any, stubToolContext())) as any;
 
     expect(result.content).toBe('Hello world');
+  });
+
+  it('reads workspace-relative and execution-scoped absolute attachment paths', async () => {
+    const attachmentRoot = await mkdtemp(join(tmpdir(), 'read-file-attachment-'));
+    await writeFile(join(attachmentRoot, 'owned.txt'), 'owned attachment');
+    const tool = createReadFileTool({
+      allowedRoots: (context) => [tempDir, ...context.executionContext!.fileAccess!.attachmentRoots],
+    });
+    const context = stubToolContext({
+      executionContext: { fileAccess: {
+        version: 1,
+        workspaceRoot: tempDir,
+        attachmentRoots: [attachmentRoot],
+        files: [{
+          path: join(attachmentRoot, 'owned.txt'),
+          sizeBytes: 16,
+          sha256: createHash('sha256').update('owned attachment').digest('hex'),
+        }],
+      } },
+    });
+
+    expect((await tool.execute({ path: 'hello.txt' } as any, context) as any).content).toBe('Hello world');
+    expect((await tool.execute({ path: join(attachmentRoot, 'owned.txt') } as any, context) as any).content).toBe('owned attachment');
+    await writeFile(join(attachmentRoot, 'owned.txt'), 'tampered content');
+    await expect(tool.execute({ path: join(attachmentRoot, 'owned.txt') } as any, context)).rejects.toThrow(
+      'Execution attachment changed',
+    );
+    await rm(attachmentRoot, { recursive: true, force: true });
+  });
+
+  it('rejects symlink escapes and roots belonging to another execution', async () => {
+    const otherRoot = await mkdtemp(join(tmpdir(), 'read-file-other-'));
+    await writeFile(join(otherRoot, 'secret.txt'), 'secret');
+    await symlink(join(otherRoot, 'secret.txt'), join(tempDir, 'escape.txt'));
+    const tool = createReadFileTool({ allowedRoots: [tempDir] });
+
+    await expect(tool.execute({ path: 'escape.txt' } as any, stubToolContext())).rejects.toThrow('outside the allowed root');
+    await expect(tool.execute({ path: join(otherRoot, 'secret.txt') } as any, stubToolContext())).rejects.toThrow('outside the allowed root');
+    await rm(otherRoot, { recursive: true, force: true });
   });
 
   it('normalizes alternate absolute paths that clearly embed the workspace root name', async () => {
@@ -181,7 +221,7 @@ describe('createReadFileTool', () => {
 
     expect(result.content).toContain('| name | value |');
     expect(extractWithPandoc).toHaveBeenCalledWith(
-      join(tempDir, 'sheet.xlsx'),
+      expect.stringMatching(/verified\.xlsx$/),
       'xlsx',
       expect.any(AbortSignal),
     );
@@ -201,7 +241,7 @@ describe('createReadFileTool', () => {
 
     expect(result.content).toContain('"format":"parquet"');
     expect(extractParquet).toHaveBeenCalledWith(
-      join(tempDir, 'sample.parquet'),
+      expect.stringMatching(/verified\.parquet$/),
       { maxRows: 2, maxCellLength: 10 },
       expect.any(AbortSignal),
     );
@@ -265,7 +305,7 @@ describe('createReadFileTool', () => {
 
     expect(result.content).toBe('# Converted document');
     expect(extractWithPandoc).toHaveBeenCalledWith(
-      expect.stringMatching(/report\.docx$/),
+      expect.stringMatching(/verified\.docx$/),
       'docx',
       expect.any(AbortSignal),
     );
@@ -287,10 +327,26 @@ describe('createReadFileTool', () => {
 
     expect(result.content).toBe('| applicant | qualifications |');
     expect(extractWithPandoc).toHaveBeenCalledWith(
-      expect.stringMatching(/Applicants\.xlsx$/),
+      expect.stringMatching(/verified\.xlsx$/),
       'xlsx',
       expect.any(AbortSignal),
     );
+  });
+
+  it('extracts from verified bytes when the source changes after reading', async () => {
+    const sourcePath = join(tempDir, 'sheet.xlsx');
+    const original = Buffer.from([0x50, 0x4b, 0x03, 0x04]);
+    await writeFile(sourcePath, original);
+    const extractWithPandoc = vi.fn(async (verifiedPath: string) => {
+      await writeFile(sourcePath, 'changed after verification');
+      expect(await readFile(verifiedPath)).toEqual(original);
+      return 'verified content';
+    });
+    const tool = createReadFileTool({ allowedRoot: tempDir, extractWithPandoc });
+
+    const result = (await tool.execute({ path: 'sheet.xlsx' } as any, stubToolContext())) as any;
+
+    expect(result.content).toBe('verified content');
   });
 
   it('rejects binary members from ZIP archives', async () => {

@@ -1,5 +1,4 @@
-export { createReadFileTool } from './read-file.js';
-export type { ReadFileToolConfig } from './read-file.js';
+export { createReadFileTool, type ReadFileToolConfig } from './read-file.js';
 
 export { createListDirectoryTool } from './list-directory.js';
 export type { ListDirectoryToolConfig } from './list-directory.js';

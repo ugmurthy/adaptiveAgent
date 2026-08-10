@@ -1,4 +1,5 @@
 import { PassThrough } from 'node:stream';
+import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -186,6 +187,71 @@ describe('AdaptiveAgent', () => {
     await expect(agent.run({ sessionId: 'invalid', goal: 'Reject cycles', executionContext: cyclic as never })).rejects.toThrow(/executionContext/);
     await expect(agent.run({ sessionId: 'invalid', goal: 'Reject class instances', executionContext: new Date() as never })).rejects.toThrow(/executionContext/);
     expect(await runStore.listBySession('invalid')).toEqual([]);
+  });
+
+  it('authorizes path-backed inputs only within canonical execution file roots', async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), 'agent-workspace-'));
+    const attachmentRoot = await mkdtemp(join(tmpdir(), 'agent-attachment-'));
+    const outsideRoot = await mkdtemp(join(tmpdir(), 'agent-outside-'));
+    try {
+      const attachedPath = join(attachmentRoot, 'notes.txt');
+      const outsidePath = join(outsideRoot, 'secret.txt');
+      await writeFile(attachedPath, 'attached');
+      await writeFile(outsidePath, 'secret');
+      const model = new SequenceModel([{ finishReason: 'stop', text: 'done' }], 'mesh');
+      const runStore = new InMemoryRunStore();
+      const agent = new AdaptiveAgent({
+        model,
+        tools: [],
+        runStore,
+        eventStore: new InMemoryEventStore(),
+        snapshotStore: new InMemorySnapshotStore(),
+        defaults: { fileInputPolicy: 'provider_native' },
+      });
+      const executionContext = {
+        fileAccess: {
+          version: 1 as const,
+          workspaceRoot,
+          attachmentRoots: [attachmentRoot],
+          files: [{
+            path: attachedPath,
+            sizeBytes: 8,
+            sha256: createHash('sha256').update('attached').digest('hex'),
+          }],
+        },
+      };
+
+      await agent.run({
+        sessionId: 'authorized-file',
+        goal: 'Read the attachment',
+        executionContext,
+        contentParts: [{ type: 'file', file: { source: { kind: 'path', path: attachedPath }, name: 'notes.txt' } }],
+      });
+      expect(model.receivedRequests[0]?.messages).toEqual(expect.arrayContaining([
+        expect.objectContaining({ content: expect.arrayContaining([
+          expect.objectContaining({ type: 'file', file: expect.objectContaining({ source: { kind: 'url', url: 'data:application/octet-stream;base64,YXR0YWNoZWQ=' } }) }),
+        ]) }),
+      ]));
+
+      await writeFile(attachedPath, 'tampered');
+      await expect(agent.run({
+        sessionId: 'changed-attachment',
+        goal: 'Read changed attachment',
+        executionContext,
+        contentParts: [{ type: 'file', file: { source: { kind: 'path', path: attachedPath }, name: 'notes.txt' } }],
+      })).rejects.toThrow('Execution attachment changed');
+      await writeFile(attachedPath, 'attached');
+
+      await expect(agent.run({
+        sessionId: 'unauthorized-file',
+        goal: 'Read outside authority',
+        executionContext,
+        contentParts: [{ type: 'file', file: { source: { kind: 'path', path: outsidePath }, name: 'secret.txt' } }],
+      })).rejects.toThrow('outside the allowed root');
+      expect(await runStore.listBySession('unauthorized-file')).toEqual([]);
+    } finally {
+      await Promise.all([workspaceRoot, attachmentRoot, outsideRoot].map((path) => rm(path, { recursive: true, force: true })));
+    }
   });
 
   it('stores an immutable copy and always inherits the parent execution context', async () => {

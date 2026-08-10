@@ -31,12 +31,14 @@ export interface DesktopState {
   traceError?: string;
   quitState: 'idle' | 'confirming' | 'draining' | 'approved';
 }
+export type DesktopAttachmentKind='file'|'image'|'audio';
+export interface AttachmentDraft { id:string; name:string; kind:DesktopAttachmentKind; sizeBytes:number; mimeType?:string; }
 
 export interface PendingApproval { rootRunId:string; approvalRunId:string; approvalId:string; parentRunId?:string; toolName:string; message:string; decisionInFlight:boolean; }
 export interface RunSummary { itemId: string; runId: string; title: string; createdAt: string; invocationKind: 'run'|'chat'; status: string; cancelRequested: boolean; occupiesSlot: boolean; steerable: boolean; artifactsAvailable: boolean; artifactsUnavailableReason?: string; pendingApproval?:PendingApproval; }
 export interface RunRecoveryPlan { runId:string; status:string; action:'resume_same_run'|'retry_same_run'|'continue_new_run'|'requires_user_action'|'requires_reconciliation'|'not_recoverable'; executable:boolean; reason:string; }
-export interface StartedRun { itemId: string; runId: string; }
-export interface ChatMessage { id: string; ordinal: number; role: 'user'|'assistant'; content: string; runId?: string; }
+export interface StartedRun { itemId: string; runId: string; executionId:string; mode:'direct'|'catalog'; }
+export interface ChatMessage { id: string; ordinal: number; role: 'user'|'assistant'; content: string; runId?: string; attachments?:AttachmentDraft[]; }
 export interface Chat { itemId:string; title:string; createdAt:string; sessionId:string; pinnedAgentId:string; pinnedAgentName:string; pinnedAgentFingerprint:string; messages:ChatMessage[]; readOnlyReason?:string; occupied:boolean; }
 export type ProductDeletionTarget = {kind:'item';itemId:string}|{kind:'run';runId:string}|{kind:'chat-turn';itemId:string;ordinal:number};
 export interface DeletionPreview { target:ProductDeletionTarget; label:string; runCount:number; planCount:number; occupied:boolean; warning:string; }
@@ -62,7 +64,9 @@ export interface RunFinishedEvent { runId: string; result?: unknown; error?: str
 export const getDesktopState = () => invoke<DesktopState>('desktop_state');
 export const reloadSettings = () => invoke<DesktopState>('reload_settings');
 export const saveSettings = (settings: EditableDesktopSettings) => invoke<DesktopState>('save_settings', { settings });
-export const startRun = (task: string) => invoke<StartedRun>('start_run', { task });
+export const selectAttachments=(existingAttachmentIds:string[]=[])=>invoke<AttachmentDraft[]>('select_attachments',{existingAttachmentIds});
+export const discardAttachmentDraft=(attachmentId:string)=>invoke<void>('discard_attachment_draft',{attachmentId});
+export const startRun = (task: string,attachmentIds:string[]=[]) => invoke<StartedRun>('start_run', { task,attachmentIds });
 export const stopRun = (runId: string) => invoke<void>('stop_run', { runId });
 export const getRunRecoveryPlan = (runId:string) => invoke<RunRecoveryPlan>('get_run_recovery_plan',{runId});
 export const recoverRun = (plan:RunRecoveryPlan) => invoke<void>('recover_run',{
@@ -77,7 +81,7 @@ export const resolveApproval = (pending:PendingApproval,approved:boolean) => inv
 export const createChat = (title:string) => invoke<Chat>('create_chat',{title});
 export const listChats = () => invoke<Chat[]>('list_chats');
 export const loadChat = (itemId:string) => invoke<Chat>('load_chat',{itemId});
-export const sendChatTurn = (itemId:string,content:string) => invoke<StartedRun>('send_chat_turn',{itemId,content});
+export const sendChatTurn = (itemId:string,content:string,attachmentIds:string[]=[]) => invoke<StartedRun>('send_chat_turn',{itemId,content,attachmentIds});
 export const previewHistoryDeletion = (target:ProductDeletionTarget) => invoke<DeletionPreview>('preview_history_deletion',{target});
 export const deleteHistory = (target:ProductDeletionTarget) => invoke<void>('delete_history',{target});
 export const listWorkspaceArtifacts = () => invoke<WorkspaceArtifact[]>('list_workspace_artifacts');

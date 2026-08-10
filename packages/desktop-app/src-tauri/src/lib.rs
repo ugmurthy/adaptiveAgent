@@ -1,9 +1,11 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+mod attachments;
 mod registry;
 mod shutdown;
 mod workbench;
+use attachments::{AttachmentDraft, MAX_ATTACHMENT_COUNT, MAX_SUBMISSION_BYTES};
 use registry::{CancelAction, RunRecord, RunRegistry, CAPACITY};
 use shutdown::{CloseDecision, QuitCoordinator, QuitState};
 use std::{
@@ -17,6 +19,7 @@ use std::{
     time::Duration,
 };
 use tauri::{AppHandle, Emitter, Manager};
+use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent},
     ShellExt,
@@ -114,6 +117,8 @@ struct RunSummary {
 struct StartedRun {
     item_id: String,
     run_id: String,
+    execution_id: String,
+    mode: String,
 }
 
 #[derive(Serialize)]
@@ -175,6 +180,7 @@ struct Bridge {
     run_delegates: Mutex<HashMap<String, String>>,
     submission: Mutex<()>,
     workbench: Arc<WorkbenchDb>,
+    attachment_root: PathBuf,
     expected_shutdown: AtomicBool,
     configuration: Mutex<Option<Value>>,
     initialization_error: Mutex<Option<String>>,
@@ -422,10 +428,44 @@ impl TraceBridge {
 }
 
 impl Bridge {
+    fn validated_drafts(&self, ids: &[String]) -> Result<Vec<AttachmentDraft>, String> {
+        if ids.len() > MAX_ATTACHMENT_COUNT {
+            return Err("ATTACHMENT_TOO_LARGE: At most 8 attachments are allowed.".into());
+        }
+        let mut unique = HashSet::new();
+        if ids.iter().any(|id| !unique.insert(id)) {
+            return Err("Duplicate attachment ID.".into());
+        }
+        let drafts = self.workbench.get_drafts(ids)?;
+        let mut total = 0;
+        for draft in &drafts {
+            attachments::validate_staged(&self.attachment_root, draft)?;
+            total += draft.size_bytes;
+        }
+        if total > MAX_SUBMISSION_BYTES {
+            return Err("ATTACHMENT_TOO_LARGE: Attachments exceed 40 MiB total.".into());
+        }
+        Ok(drafts)
+    }
     fn spawn(app: &AppHandle, workbench: Arc<WorkbenchDb>) -> Result<Arc<Self>, String> {
         // Complete all fallible persistence reads before creating a child process so every
         // spawned runtime can be published to, and shut down through, the native lifecycle.
         let saved_runs = workbench.load_runs()?;
+        let attachment_root = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| e.to_string())?
+            .join("attachments");
+        std::fs::create_dir_all(&attachment_root)
+            .map_err(|e| format!("Unable to create attachment store: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&attachment_root, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("Unable to secure attachment store: {e}"))?;
+        }
+        cleanup_attachments(&workbench, &attachment_root)?;
+        cleanup_attachment_orphans(&workbench, &attachment_root)?;
         let (mut events, child) = app
             .shell()
             .sidecar("agent-runtime")
@@ -443,6 +483,7 @@ impl Bridge {
             run_roots: Mutex::new(HashMap::new()),
             run_delegates: Mutex::new(HashMap::new()),
             workbench,
+            attachment_root,
             submission: Mutex::new(()),
             expected_shutdown: AtomicBool::new(false),
             configuration: Mutex::new(None),
@@ -528,15 +569,15 @@ impl Bridge {
     fn initialize(self: &Arc<Self>) -> Result<(), String> {
         let negotiated = self.request_wait(
             "initialize",
-            json!({ "protocolVersion": "1.12", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }),
+            json!({ "protocolVersion": "1.13", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }),
             REQUEST_TIMEOUT,
         )?;
-        if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.12") {
-            return Err("The sidecar did not negotiate desktop protocol 1.12.".into());
+        if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.13") {
+            return Err("The sidecar did not negotiate desktop protocol 1.13.".into());
         }
         let initialized = self.request_wait(
             "runtime/initialize",
-            json!({ "configurationDriven": true }),
+            json!({ "configurationDriven": true, "managedAttachmentRoot": self.attachment_root }),
             REQUEST_TIMEOUT,
         )?;
         let configuration = initialized
@@ -1068,9 +1109,10 @@ impl Bridge {
                 }
             }
             let delegate_name = self.run_delegates.lock().unwrap().get(run_id).cloned();
-            if let Some(projected) =
+            if let Some(mut projected) =
                 project_activity_event(event, &root_run_id, delegate_name.as_deref())
             {
+                redact_managed_attachment_paths(&mut projected, &self.attachment_root);
                 let _ = self.app.emit("adaptive-agent://activity", projected);
             }
             if matches!(
@@ -1349,7 +1391,11 @@ impl Bridge {
         });
     }
 
-    fn start_run(self: &Arc<Self>, task: String) -> Result<StartedRun, String> {
+    fn start_run(
+        self: &Arc<Self>,
+        task: String,
+        attachment_ids: Vec<String>,
+    ) -> Result<StartedRun, String> {
         let _submission = self.submission.lock().unwrap();
         if self.draining.load(Ordering::SeqCst) {
             return Err("The desktop is draining and cannot start new runs.".into());
@@ -1360,6 +1406,9 @@ impl Bridge {
             );
         }
         let run_id = uuid::Uuid::new_v4().to_string();
+        let drafts = self.validated_drafts(&attachment_ids)?;
+        reject_unsupported_media(&drafts)?;
+        let mode = "direct";
         let item_id = uuid::Uuid::new_v4().to_string();
         let created_at = now();
         let configuration = self
@@ -1422,23 +1471,35 @@ impl Bridge {
             workspace_root: reservation.workspace_root.clone(),
             shell_cwd: reservation.shell_cwd.clone(),
         });
-        if let Err(error) = self.workbench.reserve_task(&reservation) {
+        if let Err(error) = self
+            .workbench
+            .reserve_task_with_attachments(&reservation, &attachment_ids)
+        {
             self.registry.lock().unwrap().remove(&run_id);
             return Err(error);
         }
         if let Err(error) = self.workbench.update_run(&run_id, "submitted", "submitted") {
-            self.registry.lock().unwrap().remove(&run_id);
-            let _ = self.workbench.delete_item(&item_id);
-            return Err(error);
+            if let Some(record) = self.registry.lock().unwrap().get_mut(&run_id) {
+                record.request_active = false;
+                record.revision += 1;
+            }
+            self.reconcile_run(run_id.clone());
+            return Err(format!("SUBMISSION_CLAIMED: The task reservation is durable but could not be submitted: {error}"));
         }
         let (_request_id, receiver) =
-            match self.request("agent/run", json!({ "runId": run_id, "goal": task })) {
+            match self.request("agent/run", json!({ "executionId": run_id, "goal": task, "attachments":trusted_descriptors(&drafts) })) {
                 Ok(request) => request,
                 Err(error) => {
-                    self.registry.lock().unwrap().terminal(&run_id, "failed");
-                    self.registry.lock().unwrap().remove(&run_id);
-                    let _ = self.workbench.delete_item(&item_id);
-                    return Err(error);
+                    if let Some(record) = self.registry.lock().unwrap().get_mut(&run_id) {
+                        record.request_active = false;
+                        let state = submission_failed();
+                        apply_run_state(record, &state, None);
+                    }
+                    if self.workbench.mark_submission_failed(&run_id).is_err() {
+                        self.reconcile_run(run_id.clone());
+                    }
+                    self.emit_state();
+                    return Err(format!("SUBMISSION_CLAIMED: The task reservation is durable but could not be submitted: {error}"));
                 }
             };
         self.emit_state();
@@ -1446,6 +1507,8 @@ impl Bridge {
         let started = StartedRun {
             item_id,
             run_id: run_id.clone(),
+            execution_id: run_id.clone(),
+            mode: mode.into(),
         };
         std::thread::spawn(move || {
             let response = match receiver.recv_timeout(Duration::from_secs(30)) {
@@ -1467,7 +1530,8 @@ impl Bridge {
             match response {
                 Ok(result) => {
                     let state = state_for_execution_result(&result);
-                    let stored_result = canonical_workbench_result(&result);
+                    let stored_result =
+                        canonical_workbench_result(&result, Some(&bridge.attachment_root));
                     let _ = bridge.workbench.store_result(&run_id, &stored_result);
                     let mut accepted_quiescent = false;
                     if let Some(record) = bridge.registry.lock().unwrap().get_mut(&run_id) {
@@ -1530,10 +1594,24 @@ impl Bridge {
     }
 
     fn chat_reason(&self, chat: &ChatItem) -> Option<String> {
+        let configuration = self.configuration.lock().unwrap();
+        let current_workspace = configuration
+            .as_ref()
+            .and_then(|configuration| configuration.pointer("/workspace/root"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let current_shell_cwd = configuration
+            .as_ref()
+            .and_then(|configuration| configuration.pointer("/workspace/shellCwd"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        drop(configuration);
         match self.current_agent() {
             Err(_) => Some("The pinned agent is not currently available; this chat is read-only.".into()),
             Ok((id,_,_)) if id != chat.pinned_agent_id => Some("The resolved agent ID no longer matches this chat's pin; this chat is read-only.".into()),
             Ok((_,_,fingerprint)) if fingerprint != chat.pinned_agent_fingerprint => Some("The resolved agent configuration fingerprint no longer matches this chat's pin; this chat is read-only.".into()),
+            Ok(_) if chat.workspace_root.is_none() || chat.shell_cwd.is_none() => Some("This chat predates durable workspace provenance and is read-only.".into()),
+            Ok(_) if chat.workspace_root != current_workspace || chat.shell_cwd != current_shell_cwd => Some("The resolved workspace no longer matches this chat's pin; this chat is read-only.".into()),
             _ => None,
         }
     }
@@ -1670,6 +1748,7 @@ impl Bridge {
         let job = self.workbench.create_deletion_job(&operation)?;
         match self.execute_deletion_job(&job) {
             Ok(()) => {
+                let _ = cleanup_attachments(&self.workbench, &self.attachment_root);
                 self.emit_state();
                 Ok(())
             }
@@ -1682,7 +1761,12 @@ impl Bridge {
         }
     }
 
-    fn send_chat(self: &Arc<Self>, item_id: String, content: String) -> Result<StartedRun, String> {
+    fn send_chat(
+        self: &Arc<Self>,
+        item_id: String,
+        content: String,
+        attachment_ids: Vec<String>,
+    ) -> Result<StartedRun, String> {
         let _submission = self.submission.lock().unwrap();
         if self.draining.load(Ordering::SeqCst) {
             return Err("The desktop is draining and cannot start new runs.".into());
@@ -1701,9 +1785,15 @@ impl Bridge {
             return Err(reason);
         }
         let run_id = uuid::Uuid::new_v4().to_string();
-        let messages = self
-            .workbench
-            .reserve_chat_turn(&item_id, &run_id, &content)?;
+        let drafts = self.validated_drafts(&attachment_ids)?;
+        reject_unsupported_media(&drafts)?;
+        let mode = "direct";
+        let messages = self.workbench.reserve_chat_turn_with_attachments(
+            &item_id,
+            &run_id,
+            &content,
+            &attachment_ids,
+        )?;
         registry.insert(RunRecord {
             run_id: run_id.clone(),
             item_id: item_id.clone(),
@@ -1721,8 +1811,8 @@ impl Bridge {
             pending_interaction: None,
             pending_approval: None,
             occupies_slot: true,
-            workspace_root: None,
-            shell_cwd: None,
+            workspace_root: chat.workspace_root.clone(),
+            shell_cwd: chat.shell_cwd.clone(),
         });
         drop(registry);
         if let Err(error) = self.workbench.update_run(&run_id, "submitted", "submitted") {
@@ -1730,7 +1820,7 @@ impl Bridge {
         }
         let transcript = messages
             .iter()
-            .map(|message| json!({"role":message.role,"content":message.content}))
+            .map(|message| json!({"role":message.role,"text":message.content,"attachments":trusted_descriptors(&message.attachments)}))
             .collect::<Vec<_>>();
         let receiver = match self.request(
             "agent/chat",
@@ -1752,7 +1842,7 @@ impl Bridge {
                     self.reconcile_run(run_id.clone());
                 }
                 self.emit_state();
-                return Err(error);
+                return Err(format!("SUBMISSION_CLAIMED: The chat turn is durable but could not be submitted: {error}"));
             }
         };
         self.emit_state();
@@ -1777,7 +1867,8 @@ impl Bridge {
             match response {
                 Ok(result) => {
                     let state = state_for_execution_result(&result);
-                    let stored_result = canonical_workbench_result(&result);
+                    let stored_result =
+                        canonical_workbench_result(&result, Some(&bridge.attachment_root));
                     if state.cached_status == "succeeded" {
                         let finalized = response_assistant_value(&stored_result)
                             .ok_or_else(|| {
@@ -1842,7 +1933,12 @@ impl Bridge {
             }
             bridge.emit_state();
         });
-        Ok(StartedRun { item_id, run_id })
+        Ok(StartedRun {
+            item_id,
+            execution_id: run_id.clone(),
+            run_id,
+            mode: mode.into(),
+        })
     }
 
     fn stop_run(self: &Arc<Self>, run_id: &str) -> Result<(), String> {
@@ -1911,6 +2007,7 @@ impl Bridge {
         if previous.invocation_kind != "run" {
             return Err("Only task runs can currently be recovered.".into());
         }
+        self.validate_same_run_recovery(run_id)?;
         let inspection = self.inspect_for_recovery(run_id)?;
         let baseline_event_seq = latest_inspection_event_seq(&inspection);
         self.workbench
@@ -1933,6 +2030,7 @@ impl Bridge {
     }
 
     fn dispatch_same_run_recovery(self: &Arc<Self>, run_id: &str) -> Result<(), String> {
+        self.validate_same_run_recovery(run_id)?;
         let needs_activation = self
             .registry
             .lock()
@@ -1992,7 +2090,8 @@ impl Bridge {
             match response {
                 Ok(result) => {
                     let state = state_for_execution_result(&result);
-                    let stored_result = canonical_workbench_result(&result);
+                    let stored_result =
+                        canonical_workbench_result(&result, Some(&bridge.attachment_root));
                     if !state.occupies_slot {
                         match bridge.workbench.finalize_recovered_run(
                             &run_id,
@@ -2053,6 +2152,40 @@ impl Bridge {
             }
             bridge.emit_state();
         });
+        Ok(())
+    }
+
+    fn validate_same_run_recovery(&self, run_id: &str) -> Result<(), String> {
+        let record = self
+            .registry
+            .lock()
+            .unwrap()
+            .get(run_id)
+            .cloned()
+            .ok_or("Run is not known.")?;
+        let configuration = self.configuration.lock().unwrap();
+        let current_workspace = configuration
+            .as_ref()
+            .and_then(|value| value.pointer("/workspace/root"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let current_shell_cwd = configuration
+            .as_ref()
+            .and_then(|value| value.pointer("/workspace/shellCwd"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if record.workspace_root.is_none()
+            || record.shell_cwd.is_none()
+            || record.workspace_root != current_workspace
+            || record.shell_cwd != current_shell_cwd
+        {
+            return Err("WORKSPACE_PROVENANCE_CHANGED: The run cannot be recovered under different workspace settings.".into());
+        }
+        drop(configuration);
+        for attachment in self.workbench.task_attachments_for_run(run_id)? {
+            attachments::validate_staged(&self.attachment_root, &attachment)
+                .map_err(|error| format!("ATTACHMENT_UNRECOVERABLE: {error}"))?;
+        }
         Ok(())
     }
 
@@ -2234,6 +2367,70 @@ impl Bridge {
     }
 }
 
+fn trusted_descriptors(drafts: &[AttachmentDraft]) -> Vec<Value> {
+    drafts
+        .iter()
+        .map(|draft| {
+            let mut descriptor = json!({
+                "attachmentId": draft.id,
+                "kind": draft.kind,
+                "stagedRelativePath": draft.staged_relative_path,
+                "name": draft.name,
+                "sizeBytes": draft.size_bytes,
+                "sha256": draft.sha256,
+            });
+            if let Some(mime_type) = &draft.mime_type {
+                descriptor["mimeType"] = json!(mime_type);
+            }
+            if let Some(audio_format) = &draft.audio_format {
+                descriptor["audioFormat"] = json!(audio_format);
+            }
+            descriptor
+        })
+        .collect()
+}
+
+fn cleanup_attachments(workbench: &WorkbenchDb, root: &Path) -> Result<(), String> {
+    for (id, relative) in workbench.attachment_cleanup_candidates()? {
+        let first = Path::new(&relative).components().next();
+        if let Some(std::path::Component::Normal(directory)) = first {
+            // Removal is idempotent; only delete the row after the managed directory is absent.
+            std::fs::remove_dir_all(root.join(directory))
+                .or_else(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
+                })
+                .map_err(|error| error.to_string())?;
+            workbench.finish_attachment_cleanup(&id)?;
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_attachment_orphans(workbench: &WorkbenchDb, root: &Path) -> Result<(), String> {
+    let known = workbench
+        .attachment_managed_directories()?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    for entry in std::fs::read_dir(root).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if known.contains(&name) || uuid::Uuid::parse_str(&name).is_err() {
+            continue;
+        }
+        let file_type = entry.file_type().map_err(|error| error.to_string())?;
+        if file_type.is_dir() {
+            std::fs::remove_dir_all(entry.path()).map_err(|error| error.to_string())?;
+        } else {
+            std::fs::remove_file(entry.path()).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 fn replace_bridge(app: &AppHandle) -> Result<Arc<Bridge>, String> {
     let state = app.state::<AppState>();
     let lifecycle = state.lifecycle.lock().unwrap();
@@ -2301,6 +2498,11 @@ fn replace_bridge(app: &AppHandle) -> Result<Arc<Bridge>, String> {
                 run_roots: Mutex::new(HashMap::new()),
                 run_delegates: Mutex::new(HashMap::new()),
                 workbench,
+                attachment_root: app
+                    .path()
+                    .app_data_dir()
+                    .unwrap_or_default()
+                    .join("attachments"),
                 submission: Mutex::new(()),
                 expected_shutdown: AtomicBool::new(true),
                 configuration: Mutex::new(None),
@@ -2435,8 +2637,13 @@ fn load_trace_privacy(workbench: &WorkbenchDb) -> Result<TracePrivacy, String> {
     Ok(privacy)
 }
 
-fn request_trace_report(trace: &TraceBridge, privacy: TracePrivacy, root_run_id: &str) -> Response {
-    trace.request_wait(
+fn request_trace_report(
+    trace: &TraceBridge,
+    privacy: TracePrivacy,
+    root_run_id: &str,
+    attachment_root: &Path,
+) -> Response {
+    let mut report = trace.request_wait(
         "trace/get",
         Some(json!({
             "target": { "kind": "root-run", "rootRunId": root_run_id },
@@ -2448,7 +2655,29 @@ fn request_trace_report(trace: &TraceBridge, privacy: TracePrivacy, root_run_id:
             }
         })),
         REQUEST_TIMEOUT,
-    )
+    )?;
+    redact_managed_attachment_paths(&mut report, attachment_root);
+    Ok(report)
+}
+
+fn redact_managed_attachment_paths(value: &mut Value, attachment_root: &Path) {
+    let root = attachment_root.to_string_lossy();
+    match value {
+        Value::String(text) if text.contains(root.as_ref()) => {
+            *text = text.replace(root.as_ref(), "[MANAGED_ATTACHMENT]");
+        }
+        Value::Array(values) => {
+            for value in values {
+                redact_managed_attachment_paths(value, attachment_root);
+            }
+        }
+        Value::Object(object) => {
+            for value in object.values_mut() {
+                redact_managed_attachment_paths(value, attachment_root);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn queue_trace_refresh(
@@ -2507,20 +2736,23 @@ fn schedule_trace_refresh(app: &AppHandle, root_run_id: String, final_refresh: b
             .unwrap()
             .get_mut(&root_run_id)
             .is_some_and(|refresh| std::mem::take(&mut refresh.final_refresh));
-        let (privacy, trace, request_revision) = {
+        let (privacy, trace, attachment_root, request_revision) = {
             let state = app.state::<AppState>();
             let bridge = state.bridge.lock().unwrap().as_ref().cloned();
             let trace = state.trace.lock().unwrap().as_ref().cloned();
             let privacy = bridge
                 .as_ref()
                 .and_then(|bridge| load_trace_privacy(&bridge.workbench).ok());
+            let attachment_root = bridge.as_ref().map(|bridge| bridge.attachment_root.clone());
             let selection = state.trace_selection.lock().unwrap();
             let request_revision = (selection.root_run_id.as_deref() == Some(root_run_id.as_str()))
                 .then_some(selection.revision);
-            (privacy, trace, request_revision)
+            (privacy, trace, attachment_root, request_revision)
         };
-        let response = match (privacy, trace.as_ref()) {
-            (Some(privacy), Some(trace)) => request_trace_report(trace, privacy, &root_run_id),
+        let response = match (privacy, trace.as_ref(), attachment_root.as_deref()) {
+            (Some(privacy), Some(trace), Some(attachment_root)) => {
+                request_trace_report(trace, privacy, &root_run_id, attachment_root)
+            }
             _ => Err("Trace inspector is not ready.".into()),
         };
         let state = app.state::<AppState>();
@@ -2846,7 +3078,11 @@ fn save_settings(
 }
 
 #[tauri::command]
-fn start_run(task: String, state: tauri::State<'_, AppState>) -> Result<StartedRun, String> {
+fn start_run(
+    task: String,
+    attachment_ids: Option<Vec<String>>,
+    state: tauri::State<'_, AppState>,
+) -> Result<StartedRun, String> {
     if task.trim().is_empty() {
         return Err("Task description is required.".into());
     }
@@ -2870,7 +3106,103 @@ fn start_run(task: String, state: tauri::State<'_, AppState>) -> Result<StartedR
             .error
             .unwrap_or_else(|| "Settings are invalid.".into()));
     }
-    bridge.start_run(task)
+    bridge.start_run(task, attachment_ids.unwrap_or_default())
+}
+
+#[tauri::command]
+fn select_attachments(
+    app: AppHandle,
+    existing_attachment_ids: Option<Vec<String>>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<AttachmentDraft>, String> {
+    let bridge = state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or("ATTACHMENTS_UNAVAILABLE")?;
+    let selected = app
+        .dialog()
+        .file()
+        .blocking_pick_files()
+        .unwrap_or_default();
+    let existing = bridge.validated_drafts(&existing_attachment_ids.unwrap_or_default())?;
+    if selected.len() + existing.len() > MAX_ATTACHMENT_COUNT {
+        return Err("At most 8 attachments may be selected.".into());
+    }
+    let mut drafts = Vec::new();
+    let mut total = existing.iter().map(|draft| draft.size_bytes).sum::<u64>();
+    for selected in selected {
+        let path = match selected.into_path() {
+            Ok(path) => path,
+            Err(_) => {
+                discard_imported_drafts(&bridge, &drafts);
+                return Err("ATTACHMENT_PATH_INVALID".into());
+            }
+        };
+        let draft = match attachments::import_file(&bridge.attachment_root, &path) {
+            Ok(draft) => draft,
+            Err(error) => {
+                discard_imported_drafts(&bridge, &drafts);
+                return Err(error);
+            }
+        };
+        total += draft.size_bytes;
+        if total > MAX_SUBMISSION_BYTES {
+            let _ = std::fs::remove_dir_all(bridge.attachment_root.join(&draft.id));
+            discard_imported_drafts(&bridge, &drafts);
+            return Err("Attachments exceed 40 MiB total.".into());
+        }
+        if let Err(error) = bridge.workbench.insert_draft(&draft) {
+            let _ = std::fs::remove_dir_all(bridge.attachment_root.join(&draft.id));
+            discard_imported_drafts(&bridge, &drafts);
+            return Err(error);
+        }
+        drafts.push(draft);
+    }
+    Ok(drafts)
+}
+
+fn discard_imported_drafts(bridge: &Bridge, drafts: &[AttachmentDraft]) {
+    for draft in drafts {
+        if bridge.workbench.discard_draft(&draft.id).is_ok()
+            && std::fs::remove_dir_all(bridge.attachment_root.join(&draft.id)).is_ok()
+        {
+            let _ = bridge.workbench.finish_attachment_cleanup(&draft.id);
+        }
+    }
+}
+
+#[tauri::command]
+fn discard_attachment_draft(
+    attachment_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let bridge = state
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or("ATTACHMENTS_UNAVAILABLE")?;
+    if let Some(relative) = bridge.workbench.discard_draft(&attachment_id)? {
+        if let Some(std::path::Component::Normal(directory)) =
+            Path::new(&relative).components().next()
+        {
+            std::fs::remove_dir_all(bridge.attachment_root.join(directory))
+                .or_else(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
+                })
+                .map_err(|error| error.to_string())?;
+            bridge.workbench.finish_attachment_cleanup(&attachment_id)?;
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -2961,7 +3293,7 @@ fn get_run_result(
 
 #[tauri::command]
 fn get_run_overview(run_id: String, state: tauri::State<'_, AppState>) -> Result<Value, String> {
-    let (privacy, trace) = {
+    let (privacy, trace, attachment_root) = {
         let bridge = state
             .bridge
             .lock()
@@ -2980,9 +3312,9 @@ fn get_run_overview(run_id: String, state: tauri::State<'_, AppState>) -> Result
             .as_ref()
             .cloned()
             .ok_or("Trace inspector is not ready.")?;
-        (privacy, trace)
+        (privacy, trace, bridge.attachment_root.clone())
     };
-    request_trace_report(&trace, privacy, &run_id)
+    request_trace_report(&trace, privacy, &run_id, &attachment_root)
 }
 
 const ARTIFACT_EXTENSIONS: &[&str] = &[
@@ -3203,6 +3535,18 @@ fn create_chat(title: String, state: tauri::State<'_, AppState>) -> Result<ChatD
         .cloned()
         .ok_or("Desktop runtime is starting.")?;
     let (id, name, fingerprint) = bridge.current_agent()?;
+    let configuration = bridge.configuration.lock().unwrap();
+    let workspace_root = configuration
+        .as_ref()
+        .and_then(|configuration| configuration.pointer("/workspace/root"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let shell_cwd = configuration
+        .as_ref()
+        .and_then(|configuration| configuration.pointer("/workspace/shellCwd"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    drop(configuration);
     let chat = ChatItem {
         item_id: uuid::Uuid::new_v4().to_string(),
         title: if title.trim().is_empty() {
@@ -3215,6 +3559,8 @@ fn create_chat(title: String, state: tauri::State<'_, AppState>) -> Result<ChatD
         pinned_agent_id: id,
         pinned_agent_name: name,
         pinned_agent_fingerprint: fingerprint,
+        workspace_root,
+        shell_cwd,
     };
     bridge.workbench.create_chat(&chat)?;
     bridge.chat_dto(&chat.item_id)
@@ -3287,6 +3633,7 @@ fn delete_history(
 fn send_chat_turn(
     item_id: String,
     content: String,
+    attachment_ids: Option<Vec<String>>,
     state: tauri::State<'_, AppState>,
 ) -> Result<StartedRun, String> {
     if content.trim().is_empty() {
@@ -3306,7 +3653,11 @@ fn send_chat_turn(
         .as_ref()
         .cloned()
         .ok_or("Desktop runtime is starting.")?
-        .send_chat(item_id, content.trim().into())
+        .send_chat(
+            item_id,
+            content.trim().into(),
+            attachment_ids.unwrap_or_default(),
+        )
 }
 
 #[derive(Clone, Copy)]
@@ -3424,6 +3775,8 @@ pub fn run() {
             reload_settings,
             save_settings,
             start_run,
+            select_attachments,
+            discard_attachment_draft,
             stop_run,
             get_run_recovery_plan,
             recover_run,
@@ -3963,14 +4316,16 @@ fn preserve_approval_operation(approval: &mut PendingApproval, current: Option<&
 }
 
 fn response_assistant_value(result: &Value) -> Option<Value> {
+    let result = execution_payload(result);
     (result.get("status").and_then(Value::as_str) == Some("success"))
         .then(|| result.get("output"))
         .flatten()
         .cloned()
 }
 
-fn canonical_workbench_result(result: &Value) -> Value {
-    match result.get("status").and_then(Value::as_str) {
+fn canonical_workbench_result(result: &Value, attachment_root: Option<&Path>) -> Value {
+    let result = execution_payload(result);
+    let mut canonical = match result.get("status").and_then(Value::as_str) {
         Some("success") => json!({
             "status": "success",
             "runId": result.get("runId").cloned().unwrap_or(Value::Null),
@@ -3987,7 +4342,11 @@ fn canonical_workbench_result(result: &Value) -> Value {
             "code": result.get("code").cloned().unwrap_or_else(|| Value::String("MODEL_ERROR".into()))
         }),
         _ => result.clone(),
+    };
+    if let Some(attachment_root) = attachment_root {
+        redact_managed_attachment_paths(&mut canonical, attachment_root);
     }
+    canonical
 }
 
 fn value_as_content(value: &Value) -> String {
@@ -3998,7 +4357,7 @@ fn value_as_content(value: &Value) -> String {
 }
 
 fn chat_request_params(run_id: &str, session_id: &str, transcript: Vec<Value>) -> Value {
-    json!({"runId":run_id,"sessionId":session_id,"transcript":transcript})
+    json!({"executionId":run_id,"chatSessionId":session_id,"transcript":transcript})
 }
 
 fn recovery_required(previous_occupancy: bool) -> RunState {
@@ -4050,6 +4409,7 @@ fn apply_run_state(
 }
 
 fn state_for_execution_result(result: &Value) -> RunState {
+    let result = execution_payload(result);
     match result.get("status").and_then(Value::as_str) {
         Some("success") => state_for_durable_status("succeeded", true),
         Some("failure") => match result.get("code").and_then(Value::as_str) {
@@ -4063,6 +4423,20 @@ fn state_for_execution_result(result: &Value) -> RunState {
         }
         _ => recovery_required(true),
     }
+}
+
+fn execution_payload(result: &Value) -> &Value {
+    result
+        .get("result")
+        .filter(|value| value.is_object())
+        .unwrap_or(result)
+}
+
+fn reject_unsupported_media(drafts: &[AttachmentDraft]) -> Result<(), String> {
+    if drafts.iter().any(|draft| draft.kind != "file") {
+        return Err("UNSUPPORTED_ATTACHMENT_KIND: Desktop currently supports generic file attachments only.".into());
+    }
+    Ok(())
 }
 
 fn state_for_durable_status(status: &str, previous_occupancy: bool) -> RunState {
@@ -4122,6 +4496,39 @@ fn state_for_durable_status(status: &str, previous_occupancy: bool) -> RunState 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trusted_generic_descriptor_omits_inapplicable_optional_fields() {
+        let descriptor = trusted_descriptors(&[AttachmentDraft {
+            id: "attachment".into(),
+            name: "notes.bin".into(),
+            kind: "file".into(),
+            size_bytes: 3,
+            mime_type: None,
+            staged_relative_path: "attachment/notes.bin".into(),
+            sha256: "a".repeat(64),
+            audio_format: None,
+        }]);
+        assert_eq!(descriptor[0].get("mimeType"), None);
+        assert_eq!(descriptor[0].get("audioFormat"), None);
+        assert_eq!(descriptor[0]["stagedRelativePath"], "attachment/notes.bin");
+    }
+
+    #[test]
+    fn workbench_results_redact_managed_attachment_paths() {
+        let result = canonical_workbench_result(
+            &json!({
+                "status": "success",
+                "runId": "run",
+                "output": { "message": "Read /private/attachments/id/notes.txt" }
+            }),
+            Some(Path::new("/private/attachments")),
+        );
+        assert_eq!(
+            result["output"]["message"],
+            "Read [MANAGED_ATTACHMENT]/id/notes.txt"
+        );
+    }
 
     #[test]
     fn workspace_artifacts_are_filtered_and_confined_to_the_workspace() {
@@ -4311,14 +4718,17 @@ mod tests {
         }));
         assert_eq!(
             recovered_result(&interrupted),
-            Some(canonical_workbench_result(&json!({
-                "status": "failure",
-                "runId": "run-2",
-                "error": "Run interrupted",
-                "code": "INTERRUPTED",
-                "stepsUsed": 1,
-                "usage": {}
-            })))
+            Some(canonical_workbench_result(
+                &json!({
+                    "status": "failure",
+                    "runId": "run-2",
+                    "error": "Run interrupted",
+                    "code": "INTERRUPTED",
+                    "stepsUsed": 1,
+                    "usage": {}
+                }),
+                None
+            ))
         );
     }
 
@@ -4501,6 +4911,33 @@ mod tests {
         for forbidden in ["input", "output", "messages", "reasoning", "payload"] {
             assert!(projected.get(forbidden).is_none(), "leaked {forbidden}");
         }
+    }
+
+    #[test]
+    fn activity_projection_redacts_managed_attachment_paths_before_emission() {
+        let root = Path::new("/private/app/attachments");
+        let mut projected = project_activity_event(
+            &json!({
+                "id": "event-attachment",
+                "runId": "root-run",
+                "seq": 5,
+                "type": "model.completed",
+                "createdAt": "2026-01-01T00:00:00.000Z",
+                "payload": {
+                    "assistantContent": "/private/app/attachments/attachment-1/notes.txt"
+                }
+            }),
+            "root-run",
+            None,
+        )
+        .unwrap();
+
+        redact_managed_attachment_paths(&mut projected, root);
+
+        assert_eq!(
+            projected.get("assistantContent"),
+            Some(&json!("[MANAGED_ATTACHMENT]/attachment-1/notes.txt"))
+        );
     }
 
     #[test]

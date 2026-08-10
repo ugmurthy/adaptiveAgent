@@ -1,4 +1,5 @@
 import { basename, isAbsolute, relative, resolve, sep } from 'node:path';
+import { realpath } from 'node:fs/promises';
 
 export class PathOutsideRootError extends Error {
   constructor(
@@ -51,7 +52,39 @@ export function resolvePathWithinRoot(allowedRoot: string, requestedPath: string
   throw new PathOutsideRootError(requestedPath, allowedRoot, suggestedPath);
 }
 
-function isPathWithinRoot(resolvedRoot: string, resolvedPath: string): boolean {
+/** Resolve a read path against canonical roots. Relative paths use only the
+ * first (workspace) root; absolute paths may belong to any root. `realpath`
+ * makes containment resistant to symlink traversal. */
+export async function resolvePathWithinRoots(allowedRoots: readonly string[], requestedPath: string): Promise<string> {
+  if (allowedRoots.length === 0) {
+    throw new TypeError('At least one allowed root is required');
+  }
+  const resolvedRoots = allowedRoots.map((root) => resolve(root));
+  const canonicalRoots = await Promise.all(resolvedRoots.map((root) => realpath(root)));
+  if (canonicalRoots.some((root, index) => root !== resolvedRoots[index])) {
+    throw new TypeError('Allowed roots must remain canonical paths');
+  }
+  let candidate: string;
+  if (!isAbsolute(requestedPath)) {
+    candidate = resolvePathWithinRoot(canonicalRoots[0]!, requestedPath);
+  } else {
+    const containingRoot = canonicalRoots.find((root) => isPathWithinRoot(root, resolve(requestedPath)));
+    if (containingRoot) {
+      candidate = resolve(requestedPath);
+    } else {
+      // Preserve the established workspace-path recovery for model-generated
+      // absolute paths while never rebasing paths into attachment roots.
+      candidate = resolvePathWithinRoot(canonicalRoots[0]!, requestedPath);
+    }
+  }
+  const canonicalPath = await realpath(candidate);
+  if (canonicalRoots.some((root) => isPathWithinRoot(root, canonicalPath))) {
+    return canonicalPath;
+  }
+  throw new PathOutsideRootError(requestedPath, canonicalRoots[0]!);
+}
+
+export function isPathWithinRoot(resolvedRoot: string, resolvedPath: string): boolean {
   const relativePath = relative(resolvedRoot, resolvedPath);
   return relativePath === '' || (!relativePath.startsWith('..') && !isAbsolute(relativePath));
 }

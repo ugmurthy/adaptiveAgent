@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { ActivityEvent } from './activity';
-  import type { Chat, RunSummary } from './desktop';
+  import type { AttachmentDraft, Chat, RunSummary } from './desktop';
+  import AttachmentChips from './AttachmentChips.svelte';
   import ActivityNarrative from './ActivityNarrative.svelte';
   import ApprovalCard from './ApprovalCard.svelte';
   import ResultRenderer from './ResultRenderer.svelte';
@@ -19,6 +20,9 @@
   export let ondecision: (run: RunSummary, approved: boolean) => void;
   export let oninspect: () => void;
   export let onshowtitle: (kind: 'task' | 'chat', title: string) => void;
+  export let attachments:AttachmentDraft[]=[];
+  export let onattachments:(drafts:AttachmentDraft[])=>void=()=>{};
+  export let onerror:(message:string)=>void=()=>{};
   $: activeRun = runs.find((run)=>run.occupiesSlot);
 </script>
 
@@ -35,11 +39,11 @@
     {#each chat.messages as item (item.id)}
       <article class:assistant={item.role==='assistant'}>
         <header><strong>{item.role==='assistant'?chat.pinnedAgentName:'You'}</strong>{#if item.role==='user'}<button disabled={pending || chat.occupied} on:click={()=>ondelete({kind:'chat-turn',itemId:chat.itemId,ordinal:item.ordinal})}>Delete from here</button>{/if}</header>
-        {#if item.role==='assistant'}<ResultRenderer value={item.content}/>{:else}<p>{item.content}</p>{/if}
+        {#if item.role==='assistant'}<ResultRenderer value={item.content}/>{:else}<p>{item.content}</p>{#if item.attachments?.length}<div class="attachment-chips">{#each item.attachments as attachment}<span class="attachment-chip"><strong>{attachment.name}</strong><small>{attachment.kind} · {attachment.sizeBytes} bytes</small></span>{/each}</div>{/if}{/if}
       </article>
     {/each}
   </div>
   <ActivityNarrative events={activity} {now}/>
   {#if error}<div class="result error"><pre>{error}</pre></div>{/if}
-  <div class="message-composer"><label for="chat-message">Message</label><textarea id="chat-message" bind:value={message} disabled={!!chat.readOnlyReason || chat.occupied}></textarea><div class="actions"><button class="primary" disabled={!message.trim() || !!chat.readOnlyReason || chat.occupied || pending || !capacityAvailable} on:click={onsend}>Send</button><span class="run-status">{capacityAvailable?'Ready to send':'All execution slots are occupied'}</span></div></div>
+  <div class="message-composer"><label for="chat-message">Message</label><textarea id="chat-message" bind:value={message} disabled={!!chat.readOnlyReason || chat.occupied}></textarea><AttachmentChips drafts={attachments} onchange={onattachments} {onerror} disabled={!!chat.readOnlyReason||chat.occupied||pending}/><div class="actions"><button class="primary" disabled={!message.trim() || !!chat.readOnlyReason || chat.occupied || pending || !capacityAvailable} on:click={onsend}>Send</button><span class="run-status">{capacityAvailable?'Ready to send':'All execution slots are occupied'}</span></div></div>
 </section>
