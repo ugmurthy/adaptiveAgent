@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, setContext } from 'svelte';
   import { addActivity, type ActivityEvent } from './activity';
   import ArtifactList from './ArtifactList.svelte';
   import BrandMark from './BrandMark.svelte';
@@ -10,33 +10,13 @@
   import TaskWorkspace from './TaskWorkspace.svelte';
   import WorkbenchRail from './WorkbenchRail.svelte';
   import {
-    createChat,
-    deleteHistory,
-    getDesktopState,
-    getRunRecoveryPlan,
-    getRunResult,
-    getTracePrivacy,
-    listWorkspaceArtifacts,
-    listChats,
-    loadChat,
-    previewHistoryDeletion,
     quitCancel,
     quitTerminate,
     quitWait,
-    reloadSettings,
-    saveSettings,
-    recoverRun,
-    resolveApproval,
-    selectTrace,
-    sendChatTurn,
-    setTracePrivacy,
-    startRun,
-    steerRun,
-    stopRun,
-    subscribe,
     type Chat,
     type AttachmentDraft,
     type DeletionPreview,
+    type DesktopApi,
     type DesktopState,
     type ProductDeletionTarget,
     type RunRecoveryPlan,
@@ -44,6 +24,7 @@
     type TracePrivacy,
     type TraceReport,
   } from './desktop';
+  import { DESKTOP_API_CONTEXT } from './desktop-context';
   import {
     inspectorOpen,
     mobileRailOpen,
@@ -53,6 +34,16 @@
     type RailItem,
   } from './workbench-state';
   import { historyResultArtifacts, type ResultArtifact } from './workbench-ux';
+
+  export let api: DesktopApi;
+  setContext(DESKTOP_API_CONTEXT, api);
+  const {
+    createChat, deleteHistory, getDesktopState, getRunRecoveryPlan, getRunResult,
+    getTracePrivacy, listWorkspaceArtifacts, listChats, loadChat,
+    previewHistoryDeletion, reloadSettings, saveSettings, recoverRun,
+    resolveApproval, selectTrace, sendChatTurn, setTracePrivacy, startRun,
+    steerRun, stopRun, subscribe,
+  } = api;
 
   const emptyDesktop: DesktopState = {
     agentId: '',
@@ -124,6 +115,9 @@
     let cancelled = false;
     const storedWidth = Number(localStorage.getItem('adaptiveAgent.inspectorWidth'));
     if (storedWidth >= 320 && storedWidth <= 720) inspectorWidth = storedWidth;
+    $workbenchSelection = { kind: 'new-task' };
+    $inspectorOpen = false;
+    $mobileRailOpen = false;
     const timer = window.setInterval(() => { now = Date.now(); }, 100);
     void (async () => {
       unlisten = await subscribe(
@@ -160,7 +154,8 @@
       if (cancelled) unlisten();
       else {
         await refresh();
-        tracePrivacy = await getTracePrivacy();
+        const nextPrivacy = await getTracePrivacy();
+        if (!cancelled) tracePrivacy = nextPrivacy;
       }
     })().catch((error) => { finalError = String(error); });
     return () => {

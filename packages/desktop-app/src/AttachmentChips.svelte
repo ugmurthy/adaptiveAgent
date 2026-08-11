@@ -1,5 +1,8 @@
 <script lang="ts">
-  import { discardAttachmentDraft, selectAttachments, type AttachmentDraft } from './desktop';
+  import { type AttachmentDraft } from './desktop';
+  import { desktopApi } from './desktop-context';
+
+  const { discardAttachmentDraft, selectAttachments } = desktopApi();
 
   export let drafts: AttachmentDraft[] = [];
   export let disabled = false;

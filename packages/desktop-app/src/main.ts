@@ -1,5 +1,5 @@
 import { mount } from 'svelte';
-import App from './App.svelte';
+import DesktopRoot from './DesktopRoot.svelte';
 import './styles.css';
 
-mount(App, { target: document.getElementById('app')! });
+mount(DesktopRoot, { target: document.getElementById('app')! });

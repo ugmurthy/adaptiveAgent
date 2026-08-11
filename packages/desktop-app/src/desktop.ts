@@ -32,6 +32,35 @@ export interface DesktopState {
   traceError?: string;
   quitState: 'idle' | 'confirming' | 'draining' | 'approved';
 }
+
+export interface DesktopRecentWork {
+  itemId: string;
+  runId: string;
+  title: string;
+  status: string;
+  createdAt: string;
+  invocationKind: 'run' | 'chat';
+}
+export interface DesktopCatalogAgent {
+  id: string;
+  name: string;
+  description?: string;
+  configPath: string;
+  archived: boolean;
+  validationState: string;
+  configurationFingerprint: string;
+  status: 'starting' | 'ready' | 'running' | 'stopping' | 'error' | 'unavailable';
+  occupiedSlots: number;
+  capacity: number;
+  attention: 'none' | 'approval' | 'recovery' | 'error';
+  recentWork: DesktopRecentWork[];
+}
+export type DesktopCatalogDiagnostic = Record<string, unknown>;
+export interface DesktopCatalogStatus {
+  currentAgentId?: string;
+  diagnostics: DesktopCatalogDiagnostic[];
+  agents: DesktopCatalogAgent[];
+}
 export type DesktopAttachmentKind='file'|'image'|'audio';
 export interface AttachmentDraft { id:string; name:string; kind:DesktopAttachmentKind; sizeBytes:number; mimeType?:string; }
 
@@ -80,6 +109,9 @@ export interface DesktopApi {
 }
 
 export const desktopBootstrap=()=>invoke<DesktopBootstrap>('desktop_bootstrap');
+export const getDesktopCatalogStatus=()=>invoke<DesktopCatalogStatus>('desktop_catalog_status');
+export const openAgentWorkspace=(agentId:string)=>invoke<DesktopState>('open_agent_workspace',{agentId});
+export const listenCatalogStatusChanged=(callback:()=>void)=>listen('adaptive-agent://catalog-status-changed',callback);
 
 export function createDesktopApi(agentId:string):DesktopApi {
   if (!agentId) throw new Error('agentId is required');
@@ -93,12 +125,12 @@ export function createDesktopApi(agentId:string):DesktopApi {
     createChat:(title)=>invoke('create_chat',args({title})), listChats:()=>invoke('list_chats',args()), loadChat:(itemId)=>invoke('load_chat',args({itemId})), sendChatTurn:(itemId,content,attachmentIds=[])=>invoke('send_chat_turn',args({itemId,content,attachmentIds})),
     previewHistoryDeletion:(target)=>invoke('preview_history_deletion',args({target})), deleteHistory:(target)=>invoke('delete_history',args({target})), listWorkspaceArtifacts:()=>invoke('list_workspace_artifacts',args()), readArtifact:(path)=>invoke('read_artifact',args({path})),
     selectTrace:(rootRunId)=>invoke('select_trace',args({rootRunId})), getTracePrivacy:()=>invoke('get_trace_privacy',args()), setTracePrivacy:(privacy)=>invoke('set_trace_privacy',args({privacy})),
-    subscribe:async(activity,finished,state,trace)=>{ const unlisten=await Promise.all([
+    subscribe:async(activity,finished,state,trace)=>{ const registrations=await Promise.allSettled([
       listen<AgentActivityEvent>('adaptive-agent://activity',({payload})=>{if(payload.agentId===agentId)activity(payload)}),
       listen<RunFinishedEvent>('adaptive-agent://run-finished',({payload})=>{if(payload.agentId===agentId&&payload.runId)finished(payload)}),
       listen<DesktopState>('adaptive-agent://state',({payload})=>{if(payload.agentId===agentId)state(payload)}),
       listen<TraceEvent>('adaptive-agent://trace',({payload})=>{if(payload.agentId===agentId)trace(payload)}),
-    ]); return ()=>unlisten.forEach(fn=>fn()); },
+    ]); const unlisten=registrations.flatMap(result=>result.status==='fulfilled'?[result.value]:[]); const failed=registrations.find(result=>result.status==='rejected'); if(failed){unlisten.forEach(fn=>fn()); throw failed.reason;} let active=true; return ()=>{if(!active)return; active=false; unlisten.forEach(fn=>fn());}; },
   };
 }
 

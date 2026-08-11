@@ -34,6 +34,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_NDJSON_FRAME_SIZE: usize = 1024 * 1024;
 const TRACE_MAX_NDJSON_FRAME_SIZE: usize = 8 * 1024 * 1024;
 const TRACE_PRIVACY_SETTING: &str = "trace_privacy";
+const RECENT_WORK_LIMIT: usize = 10;
 
 type Response = Result<Value, String>;
 
@@ -112,6 +113,43 @@ struct RunSummary {
     artifacts_unavailable_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pending_approval: Option<PendingApproval>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopCatalogStatus {
+    current_agent_id: Option<String>,
+    diagnostics: Vec<Value>,
+    agents: Vec<DesktopCatalogAgent>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopCatalogAgent {
+    id: String,
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    config_path: String,
+    archived: bool,
+    validation_state: String,
+    configuration_fingerprint: String,
+    status: &'static str,
+    occupied_slots: usize,
+    capacity: usize,
+    attention: &'static str,
+    recent_work: Vec<RecentWork>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecentWork {
+    item_id: String,
+    run_id: String,
+    title: String,
+    status: String,
+    created_at: String,
+    invocation_kind: String,
 }
 
 #[derive(Serialize)]
@@ -218,6 +256,8 @@ struct ManagedRuntime {
 struct CatalogDescriptor {
     id: String,
     name: String,
+    #[serde(default)]
+    description: Option<String>,
     configuration_fingerprint: String,
     config_path: String,
     validation_state: String,
@@ -225,7 +265,7 @@ struct CatalogDescriptor {
     archived: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CatalogInspect {
     agents: Vec<CatalogDescriptor>,
@@ -259,6 +299,25 @@ enum RuntimeConvergence {
 }
 
 impl AgentRuntimeManager {
+    fn unique_catalog_descriptors(
+        descriptors: &[CatalogDescriptor],
+    ) -> HashMap<String, CatalogDescriptor> {
+        let mut counts = HashMap::<String, usize>::new();
+        for descriptor in descriptors {
+            *counts.entry(descriptor.id.clone()).or_default() += 1;
+        }
+        descriptors
+            .iter()
+            .filter(|descriptor| {
+                !descriptor.id.trim().is_empty()
+                    && !descriptor.config_path.trim().is_empty()
+                    && !descriptor.configuration_fingerprint.trim().is_empty()
+                    && counts.get(&descriptor.id) == Some(&1)
+            })
+            .map(|descriptor| (descriptor.id.clone(), descriptor.clone()))
+            .collect()
+    }
+
     fn new(app: &AppHandle) -> Result<Self, String> {
         let directory = app
             .path()
@@ -299,22 +358,7 @@ impl AgentRuntimeManager {
         let current = inspection
             .current_agent
             .ok_or("The catalog did not identify a current agent.")?;
-        let mut counts = HashMap::<String, usize>::new();
-        for descriptor in &inspection.agents {
-            *counts.entry(descriptor.id.clone()).or_default() += 1;
-        }
-        let mut catalog = HashMap::new();
-        for descriptor in inspection.agents {
-            if descriptor.id.trim().is_empty()
-                || descriptor.config_path.trim().is_empty()
-                || descriptor.configuration_fingerprint.trim().is_empty()
-            {
-                continue;
-            }
-            if counts.get(&descriptor.id) == Some(&1) {
-                catalog.insert(descriptor.id.clone(), descriptor);
-            }
-        }
+        let catalog = Self::unique_catalog_descriptors(&inspection.agents);
         let exact = catalog
             .get(&current.id)
             .filter(|candidate| **candidate == current)
@@ -376,6 +420,7 @@ impl AgentRuntimeManager {
         let probe_selection = CatalogDescriptor {
             id: "__catalog_probe__".into(),
             name: String::new(),
+            description: None,
             configuration_fingerprint: "probe".into(),
             config_path: "probe".into(),
             validation_state: "valid".into(),
@@ -415,13 +460,25 @@ impl AgentRuntimeManager {
             .current_agent
             .as_ref()
             .map(|agent| agent.id.clone());
-        let (catalog, current) = match Self::validate_catalog(inspection) {
+        let (catalog, current) = match Self::validate_catalog(inspection.clone()) {
             Ok(validated) => validated,
             Err(error) => {
+                let catalog = Self::unique_catalog_descriptors(&inspection.agents);
+                let mappings = catalog
+                    .values()
+                    .filter(|agent| agent.validation_state == "valid")
+                    .map(|agent| AgentCatalogMapping {
+                        agent_id: agent.id.clone(),
+                        fingerprint: agent.configuration_fingerprint.clone(),
+                        config_path: agent.config_path.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                self.workbench.reconcile_agent_catalog(&mappings)?;
                 *self.catalog_diagnostics.lock().unwrap() = diagnostics;
-                if self.catalog.lock().unwrap().current_agent_id.is_none() {
-                    self.catalog.lock().unwrap().current_agent_id = reported_current_id;
-                }
+                *self.catalog.lock().unwrap() = CatalogPublication {
+                    agents: catalog,
+                    current_agent_id: reported_current_id,
+                };
                 return Err(error);
             }
         };
@@ -442,6 +499,10 @@ impl AgentRuntimeManager {
         };
         *self.catalog_diagnostics.lock().unwrap() = diagnostics;
         *self.bootstrap_error.lock().unwrap() = None;
+        let _ = self.app.emit(
+            "adaptive-agent://catalog-status-changed",
+            json!({ "agentId": current.id }),
+        );
         Ok(())
     }
 
@@ -635,6 +696,11 @@ impl AgentRuntimeManager {
                 }
             }
         }
+        let agent_id = self.catalog.lock().unwrap().current_agent_id.clone();
+        let _ = self.app.emit(
+            "adaptive-agent://catalog-status-changed",
+            json!({ "agentId": agent_id }),
+        );
         Ok(failures)
     }
 
@@ -671,12 +737,157 @@ impl AgentRuntimeManager {
         self.runtimes.lock().unwrap().keys().cloned().collect()
     }
 
+    fn catalog_status(&self) -> Result<DesktopCatalogStatus, String> {
+        let (current_agent_id, mut descriptors) = {
+            let catalog = self.catalog.lock().unwrap();
+            (
+                catalog.current_agent_id.clone(),
+                catalog.agents.values().cloned().collect::<Vec<_>>(),
+            )
+        };
+        descriptors.sort_by(|left, right| left.id.cmp(&right.id));
+        let runtimes = self.runtimes.lock().unwrap().clone();
+        let mut agents = Vec::with_capacity(descriptors.len());
+        for descriptor in descriptors {
+            let snapshot = runtimes.get(&descriptor.id).and_then(|runtime| {
+                runtime
+                    .bridge
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|bridge| bridge.snapshot())
+            });
+            let (status, occupied_slots, error, mut recent_work, approval, recovery) =
+                if let Some(snapshot) = snapshot {
+                    let approval = snapshot.runs.iter().any(|run| {
+                        run.pending_approval.is_some() || run.status == "awaiting_approval"
+                    });
+                    let recovery = snapshot.runs.iter().any(|run| recovery_status(&run.status));
+                    let work: Vec<RecentWork> = snapshot
+                        .runs
+                        .into_iter()
+                        .map(|run| RecentWork {
+                            item_id: run.item_id,
+                            run_id: run.run_id,
+                            title: run.title,
+                            status: run.status,
+                            created_at: run.created_at,
+                            invocation_kind: run.invocation_kind,
+                        })
+                        .collect();
+                    (
+                        snapshot.status,
+                        snapshot.occupied_slot_count,
+                        snapshot.error.is_some(),
+                        work,
+                        approval,
+                        recovery,
+                    )
+                } else {
+                    let runs = self.workbench.load_runs_for_agent(&descriptor.id)?;
+                    let occupied = runs
+                        .iter()
+                        .filter(|run| durable_run_occupies_slot(run))
+                        .count();
+                    let stopping = runs
+                        .iter()
+                        .any(|run| durable_run_occupies_slot(run) && run.cancel_requested);
+                    let approval = runs
+                        .iter()
+                        .any(|run| run.cached_status == "awaiting_approval");
+                    let recovery = runs.iter().any(|run| {
+                        recovery_status(&run.cached_status)
+                            || run.submission_state == "recovery_required"
+                    });
+                    let status = if descriptor.validation_state != "valid" {
+                        "error"
+                    } else if descriptor.archived {
+                        "unavailable"
+                    } else if stopping {
+                        "stopping"
+                    } else if occupied > 0 {
+                        "running"
+                    } else {
+                        "ready"
+                    };
+                    let work: Vec<RecentWork> = runs
+                        .into_iter()
+                        .map(|run| RecentWork {
+                            item_id: run.item_id,
+                            run_id: run.run_id,
+                            title: run.title,
+                            status: run.cached_status,
+                            created_at: run.created_at,
+                            invocation_kind: run.invocation_kind,
+                        })
+                        .collect();
+                    (
+                        status,
+                        occupied,
+                        descriptor.validation_state != "valid",
+                        work,
+                        approval,
+                        recovery,
+                    )
+                };
+            recent_work.sort_by(|left, right| {
+                right
+                    .created_at
+                    .cmp(&left.created_at)
+                    .then_with(|| right.run_id.cmp(&left.run_id))
+            });
+            recent_work.truncate(RECENT_WORK_LIMIT);
+            agents.push(DesktopCatalogAgent {
+                id: descriptor.id,
+                name: descriptor.name,
+                description: descriptor.description,
+                config_path: descriptor.config_path,
+                archived: descriptor.archived,
+                validation_state: descriptor.validation_state,
+                configuration_fingerprint: descriptor.configuration_fingerprint,
+                status,
+                occupied_slots,
+                capacity: CAPACITY,
+                attention: fleet_attention(error, approval, recovery),
+                recent_work,
+            });
+        }
+        Ok(DesktopCatalogStatus {
+            current_agent_id,
+            diagnostics: self.catalog_diagnostics.lock().unwrap().clone(),
+            agents,
+        })
+    }
+
     fn publication_allowed(shutdown: bool) -> Result<(), String> {
         if shutdown {
             Err("Desktop runtime manager is shut down.".into())
         } else {
             Ok(())
         }
+    }
+}
+
+fn durable_run_occupies_slot(run: &Reservation) -> bool {
+    !matches!(
+        run.submission_state.as_str(),
+        "terminal" | "submission_failed"
+    )
+}
+
+fn recovery_status(status: &str) -> bool {
+    matches!(status, "recovery_required" | "recovering" | "interrupted")
+}
+
+fn fleet_attention(error: bool, approval: bool, recovery: bool) -> &'static str {
+    if error {
+        "error"
+    } else if approval {
+        "approval"
+    } else if recovery {
+        "recovery"
+    } else {
+        "none"
     }
 }
 
@@ -2895,6 +3106,10 @@ impl Bridge {
 
     fn emit_state(&self) {
         let _ = self.app.emit("adaptive-agent://state", self.snapshot());
+        let _ = self.app.emit(
+            "adaptive-agent://catalog-status-changed",
+            json!({ "agentId": self.agent_id }),
+        );
     }
 
     fn fail_all(&self, message: &str) {
@@ -3547,6 +3762,38 @@ fn desktop_state(
         }
         Err(error) => Err(error),
     }
+}
+
+#[tauri::command]
+fn desktop_catalog_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<DesktopCatalogStatus, String> {
+    state.manager.catalog_status()
+}
+
+#[tauri::command]
+fn open_agent_workspace(
+    agent_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<DesktopState, String> {
+    let _lifecycle = state.lifecycle.lock().unwrap();
+    if state.reconfiguring.load(Ordering::SeqCst) {
+        return Err("Settings are being reloaded; try again when the runtime is ready.".into());
+    }
+    if state.quit.lock().unwrap().state() != QuitState::Idle {
+        return Err("The desktop is quitting and cannot open an agent workspace.".into());
+    }
+    // `false` applies the new-work policy before either reusing or creating a runtime.
+    let runtime = state.manager.ensure_runtime(&agent_id, false)?;
+    let bridge = runtime
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or("Desktop runtime is unavailable.")?;
+    start_trace_for_runtime(&agent_id, runtime, bridge.clone())?;
+    Ok(bridge.snapshot())
 }
 
 /// Compatibility bootstrap for the single-window renderer. Native callers should bind
@@ -4377,6 +4624,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             desktop_bootstrap,
             desktop_state,
+            desktop_catalog_status,
+            open_agent_workspace,
             reload_settings,
             save_settings,
             start_run,
@@ -5130,6 +5379,7 @@ mod tests {
         CatalogDescriptor {
             id: id.into(),
             name: id.into(),
+            description: Some(format!("{id} description")),
             configuration_fingerprint: format!("fingerprint-{id}"),
             config_path: format!("/agents/{id}.json"),
             validation_state: state.into(),
@@ -5230,6 +5480,14 @@ mod tests {
             true
         )
         .is_err());
+    }
+
+    #[test]
+    fn fleet_attention_uses_error_approval_recovery_priority() {
+        assert_eq!(fleet_attention(false, false, false), "none");
+        assert_eq!(fleet_attention(false, false, true), "recovery");
+        assert_eq!(fleet_attention(false, true, true), "approval");
+        assert_eq!(fleet_attention(true, true, true), "error");
     }
 
     #[test]

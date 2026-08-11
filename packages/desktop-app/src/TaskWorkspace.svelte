@@ -1,11 +1,14 @@
 <script lang="ts">
   import type { ActivityEvent } from './activity';
-  import { getRunOverview, listWorkspaceArtifacts, type RunRecoveryPlan, type RunSummary } from './desktop';
+  import { type RunRecoveryPlan, type RunSummary } from './desktop';
+  import { desktopApi } from './desktop-context';
   import ActivityNarrative from './ActivityNarrative.svelte';
   import ArtifactList from './ArtifactList.svelte';
   import ApprovalCard from './ApprovalCard.svelte';
   import ResultRenderer from './ResultRenderer.svelte';
   import { extractResultArtifacts, recoveryActionLabel, resolveResultArtifactPaths, resultDisplayContent, type ResultArtifact } from './workbench-ux';
+
+  const { getRunOverview, listWorkspaceArtifacts } = desktopApi();
 
   export let attempts: RunSummary[] = [];
   export let selectedRun: RunSummary;
