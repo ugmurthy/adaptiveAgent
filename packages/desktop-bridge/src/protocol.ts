@@ -7,8 +7,8 @@ export {
 } from '@adaptive-agent/agent-sdk/cli';
 
 /** Keep versions as strings: JSON numbers cannot distinguish 1.10 from 1.1. */
-export const DESKTOP_PROTOCOL_VERSION = '1.13' as const;
-export const SUPPORTED_DESKTOP_PROTOCOL_VERSIONS = ['1.10', '1.11', '1.12', DESKTOP_PROTOCOL_VERSION] as const;
+export const DESKTOP_PROTOCOL_VERSION = '1.14' as const;
+export const SUPPORTED_DESKTOP_PROTOCOL_VERSIONS = ['1.10', '1.11', '1.12', '1.13', DESKTOP_PROTOCOL_VERSION] as const;
 export const DESKTOP_BRIDGE_VERSION = '0.1.0';
 
 export type DesktopProtocolVersion = (typeof SUPPORTED_DESKTOP_PROTOCOL_VERSIONS)[number];
@@ -86,6 +86,19 @@ export interface RuntimeInitializeParams {
   gatewayUrl?: string;
   requireRunPermit?: boolean;
   managedAttachmentRoot?: string;
+  /** Protocol 1.14: pin the runtime to the exact descriptor returned by catalog/inspect. */
+  agentSelection?: DesktopAgentSelection;
+}
+
+export interface DesktopAgentSelection {
+  id: string;
+  configPath: string;
+  configurationFingerprint: string;
+}
+
+export interface CatalogInspectParams {
+  cwd?: string;
+  settingsConfigPath?: string;
 }
 
 export type DesktopAttachmentKind = 'file' | 'image' | 'audio';
@@ -192,6 +205,7 @@ type RpcRequestWithoutParams<TMethod extends string> = JsonRpcRequest<TMethod, n
 
 export type DesktopRpcRequest =
   | RpcRequest<'initialize', InitializeParams>
+  | RpcRequest<'catalog/inspect', CatalogInspectParams>
   | RpcRequest<'runtime/initialize', RuntimeInitializeParams>
   | RpcRequestWithoutParams<'runtime/info'>
   | RpcRequestWithoutParams<'runtime/shutdown'>
@@ -217,6 +231,7 @@ export type DesktopRpcRequest =
 
 export const DESKTOP_RPC_METHODS = [
   'initialize',
+  'catalog/inspect',
   'runtime/initialize',
   'runtime/info',
   'runtime/shutdown',
@@ -320,6 +335,10 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
     case 'runtime/shutdown':
     case 'cli/commands':
       if (params && Object.keys(params).length > 0) invalidParams(`${method} does not accept params.`);
+      return;
+    case 'catalog/inspect':
+      optionalString(params ?? {}, 'cwd');
+      optionalString(params ?? {}, 'settingsConfigPath');
       return;
     case 'auth/updateAccessToken':
       requiredString(requiredParams(method, params), 'accessToken');
@@ -511,6 +530,13 @@ function validateRuntimeInitializeParams(value: Record<string, unknown>): void {
   optionalString(value, 'gatewayUrl');
   optionalBoolean(value, 'requireRunPermit');
   optionalString(value, 'managedAttachmentRoot');
+  optionalObject(value, 'agentSelection');
+  if (value.agentSelection !== undefined) {
+    const selection = value.agentSelection as Record<string, unknown>;
+    requiredString(selection, 'id');
+    requiredString(selection, 'configPath');
+    requiredString(selection, 'configurationFingerprint');
+  }
 }
 
 const ATTACHMENT_KEYS = new Set(['attachmentId', 'kind', 'stagedRelativePath', 'name', 'mimeType', 'sizeBytes', 'sha256', 'audioFormat']);

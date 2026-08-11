@@ -55,6 +55,7 @@
   import { historyResultArtifacts, type ResultArtifact } from './workbench-ux';
 
   const emptyDesktop: DesktopState = {
+    agentId: '',
     status: 'starting',
     configurationValid: false,
     runs: [],

@@ -146,8 +146,55 @@ describe('desktop runtime protocol', () => {
       params: { protocolVersion: '2.0', clientInfo: { name: 'desktop' } },
     }))).rejects.toMatchObject({
       code: 'UNSUPPORTED_PROTOCOL_VERSION',
-      data: { supportedProtocolVersions: ['1.10', '1.11', '1.12', '1.13'] },
+      data: { supportedProtocolVersions: ['1.10', '1.11', '1.12', '1.13', '1.14'] },
     });
+  });
+
+  it('inspects the desktop-safe catalog and pins an exact agent in protocol 1.14', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'desktop-catalog-'));
+    const agentPath = join(cwd, 'agent.json');
+    await writeFile(agentPath, JSON.stringify({ id: 'desktop-agent', name: 'Desktop Agent', invocationModes: ['run'], defaultInvocationMode: 'run', model: { provider: 'ollama', model: 'test-model' }, tools: [] }));
+    await writeFile(join(cwd, 'agent.settings.json'), JSON.stringify({ runtime: { mode: 'memory' }, interaction: { approvalMode: 'manual', clarificationMode: 'interactive' } }));
+    const { runtime } = createRuntime();
+    try {
+      const initialized = await runtime.handleRpc(request({ id: 'protocol', method: 'initialize', params: { protocolVersion: '1.14', clientInfo: { name: 'desktop' } } })) as any;
+      expect(initialized.capabilities.methods).toContain('catalog/inspect');
+      const catalog = await runtime.handleRpc(request({ id: 'catalog', method: 'catalog/inspect', params: { cwd } })) as any;
+      expect(catalog).toMatchObject({ currentAgent: { id: 'desktop-agent', configPath: agentPath }, settingsPath: join(cwd, 'agent.settings.json'), diagnostics: [] });
+      expect(catalog).not.toHaveProperty('config');
+      expect(catalog).not.toHaveProperty('tools');
+      const descriptor = catalog.currentAgent;
+      const result = await runtime.handleRpc(request({ id: 'runtime', method: 'runtime/initialize', params: { cwd, runtimeMode: 'memory', agentSelection: { id: descriptor.id, configPath: descriptor.configPath, configurationFingerprint: descriptor.configurationFingerprint } } })) as any;
+      expect(result).toMatchObject({ agent: { id: 'desktop-agent' }, runtimeMode: 'memory' });
+      await expect(runtime.handleRpc(request({ id: 'again', method: 'catalog/inspect', params: { cwd } }))).rejects.toMatchObject({ code: 'ALREADY_INITIALIZED' });
+    } finally {
+      await runtime.close();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects stale fingerprints and wrong exact agent ids or paths', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'desktop-catalog-reject-'));
+    const agentPath = join(cwd, 'agent.json');
+    const writeAgent = (name: string) => writeFile(agentPath, JSON.stringify({ id: 'desktop-agent', name, invocationModes: ['run'], defaultInvocationMode: 'run', model: { provider: 'test', model: 'test-model' }, tools: [] }));
+    await writeAgent('Original');
+    await writeFile(join(cwd, 'agent.settings.json'), JSON.stringify({ runtime: { mode: 'memory' } }));
+    const inspectRuntime = createRuntime().runtime;
+    await inspectRuntime.handleRpc(request({ id: 'protocol', method: 'initialize', params: { protocolVersion: '1.14', clientInfo: { name: 'desktop' } } }));
+    const descriptor = (await inspectRuntime.handleRpc(request({ id: 'catalog', method: 'catalog/inspect', params: { cwd } })) as any).currentAgent;
+    await writeAgent('Changed');
+    for (const selection of [
+      descriptor,
+      { ...descriptor, id: 'wrong-id' },
+      { ...descriptor, configPath: join(cwd, 'missing.json') },
+    ]) {
+      const runtime = createRuntime().runtime;
+      await runtime.handleRpc(request({ id: 'protocol', method: 'initialize', params: { protocolVersion: '1.14', clientInfo: { name: 'desktop' } } }));
+      await expect(runtime.handleRpc(request({ id: 'runtime', method: 'runtime/initialize', params: { cwd, runtimeMode: 'memory', agentSelection: selection } }))).rejects.toMatchObject({ code: 'AGENT_SELECTION_MISMATCH', jsonRpcCode: JSON_RPC_ERROR_CODES.invalidParams });
+      await runtime.close();
+    }
+    await inspectRuntime.close();
+    await rm(cwd, { recursive: true, force: true });
   });
 
   it('translates only immutable files contained by the managed attachment root', async () => {

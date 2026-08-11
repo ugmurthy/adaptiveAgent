@@ -14,7 +14,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
-        Arc, Mutex,
+        Arc, Mutex, Weak,
     },
     time::Duration,
 };
@@ -25,7 +25,8 @@ use tauri_plugin_shell::{
     ShellExt,
 };
 use workbench::{
-    now, ChatItem, ChatMessage, PendingApproval, PendingRunRecovery, Reservation, WorkbenchDb,
+    now, AgentCatalogMapping, ChatItem, ChatMessage, PendingApproval, PendingRunRecovery,
+    Reservation, WorkbenchDb,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -77,6 +78,7 @@ impl NdjsonDecoder {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopState {
+    agent_id: String,
     status: &'static str,
     configuration_valid: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -170,6 +172,9 @@ struct ArtifactPreview {
 
 struct Bridge {
     app: AppHandle,
+    agent_id: String,
+    agent_config_path: String,
+    agent_fingerprint: String,
     child: Mutex<Option<CommandChild>>,
     pending: Mutex<HashMap<u64, Sender<Response>>>,
     decoder: Mutex<NdjsonDecoder>,
@@ -191,18 +196,527 @@ struct Bridge {
     reconciling: Mutex<HashMap<String, bool>>,
 }
 
-#[derive(Default)]
 struct AppState {
+    manager: AgentRuntimeManager,
     lifecycle: Mutex<()>,
     reconfiguring: AtomicBool,
-    bridge: Mutex<Option<Arc<Bridge>>>,
-    trace: Mutex<Option<Arc<TraceBridge>>>,
-    generation: AtomicU64,
-    trace_generation: AtomicU64,
     quit: Mutex<QuitCoordinator>,
     shutdown_started: AtomicBool,
+}
+
+struct ManagedRuntime {
+    bridge: Mutex<Option<Arc<Bridge>>>,
+    trace: Mutex<Option<Arc<TraceBridge>>>,
+    trace_starting: AtomicBool,
+    trace_generation: AtomicU64,
     trace_selection: Mutex<TraceSelection>,
     trace_refreshes: Mutex<HashMap<String, TraceRefreshState>>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct CatalogDescriptor {
+    id: String,
+    name: String,
+    configuration_fingerprint: String,
+    config_path: String,
+    validation_state: String,
+    #[serde(default)]
+    archived: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogInspect {
+    agents: Vec<CatalogDescriptor>,
+    #[serde(default)]
+    diagnostics: Vec<Value>,
+    current_agent: Option<CatalogDescriptor>,
+}
+
+struct AgentRuntimeManager {
+    app: AppHandle,
+    workbench: Arc<WorkbenchDb>,
+    attachment_root: PathBuf,
+    catalog: Mutex<CatalogPublication>,
+    runtimes: Mutex<HashMap<String, Arc<ManagedRuntime>>>,
+    lifecycle: Mutex<()>,
+    shutdown: AtomicBool,
+    catalog_diagnostics: Mutex<Vec<Value>>,
+    bootstrap_error: Mutex<Option<String>>,
+}
+
+#[derive(Default)]
+struct CatalogPublication {
+    agents: HashMap<String, CatalogDescriptor>,
+    current_agent_id: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RuntimeConvergence {
+    Replace,
+    Retire,
+}
+
+impl AgentRuntimeManager {
+    fn new(app: &AppHandle) -> Result<Self, String> {
+        let directory = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| format!("Unable to resolve desktop application data: {error}"))?;
+        let workbench = Arc::new(
+            WorkbenchDb::open(directory.join("workbench.sqlite"))
+                .map_err(|error| format!("Unable to open workbench persistence: {error}"))?,
+        );
+        let attachment_root = directory.join("attachments");
+        std::fs::create_dir_all(&attachment_root)
+            .map_err(|error| format!("Unable to create attachment store: {error}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&attachment_root, std::fs::Permissions::from_mode(0o700))
+                .map_err(|error| format!("Unable to secure attachment store: {error}"))?;
+        }
+        cleanup_attachments(&workbench, &attachment_root)?;
+        cleanup_attachment_orphans(&workbench, &attachment_root)?;
+        Ok(Self {
+            app: app.clone(),
+            workbench,
+            attachment_root,
+            catalog: Mutex::new(CatalogPublication::default()),
+            runtimes: Mutex::new(HashMap::new()),
+            lifecycle: Mutex::new(()),
+            shutdown: AtomicBool::new(false),
+            catalog_diagnostics: Mutex::new(Vec::new()),
+            bootstrap_error: Mutex::new(None),
+        })
+    }
+
+    fn validate_catalog(
+        inspection: CatalogInspect,
+    ) -> Result<(HashMap<String, CatalogDescriptor>, CatalogDescriptor), String> {
+        let _diagnostics = inspection.diagnostics;
+        let current = inspection
+            .current_agent
+            .ok_or("The catalog did not identify a current agent.")?;
+        let mut counts = HashMap::<String, usize>::new();
+        for descriptor in &inspection.agents {
+            *counts.entry(descriptor.id.clone()).or_default() += 1;
+        }
+        let mut catalog = HashMap::new();
+        for descriptor in inspection.agents {
+            if descriptor.id.trim().is_empty()
+                || descriptor.config_path.trim().is_empty()
+                || descriptor.configuration_fingerprint.trim().is_empty()
+            {
+                continue;
+            }
+            if counts.get(&descriptor.id) == Some(&1) {
+                catalog.insert(descriptor.id.clone(), descriptor);
+            }
+        }
+        let exact = catalog
+            .get(&current.id)
+            .filter(|candidate| **candidate == current)
+            .cloned()
+            .ok_or("The current agent descriptor is not unique in the catalog.")?;
+        Self::creation_allowed(&exact, true)?;
+        Ok((catalog, exact))
+    }
+
+    fn creation_allowed(
+        descriptor: &CatalogDescriptor,
+        allow_archived: bool,
+    ) -> Result<(), String> {
+        if descriptor.validation_state != "valid" {
+            return Err(format!("Agent '{}' is not valid.", descriptor.id));
+        }
+        if descriptor.archived && !allow_archived {
+            return Err(format!(
+                "Agent '{}' is archived and cannot start new work.",
+                descriptor.id
+            ));
+        }
+        Ok(())
+    }
+
+    fn bootstrap(&self) -> Result<Arc<ManagedRuntime>, String> {
+        if let Err(error) = self.refresh_catalog() {
+            *self.bootstrap_error.lock().unwrap() = Some(error.clone());
+            return Err(error);
+        }
+        let current_runtime = match self.current() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                *self.bootstrap_error.lock().unwrap() = Some(error.clone());
+                return Err(error);
+            }
+        };
+        let current_id = self
+            .catalog
+            .lock()
+            .unwrap()
+            .current_agent_id
+            .clone()
+            .unwrap();
+        for agent_id in self.workbench.active_agent_ids()? {
+            if agent_id != current_id {
+                if let Err(error) = self.ensure_runtime(&agent_id, true) {
+                    eprintln!(
+                        "Unable to bind persisted active work for agent '{agent_id}': {error}"
+                    );
+                }
+            }
+        }
+        *self.bootstrap_error.lock().unwrap() = None;
+        Ok(current_runtime)
+    }
+
+    fn inspect_catalog(&self) -> Result<CatalogInspect, String> {
+        let probe_selection = CatalogDescriptor {
+            id: "__catalog_probe__".into(),
+            name: String::new(),
+            configuration_fingerprint: "probe".into(),
+            config_path: "probe".into(),
+            validation_state: "valid".into(),
+            archived: false,
+        };
+        let probe = Bridge::spawn(
+            &self.app,
+            self.workbench.clone(),
+            self.attachment_root.clone(),
+            &probe_selection,
+        )?;
+        let result = (|| {
+            let negotiated = probe.request_wait("initialize", json!({ "protocolVersion": "1.14", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }), REQUEST_TIMEOUT)?;
+            if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.14") {
+                return Err("The sidecar did not negotiate desktop protocol 1.14.".into());
+            }
+            let value = probe.request_wait("catalog/inspect", json!({}), REQUEST_TIMEOUT)?;
+            serde_json::from_value(value)
+                .map_err(|error| format!("Invalid catalog response: {error}"))
+        })();
+        probe.shutdown();
+        result
+    }
+
+    fn refresh_catalog(&self) -> Result<(), String> {
+        let _lifecycle = self.lifecycle.lock().unwrap();
+        self.refresh_catalog_locked()
+    }
+
+    fn refresh_catalog_locked(&self) -> Result<(), String> {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return Err("Desktop runtime manager is shut down.".into());
+        }
+        let inspection = self.inspect_catalog()?;
+        let diagnostics = inspection.diagnostics.clone();
+        let reported_current_id = inspection
+            .current_agent
+            .as_ref()
+            .map(|agent| agent.id.clone());
+        let (catalog, current) = match Self::validate_catalog(inspection) {
+            Ok(validated) => validated,
+            Err(error) => {
+                *self.catalog_diagnostics.lock().unwrap() = diagnostics;
+                if self.catalog.lock().unwrap().current_agent_id.is_none() {
+                    self.catalog.lock().unwrap().current_agent_id = reported_current_id;
+                }
+                return Err(error);
+            }
+        };
+        let mappings = catalog
+            .values()
+            .filter(|agent| agent.validation_state == "valid")
+            .map(|agent| AgentCatalogMapping {
+                agent_id: agent.id.clone(),
+                fingerprint: agent.configuration_fingerprint.clone(),
+                config_path: agent.config_path.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.workbench.reconcile_agent_catalog(&mappings)?;
+        // Publish only after the complete probe and durable reconciliation succeeded.
+        *self.catalog.lock().unwrap() = CatalogPublication {
+            agents: catalog,
+            current_agent_id: Some(current.id.clone()),
+        };
+        *self.catalog_diagnostics.lock().unwrap() = diagnostics;
+        *self.bootstrap_error.lock().unwrap() = None;
+        Ok(())
+    }
+
+    fn ensure_runtime(
+        &self,
+        agent_id: &str,
+        allow_archived: bool,
+    ) -> Result<Arc<ManagedRuntime>, String> {
+        let _lifecycle = self.lifecycle.lock().unwrap();
+        self.ensure_runtime_locked(agent_id, allow_archived)
+    }
+
+    fn ensure_runtime_locked(
+        &self,
+        agent_id: &str,
+        allow_archived: bool,
+    ) -> Result<Arc<ManagedRuntime>, String> {
+        Self::publication_allowed(self.shutdown.load(Ordering::SeqCst))?;
+        let descriptor = self
+            .catalog
+            .lock()
+            .unwrap()
+            .agents
+            .get(agent_id)
+            .cloned()
+            .ok_or_else(|| format!("Unknown agent '{agent_id}'."))?;
+        Self::creation_allowed(&descriptor, allow_archived)?;
+        let cached = self.runtimes.lock().unwrap().get(agent_id).cloned();
+        if let Some(runtime) = cached {
+            let matches = runtime
+                .bridge
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|bridge| Self::bridge_matches_descriptor(bridge, &descriptor));
+            if matches {
+                return Ok(runtime);
+            }
+            self.runtimes.lock().unwrap().remove(agent_id);
+            Self::shutdown_runtime(&runtime);
+        }
+        let bridge = Bridge::spawn(
+            &self.app,
+            self.workbench.clone(),
+            self.attachment_root.clone(),
+            &descriptor,
+        )?;
+        if let Err(error) = bridge.initialize() {
+            bridge.shutdown();
+            return Err(error);
+        }
+        let runtime = Arc::new(ManagedRuntime {
+            bridge: Mutex::new(Some(bridge)),
+            trace: Mutex::new(None),
+            trace_starting: AtomicBool::new(false),
+            trace_generation: AtomicU64::new(0),
+            trace_selection: Mutex::new(TraceSelection::default()),
+            trace_refreshes: Mutex::new(HashMap::new()),
+        });
+        self.runtimes
+            .lock()
+            .unwrap()
+            .insert(agent_id.into(), runtime.clone());
+        Ok(runtime)
+    }
+
+    fn current(&self) -> Result<Arc<ManagedRuntime>, String> {
+        let id = self
+            .catalog
+            .lock()
+            .unwrap()
+            .current_agent_id
+            .clone()
+            .ok_or("Desktop runtime is starting.")?;
+        self.ensure_runtime(&id, true)
+    }
+
+    fn shutdown_all(&self) {
+        let runtimes = {
+            let _lifecycle = self.lifecycle.lock().unwrap();
+            self.shutdown.store(true, Ordering::SeqCst);
+            self.runtimes
+                .lock()
+                .unwrap()
+                .drain()
+                .map(|(_, runtime)| runtime)
+                .collect::<Vec<_>>()
+        };
+        for runtime in runtimes {
+            Self::shutdown_runtime(&runtime);
+        }
+    }
+
+    fn runtime_bridges(&self) -> Vec<Arc<Bridge>> {
+        let runtimes = self
+            .runtimes
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        runtimes
+            .into_iter()
+            .filter_map(|runtime| runtime.bridge.lock().unwrap().as_ref().cloned())
+            .collect()
+    }
+
+    fn convergence_action(descriptor: Option<&CatalogDescriptor>) -> RuntimeConvergence {
+        match descriptor {
+            Some(descriptor) if Self::creation_allowed(descriptor, true).is_ok() => {
+                RuntimeConvergence::Replace
+            }
+            _ => RuntimeConvergence::Retire,
+        }
+    }
+
+    fn bridge_matches_descriptor(bridge: &Bridge, descriptor: &CatalogDescriptor) -> bool {
+        Self::immutable_selection_matches(
+            &bridge.agent_config_path,
+            &bridge.agent_fingerprint,
+            descriptor,
+        )
+    }
+
+    fn immutable_selection_matches(
+        config_path: &str,
+        fingerprint: &str,
+        descriptor: &CatalogDescriptor,
+    ) -> bool {
+        config_path == descriptor.config_path && fingerprint == descriptor.configuration_fingerprint
+    }
+
+    fn shutdown_runtime(runtime: &Arc<ManagedRuntime>) {
+        if let Some(trace) = runtime.trace.lock().unwrap().take() {
+            trace.shutdown();
+        }
+        if let Some(bridge) = runtime.bridge.lock().unwrap().take() {
+            bridge.shutdown();
+        }
+    }
+
+    /// Refreshes the catalog and converges every runtime that existed before the refresh.
+    /// All old runtimes are removed before replacements are attempted, so failures cannot
+    /// leave stale immutable selections routable.
+    fn converge_after_catalog_refresh(&self) -> Result<Vec<String>, String> {
+        let _lifecycle = self.lifecycle.lock().unwrap();
+        let instantiated = self.instantiated_agent_ids();
+        if let Err(error) = self.refresh_catalog_locked() {
+            // Settings may already be durable. Fail closed: no runtime using the previous
+            // catalog generation may remain routable after refresh fails.
+            let stale = self
+                .runtimes
+                .lock()
+                .unwrap()
+                .drain()
+                .map(|(_, runtime)| runtime)
+                .collect::<Vec<_>>();
+            self.catalog.lock().unwrap().agents.clear();
+            *self.bootstrap_error.lock().unwrap() = Some(error.clone());
+            for runtime in stale {
+                Self::shutdown_runtime(&runtime);
+            }
+            return Err(error);
+        }
+        let catalog = self.catalog.lock().unwrap();
+        let actions = instantiated
+            .into_iter()
+            .map(|id| {
+                let action = Self::convergence_action(catalog.agents.get(&id));
+                (id, action)
+            })
+            .collect::<Vec<_>>();
+        drop(catalog);
+
+        let old = {
+            let mut runtimes = self.runtimes.lock().unwrap();
+            actions
+                .iter()
+                .filter_map(|(id, _)| runtimes.remove(id))
+                .collect::<Vec<_>>()
+        };
+        for runtime in old {
+            Self::shutdown_runtime(&runtime);
+        }
+
+        let mut failures = Vec::new();
+        for (id, action) in actions {
+            if action == RuntimeConvergence::Replace {
+                if let Err(error) = self.ensure_runtime_locked(&id, true) {
+                    failures.push(format!("{id}: {error}"));
+                }
+            }
+        }
+        Ok(failures)
+    }
+
+    fn error_snapshot(&self, quit_state: QuitState) -> DesktopState {
+        DesktopState {
+            agent_id: self
+                .catalog
+                .lock()
+                .unwrap()
+                .current_agent_id
+                .clone()
+                .unwrap_or_default(),
+            status: "error",
+            configuration_valid: false,
+            configuration: None,
+            error: Some(
+                self.bootstrap_error
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "No runnable current agent is available.".into()),
+            ),
+            runs: Vec::new(),
+            occupied_slot_count: 0,
+            capacity: CAPACITY,
+            execution_health: "error",
+            trace_health: "error",
+            trace_error: Some("Trace is unavailable until agent configuration is valid.".into()),
+            quit_state,
+        }
+    }
+
+    fn instantiated_agent_ids(&self) -> Vec<String> {
+        self.runtimes.lock().unwrap().keys().cloned().collect()
+    }
+
+    fn publication_allowed(shutdown: bool) -> Result<(), String> {
+        if shutdown {
+            Err("Desktop runtime manager is shut down.".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn runtime_for(
+    state: &AppState,
+    agent_id: &str,
+    allow_archived: bool,
+) -> Result<Arc<ManagedRuntime>, String> {
+    let runtime = state.manager.ensure_runtime(agent_id, allow_archived)?;
+    let bridge = runtime
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or("Desktop runtime is starting.")?;
+    start_trace_for_runtime(agent_id, runtime.clone(), bridge)?;
+    Ok(runtime)
+}
+
+fn bridge_for(
+    state: &AppState,
+    agent_id: &str,
+    allow_archived: bool,
+) -> Result<Arc<Bridge>, String> {
+    let runtime = runtime_for(state, agent_id, allow_archived)?;
+    let bridge = runtime
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or("Desktop runtime is starting.")?;
+    bridge.assert_agent_id(agent_id)?;
+    Ok(bridge)
+}
+
+fn canonical_path(path: &str) -> Result<PathBuf, String> {
+    std::fs::canonicalize(path)
+        .map_err(|error| format!("Unable to resolve agent configuration path '{path}': {error}"))
 }
 
 #[derive(Default)]
@@ -227,6 +741,7 @@ struct TracePrivacy {
 
 struct TraceBridge {
     app: AppHandle,
+    owning_bridge: Weak<Bridge>,
     child: Mutex<Option<CommandChild>>,
     pending: Mutex<HashMap<u64, Sender<Response>>>,
     decoder: Mutex<NdjsonDecoder>,
@@ -244,6 +759,7 @@ impl TraceBridge {
         privacy: TracePrivacy,
         healthy: Arc<AtomicBool>,
         error: Arc<Mutex<Option<String>>>,
+        owning_bridge: Weak<Bridge>,
     ) -> Result<Arc<Self>, String> {
         let mut arguments = vec!["--sqlite-path".to_string(), sqlite_path.to_string()];
         if privacy.messages || privacy.reasoning {
@@ -264,6 +780,7 @@ impl TraceBridge {
             .map_err(|e| format!("Unable to start trace sidecar: {e}"))?;
         let sidecar = Arc::new(Self {
             app: app.clone(),
+            owning_bridge,
             child: Mutex::new(Some(child)),
             pending: Mutex::new(HashMap::new()),
             decoder: Mutex::new(NdjsonDecoder::new(TRACE_MAX_NDJSON_FRAME_SIZE)),
@@ -409,7 +926,7 @@ impl TraceBridge {
         self.emit_state();
     }
     fn emit_state(&self) {
-        if let Some(bridge) = self.app.state::<AppState>().bridge.lock().unwrap().as_ref() {
+        if let Some(bridge) = self.owning_bridge.upgrade() {
             bridge.emit_state();
         }
     }
@@ -428,6 +945,25 @@ impl TraceBridge {
 }
 
 impl Bridge {
+    fn control_error_payload(&self, run_id: &str, error: impl ToString) -> Value {
+        json!({ "agentId": self.agent_id, "runId": run_id, "error": error.to_string() })
+    }
+
+    fn emit_control_error(&self, run_id: &str, error: impl ToString) {
+        let _ = self.app.emit(
+            "adaptive-agent://control-error",
+            self.control_error_payload(run_id, error),
+        );
+    }
+
+    fn assert_agent_id(&self, agent_id: &str) -> Result<(), String> {
+        if self.agent_id == agent_id {
+            Ok(())
+        } else {
+            Err("The selected agent does not own this runtime.".into())
+        }
+    }
+
     fn validated_drafts(&self, ids: &[String]) -> Result<Vec<AttachmentDraft>, String> {
         if ids.len() > MAX_ATTACHMENT_COUNT {
             return Err("ATTACHMENT_TOO_LARGE: At most 8 attachments are allowed.".into());
@@ -436,7 +972,7 @@ impl Bridge {
         if ids.iter().any(|id| !unique.insert(id)) {
             return Err("Duplicate attachment ID.".into());
         }
-        let drafts = self.workbench.get_drafts(ids)?;
+        let drafts = self.workbench.get_drafts_for_agent(&self.agent_id, ids)?;
         let mut total = 0;
         for draft in &drafts {
             attachments::validate_staged(&self.attachment_root, draft)?;
@@ -447,25 +983,15 @@ impl Bridge {
         }
         Ok(drafts)
     }
-    fn spawn(app: &AppHandle, workbench: Arc<WorkbenchDb>) -> Result<Arc<Self>, String> {
+    fn spawn(
+        app: &AppHandle,
+        workbench: Arc<WorkbenchDb>,
+        attachment_root: PathBuf,
+        selection: &CatalogDescriptor,
+    ) -> Result<Arc<Self>, String> {
         // Complete all fallible persistence reads before creating a child process so every
         // spawned runtime can be published to, and shut down through, the native lifecycle.
-        let saved_runs = workbench.load_runs()?;
-        let attachment_root = app
-            .path()
-            .app_data_dir()
-            .map_err(|e| e.to_string())?
-            .join("attachments");
-        std::fs::create_dir_all(&attachment_root)
-            .map_err(|e| format!("Unable to create attachment store: {e}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&attachment_root, std::fs::Permissions::from_mode(0o700))
-                .map_err(|e| format!("Unable to secure attachment store: {e}"))?;
-        }
-        cleanup_attachments(&workbench, &attachment_root)?;
-        cleanup_attachment_orphans(&workbench, &attachment_root)?;
+        let saved_runs = workbench.load_runs_for_agent(&selection.id)?;
         let (mut events, child) = app
             .shell()
             .sidecar("agent-runtime")
@@ -474,6 +1000,9 @@ impl Bridge {
             .map_err(|error| format!("Unable to start the agent runtime: {error}"))?;
         let bridge = Arc::new(Self {
             app: app.clone(),
+            agent_id: selection.id.clone(),
+            agent_config_path: selection.config_path.clone(),
+            agent_fingerprint: selection.configuration_fingerprint.clone(),
             child: Mutex::new(Some(child)),
             pending: Mutex::new(HashMap::new()),
             decoder: Mutex::new(NdjsonDecoder::new(MAX_NDJSON_FRAME_SIZE)),
@@ -524,7 +1053,10 @@ impl Bridge {
                 shell_cwd: saved.shell_cwd,
             });
         }
-        for approval in bridge.workbench.load_pending_approvals()? {
+        for approval in bridge
+            .workbench
+            .load_pending_approvals_for_agent(&bridge.agent_id)?
+        {
             bridge.run_roots.lock().unwrap().insert(
                 approval.approval_run_id.clone(),
                 approval.root_run_id.clone(),
@@ -569,15 +1101,23 @@ impl Bridge {
     fn initialize(self: &Arc<Self>) -> Result<(), String> {
         let negotiated = self.request_wait(
             "initialize",
-            json!({ "protocolVersion": "1.13", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }),
+            json!({ "protocolVersion": "1.14", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }),
             REQUEST_TIMEOUT,
         )?;
-        if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.13") {
-            return Err("The sidecar did not negotiate desktop protocol 1.13.".into());
+        if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.14") {
+            return Err("The sidecar did not negotiate desktop protocol 1.14.".into());
         }
         let initialized = self.request_wait(
             "runtime/initialize",
-            json!({ "configurationDriven": true, "managedAttachmentRoot": self.attachment_root }),
+            json!({
+                "configurationDriven": true,
+                "managedAttachmentRoot": self.attachment_root,
+                "agentSelection": {
+                    "id": self.agent_id,
+                    "configPath": self.agent_config_path,
+                    "configurationFingerprint": self.agent_fingerprint
+                }
+            }),
             REQUEST_TIMEOUT,
         )?;
         let configuration = initialized
@@ -587,10 +1127,6 @@ impl Bridge {
                 "The sidecar did not return a safe resolved configuration.".to_string()
             })?;
         *self.configuration.lock().unwrap() = Some(configuration);
-        if let Ok((id, _, fingerprint, Some(config_path))) = self.current_agent() {
-            self.workbench
-                .backfill_agent_config_path(&id, &fingerprint, &config_path)?;
-        }
         *self.initialization_error.lock().unwrap() = None;
         self.prime_run_roots();
         self.reconcile_saved_runs();
@@ -601,7 +1137,7 @@ impl Bridge {
     }
 
     fn recover_deletion_jobs(self: &Arc<Self>) {
-        let Ok(jobs) = self.workbench.load_deletion_jobs() else {
+        let Ok(jobs) = self.workbench.load_deletion_jobs_for_agent(&self.agent_id) else {
             return;
         };
         for job in jobs {
@@ -612,7 +1148,10 @@ impl Bridge {
     }
 
     fn recover_pending_run_operations(self: &Arc<Self>) {
-        let Ok(operations) = self.workbench.load_run_recovery_operations() else {
+        let Ok(operations) = self
+            .workbench
+            .load_run_recovery_operations_for_agent(&self.agent_id)
+        else {
             return;
         };
         for operation in operations {
@@ -625,9 +1164,9 @@ impl Bridge {
         let inspection = match self.inspect_for_recovery(&operation.run_id) {
             Ok(inspection) => inspection,
             Err(error) => {
-                let _ = self.app.emit(
-                    "adaptive-agent://control-error",
-                    json!({"runId":operation.run_id,"error":format!("Unable to inspect pending recovery: {error}")}),
+                self.emit_control_error(
+                    &operation.run_id,
+                    format!("Unable to inspect pending recovery: {error}"),
                 );
                 return;
             }
@@ -651,16 +1190,19 @@ impl Bridge {
             return;
         }
         if !pending_recovery_can_dispatch(accepted, &operation.requested_action, status) {
-            let _ = self.app.emit(
-                    "adaptive-agent://control-error",
-                    json!({"runId":operation.run_id,"error":format!("Pending {} recovery requires reconciliation from runtime status {status}.",operation.requested_action)}),
-                );
+            self.emit_control_error(
+                &operation.run_id,
+                format!(
+                    "Pending {} recovery requires reconciliation from runtime status {status}.",
+                    operation.requested_action
+                ),
+            );
             return;
         }
         if let Err(error) = self.dispatch_same_run_recovery(&operation.run_id) {
-            let _ = self.app.emit(
-                "adaptive-agent://control-error",
-                json!({"runId":operation.run_id,"error":format!("Unable to restore pending recovery: {error}")}),
+            self.emit_control_error(
+                &operation.run_id,
+                format!("Unable to restore pending recovery: {error}"),
             );
         }
     }
@@ -758,9 +1300,9 @@ impl Bridge {
                     Ok(None) => {}
                     Err(error) => {
                         state = recovery_required(true);
-                        let _ = bridge.app.emit(
-                            "adaptive-agent://control-error",
-                            json!({"runId":run_id,"error":format!("Unable to read pending recovery state: {error}")}),
+                        bridge.emit_control_error(
+                            &run_id,
+                            format!("Unable to read pending recovery state: {error}"),
                         );
                     }
                 }
@@ -788,7 +1330,10 @@ impl Bridge {
                         });
                     if let Err(error) = finalized {
                         state = recovery_required(true);
-                        let _=bridge.app.emit("adaptive-agent://control-error",json!({"runId":run_id,"error":format!("Unable to reconcile successful chat turn: {error}")}));
+                        bridge.emit_control_error(
+                            &run_id,
+                            format!("Unable to reconcile successful chat turn: {error}"),
+                        );
                     }
                 }
                 let mut task_terminal_finalized = false;
@@ -803,9 +1348,9 @@ impl Bridge {
                             Ok(()) => task_terminal_finalized = true,
                             Err(error) => {
                                 state = recovery_required(true);
-                                let _ = bridge.app.emit(
-                                    "adaptive-agent://control-error",
-                                    json!({"runId":run_id,"error":format!("Unable to persist terminal run state: {error}")}),
+                                bridge.emit_control_error(
+                                    &run_id,
+                                    format!("Unable to persist terminal run state: {error}"),
                                 );
                             }
                         }
@@ -873,10 +1418,7 @@ impl Bridge {
                         {
                             Ok(()) => result_persisted = true,
                             Err(error) => {
-                                let _ = bridge.app.emit(
-                                    "adaptive-agent://control-error",
-                                    json!({"runId":run_id,"error":error}),
-                                );
+                                bridge.emit_control_error(&run_id, error);
                             }
                         }
                     }
@@ -906,7 +1448,7 @@ impl Bridge {
                 if applied_quiescent {
                     let _ = bridge.app.emit(
                         "adaptive-agent://run-finished",
-                        json!({ "runId": run_id, "result": result }),
+                        json!({ "agentId": bridge.agent_id, "runId": run_id, "result": result }),
                     );
                 }
                 bridge.emit_state();
@@ -931,10 +1473,7 @@ impl Bridge {
             // Acceptance is not quiescence. Reconciliation clears the durable intent.
             true
         } else {
-            let _ = self.app.emit(
-                "adaptive-agent://control-error",
-                json!({ "runId": run_id, "error": result.unwrap_err() }),
-            );
+            self.emit_control_error(run_id, result.unwrap_err());
             false
         }
     }
@@ -977,9 +1516,9 @@ impl Bridge {
                     return Ok(());
                 }
                 Err(error) if retry => {
-                    let _ = self.app.emit(
-                        "adaptive-agent://control-error",
-                        json!({ "runId": run_id, "error": format!("Unable to persist shutdown interrupt; retrying: {error}") }),
+                    self.emit_control_error(
+                        run_id,
+                        format!("Unable to persist shutdown interrupt; retrying: {error}"),
                     );
                     std::thread::sleep(Duration::from_millis(200));
                 }
@@ -1117,13 +1656,16 @@ impl Bridge {
                 project_activity_event(event, &root_run_id, delegate_name.as_deref())
             {
                 redact_managed_attachment_paths(&mut projected, &self.attachment_root);
+                if let Some(object) = projected.as_object_mut() {
+                    object.insert("agentId".into(), Value::String(self.agent_id.clone()));
+                }
                 let _ = self.app.emit("adaptive-agent://activity", projected);
             }
             if matches!(
                 kind,
                 "run.completed" | "run.failed" | "run.interrupted" | "replan.required"
             ) {
-                schedule_trace_refresh(&self.app, root_run_id, true);
+                schedule_trace_refresh(&self.app, self.agent_id.clone(), root_run_id, true);
             }
         }
         let root_created = is_root_run_created(event);
@@ -1307,7 +1849,10 @@ impl Bridge {
     }
 
     fn recover_pending_approval_operations(self: &Arc<Self>) {
-        if let Ok(approvals) = self.workbench.load_pending_approvals() {
+        if let Ok(approvals) = self
+            .workbench
+            .load_pending_approvals_for_agent(&self.agent_id)
+        {
             for approval in approvals
                 .into_iter()
                 .filter(|approval| approval.operation_state != "awaiting_decision")
@@ -1333,10 +1878,7 @@ impl Bridge {
                     REQUEST_TIMEOUT,
                 );
                 if let Err(error) = resolved {
-                    let _ = bridge.app.emit(
-                        "adaptive-agent://control-error",
-                        json!({"runId":root_run_id,"error":format!("Approval outcome is unknown and will be retried after runtime restart: {error}")}),
-                    );
+                    bridge.emit_control_error(&root_run_id, format!("Approval outcome is unknown and will be retried after runtime restart: {error}"));
                     bridge.reconcile_run(root_run_id.clone());
                     bridge.emit_state();
                     return;
@@ -1370,10 +1912,7 @@ impl Bridge {
                             match receiver.recv() {
                                 Ok(Ok(_)) => bridge2.reconcile_run(root),
                                 Ok(Err(error)) => {
-                                    let _ = bridge2.app.emit(
-                                        "adaptive-agent://control-error",
-                                        json!({"runId":root,"error":error}),
-                                    );
+                                    bridge2.emit_control_error(&root, error);
                                     bridge2.reconcile_run(root)
                                 }
                                 Err(_) => bridge2.reconcile_run(root),
@@ -1381,10 +1920,7 @@ impl Bridge {
                         });
                     }
                     Err(error) => {
-                        let _ = bridge.app.emit(
-                            "adaptive-agent://control-error",
-                            json!({"runId":root_run_id,"error":error}),
-                        );
+                        bridge.emit_control_error(&root_run_id, error);
                         bridge.reconcile_run(root_run_id.clone());
                     }
                 }
@@ -1558,17 +2094,14 @@ impl Bridge {
                     if accepted_quiescent {
                         let _ = bridge.app.emit(
                             "adaptive-agent://run-finished",
-                            json!({ "runId": run_id, "result": stored_result }),
+                            json!({ "agentId": bridge.agent_id, "runId": run_id, "result": stored_result }),
                         );
                     } else {
                         bridge.reconcile_run(run_id.clone());
                     }
                 }
                 Err(error) => {
-                    let _ = bridge.app.emit(
-                        "adaptive-agent://control-error",
-                        json!({ "runId": run_id, "error": error }),
-                    );
+                    bridge.emit_control_error(&run_id, error);
                     bridge.reconcile_run(run_id.clone());
                 }
             }
@@ -1631,7 +2164,9 @@ impl Bridge {
     }
 
     fn chat_dto(&self, item_id: &str) -> Result<ChatDto, String> {
-        let (chat, messages) = self.workbench.load_chat(item_id)?;
+        let (chat, messages) = self
+            .workbench
+            .load_chat_for_agent(&self.agent_id, item_id)?;
         Ok(ChatDto {
             read_only_reason: self.chat_reason(&chat),
             occupied: self.registry.lock().unwrap().item_is_occupied(item_id),
@@ -1652,10 +2187,23 @@ impl Bridge {
         }
     }
 
+    fn assert_deletion_owner(&self, target: &ProductDeletionTarget) -> Result<(), String> {
+        match target {
+            ProductDeletionTarget::Item { item_id }
+            | ProductDeletionTarget::ChatTurn { item_id, .. } => {
+                self.workbench.assert_item_owner(&self.agent_id, item_id)
+            }
+            ProductDeletionTarget::Run { run_id } => {
+                self.workbench.assert_run_owner(&self.agent_id, run_id)
+            }
+        }
+    }
+
     fn preview_deletion(
         self: &Arc<Self>,
         target: ProductDeletionTarget,
     ) -> Result<DeletionPreview, String> {
+        self.assert_deletion_owner(&target)?;
         let operation = self.deletion_operation(&target)?;
         let mut run_ids = HashSet::new();
         let mut plan_ids = HashSet::new();
@@ -1759,7 +2307,9 @@ impl Bridge {
             return Err("Stop or wait for every affected run before deleting history.".into());
         }
         let operation = self.deletion_operation(&target)?;
-        let job = self.workbench.create_deletion_job(&operation)?;
+        let job = self
+            .workbench
+            .create_deletion_job_for_agent(&self.agent_id, &operation)?;
         match self.execute_deletion_job(&job) {
             Ok(()) => {
                 let _ = cleanup_attachments(&self.workbench, &self.attachment_root);
@@ -1830,7 +2380,7 @@ impl Bridge {
         });
         drop(registry);
         if let Err(error) = self.workbench.update_run(&run_id, "submitted", "submitted") {
-            let _ = self.app.emit("adaptive-agent://control-error", json!({"runId":run_id,"error":format!("The chat reservation is durable, but its redundant submitted update failed: {error}")}));
+            self.emit_control_error(&run_id, format!("The chat reservation is durable, but its redundant submitted update failed: {error}"));
         }
         let transcript = messages
             .iter()
@@ -1852,7 +2402,7 @@ impl Bridge {
                         apply_run_state(record, &state, None);
                     }
                 } else {
-                    let _=self.app.emit("adaptive-agent://control-error",json!({"runId":run_id,"error":"Unable to persist submission failure; retaining the occupied slot for recovery."}));
+                    self.emit_control_error(&run_id, "Unable to persist submission failure; retaining the occupied slot for recovery.");
                     self.reconcile_run(run_id.clone());
                 }
                 self.emit_state();
@@ -1900,7 +2450,10 @@ impl Bridge {
                                     .map(|_| ())
                             });
                         if let Err(error) = finalized {
-                            let _=bridge.app.emit("adaptive-agent://control-error",json!({"runId":response_run_id,"error":format!("Unable to finalize successful chat turn: {error}")}));
+                            bridge.emit_control_error(
+                                &response_run_id,
+                                format!("Unable to finalize successful chat turn: {error}"),
+                            );
                             bridge.reconcile_run(response_run_id.clone());
                             bridge.emit_state();
                             return;
@@ -1909,10 +2462,7 @@ impl Bridge {
                         .workbench
                         .store_result(&response_run_id, &stored_result)
                     {
-                        let _ = bridge.app.emit(
-                            "adaptive-agent://control-error",
-                            json!({"runId":response_run_id,"error":error}),
-                        );
+                        bridge.emit_control_error(&response_run_id, error);
                     }
                     if let Some(record) = bridge.registry.lock().unwrap().get_mut(&response_run_id)
                     {
@@ -1923,25 +2473,19 @@ impl Bridge {
                                 &record.cached_status,
                                 &record.submission_state,
                             ) {
-                                let _ = bridge.app.emit(
-                                    "adaptive-agent://control-error",
-                                    json!({"runId":response_run_id,"error":error}),
-                                );
+                                bridge.emit_control_error(&response_run_id, error);
                             }
                         }
                     }
                     if !state.occupies_slot {
                         let _ = bridge.app.emit(
                             "adaptive-agent://run-finished",
-                            json!({"runId":response_run_id,"result":stored_result}),
+                            json!({"agentId":bridge.agent_id,"runId":response_run_id,"result":stored_result}),
                         );
                     }
                 }
                 Err(error) => {
-                    let _ = bridge.app.emit(
-                        "adaptive-agent://control-error",
-                        json!({"runId":response_run_id,"error":error}),
-                    );
+                    bridge.emit_control_error(&response_run_id, error);
                     bridge.reconcile_run(response_run_id.clone());
                 }
             }
@@ -2121,13 +2665,13 @@ impl Bridge {
                                 }
                                 let _ = bridge.app.emit(
                                     "adaptive-agent://run-finished",
-                                    json!({ "runId": run_id, "result": stored_result }),
+                                    json!({ "agentId": bridge.agent_id, "runId": run_id, "result": stored_result }),
                                 );
                             }
                             Err(error) => {
-                                let _ = bridge.app.emit(
-                                    "adaptive-agent://control-error",
-                                    json!({"runId":run_id,"error":format!("Unable to persist recovered run: {error}")}),
+                                bridge.emit_control_error(
+                                    &run_id,
+                                    format!("Unable to persist recovered run: {error}"),
                                 );
                                 bridge.reconcile_run(run_id.clone());
                             }
@@ -2157,10 +2701,7 @@ impl Bridge {
                     }
                 }
                 Err(error) => {
-                    let _ = bridge.app.emit(
-                        "adaptive-agent://control-error",
-                        json!({ "runId": run_id, "error": error }),
-                    );
+                    bridge.emit_control_error(&run_id, error);
                     bridge.reconcile_run(run_id.clone());
                 }
             }
@@ -2209,9 +2750,9 @@ impl Bridge {
                 match self.workbench.set_cancel_requested(run_id) {
                     Ok(()) => break,
                     Err(error) => {
-                        let _ = self.app.emit(
-                            "adaptive-agent://control-error",
-                            json!({ "runId": run_id, "error": format!("Unable to persist shutdown cancellation; retrying: {error}") }),
+                        self.emit_control_error(
+                            run_id,
+                            format!("Unable to persist shutdown cancellation; retrying: {error}"),
                         );
                         std::thread::sleep(Duration::from_millis(200));
                     }
@@ -2320,6 +2861,10 @@ impl Bridge {
             .collect::<Vec<_>>();
         runs.sort_by(|left, right| left.run_id.cmp(&right.run_id));
         DesktopState {
+            agent_id: self
+                .current_agent()
+                .map(|agent| agent.0)
+                .unwrap_or_default(),
             status: if error.is_some() {
                 "error"
             } else if any_stopping {
@@ -2445,105 +2990,33 @@ fn cleanup_attachment_orphans(workbench: &WorkbenchDb, root: &Path) -> Result<()
     Ok(())
 }
 
-fn replace_bridge(app: &AppHandle) -> Result<Arc<Bridge>, String> {
-    let state = app.state::<AppState>();
-    let lifecycle = state.lifecycle.lock().unwrap();
-    if state.shutdown_started.load(Ordering::SeqCst)
-        || state.quit.lock().unwrap().state() != QuitState::Idle
-    {
-        return Err("Settings cannot be reloaded while quitting.".into());
-    }
-    let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
-    let trace_generation = state.trace_generation.fetch_add(1, Ordering::SeqCst) + 1;
-    let previous_bridge = state.bridge.lock().unwrap().clone();
-    let previous_trace = state.trace.lock().unwrap().clone();
-    drop(lifecycle);
-    if let Some(previous) = previous_bridge {
-        previous.shutdown();
-    }
-    if let Some(previous) = previous_trace {
-        previous.shutdown();
-    }
-    let workbench_result = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("Unable to resolve desktop application data: {error}"))
-        .and_then(|directory| {
-            WorkbenchDb::open(directory.join("workbench.sqlite"))
-                .map_err(|error| format!("Unable to open workbench persistence: {error}"))
-        });
-    let (workbench, persistence_error) = match workbench_result {
-        Ok(workbench) => (Arc::new(workbench), None),
-        Err(error) => (
-            Arc::new(
-                WorkbenchDb::open_in_memory()
-                    .expect("in-memory error-state workbench database must open"),
-            ),
-            Some(error),
-        ),
-    };
-    let lifecycle = state.lifecycle.lock().unwrap();
-    if state.shutdown_started.load(Ordering::SeqCst)
-        || state.quit.lock().unwrap().state() != QuitState::Idle
-        || state.generation.load(Ordering::SeqCst) != generation
-    {
-        return Err("Settings replacement was superseded or shutdown has started.".into());
-    }
-    // Process creation and publication are one lifecycle operation: no child can exist
-    // while neither the old nor new bridge is visible to close handling.
-    state.bridge.lock().unwrap().take();
-    state.trace.lock().unwrap().take();
-    let spawn_result = match persistence_error {
-        Some(error) => Err(error),
-        None => Bridge::spawn(app, workbench.clone()),
-    };
-    let (bridge, spawn_error) = match spawn_result {
-        Ok(bridge) => (bridge, None),
-        Err(error) => {
-            // A non-running placeholder keeps renderer state and errors restricted to the same API.
-            let placeholder = Arc::new(Bridge {
-                app: app.clone(),
-                child: Mutex::new(None),
-                pending: Mutex::new(HashMap::new()),
-                decoder: Mutex::new(NdjsonDecoder::new(MAX_NDJSON_FRAME_SIZE)),
-                generation: 1,
-                next_id: AtomicU64::new(1),
-                registry: Mutex::new(RunRegistry::default()),
-                run_roots: Mutex::new(HashMap::new()),
-                run_delegates: Mutex::new(HashMap::new()),
-                workbench,
-                attachment_root: app
-                    .path()
-                    .app_data_dir()
-                    .unwrap_or_default()
-                    .join("attachments"),
-                submission: Mutex::new(()),
-                expected_shutdown: AtomicBool::new(true),
-                configuration: Mutex::new(None),
-                initialization_error: Mutex::new(Some(error.clone())),
-                trace_healthy: Arc::new(AtomicBool::new(false)),
-                trace_error: Arc::new(Mutex::new(None)),
-                draining: AtomicBool::new(false),
-                reconciling: Mutex::new(HashMap::new()),
-            });
-            (placeholder, Some(error))
-        }
-    };
-    *state.bridge.lock().unwrap() = Some(bridge.clone());
-    drop(lifecycle);
+fn trace_publication_allowed(
+    runtime_is_registered: bool,
+    bridge_is_current: bool,
+    generation: u64,
+    expected_generation: u64,
+    trace_exists: bool,
+) -> bool {
+    runtime_is_registered && bridge_is_current && generation == expected_generation && !trace_exists
+}
 
-    if let Some(error) = spawn_error {
-        bridge.emit_state();
-        return Err(error);
-    }
-    if bridge.child.lock().unwrap().is_some() {
-        if let Err(error) = bridge.initialize() {
-            *bridge.initialization_error.lock().unwrap() = Some(error.clone());
-            bridge.emit_state();
-            return Err(error);
-        }
-    }
+fn start_trace_for_runtime(
+    agent_id: &str,
+    runtime: Arc<ManagedRuntime>,
+    bridge: Arc<Bridge>,
+) -> Result<(), String> {
+    bridge.assert_agent_id(agent_id)?;
     bridge.emit_state();
+    if runtime.trace.lock().unwrap().is_some() {
+        return Ok(());
+    }
+    if runtime
+        .trace_starting
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Ok(());
+    }
     if bridge.initialization_error.lock().unwrap().is_none() {
         let path = bridge
             .configuration
@@ -2554,59 +3027,67 @@ fn replace_bridge(app: &AppHandle) -> Result<Arc<Bridge>, String> {
             .and_then(Value::as_str)
             .map(str::to_owned);
         if let Some(path) = path {
-            let app = app.clone();
+            let app = bridge.app.clone();
             let target = bridge.clone();
+            let runtime_target = runtime.clone();
+            let agent_id = agent_id.to_owned();
+            let generation = runtime.trace_generation.load(Ordering::SeqCst);
             std::thread::spawn(move || {
-                let privacy = match load_trace_privacy(&target.workbench) {
+                let privacy = match load_trace_privacy(&target.workbench, &agent_id) {
                     Ok(privacy) => privacy,
                     Err(error) => {
+                        runtime_target.trace_starting.store(false, Ordering::SeqCst);
                         *target.trace_error.lock().unwrap() = Some(error);
                         target.emit_state();
                         return;
                     }
                 };
-                let state = app.state::<AppState>();
-                let lifecycle = state.lifecycle.lock().unwrap();
-                if state.shutdown_started.load(Ordering::SeqCst)
-                    || state.quit.lock().unwrap().state() != QuitState::Idle
-                    || state.generation.load(Ordering::SeqCst) != generation
-                    || state.trace_generation.load(Ordering::SeqCst) != trace_generation
-                {
-                    return;
-                }
-                drop(lifecycle);
                 match TraceBridge::spawn_process(
                     &app,
                     &path,
                     privacy,
                     target.trace_healthy.clone(),
                     target.trace_error.clone(),
+                    Arc::downgrade(&target),
                 ) {
                     Ok(trace) => {
                         if let Err(error) = trace.initialize(privacy) {
                             trace.shutdown();
-                            if state.generation.load(Ordering::SeqCst) == generation
-                                && state.trace_generation.load(Ordering::SeqCst) == trace_generation
-                            {
-                                *target.trace_error.lock().unwrap() = Some(error);
-                                target.emit_state();
-                            }
+                            runtime_target.trace_starting.store(false, Ordering::SeqCst);
+                            *target.trace_error.lock().unwrap() = Some(error);
+                            target.emit_state();
                             return;
                         }
+                        let state = app.state::<AppState>();
+                        let registered = state
+                            .manager
+                            .runtimes
+                            .lock()
+                            .unwrap()
+                            .get(&agent_id)
+                            .is_some_and(|candidate| Arc::ptr_eq(candidate, &runtime_target));
                         let published = {
-                            let _lifecycle = state.lifecycle.lock().unwrap();
-                            if state.shutdown_started.load(Ordering::SeqCst)
-                                || state.quit.lock().unwrap().state() != QuitState::Idle
-                                || state.generation.load(Ordering::SeqCst) != generation
-                                || state.trace_generation.load(Ordering::SeqCst) != trace_generation
-                                || state.trace.lock().unwrap().is_some()
-                            {
+                            let owns_target = runtime_target
+                                .bridge
+                                .lock()
+                                .unwrap()
+                                .as_ref()
+                                .is_some_and(|bridge| Arc::ptr_eq(bridge, &target));
+                            let mut current_trace = runtime_target.trace.lock().unwrap();
+                            if !trace_publication_allowed(
+                                registered,
+                                owns_target,
+                                runtime_target.trace_generation.load(Ordering::SeqCst),
+                                generation,
+                                current_trace.is_some(),
+                            ) {
                                 false
                             } else {
-                                *state.trace.lock().unwrap() = Some(trace.clone());
+                                *current_trace = Some(trace.clone());
                                 true
                             }
                         };
+                        runtime_target.trace_starting.store(false, Ordering::SeqCst);
                         if !published {
                             trace.shutdown();
                         } else {
@@ -2614,33 +3095,38 @@ fn replace_bridge(app: &AppHandle) -> Result<Arc<Bridge>, String> {
                         }
                     }
                     Err(error) => {
-                        let state = app.state::<AppState>();
-                        if state.generation.load(Ordering::SeqCst) == generation
-                            && state.trace_generation.load(Ordering::SeqCst) == trace_generation
-                        {
-                            *target.trace_error.lock().unwrap() = Some(error);
-                            target.emit_state();
-                        }
+                        runtime_target.trace_starting.store(false, Ordering::SeqCst);
+                        *target.trace_error.lock().unwrap() = Some(error);
+                        target.emit_state();
                     }
                 }
             });
         } else {
+            runtime.trace_starting.store(false, Ordering::SeqCst);
             *bridge.trace_error.lock().unwrap() = Some(
                 "Execution did not resolve an exact SQLite path; trace is unavailable.".into(),
             );
             bridge.emit_state();
         }
     } else {
+        runtime.trace_starting.store(false, Ordering::SeqCst);
         *bridge.trace_error.lock().unwrap() =
             Some("Execution configuration is invalid; trace is unavailable.".into());
         bridge.emit_state();
     }
-    Ok(bridge)
+    Ok(())
 }
 
-fn load_trace_privacy(workbench: &WorkbenchDb) -> Result<TracePrivacy, String> {
-    let mut privacy: TracePrivacy = workbench
-        .load_setting(TRACE_PRIVACY_SETTING)?
+fn trace_privacy_setting(agent_id: &str) -> String {
+    format!("{TRACE_PRIVACY_SETTING}/{agent_id}")
+}
+
+fn load_trace_privacy(workbench: &WorkbenchDb, agent_id: &str) -> Result<TracePrivacy, String> {
+    let persisted = match workbench.load_setting(&trace_privacy_setting(agent_id))? {
+        Some(scoped) => Some(scoped),
+        None => workbench.load_setting(TRACE_PRIVACY_SETTING)?,
+    };
+    let mut privacy: TracePrivacy = persisted
         .map(serde_json::from_value)
         .transpose()
         .map_err(|error| format!("Invalid persisted trace privacy settings: {error}"))?
@@ -2732,10 +3218,18 @@ fn complete_trace_refresh(
     false
 }
 
-fn schedule_trace_refresh(app: &AppHandle, root_run_id: String, final_refresh: bool) {
+fn schedule_trace_refresh(
+    app: &AppHandle,
+    agent_id: String,
+    root_run_id: String,
+    final_refresh: bool,
+) {
     let state = app.state::<AppState>();
+    let Ok(runtime) = runtime_for(&state, &agent_id, true) else {
+        return;
+    };
     {
-        let mut refreshes = state.trace_refreshes.lock().unwrap();
+        let mut refreshes = runtime.trace_refreshes.lock().unwrap();
         if !queue_trace_refresh(&mut refreshes, &root_run_id, final_refresh) {
             return;
         }
@@ -2743,22 +3237,24 @@ fn schedule_trace_refresh(app: &AppHandle, root_run_id: String, final_refresh: b
 
     let app = app.clone();
     std::thread::spawn(move || loop {
-        let final_refresh = app
-            .state::<AppState>()
+        let state = app.state::<AppState>();
+        let Ok(runtime) = runtime_for(&state, &agent_id, true) else {
+            return;
+        };
+        let final_refresh = runtime
             .trace_refreshes
             .lock()
             .unwrap()
             .get_mut(&root_run_id)
             .is_some_and(|refresh| std::mem::take(&mut refresh.final_refresh));
         let (privacy, trace, attachment_root, request_revision) = {
-            let state = app.state::<AppState>();
-            let bridge = state.bridge.lock().unwrap().as_ref().cloned();
-            let trace = state.trace.lock().unwrap().as_ref().cloned();
+            let bridge = runtime.bridge.lock().unwrap().as_ref().cloned();
+            let trace = runtime.trace.lock().unwrap().as_ref().cloned();
             let privacy = bridge
                 .as_ref()
-                .and_then(|bridge| load_trace_privacy(&bridge.workbench).ok());
+                .and_then(|bridge| load_trace_privacy(&bridge.workbench, &agent_id).ok());
             let attachment_root = bridge.as_ref().map(|bridge| bridge.attachment_root.clone());
-            let selection = state.trace_selection.lock().unwrap();
+            let selection = runtime.trace_selection.lock().unwrap();
             let request_revision = (selection.root_run_id.as_deref() == Some(root_run_id.as_str()))
                 .then_some(selection.revision);
             (privacy, trace, attachment_root, request_revision)
@@ -2769,19 +3265,20 @@ fn schedule_trace_refresh(app: &AppHandle, root_run_id: String, final_refresh: b
             }
             _ => Err("Trace inspector is not ready.".into()),
         };
-        let state = app.state::<AppState>();
-        let selection = state.trace_selection.lock().unwrap();
+        let selection = runtime.trace_selection.lock().unwrap();
         if request_revision == Some(selection.revision)
             && selection.root_run_id.as_deref() == Some(root_run_id.as_str())
         {
             let payload = match response.as_ref() {
                 Ok(report) => json!({
+                    "agentId": agent_id,
                     "rootRunId": root_run_id,
                     "revision": selection.revision,
                     "finalRefresh": final_refresh,
                     "report": report
                 }),
                 Err(error) => json!({
+                    "agentId": agent_id,
                     "rootRunId": root_run_id,
                     "revision": selection.revision,
                     "finalRefresh": final_refresh,
@@ -2795,6 +3292,7 @@ fn schedule_trace_refresh(app: &AppHandle, root_run_id: String, final_refresh: b
             let _ = app.emit(
                 "adaptive-agent://trace-summary",
                 json!({
+                    "agentId": agent_id,
                     "rootRunId": root_run_id,
                     "summary": report.get("summary"),
                     "usage": report.get("usage"),
@@ -2803,7 +3301,7 @@ fn schedule_trace_refresh(app: &AppHandle, root_run_id: String, final_refresh: b
             );
         }
 
-        let mut refreshes = state.trace_refreshes.lock().unwrap();
+        let mut refreshes = runtime.trace_refreshes.lock().unwrap();
         if complete_trace_refresh(&mut refreshes, &root_run_id) {
             continue;
         }
@@ -2812,10 +3310,15 @@ fn schedule_trace_refresh(app: &AppHandle, root_run_id: String, final_refresh: b
 }
 
 #[tauri::command]
-fn select_trace(root_run_id: Option<String>, app: AppHandle) -> Result<u64, String> {
+fn select_trace(
+    agent_id: String,
+    root_run_id: Option<String>,
+    app: AppHandle,
+) -> Result<u64, String> {
     let state = app.state::<AppState>();
+    let runtime = runtime_for(&state, &agent_id, true)?;
     let revision = {
-        let mut selection = state.trace_selection.lock().unwrap();
+        let mut selection = runtime.trace_selection.lock().unwrap();
         selection.revision += 1;
         selection.root_run_id = root_run_id.clone();
         selection.revision
@@ -2823,15 +3326,20 @@ fn select_trace(root_run_id: Option<String>, app: AppHandle) -> Result<u64, Stri
     let Some(root_run_id) = root_run_id else {
         return Ok(revision);
     };
-    schedule_trace_refresh(&app, root_run_id.clone(), false);
+    let bridge = bridge_for(&state, &agent_id, true)?;
+    bridge.workbench.assert_run_owner(&agent_id, &root_run_id)?;
+    schedule_trace_refresh(&app, agent_id.clone(), root_run_id.clone(), false);
     let app = app.clone();
     std::thread::spawn(move || {
         let mut tick = 0_u64;
         loop {
             std::thread::sleep(Duration::from_millis(1_500));
             let state = app.state::<AppState>();
+            let Ok(runtime) = runtime_for(&state, &agent_id, true) else {
+                break;
+            };
             let selected = {
-                let selection = state.trace_selection.lock().unwrap();
+                let selection = runtime.trace_selection.lock().unwrap();
                 selection.revision == revision
                     && selection.root_run_id.as_deref() == Some(root_run_id.as_str())
             };
@@ -2839,19 +3347,24 @@ fn select_trace(root_run_id: Option<String>, app: AppHandle) -> Result<u64, Stri
                 break;
             }
             tick += 1;
-            let active = state.bridge.lock().unwrap().as_ref().is_some_and(|bridge| {
-                bridge
-                    .registry
-                    .lock()
-                    .unwrap()
-                    .get(&root_run_id)
-                    .is_some_and(|run| run.occupies_slot)
-            });
+            let active = runtime
+                .bridge
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|bridge| {
+                    bridge
+                        .registry
+                        .lock()
+                        .unwrap()
+                        .get(&root_run_id)
+                        .is_some_and(|run| run.occupies_slot)
+                });
             if active || tick % 7 == 0 {
-                schedule_trace_refresh(&app, root_run_id.clone(), false);
+                schedule_trace_refresh(&app, agent_id.clone(), root_run_id.clone(), false);
             }
             if tick % 7 == 0 {
-                let roots = state
+                let roots = runtime
                     .bridge
                     .lock()
                     .unwrap()
@@ -2871,7 +3384,7 @@ fn select_trace(root_run_id: Option<String>, app: AppHandle) -> Result<u64, Stri
                     .filter(|root| root != &root_run_id)
                     .collect::<Vec<_>>();
                 if let Some(root) = background.get((tick as usize / 7) % background.len().max(1)) {
-                    schedule_trace_refresh(&app, root.clone(), false);
+                    schedule_trace_refresh(&app, agent_id.clone(), root.clone(), false);
                 }
             }
         }
@@ -2880,23 +3393,25 @@ fn select_trace(root_run_id: Option<String>, app: AppHandle) -> Result<u64, Stri
 }
 
 #[tauri::command]
-fn get_trace_privacy(state: tauri::State<'_, AppState>) -> Result<TracePrivacy, String> {
-    let bridge = state
-        .bridge
-        .lock()
-        .unwrap()
-        .as_ref()
-        .cloned()
-        .ok_or("Desktop runtime is starting.")?;
-    load_trace_privacy(&bridge.workbench)
+fn get_trace_privacy(
+    agent_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<TracePrivacy, String> {
+    let bridge = bridge_for(&state, &agent_id, true)?;
+    load_trace_privacy(&bridge.workbench, &agent_id)
 }
 
 #[tauri::command]
-fn set_trace_privacy(mut privacy: TracePrivacy, app: AppHandle) -> Result<TracePrivacy, String> {
+fn set_trace_privacy(
+    agent_id: String,
+    mut privacy: TracePrivacy,
+    app: AppHandle,
+) -> Result<TracePrivacy, String> {
     if privacy.reasoning {
         privacy.messages = true;
     }
     let state = app.state::<AppState>();
+    let runtime = runtime_for(&state, &agent_id, false)?;
     let (bridge, sqlite_path, old_trace, trace_generation) = {
         let _lifecycle = state.lifecycle.lock().unwrap();
         if state.reconfiguring.load(Ordering::SeqCst) {
@@ -2904,8 +3419,8 @@ fn set_trace_privacy(mut privacy: TracePrivacy, app: AppHandle) -> Result<TraceP
                 "Trace privacy cannot be changed while settings are being reloaded.".into(),
             );
         }
-        let trace_generation = state.trace_generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let bridge = state
+        let trace_generation = runtime.trace_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let bridge = runtime
             .bridge
             .lock()
             .unwrap()
@@ -2921,26 +3436,26 @@ fn set_trace_privacy(mut privacy: TracePrivacy, app: AppHandle) -> Result<TraceP
             .and_then(Value::as_str)
             .map(str::to_owned)
             .ok_or("Trace requires an exact SQLite path.")?;
-        let old_trace = state.trace.lock().unwrap().as_ref().cloned();
+        let old_trace = runtime.trace.lock().unwrap().as_ref().cloned();
         (bridge, sqlite_path, old_trace, trace_generation)
     };
-    if load_trace_privacy(&bridge.workbench)? == privacy && old_trace.is_some() {
+    if load_trace_privacy(&bridge.workbench, &agent_id)? == privacy && old_trace.is_some() {
         return Ok(privacy);
     }
     let (stopped_trace, selected_root) = {
         let _lifecycle = state.lifecycle.lock().unwrap();
-        if state
+        if runtime
             .bridge
             .lock()
             .unwrap()
             .as_ref()
             .is_none_or(|current| !Arc::ptr_eq(current, &bridge))
-            || state.trace_generation.load(Ordering::SeqCst) != trace_generation
+            || runtime.trace_generation.load(Ordering::SeqCst) != trace_generation
         {
             return Err("Execution runtime changed while trace privacy was updating.".into());
         }
-        let stopped_trace = state.trace.lock().unwrap().take();
-        let mut selection = state.trace_selection.lock().unwrap();
+        let stopped_trace = runtime.trace.lock().unwrap().take();
+        let mut selection = runtime.trace_selection.lock().unwrap();
         selection.revision += 1;
         (stopped_trace, selection.root_run_id.clone())
     };
@@ -2957,6 +3472,7 @@ fn set_trace_privacy(mut privacy: TracePrivacy, app: AppHandle) -> Result<TraceP
         privacy,
         bridge.trace_healthy.clone(),
         bridge.trace_error.clone(),
+        Arc::downgrade(&bridge),
     ) {
         Ok(replacement) => replacement,
         Err(error) => {
@@ -2970,7 +3486,7 @@ fn set_trace_privacy(mut privacy: TracePrivacy, app: AppHandle) -> Result<TraceP
         return Err(error);
     }
     if let Err(error) = bridge.workbench.save_setting(
-        TRACE_PRIVACY_SETTING,
+        &trace_privacy_setting(&agent_id),
         &serde_json::to_value(privacy).unwrap(),
     ) {
         replacement.shutdown();
@@ -2980,17 +3496,17 @@ fn set_trace_privacy(mut privacy: TracePrivacy, app: AppHandle) -> Result<TraceP
     }
     let runtime_changed = {
         let _lifecycle = state.lifecycle.lock().unwrap();
-        if state
+        if runtime
             .bridge
             .lock()
             .unwrap()
             .as_ref()
             .is_none_or(|current| !Arc::ptr_eq(current, &bridge))
-            || state.trace_generation.load(Ordering::SeqCst) != trace_generation
+            || runtime.trace_generation.load(Ordering::SeqCst) != trace_generation
         {
             true
         } else {
-            *state.trace.lock().unwrap() = Some(replacement.clone());
+            *runtime.trace.lock().unwrap() = Some(replacement.clone());
             false
         }
     };
@@ -3002,25 +3518,66 @@ fn set_trace_privacy(mut privacy: TracePrivacy, app: AppHandle) -> Result<TraceP
     *bridge.trace_error.lock().unwrap() = None;
     bridge.emit_state();
     if let Some(root_run_id) = selected_root {
-        let _ = select_trace(Some(root_run_id), app.clone());
+        let _ = select_trace(agent_id, Some(root_run_id), app.clone());
     }
     Ok(privacy)
 }
 
 #[tauri::command]
-fn desktop_state(state: tauri::State<'_, AppState>) -> Result<DesktopState, String> {
-    state
-        .bridge
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|bridge| bridge.snapshot())
-        .ok_or_else(|| "Desktop runtime is starting.".into())
+fn desktop_state(
+    agent_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<DesktopState, String> {
+    match bridge_for(&state, &agent_id, true) {
+        Ok(bridge) => Ok(bridge.snapshot()),
+        Err(error)
+            if state
+                .manager
+                .catalog
+                .lock()
+                .unwrap()
+                .current_agent_id
+                .as_deref()
+                == Some(agent_id.as_str()) =>
+        {
+            *state.manager.bootstrap_error.lock().unwrap() = Some(error);
+            Ok(state
+                .manager
+                .error_snapshot(state.quit.lock().unwrap().state()))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Compatibility bootstrap for the single-window renderer. Native callers should bind
+/// subsequent operations to the returned agent ID rather than trusting renderer state.
+#[tauri::command]
+fn desktop_bootstrap(state: tauri::State<'_, AppState>) -> Result<Value, String> {
+    let snapshot = match state.manager.current() {
+        Ok(runtime) => runtime
+            .bridge
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|bridge| bridge.snapshot())
+            .unwrap_or_else(|| {
+                state
+                    .manager
+                    .error_snapshot(state.quit.lock().unwrap().state())
+            }),
+        Err(error) => {
+            *state.manager.bootstrap_error.lock().unwrap() = Some(error);
+            state
+                .manager
+                .error_snapshot(state.quit.lock().unwrap().state())
+        }
+    };
+    Ok(json!({ "currentAgentId": snapshot.agent_id, "state": snapshot }))
 }
 
 #[tauri::command]
 fn reload_settings(
-    app: AppHandle,
+    agent_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<DesktopState, String> {
     if state
@@ -3035,17 +3592,31 @@ fn reload_settings(
         if state.quit.lock().unwrap().state() != QuitState::Idle {
             return Err("Settings cannot be reloaded while quitting.".into());
         }
-        if state
+        let bridges = state.manager.runtime_bridges();
+        if bridges
+            .iter()
+            .any(|bridge| bridge.registry.lock().unwrap().any_active())
+        {
+            return Err("Stop all active runs before reloading global settings.".into());
+        }
+        drop(_lifecycle);
+        let failures = state
+            .manager
+            .converge_after_catalog_refresh()
+            .map_err(|error| format!("RUNTIME_RESTART_FAILED: {error}"))?;
+        if !failures.is_empty() {
+            return Err(format!("RUNTIME_RESTART_FAILED: {}", failures.join("; ")));
+        }
+        let runtime = state.manager.ensure_runtime(&agent_id, false)?;
+        let bridge = runtime
             .bridge
             .lock()
             .unwrap()
             .as_ref()
-            .is_some_and(|bridge| bridge.registry.lock().unwrap().any_active())
-        {
-            return Err("Stop the active run before reloading settings.".into());
-        }
-        drop(_lifecycle);
-        Ok(replace_bridge(&app)?.snapshot())
+            .cloned()
+            .ok_or("Desktop runtime is unavailable.")?;
+        start_trace_for_runtime(&agent_id, runtime, bridge.clone())?;
+        Ok(bridge.snapshot())
     })();
     state.reconfiguring.store(false, Ordering::SeqCst);
     result
@@ -3053,8 +3624,8 @@ fn reload_settings(
 
 #[tauri::command]
 fn save_settings(
+    agent_id: String,
     settings: Value,
-    app: AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<DesktopState, String> {
     if state
@@ -3069,15 +3640,37 @@ fn save_settings(
         if state.quit.lock().unwrap().state() != QuitState::Idle {
             return Err("Settings cannot be saved while quitting.".into());
         }
-        let bridge = state
-            .bridge
+        let bridge = bridge_for(&state, &agent_id, false)?;
+        if state
+            .manager
+            .runtime_bridges()
+            .iter()
+            .any(|candidate| candidate.registry.lock().unwrap().any_active())
+        {
+            return Err("Stop all active runs before saving global settings.".into());
+        }
+        let supplied_id = settings
+            .pointer("/agent/id")
+            .and_then(Value::as_str)
+            .ok_or("Settings must include agent.id.")?;
+        if supplied_id != agent_id {
+            return Err("Settings cannot switch away from the addressed agent.".into());
+        }
+        let supplied_path = settings
+            .pointer("/agent/configPath")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let expected_path = state
+            .manager
+            .catalog
             .lock()
             .unwrap()
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| "Desktop runtime is not available.".to_string())?;
-        if bridge.registry.lock().unwrap().any_active() {
-            return Err("Stop the active run before saving settings.".into());
+            .agents
+            .get(&agent_id)
+            .map(|d| d.config_path.clone())
+            .ok_or_else(|| format!("Unknown agent '{agent_id}'."))?;
+        if canonical_path(supplied_path)? != canonical_path(&expected_path)? {
+            return Err("Settings cannot change the addressed agent configuration path.".into());
         }
         drop(_lifecycle);
         bridge.request_wait(
@@ -3085,7 +3678,31 @@ fn save_settings(
             json!({ "settings": settings }),
             REQUEST_TIMEOUT,
         )?;
-        Ok(replace_bridge(&app)?.snapshot())
+        let failures = state
+            .manager
+            .converge_after_catalog_refresh()
+            .map_err(|error| format!("SETTINGS_SAVED_RUNTIME_RESTART_FAILED: {error}"))?;
+        if !failures.is_empty() {
+            return Err(format!(
+                "SETTINGS_SAVED_RUNTIME_RESTART_FAILED: {}",
+                failures.join("; ")
+            ));
+        }
+        let runtime = state
+            .manager
+            .ensure_runtime(&agent_id, false)
+            .map_err(|error| {
+                format!("SETTINGS_SAVED_RUNTIME_RESTART_FAILED: {agent_id}: {error}")
+            })?;
+        let bridge = runtime
+            .bridge
+            .lock()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .ok_or("Desktop runtime is unavailable.")?;
+        start_trace_for_runtime(&agent_id, runtime, bridge.clone())?;
+        Ok(bridge.snapshot())
     })();
     state.reconfiguring.store(false, Ordering::SeqCst);
     result
@@ -3093,6 +3710,7 @@ fn save_settings(
 
 #[tauri::command]
 fn start_run(
+    agent_id: String,
     task: String,
     attachment_ids: Option<Vec<String>>,
     state: tauri::State<'_, AppState>,
@@ -3107,13 +3725,7 @@ fn start_run(
     if state.quit.lock().unwrap().state() != QuitState::Idle {
         return Err("The desktop is quitting and cannot start new runs.".into());
     }
-    let bridge = state
-        .bridge
-        .lock()
-        .unwrap()
-        .as_ref()
-        .cloned()
-        .ok_or_else(|| "Desktop runtime is starting.".to_string())?;
+    let bridge = bridge_for(&state, &agent_id, false)?;
     if !bridge.snapshot().configuration_valid {
         return Err(bridge
             .snapshot()
@@ -3125,17 +3737,12 @@ fn start_run(
 
 #[tauri::command]
 fn select_attachments(
+    agent_id: String,
     app: AppHandle,
     existing_attachment_ids: Option<Vec<String>>,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<AttachmentDraft>, String> {
-    let bridge = state
-        .bridge
-        .lock()
-        .unwrap()
-        .as_ref()
-        .cloned()
-        .ok_or("ATTACHMENTS_UNAVAILABLE")?;
+    let bridge = bridge_for(&state, &agent_id, false)?;
     let selected = app
         .dialog()
         .file()
@@ -3168,7 +3775,10 @@ fn select_attachments(
             discard_imported_drafts(&bridge, &drafts);
             return Err("Attachments exceed 40 MiB total.".into());
         }
-        if let Err(error) = bridge.workbench.insert_draft(&draft) {
+        if let Err(error) = bridge
+            .workbench
+            .insert_draft_for_agent(&bridge.agent_id, &draft)
+        {
             let _ = std::fs::remove_dir_all(bridge.attachment_root.join(&draft.id));
             discard_imported_drafts(&bridge, &drafts);
             return Err(error);
@@ -3180,7 +3790,10 @@ fn select_attachments(
 
 fn discard_imported_drafts(bridge: &Bridge, drafts: &[AttachmentDraft]) {
     for draft in drafts {
-        if bridge.workbench.discard_draft(&draft.id).is_ok()
+        if bridge
+            .workbench
+            .discard_draft_for_agent(&bridge.agent_id, &draft.id)
+            .is_ok()
             && std::fs::remove_dir_all(bridge.attachment_root.join(&draft.id)).is_ok()
         {
             let _ = bridge.workbench.finish_attachment_cleanup(&draft.id);
@@ -3190,17 +3803,15 @@ fn discard_imported_drafts(bridge: &Bridge, drafts: &[AttachmentDraft]) {
 
 #[tauri::command]
 fn discard_attachment_draft(
+    agent_id: String,
     attachment_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let bridge = state
-        .bridge
-        .lock()
-        .unwrap()
-        .as_ref()
-        .cloned()
-        .ok_or("ATTACHMENTS_UNAVAILABLE")?;
-    if let Some(relative) = bridge.workbench.discard_draft(&attachment_id)? {
+    let bridge = bridge_for(&state, &agent_id, true)?;
+    if let Some(relative) = bridge
+        .workbench
+        .discard_draft_for_agent(&agent_id, &attachment_id)?
+    {
         if let Some(std::path::Component::Normal(directory)) =
             Path::new(&relative).components().next()
         {
@@ -3220,34 +3831,30 @@ fn discard_attachment_draft(
 }
 
 #[tauri::command]
-fn stop_run(run_id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state
-        .bridge
-        .lock()
-        .unwrap()
-        .as_ref()
-        .cloned()
-        .ok_or_else(|| "Desktop runtime is not available.".to_string())?
-        .stop_run(&run_id)
+fn stop_run(
+    agent_id: String,
+    run_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let bridge = bridge_for(&state, &agent_id, true)?;
+    bridge.workbench.assert_run_owner(&agent_id, &run_id)?;
+    bridge.stop_run(&run_id)
 }
 
 #[tauri::command]
 fn get_run_recovery_plan(
+    agent_id: String,
     run_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<Value, String> {
-    state
-        .bridge
-        .lock()
-        .unwrap()
-        .as_ref()
-        .cloned()
-        .ok_or_else(|| "Desktop runtime is not available.".to_string())?
-        .recovery_plan(&run_id)
+    let bridge = bridge_for(&state, &agent_id, true)?;
+    bridge.workbench.assert_run_owner(&agent_id, &run_id)?;
+    bridge.recovery_plan(&run_id)
 }
 
 #[tauri::command]
 fn recover_run(
+    agent_id: String,
     run_id: String,
     expected_status: String,
     expected_action: String,
@@ -3260,18 +3867,14 @@ fn recover_run(
     if state.quit.lock().unwrap().state() != QuitState::Idle {
         return Err("The desktop is quitting and cannot recover runs.".into());
     }
-    state
-        .bridge
-        .lock()
-        .unwrap()
-        .as_ref()
-        .cloned()
-        .ok_or_else(|| "Desktop runtime is not available.".to_string())?
-        .recover_run(&run_id, &expected_status, &expected_action)
+    let bridge = bridge_for(&state, &agent_id, true)?;
+    bridge.workbench.assert_run_owner(&agent_id, &run_id)?;
+    bridge.recover_run(&run_id, &expected_status, &expected_action)
 }
 
 #[tauri::command]
 fn steer_run(
+    agent_id: String,
     run_id: String,
     message: String,
     state: tauri::State<'_, AppState>,
@@ -3279,47 +3882,34 @@ fn steer_run(
     if message.trim().is_empty() {
         return Err("A steering message is required.".into());
     }
-    state
-        .bridge
-        .lock()
-        .unwrap()
-        .as_ref()
-        .cloned()
-        .ok_or_else(|| "Desktop runtime is not available.".to_string())?
-        .steer_run(&run_id, message.trim())
+    let bridge = bridge_for(&state, &agent_id, true)?;
+    bridge.workbench.assert_run_owner(&agent_id, &run_id)?;
+    bridge.steer_run(&run_id, message.trim())
 }
 
 #[tauri::command]
 fn get_run_result(
+    agent_id: String,
     run_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<Value>, String> {
-    state
-        .bridge
-        .lock()
-        .unwrap()
-        .as_ref()
-        .cloned()
-        .ok_or_else(|| "Desktop runtime is not available.".to_string())?
-        .workbench
-        .get_result(&run_id)
+    let bridge = bridge_for(&state, &agent_id, true)?;
+    bridge.workbench.assert_run_owner(&agent_id, &run_id)?;
+    bridge.workbench.get_result(&run_id)
 }
 
 #[tauri::command]
-fn get_run_overview(run_id: String, state: tauri::State<'_, AppState>) -> Result<Value, String> {
+fn get_run_overview(
+    agent_id: String,
+    run_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Value, String> {
+    let runtime = runtime_for(&state, &agent_id, true)?;
     let (privacy, trace, attachment_root) = {
-        let bridge = state
-            .bridge
-            .lock()
-            .unwrap()
-            .as_ref()
-            .cloned()
-            .ok_or("Desktop runtime is starting.")?;
-        if bridge.registry.lock().unwrap().get(&run_id).is_none() {
-            return Err("Run was not found.".into());
-        }
-        let privacy = load_trace_privacy(&bridge.workbench)?;
-        let trace = state
+        let bridge = bridge_for(&state, &agent_id, true)?;
+        bridge.workbench.assert_run_owner(&agent_id, &run_id)?;
+        let privacy = load_trace_privacy(&bridge.workbench, &agent_id)?;
+        let trace = runtime
             .trace
             .lock()
             .unwrap()
@@ -3339,14 +3929,8 @@ const ARTIFACT_EXTENSIONS: &[&str] = &[
 const MAX_TEXT_PREVIEW_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_MEDIA_PREVIEW_BYTES: u64 = 32 * 1024 * 1024;
 
-fn workspace_paths(state: &tauri::State<'_, AppState>) -> Result<(PathBuf, PathBuf), String> {
-    let bridge = state
-        .bridge
-        .lock()
-        .unwrap()
-        .as_ref()
-        .cloned()
-        .ok_or("Desktop runtime is starting.")?;
+fn workspace_paths(state: &AppState, agent_id: &str) -> Result<(PathBuf, PathBuf), String> {
+    let bridge = bridge_for(state, agent_id, true)?;
     let configuration = bridge.configuration.lock().unwrap();
     let root = configuration
         .as_ref()
@@ -3431,9 +4015,10 @@ fn resolve_artifact_path(
 
 #[tauri::command]
 fn list_workspace_artifacts(
+    agent_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<WorkspaceArtifact>, String> {
-    let (root, _) = workspace_paths(&state)?;
+    let (root, _) = workspace_paths(&state, &agent_id)?;
     let root = root
         .canonicalize()
         .map_err(|_| "The configured workspace is unavailable.".to_string())?;
@@ -3445,10 +4030,11 @@ fn list_workspace_artifacts(
 
 #[tauri::command]
 async fn read_artifact(
+    agent_id: String,
     path: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<ArtifactPreview, String> {
-    let (root, shell_cwd) = workspace_paths(&state)?;
+    let (root, shell_cwd) = workspace_paths(&state, &agent_id)?;
     let path = resolve_artifact_path(&root, &shell_cwd, &path)?;
     tauri::async_runtime::spawn_blocking(move || artifact_preview(&path))
         .await
@@ -3516,24 +4102,29 @@ fn artifact_preview(path: &Path) -> Result<ArtifactPreview, String> {
 
 #[tauri::command]
 fn resolve_approval(
+    agent_id: String,
     root_run_id: String,
     approval_run_id: String,
     approval_id: String,
     approved: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    state
-        .bridge
-        .lock()
-        .unwrap()
-        .as_ref()
-        .cloned()
-        .ok_or("Desktop runtime is starting.")?
-        .resolve_approval(root_run_id, approval_run_id, approval_id, approved)
+    let bridge = bridge_for(&state, &agent_id, true)?;
+    bridge.workbench.assert_pending_approval_owner(
+        &agent_id,
+        &root_run_id,
+        &approval_run_id,
+        &approval_id,
+    )?;
+    bridge.resolve_approval(root_run_id, approval_run_id, approval_id, approved)
 }
 
 #[tauri::command]
-fn create_chat(title: String, state: tauri::State<'_, AppState>) -> Result<ChatDto, String> {
+fn create_chat(
+    agent_id: String,
+    title: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<ChatDto, String> {
     let _lifecycle = state.lifecycle.lock().unwrap();
     if state.reconfiguring.load(Ordering::SeqCst) {
         return Err("Settings are being reloaded; try again when the runtime is ready.".into());
@@ -3541,13 +4132,7 @@ fn create_chat(title: String, state: tauri::State<'_, AppState>) -> Result<ChatD
     if state.quit.lock().unwrap().state() != QuitState::Idle {
         return Err("The desktop is quitting and cannot create chats.".into());
     }
-    let bridge = state
-        .bridge
-        .lock()
-        .unwrap()
-        .as_ref()
-        .cloned()
-        .ok_or("Desktop runtime is starting.")?;
+    let bridge = bridge_for(&state, &agent_id, false)?;
     let (id, name, fingerprint, config_path) = bridge.current_agent()?;
     let configuration = bridge.configuration.lock().unwrap();
     let workspace_root = configuration
@@ -3582,51 +4167,37 @@ fn create_chat(title: String, state: tauri::State<'_, AppState>) -> Result<ChatD
 }
 
 #[tauri::command]
-fn list_chats(state: tauri::State<'_, AppState>) -> Result<Vec<ChatDto>, String> {
-    let bridge = state
-        .bridge
-        .lock()
-        .unwrap()
-        .as_ref()
-        .cloned()
-        .ok_or("Desktop runtime is starting.")?;
+fn list_chats(agent_id: String, state: tauri::State<'_, AppState>) -> Result<Vec<ChatDto>, String> {
+    let bridge = bridge_for(&state, &agent_id, true)?;
     bridge
         .workbench
-        .list_chats()?
+        .list_chats_for_agent(&agent_id)?
         .iter()
         .map(|chat| bridge.chat_dto(&chat.item_id))
         .collect()
 }
 
 #[tauri::command]
-fn load_chat(item_id: String, state: tauri::State<'_, AppState>) -> Result<ChatDto, String> {
-    state
-        .bridge
-        .lock()
-        .unwrap()
-        .as_ref()
-        .cloned()
-        .ok_or("Desktop runtime is starting.")?
-        .chat_dto(&item_id)
+fn load_chat(
+    agent_id: String,
+    item_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<ChatDto, String> {
+    bridge_for(&state, &agent_id, true)?.chat_dto(&item_id)
 }
 
 #[tauri::command]
 fn preview_history_deletion(
+    agent_id: String,
     target: ProductDeletionTarget,
     state: tauri::State<'_, AppState>,
 ) -> Result<DeletionPreview, String> {
-    state
-        .bridge
-        .lock()
-        .unwrap()
-        .as_ref()
-        .cloned()
-        .ok_or("Desktop runtime is starting.")?
-        .preview_deletion(target)
+    bridge_for(&state, &agent_id, true)?.preview_deletion(target)
 }
 
 #[tauri::command]
 fn delete_history(
+    agent_id: String,
     target: ProductDeletionTarget,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
@@ -3634,18 +4205,12 @@ fn delete_history(
     if state.quit.lock().unwrap().state() != QuitState::Idle {
         return Err("The desktop is quitting and cannot delete history.".into());
     }
-    state
-        .bridge
-        .lock()
-        .unwrap()
-        .as_ref()
-        .cloned()
-        .ok_or("Desktop runtime is starting.")?
-        .delete_history(target)
+    bridge_for(&state, &agent_id, true)?.delete_history(target)
 }
 
 #[tauri::command]
 fn send_chat_turn(
+    agent_id: String,
     item_id: String,
     content: String,
     attachment_ids: Option<Vec<String>>,
@@ -3661,18 +4226,13 @@ fn send_chat_turn(
     if state.quit.lock().unwrap().state() != QuitState::Idle {
         return Err("The desktop is quitting and cannot start new runs.".into());
     }
-    state
-        .bridge
-        .lock()
-        .unwrap()
-        .as_ref()
-        .cloned()
-        .ok_or("Desktop runtime is starting.")?
-        .send_chat(
-            item_id,
-            content.trim().into(),
-            attachment_ids.unwrap_or_default(),
-        )
+    let bridge = bridge_for(&state, &agent_id, false)?;
+    bridge.workbench.assert_item_owner(&agent_id, &item_id)?;
+    bridge.send_chat(
+        item_id,
+        content.trim().into(),
+        attachment_ids.unwrap_or_default(),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -3685,31 +4245,58 @@ fn begin_drain(app: &AppHandle, mode: DrainMode) -> Result<DesktopState, String>
     let state = app.state::<AppState>();
     let lifecycle = state.lifecycle.lock().unwrap();
     let bridge = state
+        .manager
+        .current()?
         .bridge
         .lock()
         .unwrap()
         .as_ref()
         .cloned()
         .ok_or_else(|| "Desktop runtime is not available.".to_string())?;
+    let bridges = state.manager.runtime_bridges();
     state.quit.lock().unwrap().drain().map_err(str::to_owned)?;
-    bridge.draining.store(true, Ordering::SeqCst);
-    let cancellation_targets = bridge.registry.lock().unwrap().occupied_ids();
+    for candidate in &bridges {
+        candidate.draining.store(true, Ordering::SeqCst);
+    }
+    let cancellation_targets = bridges
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.clone(),
+                candidate.registry.lock().unwrap().occupied_ids(),
+            )
+        })
+        .collect::<Vec<_>>();
     drop(lifecycle);
-    bridge.emit_state();
+    for candidate in &bridges {
+        candidate.emit_state();
+    }
     let snapshot = bridge.snapshot();
 
     let app = app.clone();
     std::thread::spawn(move || {
         if matches!(mode, DrainMode::Terminate) {
-            bridge.arm_cancellations(&cancellation_targets);
+            for (candidate, ids) in &cancellation_targets {
+                candidate.arm_cancellations(ids);
+            }
         }
         loop {
-            let ids = bridge.registry.lock().unwrap().occupied_ids();
-            if ids.is_empty() {
+            let outstanding = bridges
+                .iter()
+                .map(|candidate| {
+                    (
+                        candidate.clone(),
+                        candidate.registry.lock().unwrap().occupied_ids(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if outstanding.iter().all(|(_, ids)| ids.is_empty()) {
                 break;
             }
-            for id in ids {
-                bridge.reconcile_run(id);
+            for (candidate, ids) in outstanding {
+                for id in ids {
+                    candidate.reconcile_run(id);
+                }
             }
             std::thread::sleep(Duration::from_millis(200));
         }
@@ -3724,17 +4311,9 @@ fn approve_and_exit(app: &AppHandle) {
     if state.shutdown_started.swap(true, Ordering::SeqCst) {
         return;
     }
-    let bridge = state.bridge.lock().unwrap().take();
-    let trace = state.trace.lock().unwrap().take();
     drop(lifecycle);
-    // Potentially blocking sidecar shutdown and app.exit happen with no native mutex held.
-    if let Some(bridge) = bridge {
-        bridge.emit_state();
-        bridge.shutdown();
-    }
-    if let Some(trace) = trace {
-        trace.shutdown();
-    }
+    // Every execution and trace child is discoverable through the manager.
+    state.manager.shutdown_all();
     {
         let _lifecycle = state.lifecycle.lock().unwrap();
         let _ = state.quit.lock().unwrap().approve();
@@ -3745,11 +4324,13 @@ fn approve_and_exit(app: &AppHandle) {
 fn native_close_requested(app: &AppHandle) -> CloseDecision {
     let state = app.state::<AppState>();
     let _lifecycle = state.lifecycle.lock().unwrap();
-    let occupied = state.bridge.lock().unwrap().as_ref().map_or(0, |bridge| {
-        bridge.registry.lock().unwrap().occupied_slot_count()
-    });
+    let bridges = state.manager.runtime_bridges();
+    let occupied = bridges
+        .iter()
+        .map(|bridge| bridge.registry.lock().unwrap().occupied_slot_count())
+        .sum();
     let decision = state.quit.lock().unwrap().close_requested(occupied);
-    if let Some(bridge) = state.bridge.lock().unwrap().as_ref() {
+    for bridge in bridges {
         bridge.emit_state();
     }
     decision
@@ -3768,15 +4349,24 @@ fn quit_terminate(app: AppHandle) -> Result<DesktopState, String> {
 #[tauri::command]
 fn quit_cancel(state: tauri::State<'_, AppState>) -> Result<DesktopState, String> {
     state.quit.lock().unwrap().cancel().map_err(str::to_owned)?;
-    let bridge = state
-        .bridge
-        .lock()
-        .unwrap()
-        .as_ref()
-        .cloned()
-        .ok_or_else(|| "Desktop runtime is not available.".to_string())?;
-    bridge.emit_state();
-    Ok(bridge.snapshot())
+    for candidate in state.manager.runtime_bridges() {
+        candidate.emit_state();
+    }
+    match state.manager.current() {
+        Ok(runtime) => runtime
+            .bridge
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|bridge| bridge.snapshot())
+            .ok_or_else(|| "Desktop runtime is not available.".into()),
+        Err(error) => {
+            *state.manager.bootstrap_error.lock().unwrap() = Some(error);
+            Ok(state
+                .manager
+                .error_snapshot(state.quit.lock().unwrap().state()))
+        }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -3784,8 +4374,8 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
-        .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
+            desktop_bootstrap,
             desktop_state,
             reload_settings,
             save_settings,
@@ -3827,7 +4417,31 @@ pub fn run() {
             }
         })
         .setup(|app| {
-            let _ = replace_bridge(app.handle());
+            let manager = AgentRuntimeManager::new(app.handle())?;
+            app.manage(AppState {
+                manager,
+                lifecycle: Mutex::new(()),
+                reconfiguring: AtomicBool::new(false),
+                quit: Mutex::new(QuitCoordinator::default()),
+                shutdown_started: AtomicBool::new(false),
+            });
+            let state = app.state::<AppState>();
+            if let Err(error) = state.manager.bootstrap() {
+                *state.manager.bootstrap_error.lock().unwrap() = Some(error);
+            }
+            let runtimes = state
+                .manager
+                .runtimes
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(agent_id, runtime)| (agent_id.clone(), runtime.clone()))
+                .collect::<Vec<_>>();
+            for (agent_id, runtime) in runtimes {
+                if let Some(bridge) = runtime.bridge.lock().unwrap().as_ref().cloned() {
+                    let _ = start_trace_for_runtime(&agent_id, runtime.clone(), bridge);
+                }
+            }
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -4512,6 +5126,112 @@ fn state_for_durable_status(status: &str, previous_occupancy: bool) -> RunState 
 mod tests {
     use super::*;
 
+    fn descriptor(id: &str, state: &str, archived: bool) -> CatalogDescriptor {
+        CatalogDescriptor {
+            id: id.into(),
+            name: id.into(),
+            configuration_fingerprint: format!("fingerprint-{id}"),
+            config_path: format!("/agents/{id}.json"),
+            validation_state: state.into(),
+            archived,
+        }
+    }
+
+    #[test]
+    fn catalog_rejects_duplicate_current_identity() {
+        let current = descriptor("agent", "valid", false);
+        let result = AgentRuntimeManager::validate_catalog(CatalogInspect {
+            agents: vec![current.clone(), current.clone()],
+            diagnostics: vec![],
+            current_agent: Some(current),
+        });
+        assert!(result.unwrap_err().contains("not unique"));
+    }
+
+    #[test]
+    fn shutdown_rejects_new_runtime_publication() {
+        assert!(AgentRuntimeManager::publication_allowed(false).is_ok());
+        assert!(AgentRuntimeManager::publication_allowed(true)
+            .unwrap_err()
+            .contains("shut down"));
+    }
+
+    #[test]
+    fn runtime_selection_must_match_descriptor_path_and_fingerprint() {
+        let descriptor = descriptor("agent", "valid", false);
+        assert!(AgentRuntimeManager::immutable_selection_matches(
+            "/agents/agent.json",
+            "fingerprint-agent",
+            &descriptor
+        ));
+        assert!(!AgentRuntimeManager::immutable_selection_matches(
+            "/agents/other.json",
+            "fingerprint-agent",
+            &descriptor
+        ));
+        assert!(!AgentRuntimeManager::immutable_selection_matches(
+            "/agents/agent.json",
+            "old-fingerprint",
+            &descriptor
+        ));
+    }
+
+    #[test]
+    fn convergence_replaces_valid_archived_runtime_and_retires_unusable_descriptors() {
+        assert_eq!(
+            AgentRuntimeManager::convergence_action(Some(&descriptor("old", "valid", true))),
+            RuntimeConvergence::Replace
+        );
+        assert_eq!(
+            AgentRuntimeManager::convergence_action(Some(&descriptor("bad", "invalid", false))),
+            RuntimeConvergence::Retire
+        );
+        assert_eq!(
+            AgentRuntimeManager::convergence_action(None),
+            RuntimeConvergence::Retire
+        );
+    }
+
+    #[test]
+    fn current_catalog_publication_is_dynamically_replaceable() {
+        let mut publication = CatalogPublication::default();
+        publication.current_agent_id = Some("first".into());
+        assert_eq!(publication.current_agent_id.as_deref(), Some("first"));
+        publication.current_agent_id = Some("replacement".into());
+        assert_eq!(publication.current_agent_id.as_deref(), Some("replacement"));
+    }
+
+    #[test]
+    fn catalog_keeps_all_unique_valid_active_and_archived_profiles() {
+        let current = descriptor("current", "valid", false);
+        let archived = descriptor("archived", "valid", true);
+        let invalid = descriptor("invalid", "invalid", false);
+        let (catalog, _) = AgentRuntimeManager::validate_catalog(CatalogInspect {
+            agents: vec![current.clone(), archived, invalid],
+            diagnostics: vec![json!({"message":"preserved by refresh"})],
+            current_agent: Some(current),
+        })
+        .unwrap();
+        assert_eq!(catalog.len(), 3);
+        assert!(catalog["archived"].archived);
+    }
+
+    #[test]
+    fn archived_and_invalid_profiles_are_blocked_for_new_work() {
+        assert!(
+            AgentRuntimeManager::creation_allowed(&descriptor("old", "valid", true), false)
+                .is_err()
+        );
+        assert!(
+            AgentRuntimeManager::creation_allowed(&descriptor("old", "valid", true), true).is_ok()
+        );
+        assert!(AgentRuntimeManager::creation_allowed(
+            &descriptor("dup", "duplicate-id", false),
+            true
+        )
+        .is_err());
+    }
+
     #[test]
     fn trusted_generic_descriptor_omits_inapplicable_optional_fields() {
         let descriptor = trusted_descriptors(&[AttachmentDraft {
@@ -5030,13 +5750,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            load_trace_privacy(&workbench).unwrap(),
+            load_trace_privacy(&workbench, "agent-a").unwrap(),
             TracePrivacy {
                 messages: true,
                 reasoning: true,
                 raw_tool_payloads: false,
             }
         );
+    }
+
+    #[test]
+    fn scoped_trace_privacy_overrides_legacy_without_affecting_other_agents() {
+        let workbench = WorkbenchDb::open_in_memory().unwrap();
+        workbench
+            .save_setting(
+                TRACE_PRIVACY_SETTING,
+                &json!({"messages":true,"reasoning":false,"rawToolPayloads":false}),
+            )
+            .unwrap();
+        workbench
+            .save_setting(
+                &trace_privacy_setting("agent-a"),
+                &json!({"messages":false,"reasoning":false,"rawToolPayloads":true}),
+            )
+            .unwrap();
+
+        assert!(
+            load_trace_privacy(&workbench, "agent-a")
+                .unwrap()
+                .raw_tool_payloads
+        );
+        assert!(load_trace_privacy(&workbench, "agent-b").unwrap().messages);
+        assert!(
+            !load_trace_privacy(&workbench, "agent-b")
+                .unwrap()
+                .raw_tool_payloads
+        );
+    }
+
+    #[test]
+    fn trace_publication_requires_exact_runtime_bridge_and_generation() {
+        assert!(trace_publication_allowed(true, true, 4, 4, false));
+        assert!(!trace_publication_allowed(false, true, 4, 4, false));
+        assert!(!trace_publication_allowed(true, false, 4, 4, false));
+        assert!(!trace_publication_allowed(true, true, 5, 4, false));
+        assert!(!trace_publication_allowed(true, true, 4, 4, true));
     }
 
     #[test]

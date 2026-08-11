@@ -1,6 +1,7 @@
 import {
   AgentSdk,
   agentConfigurationFingerprint,
+  inspectAgentSdkCatalog,
   inspectAgentSdkResolution,
   resolveRuntimeTarget,
   type AgentSdkOptions,
@@ -33,6 +34,7 @@ import {
   SUPPORTED_DESKTOP_PROTOCOL_VERSIONS,
   DesktopProtocolError,
   type CliExecuteParams,
+  type CatalogInspectParams,
   type DesktopClientInfo,
   type DesktopAttachmentInput,
   type DesktopChatMessage,
@@ -138,15 +140,23 @@ export class DesktopRuntime {
       && (request.method.startsWith('history/') || request.method === 'settings/update')) {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', `${request.method} requires desktop protocol 1.12.`, JSON_RPC_ERROR_CODES.methodNotFound);
     }
-    if (this.negotiatedProtocolVersion !== DESKTOP_PROTOCOL_VERSION
+    if (!['1.13', '1.14'].includes(this.negotiatedProtocolVersion)
       && request.method.startsWith('execution/')) {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', `${request.method} requires desktop protocol 1.13.`, JSON_RPC_ERROR_CODES.methodNotFound);
     }
-    if (this.negotiatedProtocolVersion !== '1.13' && hasV113Fields(request)) {
+    if (this.negotiatedProtocolVersion !== '1.14' && request.method === 'catalog/inspect') {
+      throw new DesktopProtocolError('METHOD_NOT_FOUND', 'catalog/inspect requires desktop protocol 1.14.', JSON_RPC_ERROR_CODES.methodNotFound);
+    }
+    if (this.negotiatedProtocolVersion !== '1.14' && request.method === 'runtime/initialize' && request.params?.agentSelection) {
+      throw new DesktopProtocolError('INVALID_PARAMS', 'Exact agent selection requires desktop protocol 1.14.', JSON_RPC_ERROR_CODES.invalidParams);
+    }
+    if (!['1.13', '1.14'].includes(this.negotiatedProtocolVersion) && hasV113Fields(request)) {
       throw new DesktopProtocolError('INVALID_PARAMS', 'Attachment and execution-envelope fields require desktop protocol 1.13.', JSON_RPC_ERROR_CODES.invalidParams);
     }
 
     switch (request.method) {
+      case 'catalog/inspect':
+        return this.inspectCatalog(request.params ?? {});
       case 'runtime/initialize':
         return this.initializeRuntime(request.params ?? {});
       case 'runtime/info':
@@ -306,7 +316,8 @@ export class DesktopRuntime {
         methods: DESKTOP_RPC_METHODS.filter((method) => {
           if (this.negotiatedProtocolVersion === '1.10' && method === 'auth/updateAccessToken') return false;
           if (this.negotiatedProtocolVersion === '1.10' || this.negotiatedProtocolVersion === '1.11') if (method.startsWith('history/') || method === 'settings/update') return false;
-          if (this.negotiatedProtocolVersion !== '1.13' && method.startsWith('execution/')) return false;
+          if (!['1.13', '1.14'].includes(this.negotiatedProtocolVersion) && method.startsWith('execution/')) return false;
+          if (this.negotiatedProtocolVersion !== '1.14' && method === 'catalog/inspect') return false;
           return true;
         }),
         notifications: ['runtime/ready', 'agent/event', 'cli/output'],
@@ -316,9 +327,26 @@ export class DesktopRuntime {
           transport: 'child-process',
           output: 'streamed-notifications',
         },
-        ...(this.negotiatedProtocolVersion === '1.13' ? { attachments: attachmentCapabilities(false, 'Initialize the runtime with managedAttachmentRoot.') } : {}),
+        ...(['1.13', '1.14'].includes(this.negotiatedProtocolVersion) ? { attachments: attachmentCapabilities(false, 'Initialize the runtime with managedAttachmentRoot.') } : {}),
       },
     };
+  }
+
+  private async inspectCatalog(params: CatalogInspectParams): Promise<JsonValue> {
+    if (this.sdk || this.sdkInitialization) {
+      throw new DesktopProtocolError('ALREADY_INITIALIZED', 'catalog/inspect is only available before runtime initialization.', JSON_RPC_ERROR_CODES.alreadyInitialized);
+    }
+    const catalog = await inspectAgentSdkCatalog({
+      ...(params.cwd ? { cwd: params.cwd } : {}),
+      ...(params.settingsConfigPath ? { settingsConfigPath: params.settingsConfigPath } : {}),
+    });
+    const currentAgent = catalog.agents.find((agent) => agent.configPath === catalog.agentPath);
+    return asJsonValue({
+      agents: catalog.agents,
+      diagnostics: catalog.diagnostics,
+      ...(currentAgent ? { currentAgent } : {}),
+      ...(catalog.settingsPath ? { settingsPath: catalog.settingsPath } : {}),
+    });
   }
 
   private runtimeInfo(): JsonValue {
@@ -357,6 +385,20 @@ export class DesktopRuntime {
         'The agent runtime is already initialized or initializing.',
         JSON_RPC_ERROR_CODES.alreadyInitialized,
       );
+    }
+
+    if (params.agentSelection) {
+      const catalog = await inspectAgentSdkCatalog({
+        ...(params.cwd ? { cwd: params.cwd } : {}),
+        ...(params.settingsConfigPath ? { settingsConfigPath: params.settingsConfigPath } : {}),
+      });
+      const selected = catalog.agents.find((agent) => agent.configPath === params.agentSelection!.configPath);
+      if (!selected
+        || selected.validationState !== 'valid'
+        || selected.id !== params.agentSelection.id
+        || selected.configurationFingerprint !== params.agentSelection.configurationFingerprint) {
+        throw agentSelectionMismatch(params.agentSelection, selected);
+      }
     }
 
     const inferenceMode = params.inferenceMode ?? (params.profileRef?.source === 'server' ? 'gateway' : undefined);
@@ -407,7 +449,7 @@ export class DesktopRuntime {
     };
     const options: AgentSdkOptions = {
       ...(params.cwd ? { cwd: params.cwd } : {}),
-      ...(params.agentConfigPath ? { agentConfigPath: params.agentConfigPath } : {}),
+      ...(params.agentSelection ? { agentConfigPath: params.agentSelection.configPath } : params.agentConfigPath ? { agentConfigPath: params.agentConfigPath } : {}),
       ...(params.settingsConfigPath ? { settingsConfigPath: params.settingsConfigPath } : {}),
       ...(params.configurationDriven ? {} : { runtimeMode: params.runtimeMode ?? 'sqlite' }),
       ...(params.sqlitePath ? { sqlitePath: params.sqlitePath } : {}),
@@ -443,6 +485,15 @@ export class DesktopRuntime {
       });
       this.settingsPath = runtimeTarget.settingsPath ?? resolve(this.settingsCwd, 'agent.settings.json');
       const sdk = await initialization;
+      if (params.agentSelection) {
+        const actual = { id: sdk.config.agent.id, configPath: sdk.agentPath, configurationFingerprint: agentConfigurationFingerprint(sdk.config) };
+        if (actual.id !== params.agentSelection.id
+          || actual.configPath !== params.agentSelection.configPath
+          || actual.configurationFingerprint !== params.agentSelection.configurationFingerprint) {
+          await sdk.close();
+          throw agentSelectionMismatch(params.agentSelection, actual);
+        }
+      }
       if (params.configurationDriven) {
         try {
           validateRestrictedDesktopConfiguration(sdk.config);
@@ -722,6 +773,15 @@ function rejectUnsupportedMedia(inputs: DesktopAttachmentInput[]): void {
   if (inputs.some((input) => input.kind !== 'file')) throw new DesktopProtocolError('UNSUPPORTED_ATTACHMENT_KIND', 'Desktop protocol 1.13 currently supports generic file attachments only.', JSON_RPC_ERROR_CODES.commandRejected);
 }
 function executionResult(executionId: string, mode: 'direct' | 'catalog', result: any, stages?: any[]): JsonValue { return asJsonValue({ executionId, mode, status: result.status, finalRunId: result.runId, traceTarget: mode === 'direct' ? { kind: 'root-run', rootRunId: executionId } : { kind: 'session', sessionId: executionId }, ...(stages ? { stages } : {}), result }); }
+
+function agentSelectionMismatch(expected: RuntimeInitializeParams['agentSelection'], actual: unknown): DesktopProtocolError {
+  return new DesktopProtocolError(
+    'AGENT_SELECTION_MISMATCH',
+    'The selected agent no longer matches its catalog descriptor (id, configPath, or configurationFingerprint). Inspect the catalog again.',
+    JSON_RPC_ERROR_CODES.invalidParams,
+    { expected: asJsonValue(expected), ...(actual ? { actual: asJsonValue(actual) } : {}) },
+  );
+}
 function hasV113Fields(request: DesktopRpcRequest): boolean {
   const visit = (value: unknown): boolean => Array.isArray(value)
     ? value.some(visit)

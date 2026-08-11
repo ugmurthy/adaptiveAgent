@@ -33,16 +33,6 @@
     });
   }
 
-  async function selectAgentConfig() {
-    const selected = await open({
-      defaultPath: settings?.agent.configPath || undefined,
-      directory: false,
-      multiple: false,
-      filters: [{ name: 'JSON configuration', extensions: ['json'] }],
-    });
-    if (selected && settings) settings.agent.configPath = selected;
-  }
-
   async function selectDirectory(field: 'root' | 'shellCwd') {
     if (!settings) return;
     const selected = await open({
@@ -72,8 +62,8 @@
         <span>Credential</span><strong>{desktop.configuration.model.credentialAvailable ? 'Available' : 'Unavailable'}</strong><small>value never exposed</small>
       </div>
       <div class="settings-grid">
-        <label class="settings-wide"><span>Agent config path</span><span class="path-picker"><input value={settings.agent.configPath} readonly disabled={pending} /><button type="button" disabled={pending} on:click={selectAgentConfig}>Choose file…</button><button type="button" disabled={pending || !settings.agent.configPath} on:click={() => { if (settings) settings.agent.configPath = ''; }}>Clear</button></span></label>
-        <label class="settings-wide"><span>Agent ID</span><input required bind:value={settings.agent.id} disabled={pending} /></label>
+        <label class="settings-wide"><span>Agent config path</span><input value={settings.agent.configPath} readonly /></label>
+        <label class="settings-wide"><span>Agent ID</span><input value={settings.agent.id} readonly /></label>
         <label><span>Inference mode</span><select bind:value={settings.inference.mode} disabled={pending}><option value="byok">BYOK</option><option value="local">Local</option><option value="gateway">Gateway</option></select></label>
         <label><span>Inference tier</span><select bind:value={settings.inference.tier} disabled={pending}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xtra-high">Extra high</option></select></label>
         <label><span>Approval mode</span><select bind:value={settings.interaction.approvalMode} disabled={pending}><option value="auto">Auto</option><option value="manual">Manual</option><option value="reject">Reject</option></select></label>

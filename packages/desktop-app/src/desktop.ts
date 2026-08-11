@@ -19,6 +19,7 @@ export interface EditableDesktopSettings {
 }
 
 export interface DesktopState {
+  agentId: string;
   status: 'starting' | 'ready' | 'running' | 'stopping' | 'error';
   configurationValid: boolean;
   configuration?: ResolvedConfiguration;
@@ -57,38 +58,77 @@ export interface TraceReport {
   llmMessages?: unknown[];
   warnings?: string[];
 }
-export interface TraceEvent { rootRunId:string; revision:number; finalRefresh:boolean; report?:TraceReport; error?:string; }
+export interface TraceEvent { agentId:string; rootRunId:string; revision:number; finalRefresh:boolean; report?:TraceReport; error?:string; }
 
-export interface RunFinishedEvent { runId: string; result?: unknown; error?: string; }
+export interface RunFinishedEvent { agentId:string; runId: string; result?: unknown; error?: string; }
 
-export const getDesktopState = () => invoke<DesktopState>('desktop_state');
-export const reloadSettings = () => invoke<DesktopState>('reload_settings');
-export const saveSettings = (settings: EditableDesktopSettings) => invoke<DesktopState>('save_settings', { settings });
-export const selectAttachments=(existingAttachmentIds:string[]=[])=>invoke<AttachmentDraft[]>('select_attachments',{existingAttachmentIds});
-export const discardAttachmentDraft=(attachmentId:string)=>invoke<void>('discard_attachment_draft',{attachmentId});
-export const startRun = (task: string,attachmentIds:string[]=[]) => invoke<StartedRun>('start_run', { task,attachmentIds });
-export const stopRun = (runId: string) => invoke<void>('stop_run', { runId });
-export const getRunRecoveryPlan = (runId:string) => invoke<RunRecoveryPlan>('get_run_recovery_plan',{runId});
-export const recoverRun = (plan:RunRecoveryPlan) => invoke<void>('recover_run',{
-  runId:plan.runId,
-  expectedStatus:plan.status,
-  expectedAction:plan.action,
-});
-export const steerRun = (runId:string,message:string) => invoke<void>('steer_run',{runId,message});
-export const getRunResult = (runId: string) => invoke<unknown | null>('get_run_result', { runId });
-export const getRunOverview = (runId: string) => invoke<TraceReport>('get_run_overview', { runId });
-export const resolveApproval = (pending:PendingApproval,approved:boolean) => invoke<void>('resolve_approval',{rootRunId:pending.rootRunId,approvalRunId:pending.approvalRunId,approvalId:pending.approvalId,approved});
-export const createChat = (title:string) => invoke<Chat>('create_chat',{title});
-export const listChats = () => invoke<Chat[]>('list_chats');
-export const loadChat = (itemId:string) => invoke<Chat>('load_chat',{itemId});
-export const sendChatTurn = (itemId:string,content:string,attachmentIds:string[]=[]) => invoke<StartedRun>('send_chat_turn',{itemId,content,attachmentIds});
-export const previewHistoryDeletion = (target:ProductDeletionTarget) => invoke<DeletionPreview>('preview_history_deletion',{target});
-export const deleteHistory = (target:ProductDeletionTarget) => invoke<void>('delete_history',{target});
-export const listWorkspaceArtifacts = () => invoke<WorkspaceArtifact[]>('list_workspace_artifacts');
-export const readArtifact = (path:string) => invoke<ArtifactPreview>('read_artifact',{path});
-export const selectTrace = (rootRunId?:string) => invoke<number>('select_trace',{rootRunId});
-export const getTracePrivacy = () => invoke<TracePrivacy>('get_trace_privacy');
-export const setTracePrivacy = (privacy:TracePrivacy) => invoke<TracePrivacy>('set_trace_privacy',{privacy});
+export interface DesktopBootstrap { currentAgentId:string; catalog?:unknown; state:DesktopState }
+export type AgentActivityEvent = ActivityEvent & { agentId:string };
+
+export interface DesktopApi {
+  getDesktopState():Promise<DesktopState>; reloadSettings():Promise<DesktopState>;
+  saveSettings(settings:EditableDesktopSettings):Promise<DesktopState>;
+  selectAttachments(existingAttachmentIds?:string[]):Promise<AttachmentDraft[]>; discardAttachmentDraft(attachmentId:string):Promise<void>;
+  startRun(task:string,attachmentIds?:string[]):Promise<StartedRun>; stopRun(runId:string):Promise<void>;
+  getRunRecoveryPlan(runId:string):Promise<RunRecoveryPlan>; recoverRun(plan:RunRecoveryPlan):Promise<void>; steerRun(runId:string,message:string):Promise<void>;
+  getRunResult(runId:string):Promise<unknown|null>; getRunOverview(runId:string):Promise<TraceReport>; resolveApproval(pending:PendingApproval,approved:boolean):Promise<void>;
+  createChat(title:string):Promise<Chat>; listChats():Promise<Chat[]>; loadChat(itemId:string):Promise<Chat>; sendChatTurn(itemId:string,content:string,attachmentIds?:string[]):Promise<StartedRun>;
+  previewHistoryDeletion(target:ProductDeletionTarget):Promise<DeletionPreview>; deleteHistory(target:ProductDeletionTarget):Promise<void>;
+  listWorkspaceArtifacts():Promise<WorkspaceArtifact[]>; readArtifact(path:string):Promise<ArtifactPreview>; selectTrace(rootRunId?:string):Promise<number>;
+  getTracePrivacy():Promise<TracePrivacy>; setTracePrivacy(privacy:TracePrivacy):Promise<TracePrivacy>;
+  subscribe(activity:(event:AgentActivityEvent)=>void,finished:(event:RunFinishedEvent)=>void,state:(event:DesktopState)=>void,trace:(event:TraceEvent)=>void):Promise<UnlistenFn>;
+}
+
+export const desktopBootstrap=()=>invoke<DesktopBootstrap>('desktop_bootstrap');
+
+export function createDesktopApi(agentId:string):DesktopApi {
+  if (!agentId) throw new Error('agentId is required');
+  const args=<T extends object>(value?:T)=>({agentId,...value});
+  return {
+    getDesktopState:()=>invoke('desktop_state',args()), reloadSettings:()=>invoke('reload_settings',args()), saveSettings:(settings)=>invoke('save_settings',args({settings})),
+    selectAttachments:(existingAttachmentIds=[])=>invoke('select_attachments',args({existingAttachmentIds})), discardAttachmentDraft:(attachmentId)=>invoke('discard_attachment_draft',args({attachmentId})),
+    startRun:(task,attachmentIds=[])=>invoke('start_run',args({task,attachmentIds})), stopRun:(runId)=>invoke('stop_run',args({runId})), getRunRecoveryPlan:(runId)=>invoke('get_run_recovery_plan',args({runId})),
+    recoverRun:(plan)=>invoke('recover_run',args({runId:plan.runId,expectedStatus:plan.status,expectedAction:plan.action})), steerRun:(runId,message)=>invoke('steer_run',args({runId,message})),
+    getRunResult:(runId)=>invoke('get_run_result',args({runId})), getRunOverview:(runId)=>invoke('get_run_overview',args({runId})), resolveApproval:(pending,approved)=>invoke('resolve_approval',args({rootRunId:pending.rootRunId,approvalRunId:pending.approvalRunId,approvalId:pending.approvalId,approved})),
+    createChat:(title)=>invoke('create_chat',args({title})), listChats:()=>invoke('list_chats',args()), loadChat:(itemId)=>invoke('load_chat',args({itemId})), sendChatTurn:(itemId,content,attachmentIds=[])=>invoke('send_chat_turn',args({itemId,content,attachmentIds})),
+    previewHistoryDeletion:(target)=>invoke('preview_history_deletion',args({target})), deleteHistory:(target)=>invoke('delete_history',args({target})), listWorkspaceArtifacts:()=>invoke('list_workspace_artifacts',args()), readArtifact:(path)=>invoke('read_artifact',args({path})),
+    selectTrace:(rootRunId)=>invoke('select_trace',args({rootRunId})), getTracePrivacy:()=>invoke('get_trace_privacy',args()), setTracePrivacy:(privacy)=>invoke('set_trace_privacy',args({privacy})),
+    subscribe:async(activity,finished,state,trace)=>{ const unlisten=await Promise.all([
+      listen<AgentActivityEvent>('adaptive-agent://activity',({payload})=>{if(payload.agentId===agentId)activity(payload)}),
+      listen<RunFinishedEvent>('adaptive-agent://run-finished',({payload})=>{if(payload.agentId===agentId&&payload.runId)finished(payload)}),
+      listen<DesktopState>('adaptive-agent://state',({payload})=>{if(payload.agentId===agentId)state(payload)}),
+      listen<TraceEvent>('adaptive-agent://trace',({payload})=>{if(payload.agentId===agentId)trace(payload)}),
+    ]); return ()=>unlisten.forEach(fn=>fn()); },
+  };
+}
+
+let compatibilityApi:Promise<DesktopApi>|undefined;
+const currentApi=()=>compatibilityApi??=(desktopBootstrap().then(value=>createDesktopApi(value.currentAgentId)));
+
+export const getDesktopState = () => currentApi().then(api=>api.getDesktopState());
+export const reloadSettings = () => currentApi().then(api=>api.reloadSettings());
+export const saveSettings = (settings: EditableDesktopSettings) => currentApi().then(api=>api.saveSettings(settings));
+export const selectAttachments=(ids:string[]=[])=>currentApi().then(api=>api.selectAttachments(ids));
+export const discardAttachmentDraft=(id:string)=>currentApi().then(api=>api.discardAttachmentDraft(id));
+export const startRun=(task:string,ids:string[]=[])=>currentApi().then(api=>api.startRun(task,ids));
+export const stopRun=(id:string)=>currentApi().then(api=>api.stopRun(id));
+export const getRunRecoveryPlan=(id:string)=>currentApi().then(api=>api.getRunRecoveryPlan(id));
+export const recoverRun=(plan:RunRecoveryPlan)=>currentApi().then(api=>api.recoverRun(plan));
+export const steerRun=(id:string,message:string)=>currentApi().then(api=>api.steerRun(id,message));
+export const getRunResult=(id:string)=>currentApi().then(api=>api.getRunResult(id));
+export const getRunOverview=(id:string)=>currentApi().then(api=>api.getRunOverview(id));
+export const resolveApproval=(pending:PendingApproval,approved:boolean)=>currentApi().then(api=>api.resolveApproval(pending,approved));
+export const createChat=(title:string)=>currentApi().then(api=>api.createChat(title));
+export const listChats=()=>currentApi().then(api=>api.listChats());
+export const loadChat=(id:string)=>currentApi().then(api=>api.loadChat(id));
+export const sendChatTurn=(id:string,content:string,ids:string[]=[])=>currentApi().then(api=>api.sendChatTurn(id,content,ids));
+export const previewHistoryDeletion=(target:ProductDeletionTarget)=>currentApi().then(api=>api.previewHistoryDeletion(target));
+export const deleteHistory=(target:ProductDeletionTarget)=>currentApi().then(api=>api.deleteHistory(target));
+export const listWorkspaceArtifacts=()=>currentApi().then(api=>api.listWorkspaceArtifacts());
+export const readArtifact=(path:string)=>currentApi().then(api=>api.readArtifact(path));
+export const selectTrace=(id?:string)=>currentApi().then(api=>api.selectTrace(id));
+export const getTracePrivacy=()=>currentApi().then(api=>api.getTracePrivacy());
+export const setTracePrivacy=(privacy:TracePrivacy)=>currentApi().then(api=>api.setTracePrivacy(privacy));
 export const quitWait = () => invoke<DesktopState>('quit_wait');
 export const quitTerminate = () => invoke<DesktopState>('quit_terminate');
 export const quitCancel = () => invoke<DesktopState>('quit_cancel');
@@ -99,13 +139,5 @@ export async function subscribe(
   state: (event: DesktopState) => void,
   trace: (event: TraceEvent) => void,
 ): Promise<UnlistenFn> {
-  const unlisten = await Promise.all([
-    listen<ActivityEvent>('adaptive-agent://activity', ({ payload }) => activity(payload)),
-    listen<RunFinishedEvent>('adaptive-agent://run-finished', ({ payload }) => {
-      if (payload && typeof payload.runId === 'string' && payload.runId.length > 0) finished(payload);
-    }),
-    listen<DesktopState>('adaptive-agent://state', ({ payload }) => state(payload)),
-    listen<TraceEvent>('adaptive-agent://trace', ({ payload }) => trace(payload)),
-  ]);
-  return () => unlisten.forEach((fn) => fn());
+  return (await currentApi()).subscribe(activity,finished,state,trace);
 }

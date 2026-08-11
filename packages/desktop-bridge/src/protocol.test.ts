@@ -34,8 +34,8 @@ describe('desktop bridge protocol', () => {
     );
   });
 
-  it('uses a string for protocol 1.13', () => {
-    expect(DESKTOP_PROTOCOL_VERSION).toBe('1.13');
+  it('uses a string for protocol 1.14', () => {
+    expect(DESKTOP_PROTOCOL_VERSION).toBe('1.14');
   });
 
   it('strictly validates managed attachment descriptors', () => {
