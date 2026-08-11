@@ -46,6 +46,16 @@ create table message_attachments (message_id text not null references chat_messa
 create trigger task_attachment_delete before delete on task_attachments begin update attachments set state='delete_pending' where attachment_id=old.attachment_id; end;
 create trigger message_attachment_delete before delete on message_attachments begin update attachments set state='delete_pending' where attachment_id=old.attachment_id; end;
 update workbench_runs set final_run_id=run_id,trace_target_json=json_object('kind','root-run','rootRunId',run_id);"#,
+) ,(
+    10,
+    r#"alter table workbench_items add column pinned_agent_config_path text;
+alter table workbench_runs add column agent_id text;
+alter table workbench_runs add column agent_config_path text;
+alter table workbench_runs add column agent_fingerprint text;
+update workbench_runs
+set agent_id=(select pinned_agent_id from workbench_items where id=workbench_runs.item_id),
+    agent_config_path=(select pinned_agent_config_path from workbench_items where id=workbench_runs.item_id),
+    agent_fingerprint=(select pinned_agent_fingerprint from workbench_items where id=workbench_runs.item_id);"#,
 )];
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -74,6 +84,7 @@ pub struct ChatItem {
     pub pinned_agent_id: String,
     pub pinned_agent_name: String,
     pub pinned_agent_fingerprint: String,
+    pub pinned_agent_config_path: Option<String>,
     pub workspace_root: Option<String>,
     pub shell_cwd: Option<String>,
 }
@@ -99,6 +110,7 @@ pub struct Reservation {
     pub agent_id: String,
     pub agent_name: String,
     pub agent_fingerprint: String,
+    pub agent_config_path: Option<String>,
     pub invocation_kind: String,
     pub cached_status: String,
     pub submission_state: String,
@@ -282,6 +294,29 @@ impl WorkbenchDb {
         Ok(())
     }
 
+    pub fn backfill_agent_config_path(
+        &self,
+        agent_id: &str,
+        agent_fingerprint: &str,
+        agent_config_path: &str,
+    ) -> Result<(), String> {
+        let mut connection = self.connection.lock().unwrap();
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        tx.execute(
+            "update workbench_items set pinned_agent_config_path=?3 where pinned_agent_id=?1 and pinned_agent_fingerprint=?2 and pinned_agent_config_path is null",
+            params![agent_id, agent_fingerprint, agent_config_path],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "update workbench_runs set agent_config_path=?3 where agent_id=?1 and agent_fingerprint=?2 and agent_config_path is null",
+            params![agent_id, agent_fingerprint, agent_config_path],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())
+    }
+
     pub fn reserve_task(&self, reservation: &Reservation) -> Result<(), String> {
         self.reserve_task_with_attachments(reservation, &[])
     }
@@ -295,8 +330,8 @@ impl WorkbenchDb {
         let tx = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
-        tx.execute("insert into workbench_items(id,kind,title,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,created_at,updated_at) values(?1,'task',?2,?3,?4,?5,?6,?7,?7)", params![reservation.item_id,reservation.title,reservation.session_id,reservation.agent_id,reservation.agent_name,reservation.agent_fingerprint,reservation.created_at]).map_err(|e| e.to_string())?;
-        tx.execute("insert into workbench_runs(run_id,item_id,invocation_kind,cached_status,submission_state,created_at,updated_at,workspace_root,shell_cwd,execution_mode,final_run_id,trace_target_json) values(?1,?2,?3,?4,?5,?6,?6,?7,?8,'direct',?1,json_object('kind','root-run','rootRunId',?1))", params![reservation.run_id,reservation.item_id,reservation.invocation_kind,reservation.cached_status,reservation.submission_state,reservation.created_at,reservation.workspace_root,reservation.shell_cwd]).map_err(|e| e.to_string())?;
+        tx.execute("insert into workbench_items(id,kind,title,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,pinned_agent_config_path,created_at,updated_at) values(?1,'task',?2,?3,?4,?5,?6,?7,?8,?8)", params![reservation.item_id,reservation.title,reservation.session_id,reservation.agent_id,reservation.agent_name,reservation.agent_fingerprint,reservation.agent_config_path,reservation.created_at]).map_err(|e| e.to_string())?;
+        tx.execute("insert into workbench_runs(run_id,item_id,invocation_kind,cached_status,submission_state,created_at,updated_at,workspace_root,shell_cwd,execution_mode,final_run_id,trace_target_json,agent_id,agent_config_path,agent_fingerprint) values(?1,?2,?3,?4,?5,?6,?6,?7,?8,'direct',?1,json_object('kind','root-run','rootRunId',?1),?9,?10,?11)", params![reservation.run_id,reservation.item_id,reservation.invocation_kind,reservation.cached_status,reservation.submission_state,reservation.created_at,reservation.workspace_root,reservation.shell_cwd,reservation.agent_id,reservation.agent_config_path,reservation.agent_fingerprint]).map_err(|e| e.to_string())?;
         claim_attachments(
             &tx,
             attachment_ids,
@@ -308,13 +343,13 @@ impl WorkbenchDb {
     }
 
     pub fn create_chat(&self, chat: &ChatItem) -> Result<(), String> {
-        self.connection.lock().unwrap().execute("insert into workbench_items(id,kind,title,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,created_at,updated_at,workspace_root,shell_cwd) values(?1,'chat',?2,?3,?4,?5,?6,?7,?7,?8,?9)", params![chat.item_id,chat.title,chat.session_id,chat.pinned_agent_id,chat.pinned_agent_name,chat.pinned_agent_fingerprint,chat.created_at,chat.workspace_root,chat.shell_cwd]).map_err(|e| e.to_string())?;
+        self.connection.lock().unwrap().execute("insert into workbench_items(id,kind,title,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,pinned_agent_config_path,created_at,updated_at,workspace_root,shell_cwd) values(?1,'chat',?2,?3,?4,?5,?6,?7,?8,?8,?9,?10)", params![chat.item_id,chat.title,chat.session_id,chat.pinned_agent_id,chat.pinned_agent_name,chat.pinned_agent_fingerprint,chat.pinned_agent_config_path,chat.created_at,chat.workspace_root,chat.shell_cwd]).map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub fn list_chats(&self) -> Result<Vec<ChatItem>, String> {
         let connection = self.connection.lock().unwrap();
-        let mut statement = connection.prepare("select id,title,created_at,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,workspace_root,shell_cwd from workbench_items where kind='chat' order by updated_at desc,id").map_err(|e| e.to_string())?;
+        let mut statement = connection.prepare("select id,title,created_at,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,pinned_agent_config_path,workspace_root,shell_cwd from workbench_items where kind='chat' order by updated_at desc,id").map_err(|e| e.to_string())?;
         let chats = statement
             .query_map([], |r| {
                 Ok(ChatItem {
@@ -325,8 +360,9 @@ impl WorkbenchDb {
                     pinned_agent_id: r.get(4)?,
                     pinned_agent_name: r.get(5)?,
                     pinned_agent_fingerprint: r.get(6)?,
-                    workspace_root: r.get(7)?,
-                    shell_cwd: r.get(8)?,
+                    pinned_agent_config_path: r.get(7)?,
+                    workspace_root: r.get(8)?,
+                    shell_cwd: r.get(9)?,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -338,7 +374,7 @@ impl WorkbenchDb {
     pub fn load_chat(&self, item_id: &str) -> Result<(ChatItem, Vec<ChatMessage>), String> {
         use rusqlite::OptionalExtension;
         let connection = self.connection.lock().unwrap();
-        let chat = connection.query_row("select id,title,created_at,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,workspace_root,shell_cwd from workbench_items where id=?1 and kind='chat'", [item_id], |r| Ok(ChatItem { item_id:r.get(0)?, title:r.get(1)?, created_at:r.get(2)?, session_id:r.get(3)?, pinned_agent_id:r.get(4)?, pinned_agent_name:r.get(5)?, pinned_agent_fingerprint:r.get(6)?, workspace_root:r.get(7)?, shell_cwd:r.get(8)? })).optional().map_err(|e| e.to_string())?.ok_or("Chat was not found.")?;
+        let chat = connection.query_row("select id,title,created_at,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,pinned_agent_config_path,workspace_root,shell_cwd from workbench_items where id=?1 and kind='chat'", [item_id], |r| Ok(ChatItem { item_id:r.get(0)?, title:r.get(1)?, created_at:r.get(2)?, session_id:r.get(3)?, pinned_agent_id:r.get(4)?, pinned_agent_name:r.get(5)?, pinned_agent_fingerprint:r.get(6)?, pinned_agent_config_path:r.get(7)?, workspace_root:r.get(8)?, shell_cwd:r.get(9)? })).optional().map_err(|e| e.to_string())?.ok_or("Chat was not found.")?;
         let mut statement = connection.prepare("select id,ordinal,role,content_json,run_id from chat_messages where item_id=?1 order by ordinal").map_err(|e| e.to_string())?;
         let messages = statement
             .query_map([item_id], |r| {
@@ -395,7 +431,7 @@ impl WorkbenchDb {
             )
             .map_err(|e| e.to_string())?;
         let now = now();
-        tx.execute("insert into workbench_runs(run_id,item_id,turn_index,invocation_kind,cached_status,submission_state,created_at,updated_at,execution_mode,final_run_id,trace_target_json,workspace_root,shell_cwd) select ?1,?2,?3,'chat','reserved','reserved',?4,?4,'direct',?1,json_object('kind','root-run','rootRunId',?1),workspace_root,shell_cwd from workbench_items where id=?2",params![run_id,item_id,ordinal,now]).map_err(|e|e.to_string())?;
+        tx.execute("insert into workbench_runs(run_id,item_id,turn_index,invocation_kind,cached_status,submission_state,created_at,updated_at,execution_mode,final_run_id,trace_target_json,workspace_root,shell_cwd,agent_id,agent_config_path,agent_fingerprint) select ?1,?2,?3,'chat','reserved','reserved',?4,?4,'direct',?1,json_object('kind','root-run','rootRunId',?1),workspace_root,shell_cwd,pinned_agent_id,pinned_agent_config_path,pinned_agent_fingerprint from workbench_items where id=?2",params![run_id,item_id,ordinal,now]).map_err(|e|e.to_string())?;
         let message_id = uuid::Uuid::new_v4().to_string();
         tx.execute("insert into chat_messages(id,item_id,ordinal,role,content_json,run_id,created_at) values(?1,?2,?3,'user',?4,?5,?6)",params![message_id,item_id,ordinal,serde_json::to_string(content).map_err(|e|e.to_string())?,run_id,now]).map_err(|e|e.to_string())?;
         claim_attachments(
@@ -892,7 +928,7 @@ impl WorkbenchDb {
 
     pub fn load_runs(&self) -> Result<Vec<Reservation>, String> {
         let connection = self.connection.lock().unwrap();
-        let mut statement = connection.prepare("select i.id,r.run_id,i.title,i.created_at,i.session_id,i.pinned_agent_id,i.pinned_agent_name,i.pinned_agent_fingerprint,r.invocation_kind,r.cached_status,r.submission_state,r.cancel_requested,r.interrupt_pending,r.workspace_root,r.shell_cwd from workbench_runs r join workbench_items i on i.id=r.item_id order by r.created_at,r.run_id").map_err(|e| e.to_string())?;
+        let mut statement = connection.prepare("select i.id,r.run_id,i.title,i.created_at,i.session_id,r.agent_id,i.pinned_agent_name,r.agent_fingerprint,r.agent_config_path,r.invocation_kind,r.cached_status,r.submission_state,r.cancel_requested,r.interrupt_pending,r.workspace_root,r.shell_cwd from workbench_runs r join workbench_items i on i.id=r.item_id order by r.created_at,r.run_id").map_err(|e| e.to_string())?;
         let rows = statement
             .query_map([], |r| {
                 Ok(Reservation {
@@ -904,13 +940,14 @@ impl WorkbenchDb {
                     agent_id: r.get(5)?,
                     agent_name: r.get(6)?,
                     agent_fingerprint: r.get(7)?,
-                    invocation_kind: r.get(8)?,
-                    cached_status: r.get(9)?,
-                    submission_state: r.get(10)?,
-                    cancel_requested: r.get(11)?,
-                    interrupt_pending: r.get(12)?,
-                    workspace_root: r.get(13)?,
-                    shell_cwd: r.get(14)?,
+                    agent_config_path: r.get(8)?,
+                    invocation_kind: r.get(9)?,
+                    cached_status: r.get(10)?,
+                    submission_state: r.get(11)?,
+                    cancel_requested: r.get(12)?,
+                    interrupt_pending: r.get(13)?,
+                    workspace_root: r.get(14)?,
+                    shell_cwd: r.get(15)?,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -1110,6 +1147,7 @@ mod tests {
             agent_id: "agent".into(),
             agent_name: "Agent".into(),
             agent_fingerprint: "fp".into(),
+            agent_config_path: Some("/agents/agent.json".into()),
             invocation_kind: "run".into(),
             cached_status: "reserved".into(),
             submission_state: "reserved".into(),
@@ -1136,6 +1174,41 @@ mod tests {
             1
         );
     }
+
+    #[test]
+    fn migration_backfills_run_agent_ownership_and_resolved_config_path() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        {
+            let connection = Connection::open(file.path()).unwrap();
+            connection.execute_batch("create table desktop_migrations(version integer primary key, applied_at text not null);").unwrap();
+            for (version, sql) in MIGRATIONS.iter().filter(|(version, _)| *version < 10) {
+                connection.execute_batch(sql).unwrap();
+                connection
+                    .execute("insert into desktop_migrations values(?1,'now')", [version])
+                    .unwrap();
+            }
+            connection.execute("insert into workbench_items(id,kind,title,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,created_at,updated_at) values('legacy-item','task','Legacy task',null,'legacy-agent','Legacy Agent','legacy-fingerprint','100','100')", []).unwrap();
+            connection.execute("insert into workbench_runs(run_id,item_id,invocation_kind,cached_status,submission_state,created_at,updated_at) values('legacy-run','legacy-item','run','succeeded','terminal','100','100')", []).unwrap();
+        }
+
+        let db = WorkbenchDb::open(file.path()).unwrap();
+        let legacy = &db.load_runs().unwrap()[0];
+        assert_eq!(legacy.agent_id, "legacy-agent");
+        assert_eq!(legacy.agent_fingerprint, "legacy-fingerprint");
+        assert_eq!(legacy.agent_config_path, None);
+
+        db.backfill_agent_config_path(
+            "legacy-agent",
+            "legacy-fingerprint",
+            "/agents/legacy-agent.json",
+        )
+        .unwrap();
+        assert_eq!(
+            db.load_runs().unwrap()[0].agent_config_path.as_deref(),
+            Some("/agents/legacy-agent.json")
+        );
+    }
+
     #[test]
     fn pending_approval_survives_reopen_and_decision_guard_is_atomic() {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -1286,6 +1359,7 @@ mod tests {
             pinned_agent_id: "agent".into(),
             pinned_agent_name: "Agent".into(),
             pinned_agent_fingerprint: "fingerprint".into(),
+            pinned_agent_config_path: Some("/agents/agent.json".into()),
             workspace_root: Some("/workspace".into()),
             shell_cwd: Some("/workspace".into()),
         }

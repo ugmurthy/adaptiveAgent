@@ -39,7 +39,7 @@ export interface RunSummary { itemId: string; runId: string; title: string; crea
 export interface RunRecoveryPlan { runId:string; status:string; action:'resume_same_run'|'retry_same_run'|'continue_new_run'|'requires_user_action'|'requires_reconciliation'|'not_recoverable'; executable:boolean; reason:string; }
 export interface StartedRun { itemId: string; runId: string; executionId:string; mode:'direct'|'catalog'; }
 export interface ChatMessage { id: string; ordinal: number; role: 'user'|'assistant'; content: string; runId?: string; attachments?:AttachmentDraft[]; }
-export interface Chat { itemId:string; title:string; createdAt:string; sessionId:string; pinnedAgentId:string; pinnedAgentName:string; pinnedAgentFingerprint:string; messages:ChatMessage[]; readOnlyReason?:string; occupied:boolean; }
+export interface Chat { itemId:string; title:string; createdAt:string; sessionId:string; pinnedAgentId:string; pinnedAgentName:string; pinnedAgentFingerprint:string; pinnedAgentConfigPath?:string; messages:ChatMessage[]; readOnlyReason?:string; occupied:boolean; }
 export type ProductDeletionTarget = {kind:'item';itemId:string}|{kind:'run';runId:string}|{kind:'chat-turn';itemId:string;ordinal:number};
 export interface DeletionPreview { target:ProductDeletionTarget; label:string; runCount:number; planCount:number; occupied:boolean; warning:string; }
 export interface WorkspaceArtifact { path:string; }

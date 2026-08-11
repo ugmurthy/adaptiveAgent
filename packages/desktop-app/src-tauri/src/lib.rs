@@ -587,6 +587,10 @@ impl Bridge {
                 "The sidecar did not return a safe resolved configuration.".to_string()
             })?;
         *self.configuration.lock().unwrap() = Some(configuration);
+        if let Ok((id, _, fingerprint, Some(config_path))) = self.current_agent() {
+            self.workbench
+                .backfill_agent_config_path(&id, &fingerprint, &config_path)?;
+        }
         *self.initialization_error.lock().unwrap() = None;
         self.prime_run_roots();
         self.reconcile_saved_runs();
@@ -1437,6 +1441,11 @@ impl Bridge {
             agent_id: required_agent_value("id")?,
             agent_name: required_agent_value("name")?,
             agent_fingerprint: required_agent_value("configurationFingerprint")?,
+            agent_config_path: agent
+                .get("configPath")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned),
             invocation_kind: "run".into(),
             cached_status: "reserved".into(),
             submission_state: "reserved".into(),
@@ -1568,7 +1577,7 @@ impl Bridge {
         Ok(started)
     }
 
-    fn current_agent(&self) -> Result<(String, String, String), String> {
+    fn current_agent(&self) -> Result<(String, String, String, Option<String>), String> {
         let configuration = self
             .configuration
             .lock()
@@ -1590,6 +1599,11 @@ impl Bridge {
             value("id")?,
             value("name")?,
             value("configurationFingerprint")?,
+            agent
+                .get("configPath")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned),
         ))
     }
 
@@ -1608,8 +1622,8 @@ impl Bridge {
         drop(configuration);
         match self.current_agent() {
             Err(_) => Some("The pinned agent is not currently available; this chat is read-only.".into()),
-            Ok((id,_,_)) if id != chat.pinned_agent_id => Some("The resolved agent ID no longer matches this chat's pin; this chat is read-only.".into()),
-            Ok((_,_,fingerprint)) if fingerprint != chat.pinned_agent_fingerprint => Some("The resolved agent configuration fingerprint no longer matches this chat's pin; this chat is read-only.".into()),
+            Ok((id,_,_,_)) if id != chat.pinned_agent_id => Some("The resolved agent ID no longer matches this chat's pin; this chat is read-only.".into()),
+            Ok((_,_,fingerprint,_)) if fingerprint != chat.pinned_agent_fingerprint => Some("The resolved agent configuration fingerprint no longer matches this chat's pin; this chat is read-only.".into()),
             Ok(_) if chat.workspace_root.is_none() || chat.shell_cwd.is_none() => Some("This chat predates durable workspace provenance and is read-only.".into()),
             Ok(_) if chat.workspace_root != current_workspace || chat.shell_cwd != current_shell_cwd => Some("The resolved workspace no longer matches this chat's pin; this chat is read-only.".into()),
             _ => None,
@@ -3534,7 +3548,7 @@ fn create_chat(title: String, state: tauri::State<'_, AppState>) -> Result<ChatD
         .as_ref()
         .cloned()
         .ok_or("Desktop runtime is starting.")?;
-    let (id, name, fingerprint) = bridge.current_agent()?;
+    let (id, name, fingerprint, config_path) = bridge.current_agent()?;
     let configuration = bridge.configuration.lock().unwrap();
     let workspace_root = configuration
         .as_ref()
@@ -3559,6 +3573,7 @@ fn create_chat(title: String, state: tauri::State<'_, AppState>) -> Result<ChatD
         pinned_agent_id: id,
         pinned_agent_name: name,
         pinned_agent_fingerprint: fingerprint,
+        pinned_agent_config_path: config_path,
         workspace_root,
         shell_cwd,
     };

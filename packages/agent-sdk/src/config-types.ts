@@ -151,6 +151,7 @@ export interface ResolvedAgentSdkConfig {
 
 export interface ResolvedAgentSdkModuleInspection {
   config: ResolvedAgentSdkConfig;
+  agentPath: string;
   tools: Array<Pick<ToolDefinition<JsonValue, JsonValue>, 'name' | 'description' | 'inputSchema' | 'requiresApproval'>>;
   delegates: Array<Pick<DelegateDefinition, 'name' | 'description' | 'allowedTools'>>;
   registeredTools: Array<Pick<ToolDefinition<JsonValue, JsonValue>, 'name' | 'description' | 'inputSchema' | 'requiresApproval'>>;
@@ -161,8 +162,13 @@ export interface AgentSdkCatalogAgent {
   id: string;
   name: string;
   description?: string;
+  configPath: string;
+  /** @deprecated Use configPath. */
   path: string;
   active: boolean;
+  archived: boolean;
+  configurationFingerprint: string;
+  validationState: 'valid' | 'duplicate-id';
   invocationModes: InvocationMode[];
   defaultInvocationMode: InvocationMode;
   provider?: string;
@@ -170,6 +176,13 @@ export interface AgentSdkCatalogAgent {
   tools: string[];
   delegates: string[];
   capabilities?: AgentCapabilityConfig;
+}
+
+export interface AgentSdkCatalogDiagnostic {
+  code: 'invalid-profile' | 'duplicate-agent-id';
+  path: string;
+  message: string;
+  relatedPaths?: string[];
 }
 
 export interface AgentSdkCatalogTool extends Pick<ToolDefinition<JsonValue, JsonValue>, 'name' | 'description' | 'inputSchema' | 'requiresApproval'> {
@@ -191,6 +204,7 @@ export interface AgentSdkCatalogInspection {
   agentPath: string;
   settingsPath?: string;
   agents: AgentSdkCatalogAgent[];
+  diagnostics: AgentSdkCatalogDiagnostic[];
   tools: AgentSdkCatalogTool[];
   delegates: AgentSdkCatalogDelegate[];
 }

@@ -1,4 +1,5 @@
 import { access, readdir, readFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { createInterface } from 'node:readline/promises';
 import { homedir } from 'node:os';
 import { delimiter, extname, isAbsolute, resolve } from 'node:path';
@@ -7,7 +8,7 @@ import { stdin, stderr } from 'node:process';
 import type { JsonObject } from '@adaptive-agent/core';
 
 import { AgentConfigValidationError } from './errors.js';
-import type { AgentConfigFile } from './config-types.js';
+import type { AgentConfigFile, ResolvedAgentSdkConfig } from './config-types.js';
 
 export async function readJson(path: string): Promise<unknown> { try { return JSON.parse(await readFile(path, 'utf-8')) as unknown; } catch (error) { throw new AgentConfigValidationError(path, [`Unable to read or parse JSON: ${error instanceof Error ? error.message : String(error)}`]); } }
 export async function pathExists(path: string): Promise<boolean> { try { await access(path); return true; } catch { return false; } }
@@ -50,8 +51,30 @@ export function mergeMetadata(base: JsonObject, extra: JsonObject | undefined): 
 export function parsePositiveInteger(value: string | undefined): number | undefined { const parsed = value ? Number.parseInt(value, 10) : NaN; return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined; }
 export function parseNonNegativeNumber(value: string | undefined): number | undefined { const parsed = value ? Number.parseFloat(value) : NaN; return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined; }
 export function readBooleanEnv(value: string | undefined): boolean { return value === '1' || value === 'true' || value === 'yes'; }
+/** Hash the execution-defining, credential-free configuration used to pin runs and chats. */
+export function agentConfigurationFingerprint(config: ResolvedAgentSdkConfig): string {
+  const executionConfiguration = {
+    agent: omitSecrets(config.agent),
+    model: { provider: config.model.provider, model: config.model.model },
+    inference: config.inference,
+    interaction: config.interaction,
+  };
+  return createHash('sha256').update(stableJson(executionConfiguration)).digest('hex');
+}
 export async function promptYesNo(question: string): Promise<boolean> { return ['y', 'yes'].includes((await promptText(question)).trim().toLowerCase()); }
 export async function promptText(question: string): Promise<string> { const rl = createInterface({ input: stdin, output: stderr }); try { return await rl.question(question); } finally { rl.close(); } }
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') return `{${Object.entries(value as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right)).map(([key, child]) => `${JSON.stringify(key)}:${stableJson(child)}`).join(',')}}`;
+  return JSON.stringify(value) ?? 'null';
+}
+
+function omitSecrets(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(omitSecrets);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).filter(([key]) => !/(api[-_]?key|access[-_]?token|credential|password|secret)/i.test(key)).map(([key, child]) => [key, omitSecrets(child)]));
+}
 
 function isAgentName(value: string): boolean {
   return Boolean(value.trim()) && !isAbsolute(value) && !/[\\/]/.test(value);

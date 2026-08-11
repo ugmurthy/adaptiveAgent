@@ -1,5 +1,6 @@
 import {
   AgentSdk,
+  agentConfigurationFingerprint,
   inspectAgentSdkResolution,
   resolveRuntimeTarget,
   type AgentSdkOptions,
@@ -332,7 +333,7 @@ export class DesktopRuntime {
         workspaceRoot: this.sdk.config.workspaceRoot,
         inferenceMode: this.sdk.config.inference.mode,
         inferenceTier: this.sdk.config.inference.tier,
-        resolvedConfiguration: asJsonValue(safeResolvedConfiguration(this.sdk.config)),
+        resolvedConfiguration: asJsonValue(safeResolvedConfiguration(this.sdk.config, this.sdk.agentPath)),
         ...(this.executionSelection?.profileRef ? { profileRef: asJsonValue(this.executionSelection.profileRef) } : {}),
         connections: {
           sqlite: {
@@ -469,7 +470,7 @@ export class DesktopRuntime {
         registeredToolNames: sdk.registeredToolNames,
         inferenceMode: sdk.config.inference.mode,
         inferenceTier: sdk.config.inference.tier,
-        resolvedConfiguration: asJsonValue(safeResolvedConfiguration(sdk.config)),
+        resolvedConfiguration: asJsonValue(safeResolvedConfiguration(sdk.config, sdk.agentPath)),
         ...(params.profileRef ? { profileRef: asJsonValue(params.profileRef) } : {}),
         connections: {
           sqlite: sdk.config.runtime.mode === 'sqlite' ? 'connected' : 'not_configured',
@@ -789,11 +790,11 @@ export function updateDesktopSettings(
   };
 }
 
-export function safeResolvedConfiguration(config: ResolvedAgentSdkConfig): SafeResolvedConfiguration {
+export function safeResolvedConfiguration(config: ResolvedAgentSdkConfig, agentPath?: string): SafeResolvedConfiguration {
   return {
     agent: {
       id: config.agent.id,
-      ...(config.settings?.agent?.configPath ? { configPath: config.settings.agent.configPath } : {}),
+      ...(agentPath ? { configPath: agentPath } : {}),
       name: config.agent.name,
       configurationFingerprint: agentConfigurationFingerprint(config),
       ...(config.agent.description ? { description: config.agent.description } : {}),
@@ -859,36 +860,6 @@ export function validateRestrictedDesktopConfiguration(config: ResolvedAgentSdkC
       JSON_RPC_ERROR_CODES.invalidParams,
     );
   }
-}
-
-/** Hash execution-defining values without returning configuration or credentials to the host. */
-function agentConfigurationFingerprint(config: ResolvedAgentSdkConfig): string {
-  const executionConfiguration = {
-    agent: omitSecrets(config.agent),
-    model: { provider: config.model.provider, model: config.model.model },
-    inference: config.inference,
-    interaction: config.interaction,
-  };
-  return createHash('sha256').update(stableJson(executionConfiguration)).digest('hex');
-}
-
-function stableJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
-  if (value && typeof value === 'object') {
-    return `{${Object.entries(value as Record<string, unknown>)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, child]) => `${JSON.stringify(key)}:${stableJson(child)}`)
-      .join(',')}}`;
-  }
-  return JSON.stringify(value) ?? 'null';
-}
-
-function omitSecrets(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(omitSecrets);
-  if (!value || typeof value !== 'object') return value;
-  return Object.fromEntries(Object.entries(value as Record<string, unknown>)
-    .filter(([key]) => !/(api[-_]?key|access[-_]?token|credential|password|secret)/i.test(key))
-    .map(([key, child]) => [key, omitSecrets(child)]));
 }
 
 async function readSettingsFile(path: string): Promise<AgentSettingsFile> {
