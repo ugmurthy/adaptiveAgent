@@ -60,6 +60,25 @@ export interface DesktopCatalogStatus {
   currentAgentId?: string;
   diagnostics: DesktopCatalogDiagnostic[];
   agents: DesktopCatalogAgent[];
+  quitState: DesktopState['quitState'];
+}
+export interface WindowPresentation {
+  x?: number; y?: number; width?: number; height?: number;
+  inspectorWidth?: number;
+  inspectorOpen: boolean;
+  selection?: import('./workbench-state').WorkbenchSelection;
+}
+export interface DesktopWindowBootstrap {
+  kind: 'studio' | 'agent';
+  agentId?: string;
+  state?: DesktopState;
+  presentation?: WindowPresentation;
+}
+export interface AgentWindowOpen {
+  agentId: string;
+  disposition: 'created' | 'focused';
+  openWindows: number;
+  maxWindows: number;
 }
 export type DesktopAttachmentKind='file'|'image'|'audio';
 export interface AttachmentDraft { id:string; name:string; kind:DesktopAttachmentKind; sizeBytes:number; mimeType?:string; }
@@ -109,8 +128,10 @@ export interface DesktopApi {
 }
 
 export const desktopBootstrap=()=>invoke<DesktopBootstrap>('desktop_bootstrap');
+export const desktopWindowBootstrap=()=>invoke<DesktopWindowBootstrap>('desktop_window_bootstrap');
 export const getDesktopCatalogStatus=()=>invoke<DesktopCatalogStatus>('desktop_catalog_status');
-export const openAgentWorkspace=(agentId:string)=>invoke<DesktopState>('open_agent_workspace',{agentId});
+export const openAgentWindow=(agentId:string)=>invoke<AgentWindowOpen>('open_agent_window',{agentId});
+export const saveWindowPresentation=(presentation:{inspectorWidth:number;inspectorOpen:boolean;selection:import('./workbench-state').WorkbenchSelection})=>invoke<void>('save_window_presentation',{presentation});
 export const listenCatalogStatusChanged=(callback:()=>void)=>listen('adaptive-agent://catalog-status-changed',callback);
 
 export function createDesktopApi(agentId:string):DesktopApi {

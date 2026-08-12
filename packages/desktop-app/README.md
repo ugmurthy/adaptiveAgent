@@ -9,6 +9,11 @@ The sidecar uses the Agent SDK's normal lookup rules: `ADAPTIVE_AGENT_SETTINGS`,
 `~/.adaptiveAgent/agent.settings.json`. The settings file selects a separate agent JSON
 definition with `agent.configPath`; `agent.id`, when present, is a matching assertion.
 
+The Agent Studio opens one native workspace window per agent. It allows three agent
+windows by default; set `ADAPTIVE_AGENT_MAX_WINDOWS` to a positive integer before
+launch to change the limit. Invalid values fall back to three and appear in catalog
+diagnostics.
+
 This MVP accepts only configured BYOK inference, an agent whose
 `defaultInvocationMode` is `run`, approval mode `auto` or `reject`, and clarification
 mode `fail`. Provider credentials are inherited by the native sidecar. Only an
@@ -52,6 +57,6 @@ events. No shell capability or generic JSON-RPC command is granted to the webvie
   modeled or shown.
 - **Privacy:** sensitive messages, reasoning, and raw tool payloads are opt-in under
   Inspector Diagnostics and may expose private data locally.
-- **Capacity and windows:** the slot meter reports runtime execution capacity. A task may
-  start only when capacity is available; chats remain persistent but turns also consume a
-  slot. On narrow windows navigation and Inspector become overlay drawers.
+- **Capacity and windows:** each agent has its own three-run execution capacity. Selecting
+  an agent creates or focuses its native workspace window; closing that window does not
+  stop active runs. On narrow windows navigation and Inspector become overlay drawers.

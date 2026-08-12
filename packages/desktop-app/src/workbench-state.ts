@@ -26,6 +26,16 @@ export const workbenchSelection = writable<WorkbenchSelection>({ kind: 'new-task
 export const inspectorOpen = writable(false);
 export const mobileRailOpen = writable(false);
 
+export function normalizeWorkbenchSelection(value: unknown): WorkbenchSelection {
+  if (!value || typeof value !== 'object' || !('kind' in value) || typeof value.kind !== 'string') return { kind: 'new-task' };
+  if (value.kind === 'new-task' || value.kind === 'new-chat' || value.kind === 'artifacts' || value.kind === 'settings') return { kind: value.kind };
+  if (value.kind === 'chat' && 'itemId' in value && typeof value.itemId === 'string' && value.itemId) return { kind: 'chat', itemId: value.itemId };
+  if (value.kind === 'task'
+    && 'itemId' in value && typeof value.itemId === 'string' && value.itemId
+    && 'runId' in value && typeof value.runId === 'string' && value.runId) return { kind: 'task', itemId: value.itemId, runId: value.runId };
+  return { kind: 'new-task' };
+}
+
 export function buildRailItems(runs: RunSummary[], chats: Chat[]): RailItem[] {
   const items: RailItem[] = [];
   const taskIds = new Set(runs.filter((run) => run.invocationKind === 'run').map((run) => run.itemId));

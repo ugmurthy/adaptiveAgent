@@ -1,22 +1,28 @@
 <script lang="ts">
   import App from './App.svelte';
   import AgentStudio from './AgentStudio.svelte';
-  import { createDesktopApi, openAgentWorkspace, type DesktopApi } from './desktop';
+  import { onMount } from 'svelte';
+  import { createDesktopApi, desktopWindowBootstrap, type DesktopApi, type WindowPresentation } from './desktop';
 
+  let mode: 'loading' | 'studio' | 'agent' | 'error' = 'loading';
   let agentId = '';
   let api: DesktopApi | undefined;
-  async function openWorkspace(id: string) {
-    const state = await openAgentWorkspace(id);
-    if (state.agentId !== id) throw new Error(`Agent workspace mismatch: requested '${id}', received '${state.agentId}'.`);
-    api = createDesktopApi(id);
-    agentId = id;
-  }
-  function closeWorkspace() { agentId = ''; api = undefined; }
+  let presentation: WindowPresentation | undefined;
+  let error = '';
+
+  onMount(() => {
+    void desktopWindowBootstrap().then((bootstrap) => {
+      if (bootstrap.kind === 'studio') { mode = 'studio'; return; }
+      if (!bootstrap.agentId || bootstrap.state?.agentId !== bootstrap.agentId) throw new Error('Agent window bootstrap did not match its native window context.');
+      agentId = bootstrap.agentId;
+      api = createDesktopApi(agentId);
+      presentation = bootstrap.presentation;
+      mode = 'agent';
+    }).catch((cause) => { error = String(cause); mode = 'error'; });
+  });
 </script>
 
-{#if agentId && api}
-  <button class="studio-back" type="button" on:click={closeWorkspace} aria-label="Return to Agent Studio">← Agent Studio</button>
-  {#key agentId}<App {api} />{/key}
-{:else}
-  <AgentStudio onOpen={openWorkspace} />
-{/if}
+{#if mode === 'loading'}<main class="studio-shell"><div class="studio-state">Opening AdaptiveAgent…</div></main>
+{:else if mode === 'error'}<main class="studio-shell"><div class="alert" role="alert">{error}</div></main>
+{:else if mode === 'agent' && agentId && api}{#key agentId}<App {api} initialPresentation={presentation} />{/key}
+{:else}<AgentStudio />{/if}

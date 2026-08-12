@@ -1,1 +1,1 @@
-{"main":{"identifier":"main","description":"Restricted AdaptiveAgent desktop renderer","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open"]}}
+{"main":{"identifier":"main","description":"Restricted AdaptiveAgent desktop renderer","local":true,"windows":["main","agent:*"],"permissions":["core:default","dialog:allow-open"]}}

@@ -18,7 +18,7 @@ use std::{
     },
     time::Duration,
 };
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent},
@@ -35,6 +35,8 @@ const MAX_NDJSON_FRAME_SIZE: usize = 1024 * 1024;
 const TRACE_MAX_NDJSON_FRAME_SIZE: usize = 8 * 1024 * 1024;
 const TRACE_PRIVACY_SETTING: &str = "trace_privacy";
 const RECENT_WORK_LIMIT: usize = 10;
+const DEFAULT_MAX_AGENT_WINDOWS: usize = 3;
+const AGENT_WINDOW_PREFIX: &str = "agent:";
 
 type Response = Result<Value, String>;
 
@@ -121,6 +123,49 @@ struct DesktopCatalogStatus {
     current_agent_id: Option<String>,
     diagnostics: Vec<Value>,
     agents: Vec<DesktopCatalogAgent>,
+    quit_state: QuitState,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowPresentation {
+    x: Option<i32>,
+    y: Option<i32>,
+    width: Option<u32>,
+    height: Option<u32>,
+    inspector_width: Option<u32>,
+    #[serde(default)]
+    inspector_open: bool,
+    selection: Option<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowPresentationUi {
+    inspector_width: u32,
+    inspector_open: bool,
+    selection: Value,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentWindowOpen {
+    agent_id: String,
+    disposition: &'static str,
+    open_windows: usize,
+    max_windows: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopWindowBootstrap {
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<DesktopState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presentation: Option<WindowPresentation>,
 }
 
 #[derive(Serialize)]
@@ -240,6 +285,10 @@ struct AppState {
     reconfiguring: AtomicBool,
     quit: Mutex<QuitCoordinator>,
     shutdown_started: AtomicBool,
+    max_agent_windows: usize,
+    window_limit_diagnostic: Option<Value>,
+    closing_agent_windows: Mutex<HashSet<String>>,
+    window_presentation: Mutex<()>,
 }
 
 struct ManagedRuntime {
@@ -737,7 +786,11 @@ impl AgentRuntimeManager {
         self.runtimes.lock().unwrap().keys().cloned().collect()
     }
 
-    fn catalog_status(&self) -> Result<DesktopCatalogStatus, String> {
+    fn catalog_status(
+        &self,
+        quit_state: QuitState,
+        window_limit_diagnostic: Option<Value>,
+    ) -> Result<DesktopCatalogStatus, String> {
         let (current_agent_id, mut descriptors) = {
             let catalog = self.catalog.lock().unwrap();
             (
@@ -852,10 +905,15 @@ impl AgentRuntimeManager {
                 recent_work,
             });
         }
+        let mut diagnostics = self.catalog_diagnostics.lock().unwrap().clone();
+        if let Some(diagnostic) = window_limit_diagnostic {
+            diagnostics.push(diagnostic);
+        }
         Ok(DesktopCatalogStatus {
             current_agent_id,
-            diagnostics: self.catalog_diagnostics.lock().unwrap().clone(),
+            diagnostics,
             agents,
+            quit_state,
         })
     }
 
@@ -889,6 +947,88 @@ fn fleet_attention(error: bool, approval: bool, recovery: bool) -> &'static str 
     } else {
         "none"
     }
+}
+
+fn parse_agent_window_limit(value: Option<&str>) -> (usize, Option<Value>) {
+    match value {
+        None => (DEFAULT_MAX_AGENT_WINDOWS, None),
+        Some(value) => match value.trim().parse::<usize>() {
+            Ok(limit) if limit > 0 => (limit, None),
+            _ => (
+                DEFAULT_MAX_AGENT_WINDOWS,
+                Some(json!({
+                    "code": "invalid-agent-window-limit",
+                    "message": format!(
+                        "ADAPTIVE_AGENT_MAX_WINDOWS must be a positive integer; using {DEFAULT_MAX_AGENT_WINDOWS}."
+                    )
+                })),
+            ),
+        },
+    }
+}
+
+fn agent_window_label(agent_id: &str) -> String {
+    let encoded = agent_id
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{AGENT_WINDOW_PREFIX}{encoded}")
+}
+
+fn agent_id_from_window_label(label: &str) -> Option<String> {
+    let encoded = label.strip_prefix(AGENT_WINDOW_PREFIX)?;
+    if encoded.is_empty() || encoded.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = (0..encoded.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&encoded[index..index + 2], 16).ok())
+        .collect::<Option<Vec<_>>>()?;
+    String::from_utf8(bytes).ok()
+}
+
+fn window_presentation_key(agent_id: &str) -> String {
+    format!("window_presentation/{agent_id}")
+}
+
+fn open_agent_window_count(app: &AppHandle, state: &AppState) -> usize {
+    let closing = state.closing_agent_windows.lock().unwrap();
+    app.webview_windows()
+        .keys()
+        .filter(|label| label.starts_with(AGENT_WINDOW_PREFIX) && !closing.contains(*label))
+        .count()
+}
+
+fn ensure_agent_window_visible(window: &WebviewWindow) -> Result<(), String> {
+    let position = window
+        .outer_position()
+        .map_err(|error| format!("Unable to read agent window position: {error}"))?;
+    let size = window
+        .outer_size()
+        .map_err(|error| format!("Unable to read agent window size: {error}"))?;
+    let monitors = window
+        .available_monitors()
+        .map_err(|error| format!("Unable to inspect available monitors: {error}"))?;
+    let right = i64::from(position.x) + i64::from(size.width);
+    let bottom = i64::from(position.y) + i64::from(size.height);
+    let visible = monitors.iter().any(|monitor| {
+        let monitor_position = monitor.position();
+        let monitor_size = monitor.size();
+        let monitor_right = i64::from(monitor_position.x) + i64::from(monitor_size.width);
+        let monitor_bottom = i64::from(monitor_position.y) + i64::from(monitor_size.height);
+        let overlap_width =
+            right.min(monitor_right) - i64::from(position.x).max(i64::from(monitor_position.x));
+        let overlap_height =
+            bottom.min(monitor_bottom) - i64::from(position.y).max(i64::from(monitor_position.y));
+        overlap_width >= 80 && overlap_height >= 40
+    });
+    if !visible {
+        window
+            .center()
+            .map_err(|error| format!("Unable to center agent window: {error}"))?;
+    }
+    Ok(())
 }
 
 fn runtime_for(
@@ -3768,14 +3908,18 @@ fn desktop_state(
 fn desktop_catalog_status(
     state: tauri::State<'_, AppState>,
 ) -> Result<DesktopCatalogStatus, String> {
-    state.manager.catalog_status()
+    let quit_state = state.quit.lock().unwrap().state();
+    state
+        .manager
+        .catalog_status(quit_state, state.window_limit_diagnostic.clone())
 }
 
 #[tauri::command]
-fn open_agent_workspace(
+async fn open_agent_window(
     agent_id: String,
+    app: AppHandle,
     state: tauri::State<'_, AppState>,
-) -> Result<DesktopState, String> {
+) -> Result<AgentWindowOpen, String> {
     let _lifecycle = state.lifecycle.lock().unwrap();
     if state.reconfiguring.load(Ordering::SeqCst) {
         return Err("Settings are being reloaded; try again when the runtime is ready.".into());
@@ -3783,7 +3927,38 @@ fn open_agent_workspace(
     if state.quit.lock().unwrap().state() != QuitState::Idle {
         return Err("The desktop is quitting and cannot open an agent workspace.".into());
     }
-    // `false` applies the new-work policy before either reusing or creating a runtime.
+    let label = agent_window_label(&agent_id);
+    if state.closing_agent_windows.lock().unwrap().contains(&label) {
+        return Err(format!(
+            "Agent window for '{agent_id}' is closing; try again."
+        ));
+    }
+    if let Some(window) = app.get_webview_window(&label) {
+        window
+            .unminimize()
+            .map_err(|error| format!("Unable to restore agent window: {error}"))?;
+        ensure_agent_window_visible(&window)?;
+        window
+            .show()
+            .map_err(|error| format!("Unable to show agent window: {error}"))?;
+        window
+            .set_focus()
+            .map_err(|error| format!("Unable to focus agent window: {error}"))?;
+        let open_windows = open_agent_window_count(&app, state.inner());
+        return Ok(AgentWindowOpen {
+            agent_id,
+            disposition: "focused",
+            open_windows,
+            max_windows: state.max_agent_windows,
+        });
+    }
+    let open_windows = open_agent_window_count(&app, state.inner());
+    if open_windows >= state.max_agent_windows {
+        return Err(format!(
+            "Agent window limit reached ({}/{}). Close an agent window before opening another.",
+            open_windows, state.max_agent_windows
+        ));
+    }
     let runtime = state.manager.ensure_runtime(&agent_id, false)?;
     let bridge = runtime
         .bridge
@@ -3792,8 +3967,117 @@ fn open_agent_workspace(
         .as_ref()
         .cloned()
         .ok_or("Desktop runtime is unavailable.")?;
-    start_trace_for_runtime(&agent_id, runtime, bridge.clone())?;
-    Ok(bridge.snapshot())
+    start_trace_for_runtime(&agent_id, runtime, bridge)?;
+    let descriptor = state
+        .manager
+        .catalog
+        .lock()
+        .unwrap()
+        .agents
+        .get(&agent_id)
+        .cloned()
+        .ok_or_else(|| format!("Unknown agent '{agent_id}'."))?;
+    let presentation = state
+        .manager
+        .workbench
+        .load_setting(&window_presentation_key(&agent_id))?
+        .map(serde_json::from_value::<WindowPresentation>)
+        .transpose()
+        .map_err(|error| format!("Invalid saved window presentation: {error}"))?
+        .unwrap_or_default();
+    let builder = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("index.html".into()))
+        .title(format!("{} — AdaptiveAgent", descriptor.name))
+        .inner_size(
+            presentation.width.unwrap_or(1180).max(680) as f64,
+            presentation.height.unwrap_or(780).max(600) as f64,
+        )
+        .min_inner_size(680.0, 600.0)
+        .resizable(true)
+        .visible(false);
+    let window = builder
+        .build()
+        .map_err(|error| format!("Unable to create agent window: {error}"))?;
+    if let (Some(x), Some(y)) = (presentation.x, presentation.y) {
+        window
+            .set_position(tauri::PhysicalPosition::new(x, y))
+            .map_err(|error| format!("Unable to restore agent window position: {error}"))?;
+    }
+    ensure_agent_window_visible(&window)?;
+    window
+        .show()
+        .map_err(|error| format!("Unable to show agent window: {error}"))?;
+    window
+        .set_focus()
+        .map_err(|error| format!("Unable to focus agent window: {error}"))?;
+    Ok(AgentWindowOpen {
+        agent_id,
+        disposition: "created",
+        open_windows: open_windows + 1,
+        max_windows: state.max_agent_windows,
+    })
+}
+
+#[tauri::command]
+fn desktop_window_bootstrap(
+    window: WebviewWindow,
+    state: tauri::State<'_, AppState>,
+) -> Result<DesktopWindowBootstrap, String> {
+    let Some(agent_id) = agent_id_from_window_label(window.label()) else {
+        return Ok(DesktopWindowBootstrap {
+            kind: "studio",
+            agent_id: None,
+            state: None,
+            presentation: None,
+        });
+    };
+    let runtime = state.manager.ensure_runtime(&agent_id, true)?;
+    let bridge = runtime
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or("Desktop runtime is unavailable.")?;
+    let presentation = state
+        .manager
+        .workbench
+        .load_setting(&window_presentation_key(&agent_id))?
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| format!("Invalid saved window presentation: {error}"))?;
+    Ok(DesktopWindowBootstrap {
+        kind: "agent",
+        agent_id: Some(agent_id),
+        state: Some(bridge.snapshot()),
+        presentation,
+    })
+}
+
+#[tauri::command]
+fn save_window_presentation(
+    presentation: WindowPresentationUi,
+    window: WebviewWindow,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let agent_id = agent_id_from_window_label(window.label())
+        .ok_or("Window presentation is only available to agent windows.")?;
+    let _presentation = state.window_presentation.lock().unwrap();
+    let key = window_presentation_key(&agent_id);
+    let mut saved = state
+        .manager
+        .workbench
+        .load_setting(&key)?
+        .map(serde_json::from_value::<WindowPresentation>)
+        .transpose()
+        .map_err(|error| format!("Invalid saved window presentation: {error}"))?
+        .unwrap_or_default();
+    saved.inspector_width = Some(presentation.inspector_width.clamp(320, 720));
+    saved.inspector_open = presentation.inspector_open;
+    saved.selection = Some(presentation.selection);
+    state.manager.workbench.save_setting(
+        &key,
+        &serde_json::to_value(saved).map_err(|error| error.to_string())?,
+    )
 }
 
 /// Compatibility bootstrap for the single-window renderer. Native callers should bind
@@ -4559,6 +4843,14 @@ fn approve_and_exit(app: &AppHandle) {
         return;
     }
     drop(lifecycle);
+    for window in app.webview_windows().values() {
+        if let Err(error) = persist_agent_window_bounds(window, &state) {
+            eprintln!(
+                "Unable to persist agent window '{}' during shutdown: {error}",
+                window.label()
+            );
+        }
+    }
     // Every execution and trace child is discoverable through the manager.
     state.manager.shutdown_all();
     {
@@ -4581,6 +4873,45 @@ fn native_close_requested(app: &AppHandle) -> CloseDecision {
         bridge.emit_state();
     }
     decision
+}
+
+fn focus_parent_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn persist_agent_window_bounds(window: &WebviewWindow, state: &AppState) -> Result<(), String> {
+    let Some(agent_id) = agent_id_from_window_label(window.label()) else {
+        return Ok(());
+    };
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let position = window
+        .outer_position()
+        .map_err(|error| format!("Unable to read agent window position: {error}"))?;
+    let size = window
+        .inner_size()
+        .map_err(|error| format!("Unable to read agent window size: {error}"))?;
+    let _presentation = state.window_presentation.lock().unwrap();
+    let key = window_presentation_key(&agent_id);
+    let mut presentation = state
+        .manager
+        .workbench
+        .load_setting(&key)?
+        .map(serde_json::from_value::<WindowPresentation>)
+        .transpose()
+        .map_err(|error| format!("Invalid saved window presentation: {error}"))?
+        .unwrap_or_default();
+    presentation.x = Some(position.x);
+    presentation.y = Some(position.y);
+    presentation.width = Some((size.width as f64 / scale).round() as u32);
+    presentation.height = Some((size.height as f64 / scale).round() as u32);
+    state.manager.workbench.save_setting(
+        &key,
+        &serde_json::to_value(presentation).map_err(|error| error.to_string())?,
+    )
 }
 
 #[tauri::command]
@@ -4623,9 +4954,11 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![
             desktop_bootstrap,
+            desktop_window_bootstrap,
             desktop_state,
             desktop_catalog_status,
-            open_agent_workspace,
+            open_agent_window,
+            save_window_presentation,
             reload_settings,
             save_settings,
             start_run,
@@ -4655,6 +4988,29 @@ pub fn run() {
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if agent_id_from_window_label(window.label()).is_some() {
+                    window
+                        .app_handle()
+                        .state::<AppState>()
+                        .closing_agent_windows
+                        .lock()
+                        .unwrap()
+                        .insert(window.label().into());
+                    let persistence = window
+                        .app_handle()
+                        .get_webview_window(window.label())
+                        .ok_or_else(|| "Agent webview window is unavailable.".to_string())
+                        .and_then(|webview| {
+                            persist_agent_window_bounds(
+                                &webview,
+                                &window.app_handle().state::<AppState>(),
+                            )
+                        });
+                    if let Err(error) = persistence {
+                        eprintln!("Unable to persist agent window presentation: {error}");
+                    }
+                    return;
+                }
                 match native_close_requested(window.app_handle()) {
                     CloseDecision::Prevent => api.prevent_close(),
                     CloseDecision::ShutdownNow => {
@@ -4663,16 +5019,33 @@ pub fn run() {
                     }
                     CloseDecision::Allow => {}
                 }
+            } else if matches!(event, tauri::WindowEvent::Destroyed)
+                && agent_id_from_window_label(window.label()).is_some()
+            {
+                window
+                    .app_handle()
+                    .state::<AppState>()
+                    .closing_agent_windows
+                    .lock()
+                    .unwrap()
+                    .remove(window.label());
             }
         })
         .setup(|app| {
             let manager = AgentRuntimeManager::new(app.handle())?;
+            let (max_agent_windows, window_limit_diagnostic) = parse_agent_window_limit(
+                std::env::var("ADAPTIVE_AGENT_MAX_WINDOWS").ok().as_deref(),
+            );
             app.manage(AppState {
                 manager,
                 lifecycle: Mutex::new(()),
                 reconfiguring: AtomicBool::new(false),
                 quit: Mutex::new(QuitCoordinator::default()),
                 shutdown_started: AtomicBool::new(false),
+                max_agent_windows,
+                window_limit_diagnostic,
+                closing_agent_windows: Mutex::new(HashSet::new()),
+                window_presentation: Mutex::new(()),
             });
             let state = app.state::<AppState>();
             if let Err(error) = state.manager.bootstrap() {
@@ -4699,7 +5072,10 @@ pub fn run() {
     app.run(|app, event| {
         if let tauri::RunEvent::ExitRequested { api, .. } = event {
             match native_close_requested(app) {
-                CloseDecision::Prevent => api.prevent_exit(),
+                CloseDecision::Prevent => {
+                    api.prevent_exit();
+                    focus_parent_window(app);
+                }
                 CloseDecision::ShutdownNow => {
                     api.prevent_exit();
                     approve_and_exit(app);
@@ -5488,6 +5864,34 @@ mod tests {
         assert_eq!(fleet_attention(false, false, true), "recovery");
         assert_eq!(fleet_attention(false, true, true), "approval");
         assert_eq!(fleet_attention(true, true, true), "error");
+    }
+
+    #[test]
+    fn agent_window_labels_are_deterministic_and_round_trip_utf8() {
+        let label = agent_window_label("research/日本語:agent");
+        assert!(label.starts_with(AGENT_WINDOW_PREFIX));
+        assert_eq!(
+            agent_id_from_window_label(&label).as_deref(),
+            Some("research/日本語:agent")
+        );
+        assert_eq!(agent_window_label("agent"), agent_window_label("agent"));
+        assert!(agent_id_from_window_label("main").is_none());
+        assert!(agent_id_from_window_label("agent:xyz").is_none());
+    }
+
+    #[test]
+    fn agent_window_limit_defaults_and_rejects_non_positive_values() {
+        assert_eq!(parse_agent_window_limit(None).0, 3);
+        assert_eq!(parse_agent_window_limit(Some(" 5 ")).0, 5);
+        assert!(parse_agent_window_limit(Some("5")).1.is_none());
+        for invalid in ["", "0", "-1", "many"] {
+            let (limit, diagnostic) = parse_agent_window_limit(Some(invalid));
+            assert_eq!(limit, 3);
+            assert_eq!(
+                diagnostic.as_ref().and_then(|value| value["code"].as_str()),
+                Some("invalid-agent-window-limit")
+            );
+        }
     }
 
     #[test]

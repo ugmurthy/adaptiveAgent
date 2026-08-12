@@ -2,9 +2,8 @@
   import { onMount } from 'svelte';
   import BrandMark from './BrandMark.svelte';
   import { aggregateRecentWork, agentsNeedingAttention, filterAndSortAgents, isLaunchable } from './agent-studio';
-  import { getDesktopCatalogStatus, listenCatalogStatusChanged, type DesktopCatalogStatus } from './desktop';
+  import { getDesktopCatalogStatus, listenCatalogStatusChanged, openAgentWindow, quitCancel, quitTerminate, quitWait, type DesktopCatalogStatus } from './desktop';
 
-  export let onOpen: (agentId: string) => Promise<void>;
   let catalog: DesktopCatalogStatus | undefined;
   let loading = true;
   let error = '';
@@ -34,7 +33,23 @@
   }
   async function open(id: string) {
     openingId = id; error = '';
-    try { await onOpen(id); } catch (cause) { error = String(cause); openingId = ''; }
+    try {
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        try { await openAgentWindow(id); break; }
+        catch (cause) {
+          if (!String(cause).includes('is closing') || attempt === 4) throw cause;
+          await new Promise((resolve) => setTimeout(resolve, 80));
+        }
+      }
+    } catch (cause) { error = String(cause); }
+    finally { openingId = ''; }
+  }
+  async function quit(action: 'wait' | 'terminate' | 'cancel') {
+    error = '';
+    try {
+      await (action === 'wait' ? quitWait() : action === 'terminate' ? quitTerminate() : quitCancel());
+      await refresh();
+    } catch (cause) { error = String(cause); }
   }
   const diagnosticText = (value: Record<string, unknown>) => typeof value.message === 'string' ? value.message : JSON.stringify(value);
   const date = (value: string) => new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value));
@@ -48,6 +63,9 @@
 </script>
 
 <main class="studio-shell">
+  {#if catalog?.quitState === 'confirming'}
+    <div class="modal-backdrop" role="presentation"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="studio-quit-title"><h2 id="studio-quit-title">Runs are still active</h2><p>Choose how AdaptiveAgent should finish before quitting.</p><div class="actions"><button on:click={() => quit('cancel')}>Cancel</button><button on:click={() => quit('wait')}>Wait for runs</button><button class="danger" on:click={() => quit('terminate')}>Terminate all and quit</button></div></div></div>
+  {/if}
   <header class="studio-header">
     <div class="brand"><BrandMark /><div><strong>Adaptive Agent</strong><span>Agent Studio</span></div></div>
     <button type="button" on:click={refresh} disabled={loading}>↻ Refresh</button>

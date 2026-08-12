@@ -13,6 +13,7 @@
     quitCancel,
     quitTerminate,
     quitWait,
+    saveWindowPresentation,
     type Chat,
     type AttachmentDraft,
     type DeletionPreview,
@@ -23,6 +24,7 @@
     type RunSummary,
     type TracePrivacy,
     type TraceReport,
+    type WindowPresentation,
   } from './desktop';
   import { DESKTOP_API_CONTEXT } from './desktop-context';
   import {
@@ -30,12 +32,14 @@
     mobileRailOpen,
     buildRailItems,
     filterRailItems,
+    normalizeWorkbenchSelection,
     workbenchSelection,
     type RailItem,
   } from './workbench-state';
   import { historyResultArtifacts, type ResultArtifact } from './workbench-ux';
 
   export let api: DesktopApi;
+  export let initialPresentation: WindowPresentation | undefined = undefined;
   setContext(DESKTOP_API_CONTEXT, api);
   const {
     createChat, deleteHistory, getDesktopState, getRunRecoveryPlan, getRunResult,
@@ -112,11 +116,14 @@
 
   onMount(() => {
     let unlisten = () => {};
+    let unsubscribeSelection = () => {};
+    let unsubscribeInspector = () => {};
     let cancelled = false;
-    const storedWidth = Number(localStorage.getItem('adaptiveAgent.inspectorWidth'));
+    const storedWidth = initialPresentation?.inspectorWidth ?? Number(localStorage.getItem('adaptiveAgent.inspectorWidth'));
     if (storedWidth >= 320 && storedWidth <= 720) inspectorWidth = storedWidth;
-    $workbenchSelection = { kind: 'new-task' };
-    $inspectorOpen = false;
+    const restoredSelection = normalizeWorkbenchSelection(initialPresentation?.selection);
+    $workbenchSelection = restoredSelection;
+    $inspectorOpen = initialPresentation?.inspectorOpen ?? false;
     $mobileRailOpen = false;
     const timer = window.setInterval(() => { now = Date.now(); }, 100);
     void (async () => {
@@ -154,16 +161,47 @@
       if (cancelled) unlisten();
       else {
         await refresh();
-        const nextPrivacy = await getTracePrivacy();
-        if (!cancelled) tracePrivacy = nextPrivacy;
+        if (cancelled) return;
+        unsubscribeSelection = workbenchSelection.subscribe(persistPresentation);
+        unsubscribeInspector = inspectorOpen.subscribe(persistPresentation);
+        try {
+          if (restoredSelection.kind === 'task' && desktop.runs.some((run) => run.runId === restoredSelection.runId)) {
+            await selectTaskRun(restoredSelection.runId);
+          } else if (restoredSelection.kind === 'chat' && chats.some((chat) => chat.itemId === restoredSelection.itemId)) {
+            await selectChat(restoredSelection.itemId);
+          } else if (restoredSelection.kind === 'task' || restoredSelection.kind === 'chat') {
+            $workbenchSelection = { kind: 'new-task' };
+          }
+        } catch (error) {
+          if (!cancelled) {
+            finalError = String(error);
+            $workbenchSelection = { kind: 'new-task' };
+          }
+        }
+        try {
+          const nextPrivacy = await getTracePrivacy();
+          if (!cancelled) tracePrivacy = nextPrivacy;
+        } catch (error) {
+          if (!cancelled) traceError = String(error);
+        }
       }
     })().catch((error) => { finalError = String(error); });
     return () => {
       cancelled = true;
       window.clearInterval(timer);
+      unsubscribeSelection();
+      unsubscribeInspector();
       unlisten();
     };
   });
+
+  function persistPresentation() {
+    void saveWindowPresentation({
+      inspectorWidth,
+      inspectorOpen: $inspectorOpen,
+      selection: $workbenchSelection,
+    }).catch((cause) => { finalError = String(cause); });
+  }
 
   function scheduleRefresh() {
     if (refreshScheduled) return;
@@ -488,11 +526,12 @@
   async function quit(action: 'wait' | 'terminate' | 'cancel') {
     controlPending = true;
     try {
-      desktop = await (action === 'wait'
+      await (action === 'wait'
         ? quitWait()
         : action === 'terminate'
           ? quitTerminate()
           : quitCancel());
+      desktop = await getDesktopState();
     } catch (error) {
       finalError = String(error);
     }
@@ -520,7 +559,7 @@
   function resizeInspector(event: PointerEvent) {
     const startX = event.clientX; const startWidth = inspectorWidth;
     const move = (next: PointerEvent) => { inspectorWidth = Math.max(320, Math.min(720, startWidth + startX - next.clientX)); };
-    const up = () => { localStorage.setItem('adaptiveAgent.inspectorWidth', String(inspectorWidth)); window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
+    const up = () => { localStorage.setItem('adaptiveAgent.inspectorWidth', String(inspectorWidth)); persistPresentation(); window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
     window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
   }
 </script>
