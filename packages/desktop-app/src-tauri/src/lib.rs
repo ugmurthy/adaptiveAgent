@@ -328,11 +328,21 @@ struct AgentRuntimeManager {
     workbench: Arc<WorkbenchDb>,
     attachment_root: PathBuf,
     catalog: Mutex<CatalogPublication>,
-    runtimes: Mutex<HashMap<String, Arc<ManagedRuntime>>>,
+    runtime_maps: Mutex<RuntimeMaps>,
     lifecycle: Mutex<()>,
+    deletion: Mutex<()>,
+    trace_policy: Mutex<()>,
     shutdown: AtomicBool,
     catalog_diagnostics: Mutex<Vec<Value>>,
     bootstrap_error: Mutex<Option<String>>,
+}
+
+type GenerationKey = (String, String, String);
+
+#[derive(Default)]
+struct RuntimeMaps {
+    current: HashMap<String, Arc<ManagedRuntime>>,
+    retired: HashMap<GenerationKey, Arc<ManagedRuntime>>,
 }
 
 #[derive(Default)]
@@ -348,6 +358,63 @@ enum RuntimeConvergence {
 }
 
 impl AgentRuntimeManager {
+    fn runtime_quiescent(&self, runtime: &Arc<ManagedRuntime>) -> bool {
+        if runtime.trace_starting.load(Ordering::SeqCst)
+            || !runtime.trace_refreshes.lock().unwrap().is_empty()
+        {
+            return false;
+        }
+        let Some(bridge) = runtime.bridge.lock().unwrap().as_ref().cloned() else {
+            return false;
+        };
+        if self
+            .workbench
+            .generation_has_pending_operations(
+                &bridge.agent_id,
+                &bridge.agent_config_path,
+                &bridge.agent_fingerprint,
+            )
+            .unwrap_or(true)
+        {
+            return false;
+        }
+        let registry_quiescent = bridge.registry.lock().unwrap().records().all(|record| {
+            !record.occupies_slot
+                && !record.request_active
+                && !record
+                    .pending_approval
+                    .as_ref()
+                    .is_some_and(|approval| approval.decision_in_flight)
+        });
+        registry_quiescent
+            && bridge.pending.lock().unwrap().is_empty()
+            && bridge.reconciling.lock().unwrap().is_empty()
+            && bridge.submission.try_lock().is_ok()
+    }
+
+    fn retire_quiescent_generations(&self) {
+        // Keep exact-generation routing stable from the quiescence decision through
+        // sidecar shutdown. Deletion takes this lock before resolving any owner.
+        let _deletion = self.deletion.lock().unwrap();
+        let retiring = {
+            let _lifecycle = self.lifecycle.lock().unwrap();
+            let mut maps = self.runtime_maps.lock().unwrap();
+            let keys = maps
+                .retired
+                .iter()
+                .filter(|(_, runtime)| self.runtime_quiescent(runtime))
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| maps.retired.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        // Sidecar RPC/shutdown must never run while lifecycle or map locks are held.
+        for runtime in retiring {
+            Self::shutdown_runtime(&runtime);
+        }
+    }
+
     fn unique_catalog_descriptors(
         descriptors: &[CatalogDescriptor],
     ) -> HashMap<String, CatalogDescriptor> {
@@ -392,8 +459,10 @@ impl AgentRuntimeManager {
             workbench,
             attachment_root,
             catalog: Mutex::new(CatalogPublication::default()),
-            runtimes: Mutex::new(HashMap::new()),
+            runtime_maps: Mutex::new(RuntimeMaps::default()),
             lifecycle: Mutex::new(()),
+            deletion: Mutex::new(()),
+            trace_policy: Mutex::new(()),
             shutdown: AtomicBool::new(false),
             catalog_diagnostics: Mutex::new(Vec::new()),
             bootstrap_error: Mutex::new(None),
@@ -438,6 +507,23 @@ impl AgentRuntimeManager {
             *self.bootstrap_error.lock().unwrap() = Some(error.clone());
             return Err(error);
         }
+        // Only process startup can prove that an old immutable generation no longer has
+        // a live sidecar. Catalog refreshes during this process deliberately retain old
+        // generations while their runs finish, so they must not terminalize those runs.
+        let mappings = self
+            .catalog
+            .lock()
+            .unwrap()
+            .agents
+            .values()
+            .filter(|agent| agent.validation_state == "valid")
+            .map(|agent| AgentCatalogMapping {
+                agent_id: agent.id.clone(),
+                fingerprint: agent.configuration_fingerprint.clone(),
+                config_path: agent.config_path.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.workbench.interrupt_orphaned_generations(&mappings)?;
         let current_runtime = match self.current() {
             Ok(runtime) => runtime,
             Err(error) => {
@@ -452,14 +538,18 @@ impl AgentRuntimeManager {
             .current_agent_id
             .clone()
             .unwrap();
-        for agent_id in self.workbench.active_agent_ids()? {
-            if agent_id != current_id {
-                if let Err(error) = self.ensure_runtime(&agent_id, true) {
+        let active_agent_ids = self.workbench.active_agent_ids()?;
+        for agent_id in &active_agent_ids {
+            if agent_id != &current_id {
+                if let Err(error) = self.ensure_runtime(agent_id, true) {
                     eprintln!(
                         "Unable to bind persisted active work for agent '{agent_id}': {error}"
                     );
                 }
             }
+        }
+        for agent_id in active_agent_ids {
+            self.recover_deletion_jobs(&agent_id);
         }
         *self.bootstrap_error.lock().unwrap() = None;
         Ok(current_runtime)
@@ -579,7 +669,13 @@ impl AgentRuntimeManager {
             .cloned()
             .ok_or_else(|| format!("Unknown agent '{agent_id}'."))?;
         Self::creation_allowed(&descriptor, allow_archived)?;
-        let cached = self.runtimes.lock().unwrap().get(agent_id).cloned();
+        let cached = self
+            .runtime_maps
+            .lock()
+            .unwrap()
+            .current
+            .get(agent_id)
+            .cloned();
         if let Some(runtime) = cached {
             let matches = runtime
                 .bridge
@@ -590,8 +686,56 @@ impl AgentRuntimeManager {
             if matches {
                 return Ok(runtime);
             }
-            self.runtimes.lock().unwrap().remove(agent_id);
-            Self::shutdown_runtime(&runtime);
+            let old_bridge = runtime.bridge.lock().unwrap().as_ref().cloned();
+            if let Some(old_bridge) = old_bridge {
+                let target_key = (
+                    agent_id.to_owned(),
+                    descriptor.config_path.clone(),
+                    descriptor.configuration_fingerprint.clone(),
+                );
+                let mut maps = self.runtime_maps.lock().unwrap();
+                if maps.retired.contains_key(&target_key) {
+                    return Err("GENERATION_COLLISION: This exact runtime generation is already retained and cannot be instantiated twice.".into());
+                }
+                maps.retired.insert(
+                    (
+                        agent_id.to_owned(),
+                        old_bridge.agent_config_path.clone(),
+                        old_bridge.agent_fingerprint.clone(),
+                    ),
+                    runtime.clone(),
+                );
+                maps.current.remove(agent_id);
+            }
+        }
+        let target_key = (
+            agent_id.to_owned(),
+            descriptor.config_path.clone(),
+            descriptor.configuration_fingerprint.clone(),
+        );
+        {
+            let maps = self.runtime_maps.lock().unwrap();
+            if maps
+                .current
+                .values()
+                .chain(maps.retired.values())
+                .any(|runtime| {
+                    runtime
+                        .bridge
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|bridge| {
+                            bridge.agent_id == target_key.0
+                                && bridge.agent_config_path == target_key.1
+                                && bridge.agent_fingerprint == target_key.2
+                        })
+                })
+            {
+                return Err(
+                    "GENERATION_COLLISION: This exact runtime generation is already owned.".into(),
+                );
+            }
         }
         let bridge = Bridge::spawn(
             &self.app,
@@ -611,9 +755,26 @@ impl AgentRuntimeManager {
             trace_selection: Mutex::new(TraceSelection::default()),
             trace_refreshes: Mutex::new(HashMap::new()),
         });
-        self.runtimes
+        // The lifecycle lock excludes catalog transitions; revalidate the immutable
+        // selection immediately before publication so no stale spawn can become current.
+        let exact = self
+            .catalog
             .lock()
             .unwrap()
+            .agents
+            .get(agent_id)
+            .is_some_and(|candidate| candidate == &descriptor);
+        if !exact {
+            Self::shutdown_runtime(&runtime);
+            return Err(
+                "GENERATION_CHANGED: Agent selection changed while its runtime was starting."
+                    .into(),
+            );
+        }
+        self.runtime_maps
+            .lock()
+            .unwrap()
+            .current
             .insert(agent_id.into(), runtime.clone());
         Ok(runtime)
     }
@@ -633,12 +794,14 @@ impl AgentRuntimeManager {
         let runtimes = {
             let _lifecycle = self.lifecycle.lock().unwrap();
             self.shutdown.store(true, Ordering::SeqCst);
-            self.runtimes
-                .lock()
-                .unwrap()
+            let mut maps = self.runtime_maps.lock().unwrap();
+            let mut all = maps
+                .current
                 .drain()
                 .map(|(_, runtime)| runtime)
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            all.extend(maps.retired.drain().map(|(_, runtime)| runtime));
+            all
         };
         for runtime in runtimes {
             Self::shutdown_runtime(&runtime);
@@ -646,17 +809,344 @@ impl AgentRuntimeManager {
     }
 
     fn runtime_bridges(&self) -> Vec<Arc<Bridge>> {
-        let runtimes = self
-            .runtimes
-            .lock()
-            .unwrap()
+        let maps = self.runtime_maps.lock().unwrap();
+        maps.current
             .values()
+            .chain(maps.retired.values())
             .cloned()
-            .collect::<Vec<_>>();
-        runtimes
+            .collect::<Vec<_>>()
             .into_iter()
             .filter_map(|runtime| runtime.bridge.lock().unwrap().as_ref().cloned())
             .collect()
+    }
+
+    fn runtimes_for_agent(&self, agent_id: &str) -> Vec<Arc<ManagedRuntime>> {
+        let maps = self.runtime_maps.lock().unwrap();
+        maps.current
+            .get(agent_id)
+            .into_iter()
+            .chain(maps.retired.values().filter(|runtime| {
+                runtime
+                    .bridge
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|bridge| bridge.agent_id == agent_id)
+            }))
+            .cloned()
+            .collect()
+    }
+
+    fn bridge_for_run(&self, agent_id: &str, run_id: &str) -> Result<Arc<Bridge>, String> {
+        self.runtime_for_run(agent_id, run_id)?
+            .bridge
+            .lock()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "GENERATION_UNAVAILABLE: The owning runtime has retired.".into())
+    }
+
+    fn deletion_operation(
+        &self,
+        agent_id: &str,
+        target: &ProductDeletionTarget,
+    ) -> Result<Value, String> {
+        match target {
+            ProductDeletionTarget::Item { item_id } => {
+                self.workbench.assert_item_owner(agent_id, item_id)?;
+                self.workbench.item_deletion_operation(item_id)
+            }
+            ProductDeletionTarget::Run { run_id } => {
+                self.workbench.assert_run_owner(agent_id, run_id)?;
+                self.workbench.run_deletion_operation(run_id)
+            }
+            ProductDeletionTarget::ChatTurn { item_id, ordinal } => {
+                self.workbench.assert_item_owner(agent_id, item_id)?;
+                self.workbench
+                    .chat_turn_deletion_operation(item_id, *ordinal)
+            }
+        }
+    }
+
+    fn deletion_routes(
+        &self,
+        agent_id: &str,
+        operation: &Value,
+    ) -> Result<Vec<(Arc<Bridge>, Value)>, String> {
+        let run_ids = operation["workbenchRunIds"]
+            .as_array()
+            .ok_or("Deletion operation has no workbench run IDs.")?;
+        let mut seen = HashSet::new();
+        let mut routes = Vec::new();
+        for run_id in run_ids.iter().filter_map(Value::as_str) {
+            if !seen.insert(run_id.to_owned()) {
+                continue;
+            }
+            // Root-run deletion is idempotent and precisely scoped, unlike a session
+            // target which may include roots persisted by another generation.
+            routes.push((
+                self.bridge_for_run(agent_id, run_id)?,
+                json!({"kind":"root-run","rootRunId":run_id}),
+            ));
+        }
+        Ok(routes)
+    }
+
+    fn request_history(
+        bridge: &Arc<Bridge>,
+        method: &str,
+        target: &Value,
+    ) -> Result<Value, String> {
+        let (_, receiver) = bridge.request(method, json!({"target":target}))?;
+        receiver.recv_timeout(REQUEST_TIMEOUT).map_err(|_| {
+            format!(
+                "History {} timed out.",
+                if method.ends_with("delete") {
+                    "deletion"
+                } else {
+                    "preview"
+                }
+            )
+        })?
+    }
+
+    fn preview_deletion(
+        &self,
+        agent_id: &str,
+        target: ProductDeletionTarget,
+    ) -> Result<DeletionPreview, String> {
+        let _deletion = self.deletion.lock().unwrap();
+        let operation = self.deletion_operation(agent_id, &target)?;
+        let durable_ids = operation["workbenchRunIds"]
+            .as_array()
+            .ok_or("Deletion operation has no workbench run IDs.")?
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<HashSet<_>>();
+        let occupied = self
+            .workbench
+            .load_runs_for_agent(agent_id)?
+            .iter()
+            .any(|run| durable_ids.contains(run.run_id.as_str()) && durable_run_occupies_slot(run));
+        let routes = self.deletion_routes(agent_id, &operation)?;
+        let mut run_ids = HashSet::new();
+        let mut plan_ids = HashSet::new();
+        for (bridge, runtime_target) in routes {
+            let response =
+                Self::request_history(&bridge, "history/previewDeletion", &runtime_target)?;
+            for id in response["runIds"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                run_ids.insert(id.to_owned());
+            }
+            for field in ["ownedPlanIds", "preservedPlanIds"] {
+                for id in response[field]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                {
+                    plan_ids.insert(id.to_owned());
+                }
+            }
+        }
+        let label = match &target {
+            ProductDeletionTarget::Item { .. } => operation["label"]
+                .as_str()
+                .ok_or("History item has no label.")?
+                .to_owned(),
+            ProductDeletionTarget::Run { run_id } => format!("run {run_id}"),
+            ProductDeletionTarget::ChatTurn { ordinal, .. } => {
+                format!("chat from turn {} onward", ordinal / 2 + 1)
+            }
+        };
+        Ok(DeletionPreview { target, label, run_count: run_ids.len(), plan_count: plan_ids.len(), occupied,
+            warning: "This permanently deletes the selected history and its runtime evidence. This cannot be undone." })
+    }
+
+    fn execute_deletion_job_locked(
+        &self,
+        agent_id: &str,
+        job: &workbench::DeletionJob,
+    ) -> Result<(), String> {
+        let routes = self.deletion_routes(agent_id, &job.operation)?;
+        for (bridge, target) in &routes {
+            Self::request_history(bridge, "history/delete", target)?;
+        }
+        self.workbench.complete_deletion_job(job)?;
+        let roots = job.operation["workbenchRunIds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect::<HashSet<_>>();
+        for bridge in self
+            .runtime_bridges()
+            .into_iter()
+            .filter(|bridge| bridge.agent_id == agent_id)
+        {
+            bridge.remove_deleted_runs(&roots);
+        }
+        Ok(())
+    }
+
+    fn recover_deletion_jobs(&self, agent_id: &str) {
+        let _deletion = self.deletion.lock().unwrap();
+        let Ok(jobs) = self.workbench.load_deletion_jobs_for_agent(agent_id) else {
+            return;
+        };
+        for job in jobs {
+            if let Err(error) = self.execute_deletion_job_locked(agent_id, &job) {
+                let _ = self.workbench.fail_deletion_job(&job.id, &error);
+            }
+        }
+    }
+
+    fn delete_history(&self, agent_id: &str, target: ProductDeletionTarget) -> Result<(), String> {
+        let _deletion = self.deletion.lock().unwrap();
+        let operation = self.deletion_operation(agent_id, &target)?;
+        let durable_ids = operation["workbenchRunIds"]
+            .as_array()
+            .ok_or("Deletion operation has no workbench run IDs.")?
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<HashSet<_>>();
+        if self
+            .workbench
+            .load_runs_for_agent(agent_id)?
+            .iter()
+            .any(|run| durable_ids.contains(run.run_id.as_str()) && durable_run_occupies_slot(run))
+        {
+            return Err("Stop or wait for every affected run before deleting history.".into());
+        }
+        let routes = self.deletion_routes(agent_id, &operation)?;
+        for (bridge, runtime_target) in &routes {
+            Self::request_history(bridge, "history/previewDeletion", runtime_target)?;
+        }
+        let job = self
+            .workbench
+            .create_deletion_job_for_agent(agent_id, &operation)?;
+        if let Err(error) = self.execute_deletion_job_locked(agent_id, &job) {
+            let _ = self.workbench.fail_deletion_job(&job.id, &error);
+            return Err(format!(
+                "Deletion is incomplete and will be retried safely: {error}"
+            ));
+        }
+        let _ = cleanup_attachments(&self.workbench, &self.attachment_root);
+        for bridge in self
+            .runtime_bridges()
+            .into_iter()
+            .filter(|bridge| bridge.agent_id == agent_id)
+        {
+            bridge.emit_state();
+        }
+        Ok(())
+    }
+
+    fn agent_snapshot(
+        &self,
+        agent_id: &str,
+        quit_state: QuitState,
+    ) -> Result<DesktopState, String> {
+        let current = self
+            .runtime_maps
+            .lock()
+            .unwrap()
+            .current
+            .get(agent_id)
+            .cloned();
+        let current_bridge = current.and_then(|runtime| runtime.bridge.lock().unwrap().clone());
+        let mut snapshot = current_bridge
+            .as_ref()
+            .map(|bridge| bridge.snapshot())
+            .unwrap_or_else(|| self.unavailable_snapshot(agent_id, quit_state.clone()));
+        let mut summaries = HashMap::<String, RunSummary>::new();
+        for run in self.workbench.load_runs_for_agent(agent_id)? {
+            let occupies_slot = durable_run_occupies_slot(&run);
+            summaries.insert(
+                run.run_id.clone(),
+                RunSummary {
+                    item_id: run.item_id,
+                    run_id: run.run_id,
+                    title: run.title,
+                    created_at: run.created_at,
+                    invocation_kind: run.invocation_kind,
+                    status: run.cached_status,
+                    cancel_requested: run.cancel_requested,
+                    occupies_slot,
+                    steerable: false,
+                    artifacts_available: false,
+                    artifacts_unavailable_reason: Some(
+                        "Artifacts require the owning runtime generation.".into(),
+                    ),
+                    pending_approval: None,
+                },
+            );
+        }
+        let mut live_owners = HashSet::new();
+        for bridge in self
+            .runtime_bridges()
+            .into_iter()
+            .filter(|bridge| bridge.agent_id == agent_id)
+        {
+            for run in bridge.snapshot().runs {
+                if !live_owners.insert(run.run_id.clone()) {
+                    return Err(format!("DUPLICATE_RUN_OWNER: Run '{}' is owned by multiple live runtime generations.", run.run_id));
+                }
+                if let Some(existing) = summaries.get_mut(&run.run_id) {
+                    // Persistence and the owning registry are independent evidence. Never
+                    // turn either one's active/cancel signal into a false quiescent state.
+                    let occupied = existing.occupies_slot || run.occupies_slot;
+                    let cancelled = existing.cancel_requested || run.cancel_requested;
+                    *existing = run;
+                    existing.occupies_slot = occupied;
+                    existing.cancel_requested = cancelled;
+                } else {
+                    summaries.insert(run.run_id.clone(), run);
+                }
+            }
+        }
+        snapshot.runs = summaries.into_values().collect();
+        snapshot
+            .runs
+            .sort_by(|left, right| left.run_id.cmp(&right.run_id));
+        snapshot.occupied_slot_count = snapshot.runs.iter().filter(|run| run.occupies_slot).count();
+        let stopping = snapshot
+            .runs
+            .iter()
+            .any(|run| run.cancel_requested && run.occupies_slot);
+        snapshot.status = if snapshot.error.is_some() {
+            "error"
+        } else if stopping {
+            "stopping"
+        } else if snapshot.occupied_slot_count > 0 {
+            "running"
+        } else {
+            "ready"
+        };
+        snapshot.quit_state = quit_state;
+        Ok(snapshot)
+    }
+
+    fn runtime_for_run(&self, agent_id: &str, run_id: &str) -> Result<Arc<ManagedRuntime>, String> {
+        let owner = self.workbench.load_run_for_agent(agent_id, run_id)?;
+        let maps = self.runtime_maps.lock().unwrap();
+        maps.current.get(agent_id).into_iter().chain(maps.retired.values())
+            .find(|runtime| {
+                runtime.bridge.lock().unwrap().as_ref().is_some_and(|bridge| {
+                    bridge.agent_id == owner.agent_id
+                        && bridge.agent_fingerprint == owner.agent_fingerprint
+                        && owner.agent_config_path.as_deref() == Some(&bridge.agent_config_path)
+                })
+            }).cloned()
+            .ok_or_else(|| {
+                "GENERATION_UNAVAILABLE: The runtime generation that owns this run is not available. History is preserved, but runtime controls cannot be routed safely.".into()
+            })
     }
 
     fn convergence_action(descriptor: Option<&CatalogDescriptor>) -> RuntimeConvergence {
@@ -696,24 +1186,17 @@ impl AgentRuntimeManager {
     /// Refreshes the catalog and converges every runtime that existed before the refresh.
     /// All old runtimes are removed before replacements are attempted, so failures cannot
     /// leave stale immutable selections routable.
-    fn converge_after_catalog_refresh(&self) -> Result<Vec<String>, String> {
+    fn converge_after_catalog_refresh(
+        &self,
+        restart_unchanged_agent: Option<&str>,
+    ) -> Result<Vec<String>, String> {
+        let _deletion = self.deletion.lock().unwrap();
         let _lifecycle = self.lifecycle.lock().unwrap();
         let instantiated = self.instantiated_agent_ids();
         if let Err(error) = self.refresh_catalog_locked() {
-            // Settings may already be durable. Fail closed: no runtime using the previous
-            // catalog generation may remain routable after refresh fails.
-            let stale = self
-                .runtimes
-                .lock()
-                .unwrap()
-                .drain()
-                .map(|(_, runtime)| runtime)
-                .collect::<Vec<_>>();
-            self.catalog.lock().unwrap().agents.clear();
+            // A failed candidate publication must not terminate in-process work owned by
+            // the last successfully initialized immutable generation.
             *self.bootstrap_error.lock().unwrap() = Some(error.clone());
-            for runtime in stale {
-                Self::shutdown_runtime(&runtime);
-            }
             return Err(error);
         }
         let catalog = self.catalog.lock().unwrap();
@@ -726,23 +1209,65 @@ impl AgentRuntimeManager {
             .collect::<Vec<_>>();
         drop(catalog);
 
-        let old = {
-            let mut runtimes = self.runtimes.lock().unwrap();
-            actions
-                .iter()
-                .filter_map(|(id, _)| runtimes.remove(id))
-                .collect::<Vec<_>>()
-        };
-        for runtime in old {
-            Self::shutdown_runtime(&runtime);
-        }
-
         let mut failures = Vec::new();
         for (id, action) in actions {
             if action == RuntimeConvergence::Replace {
+                let unchanged = self
+                    .runtime_maps
+                    .lock()
+                    .unwrap()
+                    .current
+                    .get(&id)
+                    .is_some_and(|runtime| {
+                        runtime
+                            .bridge
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .is_some_and(|bridge| {
+                                self.catalog.lock().unwrap().agents.get(&id).is_some_and(
+                                    |descriptor| {
+                                        Self::bridge_matches_descriptor(bridge, descriptor)
+                                    },
+                                )
+                            })
+                    });
+                if restart_unchanged_agent == Some(id.as_str()) && unchanged {
+                    let runtime = self
+                        .runtime_maps
+                        .lock()
+                        .unwrap()
+                        .current
+                        .get(&id)
+                        .cloned()
+                        .unwrap();
+                    if !self.runtime_quiescent(&runtime) {
+                        failures.push(format!("{id}: Unchanged runtime settings cannot be reloaded while the generation is not quiescent."));
+                        continue;
+                    }
+                    // Remove under the lifecycle/map locks, then perform RPC shutdown with
+                    // neither map locked. Exact-generation spawning is therefore gap-free
+                    // for routing (there are no occupied records) and cannot duplicate.
+                    self.runtime_maps.lock().unwrap().current.remove(&id);
+                    Self::shutdown_runtime(&runtime);
+                }
                 if let Err(error) = self.ensure_runtime_locked(&id, true) {
                     failures.push(format!("{id}: {error}"));
                 }
+            } else if let Some(runtime) =
+                self.runtime_maps.lock().unwrap().current.get(&id).cloned()
+            {
+                let bridge = runtime.bridge.lock().unwrap().as_ref().unwrap().clone();
+                let mut maps = self.runtime_maps.lock().unwrap();
+                maps.retired.insert(
+                    (
+                        id.clone(),
+                        bridge.agent_config_path.clone(),
+                        bridge.agent_fingerprint.clone(),
+                    ),
+                    runtime,
+                );
+                maps.current.remove(&id);
             }
         }
         let agent_id = self.catalog.lock().unwrap().current_agent_id.clone();
@@ -754,14 +1279,20 @@ impl AgentRuntimeManager {
     }
 
     fn error_snapshot(&self, quit_state: QuitState) -> DesktopState {
+        let agent_id = self
+            .catalog
+            .lock()
+            .unwrap()
+            .current_agent_id
+            .clone()
+            .unwrap_or_default();
+        self.agent_snapshot(&agent_id, quit_state.clone())
+            .unwrap_or_else(|_| self.unavailable_snapshot(&agent_id, quit_state))
+    }
+
+    fn unavailable_snapshot(&self, agent_id: &str, quit_state: QuitState) -> DesktopState {
         DesktopState {
-            agent_id: self
-                .catalog
-                .lock()
-                .unwrap()
-                .current_agent_id
-                .clone()
-                .unwrap_or_default(),
+            agent_id: agent_id.into(),
             status: "error",
             configuration_valid: false,
             configuration: None,
@@ -783,7 +1314,13 @@ impl AgentRuntimeManager {
     }
 
     fn instantiated_agent_ids(&self) -> Vec<String> {
-        self.runtimes.lock().unwrap().keys().cloned().collect()
+        self.runtime_maps
+            .lock()
+            .unwrap()
+            .current
+            .keys()
+            .cloned()
+            .collect()
     }
 
     fn catalog_status(
@@ -791,6 +1328,7 @@ impl AgentRuntimeManager {
         quit_state: QuitState,
         window_limit_diagnostic: Option<Value>,
     ) -> Result<DesktopCatalogStatus, String> {
+        self.retire_quiescent_generations();
         let (current_agent_id, mut descriptors) = {
             let catalog = self.catalog.lock().unwrap();
             (
@@ -799,7 +1337,7 @@ impl AgentRuntimeManager {
             )
         };
         descriptors.sort_by(|left, right| left.id.cmp(&right.id));
-        let runtimes = self.runtimes.lock().unwrap().clone();
+        let runtimes = self.runtime_maps.lock().unwrap().current.clone();
         let mut agents = Vec::with_capacity(descriptors.len());
         for descriptor in descriptors {
             let snapshot = runtimes.get(&descriptor.id).and_then(|runtime| {
@@ -810,7 +1348,7 @@ impl AgentRuntimeManager {
                     .as_ref()
                     .map(|bridge| bridge.snapshot())
             });
-            let (status, occupied_slots, error, mut recent_work, approval, recovery) =
+            let (mut status, _runtime_occupied, error, _runtime_work, mut approval, mut recovery) =
                 if let Some(snapshot) = snapshot {
                     let approval = snapshot.runs.iter().any(|run| {
                         run.pending_approval.is_some() || run.status == "awaiting_approval"
@@ -883,6 +1421,40 @@ impl AgentRuntimeManager {
                         recovery,
                     )
                 };
+            // Persistence is the generation-independent occupancy ledger. Runtime-local
+            // registries cannot represent old and current generations at once.
+            let durable_runs = self.workbench.load_runs_for_agent(&descriptor.id)?;
+            let occupied_slots = durable_runs
+                .iter()
+                .filter(|run| durable_run_occupies_slot(run))
+                .count();
+            let aggregate_stopping = durable_runs
+                .iter()
+                .any(|run| durable_run_occupies_slot(run) && run.cancel_requested);
+            if descriptor.validation_state == "valid" && occupied_slots > 0 {
+                status = if aggregate_stopping {
+                    "stopping"
+                } else {
+                    "running"
+                };
+            }
+            approval |= durable_runs
+                .iter()
+                .any(|run| run.cached_status == "awaiting_approval");
+            recovery |= durable_runs.iter().any(|run| {
+                recovery_status(&run.cached_status) || run.submission_state == "recovery_required"
+            });
+            let mut recent_work: Vec<RecentWork> = durable_runs
+                .into_iter()
+                .map(|run| RecentWork {
+                    item_id: run.item_id,
+                    run_id: run.run_id,
+                    title: run.title,
+                    status: run.cached_status,
+                    created_at: run.created_at,
+                    invocation_kind: run.invocation_kind,
+                })
+                .collect();
             recent_work.sort_by(|left, right| {
                 right
                     .created_at
@@ -1342,7 +1914,14 @@ impl Bridge {
     ) -> Result<Arc<Self>, String> {
         // Complete all fallible persistence reads before creating a child process so every
         // spawned runtime can be published to, and shut down through, the native lifecycle.
-        let saved_runs = workbench.load_runs_for_agent(&selection.id)?;
+        let saved_runs = workbench
+            .load_runs_for_agent(&selection.id)?
+            .into_iter()
+            .filter(|run| {
+                run.agent_fingerprint == selection.configuration_fingerprint
+                    && run.agent_config_path.as_deref() == Some(selection.config_path.as_str())
+            })
+            .collect::<Vec<_>>();
         let (mut events, child) = app
             .shell()
             .sidecar("agent-runtime")
@@ -1404,10 +1983,11 @@ impl Bridge {
                 shell_cwd: saved.shell_cwd,
             });
         }
-        for approval in bridge
-            .workbench
-            .load_pending_approvals_for_agent(&bridge.agent_id)?
-        {
+        for approval in bridge.workbench.load_pending_approvals_for_generation(
+            &bridge.agent_id,
+            &bridge.agent_config_path,
+            &bridge.agent_fingerprint,
+        )? {
             bridge.run_roots.lock().unwrap().insert(
                 approval.approval_run_id.clone(),
                 approval.root_run_id.clone(),
@@ -1483,26 +2063,15 @@ impl Bridge {
         self.reconcile_saved_runs();
         self.recover_pending_run_operations();
         self.recover_pending_approval_operations();
-        self.recover_deletion_jobs();
         Ok(())
     }
 
-    fn recover_deletion_jobs(self: &Arc<Self>) {
-        let Ok(jobs) = self.workbench.load_deletion_jobs_for_agent(&self.agent_id) else {
-            return;
-        };
-        for job in jobs {
-            if let Err(error) = self.execute_deletion_job(&job) {
-                let _ = self.workbench.fail_deletion_job(&job.id, &error);
-            }
-        }
-    }
-
     fn recover_pending_run_operations(self: &Arc<Self>) {
-        let Ok(operations) = self
-            .workbench
-            .load_run_recovery_operations_for_agent(&self.agent_id)
-        else {
+        let Ok(operations) = self.workbench.load_run_recovery_operations_for_generation(
+            &self.agent_id,
+            &self.agent_config_path,
+            &self.agent_fingerprint,
+        ) else {
             return;
         };
         for operation in operations {
@@ -2200,10 +2769,11 @@ impl Bridge {
     }
 
     fn recover_pending_approval_operations(self: &Arc<Self>) {
-        if let Ok(approvals) = self
-            .workbench
-            .load_pending_approvals_for_agent(&self.agent_id)
-        {
+        if let Ok(approvals) = self.workbench.load_pending_approvals_for_generation(
+            &self.agent_id,
+            &self.agent_config_path,
+            &self.agent_fingerprint,
+        ) {
             for approval in approvals
                 .into_iter()
                 .filter(|approval| approval.operation_state != "awaiting_decision")
@@ -2508,6 +3078,7 @@ impl Bridge {
             Err(_) => Some("The pinned agent is not currently available; this chat is read-only.".into()),
             Ok((id,_,_,_)) if id != chat.pinned_agent_id => Some("The resolved agent ID no longer matches this chat's pin; this chat is read-only.".into()),
             Ok((_,_,fingerprint,_)) if fingerprint != chat.pinned_agent_fingerprint => Some("The resolved agent configuration fingerprint no longer matches this chat's pin; this chat is read-only.".into()),
+            Ok((_,_,_,path)) if path != chat.pinned_agent_config_path => Some("The resolved agent configuration path no longer matches this chat's pin; this chat is read-only.".into()),
             Ok(_) if chat.workspace_root.is_none() || chat.shell_cwd.is_none() => Some("This chat predates durable workspace provenance and is read-only.".into()),
             Ok(_) if chat.workspace_root != current_workspace || chat.shell_cwd != current_shell_cwd => Some("The resolved workspace no longer matches this chat's pin; this chat is read-only.".into()),
             _ => None,
@@ -2520,109 +3091,13 @@ impl Bridge {
             .load_chat_for_agent(&self.agent_id, item_id)?;
         Ok(ChatDto {
             read_only_reason: self.chat_reason(&chat),
-            occupied: self.registry.lock().unwrap().item_is_occupied(item_id),
+            occupied: self.workbench.item_is_occupied(&self.agent_id, item_id)?,
             chat,
             messages,
         })
     }
 
-    fn deletion_operation(&self, target: &ProductDeletionTarget) -> Result<Value, String> {
-        match target {
-            ProductDeletionTarget::Item { item_id } => {
-                self.workbench.item_deletion_operation(item_id)
-            }
-            ProductDeletionTarget::Run { run_id } => self.workbench.run_deletion_operation(run_id),
-            ProductDeletionTarget::ChatTurn { item_id, ordinal } => self
-                .workbench
-                .chat_turn_deletion_operation(item_id, *ordinal),
-        }
-    }
-
-    fn assert_deletion_owner(&self, target: &ProductDeletionTarget) -> Result<(), String> {
-        match target {
-            ProductDeletionTarget::Item { item_id }
-            | ProductDeletionTarget::ChatTurn { item_id, .. } => {
-                self.workbench.assert_item_owner(&self.agent_id, item_id)
-            }
-            ProductDeletionTarget::Run { run_id } => {
-                self.workbench.assert_run_owner(&self.agent_id, run_id)
-            }
-        }
-    }
-
-    fn preview_deletion(
-        self: &Arc<Self>,
-        target: ProductDeletionTarget,
-    ) -> Result<DeletionPreview, String> {
-        self.assert_deletion_owner(&target)?;
-        let operation = self.deletion_operation(&target)?;
-        let mut run_ids = HashSet::new();
-        let mut plan_ids = HashSet::new();
-        for runtime_target in operation["runtimeTargets"]
-            .as_array()
-            .ok_or("Deletion operation has no runtime targets.")?
-        {
-            let (_, receiver) =
-                self.request("history/previewDeletion", json!({"target":runtime_target}))?;
-            let response = receiver
-                .recv_timeout(REQUEST_TIMEOUT)
-                .map_err(|_| "History preview timed out.".to_string())??;
-            for id in response["runIds"].as_array().into_iter().flatten() {
-                if let Some(id) = id.as_str() {
-                    run_ids.insert(id.to_owned());
-                }
-            }
-            for field in ["ownedPlanIds", "preservedPlanIds"] {
-                for id in response[field].as_array().into_iter().flatten() {
-                    if let Some(id) = id.as_str() {
-                        plan_ids.insert(id.to_owned());
-                    }
-                }
-            }
-        }
-        let registry = self.registry.lock().unwrap();
-        let occupied = run_ids
-            .iter()
-            .any(|id| registry.get(id).is_some_and(|record| record.occupies_slot));
-        drop(registry);
-        let label = match &target {
-            ProductDeletionTarget::Item { .. } => operation["label"]
-                .as_str()
-                .ok_or("History item has no label.")?
-                .to_owned(),
-            ProductDeletionTarget::Run { run_id } => format!("run {run_id}"),
-            ProductDeletionTarget::ChatTurn { ordinal, .. } => {
-                format!("chat from turn {} onward", ordinal / 2 + 1)
-            }
-        };
-        Ok(DeletionPreview {
-            target,
-            label,
-            run_count: run_ids.len(),
-            plan_count: plan_ids.len(),
-            occupied,
-            warning: "This permanently deletes the selected history and its runtime evidence. This cannot be undone.",
-        })
-    }
-
-    fn execute_deletion_job(self: &Arc<Self>, job: &workbench::DeletionJob) -> Result<(), String> {
-        for runtime_target in job.operation["runtimeTargets"]
-            .as_array()
-            .ok_or("Deletion operation has no runtime targets.")?
-        {
-            let (_, receiver) = self.request("history/delete", json!({"target":runtime_target}))?;
-            receiver
-                .recv_timeout(REQUEST_TIMEOUT)
-                .map_err(|_| "History deletion timed out.".to_string())??;
-        }
-        self.workbench.complete_deletion_job(job)?;
-        let roots = job.operation["workbenchRunIds"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(str::to_owned)
-            .collect::<HashSet<_>>();
+    fn remove_deleted_runs(&self, roots: &HashSet<String>) {
         let affected = self
             .run_roots
             .lock()
@@ -2649,31 +3124,6 @@ impl Bridge {
             .lock()
             .unwrap()
             .retain(|run_id, _| !affected.contains(run_id));
-        Ok(())
-    }
-
-    fn delete_history(self: &Arc<Self>, target: ProductDeletionTarget) -> Result<(), String> {
-        let preview = self.preview_deletion(target.clone())?;
-        if preview.occupied {
-            return Err("Stop or wait for every affected run before deleting history.".into());
-        }
-        let operation = self.deletion_operation(&target)?;
-        let job = self
-            .workbench
-            .create_deletion_job_for_agent(&self.agent_id, &operation)?;
-        match self.execute_deletion_job(&job) {
-            Ok(()) => {
-                let _ = cleanup_attachments(&self.workbench, &self.attachment_root);
-                self.emit_state();
-                Ok(())
-            }
-            Err(error) => {
-                let _ = self.workbench.fail_deletion_job(&job.id, &error);
-                Err(format!(
-                    "Deletion is incomplete and will be retried safely: {error}"
-                ))
-            }
-        }
     }
 
     fn send_chat(
@@ -3245,7 +3695,25 @@ impl Bridge {
     }
 
     fn emit_state(&self) {
-        let _ = self.app.emit("adaptive-agent://state", self.snapshot());
+        let state = self.app.state::<AppState>();
+        state.manager.retire_quiescent_generations();
+        match state
+            .manager
+            .agent_snapshot(&self.agent_id, state.quit.lock().unwrap().state())
+        {
+            Ok(snapshot) => {
+                let _ = self.app.emit("adaptive-agent://state", snapshot);
+            }
+            Err(error) => {
+                *state.manager.bootstrap_error.lock().unwrap() = Some(error);
+                let _ = self.app.emit(
+                    "adaptive-agent://state",
+                    state
+                        .manager
+                        .error_snapshot(state.quit.lock().unwrap().state()),
+                );
+            }
+        }
         let _ = self.app.emit(
             "adaptive-agent://catalog-status-changed",
             json!({ "agentId": self.agent_id }),
@@ -3416,9 +3884,10 @@ fn start_trace_for_runtime(
                         let state = app.state::<AppState>();
                         let registered = state
                             .manager
-                            .runtimes
+                            .runtime_maps
                             .lock()
                             .unwrap()
+                            .current
                             .get(&agent_id)
                             .is_some_and(|candidate| Arc::ptr_eq(candidate, &runtime_target));
                         let published = {
@@ -3580,7 +4049,7 @@ fn schedule_trace_refresh(
     final_refresh: bool,
 ) {
     let state = app.state::<AppState>();
-    let Ok(runtime) = runtime_for(&state, &agent_id, true) else {
+    let Ok(runtime) = state.manager.runtime_for_run(&agent_id, &root_run_id) else {
         return;
     };
     {
@@ -3593,7 +4062,7 @@ fn schedule_trace_refresh(
     let app = app.clone();
     std::thread::spawn(move || loop {
         let state = app.state::<AppState>();
-        let Ok(runtime) = runtime_for(&state, &agent_id, true) else {
+        let Ok(runtime) = state.manager.runtime_for_run(&agent_id, &root_run_id) else {
             return;
         };
         let final_refresh = runtime
@@ -3671,7 +4140,17 @@ fn select_trace(
     app: AppHandle,
 ) -> Result<u64, String> {
     let state = app.state::<AppState>();
-    let runtime = runtime_for(&state, &agent_id, true)?;
+    let _trace_policy = state.manager.trace_policy.lock().unwrap();
+    let runtimes = state.manager.runtimes_for_agent(&agent_id);
+    for candidate in &runtimes {
+        let mut selection = candidate.trace_selection.lock().unwrap();
+        selection.revision += 1;
+        selection.root_run_id = None;
+    }
+    let runtime = match root_run_id.as_deref() {
+        Some(run_id) => state.manager.runtime_for_run(&agent_id, run_id)?,
+        None => runtime_for(&state, &agent_id, true)?,
+    };
     let revision = {
         let mut selection = runtime.trace_selection.lock().unwrap();
         selection.revision += 1;
@@ -3681,7 +4160,7 @@ fn select_trace(
     let Some(root_run_id) = root_run_id else {
         return Ok(revision);
     };
-    let bridge = bridge_for(&state, &agent_id, true)?;
+    let bridge = state.manager.bridge_for_run(&agent_id, &root_run_id)?;
     bridge.workbench.assert_run_owner(&agent_id, &root_run_id)?;
     schedule_trace_refresh(&app, agent_id.clone(), root_run_id.clone(), false);
     let app = app.clone();
@@ -3690,7 +4169,7 @@ fn select_trace(
         loop {
             std::thread::sleep(Duration::from_millis(1_500));
             let state = app.state::<AppState>();
-            let Ok(runtime) = runtime_for(&state, &agent_id, true) else {
+            let Ok(runtime) = state.manager.runtime_for_run(&agent_id, &root_run_id) else {
                 break;
             };
             let selected = {
@@ -3766,7 +4245,33 @@ fn set_trace_privacy(
         privacy.messages = true;
     }
     let state = app.state::<AppState>();
+    let _trace_policy = state.manager.trace_policy.lock().unwrap();
+    if state.reconfiguring.load(Ordering::SeqCst) {
+        return Err("Trace privacy cannot be changed while settings are being reloaded.".into());
+    }
     let runtime = runtime_for(&state, &agent_id, false)?;
+    // A privacy policy is agent-scoped, not generation-scoped. Invalidate every
+    // generation before any process can observe the new persisted policy.
+    for candidate in state.manager.runtimes_for_agent(&agent_id) {
+        let mut selection = candidate.trace_selection.lock().unwrap();
+        selection.revision += 1;
+        selection.root_run_id = None;
+        drop(selection);
+        if !Arc::ptr_eq(&candidate, &runtime) {
+            candidate.trace_generation.fetch_add(1, Ordering::SeqCst);
+            if let Some(trace) = candidate.trace.lock().unwrap().take() {
+                trace.shutdown();
+            }
+            if let Some(bridge) = candidate.bridge.lock().unwrap().as_ref().cloned() {
+                bridge.trace_healthy.store(false, Ordering::SeqCst);
+                *bridge.trace_error.lock().unwrap() = Some(
+                    "Trace stopped after privacy changed; it will restart with the new policy when needed."
+                        .into(),
+                );
+                bridge.emit_state();
+            }
+        }
+    }
     let (bridge, sqlite_path, old_trace, trace_generation) = {
         let _lifecycle = state.lifecycle.lock().unwrap();
         if state.reconfiguring.load(Ordering::SeqCst) {
@@ -3872,6 +4377,7 @@ fn set_trace_privacy(
     bridge.trace_healthy.store(true, Ordering::SeqCst);
     *bridge.trace_error.lock().unwrap() = None;
     bridge.emit_state();
+    drop(_trace_policy);
     if let Some(root_run_id) = selected_root {
         let _ = select_trace(agent_id, Some(root_run_id), app.clone());
     }
@@ -3883,8 +4389,10 @@ fn desktop_state(
     agent_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<DesktopState, String> {
-    match bridge_for(&state, &agent_id, true) {
-        Ok(bridge) => Ok(bridge.snapshot()),
+    match state.manager.ensure_runtime(&agent_id, true) {
+        Ok(_) => state
+            .manager
+            .agent_snapshot(&agent_id, state.quit.lock().unwrap().state()),
         Err(error)
             if state
                 .manager
@@ -4030,14 +4538,7 @@ fn desktop_window_bootstrap(
             presentation: None,
         });
     };
-    let runtime = state.manager.ensure_runtime(&agent_id, true)?;
-    let bridge = runtime
-        .bridge
-        .lock()
-        .unwrap()
-        .as_ref()
-        .cloned()
-        .ok_or("Desktop runtime is unavailable.")?;
+    state.manager.ensure_runtime(&agent_id, true)?;
     let presentation = state
         .manager
         .workbench
@@ -4047,8 +4548,12 @@ fn desktop_window_bootstrap(
         .map_err(|error| format!("Invalid saved window presentation: {error}"))?;
     Ok(DesktopWindowBootstrap {
         kind: "agent",
-        agent_id: Some(agent_id),
-        state: Some(bridge.snapshot()),
+        agent_id: Some(agent_id.clone()),
+        state: Some(
+            state
+                .manager
+                .agent_snapshot(&agent_id, state.quit.lock().unwrap().state())?,
+        ),
         presentation,
     })
 }
@@ -4085,13 +4590,20 @@ fn save_window_presentation(
 #[tauri::command]
 fn desktop_bootstrap(state: tauri::State<'_, AppState>) -> Result<Value, String> {
     let snapshot = match state.manager.current() {
-        Ok(runtime) => runtime
-            .bridge
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|bridge| bridge.snapshot())
-            .unwrap_or_else(|| {
+        Ok(_) => state
+            .manager
+            .agent_snapshot(
+                &state
+                    .manager
+                    .catalog
+                    .lock()
+                    .unwrap()
+                    .current_agent_id
+                    .clone()
+                    .unwrap_or_default(),
+                state.quit.lock().unwrap().state(),
+            )
+            .unwrap_or_else(|_| {
                 state
                     .manager
                     .error_snapshot(state.quit.lock().unwrap().state())
@@ -4123,17 +4635,10 @@ fn reload_settings(
         if state.quit.lock().unwrap().state() != QuitState::Idle {
             return Err("Settings cannot be reloaded while quitting.".into());
         }
-        let bridges = state.manager.runtime_bridges();
-        if bridges
-            .iter()
-            .any(|bridge| bridge.registry.lock().unwrap().any_active())
-        {
-            return Err("Stop all active runs before reloading global settings.".into());
-        }
         drop(_lifecycle);
         let failures = state
             .manager
-            .converge_after_catalog_refresh()
+            .converge_after_catalog_refresh(Some(&agent_id))
             .map_err(|error| format!("RUNTIME_RESTART_FAILED: {error}"))?;
         if !failures.is_empty() {
             return Err(format!("RUNTIME_RESTART_FAILED: {}", failures.join("; ")));
@@ -4147,7 +4652,9 @@ fn reload_settings(
             .cloned()
             .ok_or("Desktop runtime is unavailable.")?;
         start_trace_for_runtime(&agent_id, runtime, bridge.clone())?;
-        Ok(bridge.snapshot())
+        state
+            .manager
+            .agent_snapshot(&agent_id, state.quit.lock().unwrap().state())
     })();
     state.reconfiguring.store(false, Ordering::SeqCst);
     result
@@ -4211,7 +4718,7 @@ fn save_settings(
         )?;
         let failures = state
             .manager
-            .converge_after_catalog_refresh()
+            .converge_after_catalog_refresh(Some(&agent_id))
             .map_err(|error| format!("SETTINGS_SAVED_RUNTIME_RESTART_FAILED: {error}"))?;
         if !failures.is_empty() {
             return Err(format!(
@@ -4233,7 +4740,9 @@ fn save_settings(
             .cloned()
             .ok_or("Desktop runtime is unavailable.")?;
         start_trace_for_runtime(&agent_id, runtime, bridge.clone())?;
-        Ok(bridge.snapshot())
+        state
+            .manager
+            .agent_snapshot(&agent_id, state.quit.lock().unwrap().state())
     })();
     state.reconfiguring.store(false, Ordering::SeqCst);
     result
@@ -4367,7 +4876,7 @@ fn stop_run(
     run_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let bridge = bridge_for(&state, &agent_id, true)?;
+    let bridge = state.manager.bridge_for_run(&agent_id, &run_id)?;
     bridge.workbench.assert_run_owner(&agent_id, &run_id)?;
     bridge.stop_run(&run_id)
 }
@@ -4378,7 +4887,7 @@ fn get_run_recovery_plan(
     run_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<Value, String> {
-    let bridge = bridge_for(&state, &agent_id, true)?;
+    let bridge = state.manager.bridge_for_run(&agent_id, &run_id)?;
     bridge.workbench.assert_run_owner(&agent_id, &run_id)?;
     bridge.recovery_plan(&run_id)
 }
@@ -4398,7 +4907,7 @@ fn recover_run(
     if state.quit.lock().unwrap().state() != QuitState::Idle {
         return Err("The desktop is quitting and cannot recover runs.".into());
     }
-    let bridge = bridge_for(&state, &agent_id, true)?;
+    let bridge = state.manager.bridge_for_run(&agent_id, &run_id)?;
     bridge.workbench.assert_run_owner(&agent_id, &run_id)?;
     bridge.recover_run(&run_id, &expected_status, &expected_action)
 }
@@ -4413,7 +4922,7 @@ fn steer_run(
     if message.trim().is_empty() {
         return Err("A steering message is required.".into());
     }
-    let bridge = bridge_for(&state, &agent_id, true)?;
+    let bridge = state.manager.bridge_for_run(&agent_id, &run_id)?;
     bridge.workbench.assert_run_owner(&agent_id, &run_id)?;
     bridge.steer_run(&run_id, message.trim())
 }
@@ -4435,9 +4944,9 @@ fn get_run_overview(
     run_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<Value, String> {
-    let runtime = runtime_for(&state, &agent_id, true)?;
+    let runtime = state.manager.runtime_for_run(&agent_id, &run_id)?;
     let (privacy, trace, attachment_root) = {
-        let bridge = bridge_for(&state, &agent_id, true)?;
+        let bridge = state.manager.bridge_for_run(&agent_id, &run_id)?;
         bridge.workbench.assert_run_owner(&agent_id, &run_id)?;
         let privacy = load_trace_privacy(&bridge.workbench, &agent_id)?;
         let trace = runtime
@@ -4640,7 +5149,7 @@ fn resolve_approval(
     approved: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let bridge = bridge_for(&state, &agent_id, true)?;
+    let bridge = state.manager.bridge_for_run(&agent_id, &root_run_id)?;
     bridge.workbench.assert_pending_approval_owner(
         &agent_id,
         &root_run_id,
@@ -4723,7 +5232,7 @@ fn preview_history_deletion(
     target: ProductDeletionTarget,
     state: tauri::State<'_, AppState>,
 ) -> Result<DeletionPreview, String> {
-    bridge_for(&state, &agent_id, true)?.preview_deletion(target)
+    state.manager.preview_deletion(&agent_id, target)
 }
 
 #[tauri::command]
@@ -4736,7 +5245,7 @@ fn delete_history(
     if state.quit.lock().unwrap().state() != QuitState::Idle {
         return Err("The desktop is quitting and cannot delete history.".into());
     }
-    bridge_for(&state, &agent_id, true)?.delete_history(target)
+    state.manager.delete_history(&agent_id, target)
 }
 
 #[tauri::command]
@@ -4802,7 +5311,9 @@ fn begin_drain(app: &AppHandle, mode: DrainMode) -> Result<DesktopState, String>
     for candidate in &bridges {
         candidate.emit_state();
     }
-    let snapshot = bridge.snapshot();
+    let snapshot = state
+        .manager
+        .agent_snapshot(&bridge.agent_id, state.quit.lock().unwrap().state())?;
 
     let app = app.clone();
     std::thread::spawn(move || {
@@ -4931,13 +5442,18 @@ fn quit_cancel(state: tauri::State<'_, AppState>) -> Result<DesktopState, String
         candidate.emit_state();
     }
     match state.manager.current() {
-        Ok(runtime) => runtime
-            .bridge
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|bridge| bridge.snapshot())
-            .ok_or_else(|| "Desktop runtime is not available.".into()),
+        Ok(runtime) => {
+            let agent_id = runtime
+                .bridge
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|bridge| bridge.agent_id.clone())
+                .ok_or_else(|| "Desktop runtime is not available.".to_string())?;
+            state
+                .manager
+                .agent_snapshot(&agent_id, state.quit.lock().unwrap().state())
+        }
         Err(error) => {
             *state.manager.bootstrap_error.lock().unwrap() = Some(error);
             Ok(state
@@ -5053,9 +5569,10 @@ pub fn run() {
             }
             let runtimes = state
                 .manager
-                .runtimes
+                .runtime_maps
                 .lock()
                 .unwrap()
+                .current
                 .iter()
                 .map(|(agent_id, runtime)| (agent_id.clone(), runtime.clone()))
                 .collect::<Vec<_>>();
