@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import BrandMark from './BrandMark.svelte';
   import { aggregateRecentWork, agentsNeedingAttention, filterAndSortAgents, isLaunchable } from './agent-studio';
-  import { getDesktopCatalogStatus, listenCatalogStatusChanged, openAgentWindow, quitCancel, quitTerminate, quitWait, type DesktopCatalogStatus } from './desktop';
+  import { generateAgentDraft, getDesktopCatalogStatus, listenCatalogStatusChanged, openAgentWindow, quitCancel, quitTerminate, quitWait, saveAgentConfig, validateAgentConfig, type AgentConfigPreview, type DesktopCatalogStatus } from './desktop';
 
   let catalog: DesktopCatalogStatus | undefined;
   let loading = true;
@@ -13,6 +13,17 @@
   let refreshTimer: number | undefined;
   let refreshGeneration = 0;
   let disposed = false;
+  let builderOpen = false;
+  let builderMode: 'describe' | 'json' = 'describe';
+  let builderStep: 'input' | 'review' = 'input';
+  let builderBrief = '';
+  let builderJson = '';
+  let builderNotes: string[] = [];
+  let builderRecommendations: string[] = [];
+  let builderPreview: AgentConfigPreview | undefined;
+  let builderBusy = false;
+  let builderError = '';
+  let builderValidationGeneration = 0;
   $: agents = filterAndSortAgents(catalog?.agents ?? [], query, showArchived);
   $: recent = aggregateRecentWork(catalog?.agents ?? []);
   $: attention = agentsNeedingAttention(catalog?.agents ?? []);
@@ -51,6 +62,56 @@
       await refresh();
     } catch (cause) { error = String(cause); }
   }
+  function openBuilder(mode: 'describe' | 'json') {
+    builderOpen = true; builderMode = mode; builderStep = 'input'; builderBrief = ''; builderJson = '';
+    builderNotes = []; builderRecommendations = []; builderPreview = undefined; builderError = '';
+  }
+  function parseBuilderJson() {
+    const value: unknown = JSON.parse(builderJson);
+    if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error('Agent JSON must be an object.');
+    return value as Record<string, unknown>;
+  }
+  async function prepareBuilder() {
+    builderBusy = true; builderError = '';
+    try {
+      if (builderMode === 'describe') {
+        const prepared = await generateAgentDraft(builderBrief);
+        builderPreview = prepared; builderNotes = prepared.notes; builderRecommendations = prepared.recommendations;
+        builderJson = JSON.stringify(prepared.agent, null, 2);
+      } else {
+        builderPreview = await validateAgentConfig(parseBuilderJson());
+        builderNotes = []; builderRecommendations = [];
+        builderJson = JSON.stringify(builderPreview.agent, null, 2);
+      }
+      builderStep = 'review';
+    } catch (cause) { builderError = String(cause); }
+    finally { builderBusy = false; }
+  }
+  async function revalidateBuilder() {
+    const generation = ++builderValidationGeneration;
+    builderBusy = true; builderError = '';
+    try {
+      const preview = await validateAgentConfig(parseBuilderJson());
+      if (generation === builderValidationGeneration) builderPreview = preview;
+    }
+    catch (cause) { if (generation === builderValidationGeneration) { builderPreview = undefined; builderError = String(cause); } }
+    finally { if (generation === builderValidationGeneration) builderBusy = false; }
+  }
+  function editedBuilderJson() { builderValidationGeneration += 1; builderPreview = undefined; builderError = ''; }
+  async function saveBuilder() {
+    builderBusy = true; builderError = '';
+    try {
+      const agent = parseBuilderJson();
+      const preview = await validateAgentConfig(agent);
+      builderPreview = preview;
+      if (preview.duplicatePaths.length) throw new Error(`Choose a unique agent ID. It already exists at ${preview.duplicatePaths.join(', ')}.`);
+      if (preview.exists && !window.confirm(`Overwrite the existing agent profile at ${preview.path}?`)) return;
+      await saveAgentConfig(agent, undefined, preview.exists, preview.path, preview.targetFingerprint);
+      builderOpen = false;
+      await refresh();
+    } catch (cause) { builderError = String(cause); }
+    finally { builderBusy = false; }
+  }
   const diagnosticText = (value: Record<string, unknown>) => typeof value.message === 'string' ? value.message : JSON.stringify(value);
   const date = (value: string) => new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value));
 
@@ -66,9 +127,32 @@
   {#if catalog?.quitState === 'confirming'}
     <div class="modal-backdrop" role="presentation"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="studio-quit-title"><h2 id="studio-quit-title">Runs are still active</h2><p>Choose how AdaptiveAgent should finish before quitting.</p><div class="actions"><button on:click={() => quit('cancel')}>Cancel</button><button on:click={() => quit('wait')}>Wait for runs</button><button class="danger" on:click={() => quit('terminate')}>Terminate all and quit</button></div></div></div>
   {/if}
+  {#if builderOpen}
+    <div class="modal-backdrop" role="presentation">
+      <div class="modal agent-builder" role="dialog" aria-modal="true" aria-labelledby="agent-builder-title">
+        <header><div><span>Agent builder</span><h2 id="agent-builder-title">{builderStep === 'input' ? 'Create a specialist agent' : 'Review agent profile'}</h2></div><button type="button" aria-label="Close" on:click={() => builderOpen = false}>×</button></header>
+        {#if builderStep === 'input'}
+          <div class="builder-tabs"><button class:active={builderMode === 'describe'} on:click={() => builderMode = 'describe'}>Describe agent</button><button class:active={builderMode === 'json'} on:click={() => builderMode = 'json'}>Paste JSON</button></div>
+          {#if builderMode === 'describe'}<label><span>Description</span><textarea rows="8" bind:value={builderBrief} placeholder="Build a security review agent that inspects TypeScript changes, explains risks, and recommends focused tests."></textarea></label>
+          {:else}<label><span>Agent JSON</span><textarea class="code-editor" rows="16" bind:value={builderJson} placeholder={'{"version":1,"id":"security-reviewer",...}'}></textarea></label>{/if}
+          <p class="builder-help">Description mode uses the existing <code>adaptive-agent agent-create</code> generation path. Nothing is written until you review and confirm.</p>
+          {#if builderError}<div class="alert" role="alert">{builderError}</div>{/if}
+          <div class="actions"><button on:click={() => builderOpen = false}>Cancel</button><button class="primary" disabled={builderBusy || (builderMode === 'describe' ? !builderBrief.trim() : !builderJson.trim())} on:click={prepareBuilder}>{builderBusy ? 'Preparing…' : 'Create draft'}</button></div>
+        {:else}
+          <div class="builder-summary"><div><span>Output path</span><code>{builderPreview?.path}</code></div><div><span>Status</span><strong>{builderPreview?.duplicatePaths.length ? 'Duplicate ID' : builderPreview?.exists ? 'Overwrite requires confirmation' : 'New profile'}</strong></div></div>
+          <label><span>Review and edit JSON</span><textarea class="code-editor" rows="18" bind:value={builderJson} on:input={editedBuilderJson}></textarea></label>
+          {#if builderNotes.length}<div class="builder-advice"><strong>Notes</strong><ul>{#each builderNotes as note}<li>{note}</li>{/each}</ul></div>{/if}
+          {#if builderRecommendations.length}<div class="builder-advice"><strong>Recommendations</strong><ul>{#each builderRecommendations as recommendation}<li>{recommendation}</li>{/each}</ul></div>{/if}
+          {#if builderPreview?.duplicatePaths.length}<div class="alert" role="alert">This ID is already used by {builderPreview.duplicatePaths.join(', ')}. Edit the ID and revalidate.</div>{/if}
+          {#if builderError}<div class="alert" role="alert">{builderError}</div>{/if}
+          <div class="actions"><button on:click={() => builderStep = 'input'}>Back</button><button disabled={builderBusy} on:click={revalidateBuilder}>Validate</button><button class="primary" disabled={builderBusy || !builderPreview || builderPreview.duplicatePaths.length > 0} on:click={saveBuilder}>{builderBusy ? 'Saving…' : builderPreview?.exists ? 'Confirm overwrite' : 'Save agent'}</button></div>
+        {/if}
+      </div>
+    </div>
+  {/if}
   <header class="studio-header">
     <div class="brand"><BrandMark /><div><strong>Adaptive Agent</strong><span>Agent Studio</span></div></div>
-    <button type="button" on:click={refresh} disabled={loading}>↻ Refresh</button>
+    <div class="studio-header-actions"><button type="button" on:click={() => openBuilder('json')}>Import JSON</button><button class="primary" type="button" on:click={() => openBuilder('describe')}>＋ New agent</button><button type="button" on:click={refresh} disabled={loading}>↻ Refresh</button></div>
   </header>
   <div class="studio-content">
     <section class="studio-hero" aria-labelledby="studio-title">

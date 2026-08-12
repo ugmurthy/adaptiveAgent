@@ -7,8 +7,8 @@ export {
 } from '@adaptive-agent/agent-sdk/cli';
 
 /** Keep versions as strings: JSON numbers cannot distinguish 1.10 from 1.1. */
-export const DESKTOP_PROTOCOL_VERSION = '1.14' as const;
-export const SUPPORTED_DESKTOP_PROTOCOL_VERSIONS = ['1.10', '1.11', '1.12', '1.13', DESKTOP_PROTOCOL_VERSION] as const;
+export const DESKTOP_PROTOCOL_VERSION = '1.15' as const;
+export const SUPPORTED_DESKTOP_PROTOCOL_VERSIONS = ['1.10', '1.11', '1.12', '1.13', '1.14', DESKTOP_PROTOCOL_VERSION] as const;
 export const DESKTOP_BRIDGE_VERSION = '0.1.0';
 
 export type DesktopProtocolVersion = (typeof SUPPORTED_DESKTOP_PROTOCOL_VERSIONS)[number];
@@ -139,6 +139,22 @@ export interface CliExecuteParams {
   timeoutMs?: number;
 }
 
+export interface AgentCreateDraftParams {
+  brief: string;
+  generatorAgent?: string;
+}
+
+export interface AgentConfigParams {
+  agent: Record<string, JsonValue>;
+  generatorAgent?: string;
+}
+
+export interface AgentConfigSaveParams extends AgentConfigParams {
+  overwrite?: boolean;
+  expectedPath: string;
+  expectedTargetFingerprint: string;
+}
+
 export interface RunParams {
   runId?: string;
   executionId?: string;
@@ -226,6 +242,9 @@ export type DesktopRpcRequest =
   | RpcRequest<'interaction/resolveClarification', ClarificationParams>
   | RpcRequest<'history/previewDeletion', HistoryDeletionParams>
   | RpcRequest<'history/delete', HistoryDeletionParams>
+  | RpcRequest<'agent/createDraft', AgentCreateDraftParams>
+  | RpcRequest<'agent/validateConfig', AgentConfigParams>
+  | RpcRequest<'agent/saveConfig', AgentConfigSaveParams>
   | RpcRequestWithoutParams<'cli/commands'>
   | RpcRequest<'cli/execute', CliExecuteParams>;
 
@@ -254,6 +273,9 @@ export const DESKTOP_RPC_METHODS = [
   'interaction/resolveClarification',
   'history/previewDeletion',
   'history/delete',
+  'agent/createDraft',
+  'agent/validateConfig',
+  'agent/saveConfig',
   'cli/commands',
   'cli/execute',
 ] as const satisfies readonly DesktopRpcRequest['method'][];
@@ -340,6 +362,29 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
       optionalString(params ?? {}, 'cwd');
       optionalString(params ?? {}, 'settingsConfigPath');
       return;
+    case 'agent/createDraft': {
+      const value = requiredParams(method, params);
+      requiredString(value, 'brief');
+      optionalString(value, 'generatorAgent');
+      return;
+    }
+    case 'agent/validateConfig':
+    case 'agent/saveConfig': {
+      const value = requiredParams(method, params);
+      requiredObject(value, 'agent');
+      optionalString(value, 'generatorAgent');
+      if (method === 'agent/saveConfig') {
+        requiredString(value, 'expectedPath');
+        requiredString(value, 'expectedTargetFingerprint');
+      } else {
+        optionalString(value, 'expectedPath');
+        optionalString(value, 'expectedTargetFingerprint');
+      }
+      if (value.overwrite !== undefined && typeof value.overwrite !== 'boolean') {
+        invalidParams('overwrite must be a boolean.');
+      }
+      return;
+    }
     case 'auth/updateAccessToken':
       requiredString(requiredParams(method, params), 'accessToken');
       return;

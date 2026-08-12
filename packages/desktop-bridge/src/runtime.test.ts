@@ -146,8 +146,19 @@ describe('desktop runtime protocol', () => {
       params: { protocolVersion: '2.0', clientInfo: { name: 'desktop' } },
     }))).rejects.toMatchObject({
       code: 'UNSUPPORTED_PROTOCOL_VERSION',
-      data: { supportedProtocolVersions: ['1.10', '1.11', '1.12', '1.13', '1.14'] },
+      data: { supportedProtocolVersions: ['1.10', '1.11', '1.12', '1.13', '1.14', '1.15'] },
     });
+  });
+
+  it('exposes agent builder methods only in protocol 1.15', async () => {
+    const legacy = createRuntime().runtime;
+    const legacyInitialized = await legacy.handleRpc(request({ id: 'legacy', method: 'initialize', params: { protocolVersion: '1.14', clientInfo: { name: 'desktop' } } })) as any;
+    expect(legacyInitialized.capabilities.methods).not.toContain('agent/validateConfig');
+    await expect(legacy.handleRpc(request({ id: 'builder', method: 'agent/validateConfig', params: { agent: {} } }))).rejects.toMatchObject({ code: 'METHOD_NOT_FOUND' });
+
+    const current = createRuntime().runtime;
+    const initialized = await current.handleRpc(request({ id: 'current', method: 'initialize', params: { protocolVersion: '1.15', clientInfo: { name: 'desktop' } } })) as any;
+    expect(initialized.capabilities.methods).toEqual(expect.arrayContaining(['agent/createDraft', 'agent/validateConfig', 'agent/saveConfig']));
   });
 
   it('inspects the desktop-safe catalog and pins an exact agent in protocol 1.14', async () => {

@@ -80,6 +80,21 @@ export interface AgentWindowOpen {
   openWindows: number;
   maxWindows: number;
 }
+export interface AgentConfigPreview {
+  path: string;
+  agentsDir: string;
+  exists: boolean;
+  duplicatePaths: string[];
+  targetFingerprint: string;
+  agent: Record<string, unknown>;
+}
+export interface AgentCreatePrepared extends AgentConfigPreview {
+  brief: string;
+  generatorAgent: { requested:string; id:string; name:string };
+  draft: Record<string, unknown>;
+  notes: string[];
+  recommendations: string[];
+}
 export type DesktopAttachmentKind='file'|'image'|'audio';
 export interface AttachmentDraft { id:string; name:string; kind:DesktopAttachmentKind; sizeBytes:number; mimeType?:string; }
 
@@ -131,6 +146,9 @@ export const desktopBootstrap=()=>invoke<DesktopBootstrap>('desktop_bootstrap');
 export const desktopWindowBootstrap=()=>invoke<DesktopWindowBootstrap>('desktop_window_bootstrap');
 export const getDesktopCatalogStatus=()=>invoke<DesktopCatalogStatus>('desktop_catalog_status');
 export const openAgentWindow=(agentId:string)=>invoke<AgentWindowOpen>('open_agent_window',{agentId});
+export const generateAgentDraft=(brief:string,generatorAgent?:string)=>invoke<AgentCreatePrepared>('generate_agent_draft',{brief,generatorAgent});
+export const validateAgentConfig=(agent:Record<string,unknown>,generatorAgent?:string)=>invoke<AgentConfigPreview>('validate_agent_config',{agent,generatorAgent});
+export const saveAgentConfig=(agent:Record<string,unknown>,generatorAgent:string|undefined,overwrite:boolean,expectedPath:string,expectedTargetFingerprint:string)=>invoke<AgentConfigPreview>('save_agent_config',{agent,generatorAgent,overwrite,expectedPath,expectedTargetFingerprint});
 export const saveWindowPresentation=(presentation:{inspectorWidth:number;inspectorOpen:boolean;selection:import('./workbench-state').WorkbenchSelection})=>invoke<void>('save_window_presentation',{presentation});
 export const listenCatalogStatusChanged=(callback:()=>void)=>listen('adaptive-agent://catalog-status-changed',callback);
 

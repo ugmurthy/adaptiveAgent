@@ -37,6 +37,7 @@ const TRACE_PRIVACY_SETTING: &str = "trace_privacy";
 const RECENT_WORK_LIMIT: usize = 10;
 const DEFAULT_MAX_AGENT_WINDOWS: usize = 3;
 const AGENT_WINDOW_PREFIX: &str = "agent:";
+const AGENT_BUILDER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 type Response = Result<Value, String>;
 
@@ -572,9 +573,9 @@ impl AgentRuntimeManager {
             &probe_selection,
         )?;
         let result = (|| {
-            let negotiated = probe.request_wait("initialize", json!({ "protocolVersion": "1.14", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }), REQUEST_TIMEOUT)?;
-            if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.14") {
-                return Err("The sidecar did not negotiate desktop protocol 1.14.".into());
+            let negotiated = probe.request_wait("initialize", json!({ "protocolVersion": "1.15", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }), REQUEST_TIMEOUT)?;
+            if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.15") {
+                return Err("The sidecar did not negotiate desktop protocol 1.15.".into());
             }
             let value = probe.request_wait("catalog/inspect", json!({}), REQUEST_TIMEOUT)?;
             serde_json::from_value(value)
@@ -1637,6 +1638,18 @@ fn bridge_for(
     Ok(bridge)
 }
 
+fn agent_builder_bridge(state: &AppState) -> Result<Arc<Bridge>, String> {
+    state
+        .manager
+        .current()?
+        .bridge
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "The agent builder runtime is unavailable.".into())
+}
+
 fn canonical_path(path: &str) -> Result<PathBuf, String> {
     std::fs::canonicalize(path)
         .map_err(|error| format!("Unable to resolve agent configuration path '{path}': {error}"))
@@ -2032,11 +2045,11 @@ impl Bridge {
     fn initialize(self: &Arc<Self>) -> Result<(), String> {
         let negotiated = self.request_wait(
             "initialize",
-            json!({ "protocolVersion": "1.14", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }),
+            json!({ "protocolVersion": "1.15", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }),
             REQUEST_TIMEOUT,
         )?;
-        if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.14") {
-            return Err("The sidecar did not negotiate desktop protocol 1.14.".into());
+        if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.15") {
+            return Err("The sidecar did not negotiate desktop protocol 1.15.".into());
         }
         let initialized = self.request_wait(
             "runtime/initialize",
@@ -4423,6 +4436,79 @@ fn desktop_catalog_status(
 }
 
 #[tauri::command]
+async fn generate_agent_draft(
+    brief: String,
+    generator_agent: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Value, String> {
+    if brief.trim().is_empty() {
+        return Err("Describe the specialist agent you want to create.".into());
+    }
+    if state.quit.lock().unwrap().state() != QuitState::Idle {
+        return Err("The agent builder is unavailable while the desktop is quitting.".into());
+    }
+    let bridge = agent_builder_bridge(&state)?;
+    let brief = brief.trim().to_owned();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut params = json!({ "brief": brief });
+        if let Some(generator_agent) = generator_agent {
+            params["generatorAgent"] = Value::String(generator_agent);
+        }
+        bridge.request_wait("agent/createDraft", params, AGENT_BUILDER_TIMEOUT)
+    })
+    .await
+    .map_err(|error| format!("Agent draft generation failed: {error}"))?
+}
+
+#[tauri::command]
+async fn validate_agent_config(
+    agent: Value,
+    generator_agent: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Value, String> {
+    let bridge = agent_builder_bridge(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut params = json!({ "agent": agent });
+        if let Some(generator_agent) = generator_agent {
+            params["generatorAgent"] = Value::String(generator_agent);
+        }
+        bridge.request_wait("agent/validateConfig", params, REQUEST_TIMEOUT)
+    })
+    .await
+    .map_err(|error| format!("Agent validation failed: {error}"))?
+}
+
+#[tauri::command]
+async fn save_agent_config(
+    agent: Value,
+    generator_agent: Option<String>,
+    overwrite: bool,
+    expected_path: String,
+    expected_target_fingerprint: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Value, String> {
+    if state.quit.lock().unwrap().state() != QuitState::Idle {
+        return Err("Agent profiles cannot be saved while the desktop is quitting.".into());
+    }
+    let bridge = agent_builder_bridge(&state)?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let mut params = json!({ "agent": agent, "overwrite": overwrite, "expectedPath": expected_path, "expectedTargetFingerprint": expected_target_fingerprint });
+        if let Some(generator_agent) = generator_agent {
+            params["generatorAgent"] = Value::String(generator_agent);
+        }
+        bridge.request_wait(
+            "agent/saveConfig",
+            params,
+            REQUEST_TIMEOUT,
+        )
+    })
+    .await
+    .map_err(|error| format!("Agent save failed: {error}"))??;
+    state.manager.refresh_catalog()?;
+    Ok(result)
+}
+
+#[tauri::command]
 async fn open_agent_window(
     agent_id: String,
     app: AppHandle,
@@ -5473,6 +5559,9 @@ pub fn run() {
             desktop_window_bootstrap,
             desktop_state,
             desktop_catalog_status,
+            generate_agent_draft,
+            validate_agent_config,
+            save_agent_config,
             open_agent_window,
             save_window_presentation,
             reload_settings,

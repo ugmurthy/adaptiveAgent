@@ -7,6 +7,7 @@
   "main": "src/index.ts",
   "exports": {
     ".": "./src/index.ts",
+    "./agent-create": "./src/agent-create.ts",
     "./cli": "./src/cli-api.ts",
     "./runtime-settings": "./src/runtime-settings.ts"
   },
@@ -16,7 +17,7 @@
     "adaptive-agent-gaia-eval": "./dist/evaluate-gaia-jsonl.js"
   },
   "scripts": {
-    "build": "bun build ./src/index.ts ./src/cli-api.ts ./src/adaptive-agent.ts ./src/adaptive-agent-tui.ts ./src/evaluate-gaia-jsonl.ts --outdir dist --target bun",
+    "build": "bun build ./src/index.ts ./src/agent-create.ts ./src/cli-api.ts ./src/adaptive-agent.ts ./src/adaptive-agent-tui.ts ./src/evaluate-gaia-jsonl.ts --outdir dist --target bun",
     "adaptive-agent": "bun run ./dist/adaptive-agent.js",
     "adaptive-agent:tui": "bun run ./src/adaptive-agent-tui.ts",
     "link:global": "bun run ./scripts/link-global.ts",
