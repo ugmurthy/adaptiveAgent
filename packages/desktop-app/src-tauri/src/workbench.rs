@@ -1753,6 +1753,24 @@ mod tests {
     }
 
     #[test]
+    fn reservations_isolate_capacity_between_agents() {
+        let db = WorkbenchDb::open_in_memory().unwrap();
+        for index in 0..3 {
+            let mut run = reservation();
+            run.item_id = format!("agent-item-{index}");
+            run.run_id = format!("agent-run-{index}");
+            db.reserve_task(&run).unwrap();
+        }
+        let mut other = reservation();
+        other.item_id = "other-item".into();
+        other.run_id = "other-run".into();
+        other.agent_id = "other".into();
+        db.reserve_task(&other).unwrap();
+        assert_eq!(db.load_runs_for_agent("agent").unwrap().len(), 3);
+        assert_eq!(db.load_runs_for_agent("other").unwrap().len(), 1);
+    }
+
+    #[test]
     fn chat_turn_reservation_shares_agent_capacity_with_tasks() {
         let db = WorkbenchDb::open_in_memory().unwrap();
         db.create_chat(&ChatItem {
@@ -2170,6 +2188,35 @@ mod tests {
                 .as_deref(),
             Some("keep.json")
         );
+    }
+
+    #[test]
+    fn catalog_removal_and_restore_preserve_agent_history_and_results() {
+        let db = WorkbenchDb::open_in_memory().unwrap();
+        db.reserve_task(&reservation()).unwrap();
+        db.update_run("run", "succeeded", "terminal").unwrap();
+        db.store_result("run", &serde_json::json!({"artifact":"report.md"}))
+            .unwrap();
+
+        db.reconcile_agent_catalog(&[]).unwrap();
+        assert_eq!(db.load_runs_for_agent("agent").unwrap().len(), 1);
+        assert_eq!(
+            db.get_result("run").unwrap(),
+            Some(serde_json::json!({"artifact":"report.md"}))
+        );
+
+        db.reconcile_agent_catalog(&[AgentCatalogMapping {
+            agent_id: "agent".into(),
+            fingerprint: "fingerprint".into(),
+            config_path: "/agents/agent.json".into(),
+        }])
+        .unwrap();
+        let restored = db.load_run_for_agent("agent", "run").unwrap();
+        assert_eq!(
+            restored.agent_config_path.as_deref(),
+            Some("/agents/agent.json")
+        );
+        assert_eq!(restored.cached_status, "succeeded");
     }
 
     #[test]

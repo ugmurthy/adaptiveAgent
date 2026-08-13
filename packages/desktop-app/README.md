@@ -14,6 +14,9 @@ windows by default; set `ADAPTIVE_AGENT_MAX_WINDOWS` to a positive integer befor
 launch to change the limit. Invalid values fall back to three and appear in catalog
 diagnostics.
 
+Release candidates must complete the automated and cross-platform checks in
+[`RELEASE-CHECKLIST.md`](RELEASE-CHECKLIST.md).
+
 This MVP accepts only configured BYOK inference, an agent whose
 `defaultInvocationMode` is `run`, approval mode `auto` or `reject`, and clarification
 mode `fail`. Provider credentials are inherited by the native sidecar. Only an

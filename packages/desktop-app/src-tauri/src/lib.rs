@@ -347,6 +347,23 @@ struct AgentRuntimeManager {
 
 type GenerationKey = (String, String, String);
 
+fn generation_key(agent_id: &str, config_path: &str, fingerprint: &str) -> GenerationKey {
+    (
+        agent_id.to_owned(),
+        config_path.to_owned(),
+        fingerprint.to_owned(),
+    )
+}
+
+fn generation_matches(
+    key: &GenerationKey,
+    agent_id: &str,
+    config_path: &str,
+    fingerprint: &str,
+) -> bool {
+    key.0 == agent_id && key.1 == config_path && key.2 == fingerprint
+}
+
 #[derive(Default)]
 struct RuntimeMaps {
     current: HashMap<String, Arc<ManagedRuntime>>,
@@ -696,30 +713,30 @@ impl AgentRuntimeManager {
             }
             let old_bridge = runtime.bridge.lock().unwrap().as_ref().cloned();
             if let Some(old_bridge) = old_bridge {
-                let target_key = (
-                    agent_id.to_owned(),
-                    descriptor.config_path.clone(),
-                    descriptor.configuration_fingerprint.clone(),
+                let target_key = generation_key(
+                    agent_id,
+                    &descriptor.config_path,
+                    &descriptor.configuration_fingerprint,
                 );
                 let mut maps = self.runtime_maps.lock().unwrap();
                 if maps.retired.contains_key(&target_key) {
                     return Err("GENERATION_COLLISION: This exact runtime generation is already retained and cannot be instantiated twice.".into());
                 }
                 maps.retired.insert(
-                    (
-                        agent_id.to_owned(),
-                        old_bridge.agent_config_path.clone(),
-                        old_bridge.agent_fingerprint.clone(),
+                    generation_key(
+                        agent_id,
+                        &old_bridge.agent_config_path,
+                        &old_bridge.agent_fingerprint,
                     ),
                     runtime.clone(),
                 );
                 maps.current.remove(agent_id);
             }
         }
-        let target_key = (
-            agent_id.to_owned(),
-            descriptor.config_path.clone(),
-            descriptor.configuration_fingerprint.clone(),
+        let target_key = generation_key(
+            agent_id,
+            &descriptor.config_path,
+            &descriptor.configuration_fingerprint,
         );
         {
             let maps = self.runtime_maps.lock().unwrap();
@@ -734,9 +751,12 @@ impl AgentRuntimeManager {
                         .unwrap()
                         .as_ref()
                         .is_some_and(|bridge| {
-                            bridge.agent_id == target_key.0
-                                && bridge.agent_config_path == target_key.1
-                                && bridge.agent_fingerprint == target_key.2
+                            generation_matches(
+                                &target_key,
+                                &bridge.agent_id,
+                                &bridge.agent_config_path,
+                                &bridge.agent_fingerprint,
+                            )
                         })
                 })
             {
@@ -1143,13 +1163,21 @@ impl AgentRuntimeManager {
 
     fn runtime_for_run(&self, agent_id: &str, run_id: &str) -> Result<Arc<ManagedRuntime>, String> {
         let owner = self.workbench.load_run_for_agent(agent_id, run_id)?;
+        let owner_config_path = owner.agent_config_path.as_deref().ok_or_else(|| {
+            "GENERATION_UNAVAILABLE: This run has no agent configuration provenance.".to_string()
+        })?;
+        let owner_key =
+            generation_key(&owner.agent_id, owner_config_path, &owner.agent_fingerprint);
         let maps = self.runtime_maps.lock().unwrap();
         maps.current.get(agent_id).into_iter().chain(maps.retired.values())
             .find(|runtime| {
                 runtime.bridge.lock().unwrap().as_ref().is_some_and(|bridge| {
-                    bridge.agent_id == owner.agent_id
-                        && bridge.agent_fingerprint == owner.agent_fingerprint
-                        && owner.agent_config_path.as_deref() == Some(&bridge.agent_config_path)
+                    generation_matches(
+                        &owner_key,
+                        &bridge.agent_id,
+                        &bridge.agent_config_path,
+                        &bridge.agent_fingerprint,
+                    )
                 })
             }).cloned()
             .ok_or_else(|| {
@@ -1544,6 +1572,45 @@ fn parse_agent_window_limit(value: Option<&str>) -> (usize, Option<Value>) {
                 })),
             ),
         },
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AgentWindowPolicy {
+    Focus,
+    Create,
+    Closing,
+    LimitReached,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WindowCloseScope {
+    AgentWorkspace,
+    Application,
+}
+
+fn window_close_scope(label: &str) -> WindowCloseScope {
+    if agent_id_from_window_label(label).is_some() {
+        WindowCloseScope::AgentWorkspace
+    } else {
+        WindowCloseScope::Application
+    }
+}
+
+fn agent_window_policy(
+    already_open: bool,
+    closing: bool,
+    open_windows: usize,
+    max_windows: usize,
+) -> AgentWindowPolicy {
+    if closing {
+        AgentWindowPolicy::Closing
+    } else if already_open {
+        AgentWindowPolicy::Focus
+    } else if open_windows >= max_windows {
+        AgentWindowPolicy::LimitReached
+    } else {
+        AgentWindowPolicy::Create
     }
 }
 
@@ -4622,12 +4689,30 @@ async fn open_agent_window(
         return Err("The desktop is quitting and cannot open an agent workspace.".into());
     }
     let label = agent_window_label(&agent_id);
-    if state.closing_agent_windows.lock().unwrap().contains(&label) {
-        return Err(format!(
-            "Agent window for '{agent_id}' is closing; try again."
-        ));
+    let closing = state.closing_agent_windows.lock().unwrap().contains(&label);
+    let existing = app.get_webview_window(&label);
+    let open_windows = open_agent_window_count(&app, state.inner());
+    match agent_window_policy(
+        existing.is_some(),
+        closing,
+        open_windows,
+        state.max_agent_windows,
+    ) {
+        AgentWindowPolicy::Closing => {
+            return Err(format!(
+                "Agent window for '{agent_id}' is closing; try again."
+            ));
+        }
+        AgentWindowPolicy::LimitReached => {
+            return Err(format!(
+                "Agent window limit reached ({}/{}). Close an agent window before opening another.",
+                open_windows, state.max_agent_windows
+            ));
+        }
+        AgentWindowPolicy::Focus => {}
+        AgentWindowPolicy::Create => {}
     }
-    if let Some(window) = app.get_webview_window(&label) {
+    if let Some(window) = existing {
         window
             .unminimize()
             .map_err(|error| format!("Unable to restore agent window: {error}"))?;
@@ -4638,20 +4723,12 @@ async fn open_agent_window(
         window
             .set_focus()
             .map_err(|error| format!("Unable to focus agent window: {error}"))?;
-        let open_windows = open_agent_window_count(&app, state.inner());
         return Ok(AgentWindowOpen {
             agent_id,
             disposition: "focused",
             open_windows,
             max_windows: state.max_agent_windows,
         });
-    }
-    let open_windows = open_agent_window_count(&app, state.inner());
-    if open_windows >= state.max_agent_windows {
-        return Err(format!(
-            "Agent window limit reached ({}/{}). Close an agent window before opening another.",
-            open_windows, state.max_agent_windows
-        ));
     }
     // Archived profiles may open a read-only workspace for history and artifacts.
     // Work submission still calls bridge_for(..., false) and remains blocked.
@@ -5698,7 +5775,7 @@ pub fn run() {
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if agent_id_from_window_label(window.label()).is_some() {
+                if window_close_scope(window.label()) == WindowCloseScope::AgentWorkspace {
                     window
                         .app_handle()
                         .state::<AppState>()
@@ -5730,7 +5807,7 @@ pub fn run() {
                     CloseDecision::Allow => {}
                 }
             } else if matches!(event, tauri::WindowEvent::Destroyed)
-                && agent_id_from_window_label(window.label()).is_some()
+                && window_close_scope(window.label()) == WindowCloseScope::AgentWorkspace
             {
                 window
                     .app_handle()
@@ -6514,6 +6591,29 @@ mod tests {
     }
 
     #[test]
+    fn runtime_generation_identity_rolls_over_on_profile_edits() {
+        let original = generation_key("agent", "/agents/agent.json", "fingerprint-1");
+        assert!(generation_matches(
+            &original,
+            "agent",
+            "/agents/agent.json",
+            "fingerprint-1"
+        ));
+        assert_ne!(
+            original,
+            generation_key("agent", "/agents/agent.json", "fingerprint-2")
+        );
+        assert_ne!(
+            original,
+            generation_key("agent", "/agents/moved.json", "fingerprint-1")
+        );
+        assert_ne!(
+            original,
+            generation_key("other", "/agents/agent.json", "fingerprint-1")
+        );
+    }
+
+    #[test]
     fn convergence_replaces_valid_archived_runtime_and_retires_unusable_descriptors() {
         assert_eq!(
             AgentRuntimeManager::convergence_action(Some(&descriptor("old", "valid", true))),
@@ -6603,6 +6703,35 @@ mod tests {
                 Some("invalid-agent-window-limit")
             );
         }
+    }
+
+    #[test]
+    fn agent_window_policy_reuses_before_enforcing_the_global_limit() {
+        assert_eq!(
+            agent_window_policy(true, false, 3, 3),
+            AgentWindowPolicy::Focus
+        );
+        assert_eq!(
+            agent_window_policy(false, false, 3, 3),
+            AgentWindowPolicy::LimitReached
+        );
+        assert_eq!(
+            agent_window_policy(false, false, 2, 3),
+            AgentWindowPolicy::Create
+        );
+    }
+
+    #[test]
+    fn closing_agent_window_cannot_be_reopened_until_destroyed() {
+        assert_eq!(
+            agent_window_policy(true, true, 2, 3),
+            AgentWindowPolicy::Closing
+        );
+        assert_eq!(
+            window_close_scope(&agent_window_label("busy-agent")),
+            WindowCloseScope::AgentWorkspace
+        );
+        assert_eq!(window_close_scope("main"), WindowCloseScope::Application);
     }
 
     #[test]

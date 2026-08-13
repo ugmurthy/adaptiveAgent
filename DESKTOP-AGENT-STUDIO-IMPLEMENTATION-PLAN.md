@@ -303,13 +303,22 @@ Test macOS, Windows, and Linux for:
 
 ### Rollout
 
-1. Ship catalog and persistence migration behind a feature flag.
-2. Enable the Agent Studio with same-window navigation first.
-3. Enable native windows after agent-scoped runtimes are stable.
-4. Enable builder and lifecycle management last.
-5. Remove legacy single-agent startup assumptions after migration coverage is proven.
+1. Ship Agent Studio as one atomic compatibility unit: renderer, Rust host, desktop
+   sidecar protocol 1.16, and forward-only SQLite migrations.
+2. Promote the same packaged build through internal, canary, and broad distribution
+   cohorts using the distribution channel's release controls.
+3. Do not provide a runtime switch back to legacy single-agent writers after
+   `workbench.sqlite` has been opened and migrated.
+4. Halt further rollout by withdrawing the package. Forward-fix installations that
+   already upgraded; downgrade only by restoring matching pre-upgrade application data
+   together with the previous package.
+5. Treat the former same-window, native-window, and lifecycle stages as validation gates,
+   not independently toggleable runtime modes.
 
 ## Release cuts
+
+Releases A-C are development and validation cuts. They are not independently distributable
+packages that may mix renderer, host, protocol, or database compatibility versions.
 
 ### Release A: Multi-agent foundation
 
