@@ -6,6 +6,10 @@ export function isLaunchable(agent: DesktopCatalogAgent): boolean {
   return !agent.archived && agent.validationState === 'valid';
 }
 
+export function isInspectable(agent: DesktopCatalogAgent): boolean {
+  return agent.validationState === 'valid';
+}
+
 export function filterAndSortAgents(agents: DesktopCatalogAgent[], query: string, showArchived: boolean): DesktopCatalogAgent[] {
   const needle = query.trim().toLocaleLowerCase();
   return agents.filter((agent) => (showArchived || !agent.archived) && (!needle || `${agent.name} ${agent.description ?? ''} ${agent.id}`.toLocaleLowerCase().includes(needle)))

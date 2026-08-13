@@ -2,7 +2,7 @@ import { access, link, mkdir, open, readFile, rename, unlink, writeFile } from '
 import { createHash, randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline/promises';
 import { stdin, stderr } from 'node:process';
-import { resolve } from 'node:path';
+import { basename, dirname, resolve } from 'node:path';
 
 import type { JsonObject, JsonSchema, JsonValue, RunResult } from '@adaptive-agent/core';
 
@@ -106,6 +106,30 @@ export interface AgentConfigSaveOptions {
   overwrite?: boolean;
   expectedPath?: string;
   expectedTargetFingerprint?: string;
+}
+
+export interface AgentProfileLifecycleOptions {
+  agentId: string;
+  configPath: string;
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+  settingsConfigPath?: string;
+  generatorAgent?: string;
+}
+
+export interface AgentProfileContent {
+  agentId: string;
+  configPath: string;
+  fileName: string;
+  archived: boolean;
+  content: string;
+}
+
+export interface AgentProfileMove {
+  agentId: string;
+  previousPath: string;
+  configPath: string;
+  archived: boolean;
 }
 
 const DEFAULT_GENERATOR_AGENT = 'default-agent';
@@ -330,6 +354,68 @@ export async function saveAgentConfig(options: AgentConfigSaveOptions): Promise<
       throw error;
     }
     return prepared;
+  });
+}
+
+/** Read the exact stored profile bytes after resolving an immutable catalog identity. */
+export async function readAgentProfile(options: AgentProfileLifecycleOptions): Promise<AgentProfileContent> {
+  const selected = await resolveLifecycleProfile(options);
+  return {
+    agentId: selected.agent.id,
+    configPath: selected.agent.configPath,
+    fileName: basename(selected.agent.configPath),
+    archived: selected.agent.archived,
+    content: await readFile(selected.agent.configPath, 'utf8'),
+  };
+}
+
+/** Atomically move an active profile into its configured catalog archive directory. */
+export async function archiveAgentProfile(options: AgentProfileLifecycleOptions): Promise<AgentProfileMove> {
+  const selected = await resolveLifecycleProfile(options);
+  if (selected.agent.archived) throw new Error(`Agent "${selected.agent.id}" is already archived.`);
+  const agentsDir = selected.config.agents.dirs.find((dir) => dirname(selected.agent.configPath) === dir);
+  if (!agentsDir) throw new Error(`Agent "${selected.agent.id}" is not stored directly in a configured agents directory and cannot be archived.`);
+  return moveAgentProfile(selected.agent.id, selected.agent.configPath, resolve(agentsDir, '.archive', basename(selected.agent.configPath)), true, agentsDir);
+}
+
+/** Atomically restore an archived profile to its configured active catalog directory. */
+export async function restoreAgentProfile(options: AgentProfileLifecycleOptions): Promise<AgentProfileMove> {
+  const selected = await resolveLifecycleProfile(options);
+  if (!selected.agent.archived) throw new Error(`Agent "${selected.agent.id}" is not archived.`);
+  const agentsDir = selected.config.agents.dirs.find((dir) => dirname(selected.agent.configPath) === resolve(dir, '.archive'));
+  if (!agentsDir) throw new Error(`Agent "${selected.agent.id}" is not stored in a configured archive directory and cannot be restored.`);
+  return moveAgentProfile(selected.agent.id, selected.agent.configPath, resolve(agentsDir, basename(selected.agent.configPath)), false, agentsDir);
+}
+
+async function resolveLifecycleProfile(options: AgentProfileLifecycleOptions) {
+  const cwd = resolve(options.cwd ?? process.cwd());
+  const env = options.env ?? process.env;
+  const generatorAgent = options.generatorAgent ?? DEFAULT_GENERATOR_AGENT;
+  const catalog = await inspectAgentSdkCatalog({ cwd, env, settingsConfigPath: options.settingsConfigPath, agentConfigPath: generatorAgent });
+  const selectedPath = resolve(cwd, options.configPath);
+  const matches = catalog.agents.filter((candidate) => candidate.id === options.agentId && candidate.configPath === selectedPath);
+  if (matches.length !== 1 || matches[0]!.validationState !== 'valid') {
+    throw new Error(`Agent profile selection for "${options.agentId}" is stale or invalid; refresh the catalog and try again.`);
+  }
+  return { agent: matches[0]!, config: catalog.config };
+}
+
+async function moveAgentProfile(agentId: string, source: string, destination: string, archived: boolean, agentsDir: string): Promise<AgentProfileMove> {
+  return withAgentCatalogLock(agentsDir, async () => {
+    await mkdir(dirname(destination), { recursive: true });
+    try {
+      await link(source, destination);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new Error(`Agent profile destination already exists at ${destination}; resolve it before continuing.`);
+      throw error;
+    }
+    try {
+      await unlink(source);
+    } catch (error) {
+      await unlink(destination).catch(() => undefined);
+      throw error;
+    }
+    return { agentId, previousPath: source, configPath: destination, archived };
   });
 }
 

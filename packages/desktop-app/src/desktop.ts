@@ -95,6 +95,12 @@ export interface AgentCreatePrepared extends AgentConfigPreview {
   notes: string[];
   recommendations: string[];
 }
+export interface AgentProfileMove {
+  agentId: string;
+  previousPath: string;
+  configPath: string;
+  archived: boolean;
+}
 export type DesktopAttachmentKind='file'|'image'|'audio';
 export interface AttachmentDraft { id:string; name:string; kind:DesktopAttachmentKind; sizeBytes:number; mimeType?:string; }
 
@@ -149,6 +155,9 @@ export const openAgentWindow=(agentId:string)=>invoke<AgentWindowOpen>('open_age
 export const generateAgentDraft=(brief:string,generatorAgent?:string)=>invoke<AgentCreatePrepared>('generate_agent_draft',{brief,generatorAgent});
 export const validateAgentConfig=(agent:Record<string,unknown>,generatorAgent?:string)=>invoke<AgentConfigPreview>('validate_agent_config',{agent,generatorAgent});
 export const saveAgentConfig=(agent:Record<string,unknown>,generatorAgent:string|undefined,overwrite:boolean,expectedPath:string,expectedTargetFingerprint:string)=>invoke<AgentConfigPreview>('save_agent_config',{agent,generatorAgent,overwrite,expectedPath,expectedTargetFingerprint});
+export const exportAgentConfig=(agentId:string,configPath:string)=>invoke<string|null>('export_agent_config',{agentId,configPath});
+export const archiveAgentConfig=(agentId:string,configPath:string)=>invoke<AgentProfileMove>('archive_agent_config',{agentId,configPath});
+export const restoreAgentConfig=(agentId:string,configPath:string)=>invoke<AgentProfileMove>('restore_agent_config',{agentId,configPath});
 export const saveWindowPresentation=(presentation:{inspectorWidth:number;inspectorOpen:boolean;selection:import('./workbench-state').WorkbenchSelection})=>invoke<void>('save_window_presentation',{presentation});
 export const listenCatalogStatusChanged=(callback:()=>void)=>listen('adaptive-agent://catalog-status-changed',callback);
 

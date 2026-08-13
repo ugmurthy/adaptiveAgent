@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { prepareAgentConfigSave, renderAgentCreatePreview, runAgentCreate, saveAgentConfig, type AgentCreateDraft } from './agent-create.js';
+import { archiveAgentProfile, prepareAgentConfigSave, readAgentProfile, renderAgentCreatePreview, restoreAgentProfile, runAgentCreate, saveAgentConfig, type AgentCreateDraft } from './agent-create.js';
 import type { AgentConfigFile } from './index.js';
 
 describe('agent-create', () => {
@@ -234,6 +234,35 @@ describe('agent-create', () => {
     await expect(prepareAgentConfigSave({ agent, cwd: tempDir, settingsConfigPath: settingsPath })).resolves.toMatchObject({
       agent: { id: 'settings-model-agent', model: {} },
     });
+  });
+
+  it('exports exact profile JSON and atomically archives and restores it', async () => {
+    const path = join(agentsDir, 'lifecycle-agent.json');
+    const content = `${JSON.stringify({ ...generatorAgent(), id: 'lifecycle-agent', name: 'Lifecycle' }, null, 4)}\n`;
+    await writeFile(path, content);
+    const selection = { agentId: 'lifecycle-agent', configPath: path, cwd: tempDir, settingsConfigPath: settingsPath };
+
+    await expect(readAgentProfile(selection)).resolves.toMatchObject({ content, configPath: path, archived: false });
+    const archived = await archiveAgentProfile(selection);
+    expect(archived).toMatchObject({ previousPath: path, archived: true, configPath: join(agentsDir, '.archive', 'lifecycle-agent.json') });
+    await expect(readFile(path, 'utf8')).rejects.toThrow();
+    expect(await readFile(archived.configPath, 'utf8')).toBe(content);
+
+    const restored = await restoreAgentProfile({ ...selection, configPath: archived.configPath });
+    expect(restored).toMatchObject({ previousPath: archived.configPath, configPath: path, archived: false });
+    expect(await readFile(path, 'utf8')).toBe(content);
+  });
+
+  it('refuses stale selections and archive or restore destination collisions', async () => {
+    const path = join(agentsDir, 'collision-agent.json');
+    const archivedPath = join(agentsDir, '.archive', 'collision-agent.json');
+    const profile = { ...generatorAgent(), id: 'collision-agent', name: 'Collision' };
+    await mkdir(join(agentsDir, '.archive'), { recursive: true });
+    await writeFile(path, JSON.stringify(profile));
+    await expect(readAgentProfile({ agentId: 'wrong-id', configPath: path, cwd: tempDir, settingsConfigPath: settingsPath })).rejects.toThrow('stale or invalid');
+    await writeFile(archivedPath, JSON.stringify({ ...profile, id: 'other-agent' }));
+    await expect(archiveAgentProfile({ agentId: 'collision-agent', configPath: path, cwd: tempDir, settingsConfigPath: settingsPath })).rejects.toThrow('destination already exists');
+    expect(JSON.parse(await readFile(path, 'utf8')).id).toBe('collision-agent');
   });
 });
 

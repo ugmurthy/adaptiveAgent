@@ -157,6 +157,13 @@ struct AgentWindowOpen {
     max_windows: usize,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentProfileContent {
+    file_name: String,
+    content: String,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopWindowBootstrap {
@@ -573,9 +580,9 @@ impl AgentRuntimeManager {
             &probe_selection,
         )?;
         let result = (|| {
-            let negotiated = probe.request_wait("initialize", json!({ "protocolVersion": "1.15", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }), REQUEST_TIMEOUT)?;
-            if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.15") {
-                return Err("The sidecar did not negotiate desktop protocol 1.15.".into());
+            let negotiated = probe.request_wait("initialize", json!({ "protocolVersion": "1.16", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }), REQUEST_TIMEOUT)?;
+            if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.16") {
+                return Err("The sidecar did not negotiate desktop protocol 1.16.".into());
             }
             let value = probe.request_wait("catalog/inspect", json!({}), REQUEST_TIMEOUT)?;
             serde_json::from_value(value)
@@ -2045,11 +2052,11 @@ impl Bridge {
     fn initialize(self: &Arc<Self>) -> Result<(), String> {
         let negotiated = self.request_wait(
             "initialize",
-            json!({ "protocolVersion": "1.15", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }),
+            json!({ "protocolVersion": "1.16", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }),
             REQUEST_TIMEOUT,
         )?;
-        if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.15") {
-            return Err("The sidecar did not negotiate desktop protocol 1.15.".into());
+        if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.16") {
+            return Err("The sidecar did not negotiate desktop protocol 1.16.".into());
         }
         let initialized = self.request_wait(
             "runtime/initialize",
@@ -4509,6 +4516,99 @@ async fn save_agent_config(
 }
 
 #[tauri::command]
+async fn export_agent_config(
+    agent_id: String,
+    config_path: String,
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    let bridge = agent_builder_bridge(&state)?;
+    let profile = tauri::async_runtime::spawn_blocking(move || {
+        bridge.request_wait(
+            "agent/readConfig",
+            json!({ "agentId": agent_id, "configPath": config_path }),
+            REQUEST_TIMEOUT,
+        )
+    })
+    .await
+    .map_err(|error| format!("Agent export failed: {error}"))??;
+    let profile: AgentProfileContent = serde_json::from_value(profile)
+        .map_err(|error| format!("Invalid agent profile response: {error}"))?;
+    let Some(selected) = app
+        .dialog()
+        .file()
+        .add_filter("Agent JSON", &["json"])
+        .set_file_name(&profile.file_name)
+        .blocking_save_file()
+    else {
+        return Ok(None);
+    };
+    let path = selected
+        .into_path()
+        .map_err(|_| "The selected export destination is not a local file.".to_string())?;
+    std::fs::write(&path, profile.content.as_bytes())
+        .map_err(|error| format!("Unable to export agent profile: {error}"))?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+async fn archive_agent_config(
+    agent_id: String,
+    config_path: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Value, String> {
+    if state.quit.lock().unwrap().state() != QuitState::Idle {
+        return Err("Agent profiles cannot be archived while the desktop is quitting.".into());
+    }
+    if state
+        .manager
+        .catalog
+        .lock()
+        .unwrap()
+        .current_agent_id
+        .as_deref()
+        == Some(agent_id.as_str())
+    {
+        return Err("The currently selected startup agent cannot be archived. Select another startup agent first.".into());
+    }
+    let bridge = agent_builder_bridge(&state)?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        bridge.request_wait(
+            "agent/archiveConfig",
+            json!({ "agentId": agent_id, "configPath": config_path }),
+            REQUEST_TIMEOUT,
+        )
+    })
+    .await
+    .map_err(|error| format!("Agent archive failed: {error}"))??;
+    state.manager.refresh_catalog()?;
+    Ok(result)
+}
+
+#[tauri::command]
+async fn restore_agent_config(
+    agent_id: String,
+    config_path: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Value, String> {
+    if state.quit.lock().unwrap().state() != QuitState::Idle {
+        return Err("Agent profiles cannot be restored while the desktop is quitting.".into());
+    }
+    let bridge = agent_builder_bridge(&state)?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        bridge.request_wait(
+            "agent/restoreConfig",
+            json!({ "agentId": agent_id, "configPath": config_path }),
+            REQUEST_TIMEOUT,
+        )
+    })
+    .await
+    .map_err(|error| format!("Agent restore failed: {error}"))??;
+    state.manager.refresh_catalog()?;
+    Ok(result)
+}
+
+#[tauri::command]
 async fn open_agent_window(
     agent_id: String,
     app: AppHandle,
@@ -4553,7 +4653,9 @@ async fn open_agent_window(
             open_windows, state.max_agent_windows
         ));
     }
-    let runtime = state.manager.ensure_runtime(&agent_id, false)?;
+    // Archived profiles may open a read-only workspace for history and artifacts.
+    // Work submission still calls bridge_for(..., false) and remains blocked.
+    let runtime = state.manager.ensure_runtime(&agent_id, true)?;
     let bridge = runtime
         .bridge
         .lock()
@@ -5562,6 +5664,9 @@ pub fn run() {
             generate_agent_draft,
             validate_agent_config,
             save_agent_config,
+            export_agent_config,
+            archive_agent_config,
+            restore_agent_config,
             open_agent_window,
             save_window_presentation,
             reload_settings,

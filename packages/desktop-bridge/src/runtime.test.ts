@@ -146,7 +146,7 @@ describe('desktop runtime protocol', () => {
       params: { protocolVersion: '2.0', clientInfo: { name: 'desktop' } },
     }))).rejects.toMatchObject({
       code: 'UNSUPPORTED_PROTOCOL_VERSION',
-      data: { supportedProtocolVersions: ['1.10', '1.11', '1.12', '1.13', '1.14', '1.15'] },
+      data: { supportedProtocolVersions: ['1.10', '1.11', '1.12', '1.13', '1.14', '1.15', '1.16'] },
     });
   });
 
@@ -159,6 +159,11 @@ describe('desktop runtime protocol', () => {
     const current = createRuntime().runtime;
     const initialized = await current.handleRpc(request({ id: 'current', method: 'initialize', params: { protocolVersion: '1.15', clientInfo: { name: 'desktop' } } })) as any;
     expect(initialized.capabilities.methods).toEqual(expect.arrayContaining(['agent/createDraft', 'agent/validateConfig', 'agent/saveConfig']));
+    expect(initialized.capabilities.methods).not.toContain('agent/archiveConfig');
+
+    const lifecycle = createRuntime().runtime;
+    const lifecycleInitialized = await lifecycle.handleRpc(request({ id: 'lifecycle', method: 'initialize', params: { protocolVersion: '1.16', clientInfo: { name: 'desktop' } } })) as any;
+    expect(lifecycleInitialized.capabilities.methods).toEqual(expect.arrayContaining(['agent/readConfig', 'agent/archiveConfig', 'agent/restoreConfig']));
   });
 
   it('inspects the desktop-safe catalog and pins an exact agent in protocol 1.14', async () => {

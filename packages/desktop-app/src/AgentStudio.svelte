@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import BrandMark from './BrandMark.svelte';
-  import { aggregateRecentWork, agentsNeedingAttention, filterAndSortAgents, isLaunchable } from './agent-studio';
-  import { generateAgentDraft, getDesktopCatalogStatus, listenCatalogStatusChanged, openAgentWindow, quitCancel, quitTerminate, quitWait, saveAgentConfig, validateAgentConfig, type AgentConfigPreview, type DesktopCatalogStatus } from './desktop';
+  import { aggregateRecentWork, agentsNeedingAttention, filterAndSortAgents, isInspectable } from './agent-studio';
+  import { archiveAgentConfig, exportAgentConfig, generateAgentDraft, getDesktopCatalogStatus, listenCatalogStatusChanged, openAgentWindow, quitCancel, quitTerminate, quitWait, restoreAgentConfig, saveAgentConfig, validateAgentConfig, type AgentConfigPreview, type DesktopCatalogAgent, type DesktopCatalogStatus } from './desktop';
 
   let catalog: DesktopCatalogStatus | undefined;
   let loading = true;
@@ -10,6 +10,7 @@
   let query = '';
   let showArchived = false;
   let openingId = '';
+  let lifecycleId = '';
   let refreshTimer: number | undefined;
   let refreshGeneration = 0;
   let disposed = false;
@@ -61,6 +62,22 @@
       await (action === 'wait' ? quitWait() : action === 'terminate' ? quitTerminate() : quitCancel());
       await refresh();
     } catch (cause) { error = String(cause); }
+  }
+  async function exportProfile(agent: DesktopCatalogAgent) {
+    lifecycleId = agent.id; error = '';
+    try { await exportAgentConfig(agent.id, agent.configPath); }
+    catch (cause) { error = String(cause); }
+    finally { lifecycleId = ''; }
+  }
+  async function moveProfile(agent: DesktopCatalogAgent) {
+    const action = agent.archived ? 'restore' : 'archive';
+    if (!window.confirm(`${action === 'archive' ? 'Archive' : 'Restore'} ${agent.name}? ${action === 'archive' ? 'Its history and artifacts will remain available, but it cannot start new work until restored.' : 'It will be available for new work again.'}`)) return;
+    lifecycleId = agent.id; error = '';
+    try {
+      await (agent.archived ? restoreAgentConfig(agent.id, agent.configPath) : archiveAgentConfig(agent.id, agent.configPath));
+      await refresh();
+    } catch (cause) { error = String(cause); }
+    finally { lifecycleId = ''; }
   }
   function openBuilder(mode: 'describe' | 'json') {
     builderOpen = true; builderMode = mode; builderStep = 'input'; builderBrief = ''; builderJson = '';
@@ -170,11 +187,11 @@
           <div class="agent-grid">
             {#each agents as agent (agent.id)}
               <article class:agent-muted={agent.archived || agent.validationState !== 'valid'} class="agent-card">
-                <header><span class="agent-avatar" aria-hidden="true">{agent.name.trim().charAt(0).toUpperCase() || 'A'}</span><div><h3>{agent.name}</h3><code>{agent.id}</code></div>{#if agent.archived}<span class="badge">Archived</span>{/if}</header>
+                <header><span class="agent-avatar" aria-hidden="true">{agent.name.trim().charAt(0).toUpperCase() || 'A'}</span><div><h3>{agent.name}</h3><code>{agent.id}</code></div>{#if agent.archived}<span class="badge">Archived</span>{/if}<details class="agent-actions"><summary aria-label={`Actions for ${agent.name}`}>•••</summary><div><button type="button" disabled={lifecycleId !== '' || agent.validationState !== 'valid'} on:click={() => exportProfile(agent)}>Export JSON</button><button type="button" class:danger={!agent.archived} title={!agent.archived && catalog.currentAgentId === agent.id ? 'Select another startup agent before archiving this profile.' : undefined} disabled={lifecycleId !== '' || agent.validationState !== 'valid' || (!agent.archived && catalog.currentAgentId === agent.id)} on:click={() => moveProfile(agent)}>{agent.archived ? 'Restore agent' : 'Archive agent'}</button></div></details></header>
                 <p>{agent.description || 'No description provided.'}</p>
                 <div class="agent-metrics"><span class="status-dot" class:good={agent.status === 'ready'}>{agent.status}</span><span>{agent.occupiedSlots}/{agent.capacity} runs</span>{#if agent.attention !== 'none'}<strong class="attention">{agent.attention} needs attention</strong>{/if}</div>
                 <div class="card-recent"><strong>Recent work</strong>{#if agent.recentWork[0]}<span>{agent.recentWork[0].title}</span><small>{agent.recentWork[0].status} · {date(agent.recentWork[0].createdAt)}</small>{:else}<small>No recent work</small>{/if}</div>
-                <button class="primary" type="button" disabled={!isLaunchable(agent) || openingId !== ''} on:click={() => open(agent.id)}>{openingId === agent.id ? 'Opening…' : 'Open workspace'}</button>
+                <button class="primary" type="button" disabled={!isInspectable(agent) || openingId !== '' || lifecycleId !== ''} on:click={() => open(agent.id)}>{openingId === agent.id ? 'Opening…' : agent.archived ? 'Inspect history' : 'Open workspace'}</button>
                 {#if agent.validationState !== 'valid'}<small class="invalid-copy">Configuration: {agent.validationState}. Resolve diagnostics before opening.</small>{/if}
               </article>
             {/each}

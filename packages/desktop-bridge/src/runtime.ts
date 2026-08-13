@@ -9,8 +9,11 @@ import {
   type ResolvedAgentSdkConfig,
 } from '@adaptive-agent/agent-sdk';
 import {
+  archiveAgentProfile,
   prepareAgentConfigSave,
   prepareAgentCreate,
+  readAgentProfile,
+  restoreAgentProfile,
   saveAgentConfig,
 } from '@adaptive-agent/agent-sdk/agent-create';
 import {
@@ -146,21 +149,23 @@ export class DesktopRuntime {
       && (request.method.startsWith('history/') || request.method === 'settings/update')) {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', `${request.method} requires desktop protocol 1.12.`, JSON_RPC_ERROR_CODES.methodNotFound);
     }
-    if (!['1.13', '1.14', '1.15'].includes(this.negotiatedProtocolVersion)
+    if (!['1.13', '1.14', '1.15', '1.16'].includes(this.negotiatedProtocolVersion)
       && request.method.startsWith('execution/')) {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', `${request.method} requires desktop protocol 1.13.`, JSON_RPC_ERROR_CODES.methodNotFound);
     }
-    if (!['1.14', '1.15'].includes(this.negotiatedProtocolVersion) && request.method === 'catalog/inspect') {
+    if (!['1.14', '1.15', '1.16'].includes(this.negotiatedProtocolVersion) && request.method === 'catalog/inspect') {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', 'catalog/inspect requires desktop protocol 1.14.', JSON_RPC_ERROR_CODES.methodNotFound);
     }
-    if (this.negotiatedProtocolVersion !== '1.15' && request.method.startsWith('agent/')
-      && !['agent/run', 'agent/chat'].includes(request.method)) {
+    if (!['1.15', '1.16'].includes(this.negotiatedProtocolVersion) && ['agent/createDraft', 'agent/validateConfig', 'agent/saveConfig'].includes(request.method)) {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', `${request.method} requires desktop protocol 1.15.`, JSON_RPC_ERROR_CODES.methodNotFound);
     }
-    if (!['1.14', '1.15'].includes(this.negotiatedProtocolVersion) && request.method === 'runtime/initialize' && request.params?.agentSelection) {
+    if (this.negotiatedProtocolVersion !== '1.16' && ['agent/readConfig', 'agent/archiveConfig', 'agent/restoreConfig'].includes(request.method)) {
+      throw new DesktopProtocolError('METHOD_NOT_FOUND', `${request.method} requires desktop protocol 1.16.`, JSON_RPC_ERROR_CODES.methodNotFound);
+    }
+    if (!['1.14', '1.15', '1.16'].includes(this.negotiatedProtocolVersion) && request.method === 'runtime/initialize' && request.params?.agentSelection) {
       throw new DesktopProtocolError('INVALID_PARAMS', 'Exact agent selection requires desktop protocol 1.14.', JSON_RPC_ERROR_CODES.invalidParams);
     }
-    if (!['1.13', '1.14', '1.15'].includes(this.negotiatedProtocolVersion) && hasV113Fields(request)) {
+    if (!['1.13', '1.14', '1.15', '1.16'].includes(this.negotiatedProtocolVersion) && hasV113Fields(request)) {
       throw new DesktopProtocolError('INVALID_PARAMS', 'Attachment and execution-envelope fields require desktop protocol 1.13.', JSON_RPC_ERROR_CODES.invalidParams);
     }
 
@@ -310,6 +315,27 @@ export class DesktopRuntime {
           expectedPath: request.params!.expectedPath,
           expectedTargetFingerprint: request.params!.expectedTargetFingerprint,
         })));
+      case 'agent/readConfig':
+        return this.withAgentBuilder(async () => asJsonValue(await readAgentProfile({
+          ...request.params!,
+          cwd: this.settingsCwd,
+          settingsConfigPath: this.settingsPath,
+          generatorAgent: request.params!.generatorAgent ?? this.requireSdk().config.agent.id,
+        })));
+      case 'agent/archiveConfig':
+        return this.withAgentBuilder(async () => asJsonValue(await archiveAgentProfile({
+          ...request.params!,
+          cwd: this.settingsCwd,
+          settingsConfigPath: this.settingsPath,
+          generatorAgent: request.params!.generatorAgent ?? this.requireSdk().config.agent.id,
+        })));
+      case 'agent/restoreConfig':
+        return this.withAgentBuilder(async () => asJsonValue(await restoreAgentProfile({
+          ...request.params!,
+          cwd: this.settingsCwd,
+          settingsConfigPath: this.settingsPath,
+          generatorAgent: request.params!.generatorAgent ?? this.requireSdk().config.agent.id,
+        })));
       case 'cli/commands':
         return this.cliCommands();
       case 'cli/execute':
@@ -377,9 +403,10 @@ export class DesktopRuntime {
         methods: DESKTOP_RPC_METHODS.filter((method) => {
           if (this.negotiatedProtocolVersion === '1.10' && method === 'auth/updateAccessToken') return false;
           if (this.negotiatedProtocolVersion === '1.10' || this.negotiatedProtocolVersion === '1.11') if (method.startsWith('history/') || method === 'settings/update') return false;
-          if (!['1.13', '1.14', '1.15'].includes(this.negotiatedProtocolVersion) && method.startsWith('execution/')) return false;
-          if (!['1.14', '1.15'].includes(this.negotiatedProtocolVersion) && method === 'catalog/inspect') return false;
-          if (this.negotiatedProtocolVersion !== '1.15' && method.startsWith('agent/') && !['agent/run', 'agent/chat'].includes(method)) return false;
+          if (!['1.13', '1.14', '1.15', '1.16'].includes(this.negotiatedProtocolVersion) && method.startsWith('execution/')) return false;
+          if (!['1.14', '1.15', '1.16'].includes(this.negotiatedProtocolVersion) && method === 'catalog/inspect') return false;
+          if (!['1.15', '1.16'].includes(this.negotiatedProtocolVersion) && ['agent/createDraft', 'agent/validateConfig', 'agent/saveConfig'].includes(method)) return false;
+          if (this.negotiatedProtocolVersion !== '1.16' && ['agent/readConfig', 'agent/archiveConfig', 'agent/restoreConfig'].includes(method)) return false;
           return true;
         }),
         notifications: ['runtime/ready', 'agent/event', 'cli/output'],
@@ -389,7 +416,7 @@ export class DesktopRuntime {
           transport: 'child-process',
           output: 'streamed-notifications',
         },
-        ...(['1.13', '1.14', '1.15'].includes(this.negotiatedProtocolVersion) ? { attachments: attachmentCapabilities(false, 'Initialize the runtime with managedAttachmentRoot.') } : {}),
+        ...(['1.13', '1.14', '1.15', '1.16'].includes(this.negotiatedProtocolVersion) ? { attachments: attachmentCapabilities(false, 'Initialize the runtime with managedAttachmentRoot.') } : {}),
       },
     };
   }

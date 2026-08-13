@@ -7,8 +7,8 @@ export {
 } from '@adaptive-agent/agent-sdk/cli';
 
 /** Keep versions as strings: JSON numbers cannot distinguish 1.10 from 1.1. */
-export const DESKTOP_PROTOCOL_VERSION = '1.15' as const;
-export const SUPPORTED_DESKTOP_PROTOCOL_VERSIONS = ['1.10', '1.11', '1.12', '1.13', '1.14', DESKTOP_PROTOCOL_VERSION] as const;
+export const DESKTOP_PROTOCOL_VERSION = '1.16' as const;
+export const SUPPORTED_DESKTOP_PROTOCOL_VERSIONS = ['1.10', '1.11', '1.12', '1.13', '1.14', '1.15', DESKTOP_PROTOCOL_VERSION] as const;
 export const DESKTOP_BRIDGE_VERSION = '0.1.0';
 
 export type DesktopProtocolVersion = (typeof SUPPORTED_DESKTOP_PROTOCOL_VERSIONS)[number];
@@ -155,6 +155,12 @@ export interface AgentConfigSaveParams extends AgentConfigParams {
   expectedTargetFingerprint: string;
 }
 
+export interface AgentProfileParams {
+  agentId: string;
+  configPath: string;
+  generatorAgent?: string;
+}
+
 export interface RunParams {
   runId?: string;
   executionId?: string;
@@ -245,6 +251,7 @@ export type DesktopRpcRequest =
   | RpcRequest<'agent/createDraft', AgentCreateDraftParams>
   | RpcRequest<'agent/validateConfig', AgentConfigParams>
   | RpcRequest<'agent/saveConfig', AgentConfigSaveParams>
+  | RpcRequest<'agent/readConfig' | 'agent/archiveConfig' | 'agent/restoreConfig', AgentProfileParams>
   | RpcRequestWithoutParams<'cli/commands'>
   | RpcRequest<'cli/execute', CliExecuteParams>;
 
@@ -276,6 +283,9 @@ export const DESKTOP_RPC_METHODS = [
   'agent/createDraft',
   'agent/validateConfig',
   'agent/saveConfig',
+  'agent/readConfig',
+  'agent/archiveConfig',
+  'agent/restoreConfig',
   'cli/commands',
   'cli/execute',
 ] as const satisfies readonly DesktopRpcRequest['method'][];
@@ -383,6 +393,15 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
       if (value.overwrite !== undefined && typeof value.overwrite !== 'boolean') {
         invalidParams('overwrite must be a boolean.');
       }
+      return;
+    }
+    case 'agent/readConfig':
+    case 'agent/archiveConfig':
+    case 'agent/restoreConfig': {
+      const value = requiredParams(method, params);
+      requiredString(value, 'agentId');
+      requiredString(value, 'configPath');
+      optionalString(value, 'generatorAgent');
       return;
     }
     case 'auth/updateAccessToken':

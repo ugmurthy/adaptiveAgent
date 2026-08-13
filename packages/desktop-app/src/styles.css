@@ -334,6 +334,11 @@ dd small { display: block; margin-top: 3px; }
 .agent-card header > div { min-width: 0; flex: 1; }
 .agent-card h3 { overflow: hidden; margin: 0 0 3px; text-overflow: ellipsis; white-space: nowrap; }
 .agent-card code { color: #71848e; font-size: 10px; }
+.agent-actions { position: relative; }
+.agent-actions summary { border: 1px solid #34454d; border-radius: 7px; padding: 3px 7px; color: #8fa0a8; cursor: pointer; font-size: 12px; list-style: none; }
+.agent-actions summary::-webkit-details-marker { display: none; }
+.agent-actions > div { position: absolute; z-index: 4; top: calc(100% + 5px); right: 0; display: grid; width: 150px; gap: 4px; border: 1px solid #35464e; border-radius: 9px; background: #101b20; padding: 6px; box-shadow: 0 12px 28px rgba(0,0,0,.4); }
+.agent-actions button { width: 100%; text-align: left; }
 .agent-avatar { display: grid; width: 42px; height: 42px; flex: 0 0 42px; place-items: center; border: 1px solid #3d665b; border-radius: 12px; background: #142a25; color: #78e7c5; font-weight: 800; }
 .badge { border-radius: 999px; background: #263139; padding: 4px 7px; color: #a5b2b9; font-size: 9px; text-transform: uppercase; }
 .agent-card > p { min-height: 42px; margin: 15px 0; color: #91a1a9; font-size: 12px; line-height: 1.55; }

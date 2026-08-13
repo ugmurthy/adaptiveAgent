@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { aggregateRecentWork, agentsNeedingAttention, filterAndSortAgents, isLaunchable } from './agent-studio';
+import { aggregateRecentWork, agentsNeedingAttention, filterAndSortAgents, isInspectable, isLaunchable } from './agent-studio';
 import type { DesktopCatalogAgent } from './desktop';
 
 const agent = (id: string, overrides: Partial<DesktopCatalogAgent> = {}): DesktopCatalogAgent => ({ id, name: id, configPath: `/${id}.json`, archived: false, validationState: 'valid', configurationFingerprint: id, status: 'ready', occupiedSlots: 0, capacity: 3, attention: 'none', recentWork: [], ...overrides });
@@ -17,5 +17,7 @@ describe('Agent Studio helpers', () => {
   test('archived and invalid agents cannot launch', () => {
     expect(isLaunchable(agent('archived', { archived: true }))).toBe(false);
     expect(isLaunchable(agent('invalid', { validationState: 'invalid' }))).toBe(false);
+    expect(isInspectable(agent('archived', { archived: true }))).toBe(true);
+    expect(isInspectable(agent('invalid', { validationState: 'invalid' }))).toBe(false);
   });
 });
