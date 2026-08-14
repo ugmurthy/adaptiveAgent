@@ -3110,7 +3110,7 @@ fn start_run(
 }
 
 #[tauri::command]
-fn select_attachments(
+async fn select_attachments(
     app: AppHandle,
     existing_attachment_ids: Option<Vec<String>>,
     state: tauri::State<'_, AppState>,
