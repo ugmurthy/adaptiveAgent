@@ -94,6 +94,9 @@ describe('secure result renderer', () => {
       .not.toMatch(/javascript|https|<a|<use/i);
     expect(sanitizeSvg(purifier(), '<svg><defs><marker id="arrow"><path d="M0 0"/></marker></defs><path d="M0 0" marker-end="url(#arrow)"/></svg>'))
       .toContain('marker-end="url(#arrow)"');
+    const mermaidSvg = sanitizeSvg(purifier(), '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><path d="M0 0L1 1"/></svg>');
+    expect(mermaidSvg).toContain('<svg');
+    expect(mermaidSvg).not.toContain('http://www.w3.org/2000/svg');
   });
 
   it('does not invoke Mermaid for external references or configuration directives', async () => {

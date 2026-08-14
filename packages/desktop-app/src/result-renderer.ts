@@ -55,7 +55,7 @@ const SVG_ATTRIBUTES = [
   'marker-end', 'marker-mid', 'marker-start', 'offset', 'opacity', 'orient', 'points', 'preserveAspectRatio',
   'r', 'refX', 'refY', 'role', 'rx', 'ry', 'stop-color', 'stop-opacity', 'stroke', 'stroke-dasharray',
   'stroke-linecap', 'stroke-linejoin', 'stroke-width', 'text-anchor', 'transform', 'viewBox', 'width',
-  'x', 'x1', 'x2', 'xmlns', 'y', 'y1', 'y2',
+  'x', 'x1', 'x2', 'y', 'y1', 'y2',
 ];
 
 let renderSequence = 0;
