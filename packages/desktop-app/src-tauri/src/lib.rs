@@ -41,6 +41,33 @@ const AGENT_BUILDER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 type Response = Result<Value, String>;
 
+fn route_bridge_message(
+    message: Value,
+    pending: &Mutex<HashMap<u64, Sender<Response>>>,
+    notifications: &Sender<Value>,
+) {
+    if message.get("method").and_then(Value::as_str) == Some("agent/event") {
+        let _ = notifications.send(message.get("params").cloned().unwrap_or(Value::Null));
+        return;
+    }
+    let Some(id) = message.get("id").and_then(Value::as_u64) else {
+        return;
+    };
+    let Some(sender) = pending.lock().unwrap().remove(&id) else {
+        return;
+    };
+    let response = if let Some(error) = message.get("error") {
+        Err(error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Agent runtime request failed.")
+            .to_string())
+    } else {
+        Ok(message.get("result").cloned().unwrap_or(Value::Null))
+    };
+    let _ = sender.send(response);
+}
+
 struct NdjsonDecoder {
     buffer: Vec<u8>,
     max_frame_size: usize,
@@ -271,6 +298,7 @@ struct Bridge {
     agent_fingerprint: String,
     child: Mutex<Option<CommandChild>>,
     pending: Mutex<HashMap<u64, Sender<Response>>>,
+    notifications: Sender<Value>,
     decoder: Mutex<NdjsonDecoder>,
     generation: u64,
     next_id: AtomicU64,
@@ -2034,6 +2062,7 @@ impl Bridge {
             .map_err(|error| format!("Unable to locate the packaged agent runtime: {error}"))?
             .spawn()
             .map_err(|error| format!("Unable to start the agent runtime: {error}"))?;
+        let (notification_sender, notification_receiver) = mpsc::channel();
         let bridge = Arc::new(Self {
             app: app.clone(),
             agent_id: selection.id.clone(),
@@ -2041,6 +2070,7 @@ impl Bridge {
             agent_fingerprint: selection.configuration_fingerprint.clone(),
             child: Mutex::new(Some(child)),
             pending: Mutex::new(HashMap::new()),
+            notifications: notification_sender,
             decoder: Mutex::new(NdjsonDecoder::new(MAX_NDJSON_FRAME_SIZE)),
             generation: 1,
             next_id: AtomicU64::new(1),
@@ -2113,6 +2143,18 @@ impl Bridge {
                 root.pending_approval = Some(approval);
             }
         }
+        // Response demultiplexing must never wait for lifecycle, persistence, or UI
+        // publication work. Notifications keep sidecar order on a separate worker so an
+        // event emitted during a synchronous RPC cannot prevent its response being read.
+        let notification_bridge = Arc::downgrade(&bridge);
+        std::thread::spawn(move || {
+            while let Ok(event) = notification_receiver.recv() {
+                let Some(bridge) = notification_bridge.upgrade() else {
+                    break;
+                };
+                bridge.handle_agent_event(&event);
+            }
+        });
         let reader = bridge.clone();
         tauri::async_runtime::spawn(async move {
             while let Some(event) = events.recv().await {
@@ -2602,26 +2644,7 @@ impl Bridge {
     }
 
     fn handle_message(self: &Arc<Self>, message: Value) {
-        if message.get("method").and_then(Value::as_str) == Some("agent/event") {
-            self.handle_agent_event(message.get("params").unwrap_or(&Value::Null));
-            return;
-        }
-        let Some(id) = message.get("id").and_then(Value::as_u64) else {
-            return;
-        };
-        let Some(sender) = self.pending.lock().unwrap().remove(&id) else {
-            return;
-        };
-        let response = if let Some(error) = message.get("error") {
-            Err(error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("Agent runtime request failed.")
-                .to_string())
-        } else {
-            Ok(message.get("result").cloned().unwrap_or(Value::Null))
-        };
-        let _ = sender.send(response);
+        route_bridge_message(message, &self.pending, &self.notifications);
     }
 
     fn handle_agent_event(self: &Arc<Self>, event: &Value) {
@@ -5859,6 +5882,11 @@ pub fn run() {
                 if let Err(error) = state.manager.bootstrap() {
                     *state.manager.bootstrap_error.lock().unwrap() = Some(error);
                 }
+                state.manager.catalog_loading.store(false, Ordering::SeqCst);
+                let _ = app_handle.emit(
+                    "adaptive-agent://catalog-status-changed",
+                    json!({ "bootstrapComplete": true }),
+                );
                 let runtimes = state
                     .manager
                     .runtime_maps
@@ -5873,11 +5901,6 @@ pub fn run() {
                         let _ = start_trace_for_runtime(&agent_id, runtime.clone(), bridge);
                     }
                 }
-                state.manager.catalog_loading.store(false, Ordering::SeqCst);
-                let _ = app_handle.emit(
-                    "adaptive-agent://catalog-status-changed",
-                    json!({ "bootstrapComplete": true }),
-                );
             });
             Ok(())
         })
@@ -6576,6 +6599,36 @@ mod tests {
             validation_state: state.into(),
             archived,
         }
+    }
+
+    #[test]
+    fn sidecar_responses_are_routed_without_waiting_for_notifications() {
+        let pending = Mutex::new(HashMap::new());
+        let (response_sender, response_receiver) = mpsc::channel();
+        pending.lock().unwrap().insert(7, response_sender);
+        let (notification_sender, notification_receiver) = mpsc::channel();
+
+        route_bridge_message(
+            json!({"jsonrpc":"2.0","method":"agent/event","params":{"type":"run.progress"}}),
+            &pending,
+            &notification_sender,
+        );
+        // Deliberately leave the notification queued while routing the following RPC
+        // response. Lifecycle work performed by the notification consumer cannot delay it.
+        route_bridge_message(
+            json!({"jsonrpc":"2.0","id":7,"result":{"ready":true}}),
+            &pending,
+            &notification_sender,
+        );
+
+        assert_eq!(
+            response_receiver.try_recv().unwrap().unwrap(),
+            json!({"ready":true})
+        );
+        assert_eq!(
+            notification_receiver.try_recv().unwrap(),
+            json!({"type":"run.progress"})
+        );
     }
 
     #[test]
