@@ -17,7 +17,6 @@ pub struct RunRecord {
     pub item_id: String,
     pub title: String,
     pub created_at: String,
-    pub session_id: Option<String>,
     pub invocation_kind: String,
     pub submission_state: String,
     pub cached_status: String,
@@ -118,6 +117,7 @@ impl RunRegistry {
             .map(|record| record.run_id.clone())
             .collect()
     }
+    #[cfg(test)]
     pub fn terminal(&mut self, id: &str, status: &str) -> bool {
         let Some(r) = self.records.get_mut(id) else {
             return false;
@@ -156,7 +156,6 @@ pub(crate) fn tests_record_for_transition() -> RunRecord {
         item_id: "item-transition".into(),
         title: "Transition task".into(),
         created_at: "100".into(),
-        session_id: None,
         invocation_kind: "run".into(),
         submission_state: "submitted".into(),
         cached_status: "submitted".into(),
@@ -183,7 +182,6 @@ mod tests {
             item_id: format!("i-{id}"),
             title: format!("Task {id}"),
             created_at: "100".into(),
-            session_id: None,
             invocation_kind: "run".into(),
             submission_state: "submitted".into(),
             cached_status: "running".into(),

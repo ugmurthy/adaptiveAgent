@@ -8,6 +8,7 @@ dist/
 build/
 target/
 packages/desktop-app/src-tauri/binaries/
+packages/desktop-app/src-tauri/gen/schemas/*-schema.json
 
 marketing/
 

@@ -194,11 +194,13 @@ impl WorkbenchDb {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn insert_draft(&self, draft: &AttachmentDraft) -> Result<(), String> {
         self.connection.lock().unwrap().execute("insert into attachments(attachment_id,staged_relative_path,display_name,kind,mime_type,audio_format,size_bytes,sha256,state,created_at) values(?1,?2,?3,?4,?5,?6,?7,?8,'draft',?9)",params![draft.id,draft.staged_relative_path,draft.name,draft.kind,draft.mime_type,draft.audio_format,draft.size_bytes,draft.sha256,now()]).map_err(|e|e.to_string())?;
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn get_drafts(&self, ids: &[String]) -> Result<Vec<AttachmentDraft>, String> {
         let connection = self.connection.lock().unwrap();
         let mut output = Vec::new();
@@ -245,6 +247,7 @@ impl WorkbenchDb {
         Ok(attachments)
     }
 
+    #[cfg(test)]
     pub fn discard_draft(&self, id: &str) -> Result<Option<String>, String> {
         let connection = self.connection.lock().unwrap();
         let path=connection.query_row("select staged_relative_path from attachments where attachment_id=?1 and state='draft'",[id],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
@@ -327,6 +330,7 @@ impl WorkbenchDb {
         Self::from_connection(connection)
     }
 
+    #[cfg(test)]
     pub fn open_in_memory() -> Result<Self, String> {
         Self::from_connection(Connection::open_in_memory().map_err(|e| e.to_string())?)
     }
@@ -375,6 +379,7 @@ impl WorkbenchDb {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn backfill_agent_config_path(
         &self,
         agent_id: &str,
@@ -467,6 +472,7 @@ impl WorkbenchDb {
         ).map_err(|e|e.to_string())
     }
 
+    #[cfg(test)]
     pub fn reserve_task(&self, reservation: &Reservation) -> Result<(), String> {
         self.reserve_task_with_attachments(reservation, &[])
     }
@@ -604,6 +610,7 @@ impl WorkbenchDb {
         self.load_chat(item_id)
     }
 
+    #[cfg(test)]
     pub fn reserve_chat_turn(
         &self,
         item_id: &str,
@@ -751,6 +758,7 @@ impl WorkbenchDb {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn delete_item(&self, item_id: &str) -> Result<(), String> {
         self.connection
             .lock()
@@ -760,6 +768,7 @@ impl WorkbenchDb {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn delete_item_for_agent(&self, agent_id: &str, item_id: &str) -> Result<(), String> {
         self.assert_item_owner(agent_id, item_id)?;
         self.delete_item(item_id)
@@ -853,6 +862,7 @@ impl WorkbenchDb {
         )
     }
 
+    #[cfg(test)]
     pub fn create_deletion_job(&self, operation: &Value) -> Result<DeletionJob, String> {
         let id = uuid::Uuid::new_v4().to_string();
         let timestamp = now();
@@ -888,6 +898,7 @@ impl WorkbenchDb {
         })
     }
 
+    #[cfg(test)]
     pub fn load_deletion_jobs(&self) -> Result<Vec<DeletionJob>, String> {
         let connection = self.connection.lock().unwrap();
         let mut statement = connection.prepare("select id,operation_json,last_error from deletion_jobs where state='pending' and operation_json is not null order by created_at,id").map_err(|error|error.to_string())?;
@@ -1048,6 +1059,7 @@ impl WorkbenchDb {
         tx.commit().map_err(|e| e.to_string())
     }
 
+    #[cfg(test)]
     pub fn load_run_recovery_operations(&self) -> Result<Vec<PendingRunRecovery>, String> {
         let connection = self.connection.lock().unwrap();
         let mut statement = connection
@@ -1065,17 +1077,6 @@ impl WorkbenchDb {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
         Ok(operations)
-    }
-
-    pub fn load_run_recovery_operations_for_agent(
-        &self,
-        agent_id: &str,
-    ) -> Result<Vec<PendingRunRecovery>, String> {
-        Ok(self
-            .load_run_recovery_operations()?
-            .into_iter()
-            .filter(|op| self.assert_run_owner(agent_id, &op.run_id).is_ok())
-            .collect())
     }
 
     pub fn load_run_recovery_operations_for_generation(
@@ -1198,6 +1199,7 @@ impl WorkbenchDb {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn set_cancel_requested_for_agent(
         &self,
         agent_id: &str,
@@ -1327,6 +1329,7 @@ impl WorkbenchDb {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn load_pending_approvals(&self) -> Result<Vec<PendingApproval>, String> {
         let connection = self.connection.lock().unwrap();
         let mut statement=connection.prepare("select root_run_id,approval_run_id,approval_id,parent_run_id,tool_name,message,decision_in_flight,decision,operation_state from pending_approvals order by root_run_id").map_err(|e|e.to_string())?;
@@ -1350,6 +1353,7 @@ impl WorkbenchDb {
         Ok(rows)
     }
 
+    #[cfg(test)]
     pub fn load_pending_approvals_for_agent(
         &self,
         agent_id: &str,

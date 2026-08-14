@@ -5,5 +5,7 @@ export default defineConfig({
   plugins: [svelte()],
   clearScreen: false,
   server: { host: '127.0.0.1', port: 1420, strictPort: true },
-  build: { outDir: 'dist', emptyOutDir: true },
+  // Mermaid lazily loads some uncommon diagram renderers as standalone chunks. The
+  // largest is below 700 kB and is not part of the initial renderer payload.
+  build: { outDir: 'dist', emptyOutDir: true, chunkSizeWarningLimit: 700 },
 });

@@ -36,6 +36,10 @@ places it under Tauri's target-triple sidecar name. Native macOS (arm64/x64), Li
 (arm64/x64), and Windows x64 targets are mapped. CI can set `TAURI_TARGET_TRIPLE` or
 pass a triple to `bun run sidecar:prepare -- <triple>`.
 
+Linux packages are produced as `.deb` and `.rpm`. AppImage packaging is disabled because
+`linuxdeploy` rewrites Bun-compiled sidecar ELF headers, which makes the embedded runtimes
+unusable; use the native package for the target distribution instead.
+
 The renderer uses a narrow set of typed workbench commands for runs, chats, approvals,
 recovery, history, trace privacy, and shutdown. It receives simplified progress/final
 events. No shell capability or generic JSON-RPC command is granted to the webview.

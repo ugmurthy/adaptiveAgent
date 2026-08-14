@@ -1750,7 +1750,6 @@ struct TracePrivacy {
 }
 
 struct TraceBridge {
-    app: AppHandle,
     owning_bridge: Weak<Bridge>,
     child: Mutex<Option<CommandChild>>,
     pending: Mutex<HashMap<u64, Sender<Response>>>,
@@ -1789,7 +1788,6 @@ impl TraceBridge {
             .spawn()
             .map_err(|e| format!("Unable to start trace sidecar: {e}"))?;
         let sidecar = Arc::new(Self {
-            app: app.clone(),
             owning_bridge,
             child: Mutex::new(Some(child)),
             pending: Mutex::new(HashMap::new()),
@@ -2050,7 +2048,6 @@ impl Bridge {
                 item_id: saved.item_id,
                 title: saved.title,
                 created_at: saved.created_at,
-                session_id: saved.session_id,
                 invocation_kind: saved.invocation_kind,
                 submission_state: saved.submission_state.clone(),
                 cached_status: saved.cached_status.clone(),
@@ -3009,7 +3006,6 @@ impl Bridge {
             item_id: item_id.clone(),
             title: task.clone(),
             created_at,
-            session_id: None,
             invocation_kind: "run".into(),
             submission_state: "submitted".into(),
             cached_status: "submitted".into(),
@@ -3251,7 +3247,6 @@ impl Bridge {
             item_id: item_id.clone(),
             title: chat.title.clone(),
             created_at: chat.created_at.clone(),
-            session_id: Some(chat.session_id.clone()),
             invocation_kind: "chat".into(),
             submission_state: "submitted".into(),
             cached_status: "submitted".into(),
