@@ -200,10 +200,19 @@
     .modal-head p { margin: 0; color: var(--muted); font-size: 11px; }
     .modal-head button { border: 0; background: transparent; font-size: 20px; }
     .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-    .form-grid label { display: grid; gap: 7px; color: var(--muted); font-size: 10px; font-weight: 700; }
-    .form-grid label.wide { grid-column: 1 / -1; }
+    .form-grid label, .form-grid .field { display: grid; gap: 7px; color: var(--muted); font-size: 10px; font-weight: 700; }
+    .form-grid label.wide, .form-grid .field.wide { grid-column: 1 / -1; }
     .form-grid input, .form-grid textarea { width: 100%; border: 1px solid var(--line); border-radius: 9px; background: #fff; padding: 10px; color: var(--ink); }
     .form-grid textarea { min-height: 80px; resize: vertical; }
+    .tool-select { position: relative; }
+    .tool-select summary { display: flex; align-items: center; justify-content: space-between; min-height: 38px; border: 1px solid var(--line); border-radius: 9px; background: #fff; padding: 10px; color: var(--ink); cursor: pointer; list-style: none; font-weight: 400; }
+    .tool-select summary::-webkit-details-marker { display: none; }
+    .tool-select summary::after { color: var(--muted); content: "⌄"; font-size: 14px; }
+    .tool-select[open] summary { border-color: #8db09c; border-radius: 9px 9px 0 0; }
+    .tool-menu { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 12px; border: 1px solid #8db09c; border-top: 0; border-radius: 0 0 9px 9px; background: #fff; padding: 8px; box-shadow: 0 10px 24px rgba(24,33,29,.12); }
+    .form-grid .tool-option { display: flex; align-items: center; gap: 8px; border-radius: 6px; padding: 7px; color: var(--ink); font-weight: 400; cursor: pointer; }
+    .form-grid .tool-option:hover { background: var(--mint-soft); }
+    .form-grid .tool-option input { width: 14px; height: 14px; margin: 0; padding: 0; accent-color: var(--moss); }
     .builder-mode { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin: 20px 0; border: 1px solid var(--line); border-radius: 11px; background: #f1eee7; padding: 4px; }
     .builder-mode button { border: 0; border-radius: 8px; background: transparent; padding: 9px; color: var(--muted); font-size: 10px; }
     .builder-mode button.active { background: #fff; color: var(--ink); box-shadow: 0 2px 8px rgba(0,0,0,.06); }
@@ -418,7 +427,10 @@
       <textarea class="json-editor mono" aria-label="Agent JSON">{
   "id": "market-strategist",
   "name": "Market Strategist",
-  "model": "claude-sonnet-4",
+  "model": {
+    "provider": "anthropic",
+    "model": "claude-sonnet-4"
+  },
   "maxConcurrentRuns": 3
 }</textarea>
     </div>
@@ -427,9 +439,25 @@
       <label>Agent name<input value="Market Strategist" /></label>
       <label>Avatar initials<input value="MS" maxlength="2" /></label>
       <label class="wide">Role and operating brief<textarea>Analyse markets, challenge assumptions, and turn evidence into strategic options.</textarea></label>
+      <label>Provider<input value="Anthropic" /></label>
       <label>Model<input value="Claude Sonnet 4" /></label>
       <label>Concurrent runs<input value="3" type="number" min="3" max="3" /></label>
-      <label class="wide">Tool access<input value="Web search, read page, workspace files" /></label>
+      <div class="field wide">
+        <span>Tool access</span>
+        <details class="tool-select" id="toolSelect">
+          <summary id="selectedTools">Web search, Read web pages, Read files</summary>
+          <div class="tool-menu">
+            <label class="tool-option"><input type="checkbox" value="web_search" checked />Web search</label>
+            <label class="tool-option"><input type="checkbox" value="read_web_page" checked />Read web pages</label>
+            <label class="tool-option"><input type="checkbox" value="read_file" checked />Read files</label>
+            <label class="tool-option"><input type="checkbox" value="list_directory" />List directories</label>
+            <label class="tool-option"><input type="checkbox" value="search_files" />Search files</label>
+            <label class="tool-option"><input type="checkbox" value="write_file" />Write files</label>
+            <label class="tool-option"><input type="checkbox" value="edit_file" />Edit files</label>
+            <label class="tool-option"><input type="checkbox" value="shell_exec" />Run shell commands</label>
+          </div>
+        </details>
+      </div>
     </div>
     <div class="modal-actions"><button class="soft-btn" id="cancelModal">Cancel</button><button class="soft-btn">Export draft JSON</button><button class="primary-btn" id="saveAgent">Save JSON profile</button></div>
   </section>
@@ -565,6 +593,10 @@
   document.getElementById('saveAgent').addEventListener('click', () => { modal.classList.add('hidden'); });
   document.querySelectorAll('.template-row button').forEach(button => button.addEventListener('click', () => {
     document.querySelectorAll('.template-row button').forEach(candidate => candidate.classList.toggle('active', candidate === button));
+  }));
+  document.querySelectorAll('#toolSelect input').forEach(input => input.addEventListener('change', () => {
+    const selected = [...document.querySelectorAll('#toolSelect input:checked')].map(tool => tool.parentElement.textContent.trim());
+    document.getElementById('selectedTools').textContent = selected.length ? selected.join(', ') : 'Select tools';
   }));
   document.addEventListener('keydown', event => { if (event.key === 'Escape') { modal.classList.add('hidden'); rail.classList.remove('mobile-open'); } });
   const route = location.hash.match(/^#agent\/(\w+)/);
