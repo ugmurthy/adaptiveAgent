@@ -121,6 +121,9 @@ struct RunSummary {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopCatalogStatus {
+    loading: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
     current_agent_id: Option<String>,
     diagnostics: Vec<Value>,
     agents: Vec<DesktopCatalogAgent>,
@@ -341,6 +344,7 @@ struct AgentRuntimeManager {
     deletion: Mutex<()>,
     trace_policy: Mutex<()>,
     shutdown: AtomicBool,
+    catalog_loading: AtomicBool,
     catalog_diagnostics: Mutex<Vec<Value>>,
     bootstrap_error: Mutex<Option<String>>,
 }
@@ -489,6 +493,7 @@ impl AgentRuntimeManager {
             deletion: Mutex::new(()),
             trace_policy: Mutex::new(()),
             shutdown: AtomicBool::new(false),
+            catalog_loading: AtomicBool::new(true),
             catalog_diagnostics: Mutex::new(Vec::new()),
             bootstrap_error: Mutex::new(None),
         })
@@ -1364,6 +1369,20 @@ impl AgentRuntimeManager {
         quit_state: QuitState,
         window_limit_diagnostic: Option<Value>,
     ) -> Result<DesktopCatalogStatus, String> {
+        // Do not wait on lifecycle or runtime locks while startup is waiting for sidecar
+        // events. A synchronous renderer command can run on the native event-loop thread;
+        // blocking it here would recreate the startup deadlock this status is meant to
+        // report. Bootstrap emits a refresh event after publishing the complete catalog.
+        if self.catalog_loading.load(Ordering::SeqCst) {
+            return Ok(DesktopCatalogStatus {
+                loading: true,
+                error: None,
+                current_agent_id: None,
+                diagnostics: window_limit_diagnostic.into_iter().collect(),
+                agents: Vec::new(),
+                quit_state,
+            });
+        }
         self.retire_quiescent_generations();
         let (current_agent_id, mut descriptors) = {
             let catalog = self.catalog.lock().unwrap();
@@ -1518,6 +1537,8 @@ impl AgentRuntimeManager {
             diagnostics.push(diagnostic);
         }
         Ok(DesktopCatalogStatus {
+            loading: self.catalog_loading.load(Ordering::SeqCst),
+            error: self.bootstrap_error.lock().unwrap().clone(),
             current_agent_id,
             diagnostics,
             agents,
@@ -5829,24 +5850,35 @@ pub fn run() {
                 closing_agent_windows: Mutex::new(HashSet::new()),
                 window_presentation: Mutex::new(()),
             });
-            let state = app.state::<AppState>();
-            if let Err(error) = state.manager.bootstrap() {
-                *state.manager.bootstrap_error.lock().unwrap() = Some(error);
-            }
-            let runtimes = state
-                .manager
-                .runtime_maps
-                .lock()
-                .unwrap()
-                .current
-                .iter()
-                .map(|(agent_id, runtime)| (agent_id.clone(), runtime.clone()))
-                .collect::<Vec<_>>();
-            for (agent_id, runtime) in runtimes {
-                if let Some(bridge) = runtime.bridge.lock().unwrap().as_ref().cloned() {
-                    let _ = start_trace_for_runtime(&agent_id, runtime.clone(), bridge);
+            // Sidecar responses are delivered asynchronously. Waiting for them inside
+            // setup can block the native event loop (notably in packaged macOS apps),
+            // which also prevents the renderer's catalog IPC request from completing.
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let state = app_handle.state::<AppState>();
+                if let Err(error) = state.manager.bootstrap() {
+                    *state.manager.bootstrap_error.lock().unwrap() = Some(error);
                 }
-            }
+                let runtimes = state
+                    .manager
+                    .runtime_maps
+                    .lock()
+                    .unwrap()
+                    .current
+                    .iter()
+                    .map(|(agent_id, runtime)| (agent_id.clone(), runtime.clone()))
+                    .collect::<Vec<_>>();
+                for (agent_id, runtime) in runtimes {
+                    if let Some(bridge) = runtime.bridge.lock().unwrap().as_ref().cloned() {
+                        let _ = start_trace_for_runtime(&agent_id, runtime.clone(), bridge);
+                    }
+                }
+                state.manager.catalog_loading.store(false, Ordering::SeqCst);
+                let _ = app_handle.emit(
+                    "adaptive-agent://catalog-status-changed",
+                    json!({ "bootstrapComplete": true }),
+                );
+            });
             Ok(())
         })
         .build(tauri::generate_context!())

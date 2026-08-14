@@ -34,14 +34,15 @@
     try {
       const next = await getDesktopCatalogStatus();
       if (disposed || generation !== refreshGeneration) return;
-      catalog = next; error = '';
+      catalog = next; error = next.error ?? '';
+      if (next.loading) scheduleRefresh(500);
     }
     catch (cause) { if (!disposed && generation === refreshGeneration) error = String(cause); }
     finally { if (!disposed && generation === refreshGeneration) loading = false; }
   }
-  function scheduleRefresh() {
+  function scheduleRefresh(delay = 120) {
     if (refreshTimer !== undefined) return;
-    refreshTimer = window.setTimeout(() => { refreshTimer = undefined; void refresh(); }, 120);
+    refreshTimer = window.setTimeout(() => { refreshTimer = undefined; void refresh(); }, delay);
   }
   async function open(id: string) {
     openingId = id; error = '';
@@ -169,7 +170,7 @@
   {/if}
   <header class="studio-header">
     <div class="brand"><BrandMark /><div><strong>Adaptive Agent</strong><span>Agent Studio</span></div></div>
-    <div class="studio-header-actions"><button type="button" on:click={() => openBuilder('json')}>Import JSON</button><button class="primary" type="button" on:click={() => openBuilder('describe')}>＋ New agent</button><button type="button" on:click={refresh} disabled={loading}>↻ Refresh</button></div>
+    <div class="studio-header-actions"><button type="button" on:click={() => openBuilder('json')}>Import JSON</button><button class="primary" type="button" on:click={() => openBuilder('describe')}>＋ New agent</button><button type="button" on:click={refresh} disabled={loading || catalog?.loading}>↻ Refresh</button></div>
   </header>
   <div class="studio-content">
     <section class="studio-hero" aria-labelledby="studio-title">
@@ -180,7 +181,7 @@
       </div>
     </section>
     {#if error}<div class="alert" role="alert">{error} <button type="button" on:click={refresh}>Try again</button></div>{/if}
-    {#if loading && !catalog}<div class="studio-state" aria-live="polite">Loading agent catalog…</div>
+    {#if (loading && !catalog) || catalog?.loading}<div class="studio-state" aria-live="polite">Loading agent catalog…</div>
     {:else if catalog}
       {#if agents.length}
         <section aria-labelledby="agents-heading"><h2 id="agents-heading">Agents <small>{agents.length}</small></h2>

@@ -57,6 +57,8 @@ export interface DesktopCatalogAgent {
 }
 export type DesktopCatalogDiagnostic = Record<string, unknown>;
 export interface DesktopCatalogStatus {
+  loading: boolean;
+  error?: string;
   currentAgentId?: string;
   diagnostics: DesktopCatalogDiagnostic[];
   agents: DesktopCatalogAgent[];
