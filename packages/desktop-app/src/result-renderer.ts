@@ -48,13 +48,14 @@ const HTML_ATTRIBUTES = ['class', 'data-mermaid-placeholder', 'href', 'rel', 'ta
 const SVG_TAGS = [
   'svg', 'g', 'path', 'rect', 'circle', 'ellipse', 'line', 'polyline', 'polygon', 'text',
   'tspan', 'defs', 'marker', 'linearGradient', 'radialGradient', 'stop', 'title', 'desc', 'clipPath',
+  'style',
 ];
 const SVG_ATTRIBUTES = [
   'aria-describedby', 'aria-labelledby', 'class', 'clip-path', 'cx', 'cy', 'd', 'dominant-baseline',
   'dx', 'dy', 'fill', 'fill-opacity', 'font-family', 'font-size', 'font-weight', 'height', 'id',
   'marker-end', 'marker-mid', 'marker-start', 'offset', 'opacity', 'orient', 'points', 'preserveAspectRatio',
   'r', 'refX', 'refY', 'role', 'rx', 'ry', 'stop-color', 'stop-opacity', 'stroke', 'stroke-dasharray',
-  'stroke-linecap', 'stroke-linejoin', 'stroke-width', 'text-anchor', 'transform', 'viewBox', 'width',
+  'stroke-linecap', 'stroke-linejoin', 'stroke-width', 'style', 'text-anchor', 'transform', 'viewBox', 'width',
   'x', 'x1', 'x2', 'y', 'y1', 'y2',
 ];
 
@@ -180,13 +181,45 @@ export function sanitizeSvg(purifier: DOMPurify, svg: string): string {
     ALLOWED_TAGS: SVG_TAGS,
     ALLOWED_ATTR: SVG_ATTRIBUTES,
     ALLOW_DATA_ATTR: false,
-    FORBID_TAGS: ['script', 'style', 'foreignObject', 'iframe', 'image', 'use', 'a'],
-    FORBID_ATTR: ['href', 'xlink:href', 'onerror', 'onload', 'onclick', 'style'],
+    FORBID_TAGS: ['script', 'foreignObject', 'iframe', 'image', 'use', 'a'],
+    FORBID_ATTR: ['href', 'xlink:href', 'onerror', 'onload', 'onclick'],
   }) as string;
-  if (/<(?:script|style|foreignObject|iframe|image|use|a)\b/i.test(sanitized)) return '';
+  if (/<(?:script|foreignObject|iframe|image|use|a)\b/i.test(sanitized)) return '';
   const withoutLocalFragments = sanitized.replace(/url\(\s*#[a-z][\w:.-]*\s*\)/gi, '');
-  if (/\son[a-z]+\s*=|(?:javascript|data|https?|file):|url\s*\(|@import|expression\s*\(/i.test(withoutLocalFragments)) return '';
+  if (/\son[a-z]+\s*=|(?:javascript|data|https?|file):|url\s*\(|@import|expression\s*\(|-moz-binding|behavior\s*:/i.test(withoutLocalFragments)) return '';
+  if (!hasSafeMermaidStyles(purifier, sanitized)) return '';
   return sanitized;
+}
+
+function hasSafeMermaidStyles(purifier: DOMPurify, svg: string): boolean {
+  const template = purifier.sanitize('<template></template>', { RETURN_DOM: true }) as Element;
+  const container = template.ownerDocument.createElement('div');
+  container.innerHTML = svg;
+  const root = container.querySelector('svg');
+  if (!root) return false;
+  const styles = [...root.querySelectorAll('style')];
+  if (styles.length === 0) return true;
+  const id = root.getAttribute('id');
+  if (!id || !/^adaptive-mermaid-\d+-\d+$/.test(id)) return false;
+  return styles.every((style) => isScopedMermaidCss(style.textContent ?? '', id));
+}
+
+function isScopedMermaidCss(css: string, id: string): boolean {
+  const withoutKeyframes = css.replace(
+    /@keyframes\s+(?:edge-animation-frame|dash)\s*\{(?:[^{}]|\{[^{}]*\})*\}/gi,
+    '',
+  );
+  if (/[<>]|@|(?:javascript|data|https?|file):|url\s*\(|expression\s*\(|-moz-binding|behavior\s*:/i.test(withoutKeyframes)) {
+    return false;
+  }
+  for (const rule of withoutKeyframes.split('}')) {
+    if (!rule.trim()) continue;
+    const match = rule.match(/^([^{}]+)\{([^{}]*)$/);
+    if (!match) return false;
+    const selectors = match[1]!.split(',').map((selector) => selector.trim());
+    if (selectors.length === 0 || selectors.some((selector) => !selector.startsWith(`#${id}`))) return false;
+  }
+  return true;
 }
 
 let browserRenderer: ReturnType<typeof createResultRenderer> | undefined;

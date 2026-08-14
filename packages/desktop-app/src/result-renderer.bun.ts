@@ -99,6 +99,18 @@ describe('secure result renderer', () => {
     expect(mermaidSvg).not.toContain('http://www.w3.org/2000/svg');
   });
 
+  it('preserves scoped Mermaid presentation styles and rejects unscoped CSS', () => {
+    const styled = sanitizeSvg(
+      purifier(),
+      '<svg id="adaptive-mermaid-1-0" style="max-width: 240px" viewBox="0 0 240 80"><style>#adaptive-mermaid-1-0 .node rect{fill:#ECECFF;stroke:#9370DB}#adaptive-mermaid-1-0 .flowchart-link{fill:none;stroke:#333}</style><g class="node"><rect style="stroke-width: 1px" width="80" height="40"/></g></svg>',
+    );
+    expect(styled).toContain('<style>');
+    expect(styled).toContain('max-width: 240px');
+    expect(styled).toContain('fill:#ECECFF');
+    expect(sanitizeSvg(purifier(), '<svg id="adaptive-mermaid-1-0"><style>body{display:none}</style></svg>')).toBe('');
+    expect(sanitizeSvg(purifier(), '<svg id="adaptive-mermaid-1-0"><style>#adaptive-mermaid-1-0 rect{fill:url(https://example.com/x)}</style></svg>')).toBe('');
+  });
+
   it('does not invoke Mermaid for external references or configuration directives', async () => {
     let calls = 0;
     const render = createResultRenderer(purifier(), {
