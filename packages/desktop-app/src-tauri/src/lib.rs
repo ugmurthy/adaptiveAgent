@@ -330,6 +330,10 @@ struct AppState {
     window_presentation: Mutex<()>,
 }
 
+fn current_quit_state(state: &AppState) -> QuitState {
+    state.quit.lock().unwrap().state()
+}
+
 struct ManagedRuntime {
     bridge: Mutex<Option<Arc<Bridge>>>,
     trace: Mutex<Option<Arc<TraceBridge>>>,
@@ -3826,16 +3830,19 @@ impl Bridge {
                 "starting"
             },
             trace_error: self.trace_error.lock().unwrap().clone(),
-            quit_state: self.app.state::<AppState>().quit.lock().unwrap().state(),
+            // Manager snapshots supply the authoritative quit state. Bridge-local
+            // snapshots must not reacquire AppState::quit while their caller may hold it.
+            quit_state: QuitState::Idle,
         }
     }
 
     fn emit_state(&self) {
         let state = self.app.state::<AppState>();
         state.manager.retire_quiescent_generations();
+        let quit_state = current_quit_state(&state);
         match state
             .manager
-            .agent_snapshot(&self.agent_id, state.quit.lock().unwrap().state())
+            .agent_snapshot(&self.agent_id, quit_state.clone())
         {
             Ok(snapshot) => {
                 let _ = self.app.emit("adaptive-agent://state", snapshot);
@@ -3844,9 +3851,7 @@ impl Bridge {
                 *state.manager.bootstrap_error.lock().unwrap() = Some(error);
                 let _ = self.app.emit(
                     "adaptive-agent://state",
-                    state
-                        .manager
-                        .error_snapshot(state.quit.lock().unwrap().state()),
+                    state.manager.error_snapshot(quit_state),
                 );
             }
         }
@@ -4526,10 +4531,9 @@ fn desktop_state(
     agent_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<DesktopState, String> {
+    let quit_state = current_quit_state(&state);
     match state.manager.ensure_runtime(&agent_id, true) {
-        Ok(_) => state
-            .manager
-            .agent_snapshot(&agent_id, state.quit.lock().unwrap().state()),
+        Ok(_) => state.manager.agent_snapshot(&agent_id, quit_state.clone()),
         Err(error)
             if state
                 .manager
@@ -4541,9 +4545,7 @@ fn desktop_state(
                 == Some(agent_id.as_str()) =>
         {
             *state.manager.bootstrap_error.lock().unwrap() = Some(error);
-            Ok(state
-                .manager
-                .error_snapshot(state.quit.lock().unwrap().state()))
+            Ok(state.manager.error_snapshot(quit_state))
         }
         Err(error) => Err(error),
     }
@@ -4857,6 +4859,7 @@ fn desktop_window_bootstrap(
         });
     };
     state.manager.ensure_runtime(&agent_id, true)?;
+    let quit_state = current_quit_state(&state);
     let presentation = state
         .manager
         .workbench
@@ -4867,11 +4870,7 @@ fn desktop_window_bootstrap(
     Ok(DesktopWindowBootstrap {
         kind: "agent",
         agent_id: Some(agent_id.clone()),
-        state: Some(
-            state
-                .manager
-                .agent_snapshot(&agent_id, state.quit.lock().unwrap().state())?,
-        ),
+        state: Some(state.manager.agent_snapshot(&agent_id, quit_state)?),
         presentation,
     })
 }
@@ -4907,6 +4906,7 @@ fn save_window_presentation(
 /// subsequent operations to the returned agent ID rather than trusting renderer state.
 #[tauri::command]
 fn desktop_bootstrap(state: tauri::State<'_, AppState>) -> Result<Value, String> {
+    let quit_state = current_quit_state(&state);
     let snapshot = match state.manager.current() {
         Ok(_) => state
             .manager
@@ -4919,18 +4919,12 @@ fn desktop_bootstrap(state: tauri::State<'_, AppState>) -> Result<Value, String>
                     .current_agent_id
                     .clone()
                     .unwrap_or_default(),
-                state.quit.lock().unwrap().state(),
+                quit_state.clone(),
             )
-            .unwrap_or_else(|_| {
-                state
-                    .manager
-                    .error_snapshot(state.quit.lock().unwrap().state())
-            }),
+            .unwrap_or_else(|_| state.manager.error_snapshot(quit_state.clone())),
         Err(error) => {
             *state.manager.bootstrap_error.lock().unwrap() = Some(error);
-            state
-                .manager
-                .error_snapshot(state.quit.lock().unwrap().state())
+            state.manager.error_snapshot(quit_state)
         }
     };
     Ok(json!({ "currentAgentId": snapshot.agent_id, "state": snapshot }))
@@ -4970,9 +4964,8 @@ fn reload_settings(
             .cloned()
             .ok_or("Desktop runtime is unavailable.")?;
         start_trace_for_runtime(&agent_id, runtime, bridge.clone())?;
-        state
-            .manager
-            .agent_snapshot(&agent_id, state.quit.lock().unwrap().state())
+        let quit_state = current_quit_state(&state);
+        state.manager.agent_snapshot(&agent_id, quit_state)
     })();
     state.reconfiguring.store(false, Ordering::SeqCst);
     result
@@ -5058,9 +5051,8 @@ fn save_settings(
             .cloned()
             .ok_or("Desktop runtime is unavailable.")?;
         start_trace_for_runtime(&agent_id, runtime, bridge.clone())?;
-        state
-            .manager
-            .agent_snapshot(&agent_id, state.quit.lock().unwrap().state())
+        let quit_state = current_quit_state(&state);
+        state.manager.agent_snapshot(&agent_id, quit_state)
     })();
     state.reconfiguring.store(false, Ordering::SeqCst);
     result
@@ -5629,9 +5621,8 @@ fn begin_drain(app: &AppHandle, mode: DrainMode) -> Result<DesktopState, String>
     for candidate in &bridges {
         candidate.emit_state();
     }
-    let snapshot = state
-        .manager
-        .agent_snapshot(&bridge.agent_id, state.quit.lock().unwrap().state())?;
+    let quit_state = current_quit_state(&state);
+    let snapshot = state.manager.agent_snapshot(&bridge.agent_id, quit_state)?;
 
     let app = app.clone();
     std::thread::spawn(move || {
@@ -5759,6 +5750,7 @@ fn quit_cancel(state: tauri::State<'_, AppState>) -> Result<DesktopState, String
     for candidate in state.manager.runtime_bridges() {
         candidate.emit_state();
     }
+    let quit_state = current_quit_state(&state);
     match state.manager.current() {
         Ok(runtime) => {
             let agent_id = runtime
@@ -5768,15 +5760,11 @@ fn quit_cancel(state: tauri::State<'_, AppState>) -> Result<DesktopState, String
                 .as_ref()
                 .map(|bridge| bridge.agent_id.clone())
                 .ok_or_else(|| "Desktop runtime is not available.".to_string())?;
-            state
-                .manager
-                .agent_snapshot(&agent_id, state.quit.lock().unwrap().state())
+            state.manager.agent_snapshot(&agent_id, quit_state.clone())
         }
         Err(error) => {
             *state.manager.bootstrap_error.lock().unwrap() = Some(error);
-            Ok(state
-                .manager
-                .error_snapshot(state.quit.lock().unwrap().state()))
+            Ok(state.manager.error_snapshot(quit_state))
         }
     }
 }
