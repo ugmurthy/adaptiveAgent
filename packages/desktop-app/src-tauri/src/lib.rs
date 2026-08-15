@@ -373,6 +373,7 @@ struct AgentRuntimeManager {
     trace_policy: Mutex<()>,
     shutdown: AtomicBool,
     catalog_loading: AtomicBool,
+    runtime_bootstrapping: AtomicBool,
     catalog_diagnostics: Mutex<Vec<Value>>,
     bootstrap_error: Mutex<Option<String>>,
 }
@@ -522,6 +523,7 @@ impl AgentRuntimeManager {
             trace_policy: Mutex::new(()),
             shutdown: AtomicBool::new(false),
             catalog_loading: AtomicBool::new(true),
+            runtime_bootstrapping: AtomicBool::new(true),
             catalog_diagnostics: Mutex::new(Vec::new()),
             bootstrap_error: Mutex::new(None),
         })
@@ -676,6 +678,11 @@ impl AgentRuntimeManager {
                     agents: catalog,
                     current_agent_id: reported_current_id,
                 };
+                self.catalog_loading.store(false, Ordering::SeqCst);
+                let _ = self.app.emit(
+                    "adaptive-agent://catalog-status-changed",
+                    json!({ "catalogReady": true }),
+                );
                 return Err(error);
             }
         };
@@ -696,9 +703,10 @@ impl AgentRuntimeManager {
         };
         *self.catalog_diagnostics.lock().unwrap() = diagnostics;
         *self.bootstrap_error.lock().unwrap() = None;
+        self.catalog_loading.store(false, Ordering::SeqCst);
         let _ = self.app.emit(
             "adaptive-agent://catalog-status-changed",
-            json!({ "agentId": current.id }),
+            json!({ "agentId": current.id, "catalogReady": true }),
         );
         Ok(())
     }
@@ -1411,7 +1419,9 @@ impl AgentRuntimeManager {
                 quit_state,
             });
         }
-        self.retire_quiescent_generations();
+        if !self.runtime_bootstrapping.load(Ordering::SeqCst) {
+            self.retire_quiescent_generations();
+        }
         let (current_agent_id, mut descriptors) = {
             let catalog = self.catalog.lock().unwrap();
             (
@@ -5887,6 +5897,10 @@ pub fn run() {
                     *state.manager.bootstrap_error.lock().unwrap() = Some(error);
                 }
                 state.manager.catalog_loading.store(false, Ordering::SeqCst);
+                state
+                    .manager
+                    .runtime_bootstrapping
+                    .store(false, Ordering::SeqCst);
                 let _ = app_handle.emit(
                     "adaptive-agent://catalog-status-changed",
                     json!({ "bootstrapComplete": true }),
