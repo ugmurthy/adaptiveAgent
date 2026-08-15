@@ -12,7 +12,8 @@
   let openingId = '';
   let lifecycleId = '';
   let refreshTimer: number | undefined;
-  let refreshGeneration = 0;
+  let refreshRequested = false;
+  let refreshTask: Promise<void> | undefined;
   let disposed = false;
   let builderOpen = false;
   let builderMode: 'describe' | 'json' = 'describe';
@@ -29,16 +30,37 @@
   $: recent = aggregateRecentWork(catalog?.agents ?? []);
   $: attention = agentsNeedingAttention(catalog?.agents ?? []);
 
-  async function refresh() {
-    const generation = ++refreshGeneration;
+  async function loadCatalog() {
     try {
       const next = await getDesktopCatalogStatus();
-      if (disposed || generation !== refreshGeneration) return;
+      if (disposed) return;
       catalog = next; error = next.error ?? '';
       if (next.loading) scheduleRefresh(500);
     }
-    catch (cause) { if (!disposed && generation === refreshGeneration) error = String(cause); }
-    finally { if (!disposed && generation === refreshGeneration) loading = false; }
+    catch (cause) {
+      if (!disposed) {
+        error = String(cause);
+        if (catalog?.loading) scheduleRefresh(500);
+      }
+    }
+    finally { if (!disposed) loading = false; }
+  }
+  async function drainRefreshes() {
+    try {
+      while (refreshRequested && !disposed) {
+        refreshRequested = false;
+        await loadCatalog();
+      }
+    } finally {
+      refreshTask = undefined;
+      if (refreshRequested && !disposed) void refresh();
+    }
+  }
+  function refresh(): Promise<void> {
+    if (disposed) return Promise.resolve();
+    refreshRequested = true;
+    refreshTask ??= drainRefreshes();
+    return refreshTask;
   }
   function scheduleRefresh(delay = 120) {
     if (refreshTimer !== undefined) return;
@@ -137,7 +159,7 @@
     let unlisten = () => {};
     void listenCatalogStatusChanged(scheduleRefresh).then((fn) => { if (disposed) fn(); else unlisten = fn; });
     void refresh();
-    return () => { disposed = true; refreshGeneration += 1; unlisten(); if (refreshTimer !== undefined) clearTimeout(refreshTimer); };
+    return () => { disposed = true; refreshRequested = false; unlisten(); if (refreshTimer !== undefined) clearTimeout(refreshTimer); };
   });
 </script>
 

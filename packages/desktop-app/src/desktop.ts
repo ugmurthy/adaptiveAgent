@@ -161,7 +161,7 @@ export const exportAgentConfig=(agentId:string,configPath:string)=>invoke<string
 export const archiveAgentConfig=(agentId:string,configPath:string)=>invoke<AgentProfileMove>('archive_agent_config',{agentId,configPath});
 export const restoreAgentConfig=(agentId:string,configPath:string)=>invoke<AgentProfileMove>('restore_agent_config',{agentId,configPath});
 export const saveWindowPresentation=(presentation:{inspectorWidth:number;inspectorOpen:boolean;selection:import('./workbench-state').WorkbenchSelection})=>invoke<void>('save_window_presentation',{presentation});
-export const listenCatalogStatusChanged=(callback:()=>void)=>listen('adaptive-agent://catalog-status-changed',callback);
+export const listenCatalogStatusChanged=(callback:()=>void)=>listen('adaptive-agent://catalog-status-changed',()=>callback());
 
 export function createDesktopApi(agentId:string):DesktopApi {
   if (!agentId) throw new Error('agentId is required');
