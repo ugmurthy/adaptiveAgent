@@ -4388,7 +4388,8 @@ fn set_trace_privacy(
             if let Some(trace) = candidate.trace.lock().unwrap().take() {
                 trace.shutdown();
             }
-            if let Some(bridge) = candidate.bridge.lock().unwrap().as_ref().cloned() {
+            let bridge = candidate.bridge.lock().unwrap().as_ref().cloned();
+            if let Some(bridge) = bridge {
                 bridge.trace_healthy.store(false, Ordering::SeqCst);
                 *bridge.trace_error.lock().unwrap() = Some(
                     "Trace stopped after privacy changed; it will restart with the new policy when needed."
@@ -4539,13 +4540,16 @@ fn desktop_state(
 }
 
 #[tauri::command]
-fn desktop_catalog_status(
-    state: tauri::State<'_, AppState>,
-) -> Result<DesktopCatalogStatus, String> {
-    let quit_state = state.quit.lock().unwrap().state();
-    state
-        .manager
-        .catalog_status(quit_state, state.window_limit_diagnostic.clone())
+async fn desktop_catalog_status(app: AppHandle) -> Result<DesktopCatalogStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let quit_state = state.quit.lock().unwrap().state();
+        state
+            .manager
+            .catalog_status(quit_state, state.window_limit_diagnostic.clone())
+    })
+    .await
+    .map_err(|error| format!("Unable to read agent catalog status: {error}"))?
 }
 
 #[tauri::command]
@@ -5897,7 +5901,8 @@ pub fn run() {
                     .map(|(agent_id, runtime)| (agent_id.clone(), runtime.clone()))
                     .collect::<Vec<_>>();
                 for (agent_id, runtime) in runtimes {
-                    if let Some(bridge) = runtime.bridge.lock().unwrap().as_ref().cloned() {
+                    let bridge = runtime.bridge.lock().unwrap().as_ref().cloned();
+                    if let Some(bridge) = bridge {
                         let _ = start_trace_for_runtime(&agent_id, runtime.clone(), bridge);
                     }
                 }
