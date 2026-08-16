@@ -103,6 +103,7 @@ export interface AgentConfigSaveOptions {
   env?: NodeJS.ProcessEnv;
   settingsConfigPath?: string;
   generatorAgent?: string;
+  targetPath?: string;
   overwrite?: boolean;
   expectedPath?: string;
   expectedTargetFingerprint?: string;
@@ -292,8 +293,8 @@ export async function prepareAgentConfigSave(options: AgentConfigSaveOptions): P
     settingsConfigPath: options.settingsConfigPath,
     agentConfigPath: options.generatorAgent ?? DEFAULT_GENERATOR_AGENT,
   });
-  const agentsDir = generatorConfig.agents.dirs[0];
-  if (!agentsDir) throw new Error('agent-create requires at least one configured agents.dirs entry.');
+  const primaryAgentsDir = generatorConfig.agents.dirs[0];
+  if (!primaryAgentsDir) throw new Error('agent-create requires at least one configured agents.dirs entry.');
   if (!options.agent || Array.isArray(options.agent) || typeof options.agent !== 'object') {
     throw new Error('agent config must be a JSON object');
   }
@@ -301,13 +302,17 @@ export async function prepareAgentConfigSave(options: AgentConfigSaveOptions): P
   const id = validateExplicitAgentId(expectNonEmptyString(agent.id, 'agent config.id'));
   agent.id = id;
   await validateGeneratedAgentConfig(agent, cwd, env, generatorConfig);
-  const path = resolve(agentsDir, `${id}.json`);
   const catalog = await inspectAgentSdkCatalog({
     cwd,
     env,
     settingsConfigPath: options.settingsConfigPath,
     agentConfigPath: options.generatorAgent ?? DEFAULT_GENERATOR_AGENT,
   });
+  const path = options.targetPath ? resolve(cwd, options.targetPath) : resolve(primaryAgentsDir, `${id}.json`);
+  if (options.targetPath && !catalog.agents.some((candidate) => candidate.id === id && candidate.configPath === path && candidate.validationState === 'valid')) {
+    throw new Error(`Agent config target for "${id}" is stale or invalid; refresh the catalog and try again.`);
+  }
+  const agentsDir = options.targetPath ? dirname(path) : primaryAgentsDir;
   const duplicatePaths = catalog.agents
     .filter((candidate) => candidate.id === id)
     .map((candidate) => candidate.configPath)

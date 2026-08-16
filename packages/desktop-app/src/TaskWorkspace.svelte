@@ -6,7 +6,7 @@
   import ArtifactList from './ArtifactList.svelte';
   import ApprovalCard from './ApprovalCard.svelte';
   import ResultRenderer from './ResultRenderer.svelte';
-  import { extractResultArtifacts, recoveryActionLabel, resolveResultArtifactPaths, resultDisplayContent, type ResultArtifact } from './workbench-ux';
+  import { historyResultArtifacts, recoveryActionLabel, resultDisplayContent, type ResultArtifact } from './workbench-ux';
 
   const { getRunOverview, listWorkspaceArtifacts } = desktopApi();
 
@@ -56,7 +56,6 @@
     ? recoveryActionLabel(recoveryPlan)
     : '';
   $: resultValue = output(result);
-  $: artifacts = extractResultArtifacts(resultValue);
   $: displayedResult = resultDisplayContent(resultValue);
 
   async function submitSteer() {
@@ -103,7 +102,14 @@
     artifactRunId = requestedRunId;
     artifactError = '';
     try {
-      const loaded = resolveResultArtifactPaths(artifacts, await listWorkspaceArtifacts());
+      const [workspaceArtifacts, overview] = await Promise.all([
+        listWorkspaceArtifacts(),
+        getRunOverview(requestedRunId).catch(() => undefined),
+      ]);
+      const loaded = historyResultArtifacts([
+        resultValue,
+        ...(overview?.rootRuns ?? []).map((run) => run.result),
+      ], workspaceArtifacts);
       if (generation !== artifactGeneration || selectedRun.runId !== requestedRunId) return;
       resolvedArtifacts = loaded;
     } catch (error) {

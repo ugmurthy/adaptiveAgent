@@ -53,6 +53,7 @@ export interface DesktopCatalogAgent {
   occupiedSlots: number;
   capacity: number;
   attention: 'none' | 'approval' | 'recovery' | 'error';
+  initializationError?: string;
   recentWork: DesktopRecentWork[];
 }
 export type DesktopCatalogDiagnostic = Record<string, unknown>;
@@ -90,6 +91,7 @@ export interface AgentConfigPreview {
   targetFingerprint: string;
   agent: Record<string, unknown>;
 }
+export interface AgentProfileContent { fileName: string; content: string; }
 export interface AgentCreatePrepared extends AgentConfigPreview {
   brief: string;
   generatorAgent: { requested:string; id:string; name:string };
@@ -118,11 +120,40 @@ export interface WorkspaceArtifact { path:string; }
 export interface ArtifactPreview { name:string; kind:'text'|'markdown'|'html'|'json'|'image'|'video'; mimeType:string; content:string; }
 
 export interface TracePrivacy { messages:boolean; reasoning:boolean; rawToolPayloads:boolean; }
+export interface TraceRootRun {
+  rootRunId:string;
+  runId:string;
+  invocationKind?:string;
+  turnIndex?:number|null;
+  linkedAt?:string|null;
+  startedAt?:string|null;
+  updatedAt?:string|null;
+  completedAt?:string|null;
+  status?:string|null;
+  goal?:string|null;
+  result?:unknown;
+  errorCode?:string|null;
+  errorMessage?:string|null;
+  modelProvider?:string|null;
+  modelName?:string|null;
+}
+export interface TraceRunTreeEntry {
+  rootRunId:string;
+  runId:string;
+  parentRunId?:string|null;
+  delegateName?:string|null;
+  depth?:number;
+  status?:string|null;
+  createdAt?:string|null;
+  updatedAt?:string|null;
+  completedAt?:string|null;
+  result?:unknown;
+}
 export interface TraceReport {
   summary?: { status?:string; reason?:string };
-  rootRuns?: unknown[];
+  rootRuns?: TraceRootRun[];
   timeline?: Array<Record<string, unknown>>;
-  runTree?: unknown[];
+  runTree?: TraceRunTreeEntry[];
   usage?: { total?: { promptTokens?:number; completionTokens?:number; reasoningTokens?:number; totalTokens?:number; estimatedCostUSD?:number }; toolAccounting?: { unpricedRequests?:number }; [key:string]:unknown };
   performance?: Record<string, unknown>;
   diagnostics?: { performance?: { toolAccounting?: { unpricedRequests?:number } }; [key:string]:unknown };
@@ -155,8 +186,9 @@ export const desktopWindowBootstrap=()=>invoke<DesktopWindowBootstrap>('desktop_
 export const getDesktopCatalogStatus=()=>invoke<DesktopCatalogStatus>('desktop_catalog_status');
 export const openAgentWindow=(agentId:string)=>invoke<AgentWindowOpen>('open_agent_window',{agentId});
 export const generateAgentDraft=(brief:string,generatorAgent?:string)=>invoke<AgentCreatePrepared>('generate_agent_draft',{brief,generatorAgent});
-export const validateAgentConfig=(agent:Record<string,unknown>,generatorAgent?:string)=>invoke<AgentConfigPreview>('validate_agent_config',{agent,generatorAgent});
-export const saveAgentConfig=(agent:Record<string,unknown>,generatorAgent:string|undefined,overwrite:boolean,expectedPath:string,expectedTargetFingerprint:string)=>invoke<AgentConfigPreview>('save_agent_config',{agent,generatorAgent,overwrite,expectedPath,expectedTargetFingerprint});
+export const validateAgentConfig=(agent:Record<string,unknown>,generatorAgent?:string,targetPath?:string)=>invoke<AgentConfigPreview>('validate_agent_config',{agent,generatorAgent,targetPath});
+export const saveAgentConfig=(agent:Record<string,unknown>,generatorAgent:string|undefined,targetPath:string|undefined,overwrite:boolean,expectedPath:string,expectedTargetFingerprint:string)=>invoke<AgentConfigPreview>('save_agent_config',{agent,generatorAgent,targetPath,overwrite,expectedPath,expectedTargetFingerprint});
+export const readAgentConfig=(agentId:string,configPath:string)=>invoke<AgentProfileContent>('read_agent_config',{agentId,configPath});
 export const exportAgentConfig=(agentId:string,configPath:string)=>invoke<string|null>('export_agent_config',{agentId,configPath});
 export const archiveAgentConfig=(agentId:string,configPath:string)=>invoke<AgentProfileMove>('archive_agent_config',{agentId,configPath});
 export const restoreAgentConfig=(agentId:string,configPath:string)=>invoke<AgentProfileMove>('restore_agent_config',{agentId,configPath});

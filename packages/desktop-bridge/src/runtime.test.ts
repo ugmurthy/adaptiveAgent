@@ -213,6 +213,38 @@ describe('desktop runtime protocol', () => {
     await rm(cwd, { recursive: true, force: true });
   });
 
+  it('uses an exact catalog selection instead of the settings startup-agent pin', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'desktop-catalog-selection-'));
+    const startupPath = join(cwd, 'startup-agent.json');
+    const selectedPath = join(cwd, 'selected-agent.json');
+    const agent = (id: string) => ({ id, name: id, invocationModes: ['run'], defaultInvocationMode: 'run', model: { provider: 'mesh', model: 'test-model', apiKey: 'test-key' }, tools: [] });
+    await writeFile(startupPath, JSON.stringify(agent('startup-agent')));
+    await writeFile(selectedPath, JSON.stringify(agent('selected-agent')));
+    await writeFile(join(cwd, 'agent.settings.json'), JSON.stringify({
+      agent: { id: 'startup-agent', configPath: startupPath },
+      agents: { dirs: [cwd] },
+      runtime: { mode: 'memory' },
+      inference: { mode: 'byok' },
+      interaction: { approvalMode: 'auto', clarificationMode: 'fail' },
+    }));
+    const inspectRuntime = createRuntime().runtime;
+    await inspectRuntime.handleRpc(request({ id: 'protocol', method: 'initialize', params: { protocolVersion: '1.16', clientInfo: { name: 'desktop' } } }));
+    const catalog = await inspectRuntime.handleRpc(request({ id: 'catalog', method: 'catalog/inspect', params: { cwd } })) as any;
+    const descriptor = catalog.agents.find((candidate: { id: string }) => candidate.id === 'selected-agent');
+    expect(catalog.currentAgent.id).toBe('startup-agent');
+
+    const selectedRuntime = createRuntime().runtime;
+    try {
+      await selectedRuntime.handleRpc(request({ id: 'protocol', method: 'initialize', params: { protocolVersion: '1.16', clientInfo: { name: 'desktop' } } }));
+      const result = await selectedRuntime.handleRpc(request({ id: 'runtime', method: 'runtime/initialize', params: { cwd, runtimeMode: 'memory', inferenceMode: 'byok', approvalMode: 'auto', clarificationMode: 'fail', agentSelection: { id: descriptor.id, configPath: descriptor.configPath, configurationFingerprint: descriptor.configurationFingerprint } } })) as any;
+      expect(result.agent.id).toBe('selected-agent');
+    } finally {
+      await selectedRuntime.close();
+      await inspectRuntime.close();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('translates only immutable files contained by the managed attachment root', async () => {
     const root = await mkdtemp(join(tmpdir(), 'desktop-attachments-'));
     const workspace = await mkdtemp(join(tmpdir(), 'desktop-workspace-'));

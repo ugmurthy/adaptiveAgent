@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { aggregateRecentWork, agentsNeedingAttention, desktopTimestamp, filterAndSortAgents, isInspectable, isLaunchable } from './agent-studio';
+import { aggregateRecentWork, agentsNeedingAttention, desktopTimestamp, filterAndSortAgents, isInspectable, isLaunchable, parseAgentJson } from './agent-studio';
 import type { DesktopCatalogAgent } from './desktop';
 
 const agent = (id: string, overrides: Partial<DesktopCatalogAgent> = {}): DesktopCatalogAgent => ({ id, name: id, configPath: `/${id}.json`, archived: false, validationState: 'valid', configurationFingerprint: id, status: 'ready', occupiedSlots: 0, capacity: 3, attention: 'none', recentWork: [], ...overrides });
@@ -27,5 +27,10 @@ describe('Agent Studio helpers', () => {
     expect(isLaunchable(agent('invalid', { validationState: 'invalid' }))).toBe(false);
     expect(isInspectable(agent('archived', { archived: true }))).toBe(true);
     expect(isInspectable(agent('invalid', { validationState: 'invalid' }))).toBe(false);
+  });
+  test('identifies typographic JSON delimiters without rejecting them inside strings', () => {
+    expect(() => parseAgentJson('{\n  "defaultInvocationMode": “run"\n}')).toThrow('line 2, column 28: typographic quote “');
+    expect(() => parseAgentJson('{"defaultInvocationMode": "run”}')).toThrow('line 1, column 31: typographic quote ”');
+    expect(parseAgentJson('{"systemInstructions":"Use “quoted” words."}')).toEqual({ systemInstructions: 'Use “quoted” words.' });
   });
 });

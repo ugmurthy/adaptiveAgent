@@ -162,6 +162,24 @@ describe('agent-create', () => {
     await expect(saveAgentConfig({ agent: duplicate, cwd: tempDir, settingsConfigPath: settingsPath, expectedPath: preview.path, expectedTargetFingerprint: preview.targetFingerprint })).rejects.toThrow('choose a unique id');
   });
 
+  it('updates an exact valid profile outside the primary agents directory', async () => {
+    const targetPath = join(tempDir, 'catalog-b', 'editable-agent.json');
+    const agent = { ...generatorAgent(), id: 'editable-agent', name: 'Original' };
+    await writeFile(targetPath, JSON.stringify(agent));
+    const updated = { ...agent, name: 'Updated' };
+    const preview = await prepareAgentConfigSave({ agent: updated, cwd: tempDir, settingsConfigPath: settingsPath, targetPath });
+    expect(preview).toMatchObject({ path: targetPath, exists: true, duplicatePaths: [] });
+    await saveAgentConfig({ agent: updated, cwd: tempDir, settingsConfigPath: settingsPath, targetPath, overwrite: true, expectedPath: preview.path, expectedTargetFingerprint: preview.targetFingerprint });
+    expect(JSON.parse(await readFile(targetPath, 'utf8')).name).toBe('Updated');
+  });
+
+  it('refuses a stale or identity-changing exact profile target', async () => {
+    const targetPath = join(tempDir, 'catalog-b', 'fixed-agent.json');
+    const agent = { ...generatorAgent(), id: 'fixed-agent', name: 'Fixed' };
+    await writeFile(targetPath, JSON.stringify(agent));
+    await expect(prepareAgentConfigSave({ agent: { ...agent, id: 'changed-agent' }, cwd: tempDir, settingsConfigPath: settingsPath, targetPath })).rejects.toThrow('stale or invalid');
+  });
+
   it('rejects structurally invalid direct JSON through the standard SDK validator', async () => {
     await expect(prepareAgentConfigSave({
       agent: { id: 'invalid-agent' },

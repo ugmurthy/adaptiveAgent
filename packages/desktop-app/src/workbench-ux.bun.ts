@@ -36,6 +36,13 @@ describe('workbench UX decisions', () => {
       { path: '/workspace/two/chart.png' },
     ]);
   });
+  it('finds an existing artifact referenced by a persisted run envelope or trace result', () => {
+    const workspace = [{ path: '/Users/example/work/news.html' }];
+    expect(historyResultArtifacts([
+      { status: 'success', output: 'Created `news.html` at `/Users/example/work/news.html`.' },
+      'The bulletin is ready at /Users/example/work/news.html.',
+    ], workspace)).toEqual([{ path: '/Users/example/work/news.html' }]);
+  });
   it('exposes one status-matched Recover control', () => {
     expect(recoveryActionLabel({runId:'failed',status:'failed',action:'retry_same_run',executable:true,reason:'retryable'})).toBe('Recover run');
     expect(recoveryActionLabel({runId:'interrupted',status:'interrupted',action:'resume_same_run',executable:true,reason:'resumable'})).toBe('Recover run');

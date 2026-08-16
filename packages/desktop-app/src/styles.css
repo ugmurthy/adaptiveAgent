@@ -214,6 +214,15 @@ dd small { display: block; margin-top: 3px; }
 .metric-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 12px 0; }
 .metric-grid > div, .inspector-list article { display: flex; flex-direction: column; gap: 3px; border-bottom: 1px solid #26343c; padding: 10px; }
 .metric-grid span, .inspector-list span { color: #81919b; font-size: 11px; }
+.inspector-run-detail { display: grid; gap: 12px; margin-top: 14px; border: 1px solid #304149; border-radius: 8px; padding: 12px; }
+.inspector-run-heading { display: flex; align-items: center; justify-content: space-between; }
+.inspector-run-heading span, .inspector-field > span { color: #81919b; font-size: 10px; letter-spacing: .04em; text-transform: uppercase; }
+.inspector-field { min-width: 0; }
+.inspector-field p { margin: 5px 0 0; overflow-wrap: anywhere; font-size: 12px; line-height: 1.45; }
+.inspector-metadata { display: block; }
+.inspector-metadata > div { display: grid; grid-template-columns: 72px minmax(0, 1fr); }
+.inspector-metadata dt, .inspector-metadata dd { padding: 7px 0; font-size: 11px; }
+.inspector-run-detail .rendered-result { margin-top: 6px; border-radius: 7px; background: #071015; padding: 10px; font-size: 12px; }
 .warning-copy { border-left: 3px solid #e3b354; padding-left: 10px; color: #d9cda9; }
 .warning-copy p { margin: 5px 0; font-size: 11px; }
 .raw-toggle { margin: 14px 0 8px; background: transparent; }
@@ -349,6 +358,9 @@ dd small { display: block; margin-top: 3px; }
 .card-recent > span { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .agent-card > button { margin-top: auto; }
 .invalid-copy { margin-top: 8px; color: #efa7aa; }
+.initialization-diagnostic { display: grid; gap: 7px; margin: 0 0 12px; border: 1px solid #713b3d; border-radius: 8px; background: #291719; padding: 10px; color: #ffb9b6; font-size: 11px; line-height: 1.45; }
+.initialization-diagnostic span { overflow-wrap: anywhere; }
+.initialization-diagnostic button { justify-self: start; }
 .studio-lower { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 36px; }
 .studio-lower > section, .diagnostics-panel { border: 1px solid #2d3c44; border-radius: 12px; background: #0d171c; padding: 18px; }
 .studio-list { display: grid; gap: 2px; }

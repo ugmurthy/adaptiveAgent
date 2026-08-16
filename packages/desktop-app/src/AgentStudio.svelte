@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import BrandMark from './BrandMark.svelte';
-  import { aggregateRecentWork, agentsNeedingAttention, desktopTimestamp, filterAndSortAgents, isInspectable } from './agent-studio';
-  import { archiveAgentConfig, exportAgentConfig, generateAgentDraft, getDesktopCatalogStatus, listenCatalogStatusChanged, openAgentWindow, quitCancel, quitTerminate, quitWait, restoreAgentConfig, saveAgentConfig, validateAgentConfig, type AgentConfigPreview, type DesktopCatalogAgent, type DesktopCatalogStatus } from './desktop';
+  import { aggregateRecentWork, agentsNeedingAttention, desktopTimestamp, filterAndSortAgents, isInspectable, parseAgentJson } from './agent-studio';
+  import { archiveAgentConfig, exportAgentConfig, generateAgentDraft, getDesktopCatalogStatus, listenCatalogStatusChanged, openAgentWindow, quitCancel, quitTerminate, quitWait, readAgentConfig, restoreAgentConfig, saveAgentConfig, validateAgentConfig, type AgentConfigPreview, type DesktopCatalogAgent, type DesktopCatalogStatus } from './desktop';
 
   let catalog: DesktopCatalogStatus | undefined;
   let loading = true;
@@ -26,6 +26,7 @@
   let builderBusy = false;
   let builderError = '';
   let builderValidationGeneration = 0;
+  let builderEditing: DesktopCatalogAgent | undefined;
   $: agents = filterAndSortAgents(catalog?.agents ?? [], query, showArchived);
   $: recent = aggregateRecentWork(catalog?.agents ?? []);
   $: attention = agentsNeedingAttention(catalog?.agents ?? []);
@@ -76,7 +77,7 @@
           await new Promise((resolve) => setTimeout(resolve, 80));
         }
       }
-    } catch (cause) { error = String(cause); }
+    } catch (cause) { error = String(cause); await refresh(); }
     finally { openingId = ''; }
   }
   async function quit(action: 'wait' | 'terminate' | 'cancel') {
@@ -104,12 +105,21 @@
   }
   function openBuilder(mode: 'describe' | 'json') {
     builderOpen = true; builderMode = mode; builderStep = 'input'; builderBrief = ''; builderJson = '';
-    builderNotes = []; builderRecommendations = []; builderPreview = undefined; builderError = '';
+    builderNotes = []; builderRecommendations = []; builderPreview = undefined; builderError = ''; builderEditing = undefined;
+  }
+  async function editProfile(agent: DesktopCatalogAgent) {
+    lifecycleId = agent.id; error = '';
+    try {
+      const profile = await readAgentConfig(agent.id, agent.configPath);
+      const parsed = parseAgentJson(profile.content);
+      builderEditing = agent; builderOpen = true; builderMode = 'json'; builderStep = 'review';
+      builderBrief = ''; builderJson = JSON.stringify(parsed, null, 2); builderNotes = []; builderRecommendations = []; builderError = '';
+      builderPreview = await validateAgentConfig(parsed, undefined, agent.configPath);
+    } catch (cause) { error = String(cause); }
+    finally { lifecycleId = ''; }
   }
   function parseBuilderJson() {
-    const value: unknown = JSON.parse(builderJson);
-    if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error('Agent JSON must be an object.');
-    return value as Record<string, unknown>;
+    return parseAgentJson(builderJson);
   }
   async function prepareBuilder() {
     builderBusy = true; builderError = '';
@@ -131,7 +141,7 @@
     const generation = ++builderValidationGeneration;
     builderBusy = true; builderError = '';
     try {
-      const preview = await validateAgentConfig(parseBuilderJson());
+      const preview = await validateAgentConfig(parseBuilderJson(), undefined, builderEditing?.configPath);
       if (generation === builderValidationGeneration) builderPreview = preview;
     }
     catch (cause) { if (generation === builderValidationGeneration) { builderPreview = undefined; builderError = String(cause); } }
@@ -142,11 +152,11 @@
     builderBusy = true; builderError = '';
     try {
       const agent = parseBuilderJson();
-      const preview = await validateAgentConfig(agent);
+      const preview = await validateAgentConfig(agent, undefined, builderEditing?.configPath);
       builderPreview = preview;
       if (preview.duplicatePaths.length) throw new Error(`Choose a unique agent ID. It already exists at ${preview.duplicatePaths.join(', ')}.`);
       if (preview.exists && !window.confirm(`Overwrite the existing agent profile at ${preview.path}?`)) return;
-      await saveAgentConfig(agent, undefined, preview.exists, preview.path, preview.targetFingerprint);
+      await saveAgentConfig(agent, undefined, builderEditing?.configPath, preview.exists, preview.path, preview.targetFingerprint);
       builderOpen = false;
       await refresh();
     } catch (cause) { builderError = String(cause); }
@@ -170,7 +180,7 @@
   {#if builderOpen}
     <div class="modal-backdrop" role="presentation">
       <div class="modal agent-builder" role="dialog" aria-modal="true" aria-labelledby="agent-builder-title">
-        <header><div><span>Agent builder</span><h2 id="agent-builder-title">{builderStep === 'input' ? 'Create a specialist agent' : 'Review agent profile'}</h2></div><button type="button" aria-label="Close" on:click={() => builderOpen = false}>×</button></header>
+        <header><div><span>Agent builder</span><h2 id="agent-builder-title">{builderEditing ? `Edit ${builderEditing.name}` : builderStep === 'input' ? 'Create a specialist agent' : 'Review agent profile'}</h2></div><button type="button" aria-label="Close" on:click={() => builderOpen = false}>×</button></header>
         {#if builderStep === 'input'}
           <div class="builder-tabs"><button class:active={builderMode === 'describe'} on:click={() => builderMode = 'describe'}>Describe agent</button><button class:active={builderMode === 'json'} on:click={() => builderMode = 'json'}>Paste JSON</button></div>
           {#if builderMode === 'describe'}<label><span>Description</span><textarea rows="8" bind:value={builderBrief} placeholder="Build a security review agent that inspects TypeScript changes, explains risks, and recommends focused tests."></textarea></label>
@@ -179,13 +189,13 @@
           {#if builderError}<div class="alert" role="alert">{builderError}</div>{/if}
           <div class="actions"><button on:click={() => builderOpen = false}>Cancel</button><button class="primary" disabled={builderBusy || (builderMode === 'describe' ? !builderBrief.trim() : !builderJson.trim())} on:click={prepareBuilder}>{builderBusy ? 'Preparing…' : 'Create draft'}</button></div>
         {:else}
-          <div class="builder-summary"><div><span>Output path</span><code>{builderPreview?.path}</code></div><div><span>Status</span><strong>{builderPreview?.duplicatePaths.length ? 'Duplicate ID' : builderPreview?.exists ? 'Overwrite requires confirmation' : 'New profile'}</strong></div></div>
+          <div class="builder-summary"><div><span>{builderEditing ? 'Profile path' : 'Output path'}</span><code>{builderPreview?.path ?? builderEditing?.configPath}</code></div><div><span>Status</span><strong>{builderPreview?.duplicatePaths.length ? 'Duplicate ID' : builderEditing ? 'Editing existing profile' : builderPreview?.exists ? 'Overwrite requires confirmation' : 'New profile'}</strong></div></div>
           <label><span>Review and edit JSON</span><textarea class="code-editor" rows="18" bind:value={builderJson} on:input={editedBuilderJson}></textarea></label>
           {#if builderNotes.length}<div class="builder-advice"><strong>Notes</strong><ul>{#each builderNotes as note}<li>{note}</li>{/each}</ul></div>{/if}
           {#if builderRecommendations.length}<div class="builder-advice"><strong>Recommendations</strong><ul>{#each builderRecommendations as recommendation}<li>{recommendation}</li>{/each}</ul></div>{/if}
           {#if builderPreview?.duplicatePaths.length}<div class="alert" role="alert">This ID is already used by {builderPreview.duplicatePaths.join(', ')}. Edit the ID and revalidate.</div>{/if}
           {#if builderError}<div class="alert" role="alert">{builderError}</div>{/if}
-          <div class="actions"><button on:click={() => builderStep = 'input'}>Back</button><button disabled={builderBusy} on:click={revalidateBuilder}>Validate</button><button class="primary" disabled={builderBusy || !builderPreview || builderPreview.duplicatePaths.length > 0} on:click={saveBuilder}>{builderBusy ? 'Saving…' : builderPreview?.exists ? 'Confirm overwrite' : 'Save agent'}</button></div>
+          <div class="actions">{#if !builderEditing}<button on:click={() => builderStep = 'input'}>Back</button>{/if}<button disabled={builderBusy} on:click={revalidateBuilder}>Validate</button><button class="primary" disabled={builderBusy || !builderPreview || builderPreview.duplicatePaths.length > 0} on:click={saveBuilder}>{builderBusy ? 'Saving…' : builderEditing ? 'Save profile' : builderPreview?.exists ? 'Confirm overwrite' : 'Save agent'}</button></div>
         {/if}
       </div>
     </div>
@@ -210,10 +220,11 @@
           <div class="agent-grid">
             {#each agents as agent (agent.id)}
               <article class:agent-muted={agent.archived || agent.validationState !== 'valid'} class="agent-card">
-                <header><span class="agent-avatar" aria-hidden="true">{agent.name.trim().charAt(0).toUpperCase() || 'A'}</span><div><h3>{agent.name}</h3><code>{agent.id}</code></div>{#if agent.archived}<span class="badge">Archived</span>{/if}<details class="agent-actions"><summary aria-label={`Actions for ${agent.name}`}>•••</summary><div><button type="button" disabled={lifecycleId !== '' || agent.validationState !== 'valid'} on:click={() => exportProfile(agent)}>Export JSON</button><button type="button" class:danger={!agent.archived} title={!agent.archived && catalog.currentAgentId === agent.id ? 'Select another startup agent before archiving this profile.' : undefined} disabled={lifecycleId !== '' || agent.validationState !== 'valid' || (!agent.archived && catalog.currentAgentId === agent.id)} on:click={() => moveProfile(agent)}>{agent.archived ? 'Restore agent' : 'Archive agent'}</button></div></details></header>
+                <header><span class="agent-avatar" aria-hidden="true">{agent.name.trim().charAt(0).toUpperCase() || 'A'}</span><div><h3>{agent.name}</h3><code>{agent.id}</code></div>{#if agent.archived}<span class="badge">Archived</span>{/if}<details class="agent-actions"><summary aria-label={`Actions for ${agent.name}`}>•••</summary><div><button type="button" disabled={lifecycleId !== '' || agent.archived || agent.validationState !== 'valid'} on:click={() => editProfile(agent)}>Edit profile</button><button type="button" disabled={lifecycleId !== '' || agent.validationState !== 'valid'} on:click={() => exportProfile(agent)}>Export JSON</button><button type="button" class:danger={!agent.archived} title={!agent.archived && catalog.currentAgentId === agent.id ? 'Select another startup agent before archiving this profile.' : undefined} disabled={lifecycleId !== '' || agent.validationState !== 'valid' || (!agent.archived && catalog.currentAgentId === agent.id)} on:click={() => moveProfile(agent)}>{agent.archived ? 'Restore agent' : 'Archive agent'}</button></div></details></header>
                 <p>{agent.description || 'No description provided.'}</p>
                 <div class="agent-metrics"><span class="status-dot" class:good={agent.status === 'ready'}>{agent.status}</span><span>{agent.occupiedSlots}/{agent.capacity} runs</span>{#if agent.attention !== 'none'}<strong class="attention">{agent.attention} needs attention</strong>{/if}</div>
                 <div class="card-recent"><strong>Recent work</strong>{#if agent.recentWork[0]}<span>{agent.recentWork[0].title}</span><small>{agent.recentWork[0].status} · {date(agent.recentWork[0].createdAt)}</small>{:else}<small>No recent work</small>{/if}</div>
+                {#if agent.initializationError}<div class="initialization-diagnostic" role="alert"><strong>Initialization failed</strong><span>{agent.initializationError}</span>{#if !agent.archived}<button type="button" disabled={lifecycleId !== ''} on:click={() => editProfile(agent)}>Edit profile</button>{/if}</div>{/if}
                 <button class="primary" type="button" disabled={!isInspectable(agent) || openingId !== '' || lifecycleId !== ''} on:click={() => open(agent.id)}>{openingId === agent.id ? 'Opening…' : agent.archived ? 'Inspect history' : 'Open workspace'}</button>
                 {#if agent.validationState !== 'valid'}<small class="invalid-copy">Configuration: {agent.validationState}. Resolve diagnostics before opening.</small>{/if}
               </article>

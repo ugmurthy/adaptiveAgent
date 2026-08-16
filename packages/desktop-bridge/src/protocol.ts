@@ -147,6 +147,7 @@ export interface AgentCreateDraftParams {
 export interface AgentConfigParams {
   agent: Record<string, JsonValue>;
   generatorAgent?: string;
+  targetPath?: string;
 }
 
 export interface AgentConfigSaveParams extends AgentConfigParams {
@@ -383,6 +384,7 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
       const value = requiredParams(method, params);
       requiredObject(value, 'agent');
       optionalString(value, 'generatorAgent');
+      optionalString(value, 'targetPath');
       if (method === 'agent/saveConfig') {
         requiredString(value, 'expectedPath');
         requiredString(value, 'expectedTargetFingerprint');

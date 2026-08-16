@@ -178,6 +178,14 @@ struct WindowPresentationUi {
     selection: Value,
 }
 
+#[derive(Clone, Copy)]
+struct WindowBounds {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentWindowOpen {
@@ -187,7 +195,7 @@ struct AgentWindowOpen {
     max_windows: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentProfileContent {
     file_name: String,
@@ -221,6 +229,8 @@ struct DesktopCatalogAgent {
     occupied_slots: usize,
     capacity: usize,
     attention: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    initialization_error: Option<String>,
     recent_work: Vec<RecentWork>,
 }
 
@@ -380,6 +390,7 @@ struct AgentRuntimeManager {
     runtime_bootstrapping: AtomicBool,
     catalog_diagnostics: Mutex<Vec<Value>>,
     bootstrap_error: Mutex<Option<String>>,
+    runtime_initialization_errors: Mutex<HashMap<String, String>>,
 }
 
 type GenerationKey = (String, String, String);
@@ -530,6 +541,7 @@ impl AgentRuntimeManager {
             runtime_bootstrapping: AtomicBool::new(true),
             catalog_diagnostics: Mutex::new(Vec::new()),
             bootstrap_error: Mutex::new(None),
+            runtime_initialization_errors: Mutex::new(HashMap::new()),
         })
     }
 
@@ -721,7 +733,14 @@ impl AgentRuntimeManager {
         allow_archived: bool,
     ) -> Result<Arc<ManagedRuntime>, String> {
         let _lifecycle = self.lifecycle.lock().unwrap();
-        self.ensure_runtime_locked(agent_id, allow_archived)
+        let result = self.ensure_runtime_locked(agent_id, allow_archived);
+        if result.is_ok() {
+            self.runtime_initialization_errors
+                .lock()
+                .unwrap()
+                .remove(agent_id);
+        }
+        result
     }
 
     fn ensure_runtime_locked(
@@ -810,16 +829,33 @@ impl AgentRuntimeManager {
                 );
             }
         }
-        let bridge = Bridge::spawn(
+        eprintln!(
+            "[adaptive-agent-desktop][agent:{agent_id}] starting runtime from {}",
+            descriptor.config_path
+        );
+        let bridge = match Bridge::spawn(
             &self.app,
             self.workbench.clone(),
             self.attachment_root.clone(),
             &descriptor,
-        )?;
+        ) {
+            Ok(bridge) => bridge,
+            Err(error) => {
+                eprintln!("[adaptive-agent-desktop][agent:{agent_id}][spawn-error] {error}");
+                return Err(error);
+            }
+        };
         if let Err(error) = bridge.initialize() {
             bridge.shutdown();
-            return Err(error);
+            let diagnostic = format!("Agent '{agent_id}' could not initialize: {error}");
+            eprintln!("[adaptive-agent-desktop][agent:{agent_id}][initialization-error] {error}");
+            self.runtime_initialization_errors
+                .lock()
+                .unwrap()
+                .insert(agent_id.to_owned(), diagnostic.clone());
+            return Err(diagnostic);
         }
+        eprintln!("[adaptive-agent-desktop][agent:{agent_id}] runtime initialized");
         let runtime = Arc::new(ManagedRuntime {
             bridge: Mutex::new(Some(bridge)),
             trace: Mutex::new(None),
@@ -1437,6 +1473,12 @@ impl AgentRuntimeManager {
         let runtimes = self.runtime_maps.lock().unwrap().current.clone();
         let mut agents = Vec::with_capacity(descriptors.len());
         for descriptor in descriptors {
+            let initialization_error = self
+                .runtime_initialization_errors
+                .lock()
+                .unwrap()
+                .get(&descriptor.id)
+                .cloned();
             let snapshot = runtimes.get(&descriptor.id).and_then(|runtime| {
                 runtime
                     .bridge
@@ -1559,6 +1601,10 @@ impl AgentRuntimeManager {
                     .then_with(|| right.run_id.cmp(&left.run_id))
             });
             recent_work.truncate(RECENT_WORK_LIMIT);
+            if initialization_error.is_some() && occupied_slots == 0 && !descriptor.archived {
+                status = "error";
+            }
+            let error = error || initialization_error.is_some();
             agents.push(DesktopCatalogAgent {
                 id: descriptor.id,
                 name: descriptor.name,
@@ -1571,6 +1617,7 @@ impl AgentRuntimeManager {
                 occupied_slots,
                 capacity: CAPACITY,
                 attention: fleet_attention(error, approval, recovery),
+                initialization_error,
                 recent_work,
             });
         }
@@ -2174,11 +2221,29 @@ impl Bridge {
             while let Some(event) = events.recv().await {
                 match event {
                     CommandEvent::Stdout(bytes) => reader.handle_stdout(1, &bytes),
-                    CommandEvent::Stderr(_) => {
-                        // Sidecar diagnostics stay native and are deliberately not logged or sent to the webview.
+                    CommandEvent::Stderr(bytes) => {
+                        let output = String::from_utf8_lossy(&bytes);
+                        for line in output.lines().filter(|line| !line.trim().is_empty()) {
+                            eprintln!(
+                                "[adaptive-agent-desktop][agent:{}][sidecar-stderr] {line}",
+                                reader.agent_id
+                            );
+                        }
                     }
-                    CommandEvent::Error(_) => reader.transport_failed(),
-                    CommandEvent::Terminated(_) => {
+                    CommandEvent::Error(error) => {
+                        eprintln!(
+                            "[adaptive-agent-desktop][agent:{}][transport-error] {error}",
+                            reader.agent_id
+                        );
+                        reader.transport_failed();
+                    }
+                    CommandEvent::Terminated(payload) => {
+                        if !reader.expected_shutdown.load(Ordering::SeqCst) {
+                            eprintln!(
+                                "[adaptive-agent-desktop][agent:{}][terminated] {payload:?}",
+                                reader.agent_id
+                            );
+                        }
                         reader.transport_failed();
                         break;
                     }
@@ -2195,7 +2260,7 @@ impl Bridge {
             "initialize",
             json!({ "protocolVersion": "1.16", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }),
             REQUEST_TIMEOUT,
-        )?;
+        ).map_err(|error| format!("The runtime handshake failed before profile loading: {error}"))?;
         if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.16") {
             return Err("The sidecar did not negotiate desktop protocol 1.16.".into());
         }
@@ -2211,7 +2276,10 @@ impl Bridge {
                 }
             }),
             REQUEST_TIMEOUT,
-        )?;
+        ).map_err(|error| format!(
+            "Profile '{}' failed runtime initialization: {error} Review its model/provider, workspace paths, tools, and delegates, then retry.",
+            self.agent_config_path
+        ))?;
         let configuration = initialized
             .get("resolvedConfiguration")
             .cloned()
@@ -4593,6 +4661,7 @@ async fn generate_agent_draft(
 async fn validate_agent_config(
     agent: Value,
     generator_agent: Option<String>,
+    target_path: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<Value, String> {
     let bridge = agent_builder_bridge(&state)?;
@@ -4600,6 +4669,9 @@ async fn validate_agent_config(
         let mut params = json!({ "agent": agent });
         if let Some(generator_agent) = generator_agent {
             params["generatorAgent"] = Value::String(generator_agent);
+        }
+        if let Some(target_path) = target_path {
+            params["targetPath"] = Value::String(target_path);
         }
         bridge.request_wait("agent/validateConfig", params, REQUEST_TIMEOUT)
     })
@@ -4611,6 +4683,7 @@ async fn validate_agent_config(
 async fn save_agent_config(
     agent: Value,
     generator_agent: Option<String>,
+    target_path: Option<String>,
     overwrite: bool,
     expected_path: String,
     expected_target_fingerprint: String,
@@ -4620,10 +4693,14 @@ async fn save_agent_config(
         return Err("Agent profiles cannot be saved while the desktop is quitting.".into());
     }
     let bridge = agent_builder_bridge(&state)?;
+    let saved_agent_id = agent.get("id").and_then(Value::as_str).map(str::to_owned);
     let result = tauri::async_runtime::spawn_blocking(move || {
         let mut params = json!({ "agent": agent, "overwrite": overwrite, "expectedPath": expected_path, "expectedTargetFingerprint": expected_target_fingerprint });
         if let Some(generator_agent) = generator_agent {
             params["generatorAgent"] = Value::String(generator_agent);
+        }
+        if let Some(target_path) = target_path {
+            params["targetPath"] = Value::String(target_path);
         }
         bridge.request_wait(
             "agent/saveConfig",
@@ -4634,7 +4711,35 @@ async fn save_agent_config(
     .await
     .map_err(|error| format!("Agent save failed: {error}"))??;
     state.manager.refresh_catalog()?;
+    if let Some(agent_id) = saved_agent_id {
+        state
+            .manager
+            .runtime_initialization_errors
+            .lock()
+            .unwrap()
+            .remove(&agent_id);
+    }
     Ok(result)
+}
+
+#[tauri::command]
+async fn read_agent_config(
+    agent_id: String,
+    config_path: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<AgentProfileContent, String> {
+    let bridge = agent_builder_bridge(&state)?;
+    let profile = tauri::async_runtime::spawn_blocking(move || {
+        bridge.request_wait(
+            "agent/readConfig",
+            json!({ "agentId": agent_id, "configPath": config_path }),
+            REQUEST_TIMEOUT,
+        )
+    })
+    .await
+    .map_err(|error| format!("Agent profile read failed: {error}"))??;
+    serde_json::from_value(profile)
+        .map_err(|error| format!("Invalid agent profile response: {error}"))
 }
 
 #[tauri::command]
@@ -4731,11 +4836,14 @@ async fn restore_agent_config(
 }
 
 #[tauri::command]
-async fn open_agent_window(
-    agent_id: String,
-    app: AppHandle,
-    state: tauri::State<'_, AppState>,
-) -> Result<AgentWindowOpen, String> {
+async fn open_agent_window(agent_id: String, app: AppHandle) -> Result<AgentWindowOpen, String> {
+    tauri::async_runtime::spawn_blocking(move || open_agent_window_blocking(agent_id, app))
+        .await
+        .map_err(|error| format!("Unable to open agent workspace: {error}"))?
+}
+
+fn open_agent_window_blocking(agent_id: String, app: AppHandle) -> Result<AgentWindowOpen, String> {
+    let state = app.state::<AppState>();
     let _lifecycle = state.lifecycle.lock().unwrap();
     if state.reconfiguring.load(Ordering::SeqCst) {
         return Err("Settings are being reloaded; try again when the runtime is ready.".into());
@@ -5086,56 +5194,60 @@ fn start_run(
 }
 
 #[tauri::command]
-fn select_attachments(
+async fn select_attachments(
     agent_id: String,
     app: AppHandle,
     existing_attachment_ids: Option<Vec<String>>,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<AttachmentDraft>, String> {
     let bridge = bridge_for(&state, &agent_id, false)?;
-    let selected = app
-        .dialog()
-        .file()
-        .blocking_pick_files()
-        .unwrap_or_default();
-    let existing = bridge.validated_drafts(&existing_attachment_ids.unwrap_or_default())?;
-    if selected.len() + existing.len() > MAX_ATTACHMENT_COUNT {
-        return Err("At most 8 attachments may be selected.".into());
-    }
-    let mut drafts = Vec::new();
-    let mut total = existing.iter().map(|draft| draft.size_bytes).sum::<u64>();
-    for selected in selected {
-        let path = match selected.into_path() {
-            Ok(path) => path,
-            Err(_) => {
+    tauri::async_runtime::spawn_blocking(move || {
+        let selected = app
+            .dialog()
+            .file()
+            .blocking_pick_files()
+            .unwrap_or_default();
+        let existing = bridge.validated_drafts(&existing_attachment_ids.unwrap_or_default())?;
+        if selected.len() + existing.len() > MAX_ATTACHMENT_COUNT {
+            return Err("At most 8 attachments may be selected.".into());
+        }
+        let mut drafts = Vec::new();
+        let mut total = existing.iter().map(|draft| draft.size_bytes).sum::<u64>();
+        for selected in selected {
+            let path = match selected.into_path() {
+                Ok(path) => path,
+                Err(_) => {
+                    discard_imported_drafts(&bridge, &drafts);
+                    return Err("ATTACHMENT_PATH_INVALID".into());
+                }
+            };
+            let draft = match attachments::import_file(&bridge.attachment_root, &path) {
+                Ok(draft) => draft,
+                Err(error) => {
+                    discard_imported_drafts(&bridge, &drafts);
+                    return Err(error);
+                }
+            };
+            total += draft.size_bytes;
+            if total > MAX_SUBMISSION_BYTES {
+                let _ = std::fs::remove_dir_all(bridge.attachment_root.join(&draft.id));
                 discard_imported_drafts(&bridge, &drafts);
-                return Err("ATTACHMENT_PATH_INVALID".into());
+                return Err("Attachments exceed 40 MiB total.".into());
             }
-        };
-        let draft = match attachments::import_file(&bridge.attachment_root, &path) {
-            Ok(draft) => draft,
-            Err(error) => {
+            if let Err(error) = bridge
+                .workbench
+                .insert_draft_for_agent(&bridge.agent_id, &draft)
+            {
+                let _ = std::fs::remove_dir_all(bridge.attachment_root.join(&draft.id));
                 discard_imported_drafts(&bridge, &drafts);
                 return Err(error);
             }
-        };
-        total += draft.size_bytes;
-        if total > MAX_SUBMISSION_BYTES {
-            let _ = std::fs::remove_dir_all(bridge.attachment_root.join(&draft.id));
-            discard_imported_drafts(&bridge, &drafts);
-            return Err("Attachments exceed 40 MiB total.".into());
+            drafts.push(draft);
         }
-        if let Err(error) = bridge
-            .workbench
-            .insert_draft_for_agent(&bridge.agent_id, &draft)
-        {
-            let _ = std::fs::remove_dir_all(bridge.attachment_root.join(&draft.id));
-            discard_imported_drafts(&bridge, &drafts);
-            return Err(error);
-        }
-        drafts.push(draft);
-    }
-    Ok(drafts)
+        Ok(drafts)
+    })
+    .await
+    .map_err(|error| format!("Attachment selection failed: {error}"))?
 }
 
 fn discard_imported_drafts(bridge: &Bridge, drafts: &[AttachmentDraft]) {
@@ -5703,9 +5815,11 @@ fn focus_parent_window(app: &AppHandle) {
     }
 }
 
-fn persist_agent_window_bounds(window: &WebviewWindow, state: &AppState) -> Result<(), String> {
+fn read_agent_window_bounds(
+    window: &WebviewWindow,
+) -> Result<Option<(String, WindowBounds)>, String> {
     let Some(agent_id) = agent_id_from_window_label(window.label()) else {
-        return Ok(());
+        return Ok(None);
     };
     let scale = window.scale_factor().unwrap_or(1.0);
     let position = window
@@ -5714,8 +5828,24 @@ fn persist_agent_window_bounds(window: &WebviewWindow, state: &AppState) -> Resu
     let size = window
         .inner_size()
         .map_err(|error| format!("Unable to read agent window size: {error}"))?;
+    Ok(Some((
+        agent_id,
+        WindowBounds {
+            x: position.x,
+            y: position.y,
+            width: (size.width as f64 / scale).round() as u32,
+            height: (size.height as f64 / scale).round() as u32,
+        },
+    )))
+}
+
+fn persist_agent_window_bounds_values(
+    agent_id: &str,
+    bounds: WindowBounds,
+    state: &AppState,
+) -> Result<(), String> {
     let _presentation = state.window_presentation.lock().unwrap();
-    let key = window_presentation_key(&agent_id);
+    let key = window_presentation_key(agent_id);
     let mut presentation = state
         .manager
         .workbench
@@ -5724,14 +5854,21 @@ fn persist_agent_window_bounds(window: &WebviewWindow, state: &AppState) -> Resu
         .transpose()
         .map_err(|error| format!("Invalid saved window presentation: {error}"))?
         .unwrap_or_default();
-    presentation.x = Some(position.x);
-    presentation.y = Some(position.y);
-    presentation.width = Some((size.width as f64 / scale).round() as u32);
-    presentation.height = Some((size.height as f64 / scale).round() as u32);
+    presentation.x = Some(bounds.x);
+    presentation.y = Some(bounds.y);
+    presentation.width = Some(bounds.width);
+    presentation.height = Some(bounds.height);
     state.manager.workbench.save_setting(
         &key,
         &serde_json::to_value(presentation).map_err(|error| error.to_string())?,
     )
+}
+
+fn persist_agent_window_bounds(window: &WebviewWindow, state: &AppState) -> Result<(), String> {
+    let Some((agent_id, bounds)) = read_agent_window_bounds(window)? else {
+        return Ok(());
+    };
+    persist_agent_window_bounds_values(&agent_id, bounds, state)
 }
 
 #[tauri::command]
@@ -5782,6 +5919,7 @@ pub fn run() {
             generate_agent_draft,
             validate_agent_config,
             save_agent_config,
+            read_agent_config,
             export_agent_config,
             archive_agent_config,
             restore_agent_config,
@@ -5824,18 +5962,33 @@ pub fn run() {
                         .lock()
                         .unwrap()
                         .insert(window.label().into());
-                    let persistence = window
+                    let bounds = window
                         .app_handle()
                         .get_webview_window(window.label())
                         .ok_or_else(|| "Agent webview window is unavailable.".to_string())
-                        .and_then(|webview| {
-                            persist_agent_window_bounds(
-                                &webview,
-                                &window.app_handle().state::<AppState>(),
-                            )
-                        });
-                    if let Err(error) = persistence {
-                        eprintln!("Unable to persist agent window presentation: {error}");
+                        .and_then(|webview| read_agent_window_bounds(&webview));
+                    match bounds {
+                        Ok(Some((agent_id, bounds))) => {
+                            let app = window.app_handle().clone();
+                            // SQLite is shared with run-completion persistence. Never wait for
+                            // that connection from Tauri's native window event thread: doing so
+                            // stalls both the close and webview IPC such as trace inspection.
+                            tauri::async_runtime::spawn_blocking(move || {
+                                if let Err(error) = persist_agent_window_bounds_values(
+                                    &agent_id,
+                                    bounds,
+                                    &app.state::<AppState>(),
+                                ) {
+                                    eprintln!(
+                                        "Unable to persist agent window presentation: {error}"
+                                    );
+                                }
+                            });
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            eprintln!("Unable to persist agent window presentation: {error}");
+                        }
                     }
                     return;
                 }

@@ -304,6 +304,7 @@ export class DesktopRuntime {
           cwd: this.settingsCwd,
           settingsConfigPath: this.settingsPath,
           generatorAgent: request.params!.generatorAgent ?? this.requireSdk().config.agent.id,
+          targetPath: request.params!.targetPath,
         })));
       case 'agent/saveConfig':
         return this.withAgentBuilder(async () => asJsonValue(await saveAgentConfig({
@@ -312,6 +313,7 @@ export class DesktopRuntime {
           settingsConfigPath: this.settingsPath,
           generatorAgent: request.params!.generatorAgent ?? this.requireSdk().config.agent.id,
           overwrite: request.params!.overwrite ?? false,
+          targetPath: request.params!.targetPath,
           expectedPath: request.params!.expectedPath,
           expectedTargetFingerprint: request.params!.expectedTargetFingerprint,
         })));
@@ -527,6 +529,12 @@ export class DesktopRuntime {
     this.gatewayClient = gatewayClient;
 
     const settingsOverrides: NonNullable<AgentSdkOptions['settingsOverrides']> = {
+      ...(params.agentSelection ? {
+        agent: {
+          id: params.agentSelection.id,
+          configPath: params.agentSelection.configPath,
+        },
+      } : {}),
       logging: { enabled: false },
       events: { subscribe: false, printLifecycle: false, verbose: false },
       ...(params.configurationDriven ? {} : {
@@ -1005,7 +1013,7 @@ export function validateRestrictedDesktopConfiguration(config: ResolvedAgentSdkC
   if (errors.length > 0) {
     throw new DesktopProtocolError(
       'INVALID_DESKTOP_CONFIGURATION',
-      `Desktop settings are not runnable: ${errors.join('; ')}. Update agent.settings.json and reload settings.`,
+      `Desktop configuration is not runnable: ${errors.join('; ')}. Update the selected agent profile or agent.settings.json, then reload settings.`,
       JSON_RPC_ERROR_CODES.invalidParams,
     );
   }
