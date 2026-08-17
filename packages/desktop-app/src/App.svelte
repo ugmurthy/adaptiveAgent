@@ -667,6 +667,7 @@
           pending={startPending}
           disabled={!desktop.configurationValid || desktop.quitState !== 'idle'}
           status={`${desktop.occupiedSlotCount}/${desktop.capacity} execution slots occupied`}
+          error={finalError}
           configuration={desktop.configuration}
           capacityAvailable={desktop.occupiedSlotCount < desktop.capacity}
           onsubmit={submitNew}
