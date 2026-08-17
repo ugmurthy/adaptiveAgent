@@ -94,3 +94,20 @@ These rules protect the package boundary established by `CORE-SESSION-SWARM-SPEC
 ## Package-specific notes
 
 - In `packages/trace-session`, keep gateway tables optional. Trace reporting must work against core runtime Postgres tables even when `gateway_sessions` and `gateway_session_run_links` are absent.
+
+### Diagnosing stuck pending UI states in `packages/desktop-app`
+
+Treat a persistent pending label such as "Loading...", "Saving...", or "Uploading..." as a symptom, not proof that the underlying operation is still running.
+
+Trace the operation end-to-end before changing code:
+
+1. Confirm the UI event fired and the handler started.
+2. Confirm the backend/native request was sent, entered its handler, and returned or failed.
+3. Confirm the renderer received the result and applied the state change.
+4. Check for exceptions during response processing or rendering.
+5. Verify the visible DOM transitioned out of the pending state.
+6. If the operation blocks, capture runtime evidence before proposing a fix.
+7. If it returns but the UI remains pending, reduce the response or affected data to isolate a failing record or field.
+8. Verify pending state is cleared in success, error, cancellation, and timeout paths.
+
+Prefer evidence-backed fixes over speculative changes to polling, IPC, or state management. Validate with real persisted data and the original full workflow.

@@ -1147,6 +1147,9 @@ impl AgentRuntimeManager {
             ));
         }
         let _ = cleanup_attachments(&self.workbench, &self.attachment_root);
+        // State emission retires quiescent generations and takes this lock itself.
+        // Release it after deletion cleanup to avoid self-deadlocking.
+        drop(_deletion);
         for bridge in self
             .runtime_bridges()
             .into_iter()
