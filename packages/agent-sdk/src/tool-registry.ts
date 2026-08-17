@@ -22,14 +22,16 @@ import {
 import type {
   AgentConfigFile,
   AgentSdkCatalogAgent,
+  AgentSdkCatalogDiagnostic,
   AgentSdkCatalogDelegate,
   AgentSdkOptions,
   ResolvedAgentSdkConfig,
 } from './config-types.js';
 import type { GatewayClient } from '@adaptive-agent/gateway-client';
 import { createGatewayProxyTool } from './gateway-tools.js';
+import { resolveAgentSdkConfig } from './config-resolve.js';
 import { validateAgent } from './config-validate.js';
-import { expandStrings, parseNonNegativeNumber, parsePositiveInteger, pathExists, readJson } from './sdk-utils.js';
+import { agentConfigurationFingerprint, expandStrings, parseNonNegativeNumber, parsePositiveInteger, pathExists, readJson } from './sdk-utils.js';
 
 const DEFAULT_MODULE_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
 
@@ -135,43 +137,73 @@ async function loadDelegates(names: string[], dirs: string[], availableTools: Se
   return names.map((name) => delegates.get(name)!);
 }
 
-export async function discoverCatalogAgents(config: ResolvedAgentSdkConfig, activeAgentPath: string): Promise<AgentSdkCatalogAgent[]> {
-  const agents: AgentSdkCatalogAgent[] = [agentConfigToCatalogAgent(config.agent, activeAgentPath, true)];
+export async function discoverCatalogAgents(config: ResolvedAgentSdkConfig, activeAgentPath: string, options: AgentSdkOptions = {}): Promise<AgentSdkCatalogAgent[]> {
+  return (await discoverCatalogAgentInventory(config, activeAgentPath, options)).agents;
+}
+
+export async function discoverCatalogAgentInventory(config: ResolvedAgentSdkConfig, activeAgentPath: string, options: AgentSdkOptions = {}): Promise<{ agents: AgentSdkCatalogAgent[]; diagnostics: AgentSdkCatalogDiagnostic[] }> {
+  const activeArchived = config.agents.dirs.some((dir) => dirname(activeAgentPath) === resolve(dir, '.archive'));
+  const agents: AgentSdkCatalogAgent[] = [agentConfigToCatalogAgent(config.agent, activeAgentPath, true, activeArchived, agentConfigurationFingerprint(config))];
+  const diagnostics: AgentSdkCatalogDiagnostic[] = [];
   const seenPaths = new Set([activeAgentPath]);
-  const env = { ...process.env, ...(config.settings.env ?? {}) };
+  const env = { ...(options.env ?? process.env), ...(config.settings.env ?? {}) };
 
   for (const dir of config.agents.dirs) {
     if (!(await pathExists(dir))) continue;
-    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
-    for (const entry of entries) {
-      if (!entry.isFile() || extname(entry.name).toLowerCase() !== '.json') continue;
-      const path = resolve(dir, entry.name);
-      if (seenPaths.has(path)) continue;
-      const agent = await readCatalogAgent(path, env);
-      if (!agent) continue;
-      agents.push(agentConfigToCatalogAgent(agent, path, path === activeAgentPath));
-      seenPaths.add(path);
+    for (const source of [{ path: dir, archived: false }, { path: resolve(dir, '.archive'), archived: true }]) {
+      const entries = await readdir(source.path, { withFileTypes: true }).catch(() => []);
+      entries.sort((left, right) => left.name.localeCompare(right.name));
+      for (const entry of entries) {
+        if (!entry.isFile() || extname(entry.name).toLowerCase() !== '.json') continue;
+        const path = resolve(source.path, entry.name);
+        if (seenPaths.has(path)) continue;
+        seenPaths.add(path);
+        try {
+          const agent = validateAgent(expandStrings(await readJson(path), env), path);
+          const resolved = await resolveAgentSdkConfig({
+            ...options,
+            agentConfig: agent,
+            agentConfigPath: undefined,
+            settingsConfig: {
+              ...config.settings,
+              agent: { ...config.settings.agent, id: agent.id, configPath: path },
+            },
+            settingsConfigPath: undefined,
+            settingsOverrides: undefined,
+          });
+          agents.push(agentConfigToCatalogAgent(agent, path, path === activeAgentPath, source.archived, agentConfigurationFingerprint(resolved)));
+        } catch (error) {
+          diagnostics.push({ code: 'invalid-profile', path, message: safeErrorMessage(error) });
+        }
+      }
     }
   }
 
-  return agents.sort((left, right) => Number(right.active) - Number(left.active) || left.id.localeCompare(right.id) || left.path.localeCompare(right.path));
-}
-
-async function readCatalogAgent(path: string, env: NodeJS.ProcessEnv): Promise<AgentConfigFile | undefined> {
-  try {
-    return validateAgent(expandStrings(await readJson(path), env), path);
-  } catch {
-    return undefined;
+  const byId = new Map<string, AgentSdkCatalogAgent[]>();
+  for (const agent of agents) byId.set(agent.id, [...(byId.get(agent.id) ?? []), agent]);
+  for (const [id, matches] of byId) {
+    if (matches.length < 2) continue;
+    const paths = matches.map((agent) => agent.path).sort();
+    for (const agent of matches) agent.validationState = 'duplicate-id';
+    diagnostics.push({ code: 'duplicate-agent-id', path: paths[0]!, relatedPaths: paths.slice(1), message: `Agent id "${id}" is declared by ${paths.length} profiles.` });
   }
+
+  agents.sort((left, right) => Number(right.active) - Number(left.active) || left.id.localeCompare(right.id) || left.path.localeCompare(right.path));
+  diagnostics.sort((left, right) => left.path.localeCompare(right.path) || left.code.localeCompare(right.code));
+  return { agents, diagnostics };
 }
 
-function agentConfigToCatalogAgent(agent: AgentConfigFile, path: string, active: boolean): AgentSdkCatalogAgent {
+function agentConfigToCatalogAgent(agent: AgentConfigFile, path: string, active: boolean, archived: boolean, configurationFingerprint: string): AgentSdkCatalogAgent {
   return {
     id: agent.id,
     name: agent.name,
     ...(agent.description ? { description: agent.description } : {}),
+    configPath: path,
     path,
     active,
+    archived,
+    configurationFingerprint,
+    validationState: 'valid',
     invocationModes: agent.invocationModes,
     defaultInvocationMode: agent.defaultInvocationMode,
     ...(agent.model.provider ? { provider: agent.model.provider } : {}),
@@ -180,6 +212,11 @@ function agentConfigToCatalogAgent(agent: AgentConfigFile, path: string, active:
     delegates: agent.delegates ?? [],
     ...(agent.capabilities ? { capabilities: agent.capabilities } : {}),
   };
+}
+
+function safeErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : 'Invalid agent profile.';
+  return message.replace(/[\r\n]+/g, ' ').slice(0, 500);
 }
 
 export async function discoverCatalogDelegates(config: ResolvedAgentSdkConfig, configuredDelegateNames: Set<string>): Promise<AgentSdkCatalogDelegate[]> {

@@ -1,12 +1,18 @@
 import { describe, expect, it } from 'bun:test';
 import type { Chat, RunSummary } from './desktop';
-import { buildRailItems, filterRailItems } from './workbench-state';
+import { buildRailItems, filterRailItems, normalizeWorkbenchSelection } from './workbench-state';
 
 function run(overrides: Partial<RunSummary> = {}): RunSummary {
   return { itemId:'task',runId:'run',title:'Task',createdAt:'100',invocationKind:'run',status:'succeeded',cancelRequested:false,occupiesSlot:false,steerable:false,artifactsAvailable:true,...overrides };
 }
 
 describe('workbench rail grouping', () => {
+  it('validates restored window selections and rejects stale shapes', () => {
+    expect(normalizeWorkbenchSelection({ kind: 'task', itemId: 'item', runId: 'run' })).toEqual({ kind: 'task', itemId: 'item', runId: 'run' });
+    expect(normalizeWorkbenchSelection({ kind: 'chat', itemId: 'chat' })).toEqual({ kind: 'chat', itemId: 'chat' });
+    expect(normalizeWorkbenchSelection({ kind: 'task', itemId: 'item' })).toEqual({ kind: 'new-task' });
+    expect(normalizeWorkbenchSelection({ kind: 'unknown' })).toEqual({ kind: 'new-task' });
+  });
   it('deduplicates attempts and prioritizes input, active work, then history', () => {
     const runs = [
       run({runId:'old'}),

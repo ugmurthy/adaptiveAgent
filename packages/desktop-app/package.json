@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "test": "bun test ./src/activity.bun.ts ./src/result-renderer.bun.ts ./src/workbench-state.bun.ts ./src/workbench-ux.bun.ts",
+    "test": "bun test ./src/activity.bun.ts ./src/result-renderer.bun.ts ./src/workbench-state.bun.ts ./src/workbench-ux.bun.ts ./src/agent-studio.bun.ts",
     "web:build": "vite build",
     "sidecar:prepare": "bun run scripts/prepare-sidecar.ts",
     "tauri:dev": "bun run sidecar:prepare && tauri dev",

@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { renderAgentCreatePreview, runAgentCreate, type AgentCreateDraft } from './agent-create.js';
+import { archiveAgentProfile, prepareAgentConfigSave, readAgentProfile, renderAgentCreatePreview, restoreAgentProfile, runAgentCreate, saveAgentConfig, type AgentCreateDraft } from './agent-create.js';
 import type { AgentConfigFile } from './index.js';
 
 describe('agent-create', () => {
@@ -136,6 +136,151 @@ describe('agent-create', () => {
     expect(report.prompted).toBe(true);
     const written = JSON.parse(await readFile(join(agentsDir, 'planning-agent.json'), 'utf-8')) as AgentConfigFile;
     expect(written.id).toBe('planning-agent');
+  });
+
+  it('validates reviewed JSON, previews its path, and requires explicit overwrite', async () => {
+    const agent = { ...generatorAgent(), id: 'direct-agent', name: 'Direct Agent' };
+    const preview = await prepareAgentConfigSave({
+      agent,
+      cwd: tempDir,
+      settingsConfigPath: settingsPath,
+    });
+    expect(preview.path).toBe(join(agentsDir, 'direct-agent.json'));
+    expect(preview.exists).toBe(false);
+    await saveAgentConfig({ agent, cwd: tempDir, settingsConfigPath: settingsPath, expectedPath: preview.path, expectedTargetFingerprint: preview.targetFingerprint });
+    const existing = await prepareAgentConfigSave({ agent, cwd: tempDir, settingsConfigPath: settingsPath });
+    await expect(saveAgentConfig({ agent, cwd: tempDir, settingsConfigPath: settingsPath, expectedPath: existing.path, expectedTargetFingerprint: existing.targetFingerprint })).rejects.toThrow('explicit overwrite');
+    await saveAgentConfig({ agent: { ...agent, name: 'Updated' }, cwd: tempDir, settingsConfigPath: settingsPath, overwrite: true, expectedPath: existing.path, expectedTargetFingerprint: existing.targetFingerprint });
+    expect(JSON.parse(await readFile(preview.path, 'utf8')).name).toBe('Updated');
+  });
+
+  it('rejects duplicate IDs in another configured agents directory', async () => {
+    const duplicate = { ...generatorAgent(), id: 'duplicate-agent', name: 'Duplicate' };
+    await writeFile(join(tempDir, 'catalog-b', 'duplicate.json'), JSON.stringify(duplicate));
+    const preview = await prepareAgentConfigSave({ agent: duplicate, cwd: tempDir, settingsConfigPath: settingsPath });
+    expect(preview.duplicatePaths).toEqual([join(tempDir, 'catalog-b', 'duplicate.json')]);
+    await expect(saveAgentConfig({ agent: duplicate, cwd: tempDir, settingsConfigPath: settingsPath, expectedPath: preview.path, expectedTargetFingerprint: preview.targetFingerprint })).rejects.toThrow('choose a unique id');
+  });
+
+  it('updates an exact valid profile outside the primary agents directory', async () => {
+    const targetPath = join(tempDir, 'catalog-b', 'editable-agent.json');
+    const agent = { ...generatorAgent(), id: 'editable-agent', name: 'Original' };
+    await writeFile(targetPath, JSON.stringify(agent));
+    const updated = { ...agent, name: 'Updated' };
+    const preview = await prepareAgentConfigSave({ agent: updated, cwd: tempDir, settingsConfigPath: settingsPath, targetPath });
+    expect(preview).toMatchObject({ path: targetPath, exists: true, duplicatePaths: [] });
+    await saveAgentConfig({ agent: updated, cwd: tempDir, settingsConfigPath: settingsPath, targetPath, overwrite: true, expectedPath: preview.path, expectedTargetFingerprint: preview.targetFingerprint });
+    expect(JSON.parse(await readFile(targetPath, 'utf8')).name).toBe('Updated');
+  });
+
+  it('refuses a stale or identity-changing exact profile target', async () => {
+    const targetPath = join(tempDir, 'catalog-b', 'fixed-agent.json');
+    const agent = { ...generatorAgent(), id: 'fixed-agent', name: 'Fixed' };
+    await writeFile(targetPath, JSON.stringify(agent));
+    await expect(prepareAgentConfigSave({ agent: { ...agent, id: 'changed-agent' }, cwd: tempDir, settingsConfigPath: settingsPath, targetPath })).rejects.toThrow('stale or invalid');
+  });
+
+  it('rejects structurally invalid direct JSON through the standard SDK validator', async () => {
+    await expect(prepareAgentConfigSave({
+      agent: { id: 'invalid-agent' },
+      cwd: tempDir,
+      settingsConfigPath: settingsPath,
+    })).rejects.toThrow(/required property|must have required/i);
+  });
+
+  it('rejects a save when edits change the previewed output path', async () => {
+    const agent = { ...generatorAgent(), id: 'first-id', name: 'First' };
+    const preview = await prepareAgentConfigSave({ agent, cwd: tempDir, settingsConfigPath: settingsPath });
+    await expect(saveAgentConfig({
+      agent: { ...agent, id: 'second-id' },
+      cwd: tempDir,
+      settingsConfigPath: settingsPath,
+      expectedPath: preview.path,
+      expectedTargetFingerprint: preview.targetFingerprint,
+    })).rejects.toThrow('preview is stale');
+  });
+
+  it('never replaces a target created or changed after preview', async () => {
+    const agent = { ...generatorAgent(), id: 'raced-agent', name: 'Raced Agent' };
+    const missingPreview = await prepareAgentConfigSave({ agent, cwd: tempDir, settingsConfigPath: settingsPath });
+    await writeFile(missingPreview.path, '{"external":"created"}\n');
+    await expect(saveAgentConfig({
+      agent,
+      cwd: tempDir,
+      settingsConfigPath: settingsPath,
+      expectedPath: missingPreview.path,
+      expectedTargetFingerprint: missingPreview.targetFingerprint,
+    })).rejects.toThrow('target changed');
+    expect(JSON.parse(await readFile(missingPreview.path, 'utf8'))).toEqual({ external: 'created' });
+
+    const existingPreview = await prepareAgentConfigSave({ agent, cwd: tempDir, settingsConfigPath: settingsPath });
+    await writeFile(existingPreview.path, '{"external":"changed"}\n');
+    await expect(saveAgentConfig({
+      agent,
+      cwd: tempDir,
+      settingsConfigPath: settingsPath,
+      overwrite: true,
+      expectedPath: existingPreview.path,
+      expectedTargetFingerprint: existingPreview.targetFingerprint,
+    })).rejects.toThrow('target changed');
+    expect(JSON.parse(await readFile(existingPreview.path, 'utf8'))).toEqual({ external: 'changed' });
+  });
+
+  it('serializes concurrent publications and permits only the previewed target state', async () => {
+    const agent = { ...generatorAgent(), id: 'concurrent-agent', name: 'Concurrent Agent' };
+    const preview = await prepareAgentConfigSave({ agent, cwd: tempDir, settingsConfigPath: settingsPath });
+    const options = {
+      agent,
+      cwd: tempDir,
+      settingsConfigPath: settingsPath,
+      expectedPath: preview.path,
+      expectedTargetFingerprint: preview.targetFingerprint,
+    };
+    const results = await Promise.allSettled([saveAgentConfig(options), saveAgentConfig(options)]);
+    expect(results.filter(({ status }) => status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter(({ status }) => status === 'rejected')).toHaveLength(1);
+  });
+
+  it('validates candidates with active model settings instead of synthetic defaults', async () => {
+    await writeFile(settingsPath, JSON.stringify({
+      version: 1,
+      agents: { dirs: ['./catalog-a', './catalog-b'] },
+      runtime: { mode: 'memory' },
+      model: { overrideProvider: 'ollama', overrideModel: 'settings-model' },
+    }));
+    const agent = { ...generatorAgent(), id: 'settings-model-agent', model: {} };
+    await expect(prepareAgentConfigSave({ agent, cwd: tempDir, settingsConfigPath: settingsPath })).resolves.toMatchObject({
+      agent: { id: 'settings-model-agent', model: {} },
+    });
+  });
+
+  it('exports exact profile JSON and atomically archives and restores it', async () => {
+    const path = join(agentsDir, 'lifecycle-agent.json');
+    const content = `${JSON.stringify({ ...generatorAgent(), id: 'lifecycle-agent', name: 'Lifecycle' }, null, 4)}\n`;
+    await writeFile(path, content);
+    const selection = { agentId: 'lifecycle-agent', configPath: path, cwd: tempDir, settingsConfigPath: settingsPath };
+
+    await expect(readAgentProfile(selection)).resolves.toMatchObject({ content, configPath: path, archived: false });
+    const archived = await archiveAgentProfile(selection);
+    expect(archived).toMatchObject({ previousPath: path, archived: true, configPath: join(agentsDir, '.archive', 'lifecycle-agent.json') });
+    await expect(readFile(path, 'utf8')).rejects.toThrow();
+    expect(await readFile(archived.configPath, 'utf8')).toBe(content);
+
+    const restored = await restoreAgentProfile({ ...selection, configPath: archived.configPath });
+    expect(restored).toMatchObject({ previousPath: archived.configPath, configPath: path, archived: false });
+    expect(await readFile(path, 'utf8')).toBe(content);
+  });
+
+  it('refuses stale selections and archive or restore destination collisions', async () => {
+    const path = join(agentsDir, 'collision-agent.json');
+    const archivedPath = join(agentsDir, '.archive', 'collision-agent.json');
+    const profile = { ...generatorAgent(), id: 'collision-agent', name: 'Collision' };
+    await mkdir(join(agentsDir, '.archive'), { recursive: true });
+    await writeFile(path, JSON.stringify(profile));
+    await expect(readAgentProfile({ agentId: 'wrong-id', configPath: path, cwd: tempDir, settingsConfigPath: settingsPath })).rejects.toThrow('stale or invalid');
+    await writeFile(archivedPath, JSON.stringify({ ...profile, id: 'other-agent' }));
+    await expect(archiveAgentProfile({ agentId: 'collision-agent', configPath: path, cwd: tempDir, settingsConfigPath: settingsPath })).rejects.toThrow('destination already exists');
+    expect(JSON.parse(await readFile(path, 'utf8')).id).toBe('collision-agent');
   });
 });
 

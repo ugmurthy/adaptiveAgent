@@ -46,7 +46,45 @@ create table message_attachments (message_id text not null references chat_messa
 create trigger task_attachment_delete before delete on task_attachments begin update attachments set state='delete_pending' where attachment_id=old.attachment_id; end;
 create trigger message_attachment_delete before delete on message_attachments begin update attachments set state='delete_pending' where attachment_id=old.attachment_id; end;
 update workbench_runs set final_run_id=run_id,trace_target_json=json_object('kind','root-run','rootRunId',run_id);"#,
+) ,(
+    10,
+    r#"alter table workbench_items add column pinned_agent_config_path text;
+alter table workbench_runs add column agent_id text;
+alter table workbench_runs add column agent_config_path text;
+alter table workbench_runs add column agent_fingerprint text;
+update workbench_runs
+set agent_id=(select pinned_agent_id from workbench_items where id=workbench_runs.item_id),
+    agent_config_path=(select pinned_agent_config_path from workbench_items where id=workbench_runs.item_id),
+    agent_fingerprint=(select pinned_agent_fingerprint from workbench_items where id=workbench_runs.item_id);"#,
+) ,(
+    11,
+    r#"create index workbench_items_agent_updated on workbench_items(pinned_agent_id,updated_at desc,id);
+create index workbench_runs_agent_created on workbench_runs(agent_id,created_at,run_id);
+create index workbench_runs_agent_item on workbench_runs(agent_id,item_id);
+alter table attachments add column owner_agent_id text;
+alter table deletion_jobs add column agent_id text;
+update attachments
+set owner_agent_id=coalesce(
+  (select i.pinned_agent_id from task_attachments t join workbench_items i on i.id=t.item_id where t.attachment_id=attachments.attachment_id),
+  (select i.pinned_agent_id from message_attachments m join chat_messages c on c.id=m.message_id join workbench_items i on i.id=c.item_id where m.attachment_id=attachments.attachment_id)
+)
+where state='owned';
+update deletion_jobs
+set agent_id=coalesce(
+  (select pinned_agent_id from workbench_items where id=deletion_jobs.item_id),
+  (select agent_id from workbench_runs where run_id=deletion_jobs.root_run_id)
+)
+where agent_id is null;
+create index attachments_agent_state on attachments(owner_agent_id,state,created_at);
+create index deletion_jobs_agent_state on deletion_jobs(agent_id,state,created_at,id);"#,
 )];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentCatalogMapping {
+    pub agent_id: String,
+    pub fingerprint: String,
+    pub config_path: String,
+}
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -74,6 +112,7 @@ pub struct ChatItem {
     pub pinned_agent_id: String,
     pub pinned_agent_name: String,
     pub pinned_agent_fingerprint: String,
+    pub pinned_agent_config_path: Option<String>,
     pub workspace_root: Option<String>,
     pub shell_cwd: Option<String>,
 }
@@ -99,6 +138,7 @@ pub struct Reservation {
     pub agent_id: String,
     pub agent_name: String,
     pub agent_fingerprint: String,
+    pub agent_config_path: Option<String>,
     pub invocation_kind: String,
     pub cached_status: String,
     pub submission_state: String,
@@ -127,17 +167,59 @@ pub struct WorkbenchDb {
     connection: Mutex<Connection>,
 }
 
+const AGENT_RUN_CAPACITY: i64 = 3;
+
+fn assert_agent_capacity(tx: &rusqlite::Transaction<'_>, agent_id: &str) -> Result<(), String> {
+    let occupied: i64 = tx
+        .query_row(
+            "select count(*) from workbench_runs where agent_id=?1 and submission_state not in ('terminal','submission_failed')",
+            [agent_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if occupied >= AGENT_RUN_CAPACITY {
+        Err("All 3 task slots are occupied. Stop or wait for a run, then try again.".into())
+    } else {
+        Ok(())
+    }
+}
+
 impl WorkbenchDb {
+    pub fn insert_draft_for_agent(
+        &self,
+        agent_id: &str,
+        draft: &AttachmentDraft,
+    ) -> Result<(), String> {
+        self.connection.lock().unwrap().execute("insert into attachments(attachment_id,staged_relative_path,display_name,kind,mime_type,audio_format,size_bytes,sha256,state,created_at,owner_agent_id) values(?1,?2,?3,?4,?5,?6,?7,?8,'draft',?9,?10)",params![draft.id,draft.staged_relative_path,draft.name,draft.kind,draft.mime_type,draft.audio_format,draft.size_bytes,draft.sha256,now(),agent_id]).map_err(|e|e.to_string())?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn insert_draft(&self, draft: &AttachmentDraft) -> Result<(), String> {
         self.connection.lock().unwrap().execute("insert into attachments(attachment_id,staged_relative_path,display_name,kind,mime_type,audio_format,size_bytes,sha256,state,created_at) values(?1,?2,?3,?4,?5,?6,?7,?8,'draft',?9)",params![draft.id,draft.staged_relative_path,draft.name,draft.kind,draft.mime_type,draft.audio_format,draft.size_bytes,draft.sha256,now()]).map_err(|e|e.to_string())?;
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn get_drafts(&self, ids: &[String]) -> Result<Vec<AttachmentDraft>, String> {
         let connection = self.connection.lock().unwrap();
         let mut output = Vec::new();
         for id in ids {
             let draft=connection.query_row("select attachment_id,display_name,kind,size_bytes,mime_type,staged_relative_path,sha256,audio_format from attachments where attachment_id=?1 and state='draft'",[id],|r|Ok(AttachmentDraft{id:r.get(0)?,name:r.get(1)?,kind:r.get(2)?,size_bytes:r.get(3)?,mime_type:r.get(4)?,staged_relative_path:r.get(5)?,sha256:r.get(6)?,audio_format:r.get(7)?})).optional().map_err(|e|e.to_string())?.ok_or("ATTACHMENT_NOT_FOUND")?;
+            output.push(draft);
+        }
+        Ok(output)
+    }
+
+    pub fn get_drafts_for_agent(
+        &self,
+        agent_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<AttachmentDraft>, String> {
+        let connection = self.connection.lock().unwrap();
+        let mut output = Vec::new();
+        for id in ids {
+            let draft=connection.query_row("select attachment_id,display_name,kind,size_bytes,mime_type,staged_relative_path,sha256,audio_format from attachments where attachment_id=?1 and owner_agent_id=?2 and state='draft'",params![id,agent_id],|r|Ok(AttachmentDraft{id:r.get(0)?,name:r.get(1)?,kind:r.get(2)?,size_bytes:r.get(3)?,mime_type:r.get(4)?,staged_relative_path:r.get(5)?,sha256:r.get(6)?,audio_format:r.get(7)?})).optional().map_err(|e|e.to_string())?.ok_or("ATTACHMENT_NOT_FOUND")?;
             output.push(draft);
         }
         Ok(output)
@@ -165,6 +247,7 @@ impl WorkbenchDb {
         Ok(attachments)
     }
 
+    #[cfg(test)]
     pub fn discard_draft(&self, id: &str) -> Result<Option<String>, String> {
         let connection = self.connection.lock().unwrap();
         let path=connection.query_row("select staged_relative_path from attachments where attachment_id=?1 and state='draft'",[id],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
@@ -175,6 +258,19 @@ impl WorkbenchDb {
                     [id],
                 )
                 .map_err(|e| e.to_string())?;
+        }
+        Ok(path)
+    }
+
+    pub fn discard_draft_for_agent(
+        &self,
+        agent_id: &str,
+        id: &str,
+    ) -> Result<Option<String>, String> {
+        let connection = self.connection.lock().unwrap();
+        let path=connection.query_row("select staged_relative_path from attachments where attachment_id=?1 and owner_agent_id=?2 and state='draft'",params![id,agent_id],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+        if path.is_some() {
+            connection.execute("update attachments set state='delete_pending' where attachment_id=?1 and owner_agent_id=?2 and state='draft'",params![id,agent_id]).map_err(|e|e.to_string())?;
         }
         Ok(path)
     }
@@ -234,6 +330,7 @@ impl WorkbenchDb {
         Self::from_connection(connection)
     }
 
+    #[cfg(test)]
     pub fn open_in_memory() -> Result<Self, String> {
         Self::from_connection(Connection::open_in_memory().map_err(|e| e.to_string())?)
     }
@@ -282,6 +379,100 @@ impl WorkbenchDb {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub fn backfill_agent_config_path(
+        &self,
+        agent_id: &str,
+        agent_fingerprint: &str,
+        agent_config_path: &str,
+    ) -> Result<(), String> {
+        let mut connection = self.connection.lock().unwrap();
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        tx.execute(
+            "update workbench_items set pinned_agent_config_path=?3 where pinned_agent_id=?1 and pinned_agent_fingerprint=?2 and pinned_agent_config_path is null",
+            params![agent_id, agent_fingerprint, agent_config_path],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "update workbench_runs set agent_config_path=?3 where agent_id=?1 and agent_fingerprint=?2 and agent_config_path is null",
+            params![agent_id, agent_fingerprint, agent_config_path],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    /// Reconciles the complete active and archived catalog. Callers should remove
+    /// duplicate triples before calling; repeated mappings remain harmless.
+    pub fn reconcile_agent_catalog(&self, mappings: &[AgentCatalogMapping]) -> Result<(), String> {
+        let mut connection = self.connection.lock().unwrap();
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        for mapping in mappings {
+            tx.execute("update workbench_items set pinned_agent_config_path=?3 where pinned_agent_id=?1 and pinned_agent_fingerprint=?2 and pinned_agent_config_path is null",params![mapping.agent_id,mapping.fingerprint,mapping.config_path]).map_err(|e|e.to_string())?;
+            tx.execute("update workbench_runs set agent_config_path=?3 where agent_id=?1 and agent_fingerprint=?2 and agent_config_path is null",params![mapping.agent_id,mapping.fingerprint,mapping.config_path]).map_err(|e|e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// Terminates active work whose immutable generation cannot be recreated from the
+    /// complete current catalog. The state transition and stale-operation cleanup are
+    /// atomic; historical results are intentionally left untouched.
+    pub fn interrupt_orphaned_generations(
+        &self,
+        mappings: &[AgentCatalogMapping],
+    ) -> Result<Vec<String>, String> {
+        let mut connection = self.connection.lock().unwrap();
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        tx.execute_batch("create temp table if not exists recreatable_generations(agent_id text not null,config_path text not null,fingerprint text not null,primary key(agent_id,config_path,fingerprint)); delete from recreatable_generations;").map_err(|e|e.to_string())?;
+        for mapping in mappings {
+            tx.execute(
+                "insert or ignore into recreatable_generations values(?1,?2,?3)",
+                params![mapping.agent_id, mapping.config_path, mapping.fingerprint],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        let mut statement = tx.prepare("select run_id from workbench_runs r where submission_state not in ('terminal','submission_failed') and not exists(select 1 from recreatable_generations g where g.agent_id=r.agent_id and g.config_path=r.agent_config_path and g.fingerprint=r.agent_fingerprint) order by run_id").map_err(|e|e.to_string())?;
+        let run_ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        drop(statement);
+        for run_id in &run_ids {
+            tx.execute(
+                "delete from pending_approvals where root_run_id=?1",
+                [run_id],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute(
+                "delete from run_recovery_operations where run_id=?1",
+                [run_id],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute("update workbench_runs set cached_status='interrupted',submission_state='terminal',cancel_requested=0,interrupt_pending=0,updated_at=?2 where run_id=?1",params![run_id,now()]).map_err(|e|e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(run_ids)
+    }
+
+    pub fn generation_has_pending_operations(
+        &self,
+        agent_id: &str,
+        config_path: &str,
+        fingerprint: &str,
+    ) -> Result<bool, String> {
+        self.connection.lock().unwrap().query_row(
+            "select exists(select 1 from workbench_runs r where r.agent_id=?1 and r.agent_config_path=?2 and r.agent_fingerprint=?3 and (exists(select 1 from run_recovery_operations o where o.run_id=r.run_id) or exists(select 1 from deletion_jobs d,json_each(d.operation_json,'$.workbenchRunIds') j where d.state='pending' and d.agent_id=?1 and j.value=r.run_id)))",
+            params![agent_id,config_path,fingerprint], |row| row.get(0)
+        ).map_err(|e|e.to_string())
+    }
+
+    #[cfg(test)]
     pub fn reserve_task(&self, reservation: &Reservation) -> Result<(), String> {
         self.reserve_task_with_attachments(reservation, &[])
     }
@@ -295,11 +486,13 @@ impl WorkbenchDb {
         let tx = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
-        tx.execute("insert into workbench_items(id,kind,title,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,created_at,updated_at) values(?1,'task',?2,?3,?4,?5,?6,?7,?7)", params![reservation.item_id,reservation.title,reservation.session_id,reservation.agent_id,reservation.agent_name,reservation.agent_fingerprint,reservation.created_at]).map_err(|e| e.to_string())?;
-        tx.execute("insert into workbench_runs(run_id,item_id,invocation_kind,cached_status,submission_state,created_at,updated_at,workspace_root,shell_cwd,execution_mode,final_run_id,trace_target_json) values(?1,?2,?3,?4,?5,?6,?6,?7,?8,'direct',?1,json_object('kind','root-run','rootRunId',?1))", params![reservation.run_id,reservation.item_id,reservation.invocation_kind,reservation.cached_status,reservation.submission_state,reservation.created_at,reservation.workspace_root,reservation.shell_cwd]).map_err(|e| e.to_string())?;
+        assert_agent_capacity(&tx, &reservation.agent_id)?;
+        tx.execute("insert into workbench_items(id,kind,title,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,pinned_agent_config_path,created_at,updated_at) values(?1,'task',?2,?3,?4,?5,?6,?7,?8,?8)", params![reservation.item_id,reservation.title,reservation.session_id,reservation.agent_id,reservation.agent_name,reservation.agent_fingerprint,reservation.agent_config_path,reservation.created_at]).map_err(|e| e.to_string())?;
+        tx.execute("insert into workbench_runs(run_id,item_id,invocation_kind,cached_status,submission_state,created_at,updated_at,workspace_root,shell_cwd,execution_mode,final_run_id,trace_target_json,agent_id,agent_config_path,agent_fingerprint) values(?1,?2,?3,?4,?5,?6,?6,?7,?8,'direct',?1,json_object('kind','root-run','rootRunId',?1),?9,?10,?11)", params![reservation.run_id,reservation.item_id,reservation.invocation_kind,reservation.cached_status,reservation.submission_state,reservation.created_at,reservation.workspace_root,reservation.shell_cwd,reservation.agent_id,reservation.agent_config_path,reservation.agent_fingerprint]).map_err(|e| e.to_string())?;
         claim_attachments(
             &tx,
             attachment_ids,
+            &reservation.agent_id,
             "task_attachments",
             "item_id",
             &reservation.item_id,
@@ -308,13 +501,13 @@ impl WorkbenchDb {
     }
 
     pub fn create_chat(&self, chat: &ChatItem) -> Result<(), String> {
-        self.connection.lock().unwrap().execute("insert into workbench_items(id,kind,title,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,created_at,updated_at,workspace_root,shell_cwd) values(?1,'chat',?2,?3,?4,?5,?6,?7,?7,?8,?9)", params![chat.item_id,chat.title,chat.session_id,chat.pinned_agent_id,chat.pinned_agent_name,chat.pinned_agent_fingerprint,chat.created_at,chat.workspace_root,chat.shell_cwd]).map_err(|e| e.to_string())?;
+        self.connection.lock().unwrap().execute("insert into workbench_items(id,kind,title,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,pinned_agent_config_path,created_at,updated_at,workspace_root,shell_cwd) values(?1,'chat',?2,?3,?4,?5,?6,?7,?8,?8,?9,?10)", params![chat.item_id,chat.title,chat.session_id,chat.pinned_agent_id,chat.pinned_agent_name,chat.pinned_agent_fingerprint,chat.pinned_agent_config_path,chat.created_at,chat.workspace_root,chat.shell_cwd]).map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub fn list_chats(&self) -> Result<Vec<ChatItem>, String> {
         let connection = self.connection.lock().unwrap();
-        let mut statement = connection.prepare("select id,title,created_at,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,workspace_root,shell_cwd from workbench_items where kind='chat' order by updated_at desc,id").map_err(|e| e.to_string())?;
+        let mut statement = connection.prepare("select id,title,created_at,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,pinned_agent_config_path,workspace_root,shell_cwd from workbench_items where kind='chat' order by updated_at desc,id").map_err(|e| e.to_string())?;
         let chats = statement
             .query_map([], |r| {
                 Ok(ChatItem {
@@ -325,8 +518,9 @@ impl WorkbenchDb {
                     pinned_agent_id: r.get(4)?,
                     pinned_agent_name: r.get(5)?,
                     pinned_agent_fingerprint: r.get(6)?,
-                    workspace_root: r.get(7)?,
-                    shell_cwd: r.get(8)?,
+                    pinned_agent_config_path: r.get(7)?,
+                    workspace_root: r.get(8)?,
+                    shell_cwd: r.get(9)?,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -335,10 +529,54 @@ impl WorkbenchDb {
         Ok(chats)
     }
 
+    pub fn list_chats_for_agent(&self, agent_id: &str) -> Result<Vec<ChatItem>, String> {
+        Ok(self
+            .list_chats()?
+            .into_iter()
+            .filter(|chat| chat.pinned_agent_id == agent_id)
+            .collect())
+    }
+
+    pub fn assert_item_owner(&self, agent_id: &str, item_id: &str) -> Result<(), String> {
+        let owned: bool = self
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "select exists(select 1 from workbench_items where id=?1 and pinned_agent_id=?2)",
+                params![item_id, agent_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if owned {
+            Ok(())
+        } else {
+            Err("History item was not found for this agent.".into())
+        }
+    }
+
+    pub fn assert_run_owner(&self, agent_id: &str, run_id: &str) -> Result<(), String> {
+        let owned: bool = self
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "select exists(select 1 from workbench_runs where run_id=?1 and agent_id=?2)",
+                params![run_id, agent_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if owned {
+            Ok(())
+        } else {
+            Err("Run was not found for this agent.".into())
+        }
+    }
+
     pub fn load_chat(&self, item_id: &str) -> Result<(ChatItem, Vec<ChatMessage>), String> {
         use rusqlite::OptionalExtension;
         let connection = self.connection.lock().unwrap();
-        let chat = connection.query_row("select id,title,created_at,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,workspace_root,shell_cwd from workbench_items where id=?1 and kind='chat'", [item_id], |r| Ok(ChatItem { item_id:r.get(0)?, title:r.get(1)?, created_at:r.get(2)?, session_id:r.get(3)?, pinned_agent_id:r.get(4)?, pinned_agent_name:r.get(5)?, pinned_agent_fingerprint:r.get(6)?, workspace_root:r.get(7)?, shell_cwd:r.get(8)? })).optional().map_err(|e| e.to_string())?.ok_or("Chat was not found.")?;
+        let chat = connection.query_row("select id,title,created_at,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,pinned_agent_config_path,workspace_root,shell_cwd from workbench_items where id=?1 and kind='chat'", [item_id], |r| Ok(ChatItem { item_id:r.get(0)?, title:r.get(1)?, created_at:r.get(2)?, session_id:r.get(3)?, pinned_agent_id:r.get(4)?, pinned_agent_name:r.get(5)?, pinned_agent_fingerprint:r.get(6)?, pinned_agent_config_path:r.get(7)?, workspace_root:r.get(8)?, shell_cwd:r.get(9)? })).optional().map_err(|e| e.to_string())?.ok_or("Chat was not found.")?;
         let mut statement = connection.prepare("select id,ordinal,role,content_json,run_id from chat_messages where item_id=?1 order by ordinal").map_err(|e| e.to_string())?;
         let messages = statement
             .query_map([item_id], |r| {
@@ -363,6 +601,16 @@ impl WorkbenchDb {
         Ok((chat, messages))
     }
 
+    pub fn load_chat_for_agent(
+        &self,
+        agent_id: &str,
+        item_id: &str,
+    ) -> Result<(ChatItem, Vec<ChatMessage>), String> {
+        self.assert_item_owner(agent_id, item_id)?;
+        self.load_chat(item_id)
+    }
+
+    #[cfg(test)]
     pub fn reserve_chat_turn(
         &self,
         item_id: &str,
@@ -383,6 +631,14 @@ impl WorkbenchDb {
         let tx = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
+        let agent_id: String = tx
+            .query_row(
+                "select pinned_agent_id from workbench_items where id=?1 and kind='chat'",
+                [item_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        assert_agent_capacity(&tx, &agent_id)?;
         let occupied:i64=tx.query_row("select count(*) from workbench_runs where item_id=?1 and submission_state not in ('terminal','submission_failed')",[item_id],|r|r.get(0)).map_err(|e|e.to_string())?;
         if occupied > 0 {
             return Err("This chat already has a turn in progress.".into());
@@ -395,12 +651,18 @@ impl WorkbenchDb {
             )
             .map_err(|e| e.to_string())?;
         let now = now();
-        tx.execute("insert into workbench_runs(run_id,item_id,turn_index,invocation_kind,cached_status,submission_state,created_at,updated_at,execution_mode,final_run_id,trace_target_json,workspace_root,shell_cwd) select ?1,?2,?3,'chat','reserved','reserved',?4,?4,'direct',?1,json_object('kind','root-run','rootRunId',?1),workspace_root,shell_cwd from workbench_items where id=?2",params![run_id,item_id,ordinal,now]).map_err(|e|e.to_string())?;
+        tx.execute("insert into workbench_runs(run_id,item_id,turn_index,invocation_kind,cached_status,submission_state,created_at,updated_at,execution_mode,final_run_id,trace_target_json,workspace_root,shell_cwd,agent_id,agent_config_path,agent_fingerprint) select ?1,?2,?3,'chat','reserved','reserved',?4,?4,'direct',?1,json_object('kind','root-run','rootRunId',?1),workspace_root,shell_cwd,pinned_agent_id,pinned_agent_config_path,pinned_agent_fingerprint from workbench_items where id=?2",params![run_id,item_id,ordinal,now]).map_err(|e|e.to_string())?;
         let message_id = uuid::Uuid::new_v4().to_string();
         tx.execute("insert into chat_messages(id,item_id,ordinal,role,content_json,run_id,created_at) values(?1,?2,?3,'user',?4,?5,?6)",params![message_id,item_id,ordinal,serde_json::to_string(content).map_err(|e|e.to_string())?,run_id,now]).map_err(|e|e.to_string())?;
         claim_attachments(
             &tx,
             attachment_ids,
+            &tx.query_row(
+                "select pinned_agent_id from workbench_items where id=?1",
+                [item_id],
+                |r| r.get::<_, String>(0),
+            )
+            .map_err(|e| e.to_string())?,
             "message_attachments",
             "message_id",
             &message_id,
@@ -496,6 +758,7 @@ impl WorkbenchDb {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn delete_item(&self, item_id: &str) -> Result<(), String> {
         self.connection
             .lock()
@@ -503,6 +766,12 @@ impl WorkbenchDb {
             .execute("delete from workbench_items where id=?1", [item_id])
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn delete_item_for_agent(&self, agent_id: &str, item_id: &str) -> Result<(), String> {
+        self.assert_item_owner(agent_id, item_id)?;
+        self.delete_item(item_id)
     }
 
     pub fn item_deletion_operation(&self, item_id: &str) -> Result<Value, String> {
@@ -518,11 +787,11 @@ impl WorkbenchDb {
             .ok_or("History item was not found.")?;
         let mut statement = connection
             .prepare(
-                "select run_id from workbench_runs where item_id=?1 order by created_at,run_id",
+                "select run_id from workbench_runs where item_id=?1 order by case when ?2='chat' then turn_index end desc,case when ?2<>'chat' then created_at end,case when ?2<>'chat' then run_id end",
             )
             .map_err(|error| error.to_string())?;
         let run_ids = statement
-            .query_map([item_id], |row| row.get::<_, String>(0))
+            .query_map(params![item_id, kind], |row| row.get::<_, String>(0))
             .map_err(|error| error.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
@@ -593,6 +862,7 @@ impl WorkbenchDb {
         )
     }
 
+    #[cfg(test)]
     pub fn create_deletion_job(&self, operation: &Value) -> Result<DeletionJob, String> {
         let id = uuid::Uuid::new_v4().to_string();
         let timestamp = now();
@@ -607,6 +877,28 @@ impl WorkbenchDb {
         })
     }
 
+    pub fn create_deletion_job_for_agent(
+        &self,
+        agent_id: &str,
+        operation: &Value,
+    ) -> Result<DeletionJob, String> {
+        if let Some(item_id) = operation.get("itemId").and_then(Value::as_str) {
+            self.assert_item_owner(agent_id, item_id)?;
+        }
+        if let Some(run_id) = operation.get("runId").and_then(Value::as_str) {
+            self.assert_run_owner(agent_id, run_id)?;
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let timestamp = now();
+        self.connection.lock().unwrap().execute("insert into deletion_jobs(id,item_id,root_run_id,state,last_error,created_at,updated_at,operation_json,agent_id) values(?1,?2,?3,'pending',null,?4,?4,?5,?6)",params![id,operation.get("itemId").and_then(Value::as_str),operation.get("runId").and_then(Value::as_str),timestamp,operation.to_string(),agent_id]).map_err(|e|e.to_string())?;
+        Ok(DeletionJob {
+            id,
+            operation: operation.clone(),
+            last_error: None,
+        })
+    }
+
+    #[cfg(test)]
     pub fn load_deletion_jobs(&self) -> Result<Vec<DeletionJob>, String> {
         let connection = self.connection.lock().unwrap();
         let mut statement = connection.prepare("select id,operation_json,last_error from deletion_jobs where state='pending' and operation_json is not null order by created_at,id").map_err(|error|error.to_string())?;
@@ -625,6 +917,30 @@ impl WorkbenchDb {
                     id,
                     operation: serde_json::from_str(&operation)
                         .map_err(|error| error.to_string())?,
+                    last_error,
+                })
+            })
+            .collect();
+        jobs
+    }
+
+    pub fn load_deletion_jobs_for_agent(&self, agent_id: &str) -> Result<Vec<DeletionJob>, String> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement=connection.prepare("select id,operation_json,last_error from deletion_jobs where agent_id=?1 and state='pending' and operation_json is not null order by created_at,id").map_err(|e|e.to_string())?;
+        let jobs = statement
+            .query_map([agent_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .map(|row| {
+                let (id, json, last_error) = row.map_err(|e| e.to_string())?;
+                Ok(DeletionJob {
+                    id,
+                    operation: serde_json::from_str(&json).map_err(|e| e.to_string())?,
                     last_error,
                 })
             })
@@ -713,6 +1029,14 @@ impl WorkbenchDb {
         let tx = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
+        let agent_id: String = tx
+            .query_row(
+                "select agent_id from workbench_runs where run_id=?1 and submission_state='terminal'",
+                [run_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| "Run is not in a recoverable workbench state.".to_string())?;
+        assert_agent_capacity(&tx, &agent_id)?;
         let changed = tx
             .execute(
                 "update workbench_runs set cached_status='recovering',submission_state='submitted',cancel_requested=0,interrupt_pending=0,updated_at=?2 where run_id=?1 and submission_state='terminal'",
@@ -735,6 +1059,7 @@ impl WorkbenchDb {
         tx.commit().map_err(|e| e.to_string())
     }
 
+    #[cfg(test)]
     pub fn load_run_recovery_operations(&self) -> Result<Vec<PendingRunRecovery>, String> {
         let connection = self.connection.lock().unwrap();
         let mut statement = connection
@@ -752,6 +1077,28 @@ impl WorkbenchDb {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
         Ok(operations)
+    }
+
+    pub fn load_run_recovery_operations_for_generation(
+        &self,
+        agent_id: &str,
+        config_path: &str,
+        fingerprint: &str,
+    ) -> Result<Vec<PendingRunRecovery>, String> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare("select o.run_id,o.requested_action,o.baseline_event_seq from run_recovery_operations o join workbench_runs r on r.run_id=o.run_id where r.agent_id=?1 and r.agent_config_path=?2 and r.agent_fingerprint=?3 order by o.updated_at,o.run_id").map_err(|e|e.to_string())?;
+        let rows = statement
+            .query_map(params![agent_id, config_path, fingerprint], |row| {
+                Ok(PendingRunRecovery {
+                    run_id: row.get(0)?,
+                    requested_action: row.get(1)?,
+                    baseline_event_seq: row.get(2)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
     }
 
     pub fn get_run_recovery_operation(
@@ -777,11 +1124,15 @@ impl WorkbenchDb {
     }
 
     pub fn activate_pending_run_recovery(&self, run_id: &str) -> Result<(), String> {
-        let changed = self
-            .connection
-            .lock()
-            .unwrap()
-            .execute(
+        let mut connection = self.connection.lock().unwrap();
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let (agent_id, submission_state): (String, String) = tx.query_row("select agent_id,submission_state from workbench_runs where run_id=?1 and exists(select 1 from run_recovery_operations where run_id=?1)", [run_id], |row| Ok((row.get(0)?, row.get(1)?))).map_err(|_| "Pending run recovery is not known.".to_string())?;
+        if matches!(submission_state.as_str(), "terminal" | "submission_failed") {
+            assert_agent_capacity(&tx, &agent_id)?;
+        }
+        let changed = tx.execute(
                 "update workbench_runs set cached_status='recovering',submission_state='submitted',cancel_requested=0,interrupt_pending=0,updated_at=?2 where run_id=?1 and exists(select 1 from run_recovery_operations where run_id=?1)",
                 params![run_id, now()],
             )
@@ -789,7 +1140,7 @@ impl WorkbenchDb {
         if changed == 0 {
             return Err("Pending run recovery is not known.".into());
         }
-        Ok(())
+        tx.commit().map_err(|e| e.to_string())
     }
 
     pub fn clear_run_recovery_operation(&self, run_id: &str) -> Result<(), String> {
@@ -848,6 +1199,16 @@ impl WorkbenchDb {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub fn set_cancel_requested_for_agent(
+        &self,
+        agent_id: &str,
+        run_id: &str,
+    ) -> Result<(), String> {
+        self.assert_run_owner(agent_id, run_id)?;
+        self.set_cancel_requested(run_id)
+    }
+
     pub fn store_result(&self, run_id: &str, result: &serde_json::Value) -> Result<(), String> {
         self.connection
             .lock()
@@ -892,7 +1253,7 @@ impl WorkbenchDb {
 
     pub fn load_runs(&self) -> Result<Vec<Reservation>, String> {
         let connection = self.connection.lock().unwrap();
-        let mut statement = connection.prepare("select i.id,r.run_id,i.title,i.created_at,i.session_id,i.pinned_agent_id,i.pinned_agent_name,i.pinned_agent_fingerprint,r.invocation_kind,r.cached_status,r.submission_state,r.cancel_requested,r.interrupt_pending,r.workspace_root,r.shell_cwd from workbench_runs r join workbench_items i on i.id=r.item_id order by r.created_at,r.run_id").map_err(|e| e.to_string())?;
+        let mut statement = connection.prepare("select i.id,r.run_id,i.title,i.created_at,i.session_id,r.agent_id,i.pinned_agent_name,r.agent_fingerprint,r.agent_config_path,r.invocation_kind,r.cached_status,r.submission_state,r.cancel_requested,r.interrupt_pending,r.workspace_root,r.shell_cwd from workbench_runs r join workbench_items i on i.id=r.item_id order by r.created_at,r.run_id").map_err(|e| e.to_string())?;
         let rows = statement
             .query_map([], |r| {
                 Ok(Reservation {
@@ -904,19 +1265,35 @@ impl WorkbenchDb {
                     agent_id: r.get(5)?,
                     agent_name: r.get(6)?,
                     agent_fingerprint: r.get(7)?,
-                    invocation_kind: r.get(8)?,
-                    cached_status: r.get(9)?,
-                    submission_state: r.get(10)?,
-                    cancel_requested: r.get(11)?,
-                    interrupt_pending: r.get(12)?,
-                    workspace_root: r.get(13)?,
-                    shell_cwd: r.get(14)?,
+                    agent_config_path: r.get(8)?,
+                    invocation_kind: r.get(9)?,
+                    cached_status: r.get(10)?,
+                    submission_state: r.get(11)?,
+                    cancel_requested: r.get(12)?,
+                    interrupt_pending: r.get(13)?,
+                    workspace_root: r.get(14)?,
+                    shell_cwd: r.get(15)?,
                 })
             })
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
         Ok(rows)
+    }
+
+    pub fn load_runs_for_agent(&self, agent_id: &str) -> Result<Vec<Reservation>, String> {
+        Ok(self
+            .load_runs()?
+            .into_iter()
+            .filter(|run| run.agent_id == agent_id)
+            .collect())
+    }
+
+    pub fn load_run_for_agent(&self, agent_id: &str, run_id: &str) -> Result<Reservation, String> {
+        self.load_runs_for_agent(agent_id)?
+            .into_iter()
+            .find(|run| run.run_id == run_id)
+            .ok_or_else(|| "Run was not found for this agent.".into())
     }
 
     pub fn load_setting(&self, key: &str) -> Result<Option<Value>, String> {
@@ -952,6 +1329,7 @@ impl WorkbenchDb {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn load_pending_approvals(&self) -> Result<Vec<PendingApproval>, String> {
         let connection = self.connection.lock().unwrap();
         let mut statement=connection.prepare("select root_run_id,approval_run_id,approval_id,parent_run_id,tool_name,message,decision_in_flight,decision,operation_state from pending_approvals order by root_run_id").map_err(|e|e.to_string())?;
@@ -969,6 +1347,93 @@ impl WorkbenchDb {
                     operation_state: r.get(8)?,
                 })
             })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
+    #[cfg(test)]
+    pub fn load_pending_approvals_for_agent(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<PendingApproval>, String> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement=connection.prepare("select p.root_run_id,p.approval_run_id,p.approval_id,p.parent_run_id,p.tool_name,p.message,p.decision_in_flight,p.decision,p.operation_state from pending_approvals p join workbench_runs r on r.run_id=p.root_run_id where r.agent_id=?1 order by p.root_run_id").map_err(|e|e.to_string())?;
+        let rows = statement
+            .query_map([agent_id], |r| {
+                Ok(PendingApproval {
+                    root_run_id: r.get(0)?,
+                    approval_run_id: r.get(1)?,
+                    approval_id: r.get(2)?,
+                    parent_run_id: r.get(3)?,
+                    tool_name: r.get(4)?,
+                    message: r.get(5)?,
+                    decision_in_flight: r.get(6)?,
+                    decision: r.get(7)?,
+                    operation_state: r.get(8)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
+    pub fn load_pending_approvals_for_generation(
+        &self,
+        agent_id: &str,
+        config_path: &str,
+        fingerprint: &str,
+    ) -> Result<Vec<PendingApproval>, String> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement=connection.prepare("select p.root_run_id,p.approval_run_id,p.approval_id,p.parent_run_id,p.tool_name,p.message,p.decision_in_flight,p.decision,p.operation_state from pending_approvals p join workbench_runs r on r.run_id=p.root_run_id where r.agent_id=?1 and r.agent_config_path=?2 and r.agent_fingerprint=?3 order by p.root_run_id").map_err(|e|e.to_string())?;
+        let rows = statement
+            .query_map(params![agent_id, config_path, fingerprint], |r| {
+                Ok(PendingApproval {
+                    root_run_id: r.get(0)?,
+                    approval_run_id: r.get(1)?,
+                    approval_id: r.get(2)?,
+                    parent_run_id: r.get(3)?,
+                    tool_name: r.get(4)?,
+                    message: r.get(5)?,
+                    decision_in_flight: r.get(6)?,
+                    decision: r.get(7)?,
+                    operation_state: r.get(8)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
+    pub fn item_is_occupied(&self, agent_id: &str, item_id: &str) -> Result<bool, String> {
+        self.connection.lock().unwrap().query_row("select exists(select 1 from workbench_runs where agent_id=?1 and item_id=?2 and submission_state not in ('terminal','submission_failed'))", params![agent_id,item_id], |row| row.get(0)).map_err(|e|e.to_string())
+    }
+
+    pub fn assert_pending_approval_owner(
+        &self,
+        agent_id: &str,
+        root_run_id: &str,
+        approval_run_id: &str,
+        approval_id: &str,
+    ) -> Result<(), String> {
+        let owned: bool = self.connection.lock().unwrap().query_row(
+            "select exists(select 1 from pending_approvals p join workbench_runs r on r.run_id=p.root_run_id where r.agent_id=?1 and p.root_run_id=?2 and p.approval_run_id=?3 and p.approval_id=?4)",
+            params![agent_id,root_run_id,approval_run_id,approval_id], |r| r.get(0)).map_err(|e|e.to_string())?;
+        if owned {
+            Ok(())
+        } else {
+            Err("Pending approval was not found for this agent.".into())
+        }
+    }
+
+    pub fn active_agent_ids(&self) -> Result<Vec<String>, String> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement=connection.prepare("select distinct agent_id from (select agent_id from workbench_runs where agent_id is not null and submission_state not in ('terminal','submission_failed') union select r.agent_id from pending_approvals p join workbench_runs r on r.run_id=p.root_run_id union select r.agent_id from run_recovery_operations o join workbench_runs r on r.run_id=o.run_id union select agent_id from deletion_jobs where state='pending' and agent_id is not null) order by agent_id").map_err(|e|e.to_string())?;
+        let rows = statement
+            .query_map([], |r| r.get(0))
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
@@ -1068,12 +1533,13 @@ fn load_message_attachments(
 fn claim_attachments(
     tx: &rusqlite::Transaction<'_>,
     ids: &[String],
+    agent_id: &str,
     join_table: &str,
     owner_column: &str,
     owner: &str,
 ) -> Result<(), String> {
     for (ordinal, id) in ids.iter().enumerate() {
-        let changed=tx.execute("update attachments set state='owned',claimed_at=?2 where attachment_id=?1 and state='draft'",params![id,now()]).map_err(|e|e.to_string())?;
+        let changed=tx.execute("update attachments set state='owned',claimed_at=?2,owner_agent_id=?3 where attachment_id=?1 and state='draft' and (owner_agent_id=?3 or owner_agent_id is null)",params![id,now(),agent_id]).map_err(|e|e.to_string())?;
         if changed != 1 {
             return Err("ATTACHMENT_NOT_FOUND: Draft was already claimed or discarded.".into());
         }
@@ -1110,6 +1576,7 @@ mod tests {
             agent_id: "agent".into(),
             agent_name: "Agent".into(),
             agent_fingerprint: "fp".into(),
+            agent_config_path: Some("/agents/agent.json".into()),
             invocation_kind: "run".into(),
             cached_status: "reserved".into(),
             submission_state: "reserved".into(),
@@ -1136,6 +1603,41 @@ mod tests {
             1
         );
     }
+
+    #[test]
+    fn migration_backfills_run_agent_ownership_and_resolved_config_path() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        {
+            let connection = Connection::open(file.path()).unwrap();
+            connection.execute_batch("create table desktop_migrations(version integer primary key, applied_at text not null);").unwrap();
+            for (version, sql) in MIGRATIONS.iter().filter(|(version, _)| *version < 10) {
+                connection.execute_batch(sql).unwrap();
+                connection
+                    .execute("insert into desktop_migrations values(?1,'now')", [version])
+                    .unwrap();
+            }
+            connection.execute("insert into workbench_items(id,kind,title,session_id,pinned_agent_id,pinned_agent_name,pinned_agent_fingerprint,created_at,updated_at) values('legacy-item','task','Legacy task',null,'legacy-agent','Legacy Agent','legacy-fingerprint','100','100')", []).unwrap();
+            connection.execute("insert into workbench_runs(run_id,item_id,invocation_kind,cached_status,submission_state,created_at,updated_at) values('legacy-run','legacy-item','run','succeeded','terminal','100','100')", []).unwrap();
+        }
+
+        let db = WorkbenchDb::open(file.path()).unwrap();
+        let legacy = &db.load_runs().unwrap()[0];
+        assert_eq!(legacy.agent_id, "legacy-agent");
+        assert_eq!(legacy.agent_fingerprint, "legacy-fingerprint");
+        assert_eq!(legacy.agent_config_path, None);
+
+        db.backfill_agent_config_path(
+            "legacy-agent",
+            "legacy-fingerprint",
+            "/agents/legacy-agent.json",
+        )
+        .unwrap();
+        assert_eq!(
+            db.load_runs().unwrap()[0].agent_config_path.as_deref(),
+            Some("/agents/legacy-agent.json")
+        );
+    }
+
     #[test]
     fn pending_approval_survives_reopen_and_decision_guard_is_atomic() {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -1234,6 +1736,73 @@ mod tests {
     }
 
     #[test]
+    fn reservations_enforce_agent_capacity_across_fingerprints() {
+        let db = WorkbenchDb::open_in_memory().unwrap();
+        for index in 0..3 {
+            let mut run = reservation();
+            run.item_id = format!("item-{index}");
+            run.run_id = format!("run-{index}");
+            run.agent_fingerprint = format!("fingerprint-{index}");
+            db.reserve_task(&run).unwrap();
+        }
+        let mut fourth = reservation();
+        fourth.item_id = "item-4".into();
+        fourth.run_id = "run-4".into();
+        fourth.agent_fingerprint = "newest-fingerprint".into();
+        assert!(db
+            .reserve_task(&fourth)
+            .unwrap_err()
+            .contains("3 task slots"));
+        assert_eq!(db.load_runs_for_agent("agent").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn reservations_isolate_capacity_between_agents() {
+        let db = WorkbenchDb::open_in_memory().unwrap();
+        for index in 0..3 {
+            let mut run = reservation();
+            run.item_id = format!("agent-item-{index}");
+            run.run_id = format!("agent-run-{index}");
+            db.reserve_task(&run).unwrap();
+        }
+        let mut other = reservation();
+        other.item_id = "other-item".into();
+        other.run_id = "other-run".into();
+        other.agent_id = "other".into();
+        db.reserve_task(&other).unwrap();
+        assert_eq!(db.load_runs_for_agent("agent").unwrap().len(), 3);
+        assert_eq!(db.load_runs_for_agent("other").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn chat_turn_reservation_shares_agent_capacity_with_tasks() {
+        let db = WorkbenchDb::open_in_memory().unwrap();
+        db.create_chat(&ChatItem {
+            item_id: "capacity-chat".into(),
+            title: "chat".into(),
+            created_at: "now".into(),
+            session_id: "capacity-session".into(),
+            pinned_agent_id: "agent".into(),
+            pinned_agent_name: "Agent".into(),
+            pinned_agent_fingerprint: "new-fingerprint".into(),
+            pinned_agent_config_path: Some("/agent.json".into()),
+            workspace_root: Some("/workspace".into()),
+            shell_cwd: Some("/workspace".into()),
+        })
+        .unwrap();
+        for index in 0..3 {
+            let mut run = reservation();
+            run.item_id = format!("capacity-item-{index}");
+            run.run_id = format!("capacity-run-{index}");
+            db.reserve_task(&run).unwrap();
+        }
+        assert!(db
+            .reserve_chat_turn("capacity-chat", "chat-run", "hello")
+            .unwrap_err()
+            .contains("3 task slots"));
+    }
+
+    #[test]
     fn same_run_recovery_is_an_atomic_terminal_to_submitted_transition() {
         let db = WorkbenchDb::open_in_memory().unwrap();
         db.reserve_task(&reservation()).unwrap();
@@ -1277,6 +1846,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn activating_already_nonterminal_recovery_does_not_count_itself_twice() {
+        let db = WorkbenchDb::open_in_memory().unwrap();
+        db.reserve_task(&reservation()).unwrap();
+        db.update_run("run", "interrupted", "terminal").unwrap();
+        db.begin_same_run_recovery("run", "resume", 4).unwrap();
+        for index in 1..3 {
+            let mut other = reservation();
+            other.item_id = format!("other-item-{index}");
+            other.run_id = format!("other-run-{index}");
+            db.reserve_task(&other).unwrap();
+        }
+        assert_eq!(db.load_runs_for_agent("agent").unwrap().len(), 3);
+        db.activate_pending_run_recovery("run").unwrap();
+        assert_eq!(
+            db.load_run_for_agent("agent", "run")
+                .unwrap()
+                .submission_state,
+            "submitted"
+        );
+    }
+
     fn chat() -> ChatItem {
         ChatItem {
             item_id: "chat".into(),
@@ -1286,6 +1877,7 @@ mod tests {
             pinned_agent_id: "agent".into(),
             pinned_agent_name: "Agent".into(),
             pinned_agent_fingerprint: "fingerprint".into(),
+            pinned_agent_config_path: Some("/agents/agent.json".into()),
             workspace_root: Some("/workspace".into()),
             shell_cwd: Some("/workspace".into()),
         }
@@ -1493,6 +2085,10 @@ mod tests {
             operation["runtimeTargets"],
             serde_json::json!([{"kind":"root-run","rootRunId":"chat-run-2"}])
         );
+        assert_eq!(
+            db.item_deletion_operation("chat").unwrap()["workbenchRunIds"],
+            serde_json::json!(["chat-run-2", "chat-run-1"])
+        );
         let job = db.create_deletion_job(&operation).unwrap();
         db.complete_deletion_job(&job).unwrap();
         assert_eq!(
@@ -1526,5 +2122,247 @@ mod tests {
         assert!(db.load_deletion_jobs().unwrap().is_empty());
         assert!(db.load_runs().unwrap().is_empty());
         assert!(db.complete_deletion_job(&job).is_ok());
+    }
+
+    #[test]
+    fn catalog_reconciliation_is_all_agent_exact_and_never_overwrites() {
+        let db = WorkbenchDb::open_in_memory().unwrap();
+        let mut active = reservation();
+        active.agent_config_path = None;
+        db.reserve_task(&active).unwrap();
+        let mut archived = reservation();
+        archived.item_id = "archived-item".into();
+        archived.run_id = "archived-run".into();
+        archived.agent_id = "archived".into();
+        archived.agent_fingerprint = "old-fingerprint".into();
+        archived.agent_config_path = None;
+        db.reserve_task(&archived).unwrap();
+        let mut fixed = reservation();
+        fixed.item_id = "fixed-item".into();
+        fixed.run_id = "fixed-run".into();
+        fixed.agent_config_path = Some("keep.json".into());
+        db.reserve_task(&fixed).unwrap();
+
+        db.reconcile_agent_catalog(&[
+            AgentCatalogMapping {
+                agent_id: "agent".into(),
+                fingerprint: "fp".into(),
+                config_path: "active.json".into(),
+            },
+            AgentCatalogMapping {
+                agent_id: "archived".into(),
+                fingerprint: "old-fingerprint".into(),
+                config_path: "archive.json".into(),
+            },
+            // Duplicate input is harmless; production callers deduplicate catalog triples.
+            AgentCatalogMapping {
+                agent_id: "agent".into(),
+                fingerprint: "fp".into(),
+                config_path: "active.json".into(),
+            },
+            AgentCatalogMapping {
+                agent_id: "archived".into(),
+                fingerprint: "changed".into(),
+                config_path: "wrong.json".into(),
+            },
+        ])
+        .unwrap();
+        let runs = db.load_runs().unwrap();
+        assert_eq!(
+            runs.iter()
+                .find(|r| r.run_id == "run")
+                .unwrap()
+                .agent_config_path
+                .as_deref(),
+            Some("active.json")
+        );
+        assert_eq!(
+            runs.iter()
+                .find(|r| r.run_id == "archived-run")
+                .unwrap()
+                .agent_config_path
+                .as_deref(),
+            Some("archive.json")
+        );
+        assert_eq!(
+            runs.iter()
+                .find(|r| r.run_id == "fixed-run")
+                .unwrap()
+                .agent_config_path
+                .as_deref(),
+            Some("keep.json")
+        );
+    }
+
+    #[test]
+    fn catalog_removal_and_restore_preserve_agent_history_and_results() {
+        let db = WorkbenchDb::open_in_memory().unwrap();
+        db.reserve_task(&reservation()).unwrap();
+        db.update_run("run", "succeeded", "terminal").unwrap();
+        db.store_result("run", &serde_json::json!({"artifact":"report.md"}))
+            .unwrap();
+
+        db.reconcile_agent_catalog(&[]).unwrap();
+        assert_eq!(db.load_runs_for_agent("agent").unwrap().len(), 1);
+        assert_eq!(
+            db.get_result("run").unwrap(),
+            Some(serde_json::json!({"artifact":"report.md"}))
+        );
+
+        db.reconcile_agent_catalog(&[AgentCatalogMapping {
+            agent_id: "agent".into(),
+            fingerprint: "fingerprint".into(),
+            config_path: "/agents/agent.json".into(),
+        }])
+        .unwrap();
+        let restored = db.load_run_for_agent("agent", "run").unwrap();
+        assert_eq!(
+            restored.agent_config_path.as_deref(),
+            Some("/agents/agent.json")
+        );
+        assert_eq!(restored.cached_status, "succeeded");
+    }
+
+    #[test]
+    fn orphaned_generation_is_interrupted_without_touching_valid_or_historical_results() {
+        let db = WorkbenchDb::open_in_memory().unwrap();
+        let valid = reservation();
+        db.reserve_task(&valid).unwrap();
+        let mut orphan = reservation();
+        orphan.item_id = "orphan-item".into();
+        orphan.run_id = "orphan-run".into();
+        orphan.agent_fingerprint = "gone".into();
+        db.reserve_task(&orphan).unwrap();
+        db.store_result("orphan-run", &serde_json::json!({"partial":"kept"}))
+            .unwrap();
+        db.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "insert into run_recovery_operations values('orphan-run','resume',1,'now')",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            db.interrupt_orphaned_generations(&[AgentCatalogMapping {
+                agent_id: "agent".into(),
+                fingerprint: "fp".into(),
+                config_path: "/agents/agent.json".into()
+            }])
+            .unwrap(),
+            vec!["orphan-run"]
+        );
+        assert_eq!(
+            db.load_run_for_agent("agent", "run")
+                .unwrap()
+                .submission_state,
+            "reserved"
+        );
+        let orphan = db.load_run_for_agent("agent", "orphan-run").unwrap();
+        assert_eq!(
+            (
+                orphan.cached_status.as_str(),
+                orphan.submission_state.as_str()
+            ),
+            ("interrupted", "terminal")
+        );
+        assert_eq!(
+            db.get_result("orphan-run").unwrap(),
+            Some(serde_json::json!({"partial":"kept"}))
+        );
+        assert!(db.load_run_recovery_operations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_scoped_history_and_attachment_control_rejects_other_agent() {
+        let db = WorkbenchDb::open_in_memory().unwrap();
+        db.reserve_task(&reservation()).unwrap();
+        let mut other = reservation();
+        other.item_id = "other-item".into();
+        other.run_id = "other-run".into();
+        other.agent_id = "other".into();
+        db.reserve_task(&other).unwrap();
+        assert_eq!(db.load_runs_for_agent("agent").unwrap().len(), 1);
+        assert!(db.assert_run_owner("agent", "other-run").is_err());
+        assert!(db
+            .set_cancel_requested_for_agent("agent", "other-run")
+            .is_err());
+        assert!(db.delete_item_for_agent("agent", "other-item").is_err());
+
+        let draft = AttachmentDraft {
+            id: "draft".into(),
+            name: "x".into(),
+            kind: "file".into(),
+            size_bytes: 1,
+            mime_type: None,
+            staged_relative_path: "draft/x".into(),
+            sha256: "hash".into(),
+            audio_format: None,
+        };
+        db.insert_draft_for_agent("other", &draft).unwrap();
+        assert!(db.get_drafts_for_agent("agent", &["draft".into()]).is_err());
+        assert_eq!(db.discard_draft_for_agent("agent", "draft").unwrap(), None);
+        assert!(db
+            .reserve_task_with_attachments(&reservation(), &["draft".into()])
+            .is_err());
+    }
+
+    #[test]
+    fn delegated_pending_approval_is_owned_by_root_agent() {
+        let db = WorkbenchDb::open_in_memory().unwrap();
+        db.reserve_task(&reservation()).unwrap();
+        db.save_pending_approval(&PendingApproval {
+            root_run_id: "run".into(),
+            approval_run_id: "delegated-child".into(),
+            approval_id: "approval".into(),
+            parent_run_id: Some("run".into()),
+            tool_name: "tool".into(),
+            message: "approve".into(),
+            decision_in_flight: false,
+            decision: None,
+            operation_state: "awaiting_decision".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            db.load_pending_approvals_for_agent("agent").unwrap().len(),
+            1
+        );
+        assert!(db
+            .assert_pending_approval_owner("agent", "run", "delegated-child", "approval")
+            .is_ok());
+        assert!(db
+            .assert_pending_approval_owner("other", "run", "delegated-child", "approval")
+            .is_err());
+    }
+
+    #[test]
+    fn active_agent_ids_include_every_durable_work_source() {
+        let db = WorkbenchDb::open_in_memory().unwrap();
+        db.reserve_task(&reservation()).unwrap();
+        assert_eq!(db.active_agent_ids().unwrap(), vec!["agent"]);
+        db.update_run("run", "succeeded", "terminal").unwrap();
+        assert!(db.active_agent_ids().unwrap().is_empty());
+        db.save_pending_approval(&PendingApproval {
+            root_run_id: "run".into(),
+            approval_run_id: "child".into(),
+            approval_id: "approval".into(),
+            parent_run_id: None,
+            tool_name: "tool".into(),
+            message: "approve".into(),
+            decision_in_flight: false,
+            decision: None,
+            operation_state: "awaiting_decision".into(),
+        })
+        .unwrap();
+        assert_eq!(db.active_agent_ids().unwrap(), vec!["agent"]);
+    }
+
+    #[test]
+    fn submission_failed_run_alone_does_not_activate_agent() {
+        let db = WorkbenchDb::open_in_memory().unwrap();
+        db.reserve_task(&reservation()).unwrap();
+        db.update_run("run", "failed", "submission_failed").unwrap();
+        assert!(db.active_agent_ids().unwrap().is_empty());
     }
 }

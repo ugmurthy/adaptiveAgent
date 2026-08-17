@@ -1,12 +1,14 @@
-import { access, mkdir, writeFile } from 'node:fs/promises';
+import { access, link, mkdir, open, readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline/promises';
 import { stdin, stderr } from 'node:process';
-import { resolve } from 'node:path';
+import { basename, dirname, resolve } from 'node:path';
 
 import type { JsonObject, JsonSchema, JsonValue, RunResult } from '@adaptive-agent/core';
 
 import {
   createAgentSdk,
+  inspectAgentSdkCatalog,
   loadAgentSdkConfig,
   type AgentCapabilityConfig,
   type AgentConfigFile,
@@ -86,6 +88,51 @@ export interface AgentCreateOptions {
   confirm?: (prepared: AgentCreatePrepared) => Promise<boolean> | boolean;
 }
 
+export interface AgentConfigSavePreview {
+  path: string;
+  agentsDir: string;
+  exists: boolean;
+  duplicatePaths: string[];
+  targetFingerprint: string;
+  agent: AgentConfigFile;
+}
+
+export interface AgentConfigSaveOptions {
+  agent: unknown;
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+  settingsConfigPath?: string;
+  generatorAgent?: string;
+  targetPath?: string;
+  overwrite?: boolean;
+  expectedPath?: string;
+  expectedTargetFingerprint?: string;
+}
+
+export interface AgentProfileLifecycleOptions {
+  agentId: string;
+  configPath: string;
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+  settingsConfigPath?: string;
+  generatorAgent?: string;
+}
+
+export interface AgentProfileContent {
+  agentId: string;
+  configPath: string;
+  fileName: string;
+  archived: boolean;
+  content: string;
+}
+
+export interface AgentProfileMove {
+  agentId: string;
+  previousPath: string;
+  configPath: string;
+  archived: boolean;
+}
+
 const DEFAULT_GENERATOR_AGENT = 'default-agent';
 
 const AGENT_CREATE_DRAFT_SCHEMA: JsonSchema = {
@@ -149,9 +196,24 @@ export async function runAgentCreate(options: AgentCreateOptions): Promise<Agent
     }
   }
 
-  await mkdir(prepared.agentsDir, { recursive: true });
-  await writeFile(prepared.path, `${JSON.stringify(prepared.agent, null, 2)}\n`);
-  const status = prepared.exists ? 'overwritten' : 'created';
+  const preview = await prepareAgentConfigSave({
+    agent: prepared.agent,
+    cwd: options.cwd,
+    env: options.env,
+    settingsConfigPath: options.settingsConfigPath,
+    generatorAgent: options.generatorAgent,
+  });
+  await saveAgentConfig({
+    agent: prepared.agent,
+    cwd: options.cwd,
+    env: options.env,
+    settingsConfigPath: options.settingsConfigPath,
+    generatorAgent: options.generatorAgent,
+    overwrite: force,
+    expectedPath: preview.path,
+    expectedTargetFingerprint: preview.targetFingerprint,
+  });
+  const status = preview.exists ? 'overwritten' : 'created';
   return {
     command: 'agent-create',
     status,
@@ -219,6 +281,180 @@ export async function prepareAgentCreate(options: AgentCreateOptions): Promise<A
     notes: draft.notes ?? [],
     recommendations: draft.recommendations ?? [],
   };
+}
+
+/** Validate a reviewed or directly supplied profile through the normal Agent SDK loader. */
+export async function prepareAgentConfigSave(options: AgentConfigSaveOptions): Promise<AgentConfigSavePreview> {
+  const cwd = resolve(options.cwd ?? process.cwd());
+  const env = options.env ?? process.env;
+  const generatorConfig = await loadAgentSdkConfig({
+    cwd,
+    env,
+    settingsConfigPath: options.settingsConfigPath,
+    agentConfigPath: options.generatorAgent ?? DEFAULT_GENERATOR_AGENT,
+  });
+  const primaryAgentsDir = generatorConfig.agents.dirs[0];
+  if (!primaryAgentsDir) throw new Error('agent-create requires at least one configured agents.dirs entry.');
+  if (!options.agent || Array.isArray(options.agent) || typeof options.agent !== 'object') {
+    throw new Error('agent config must be a JSON object');
+  }
+  const agent = structuredClone(options.agent) as AgentConfigFile;
+  const id = validateExplicitAgentId(expectNonEmptyString(agent.id, 'agent config.id'));
+  agent.id = id;
+  await validateGeneratedAgentConfig(agent, cwd, env, generatorConfig);
+  const catalog = await inspectAgentSdkCatalog({
+    cwd,
+    env,
+    settingsConfigPath: options.settingsConfigPath,
+    agentConfigPath: options.generatorAgent ?? DEFAULT_GENERATOR_AGENT,
+  });
+  const path = options.targetPath ? resolve(cwd, options.targetPath) : resolve(primaryAgentsDir, `${id}.json`);
+  if (options.targetPath && !catalog.agents.some((candidate) => candidate.id === id && candidate.configPath === path && candidate.validationState === 'valid')) {
+    throw new Error(`Agent config target for "${id}" is stale or invalid; refresh the catalog and try again.`);
+  }
+  const agentsDir = options.targetPath ? dirname(path) : primaryAgentsDir;
+  const duplicatePaths = catalog.agents
+    .filter((candidate) => candidate.id === id)
+    .map((candidate) => candidate.configPath)
+    .filter((candidate) => candidate !== path);
+  return {
+    path,
+    agentsDir,
+    exists: await pathExists(path),
+    duplicatePaths,
+    targetFingerprint: await fileFingerprint(path),
+    agent,
+  };
+}
+
+/** Revalidate immediately before an atomic write; callers must explicitly allow overwrite. */
+export async function saveAgentConfig(options: AgentConfigSaveOptions): Promise<AgentConfigSavePreview> {
+  const preview = await prepareAgentConfigSave(options);
+  return withAgentCatalogLock(preview.agentsDir, async () => {
+    const prepared = await prepareAgentConfigSave(options);
+    if (!options.expectedPath || options.expectedPath !== prepared.path) {
+      throw new Error('Agent save preview is stale; validate the edited profile again.');
+    }
+    if (!options.expectedTargetFingerprint || options.expectedTargetFingerprint !== prepared.targetFingerprint) {
+      throw new Error('Agent config target changed after preview; review and confirm again.');
+    }
+    if (prepared.duplicatePaths.length > 0) {
+      throw new Error(`Agent id "${prepared.agent.id}" already exists at ${prepared.duplicatePaths.join(', ')}; choose a unique id.`);
+    }
+    if (prepared.exists && !options.overwrite) {
+      throw new Error(`Agent config already exists at ${prepared.path}; explicit overwrite confirmation is required.`);
+    }
+    const temporary = `${prepared.path}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(temporary, `${JSON.stringify(prepared.agent, null, 2)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+      if (prepared.exists) {
+        await rename(temporary, prepared.path);
+      } else {
+        // link is an atomic no-clobber install; rename would replace a file created after preview.
+        await link(temporary, prepared.path);
+        await unlink(temporary);
+      }
+    } catch (error) {
+      await unlink(temporary).catch(() => undefined);
+      throw error;
+    }
+    return prepared;
+  });
+}
+
+/** Read the exact stored profile bytes after resolving an immutable catalog identity. */
+export async function readAgentProfile(options: AgentProfileLifecycleOptions): Promise<AgentProfileContent> {
+  const selected = await resolveLifecycleProfile(options);
+  return {
+    agentId: selected.agent.id,
+    configPath: selected.agent.configPath,
+    fileName: basename(selected.agent.configPath),
+    archived: selected.agent.archived,
+    content: await readFile(selected.agent.configPath, 'utf8'),
+  };
+}
+
+/** Atomically move an active profile into its configured catalog archive directory. */
+export async function archiveAgentProfile(options: AgentProfileLifecycleOptions): Promise<AgentProfileMove> {
+  const selected = await resolveLifecycleProfile(options);
+  if (selected.agent.archived) throw new Error(`Agent "${selected.agent.id}" is already archived.`);
+  const agentsDir = selected.config.agents.dirs.find((dir) => dirname(selected.agent.configPath) === dir);
+  if (!agentsDir) throw new Error(`Agent "${selected.agent.id}" is not stored directly in a configured agents directory and cannot be archived.`);
+  return moveAgentProfile(selected.agent.id, selected.agent.configPath, resolve(agentsDir, '.archive', basename(selected.agent.configPath)), true, agentsDir);
+}
+
+/** Atomically restore an archived profile to its configured active catalog directory. */
+export async function restoreAgentProfile(options: AgentProfileLifecycleOptions): Promise<AgentProfileMove> {
+  const selected = await resolveLifecycleProfile(options);
+  if (!selected.agent.archived) throw new Error(`Agent "${selected.agent.id}" is not archived.`);
+  const agentsDir = selected.config.agents.dirs.find((dir) => dirname(selected.agent.configPath) === resolve(dir, '.archive'));
+  if (!agentsDir) throw new Error(`Agent "${selected.agent.id}" is not stored in a configured archive directory and cannot be restored.`);
+  return moveAgentProfile(selected.agent.id, selected.agent.configPath, resolve(agentsDir, basename(selected.agent.configPath)), false, agentsDir);
+}
+
+async function resolveLifecycleProfile(options: AgentProfileLifecycleOptions) {
+  const cwd = resolve(options.cwd ?? process.cwd());
+  const env = options.env ?? process.env;
+  const generatorAgent = options.generatorAgent ?? DEFAULT_GENERATOR_AGENT;
+  const catalog = await inspectAgentSdkCatalog({ cwd, env, settingsConfigPath: options.settingsConfigPath, agentConfigPath: generatorAgent });
+  const selectedPath = resolve(cwd, options.configPath);
+  const matches = catalog.agents.filter((candidate) => candidate.id === options.agentId && candidate.configPath === selectedPath);
+  if (matches.length !== 1 || matches[0]!.validationState !== 'valid') {
+    throw new Error(`Agent profile selection for "${options.agentId}" is stale or invalid; refresh the catalog and try again.`);
+  }
+  return { agent: matches[0]!, config: catalog.config };
+}
+
+async function moveAgentProfile(agentId: string, source: string, destination: string, archived: boolean, agentsDir: string): Promise<AgentProfileMove> {
+  return withAgentCatalogLock(agentsDir, async () => {
+    await mkdir(dirname(destination), { recursive: true });
+    try {
+      await link(source, destination);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new Error(`Agent profile destination already exists at ${destination}; resolve it before continuing.`);
+      throw error;
+    }
+    try {
+      await unlink(source);
+    } catch (error) {
+      await unlink(destination).catch(() => undefined);
+      throw error;
+    }
+    return { agentId, previousPath: source, configPath: destination, archived };
+  });
+}
+
+async function withAgentCatalogLock<T>(agentsDir: string, operation: () => Promise<T>): Promise<T> {
+  await mkdir(agentsDir, { recursive: true });
+  const lockPath = resolve(agentsDir, '.adaptive-agent.catalog.lock');
+  let lock: Awaited<ReturnType<typeof open>> | undefined;
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    try {
+      lock = await open(lockPath, 'wx', 0o600);
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+    }
+  }
+  if (!lock) throw new Error(`Agent catalog is busy at ${agentsDir}; try again. If no agent-create process is running, remove the stale lock at ${lockPath}.`);
+  try {
+    await lock.writeFile(JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }));
+    return await operation();
+  } finally {
+    await lock.close().catch(() => undefined);
+    await unlink(lockPath).catch(() => undefined);
+  }
+}
+
+async function fileFingerprint(path: string): Promise<string> {
+  try {
+    const content = await readFile(path);
+    return `sha256:${createHash('sha256').update(content).digest('hex')}`;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'absent';
+    throw error;
+  }
 }
 
 export function renderAgentCreateReport(report: AgentCreateReport, output: AgentCreateOutputFormat = 'pretty'): string {
@@ -410,16 +646,14 @@ async function validateGeneratedAgentConfig(
   env: NodeJS.ProcessEnv,
   generatorConfig: ResolvedAgentSdkConfig,
 ): Promise<void> {
+  const settings = structuredClone(generatorConfig.settings);
+  delete settings.agent;
+  settings.runtime = { ...settings.runtime, mode: 'memory' };
   await loadAgentSdkConfig({
     cwd,
     env,
     agentConfig: agent,
-    settingsConfig: {
-      version: 1,
-      agents: { dirs: generatorConfig.agents.dirs },
-      skills: generatorConfig.settings.skills,
-      runtime: { mode: 'memory' },
-    },
+    settingsConfig: settings,
   });
 }
 

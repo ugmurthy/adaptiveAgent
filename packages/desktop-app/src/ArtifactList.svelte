@@ -1,6 +1,9 @@
 <script lang="ts">
-  import { readArtifact, type ArtifactPreview } from './desktop';
+  import { type ArtifactPreview } from './desktop';
+  import { desktopApi } from './desktop-context';
   import ResultRenderer from './ResultRenderer.svelte';
+
+  const { readArtifact } = desktopApi();
 
   export let artifacts: Array<{ path: string; detail?: string }> = [];
   let preview: ArtifactPreview | undefined;

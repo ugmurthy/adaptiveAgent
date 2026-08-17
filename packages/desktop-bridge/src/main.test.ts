@@ -39,7 +39,7 @@ describe('desktop bridge process', () => {
     expect(messages[0]).toMatchObject({
       jsonrpc: '2.0',
       method: 'runtime/ready',
-      params: { protocolVersion: '1.13' },
+      params: { protocolVersion: '1.16' },
     });
     expect(messages).toContainEqual(expect.objectContaining({
       jsonrpc: '2.0',

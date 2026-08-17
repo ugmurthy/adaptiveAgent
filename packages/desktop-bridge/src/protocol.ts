@@ -7,8 +7,8 @@ export {
 } from '@adaptive-agent/agent-sdk/cli';
 
 /** Keep versions as strings: JSON numbers cannot distinguish 1.10 from 1.1. */
-export const DESKTOP_PROTOCOL_VERSION = '1.13' as const;
-export const SUPPORTED_DESKTOP_PROTOCOL_VERSIONS = ['1.10', '1.11', '1.12', DESKTOP_PROTOCOL_VERSION] as const;
+export const DESKTOP_PROTOCOL_VERSION = '1.16' as const;
+export const SUPPORTED_DESKTOP_PROTOCOL_VERSIONS = ['1.10', '1.11', '1.12', '1.13', '1.14', '1.15', DESKTOP_PROTOCOL_VERSION] as const;
 export const DESKTOP_BRIDGE_VERSION = '0.1.0';
 
 export type DesktopProtocolVersion = (typeof SUPPORTED_DESKTOP_PROTOCOL_VERSIONS)[number];
@@ -86,6 +86,19 @@ export interface RuntimeInitializeParams {
   gatewayUrl?: string;
   requireRunPermit?: boolean;
   managedAttachmentRoot?: string;
+  /** Protocol 1.14: pin the runtime to the exact descriptor returned by catalog/inspect. */
+  agentSelection?: DesktopAgentSelection;
+}
+
+export interface DesktopAgentSelection {
+  id: string;
+  configPath: string;
+  configurationFingerprint: string;
+}
+
+export interface CatalogInspectParams {
+  cwd?: string;
+  settingsConfigPath?: string;
 }
 
 export type DesktopAttachmentKind = 'file' | 'image' | 'audio';
@@ -124,6 +137,29 @@ export interface CliExecuteParams {
   /** Optional piped stdin. Environment overrides are deliberately unsupported. */
   stdin?: string;
   timeoutMs?: number;
+}
+
+export interface AgentCreateDraftParams {
+  brief: string;
+  generatorAgent?: string;
+}
+
+export interface AgentConfigParams {
+  agent: Record<string, JsonValue>;
+  generatorAgent?: string;
+  targetPath?: string;
+}
+
+export interface AgentConfigSaveParams extends AgentConfigParams {
+  overwrite?: boolean;
+  expectedPath: string;
+  expectedTargetFingerprint: string;
+}
+
+export interface AgentProfileParams {
+  agentId: string;
+  configPath: string;
+  generatorAgent?: string;
 }
 
 export interface RunParams {
@@ -192,6 +228,7 @@ type RpcRequestWithoutParams<TMethod extends string> = JsonRpcRequest<TMethod, n
 
 export type DesktopRpcRequest =
   | RpcRequest<'initialize', InitializeParams>
+  | RpcRequest<'catalog/inspect', CatalogInspectParams>
   | RpcRequest<'runtime/initialize', RuntimeInitializeParams>
   | RpcRequestWithoutParams<'runtime/info'>
   | RpcRequestWithoutParams<'runtime/shutdown'>
@@ -212,11 +249,16 @@ export type DesktopRpcRequest =
   | RpcRequest<'interaction/resolveClarification', ClarificationParams>
   | RpcRequest<'history/previewDeletion', HistoryDeletionParams>
   | RpcRequest<'history/delete', HistoryDeletionParams>
+  | RpcRequest<'agent/createDraft', AgentCreateDraftParams>
+  | RpcRequest<'agent/validateConfig', AgentConfigParams>
+  | RpcRequest<'agent/saveConfig', AgentConfigSaveParams>
+  | RpcRequest<'agent/readConfig' | 'agent/archiveConfig' | 'agent/restoreConfig', AgentProfileParams>
   | RpcRequestWithoutParams<'cli/commands'>
   | RpcRequest<'cli/execute', CliExecuteParams>;
 
 export const DESKTOP_RPC_METHODS = [
   'initialize',
+  'catalog/inspect',
   'runtime/initialize',
   'runtime/info',
   'runtime/shutdown',
@@ -239,6 +281,12 @@ export const DESKTOP_RPC_METHODS = [
   'interaction/resolveClarification',
   'history/previewDeletion',
   'history/delete',
+  'agent/createDraft',
+  'agent/validateConfig',
+  'agent/saveConfig',
+  'agent/readConfig',
+  'agent/archiveConfig',
+  'agent/restoreConfig',
   'cli/commands',
   'cli/execute',
 ] as const satisfies readonly DesktopRpcRequest['method'][];
@@ -321,6 +369,43 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
     case 'cli/commands':
       if (params && Object.keys(params).length > 0) invalidParams(`${method} does not accept params.`);
       return;
+    case 'catalog/inspect':
+      optionalString(params ?? {}, 'cwd');
+      optionalString(params ?? {}, 'settingsConfigPath');
+      return;
+    case 'agent/createDraft': {
+      const value = requiredParams(method, params);
+      requiredString(value, 'brief');
+      optionalString(value, 'generatorAgent');
+      return;
+    }
+    case 'agent/validateConfig':
+    case 'agent/saveConfig': {
+      const value = requiredParams(method, params);
+      requiredObject(value, 'agent');
+      optionalString(value, 'generatorAgent');
+      optionalString(value, 'targetPath');
+      if (method === 'agent/saveConfig') {
+        requiredString(value, 'expectedPath');
+        requiredString(value, 'expectedTargetFingerprint');
+      } else {
+        optionalString(value, 'expectedPath');
+        optionalString(value, 'expectedTargetFingerprint');
+      }
+      if (value.overwrite !== undefined && typeof value.overwrite !== 'boolean') {
+        invalidParams('overwrite must be a boolean.');
+      }
+      return;
+    }
+    case 'agent/readConfig':
+    case 'agent/archiveConfig':
+    case 'agent/restoreConfig': {
+      const value = requiredParams(method, params);
+      requiredString(value, 'agentId');
+      requiredString(value, 'configPath');
+      optionalString(value, 'generatorAgent');
+      return;
+    }
     case 'auth/updateAccessToken':
       requiredString(requiredParams(method, params), 'accessToken');
       return;
@@ -511,6 +596,13 @@ function validateRuntimeInitializeParams(value: Record<string, unknown>): void {
   optionalString(value, 'gatewayUrl');
   optionalBoolean(value, 'requireRunPermit');
   optionalString(value, 'managedAttachmentRoot');
+  optionalObject(value, 'agentSelection');
+  if (value.agentSelection !== undefined) {
+    const selection = value.agentSelection as Record<string, unknown>;
+    requiredString(selection, 'id');
+    requiredString(selection, 'configPath');
+    requiredString(selection, 'configurationFingerprint');
+  }
 }
 
 const ATTACHMENT_KEYS = new Set(['attachmentId', 'kind', 'stagedRelativePath', 'name', 'mimeType', 'sizeBytes', 'sha256', 'audioFormat']);

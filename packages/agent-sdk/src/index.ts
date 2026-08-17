@@ -44,7 +44,7 @@ import type {
 import { resolveAgentSdkConfig, resolveAgentSdkConfigWithSources } from './config-resolve.js';
 import { groundTruthSystemInstructions, mergeGroundTruthContext } from './ground-truth-context.js';
 import { resolveRuntimeBundle } from './postgres-runtime.js';
-import { discoverCatalogAgents, discoverCatalogDelegates, resolveToolsAndDelegates } from './tool-registry.js';
+import { discoverCatalogAgentInventory, discoverCatalogDelegates, resolveToolsAndDelegates } from './tool-registry.js';
 import { mergeMetadata, normalizeRecovery, promptText, promptYesNo } from './sdk-utils.js';
 import { resolveServerProfile } from './server-profiles.js';
 
@@ -53,6 +53,7 @@ export * from './errors.js';
 export * from './ambient.js';
 export * from './swarm-sdk.js';
 export * from './context-bundles.js';
+export { agentConfigurationFingerprint } from './sdk-utils.js';
 export * from './server-profiles.js';
 export { createGatewayProxyTool, type GatewayProxyToolFactoryOptions, type GatewayRemoteToolName } from './gateway-tools.js';
 export { buildGroundTruthContext, mergeGroundTruthContext } from './ground-truth-context.js';
@@ -83,6 +84,7 @@ export class AgentSdk {
   readonly agent: AdaptiveAgent;
   readonly created: CreatedAdaptiveAgent<RunStore, EventStore, SnapshotStore, PlanStore | undefined, ContinuationStore>;
   readonly config: ResolvedAgentSdkConfig;
+  readonly agentPath: string;
   readonly metadata: JsonObject;
   readonly registeredToolNames: string[];
   private readonly closeRuntime?: () => Promise<void>;
@@ -96,10 +98,11 @@ export class AgentSdk {
   private readonly clock?: () => Date;
   private unsubscribe?: () => void;
 
-  private constructor(args: { created: CreatedAdaptiveAgent<RunStore, EventStore, SnapshotStore, PlanStore | undefined, ContinuationStore>; config: ResolvedAgentSdkConfig; metadata: JsonObject; registeredToolNames: string[]; closeRuntime?: () => Promise<void>; authorization?: { client: GatewayClient; inferenceMode: InferenceMode; defaultTier: InferenceTier; profileRefs: ProfileRef[]; owned: boolean }; unsubscribe?: () => void; clock?: () => Date }) {
+  private constructor(args: { created: CreatedAdaptiveAgent<RunStore, EventStore, SnapshotStore, PlanStore | undefined, ContinuationStore>; config: ResolvedAgentSdkConfig; agentPath: string; metadata: JsonObject; registeredToolNames: string[]; closeRuntime?: () => Promise<void>; authorization?: { client: GatewayClient; inferenceMode: InferenceMode; defaultTier: InferenceTier; profileRefs: ProfileRef[]; owned: boolean }; unsubscribe?: () => void; clock?: () => Date }) {
     this.created = args.created;
     this.agent = args.created.agent;
     this.config = args.config;
+    this.agentPath = args.agentPath;
     this.metadata = args.metadata;
     this.registeredToolNames = args.registeredToolNames;
     this.closeRuntime = args.closeRuntime;
@@ -110,7 +113,8 @@ export class AgentSdk {
 
   static async create(options: AgentSdkOptions = {}): Promise<AgentSdk> {
     options = await resolveServerProfileOptions(options);
-    const config = await resolveAgentSdkConfig(options);
+    const resolved = await resolveAgentSdkConfigWithSources(options);
+    const config = resolved.config;
     const runtime = options.runtime
       ? { mode: config.runtime.mode, runtime: options.runtime }
       : await resolveRuntimeBundle(
@@ -154,7 +158,7 @@ export class AgentSdk {
       logger,
     });
     const unsubscribe = config.events.subscribe && created.runtime.eventStore.subscribe ? created.runtime.eventStore.subscribe((event) => options.eventListener?.(event)) : undefined;
-    return new AgentSdk({ created, config, metadata, registeredToolNames: modules.registeredToolNames, closeRuntime: runtime.close, authorization, unsubscribe, clock: options.clock });
+    return new AgentSdk({ created, config, agentPath: resolved.agentPath, metadata, registeredToolNames: modules.registeredToolNames, closeRuntime: runtime.close, authorization, unsubscribe, clock: options.clock });
   }
 
   async run(goal: string, options: AgentSdkRunOptions = {}): Promise<RunResult> {
@@ -362,7 +366,8 @@ async function resolveServerProfileOptions(options: AgentSdkOptions): Promise<Ag
 export async function loadAgentSdkConfig(options: AgentSdkOptions = {}): Promise<ResolvedAgentSdkConfig> { return resolveAgentSdkConfig(options); }
 
 export async function inspectAgentSdkResolution(options: AgentSdkOptions = {}): Promise<ResolvedAgentSdkModuleInspection> {
-  const config = await resolveAgentSdkConfig(options);
+  const resolved = await resolveAgentSdkConfigWithSources(options);
+  const config = resolved.config;
   const client = config.inference.mode === 'gateway' && config.gateway.remoteTools.length
     ? options.gatewayClient ?? createGatewayClient(config, options)
     : undefined;
@@ -370,6 +375,7 @@ export async function inspectAgentSdkResolution(options: AgentSdkOptions = {}): 
   const registeredTools = modules.registeredTools.map(pickToolInspectionFields);
   return {
     config,
+    agentPath: resolved.agentPath,
     tools: modules.tools.map(pickToolInspectionFields),
     delegates: modules.delegates.map((delegate) => ({
       name: delegate.name,
@@ -389,12 +395,14 @@ export async function inspectAgentSdkCatalog(options: AgentSdkOptions = {}): Pro
   const modules = await resolveToolsAndDelegates(resolved.config, options, client);
   const configuredToolNames = new Set(resolved.config.agent.tools);
   const configuredDelegateNames = new Set(resolved.config.agent.delegates ?? []);
+  const agentInventory = await discoverCatalogAgentInventory(resolved.config, resolved.agentPath, options);
 
   return {
     config: resolved.config,
     agentPath: resolved.agentPath,
     ...(resolved.settingsPath ? { settingsPath: resolved.settingsPath } : {}),
-    agents: await discoverCatalogAgents(resolved.config, resolved.agentPath),
+    agents: agentInventory.agents,
+    diagnostics: agentInventory.diagnostics,
     tools: modules.registeredTools.map((tool) => ({
       ...pickToolInspectionFields(tool),
       configured: configuredToolNames.has(tool.name),

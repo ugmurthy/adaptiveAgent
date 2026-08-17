@@ -1,11 +1,21 @@
 import {
   AgentSdk,
+  agentConfigurationFingerprint,
+  inspectAgentSdkCatalog,
   inspectAgentSdkResolution,
   resolveRuntimeTarget,
   type AgentSdkOptions,
   type AgentSettingsFile,
   type ResolvedAgentSdkConfig,
 } from '@adaptive-agent/agent-sdk';
+import {
+  archiveAgentProfile,
+  prepareAgentConfigSave,
+  prepareAgentCreate,
+  readAgentProfile,
+  restoreAgentProfile,
+  saveAgentConfig,
+} from '@adaptive-agent/agent-sdk/agent-create';
 import {
   ADAPTIVE_AGENT_CLI_COMMANDS,
   ADAPTIVE_AGENT_CLI_SUBCOMMANDS,
@@ -32,6 +42,7 @@ import {
   SUPPORTED_DESKTOP_PROTOCOL_VERSIONS,
   DesktopProtocolError,
   type CliExecuteParams,
+  type CatalogInspectParams,
   type DesktopClientInfo,
   type DesktopAttachmentInput,
   type DesktopChatMessage,
@@ -103,6 +114,7 @@ export class DesktopRuntime {
   private settingsPath: string | undefined;
   private settingsCwd = process.cwd();
   private settingsUpdateInProgress = false;
+  private agentBuilderInProgress = false;
 
   constructor(
     private readonly write: DesktopMessageWriter,
@@ -137,15 +149,29 @@ export class DesktopRuntime {
       && (request.method.startsWith('history/') || request.method === 'settings/update')) {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', `${request.method} requires desktop protocol 1.12.`, JSON_RPC_ERROR_CODES.methodNotFound);
     }
-    if (this.negotiatedProtocolVersion !== DESKTOP_PROTOCOL_VERSION
+    if (!['1.13', '1.14', '1.15', '1.16'].includes(this.negotiatedProtocolVersion)
       && request.method.startsWith('execution/')) {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', `${request.method} requires desktop protocol 1.13.`, JSON_RPC_ERROR_CODES.methodNotFound);
     }
-    if (this.negotiatedProtocolVersion !== '1.13' && hasV113Fields(request)) {
+    if (!['1.14', '1.15', '1.16'].includes(this.negotiatedProtocolVersion) && request.method === 'catalog/inspect') {
+      throw new DesktopProtocolError('METHOD_NOT_FOUND', 'catalog/inspect requires desktop protocol 1.14.', JSON_RPC_ERROR_CODES.methodNotFound);
+    }
+    if (!['1.15', '1.16'].includes(this.negotiatedProtocolVersion) && ['agent/createDraft', 'agent/validateConfig', 'agent/saveConfig'].includes(request.method)) {
+      throw new DesktopProtocolError('METHOD_NOT_FOUND', `${request.method} requires desktop protocol 1.15.`, JSON_RPC_ERROR_CODES.methodNotFound);
+    }
+    if (this.negotiatedProtocolVersion !== '1.16' && ['agent/readConfig', 'agent/archiveConfig', 'agent/restoreConfig'].includes(request.method)) {
+      throw new DesktopProtocolError('METHOD_NOT_FOUND', `${request.method} requires desktop protocol 1.16.`, JSON_RPC_ERROR_CODES.methodNotFound);
+    }
+    if (!['1.14', '1.15', '1.16'].includes(this.negotiatedProtocolVersion) && request.method === 'runtime/initialize' && request.params?.agentSelection) {
+      throw new DesktopProtocolError('INVALID_PARAMS', 'Exact agent selection requires desktop protocol 1.14.', JSON_RPC_ERROR_CODES.invalidParams);
+    }
+    if (!['1.13', '1.14', '1.15', '1.16'].includes(this.negotiatedProtocolVersion) && hasV113Fields(request)) {
       throw new DesktopProtocolError('INVALID_PARAMS', 'Attachment and execution-envelope fields require desktop protocol 1.13.', JSON_RPC_ERROR_CODES.invalidParams);
     }
 
     switch (request.method) {
+      case 'catalog/inspect':
+        return this.inspectCatalog(request.params ?? {});
       case 'runtime/initialize':
         return this.initializeRuntime(request.params ?? {});
       case 'runtime/info':
@@ -255,6 +281,63 @@ export class DesktopRuntime {
         return asJsonValue(await this.requireMaintenanceStore().previewDeletion(request.params!.target));
       case 'history/delete':
         return asJsonValue(await this.requireMaintenanceStore().deleteHistory(request.params!.target));
+      case 'agent/createDraft':
+        return this.withAgentBuilder(async () => {
+          const generatorAgent = request.params!.generatorAgent ?? this.requireSdk().config.agent.id;
+          const prepared = await prepareAgentCreate({
+            brief: request.params!.brief,
+            cwd: this.settingsCwd,
+            settingsConfigPath: this.settingsPath,
+            generatorAgent,
+          });
+          const preview = await prepareAgentConfigSave({
+            agent: prepared.agent,
+            cwd: this.settingsCwd,
+            settingsConfigPath: this.settingsPath,
+            generatorAgent,
+          });
+          return asJsonValue({ ...prepared, ...preview });
+        });
+      case 'agent/validateConfig':
+        return this.withAgentBuilder(async () => asJsonValue(await prepareAgentConfigSave({
+          agent: request.params!.agent,
+          cwd: this.settingsCwd,
+          settingsConfigPath: this.settingsPath,
+          generatorAgent: request.params!.generatorAgent ?? this.requireSdk().config.agent.id,
+          targetPath: request.params!.targetPath,
+        })));
+      case 'agent/saveConfig':
+        return this.withAgentBuilder(async () => asJsonValue(await saveAgentConfig({
+          agent: request.params!.agent,
+          cwd: this.settingsCwd,
+          settingsConfigPath: this.settingsPath,
+          generatorAgent: request.params!.generatorAgent ?? this.requireSdk().config.agent.id,
+          overwrite: request.params!.overwrite ?? false,
+          targetPath: request.params!.targetPath,
+          expectedPath: request.params!.expectedPath,
+          expectedTargetFingerprint: request.params!.expectedTargetFingerprint,
+        })));
+      case 'agent/readConfig':
+        return this.withAgentBuilder(async () => asJsonValue(await readAgentProfile({
+          ...request.params!,
+          cwd: this.settingsCwd,
+          settingsConfigPath: this.settingsPath,
+          generatorAgent: request.params!.generatorAgent ?? this.requireSdk().config.agent.id,
+        })));
+      case 'agent/archiveConfig':
+        return this.withAgentBuilder(async () => asJsonValue(await archiveAgentProfile({
+          ...request.params!,
+          cwd: this.settingsCwd,
+          settingsConfigPath: this.settingsPath,
+          generatorAgent: request.params!.generatorAgent ?? this.requireSdk().config.agent.id,
+        })));
+      case 'agent/restoreConfig':
+        return this.withAgentBuilder(async () => asJsonValue(await restoreAgentProfile({
+          ...request.params!,
+          cwd: this.settingsCwd,
+          settingsConfigPath: this.settingsPath,
+          generatorAgent: request.params!.generatorAgent ?? this.requireSdk().config.agent.id,
+        })));
       case 'cli/commands':
         return this.cliCommands();
       case 'cli/execute':
@@ -276,6 +359,23 @@ export class DesktopRuntime {
     await sdk?.close();
     this.gatewayClient?.close();
     this.gatewayClient = undefined;
+  }
+
+  private async withAgentBuilder<T>(operation: () => Promise<T>): Promise<T> {
+    this.requireSdk();
+    if (this.agentBuilderInProgress) {
+      throw new DesktopProtocolError(
+        'COMMAND_REJECTED',
+        'Another agent builder operation is already in progress.',
+        JSON_RPC_ERROR_CODES.commandRejected,
+      );
+    }
+    this.agentBuilderInProgress = true;
+    try {
+      return await operation();
+    } finally {
+      this.agentBuilderInProgress = false;
+    }
   }
 
   private initializeProtocol(params: { protocolVersion: string; clientInfo: DesktopClientInfo }): JsonValue {
@@ -305,7 +405,10 @@ export class DesktopRuntime {
         methods: DESKTOP_RPC_METHODS.filter((method) => {
           if (this.negotiatedProtocolVersion === '1.10' && method === 'auth/updateAccessToken') return false;
           if (this.negotiatedProtocolVersion === '1.10' || this.negotiatedProtocolVersion === '1.11') if (method.startsWith('history/') || method === 'settings/update') return false;
-          if (this.negotiatedProtocolVersion !== '1.13' && method.startsWith('execution/')) return false;
+          if (!['1.13', '1.14', '1.15', '1.16'].includes(this.negotiatedProtocolVersion) && method.startsWith('execution/')) return false;
+          if (!['1.14', '1.15', '1.16'].includes(this.negotiatedProtocolVersion) && method === 'catalog/inspect') return false;
+          if (!['1.15', '1.16'].includes(this.negotiatedProtocolVersion) && ['agent/createDraft', 'agent/validateConfig', 'agent/saveConfig'].includes(method)) return false;
+          if (this.negotiatedProtocolVersion !== '1.16' && ['agent/readConfig', 'agent/archiveConfig', 'agent/restoreConfig'].includes(method)) return false;
           return true;
         }),
         notifications: ['runtime/ready', 'agent/event', 'cli/output'],
@@ -315,9 +418,26 @@ export class DesktopRuntime {
           transport: 'child-process',
           output: 'streamed-notifications',
         },
-        ...(this.negotiatedProtocolVersion === '1.13' ? { attachments: attachmentCapabilities(false, 'Initialize the runtime with managedAttachmentRoot.') } : {}),
+        ...(['1.13', '1.14', '1.15', '1.16'].includes(this.negotiatedProtocolVersion) ? { attachments: attachmentCapabilities(false, 'Initialize the runtime with managedAttachmentRoot.') } : {}),
       },
     };
+  }
+
+  private async inspectCatalog(params: CatalogInspectParams): Promise<JsonValue> {
+    if (this.sdk || this.sdkInitialization) {
+      throw new DesktopProtocolError('ALREADY_INITIALIZED', 'catalog/inspect is only available before runtime initialization.', JSON_RPC_ERROR_CODES.alreadyInitialized);
+    }
+    const catalog = await inspectAgentSdkCatalog({
+      ...(params.cwd ? { cwd: params.cwd } : {}),
+      ...(params.settingsConfigPath ? { settingsConfigPath: params.settingsConfigPath } : {}),
+    });
+    const currentAgent = catalog.agents.find((agent) => agent.configPath === catalog.agentPath);
+    return asJsonValue({
+      agents: catalog.agents,
+      diagnostics: catalog.diagnostics,
+      ...(currentAgent ? { currentAgent } : {}),
+      ...(catalog.settingsPath ? { settingsPath: catalog.settingsPath } : {}),
+    });
   }
 
   private runtimeInfo(): JsonValue {
@@ -332,7 +452,7 @@ export class DesktopRuntime {
         workspaceRoot: this.sdk.config.workspaceRoot,
         inferenceMode: this.sdk.config.inference.mode,
         inferenceTier: this.sdk.config.inference.tier,
-        resolvedConfiguration: asJsonValue(safeResolvedConfiguration(this.sdk.config)),
+        resolvedConfiguration: asJsonValue(safeResolvedConfiguration(this.sdk.config, this.sdk.agentPath)),
         ...(this.executionSelection?.profileRef ? { profileRef: asJsonValue(this.executionSelection.profileRef) } : {}),
         connections: {
           sqlite: {
@@ -356,6 +476,20 @@ export class DesktopRuntime {
         'The agent runtime is already initialized or initializing.',
         JSON_RPC_ERROR_CODES.alreadyInitialized,
       );
+    }
+
+    if (params.agentSelection) {
+      const catalog = await inspectAgentSdkCatalog({
+        ...(params.cwd ? { cwd: params.cwd } : {}),
+        ...(params.settingsConfigPath ? { settingsConfigPath: params.settingsConfigPath } : {}),
+      });
+      const selected = catalog.agents.find((agent) => agent.configPath === params.agentSelection!.configPath);
+      if (!selected
+        || selected.validationState !== 'valid'
+        || selected.id !== params.agentSelection.id
+        || selected.configurationFingerprint !== params.agentSelection.configurationFingerprint) {
+        throw agentSelectionMismatch(params.agentSelection, selected);
+      }
     }
 
     const inferenceMode = params.inferenceMode ?? (params.profileRef?.source === 'server' ? 'gateway' : undefined);
@@ -395,6 +529,12 @@ export class DesktopRuntime {
     this.gatewayClient = gatewayClient;
 
     const settingsOverrides: NonNullable<AgentSdkOptions['settingsOverrides']> = {
+      ...(params.agentSelection ? {
+        agent: {
+          id: params.agentSelection.id,
+          configPath: params.agentSelection.configPath,
+        },
+      } : {}),
       logging: { enabled: false },
       events: { subscribe: false, printLifecycle: false, verbose: false },
       ...(params.configurationDriven ? {} : {
@@ -406,7 +546,7 @@ export class DesktopRuntime {
     };
     const options: AgentSdkOptions = {
       ...(params.cwd ? { cwd: params.cwd } : {}),
-      ...(params.agentConfigPath ? { agentConfigPath: params.agentConfigPath } : {}),
+      ...(params.agentSelection ? { agentConfigPath: params.agentSelection.configPath } : params.agentConfigPath ? { agentConfigPath: params.agentConfigPath } : {}),
       ...(params.settingsConfigPath ? { settingsConfigPath: params.settingsConfigPath } : {}),
       ...(params.configurationDriven ? {} : { runtimeMode: params.runtimeMode ?? 'sqlite' }),
       ...(params.sqlitePath ? { sqlitePath: params.sqlitePath } : {}),
@@ -442,6 +582,15 @@ export class DesktopRuntime {
       });
       this.settingsPath = runtimeTarget.settingsPath ?? resolve(this.settingsCwd, 'agent.settings.json');
       const sdk = await initialization;
+      if (params.agentSelection) {
+        const actual = { id: sdk.config.agent.id, configPath: sdk.agentPath, configurationFingerprint: agentConfigurationFingerprint(sdk.config) };
+        if (actual.id !== params.agentSelection.id
+          || actual.configPath !== params.agentSelection.configPath
+          || actual.configurationFingerprint !== params.agentSelection.configurationFingerprint) {
+          await sdk.close();
+          throw agentSelectionMismatch(params.agentSelection, actual);
+        }
+      }
       if (params.configurationDriven) {
         try {
           validateRestrictedDesktopConfiguration(sdk.config);
@@ -469,7 +618,7 @@ export class DesktopRuntime {
         registeredToolNames: sdk.registeredToolNames,
         inferenceMode: sdk.config.inference.mode,
         inferenceTier: sdk.config.inference.tier,
-        resolvedConfiguration: asJsonValue(safeResolvedConfiguration(sdk.config)),
+        resolvedConfiguration: asJsonValue(safeResolvedConfiguration(sdk.config, sdk.agentPath)),
         ...(params.profileRef ? { profileRef: asJsonValue(params.profileRef) } : {}),
         connections: {
           sqlite: sdk.config.runtime.mode === 'sqlite' ? 'connected' : 'not_configured',
@@ -721,6 +870,15 @@ function rejectUnsupportedMedia(inputs: DesktopAttachmentInput[]): void {
   if (inputs.some((input) => input.kind !== 'file')) throw new DesktopProtocolError('UNSUPPORTED_ATTACHMENT_KIND', 'Desktop protocol 1.13 currently supports generic file attachments only.', JSON_RPC_ERROR_CODES.commandRejected);
 }
 function executionResult(executionId: string, mode: 'direct' | 'catalog', result: any, stages?: any[]): JsonValue { return asJsonValue({ executionId, mode, status: result.status, finalRunId: result.runId, traceTarget: mode === 'direct' ? { kind: 'root-run', rootRunId: executionId } : { kind: 'session', sessionId: executionId }, ...(stages ? { stages } : {}), result }); }
+
+function agentSelectionMismatch(expected: RuntimeInitializeParams['agentSelection'], actual: unknown): DesktopProtocolError {
+  return new DesktopProtocolError(
+    'AGENT_SELECTION_MISMATCH',
+    'The selected agent no longer matches its catalog descriptor (id, configPath, or configurationFingerprint). Inspect the catalog again.',
+    JSON_RPC_ERROR_CODES.invalidParams,
+    { expected: asJsonValue(expected), ...(actual ? { actual: asJsonValue(actual) } : {}) },
+  );
+}
 function hasV113Fields(request: DesktopRpcRequest): boolean {
   const visit = (value: unknown): boolean => Array.isArray(value)
     ? value.some(visit)
@@ -789,11 +947,11 @@ export function updateDesktopSettings(
   };
 }
 
-export function safeResolvedConfiguration(config: ResolvedAgentSdkConfig): SafeResolvedConfiguration {
+export function safeResolvedConfiguration(config: ResolvedAgentSdkConfig, agentPath?: string): SafeResolvedConfiguration {
   return {
     agent: {
       id: config.agent.id,
-      ...(config.settings?.agent?.configPath ? { configPath: config.settings.agent.configPath } : {}),
+      ...(agentPath ? { configPath: agentPath } : {}),
       name: config.agent.name,
       configurationFingerprint: agentConfigurationFingerprint(config),
       ...(config.agent.description ? { description: config.agent.description } : {}),
@@ -855,40 +1013,10 @@ export function validateRestrictedDesktopConfiguration(config: ResolvedAgentSdkC
   if (errors.length > 0) {
     throw new DesktopProtocolError(
       'INVALID_DESKTOP_CONFIGURATION',
-      `Desktop settings are not runnable: ${errors.join('; ')}. Update agent.settings.json and reload settings.`,
+      `Desktop configuration is not runnable: ${errors.join('; ')}. Update the selected agent profile or agent.settings.json, then reload settings.`,
       JSON_RPC_ERROR_CODES.invalidParams,
     );
   }
-}
-
-/** Hash execution-defining values without returning configuration or credentials to the host. */
-function agentConfigurationFingerprint(config: ResolvedAgentSdkConfig): string {
-  const executionConfiguration = {
-    agent: omitSecrets(config.agent),
-    model: { provider: config.model.provider, model: config.model.model },
-    inference: config.inference,
-    interaction: config.interaction,
-  };
-  return createHash('sha256').update(stableJson(executionConfiguration)).digest('hex');
-}
-
-function stableJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
-  if (value && typeof value === 'object') {
-    return `{${Object.entries(value as Record<string, unknown>)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, child]) => `${JSON.stringify(key)}:${stableJson(child)}`)
-      .join(',')}}`;
-  }
-  return JSON.stringify(value) ?? 'null';
-}
-
-function omitSecrets(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(omitSecrets);
-  if (!value || typeof value !== 'object') return value;
-  return Object.fromEntries(Object.entries(value as Record<string, unknown>)
-    .filter(([key]) => !/(api[-_]?key|access[-_]?token|credential|password|secret)/i.test(key))
-    .map(([key, child]) => [key, omitSecrets(child)]));
 }
 
 async function readSettingsFile(path: string): Promise<AgentSettingsFile> {

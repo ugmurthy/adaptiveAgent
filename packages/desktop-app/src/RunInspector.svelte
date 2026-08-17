@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { DesktopState, TracePrivacy, TraceReport } from './desktop';
+  import ResultRenderer from './ResultRenderer.svelte';
   export let desktop: DesktopState;
   export let root = '';
   export let report: TraceReport | undefined;
@@ -43,6 +44,12 @@
       },
     };
   }
+
+  function formatDate(value?: string | null): string {
+    if (!value) return 'Not recorded';
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+  }
 </script>
 
 <aside class="run-inspector" aria-label="Run inspector">
@@ -60,10 +67,24 @@
     {#if view==='overview'}
       <div class="summary"><strong>{report.summary?.status ?? 'unknown'}</strong><span>{report.summary?.reason ?? 'No summary available.'}</span></div>
       <div class="metric-grid"><div><strong>{report.rootRuns?.length ?? 0}</strong><span>root runs</span></div><div><strong>{report.timeline?.length ?? 0}</strong><span>events</span></div></div>
+      {#each (report.rootRuns ?? []) as run}
+        <article class="inspector-run-detail">
+          <div class="inspector-run-heading"><strong>{run.status ?? 'unknown'}</strong><span>{run.runId.slice(0,8)}</span></div>
+          {#if run.goal}<div class="inspector-field"><span>Goal</span><p>{run.goal}</p></div>{/if}
+          <dl class="inspector-metadata">
+            <div><dt>Model</dt><dd>{[run.modelProvider, run.modelName].filter(Boolean).join(' / ') || 'Not recorded'}</dd></div>
+            <div><dt>Started</dt><dd>{formatDate(run.startedAt ?? run.linkedAt)}</dd></div>
+            <div><dt>Completed</dt><dd>{formatDate(run.completedAt)}</dd></div>
+          </dl>
+          {#if run.errorCode || run.errorMessage}<div class="alert"><strong>{run.errorCode ?? 'Run error'}</strong>{#if run.errorMessage}<p>{run.errorMessage}</p>{/if}</div>{/if}
+          {#if run.result !== null && run.result !== undefined}<div class="inspector-field"><span>Final output</span><ResultRenderer value={run.result}/></div>{/if}
+        </article>
+      {/each}
     {:else if view==='timeline'}
       <div class="inspector-list">{#each (report.timeline ?? []).slice(-50) as entry}<article><strong>{String(entry.eventType ?? entry.type ?? 'Event')}</strong><span>{String(entry.toolName ?? entry.runId ?? '')}</span></article>{/each}</div>
     {:else if view==='agents'}
       <div class="inspector-stat"><strong>{report.runTree?.length ?? 0}</strong><span>agent run records</span></div>
+      <div class="inspector-list">{#each (report.runTree ?? []) as run}<article><strong>{run.delegateName ?? (run.depth ? 'Child run' : 'Coordinator')}</strong><span>{run.status ?? 'unknown'} · {run.runId.slice(0,8)}</span>{#if run.parentRunId}<small>Parent {run.parentRunId.slice(0,8)}</small>{/if}</article>{/each}</div>
     {:else if view==='tools'}
       {@const tools=(report.timeline ?? []).filter((entry)=>typeof entry.toolName==='string')}<div class="inspector-stat"><strong>{tools.length}</strong><span>tool events</span></div><div class="inspector-list">{#each tools.slice(-30) as tool}<article><strong>{String(tool.toolName)}</strong><span>{String(tool.eventType ?? '')}</span></article>{/each}</div>
     {:else if view==='usage'}

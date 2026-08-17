@@ -9,6 +9,14 @@ The sidecar uses the Agent SDK's normal lookup rules: `ADAPTIVE_AGENT_SETTINGS`,
 `~/.adaptiveAgent/agent.settings.json`. The settings file selects a separate agent JSON
 definition with `agent.configPath`; `agent.id`, when present, is a matching assertion.
 
+The Agent Studio opens one native workspace window per agent. It allows three agent
+windows by default; set `ADAPTIVE_AGENT_MAX_WINDOWS` to a positive integer before
+launch to change the limit. Invalid values fall back to three and appear in catalog
+diagnostics.
+
+Release candidates must complete the automated and cross-platform checks in
+[`RELEASE-CHECKLIST.md`](RELEASE-CHECKLIST.md).
+
 This MVP accepts only configured BYOK inference, an agent whose
 `defaultInvocationMode` is `run`, approval mode `auto` or `reject`, and clarification
 mode `fail`. Provider credentials are inherited by the native sidecar. Only an
@@ -27,6 +35,10 @@ bun run desktop-app:build
 places it under Tauri's target-triple sidecar name. Native macOS (arm64/x64), Linux
 (arm64/x64), and Windows x64 targets are mapped. CI can set `TAURI_TARGET_TRIPLE` or
 pass a triple to `bun run sidecar:prepare -- <triple>`.
+
+Linux packages are produced as `.deb` and `.rpm`. AppImage packaging is disabled because
+`linuxdeploy` rewrites Bun-compiled sidecar ELF headers, which makes the embedded runtimes
+unusable; use the native package for the target distribution instead.
 
 The renderer uses a narrow set of typed workbench commands for runs, chats, approvals,
 recovery, history, trace privacy, and shutdown. It receives simplified progress/final
@@ -52,6 +64,6 @@ events. No shell capability or generic JSON-RPC command is granted to the webvie
   modeled or shown.
 - **Privacy:** sensitive messages, reasoning, and raw tool payloads are opt-in under
   Inspector Diagnostics and may expose private data locally.
-- **Capacity and windows:** the slot meter reports runtime execution capacity. A task may
-  start only when capacity is available; chats remain persistent but turns also consume a
-  slot. On narrow windows navigation and Inspector become overlay drawers.
+- **Capacity and windows:** each agent has its own three-run execution capacity. Selecting
+  an agent creates or focuses its native workspace window; closing that window does not
+  stop active runs. On narrow windows navigation and Inspector become overlay drawers.
