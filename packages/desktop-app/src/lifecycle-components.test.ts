@@ -3,7 +3,8 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { mount, tick, unmount } from 'svelte';
 import App from './App.svelte';
-import type { DesktopApi, DesktopState } from './desktop';
+import { saveWindowPresentation } from './desktop';
+import type { DesktopApi, DesktopState, RunRecoveryPlan, RunSummary } from './desktop';
 
 vi.mock('./desktop', async (loadOriginal) => ({
   ...await loadOriginal<typeof import('./desktop')>(),
@@ -18,6 +19,7 @@ const storage = new Map<string, string>();
 
 beforeEach(() => {
   storage.clear();
+  vi.mocked(saveWindowPresentation).mockResolvedValue(undefined);
   Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: {
     getItem: (key: string) => storage.get(key) ?? null,
     setItem: (key: string, value: string) => storage.set(key, value),
@@ -88,5 +90,47 @@ describe('mounted component lifecycle ownership', () => {
     await Promise.resolve();
 
     expect(unsubscribe).toHaveBeenCalledOnce();
+  });
+
+  test('keeps a matching recovery plan visible while refreshing it', async () => {
+    const run: RunSummary = {
+      itemId: 'item-1', runId: 'run-1', title: 'Existing run', createdAt: '2026-08-17T12:00:00Z',
+      invocationKind: 'run', status: 'succeeded', cancelRequested: false, occupiesSlot: false,
+      steerable: false, artifactsAvailable: false, artifactsUnavailableReason: 'No artifacts',
+    };
+    const desktopState: DesktopState = { ...state, runs: [run] };
+    const plan: RunRecoveryPlan = {
+      runId: run.runId, status: run.status, action: 'not_recoverable', executable: false,
+      reason: 'This terminal run is complete.',
+    };
+    let onState!: (state: DesktopState) => void;
+    let finishRefresh!: (plan: RunRecoveryPlan) => void;
+    const pendingRefresh = new Promise<RunRecoveryPlan>((resolve) => { finishRefresh = resolve; });
+    const getRunRecoveryPlan = vi.fn()
+      .mockResolvedValueOnce(plan)
+      .mockImplementationOnce(() => pendingRefresh);
+    const desktopApi = api({
+      getDesktopState: vi.fn().mockResolvedValue(desktopState),
+      getRunResult: vi.fn().mockResolvedValue('Completed result'),
+      getRunRecoveryPlan,
+      subscribe: vi.fn(async (...args: Parameters<DesktopApi['subscribe']>) => {
+        onState = args[2];
+        return vi.fn();
+      }),
+    });
+    const target = document.createElement('div');
+    document.body.append(target);
+    const component = mount(App, { target, props: { api: desktopApi } });
+    mounted.push(component);
+
+    await vi.waitFor(() => expect(target.querySelector<HTMLButtonElement>('.rail-item')).toBeTruthy());
+    target.querySelector<HTMLButtonElement>('.rail-item')!.click();
+    await vi.waitFor(() => expect(target.textContent).toContain(plan.reason));
+    onState(desktopState);
+    await tick();
+
+    expect(getRunRecoveryPlan).toHaveBeenCalledTimes(2);
+    expect(target.textContent).toContain(plan.reason);
+    finishRefresh(plan);
   });
 });

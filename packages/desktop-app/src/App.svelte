@@ -429,7 +429,11 @@
       if (selectedRunId === runId) selectedRecoveryPlan = undefined;
       return;
     }
-    if (selectedRunId === runId) selectedRecoveryPlan = undefined;
+    if (selectedRunId === runId
+      && selectedRecoveryPlan
+      && (selectedRecoveryPlan.runId !== runId || selectedRecoveryPlan.status !== run.status)) {
+      selectedRecoveryPlan = undefined;
+    }
     try {
       const plan = await getRunRecoveryPlan(runId);
       const current = desktop.runs.find((candidate) => candidate.runId === runId);
