@@ -16,7 +16,7 @@ use std::{
         mpsc::{self, Receiver, Sender},
         Arc, Mutex, Weak,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tauri_plugin_dialog::DialogExt;
@@ -4799,21 +4799,29 @@ async fn export_agent_config(
     .map_err(|error| format!("Agent export failed: {error}"))??;
     let profile: AgentProfileContent = serde_json::from_value(profile)
         .map_err(|error| format!("Invalid agent profile response: {error}"))?;
-    let Some(selected) = app
-        .dialog()
-        .file()
-        .add_filter("Agent JSON", &["json"])
-        .set_file_name(&profile.file_name)
-        .blocking_save_file()
-    else {
-        return Ok(None);
-    };
-    let path = selected
-        .into_path()
-        .map_err(|_| "The selected export destination is not a local file.".to_string())?;
-    std::fs::write(&path, profile.content.as_bytes())
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(selected) = app
+            .dialog()
+            .file()
+            .add_filter("Agent JSON", &["json"])
+            .set_file_name(&profile.file_name)
+            .blocking_save_file()
+        else {
+            return Ok(None);
+        };
+        let path = selected
+            .into_path()
+            .map_err(|_| "The selected export destination is not a local file.".to_string())?;
+        write_agent_export(&path, &profile.content).map(Some)
+    })
+    .await
+    .map_err(|error| format!("Agent export failed: {error}"))?
+}
+
+fn write_agent_export(path: &Path, content: &str) -> Result<String, String> {
+    std::fs::write(path, content.as_bytes())
         .map_err(|error| format!("Unable to export agent profile: {error}"))?;
-    Ok(Some(path.to_string_lossy().into_owned()))
+    Ok(path.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
@@ -5051,36 +5059,47 @@ fn save_window_presentation(
 /// Compatibility bootstrap for the single-window renderer. Native callers should bind
 /// subsequent operations to the returned agent ID rather than trusting renderer state.
 #[tauri::command]
-fn desktop_bootstrap(state: tauri::State<'_, AppState>) -> Result<Value, String> {
-    let quit_state = current_quit_state(&state);
-    let snapshot = match state.manager.current() {
-        Ok(_) => state
-            .manager
-            .agent_snapshot(
-                &state
-                    .manager
-                    .catalog
-                    .lock()
-                    .unwrap()
-                    .current_agent_id
-                    .clone()
-                    .unwrap_or_default(),
-                quit_state.clone(),
-            )
-            .unwrap_or_else(|_| state.manager.error_snapshot(quit_state.clone())),
-        Err(error) => {
-            *state.manager.bootstrap_error.lock().unwrap() = Some(error);
-            state.manager.error_snapshot(quit_state)
-        }
-    };
-    Ok(json!({ "currentAgentId": snapshot.agent_id, "state": snapshot }))
+async fn desktop_bootstrap(app: AppHandle) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let quit_state = current_quit_state(&state);
+        let snapshot = match state.manager.current() {
+            Ok(_) => state
+                .manager
+                .agent_snapshot(
+                    &state
+                        .manager
+                        .catalog
+                        .lock()
+                        .unwrap()
+                        .current_agent_id
+                        .clone()
+                        .unwrap_or_default(),
+                    quit_state.clone(),
+                )
+                .unwrap_or_else(|_| state.manager.error_snapshot(quit_state.clone())),
+            Err(error) => {
+                *state.manager.bootstrap_error.lock().unwrap() = Some(error);
+                state.manager.error_snapshot(quit_state)
+            }
+        };
+        Ok(json!({ "currentAgentId": snapshot.agent_id, "state": snapshot }))
+    })
+    .await
+    .map_err(|error| format!("Desktop bootstrap failed: {error}"))?
 }
 
 #[tauri::command]
-fn reload_settings(
-    agent_id: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<DesktopState, String> {
+async fn reload_settings(agent_id: String, app: AppHandle) -> Result<DesktopState, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        reload_settings_blocking(agent_id, &state)
+    })
+    .await
+    .map_err(|error| format!("Settings reload failed: {error}"))?
+}
+
+fn reload_settings_blocking(agent_id: String, state: &AppState) -> Result<DesktopState, String> {
     if state
         .reconfiguring
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -5110,7 +5129,7 @@ fn reload_settings(
             .cloned()
             .ok_or("Desktop runtime is unavailable.")?;
         start_trace_for_runtime(&agent_id, runtime, bridge.clone())?;
-        let quit_state = current_quit_state(&state);
+        let quit_state = current_quit_state(state);
         state.manager.agent_snapshot(&agent_id, quit_state)
     })();
     state.reconfiguring.store(false, Ordering::SeqCst);
@@ -5118,10 +5137,23 @@ fn reload_settings(
 }
 
 #[tauri::command]
-fn save_settings(
+async fn save_settings(
     agent_id: String,
     settings: Value,
-    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<DesktopState, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        save_settings_blocking(agent_id, settings, &state)
+    })
+    .await
+    .map_err(|error| format!("Settings save failed: {error}"))?
+}
+
+fn save_settings_blocking(
+    agent_id: String,
+    settings: Value,
+    state: &AppState,
 ) -> Result<DesktopState, String> {
     if state
         .reconfiguring
@@ -5135,7 +5167,7 @@ fn save_settings(
         if state.quit.lock().unwrap().state() != QuitState::Idle {
             return Err("Settings cannot be saved while quitting.".into());
         }
-        let bridge = bridge_for(&state, &agent_id, false)?;
+        let bridge = bridge_for(state, &agent_id, false)?;
         if state
             .manager
             .runtime_bridges()
@@ -5197,7 +5229,7 @@ fn save_settings(
             .cloned()
             .ok_or("Desktop runtime is unavailable.")?;
         start_trace_for_runtime(&agent_id, runtime, bridge.clone())?;
-        let quit_state = current_quit_state(&state);
+        let quit_state = current_quit_state(state);
         state.manager.agent_snapshot(&agent_id, quit_state)
     })();
     state.reconfiguring.store(false, Ordering::SeqCst);
@@ -5205,7 +5237,7 @@ fn save_settings(
 }
 
 #[tauri::command]
-fn start_run(
+async fn start_run(
     agent_id: String,
     task: String,
     attachment_ids: Option<Vec<String>>,
@@ -5231,7 +5263,11 @@ fn start_run(
         }
         bridge
     };
-    bridge.start_run(task, attachment_ids.unwrap_or_default())
+    tauri::async_runtime::spawn_blocking(move || {
+        bridge.start_run(task, attachment_ids.unwrap_or_default())
+    })
+    .await
+    .map_err(|error| format!("Run submission failed: {error}"))?
 }
 
 #[tauri::command]
@@ -5305,58 +5341,66 @@ fn discard_imported_drafts(bridge: &Bridge, drafts: &[AttachmentDraft]) {
 }
 
 #[tauri::command]
-fn discard_attachment_draft(
+async fn discard_attachment_draft(
     agent_id: String,
     attachment_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     let bridge = bridge_for(&state, &agent_id, true)?;
-    if let Some(relative) = bridge
-        .workbench
-        .discard_draft_for_agent(&agent_id, &attachment_id)?
-    {
-        if let Some(std::path::Component::Normal(directory)) =
-            Path::new(&relative).components().next()
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(relative) = bridge
+            .workbench
+            .discard_draft_for_agent(&agent_id, &attachment_id)?
         {
-            std::fs::remove_dir_all(bridge.attachment_root.join(directory))
-                .or_else(|error| {
-                    if error.kind() == std::io::ErrorKind::NotFound {
-                        Ok(())
-                    } else {
-                        Err(error)
-                    }
-                })
-                .map_err(|error| error.to_string())?;
-            bridge.workbench.finish_attachment_cleanup(&attachment_id)?;
+            if let Some(std::path::Component::Normal(directory)) =
+                Path::new(&relative).components().next()
+            {
+                std::fs::remove_dir_all(bridge.attachment_root.join(directory))
+                    .or_else(|error| {
+                        if error.kind() == std::io::ErrorKind::NotFound {
+                            Ok(())
+                        } else {
+                            Err(error)
+                        }
+                    })
+                    .map_err(|error| error.to_string())?;
+                bridge.workbench.finish_attachment_cleanup(&attachment_id)?;
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("Attachment cleanup failed: {error}"))?
 }
 
 #[tauri::command]
-fn stop_run(
+async fn stop_run(
     agent_id: String,
     run_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     let bridge = state.manager.bridge_for_run(&agent_id, &run_id)?;
     bridge.workbench.assert_run_owner(&agent_id, &run_id)?;
-    bridge.stop_run(&run_id)
+    tauri::async_runtime::spawn_blocking(move || bridge.stop_run(&run_id))
+        .await
+        .map_err(|error| format!("Run stop failed: {error}"))?
 }
 
 #[tauri::command]
-fn get_run_recovery_plan(
+async fn get_run_recovery_plan(
     agent_id: String,
     run_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<Value, String> {
     let bridge = state.manager.bridge_for_run(&agent_id, &run_id)?;
     bridge.workbench.assert_run_owner(&agent_id, &run_id)?;
-    bridge.recovery_plan(&run_id)
+    tauri::async_runtime::spawn_blocking(move || bridge.recovery_plan(&run_id))
+        .await
+        .map_err(|error| format!("Recovery planning failed: {error}"))?
 }
 
 #[tauri::command]
-fn recover_run(
+async fn recover_run(
     agent_id: String,
     run_id: String,
     expected_status: String,
@@ -5375,11 +5419,15 @@ fn recover_run(
         bridge.workbench.assert_run_owner(&agent_id, &run_id)?;
         bridge
     };
-    bridge.recover_run(&run_id, &expected_status, &expected_action)
+    tauri::async_runtime::spawn_blocking(move || {
+        bridge.recover_run(&run_id, &expected_status, &expected_action)
+    })
+    .await
+    .map_err(|error| format!("Run recovery failed: {error}"))?
 }
 
 #[tauri::command]
-fn steer_run(
+async fn steer_run(
     agent_id: String,
     run_id: String,
     message: String,
@@ -5390,7 +5438,10 @@ fn steer_run(
     }
     let bridge = state.manager.bridge_for_run(&agent_id, &run_id)?;
     bridge.workbench.assert_run_owner(&agent_id, &run_id)?;
-    bridge.steer_run(&run_id, message.trim())
+    let message = message.trim().to_owned();
+    tauri::async_runtime::spawn_blocking(move || bridge.steer_run(&run_id, &message))
+        .await
+        .map_err(|error| format!("Run steering failed: {error}"))?
 }
 
 #[tauri::command]
@@ -5405,7 +5456,7 @@ fn get_run_result(
 }
 
 #[tauri::command]
-fn get_run_overview(
+async fn get_run_overview(
     agent_id: String,
     run_id: String,
     state: tauri::State<'_, AppState>,
@@ -5424,7 +5475,11 @@ fn get_run_overview(
             .ok_or("Trace inspector is not ready.")?;
         (privacy, trace, bridge.attachment_root.clone())
     };
-    request_trace_report(&trace, privacy, &run_id, &attachment_root)
+    tauri::async_runtime::spawn_blocking(move || {
+        request_trace_report(&trace, privacy, &run_id, &attachment_root)
+    })
+    .await
+    .map_err(|error| format!("Trace overview failed: {error}"))?
 }
 
 const ARTIFACT_EXTENSIONS: &[&str] = &[
@@ -5434,6 +5489,9 @@ const ARTIFACT_EXTENSIONS: &[&str] = &[
 ];
 const MAX_TEXT_PREVIEW_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_MEDIA_PREVIEW_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_ARTIFACT_DEPTH: usize = 16;
+const MAX_ARTIFACT_RESULTS: usize = 2_000;
+const ARTIFACT_SCAN_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn workspace_paths(state: &AppState, agent_id: &str) -> Result<(PathBuf, PathBuf), String> {
     let bridge = bridge_for(state, agent_id, true)?;
@@ -5453,36 +5511,53 @@ fn workspace_paths(state: &AppState, agent_id: &str) -> Result<(PathBuf, PathBuf
     Ok((root, shell_cwd))
 }
 
-fn collect_workspace_artifacts(directory: &Path, artifacts: &mut Vec<WorkspaceArtifact>) {
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
+fn collect_workspace_artifacts(directory: &Path) -> Result<Vec<WorkspaceArtifact>, String> {
+    let started = Instant::now();
+    let mut pending = vec![(directory.to_path_buf(), 0usize)];
+    let mut artifacts = Vec::new();
+    while let Some((directory, depth)) = pending.pop() {
+        if started.elapsed() > ARTIFACT_SCAN_TIMEOUT {
+            return Err("Artifact discovery exceeded its 2 second time limit.".into());
+        }
+        let Ok(entries) = std::fs::read_dir(directory) else {
             continue;
         };
-        if file_type.is_dir() {
-            if matches!(
-                entry.file_name().to_str(),
-                Some(".git" | "node_modules" | "target")
-            ) {
+        let mut entries = entries.flatten().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        let mut child_directories = Vec::new();
+        for entry in entries {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
                 continue;
+            };
+            if file_type.is_dir() && depth < MAX_ARTIFACT_DEPTH {
+                if !matches!(
+                    entry.file_name().to_str(),
+                    Some(".git" | "node_modules" | "target")
+                ) {
+                    child_directories.push((path, depth + 1));
+                }
+            } else if file_type.is_file()
+                && path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| {
+                        ARTIFACT_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+                    })
+            {
+                artifacts.push(WorkspaceArtifact {
+                    path: path.to_string_lossy().into_owned(),
+                });
+                if artifacts.len() == MAX_ARTIFACT_RESULTS {
+                    artifacts.sort_by(|left, right| left.path.cmp(&right.path));
+                    return Ok(artifacts);
+                }
             }
-            collect_workspace_artifacts(&path, artifacts);
-        } else if file_type.is_file()
-            && path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| {
-                    ARTIFACT_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
-                })
-        {
-            artifacts.push(WorkspaceArtifact {
-                path: path.to_string_lossy().into_owned(),
-            });
         }
+        pending.extend(child_directories.into_iter().rev());
     }
+    artifacts.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(artifacts)
 }
 
 fn resolve_artifact_path(
@@ -5506,9 +5581,7 @@ fn resolve_artifact_path(
         return Ok(path);
     }
     if requested.components().count() == 1 {
-        let mut artifacts = Vec::new();
-        collect_workspace_artifacts(&root, &mut artifacts);
-        let matches = artifacts
+        let matches = collect_workspace_artifacts(&root)?
             .into_iter()
             .filter(|artifact| Path::new(&artifact.path).file_name() == requested.file_name())
             .collect::<Vec<_>>();
@@ -5520,18 +5593,19 @@ fn resolve_artifact_path(
 }
 
 #[tauri::command]
-fn list_workspace_artifacts(
+async fn list_workspace_artifacts(
     agent_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<WorkspaceArtifact>, String> {
     let (root, _) = workspace_paths(&state, &agent_id)?;
-    let root = root
-        .canonicalize()
-        .map_err(|_| "The configured workspace is unavailable.".to_string())?;
-    let mut artifacts = Vec::new();
-    collect_workspace_artifacts(&root, &mut artifacts);
-    artifacts.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(artifacts)
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = root
+            .canonicalize()
+            .map_err(|_| "The configured workspace is unavailable.".to_string())?;
+        collect_workspace_artifacts(&root)
+    })
+    .await
+    .map_err(|error| format!("Artifact discovery failed: {error}"))?
 }
 
 #[tauri::command]
@@ -5541,10 +5615,12 @@ async fn read_artifact(
     state: tauri::State<'_, AppState>,
 ) -> Result<ArtifactPreview, String> {
     let (root, shell_cwd) = workspace_paths(&state, &agent_id)?;
-    let path = resolve_artifact_path(&root, &shell_cwd, &path)?;
-    tauri::async_runtime::spawn_blocking(move || artifact_preview(&path))
-        .await
-        .map_err(|_| "Artifact preview could not be prepared.".to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = resolve_artifact_path(&root, &shell_cwd, &path)?;
+        artifact_preview(&path)
+    })
+    .await
+    .map_err(|_| "Artifact preview could not be prepared.".to_string())?
 }
 
 fn artifact_preview(path: &Path) -> Result<ArtifactPreview, String> {
@@ -5715,7 +5791,7 @@ fn delete_history(
 }
 
 #[tauri::command]
-fn send_chat_turn(
+async fn send_chat_turn(
     agent_id: String,
     item_id: String,
     content: String,
@@ -5737,11 +5813,12 @@ fn send_chat_turn(
         bridge.workbench.assert_item_owner(&agent_id, &item_id)?;
         bridge
     };
-    bridge.send_chat(
-        item_id,
-        content.trim().into(),
-        attachment_ids.unwrap_or_default(),
-    )
+    let content = content.trim().to_owned();
+    tauri::async_runtime::spawn_blocking(move || {
+        bridge.send_chat(item_id, content, attachment_ids.unwrap_or_default())
+    })
+    .await
+    .map_err(|error| format!("Chat submission failed: {error}"))?
 }
 
 #[derive(Clone, Copy)]
@@ -5922,13 +5999,17 @@ fn persist_agent_window_bounds(window: &WebviewWindow, state: &AppState) -> Resu
 }
 
 #[tauri::command]
-fn quit_wait(app: AppHandle) -> Result<DesktopState, String> {
-    begin_drain(&app, DrainMode::Wait)
+async fn quit_wait(app: AppHandle) -> Result<DesktopState, String> {
+    tauri::async_runtime::spawn_blocking(move || begin_drain(&app, DrainMode::Wait))
+        .await
+        .map_err(|error| format!("Quit coordination failed: {error}"))?
 }
 
 #[tauri::command]
-fn quit_terminate(app: AppHandle) -> Result<DesktopState, String> {
-    begin_drain(&app, DrainMode::Terminate)
+async fn quit_terminate(app: AppHandle) -> Result<DesktopState, String> {
+    tauri::async_runtime::spawn_blocking(move || begin_drain(&app, DrainMode::Terminate))
+        .await
+        .map_err(|error| format!("Quit coordination failed: {error}"))?
 }
 
 #[tauri::command]
@@ -7067,8 +7148,7 @@ mod tests {
         std::fs::create_dir(workspace.path().join("node_modules")).unwrap();
         std::fs::write(workspace.path().join("node_modules/ignored.json"), "{}").unwrap();
 
-        let mut artifacts = Vec::new();
-        collect_workspace_artifacts(workspace.path(), &mut artifacts);
+        let artifacts = collect_workspace_artifacts(workspace.path()).unwrap();
         assert_eq!(artifacts.len(), 1);
         assert!(artifacts[0].path.ends_with("report.md"));
         let preview = artifact_preview(&nested.join("report.md")).unwrap();
@@ -7107,6 +7187,61 @@ mod tests {
             outside.path().to_str().unwrap()
         )
         .is_err());
+    }
+
+    #[test]
+    fn workspace_artifact_discovery_is_deterministic_and_bounded() {
+        let workspace = tempfile::tempdir().unwrap();
+        for index in (0..=MAX_ARTIFACT_RESULTS).rev() {
+            std::fs::write(
+                workspace.path().join(format!("artifact-{index:04}.json")),
+                "{}",
+            )
+            .unwrap();
+        }
+        let first = collect_workspace_artifacts(workspace.path()).unwrap();
+        let second = collect_workspace_artifacts(workspace.path()).unwrap();
+        assert_eq!(first.len(), MAX_ARTIFACT_RESULTS);
+        assert_eq!(
+            first
+                .iter()
+                .map(|artifact| &artifact.path)
+                .collect::<Vec<_>>(),
+            second
+                .iter()
+                .map(|artifact| &artifact.path)
+                .collect::<Vec<_>>()
+        );
+        assert!(first.windows(2).all(|pair| pair[0].path < pair[1].path));
+
+        let deep_workspace = tempfile::tempdir().unwrap();
+        let mut directory = deep_workspace.path().join("deep");
+        for depth in 0..=MAX_ARTIFACT_DEPTH {
+            directory = directory.join(format!("level-{depth}"));
+            std::fs::create_dir_all(&directory).unwrap();
+        }
+        std::fs::write(directory.join("too-deep.json"), "{}").unwrap();
+        assert!(!collect_workspace_artifacts(deep_workspace.path())
+            .unwrap()
+            .iter()
+            .any(|artifact| artifact.path.ends_with("too-deep.json")));
+    }
+
+    #[test]
+    fn agent_export_write_failures_are_actionable() {
+        let directory = tempfile::tempdir().unwrap();
+        let exported = directory.path().join("agent.json");
+        assert_eq!(
+            write_agent_export(&exported, "{\"id\":\"test\"}").unwrap(),
+            exported.to_string_lossy()
+        );
+        assert_eq!(
+            std::fs::read_to_string(exported).unwrap(),
+            "{\"id\":\"test\"}"
+        );
+        assert!(write_agent_export(directory.path(), "{}")
+            .unwrap_err()
+            .starts_with("Unable to export agent profile:"));
     }
 
     #[test]
