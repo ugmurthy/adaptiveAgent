@@ -1295,10 +1295,12 @@ impl AgentRuntimeManager {
     }
 
     fn shutdown_runtime(runtime: &Arc<ManagedRuntime>) {
-        if let Some(trace) = runtime.trace.lock().unwrap().take() {
+        let trace = runtime.trace.lock().unwrap().take();
+        if let Some(trace) = trace {
             trace.shutdown();
         }
-        if let Some(bridge) = runtime.bridge.lock().unwrap().take() {
+        let bridge = runtime.bridge.lock().unwrap().take();
+        if let Some(bridge) = bridge {
             bridge.shutdown();
         }
     }
@@ -2014,7 +2016,8 @@ impl TraceBridge {
             Ok(messages) => {
                 for message in messages {
                     if let Some(id) = message.get("id").and_then(Value::as_u64) {
-                        if let Some(sender) = self.pending.lock().unwrap().remove(&id) {
+                        let sender = self.pending.lock().unwrap().remove(&id);
+                        if let Some(sender) = sender {
                             let response = if let Some(error) = message.get("error") {
                                 Err(error
                                     .get("message")
@@ -2038,10 +2041,12 @@ impl TraceBridge {
         }
         self.healthy.store(false, Ordering::SeqCst);
         *self.error.lock().unwrap() = Some(message.into());
-        for (_, sender) in self.pending.lock().unwrap().drain() {
+        let pending = std::mem::take(&mut *self.pending.lock().unwrap());
+        for (_, sender) in pending {
             let _ = sender.send(Err(message.into()));
         }
-        if let Some(child) = self.child.lock().unwrap().take() {
+        let child = self.child.lock().unwrap().take();
+        if let Some(child) = child {
             let _ = child.kill();
         }
         self.emit_state();
@@ -2056,10 +2061,12 @@ impl TraceBridge {
         if let Ok(_request) = self.request_gate.try_lock() {
             let _ = self.request_wait_serialized("shutdown", None, SHUTDOWN_TIMEOUT);
         }
-        if let Some(child) = self.child.lock().unwrap().take() {
+        let child = self.child.lock().unwrap().take();
+        if let Some(child) = child {
             let _ = child.kill();
         }
-        for (_, sender) in self.pending.lock().unwrap().drain() {
+        let pending = std::mem::take(&mut *self.pending.lock().unwrap());
+        for (_, sender) in pending {
             let _ = sender.send(Err("Trace sidecar was shut down.".into()));
         }
     }
@@ -3217,12 +3224,18 @@ impl Bridge {
                             == ApplyState::Accepted
                             && !state.occupies_slot;
                     }
-                    if let Some(record) = bridge.registry.lock().unwrap().get(&run_id) {
-                        let _ = bridge.workbench.update_run(
-                            &run_id,
-                            &record.cached_status,
-                            &record.submission_state,
-                        );
+                    let persisted_state =
+                        bridge.registry.lock().unwrap().get(&run_id).map(|record| {
+                            (
+                                record.cached_status.clone(),
+                                record.submission_state.clone(),
+                            )
+                        });
+                    if let Some((cached_status, submission_state)) = persisted_state {
+                        let _ =
+                            bridge
+                                .workbench
+                                .update_run(&run_id, &cached_status, &submission_state);
                     }
                     if accepted_quiescent {
                         let _ = bridge.app.emit(
@@ -3348,14 +3361,16 @@ impl Bridge {
         if self.draining.load(Ordering::SeqCst) {
             return Err("The desktop is draining and cannot start new runs.".into());
         }
-        let mut registry = self.registry.lock().unwrap();
-        if !registry.has_capacity() {
-            return Err(
-                "All 3 task slots are occupied. Stop or wait for a run, then try again.".into(),
-            );
-        }
-        if registry.item_is_occupied(&item_id) {
-            return Err("This chat already has a turn in progress.".into());
+        {
+            let registry = self.registry.lock().unwrap();
+            if !registry.has_capacity() {
+                return Err(
+                    "All 3 task slots are occupied. Stop or wait for a run, then try again.".into(),
+                );
+            }
+            if registry.item_is_occupied(&item_id) {
+                return Err("This chat already has a turn in progress.".into());
+            }
         }
         let (chat, _) = self.workbench.load_chat(&item_id)?;
         if let Some(reason) = self.chat_reason(&chat) {
@@ -3371,7 +3386,7 @@ impl Bridge {
             &content,
             &attachment_ids,
         )?;
-        registry.insert(RunRecord {
+        self.registry.lock().unwrap().insert(RunRecord {
             run_id: run_id.clone(),
             item_id: item_id.clone(),
             title: chat.title.clone(),
@@ -3390,7 +3405,6 @@ impl Bridge {
             workspace_root: chat.workspace_root.clone(),
             shell_cwd: chat.shell_cwd.clone(),
         });
-        drop(registry);
         if let Err(error) = self.workbench.update_run(&run_id, "submitted", "submitted") {
             self.emit_control_error(&run_id, format!("The chat reservation is durable, but its redundant submitted update failed: {error}"));
         }
@@ -3479,14 +3493,27 @@ impl Bridge {
                     if let Some(record) = bridge.registry.lock().unwrap().get_mut(&response_run_id)
                     {
                         let _ = apply_run_state(record, &state, None);
-                        if state.cached_status != "succeeded" {
-                            if let Err(error) = bridge.workbench.update_run(
-                                &response_run_id,
-                                &record.cached_status,
-                                &record.submission_state,
-                            ) {
-                                bridge.emit_control_error(&response_run_id, error);
-                            }
+                    }
+                    let persisted_state =
+                        (state.cached_status != "succeeded")
+                            .then(|| {
+                                bridge.registry.lock().unwrap().get(&response_run_id).map(
+                                    |record| {
+                                        (
+                                            record.cached_status.clone(),
+                                            record.submission_state.clone(),
+                                        )
+                                    },
+                                )
+                            })
+                            .flatten();
+                    if let Some((cached_status, submission_state)) = persisted_state {
+                        if let Err(error) = bridge.workbench.update_run(
+                            &response_run_id,
+                            &cached_status,
+                            &submission_state,
+                        ) {
+                            bridge.emit_control_error(&response_run_id, error);
                         }
                     }
                     if !state.occupies_slot {
@@ -3698,16 +3725,22 @@ impl Bridge {
                             == ApplyState::Accepted
                             && !state.occupies_slot;
                     }
-                    let state_persisted = if let Some(record) =
-                        bridge.registry.lock().unwrap().get(&run_id)
-                    {
-                        bridge
-                            .workbench
-                            .update_run(&run_id, &record.cached_status, &record.submission_state)
-                            .is_ok()
-                    } else {
-                        false
-                    };
+                    let persisted_state =
+                        bridge.registry.lock().unwrap().get(&run_id).map(|record| {
+                            (
+                                record.cached_status.clone(),
+                                record.submission_state.clone(),
+                            )
+                        });
+                    let state_persisted =
+                        if let Some((cached_status, submission_state)) = persisted_state {
+                            bridge
+                                .workbench
+                                .update_run(&run_id, &cached_status, &submission_state)
+                                .is_ok()
+                        } else {
+                            false
+                        };
                     if !accepted_quiescent || !state_persisted {
                         bridge.reconcile_run(run_id.clone());
                     }
@@ -3933,7 +3966,8 @@ impl Bridge {
     }
 
     fn fail_all(&self, message: &str) {
-        for (_, sender) in self.pending.lock().unwrap().drain() {
+        let pending = std::mem::take(&mut *self.pending.lock().unwrap());
+        for (_, sender) in pending {
             let _ = sender.send(Err(message.into()));
         }
     }
@@ -3954,7 +3988,8 @@ impl Bridge {
         if let Ok((_, receiver)) = self.request("runtime/shutdown", json!({})) {
             let _ = receiver.recv_timeout(SHUTDOWN_TIMEOUT);
         }
-        if let Some(child) = self.child.lock().unwrap().take() {
+        let child = self.child.lock().unwrap().take();
+        if let Some(child) = child {
             let _ = child.kill();
         }
         self.fail_all("The agent runtime was shut down.");
@@ -5179,20 +5214,23 @@ fn start_run(
     if task.trim().is_empty() {
         return Err("Task description is required.".into());
     }
-    let _lifecycle = state.lifecycle.lock().unwrap();
-    if state.reconfiguring.load(Ordering::SeqCst) {
-        return Err("Settings are being reloaded; try again when the runtime is ready.".into());
-    }
-    if state.quit.lock().unwrap().state() != QuitState::Idle {
-        return Err("The desktop is quitting and cannot start new runs.".into());
-    }
-    let bridge = bridge_for(&state, &agent_id, false)?;
-    if !bridge.snapshot().configuration_valid {
-        return Err(bridge
-            .snapshot()
-            .error
-            .unwrap_or_else(|| "Settings are invalid.".into()));
-    }
+    let bridge = {
+        let _lifecycle = state.lifecycle.lock().unwrap();
+        if state.reconfiguring.load(Ordering::SeqCst) {
+            return Err("Settings are being reloaded; try again when the runtime is ready.".into());
+        }
+        if state.quit.lock().unwrap().state() != QuitState::Idle {
+            return Err("The desktop is quitting and cannot start new runs.".into());
+        }
+        let bridge = bridge_for(&state, &agent_id, false)?;
+        let snapshot = bridge.snapshot();
+        if !snapshot.configuration_valid {
+            return Err(snapshot
+                .error
+                .unwrap_or_else(|| "Settings are invalid.".into()));
+        }
+        bridge
+    };
     bridge.start_run(task, attachment_ids.unwrap_or_default())
 }
 
@@ -5325,15 +5363,18 @@ fn recover_run(
     expected_action: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let _lifecycle = state.lifecycle.lock().unwrap();
-    if state.reconfiguring.load(Ordering::SeqCst) {
-        return Err("Settings are being reloaded; try again when the runtime is ready.".into());
-    }
-    if state.quit.lock().unwrap().state() != QuitState::Idle {
-        return Err("The desktop is quitting and cannot recover runs.".into());
-    }
-    let bridge = state.manager.bridge_for_run(&agent_id, &run_id)?;
-    bridge.workbench.assert_run_owner(&agent_id, &run_id)?;
+    let bridge = {
+        let _lifecycle = state.lifecycle.lock().unwrap();
+        if state.reconfiguring.load(Ordering::SeqCst) {
+            return Err("Settings are being reloaded; try again when the runtime is ready.".into());
+        }
+        if state.quit.lock().unwrap().state() != QuitState::Idle {
+            return Err("The desktop is quitting and cannot recover runs.".into());
+        }
+        let bridge = state.manager.bridge_for_run(&agent_id, &run_id)?;
+        bridge.workbench.assert_run_owner(&agent_id, &run_id)?;
+        bridge
+    };
     bridge.recover_run(&run_id, &expected_status, &expected_action)
 }
 
@@ -5684,15 +5725,18 @@ fn send_chat_turn(
     if content.trim().is_empty() {
         return Err("Message is required.".into());
     }
-    let _lifecycle = state.lifecycle.lock().unwrap();
-    if state.reconfiguring.load(Ordering::SeqCst) {
-        return Err("Settings are being reloaded; try again when the runtime is ready.".into());
-    }
-    if state.quit.lock().unwrap().state() != QuitState::Idle {
-        return Err("The desktop is quitting and cannot start new runs.".into());
-    }
-    let bridge = bridge_for(&state, &agent_id, false)?;
-    bridge.workbench.assert_item_owner(&agent_id, &item_id)?;
+    let bridge = {
+        let _lifecycle = state.lifecycle.lock().unwrap();
+        if state.reconfiguring.load(Ordering::SeqCst) {
+            return Err("Settings are being reloaded; try again when the runtime is ready.".into());
+        }
+        if state.quit.lock().unwrap().state() != QuitState::Idle {
+            return Err("The desktop is quitting and cannot start new runs.".into());
+        }
+        let bridge = bridge_for(&state, &agent_id, false)?;
+        bridge.workbench.assert_item_owner(&agent_id, &item_id)?;
+        bridge
+    };
     bridge.send_chat(
         item_id,
         content.trim().into(),
@@ -5797,13 +5841,16 @@ fn approve_and_exit(app: &AppHandle) {
 
 fn native_close_requested(app: &AppHandle) -> CloseDecision {
     let state = app.state::<AppState>();
-    let _lifecycle = state.lifecycle.lock().unwrap();
-    let bridges = state.manager.runtime_bridges();
-    let occupied = bridges
-        .iter()
-        .map(|bridge| bridge.registry.lock().unwrap().occupied_slot_count())
-        .sum();
-    let decision = state.quit.lock().unwrap().close_requested(occupied);
+    let (decision, bridges) = {
+        let _lifecycle = state.lifecycle.lock().unwrap();
+        let bridges = state.manager.runtime_bridges();
+        let occupied = bridges
+            .iter()
+            .map(|bridge| bridge.registry.lock().unwrap().occupied_slot_count())
+            .sum();
+        let decision = state.quit.lock().unwrap().close_requested(occupied);
+        (decision, bridges)
+    };
     for bridge in bridges {
         bridge.emit_state();
     }

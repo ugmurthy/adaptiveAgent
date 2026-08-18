@@ -141,6 +141,7 @@ it('runs remote inference in SQLite while writing artifacts locally', async () =
     model: { provider: 'ollama', model: 'unused' },
     tools: ['write_file'],
   }));
+  await writeFile(join(cwd, 'agent.settings.json'), '{}');
   const runtime = new DesktopRuntime(() => undefined);
 
   try {
@@ -255,6 +256,7 @@ it('keeps three spawned sidecar runs and control responses correlated under SQLi
     invocationModes: ['run'], defaultInvocationMode: 'run',
     model: { provider: 'ollama', model: 'unused' }, tools: [],
   }));
+  await writeFile(join(cwd, 'agent.settings.json'), '{}');
 
   const child = spawn('bun', [resolve(import.meta.dirname, 'main.ts')], { stdio: ['pipe', 'pipe', 'pipe'] });
   const rpc = createRpcPeer(child.stdout, child.stdin);

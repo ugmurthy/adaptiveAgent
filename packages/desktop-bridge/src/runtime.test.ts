@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -247,6 +247,7 @@ describe('desktop runtime protocol', () => {
 
   it('translates only immutable files contained by the managed attachment root', async () => {
     const root = await mkdtemp(join(tmpdir(), 'desktop-attachments-'));
+    const canonicalRoot = await realpath(root);
     const workspace = await mkdtemp(join(tmpdir(), 'desktop-workspace-'));
     await mkdir(join(root, 'attachment-1'));
     const content = Buffer.from('attachment contents');
@@ -278,8 +279,8 @@ describe('desktop runtime protocol', () => {
       executionContext: { fileAccess: {
         version: 1,
         workspaceRoot: workspace,
-        attachmentRoots: [join(root, 'attachment-1')],
-        files: [{ path: join(root, 'attachment-1', 'note.txt'), sizeBytes: content.length, sha256: attachment.sha256 }],
+        attachmentRoots: [join(canonicalRoot, 'attachment-1')],
+        files: [{ path: join(canonicalRoot, 'attachment-1', 'note.txt'), sizeBytes: content.length, sha256: attachment.sha256 }],
       } },
     }));
 

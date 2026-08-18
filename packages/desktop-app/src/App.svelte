@@ -37,6 +37,7 @@
     type RailItem,
   } from './workbench-state';
   import { historyResultArtifacts, type ResultArtifact } from './workbench-ux';
+  import { createRefreshCoordinator } from './refresh-coordinator';
 
   export let api: DesktopApi;
   export let initialPresentation: WindowPresentation | undefined = undefined;
@@ -79,9 +80,7 @@
   let controlPending = false;
   let deletionPending = false;
   let deletionPreview: DeletionPreview | undefined;
-  let refreshGeneration = 0;
   let recoveryPlanGeneration = 0;
-  let refreshScheduled = false;
   let now = Date.now();
   let traceRoot = '';
   let traceReport: TraceReport | undefined;
@@ -96,6 +95,7 @@
   let historyQuery = '';
   let loadedArtifactsFilterKey = '';
   let artifactsGeneration = 0;
+  const refreshCoordinator = createRefreshCoordinator(refreshPass);
 
   $: railItems = buildRailItems(desktop.runs, chats);
   $: filteredHistoryItems = filterRailItems(railItems, historyQuery).filter((item) => item.group === 'History');
@@ -188,6 +188,7 @@
     })().catch((error) => { finalError = String(error); });
     return () => {
       cancelled = true;
+      refreshCoordinator.dispose();
       window.clearInterval(timer);
       unsubscribeSelection();
       unsubscribeInspector();
@@ -204,16 +205,14 @@
   }
 
   function scheduleRefresh() {
-    if (refreshScheduled) return;
-    refreshScheduled = true;
-    queueMicrotask(() => {
-      refreshScheduled = false;
-      void refresh();
-    });
+    void refreshCoordinator.request();
   }
 
-  async function refresh() {
-    const generation = ++refreshGeneration;
+  function refresh(): Promise<void> {
+    return refreshCoordinator.request();
+  }
+
+  async function refreshPass() {
     const selectedChatId = selectedChat?.itemId;
     try {
       const [nextDesktop, nextChats, nextChat] = await Promise.all([
@@ -221,7 +220,6 @@
         listChats(),
         selectedChatId ? loadChat(selectedChatId) : Promise.resolve(undefined),
       ]);
-      if (generation !== refreshGeneration) return;
       desktop = nextDesktop;
       chats = nextChats;
       if (selectedChatId && selectedChat?.itemId === selectedChatId) selectedChat = nextChat;
@@ -231,7 +229,7 @@
         if ($workbenchSelection.kind === 'task') $workbenchSelection = { kind: 'new-task' };
       }
     } catch (error) {
-      if (generation === refreshGeneration) finalError = String(error);
+      finalError = String(error);
     }
   }
 

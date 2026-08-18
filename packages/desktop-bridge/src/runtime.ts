@@ -192,7 +192,7 @@ export class DesktopRuntime {
         const executionId = params.executionId ?? params.runId!;
         rejectUnsupportedMedia(params.attachments ?? []);
         const parts = await this.validateAndTranslateAttachments(params.attachments ?? []);
-        const fileAccess = this.fileAccessContext(params.attachments ?? []);
+        const fileAccess = await this.fileAccessContext(params.attachments ?? []);
         const result = await sdk.runRaw(params.goal, {
           runId: asRunId(executionId),
           ...(params.sessionId ? { sessionId: params.sessionId } : {}),
@@ -210,7 +210,7 @@ export class DesktopRuntime {
         const attachments = params.executionId ? desktopTranscriptAttachments(params.transcript as DesktopChatMessage[]) : [];
         rejectUnsupportedMedia(attachments);
         const transcript = params.executionId ? await this.translateDesktopTranscript(params.transcript as DesktopChatMessage[]) : params.transcript as ChatMessage[];
-        const fileAccess = this.fileAccessContext(attachments);
+        const fileAccess = await this.fileAccessContext(attachments);
         const result = await this.requireSdk().chatRaw(transcript, {
           runId: asRunId(executionId),
           ...(params.chatSessionId ? { sessionId: params.chatSessionId } : {}),
@@ -826,13 +826,14 @@ export class DesktopRuntime {
   private async validateAndTranslateAttachments(inputs: DesktopAttachmentInput[]): Promise<ModelContentPart[]> {
     if (!inputs.length) return [];
     if (!this.managedAttachmentRoot) throw new DesktopProtocolError('ATTACHMENTS_UNAVAILABLE', 'managedAttachmentRoot is not configured.', JSON_RPC_ERROR_CODES.commandRejected);
+    const managedRoot = await realpath(this.managedAttachmentRoot).catch(() => { throw new DesktopProtocolError('ATTACHMENTS_UNAVAILABLE', 'managedAttachmentRoot is unavailable.', JSON_RPC_ERROR_CODES.commandRejected); });
     return Promise.all(inputs.map(async (input) => {
       if (isAbsolute(input.stagedRelativePath) || input.stagedRelativePath.split(/[\\/]/).includes('..')) throw attachmentError('ATTACHMENT_PATH_INVALID', input.attachmentId);
       const components = input.stagedRelativePath.split(/[\\/]/);
       if (components.length !== 2 || components[0] !== input.attachmentId || components[1] !== input.name) throw attachmentError('ATTACHMENT_PATH_INVALID', input.attachmentId);
-      const lexical = resolve(this.managedAttachmentRoot!, input.stagedRelativePath);
+      const lexical = resolve(managedRoot, input.stagedRelativePath);
       const canonical = await realpath(lexical).catch(() => { throw attachmentError('ATTACHMENT_NOT_FOUND', input.attachmentId); });
-      const rel = relative(this.managedAttachmentRoot!, canonical);
+      const rel = relative(managedRoot, canonical);
       if (!rel || rel.startsWith('..') || isAbsolute(rel)) throw attachmentError('ATTACHMENT_PATH_INVALID', input.attachmentId);
       const info = await stat(canonical);
       if (!info.isFile() || info.size !== input.sizeBytes) throw attachmentError('ATTACHMENT_CHANGED', input.attachmentId);
@@ -848,17 +849,19 @@ export class DesktopRuntime {
     return Promise.all(messages.map(async (message) => ({ role: message.role, content: message.attachments?.length ? [{ type: 'text', text: message.text }, ...await this.validateAndTranslateAttachments(message.attachments)] : message.text })));
   }
 
-  private fileAccessContext(inputs: DesktopAttachmentInput[]) {
+  private async fileAccessContext(inputs: DesktopAttachmentInput[]) {
     if (!inputs.length || !this.managedAttachmentRoot) return undefined;
+    const managedRoot = await realpath(this.managedAttachmentRoot);
+    const files = await Promise.all(inputs.map(async (input) => ({
+      path: await realpath(resolve(managedRoot, input.stagedRelativePath)),
+      sizeBytes: input.sizeBytes,
+      sha256: input.sha256,
+    })));
     return {
       version: 1 as const,
       workspaceRoot: this.requireSdk().config.workspaceRoot,
-      attachmentRoots: [...new Set(inputs.map((input) => resolve(this.managedAttachmentRoot!, input.attachmentId)))],
-      files: inputs.map((input) => ({
-        path: resolve(this.managedAttachmentRoot!, input.stagedRelativePath),
-        sizeBytes: input.sizeBytes,
-        sha256: input.sha256,
-      })),
+      attachmentRoots: [...new Set(inputs.map((input) => resolve(managedRoot, input.attachmentId)))],
+      files,
     };
   }
 }
