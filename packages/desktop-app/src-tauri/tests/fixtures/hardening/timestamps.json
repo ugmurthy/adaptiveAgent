@@ -1,0 +1,7 @@
+[
+  { "name": "iso", "value": "2026-08-17T12:34:56.789Z", "epochMilliseconds": 1786970096789 },
+  { "name": "number", "value": 1786970096789, "epochMilliseconds": 1786970096789 },
+  { "name": "epoch-string", "value": "1786970096789", "epochMilliseconds": 1786970096789 },
+  { "name": "blank", "value": "", "epochMilliseconds": null },
+  { "name": "invalid", "value": "not-a-timestamp", "epochMilliseconds": null }
+]

@@ -1,0 +1,15 @@
+{
+  "delayedRefresh": {
+    "requests": ["initial-delayed", "event-1", "event-2", "event-3"],
+    "expectedAppliedRevision": 3,
+    "maximumConcurrentRequests": 1,
+    "maximumTrailingRequests": 1
+  },
+  "persistenceFailures": ["task-completion", "chat-completion", "recovery-completion"],
+  "lifecycleRace": ["runtime-initialization", "settings-reload", "application-shutdown"],
+  "shutdown": {
+    "responseBeforeExit": true,
+    "pendingCallersReleased": true,
+    "expectedExit": "clean"
+  }
+}

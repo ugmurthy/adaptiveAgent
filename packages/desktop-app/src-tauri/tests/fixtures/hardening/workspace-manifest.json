@@ -1,0 +1,12 @@
+{
+  "maximumDepthFixture": 40,
+  "artifactCountFixture": 5000,
+  "historicalWorkspace": "workspace-before-settings-change",
+  "currentWorkspace": "workspace-after-settings-change",
+  "duplicateBasenames": ["reports/a/result.json", "reports/b/result.json"],
+  "symlinkEscape": {
+    "link": "reports/outside.json",
+    "target": "../outside-workspace/secret.json",
+    "expected": "rejected"
+  }
+}
