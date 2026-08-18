@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import type { ActivityEvent } from './activity';
   import { type RunRecoveryPlan, type RunSummary } from './desktop';
   import { desktopApi } from './desktop-context';
@@ -34,6 +35,9 @@
   let artifactGeneration = 0;
   let exportOpen = false;
   let exportError = '';
+  let disposed = false;
+
+  onDestroy(() => { disposed = true; artifactGeneration += 1; });
 
   $: if (steerRunId !== selectedRun.runId) {
     artifactGeneration += 1;
@@ -110,10 +114,10 @@
         resultValue,
         ...(overview?.rootRuns ?? []).map((run) => run.result),
       ], workspaceArtifacts);
-      if (generation !== artifactGeneration || selectedRun.runId !== requestedRunId) return;
+      if (disposed || generation !== artifactGeneration || selectedRun.runId !== requestedRunId) return;
       resolvedArtifacts = loaded;
     } catch (error) {
-      if (generation !== artifactGeneration || selectedRun.runId !== requestedRunId) return;
+      if (disposed || generation !== artifactGeneration || selectedRun.runId !== requestedRunId) return;
       artifactError = String(error);
       resolvedArtifacts = [];
     }

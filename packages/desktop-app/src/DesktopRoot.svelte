@@ -11,14 +11,17 @@
   let error = '';
 
   onMount(() => {
+    let disposed = false;
     void desktopWindowBootstrap().then((bootstrap) => {
+      if (disposed) return;
       if (bootstrap.kind === 'studio') { mode = 'studio'; return; }
       if (!bootstrap.agentId || bootstrap.state?.agentId !== bootstrap.agentId) throw new Error('Agent window bootstrap did not match its native window context.');
       agentId = bootstrap.agentId;
       api = createDesktopApi(agentId);
       presentation = bootstrap.presentation;
       mode = 'agent';
-    }).catch((cause) => { error = String(cause); mode = 'error'; });
+    }).catch((cause) => { if (!disposed) { error = String(cause); mode = 'error'; } });
+    return () => { disposed = true; };
   });
 </script>
 

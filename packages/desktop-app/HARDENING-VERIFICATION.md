@@ -46,3 +46,14 @@ represented as automated passes.
   remains targeted, while smart punctuation inside valid strings remains accepted.
 - Forward migration tests copy the pre-upgrade database before opening it and verify the source
   fixture remains at its original migration version.
+
+## Hardening Phase 4
+
+- App refresh, trace selection, artifact resolution, and recovery requests reject late completion
+  after disposal or supersession.
+- Desktop event callbacks, store subscriptions, the clock interval, and in-progress inspector
+  pointer-drag listeners have explicit component ownership and teardown.
+- Agent-window bootstrap and asynchronous artifact/result rendering do not publish into disposed
+  components.
+- Mounted component regressions verify normal unsubscription and the race where subscription setup
+  finishes after the owning component has already unmounted.

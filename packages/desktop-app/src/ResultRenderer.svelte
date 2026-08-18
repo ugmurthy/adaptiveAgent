@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import { renderResult, type RenderedResult } from './result-renderer';
 
   export let value: unknown;
@@ -6,6 +7,7 @@
   let error = '';
   let sourceVisible = false;
   let generation = 0;
+  onDestroy(() => { generation += 1; });
   $: source = rendered?.source ?? rawSource(value);
 
   $: void load(value);

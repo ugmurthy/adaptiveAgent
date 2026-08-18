@@ -95,6 +95,9 @@
   let historyQuery = '';
   let loadedArtifactsFilterKey = '';
   let artifactsGeneration = 0;
+  let traceGeneration = 0;
+  let disposed = false;
+  let stopInspectorResize = () => {};
   const refreshCoordinator = createRefreshCoordinator(refreshPass);
 
   $: railItems = buildRailItems(desktop.runs, chats);
@@ -111,14 +114,14 @@
     traceRoot = inspectionRoot;
     traceReport = undefined;
     traceError = '';
-    void selectTrace(traceRoot || undefined).catch((error) => { traceError = String(error); });
+    void loadTrace(traceRoot);
   }
 
   onMount(() => {
     let unlisten = () => {};
     let unsubscribeSelection = () => {};
     let unsubscribeInspector = () => {};
-    let cancelled = false;
+    disposed = false;
     const storedWidth = initialPresentation?.inspectorWidth ?? Number(localStorage.getItem('adaptiveAgent.inspectorWidth'));
     if (storedWidth >= 320 && storedWidth <= 720) inspectorWidth = storedWidth;
     const restoredSelection = normalizeWorkbenchSelection(initialPresentation?.selection);
@@ -128,8 +131,9 @@
     const timer = window.setInterval(() => { now = Date.now(); }, 100);
     void (async () => {
       unlisten = await subscribe(
-        (event) => { activityByRoot = addActivity(activityByRoot, event); },
+        (event) => { if (!disposed) activityByRoot = addActivity(activityByRoot, event); },
         (event) => {
+          if (disposed) return;
           const previous = resultsByRun[event.runId];
           resultsByRun = {
             ...resultsByRun,
@@ -146,6 +150,7 @@
           if (event.runId === selectedRunId) void loadRecoveryPlan(event.runId);
         },
         (state) => {
+          if (disposed) return;
           desktop = state;
           const run = state.runs.find((candidate) => candidate.runId === selectedRunId);
           if (run?.occupiesSlot) selectedRecoveryPlan = undefined;
@@ -153,15 +158,15 @@
           scheduleRefresh();
         },
         (event) => {
-          if (event.rootRunId !== traceRoot || privacyPending) return;
+          if (disposed || event.rootRunId !== traceRoot || privacyPending) return;
           traceReport = event.report;
           traceError = event.error ?? '';
         },
       );
-      if (cancelled) unlisten();
+      if (disposed) unlisten();
       else {
         await refresh();
-        if (cancelled) return;
+        if (disposed) return;
         unsubscribeSelection = workbenchSelection.subscribe(persistPresentation);
         unsubscribeInspector = inspectorOpen.subscribe(persistPresentation);
         try {
@@ -173,22 +178,26 @@
             $workbenchSelection = { kind: 'new-task' };
           }
         } catch (error) {
-          if (!cancelled) {
+          if (!disposed) {
             finalError = String(error);
             $workbenchSelection = { kind: 'new-task' };
           }
         }
         try {
           const nextPrivacy = await getTracePrivacy();
-          if (!cancelled) tracePrivacy = nextPrivacy;
+          if (!disposed) tracePrivacy = nextPrivacy;
         } catch (error) {
-          if (!cancelled) traceError = String(error);
+          if (!disposed) traceError = String(error);
         }
       }
-    })().catch((error) => { finalError = String(error); });
+    })().catch((error) => { if (!disposed) finalError = String(error); });
     return () => {
-      cancelled = true;
+      disposed = true;
+      artifactsGeneration += 1;
+      recoveryPlanGeneration += 1;
+      traceGeneration += 1;
       refreshCoordinator.dispose();
+      stopInspectorResize();
       window.clearInterval(timer);
       unsubscribeSelection();
       unsubscribeInspector();
@@ -197,6 +206,7 @@
   });
 
   function persistPresentation() {
+    if (disposed) return;
     void saveWindowPresentation({
       inspectorWidth,
       inspectorOpen: $inspectorOpen,
@@ -220,6 +230,7 @@
         listChats(),
         selectedChatId ? loadChat(selectedChatId) : Promise.resolve(undefined),
       ]);
+      if (disposed) return;
       desktop = nextDesktop;
       chats = nextChats;
       if (selectedChatId && selectedChat?.itemId === selectedChatId) selectedChat = nextChat;
@@ -229,7 +240,16 @@
         if ($workbenchSelection.kind === 'task') $workbenchSelection = { kind: 'new-task' };
       }
     } catch (error) {
-      finalError = String(error);
+      if (!disposed) finalError = String(error);
+    }
+  }
+
+  async function loadTrace(root: string) {
+    const generation = ++traceGeneration;
+    try {
+      await selectTrace(root || undefined);
+    } catch (error) {
+      if (!disposed && generation === traceGeneration && traceRoot === root) traceError = String(error);
     }
   }
 
@@ -293,15 +313,15 @@
         return historyResultArtifacts(result === null ? [] : [result], workspace)
           .map((artifact) => ({ ...artifact, runId: run.runId }));
       }));
-      if (generation !== artifactsGeneration) return;
+      if (disposed || generation !== artifactsGeneration) return;
       historyArtifacts = [...new Map(resolved.flat().map((artifact) => [`${artifact.runId}:${artifact.path}`, artifact])).values()];
     } catch (error) {
-      if (generation === artifactsGeneration) {
+      if (!disposed && generation === artifactsGeneration) {
         artifactsError = String(error);
         historyArtifacts = [];
       }
     } finally {
-      if (generation === artifactsGeneration) artifactsPending = false;
+      if (!disposed && generation === artifactsGeneration) artifactsPending = false;
     }
   }
 
@@ -559,9 +579,12 @@
   }
 
   function resizeInspector(event: PointerEvent) {
+    stopInspectorResize();
     const startX = event.clientX; const startWidth = inspectorWidth;
     const move = (next: PointerEvent) => { inspectorWidth = Math.max(320, Math.min(720, startWidth + startX - next.clientX)); };
-    const up = () => { localStorage.setItem('adaptiveAgent.inspectorWidth', String(inspectorWidth)); persistPresentation(); window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
+    const cleanup = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); stopInspectorResize = () => {}; };
+    const up = () => { localStorage.setItem('adaptiveAgent.inspectorWidth', String(inspectorWidth)); persistPresentation(); cleanup(); };
+    stopInspectorResize = cleanup;
     window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
   }
 </script>

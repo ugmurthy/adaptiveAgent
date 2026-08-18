@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import { type ArtifactPreview } from './desktop';
   import { desktopApi } from './desktop-context';
   import ResultRenderer from './ResultRenderer.svelte';
@@ -12,6 +13,8 @@
   let previewError = '';
   let loading = false;
   let generation = 0;
+
+  onDestroy(() => { generation += 1; });
 
   function baseName(path: string): string {
     return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
