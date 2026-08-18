@@ -57,3 +57,13 @@ represented as automated passes.
   components.
 - Mounted component regressions verify normal unsubscription and the race where subscription setup
   finishes after the owning component has already unmounted.
+
+## Hardening Phase 5
+
+- The complete automated gate and native macOS Tauri release build passed.
+- The `.app` contains arm64 host, agent-runtime, and trace-session executables, and Tauri produced
+  `AdaptiveAgent_0.1.0_aarch64.dmg`.
+- `HARDENING-RELEASE-CANDIDATE.md` records source and artifact hashes, automated coverage, signing
+  status, the exact native matrix, packaged-workflow gaps, and release blockers.
+- `RELEASE-CHECKLIST.md` defines atomic same-package cohort promotion and forward-only rollback;
+  it prohibits opening a forward-migrated database with an older package.

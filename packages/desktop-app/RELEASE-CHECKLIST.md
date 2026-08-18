@@ -45,42 +45,46 @@ Record the packaged build identifier and tester for each completed column.
 
 | Scenario | macOS | Windows | Linux |
 | --- | --- | --- | --- |
-| Agent avatar creates a native workspace window | [ ] | [ ] | [ ] |
-| Reopening an agent restores, focuses, and reuses its window | [ ] | [ ] | [ ] |
-| Window position remains visible after monitor removal | [ ] | [ ] | [ ] |
-| Closing a child preserves its active runs | [ ] | [ ] | [ ] |
-| Closing the parent follows the active-run quit flow | [ ] | [ ] | [ ] |
-| Quitting with closed child windows handles active runs | [ ] | [ ] | [ ] |
-| Three different agents execute concurrently | [ ] | [ ] | [ ] |
-| A fourth run is rejected only for the saturated agent | [ ] | [ ] | [ ] |
-| `ADAPTIVE_AGENT_MAX_WINDOWS` accepts a positive integer | [ ] | [ ] | [ ] |
-| Invalid window-limit values fall back to 3 with a diagnostic | [ ] | [ ] | [ ] |
-| Native JSON export dialog writes the exact profile | [ ] | [ ] | [ ] |
-| Archive disables new work but retains history and artifacts | [ ] | [ ] | [ ] |
-| Restore re-enables work without changing prior history | [ ] | [ ] | [ ] |
+| Agent window create, focus, restore, and reuse | [ ] | [ ] | [ ] |
+| Multi-monitor placement and scaling | [ ] | [ ] | [ ] |
+| Child close preserves active runs | [ ] | [ ] | [ ] |
+| Parent quit handles closed child windows with active runs | [ ] | [ ] | [ ] |
+| Three agents execute concurrently | [ ] | [ ] | [ ] |
+| Native profile export dialog | [ ] | [ ] | [ ] |
+| Large workspace remains responsive | [ ] | [ ] | [ ] |
+| Initialization failure remains attributable to one profile | [ ] | [ ] | [ ] |
+| Clean shutdown leaves no sidecars | [ ] | [ ] | [ ] |
 
 Also test moving a child between monitors with different scaling, minimizing it before
 reopening from the Studio, and closing/reopening it while another agent is running.
 
 ## Rollout and rollback
 
-Release cuts are the rollout boundary; do not mix partially compatible protocol or database
-versions within one packaged application. Promote in this order:
+The signed package SHA-256 is the rollout boundary; do not rebuild between cohorts or mix
+partially compatible renderer, host, protocol, sidecar, or database versions. Promote the exact
+same package in this order:
 
-1. Multi-agent catalog, persistence migration, and same-window internal validation.
-2. Agent-scoped runtimes and native specialist windows.
-3. Builder, export, archive, and restore.
-4. Full production rollout after the native matrix is complete.
+1. Internal testers using a copied application-data directory.
+2. A canary cohort after all package, migration, workflow, and native-matrix gates pass.
+3. Broad distribution after canary telemetry shows no identity, persistence, shutdown, or
+   renderer regression.
 
 Use the distribution channel's cohort or promotion control, not an application environment
 variable, to control rollout. The final application intentionally has no runtime feature flag
 that can expose a partially migrated schema: migrations are forward-only and the renderer,
 Rust host, and sidecar protocol ship as one unit. Halt further rollout by withdrawing the
-package. Withdrawal does not downgrade installations that already upgraded; forward-fix those
-installations. Downgrade only by restoring a verified pre-upgrade application-data backup
-together with the previous package.
+package. Stop promotion immediately for identity leakage, migration/data loss, unrecoverable
+pending work, orphaned sidecars, or a renderer-blocking failure. Preserve the affected application
+data and diagnostics before remediation. Withdrawal does not downgrade installations that already
+upgraded; forward-fix those installations as one new compatibility unit. Downgrade only by
+atomically restoring a verified pre-upgrade application-data backup together with the exact
+previous signed package. Never run the previous package against a forward-migrated database.
 
 Before broad rollout, retain a backup from the previous package and test upgrade against a
 copy containing pre-Agent-Studio history. Verify that provenance backfill identifies every
 historical run whose profile still exists and that unmatched active generations become
 interrupted without deleting results.
+
+For every cohort, record package SHA-256, signing/notarization verification, schema version,
+protocol version, cohort, start/end time, owner, gate results, and rollback-backup location. Keep
+the previous signed package and its matching backup until broad-rollout observation is complete.
