@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import BrandMark from './BrandMark.svelte';
-  import { aggregateRecentWork, agentsNeedingAttention, desktopTimestamp, filterAndSortAgents, isInspectable, parseAgentJson } from './agent-studio';
+  import { aggregateRecentWork, agentsNeedingAttention, filterAndSortAgents, isInspectable, parseAgentJson } from './agent-studio';
+  import { formatTimestamp } from './timestamp';
   import { archiveAgentConfig, exportAgentConfig, generateAgentDraft, getDesktopCatalogStatus, listenCatalogStatusChanged, openAgentWindow, quitCancel, quitTerminate, quitWait, readAgentConfig, restoreAgentConfig, saveAgentConfig, validateAgentConfig, type AgentConfigPreview, type DesktopCatalogAgent, type DesktopCatalogStatus } from './desktop';
 
   let catalog: DesktopCatalogStatus | undefined;
@@ -163,7 +164,7 @@
     finally { builderBusy = false; }
   }
   const diagnosticText = (value: Record<string, unknown>) => typeof value.message === 'string' ? value.message : JSON.stringify(value);
-  const date = (value: string) => new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(desktopTimestamp(value)));
+  const date = (value: string) => formatTimestamp(value);
 
   onMount(() => {
     let unlisten = () => {};

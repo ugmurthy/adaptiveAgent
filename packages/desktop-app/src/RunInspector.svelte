@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { DesktopState, TracePrivacy, TraceReport } from './desktop';
   import ResultRenderer from './ResultRenderer.svelte';
+  import { formatTimestamp } from './timestamp';
   export let desktop: DesktopState;
   export let root = '';
   export let report: TraceReport | undefined;
@@ -46,9 +47,7 @@
   }
 
   function formatDate(value?: string | null): string {
-    if (!value) return 'Not recorded';
-    const date = new Date(value);
-    return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+    return formatTimestamp(value);
   }
 </script>
 

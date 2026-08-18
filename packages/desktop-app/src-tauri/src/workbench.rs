@@ -1606,9 +1606,9 @@ mod tests {
 
     #[test]
     fn migration_backfills_run_agent_ownership_and_resolved_config_path() {
-        let file = tempfile::NamedTempFile::new().unwrap();
+        let source = tempfile::NamedTempFile::new().unwrap();
         {
-            let connection = Connection::open(file.path()).unwrap();
+            let connection = Connection::open(source.path()).unwrap();
             connection.execute_batch("create table desktop_migrations(version integer primary key, applied_at text not null);").unwrap();
             for (version, sql) in MIGRATIONS.iter().filter(|(version, _)| *version < 10) {
                 connection.execute_batch(sql).unwrap();
@@ -1620,7 +1620,9 @@ mod tests {
             connection.execute("insert into workbench_runs(run_id,item_id,invocation_kind,cached_status,submission_state,created_at,updated_at) values('legacy-run','legacy-item','run','succeeded','terminal','100','100')", []).unwrap();
         }
 
-        let db = WorkbenchDb::open(file.path()).unwrap();
+        let migrated = tempfile::NamedTempFile::new().unwrap();
+        std::fs::copy(source.path(), migrated.path()).unwrap();
+        let db = WorkbenchDb::open(migrated.path()).unwrap();
         let legacy = &db.load_runs().unwrap()[0];
         assert_eq!(legacy.agent_id, "legacy-agent");
         assert_eq!(legacy.agent_fingerprint, "legacy-fingerprint");
@@ -1635,6 +1637,14 @@ mod tests {
         assert_eq!(
             db.load_runs().unwrap()[0].agent_config_path.as_deref(),
             Some("/agents/legacy-agent.json")
+        );
+        let source_connection = Connection::open(source.path()).unwrap();
+        assert_eq!(
+            source_connection
+                .query_row("select max(version) from desktop_migrations", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            9
         );
     }
 

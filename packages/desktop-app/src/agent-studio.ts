@@ -1,11 +1,7 @@
 import type { DesktopCatalogAgent, DesktopRecentWork } from './desktop';
+import { compareTimestamps } from './timestamp';
 
 const attentionRank: Record<string, number> = { error: 0, approval: 1, recovery: 2, none: 3 };
-
-export function desktopTimestamp(value: string): number {
-  const epochMilliseconds = Number(value);
-  return value.trim() !== '' && Number.isFinite(epochMilliseconds) ? epochMilliseconds : Date.parse(value);
-}
 
 export function isLaunchable(agent: DesktopCatalogAgent): boolean {
   return !agent.archived && agent.validationState === 'valid';
@@ -24,7 +20,7 @@ export function filterAndSortAgents(agents: DesktopCatalogAgent[], query: string
 export interface FleetRecentWork extends DesktopRecentWork { agentId: string; agentName: string }
 export function aggregateRecentWork(agents: DesktopCatalogAgent[], limit = 8): FleetRecentWork[] {
   return agents.flatMap((agent) => agent.recentWork.map((work) => ({ ...work, agentId: agent.id, agentName: agent.name })))
-    .sort((a, b) => desktopTimestamp(b.createdAt) - desktopTimestamp(a.createdAt) || b.runId.localeCompare(a.runId)).slice(0, limit);
+    .sort((a, b) => compareTimestamps(b.createdAt, a.createdAt) || b.runId.localeCompare(a.runId)).slice(0, limit);
 }
 
 export function agentsNeedingAttention(agents: DesktopCatalogAgent[]): DesktopCatalogAgent[] {
@@ -44,8 +40,34 @@ export function parseAgentJson(text: string): Record<string, unknown> {
       const column = smartQuote - before.lastIndexOf('\n');
       throw new Error(`Invalid JSON at line ${line}, column ${column}: typographic quote ${text[smartQuote]} cannot delimit a JSON string. Replace it with a plain double quote (").`);
     }
+    if (cause instanceof Error) {
+      const location = jsonErrorLocation(text, cause.message) ?? inferredJsonErrorLocation(text);
+      throw new Error(`Invalid JSON at line ${location.line}, column ${location.column}: ${cause.message}`);
+    }
     throw cause;
   }
+}
+
+function inferredJsonErrorLocation(text: string): { line: number; column: number } {
+  const trailingComma = /,\s*([}\]])/g;
+  let match: RegExpExecArray | null;
+  let position = text.length;
+  while ((match = trailingComma.exec(text))) position = match.index + match[0].lastIndexOf(match[1]);
+  const before = text.slice(0, position);
+  return { line: before.split('\n').length, column: position - before.lastIndexOf('\n') };
+}
+
+function jsonErrorLocation(text: string, message: string): { line: number; column: number } | undefined {
+  const explicit = message.match(/line\s+(\d+)(?:\s*,?\s*column\s+(\d+))/i);
+  if (explicit) return { line: Number(explicit[1]), column: Number(explicit[2]) };
+  const positioned = message.match(/position\s+(\d+)/i);
+  if (!positioned) return undefined;
+  const position = Math.min(Number(positioned[1]), text.length);
+  const before = text.slice(0, position);
+  return {
+    line: before.split('\n').length,
+    column: position - before.lastIndexOf('\n'),
+  };
 }
 
 function findSmartJsonQuote(text: string): number | undefined {

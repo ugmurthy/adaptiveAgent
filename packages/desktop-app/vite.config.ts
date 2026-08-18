@@ -3,6 +3,7 @@ import { defineConfig } from 'vite';
 
 export default defineConfig({
   plugins: [svelte()],
+  resolve: { conditions: ['browser'] },
   clearScreen: false,
   server: { host: '127.0.0.1', port: 1420, strictPort: true },
   // Mermaid lazily loads some uncommon diagram renderers as standalone chunks. The

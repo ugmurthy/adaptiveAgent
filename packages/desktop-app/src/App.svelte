@@ -285,12 +285,16 @@
     try {
       const itemIds = new Set(items.map((item) => item.id));
       const runs = desktop.runs.filter((run) => itemIds.has(run.itemId) && !run.occupiesSlot);
-      const [workspace, results] = await Promise.all([
-        listWorkspaceArtifacts(),
-        Promise.all(runs.map((run) => getRunResult(run.runId))),
-      ]);
+      const resolved = await Promise.all(runs.map(async (run) => {
+        const [workspace, result] = await Promise.all([
+          listWorkspaceArtifacts(run.runId),
+          getRunResult(run.runId),
+        ]);
+        return historyResultArtifacts(result === null ? [] : [result], workspace)
+          .map((artifact) => ({ ...artifact, runId: run.runId }));
+      }));
       if (generation !== artifactsGeneration) return;
-      historyArtifacts = historyResultArtifacts(results.filter((result) => result !== null), workspace);
+      historyArtifacts = [...new Map(resolved.flat().map((artifact) => [`${artifact.runId}:${artifact.path}`, artifact])).values()];
     } catch (error) {
       if (generation === artifactsGeneration) {
         artifactsError = String(error);

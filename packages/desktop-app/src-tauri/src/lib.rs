@@ -5493,8 +5493,22 @@ const MAX_ARTIFACT_DEPTH: usize = 16;
 const MAX_ARTIFACT_RESULTS: usize = 2_000;
 const ARTIFACT_SCAN_TIMEOUT: Duration = Duration::from_secs(2);
 
-fn workspace_paths(state: &AppState, agent_id: &str) -> Result<(PathBuf, PathBuf), String> {
+fn workspace_paths(
+    state: &AppState,
+    agent_id: &str,
+    run_id: Option<&str>,
+) -> Result<(PathBuf, PathBuf), String> {
     let bridge = bridge_for(state, agent_id, true)?;
+    if let Some(run_id) = run_id {
+        let run = bridge.workbench.load_run_for_agent(agent_id, run_id)?;
+        let root = run.workspace_root.map(PathBuf::from).ok_or(
+            "This run predates durable workspace provenance; its artifacts cannot be resolved safely.",
+        )?;
+        let shell_cwd = run.shell_cwd.map(PathBuf::from).ok_or(
+            "This run predates durable shell provenance; its artifacts cannot be resolved safely.",
+        )?;
+        return Ok((root, shell_cwd));
+    }
     let configuration = bridge.configuration.lock().unwrap();
     let root = configuration
         .as_ref()
@@ -5595,9 +5609,10 @@ fn resolve_artifact_path(
 #[tauri::command]
 async fn list_workspace_artifacts(
     agent_id: String,
+    run_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<WorkspaceArtifact>, String> {
-    let (root, _) = workspace_paths(&state, &agent_id)?;
+    let (root, _) = workspace_paths(&state, &agent_id, run_id.as_deref())?;
     tauri::async_runtime::spawn_blocking(move || {
         let root = root
             .canonicalize()
@@ -5612,9 +5627,10 @@ async fn list_workspace_artifacts(
 async fn read_artifact(
     agent_id: String,
     path: String,
+    run_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<ArtifactPreview, String> {
-    let (root, shell_cwd) = workspace_paths(&state, &agent_id)?;
+    let (root, shell_cwd) = workspace_paths(&state, &agent_id, run_id.as_deref())?;
     tauri::async_runtime::spawn_blocking(move || {
         let path = resolve_artifact_path(&root, &shell_cwd, &path)?;
         artifact_preview(&path)
@@ -7187,6 +7203,39 @@ mod tests {
             outside.path().to_str().unwrap()
         )
         .is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path(), nested.join("escaped.json")).unwrap();
+            assert!(resolve_artifact_path(
+                workspace.path(),
+                workspace.path(),
+                "output/escaped.json"
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn historical_artifact_resolution_uses_its_persisted_workspace() {
+        let historical = tempfile::tempdir().unwrap();
+        let current = tempfile::tempdir().unwrap();
+        std::fs::write(historical.path().join("result.json"), "{\"version\":1}").unwrap();
+        std::fs::write(current.path().join("result.json"), "{\"version\":2}").unwrap();
+
+        let resolved =
+            resolve_artifact_path(historical.path(), historical.path(), "result.json").unwrap();
+        assert_eq!(
+            resolved,
+            historical
+                .path()
+                .join("result.json")
+                .canonicalize()
+                .unwrap()
+        );
+        assert_eq!(
+            artifact_preview(&resolved).unwrap().content,
+            "{\"version\":1}"
+        );
     }
 
     #[test]

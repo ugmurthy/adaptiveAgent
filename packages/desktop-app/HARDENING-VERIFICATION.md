@@ -29,3 +29,20 @@ results, and a two-second deadline. It does not follow directory symlinks or sca
 
 These GUI gaps remain release blockers for the Hardening Phase 5 native matrix; they are not
 represented as automated passes.
+
+## Hardening Phase 3
+
+- `timestamp.ts` is the single normalization and display contract for ISO strings, numbers,
+  epoch-millisecond strings, blanks, and invalid values.
+- Agent Studio, workbench history, and run inspector use that contract. Mounted Svelte tests cover
+  blank and malformed persisted values.
+- Artifact list and preview requests may carry a run ID. Native resolution then uses that run's
+  persisted `workspace_root` and `shell_cwd`, canonicalizes paths, rejects escapes and ambiguous
+  basenames, and never substitutes the current agent workspace.
+- Durable run results remain the primary artifact source when trace data is empty or unavailable;
+  trace results are additive and resolved only against files actually discovered in the run's
+  workspace.
+- General JSON syntax failures include line and column diagnostics; typographic delimiter guidance
+  remains targeted, while smart punctuation inside valid strings remains accepted.
+- Forward migration tests copy the pre-upgrade database before opening it and verify the source
+  fixture remains at its original migration version.

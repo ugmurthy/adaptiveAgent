@@ -7,7 +7,7 @@ export function resolveComposerMode(mode: ComposerMode, prompt: string): 'task' 
   return /^(chat:|discuss:|talk about\b)/i.test(prompt.trim()) ? 'chat' : 'task';
 }
 
-export interface ResultArtifact { path: string; detail?: string }
+export interface ResultArtifact { path: string; detail?: string; runId?: string }
 
 export function resultDisplayContent(value: unknown): unknown {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return value;

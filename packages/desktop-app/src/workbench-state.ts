@@ -1,5 +1,6 @@
 import { writable } from 'svelte/store';
 import type { Chat, RunSummary } from './desktop';
+import { compareTimestamps } from './timestamp';
 
 export type WorkbenchSelection =
   | { kind: 'new-task' }
@@ -72,7 +73,7 @@ export function buildRailItems(runs: RunSummary[], chats: Chat[]): RailItem[] {
   const groupOrder: Record<RailGroup, number> = { Active: 0, 'Needs input': 1, History: 2 };
   return items.sort((left, right) =>
     groupOrder[left.group] - groupOrder[right.group]
-    || (left.group === 'History' ? Number(right.createdAt) - Number(left.createdAt) : left.title.localeCompare(right.title))
+    || (left.group === 'History' ? compareTimestamps(right.createdAt, left.createdAt) : left.title.localeCompare(right.title))
     || left.title.localeCompare(right.title),
   );
 }

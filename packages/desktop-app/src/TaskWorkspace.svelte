@@ -103,7 +103,7 @@
     artifactError = '';
     try {
       const [workspaceArtifacts, overview] = await Promise.all([
-        listWorkspaceArtifacts(),
+        listWorkspaceArtifacts(requestedRunId),
         getRunOverview(requestedRunId).catch(() => undefined),
       ]);
       const loaded = historyResultArtifacts([
@@ -147,7 +147,7 @@
     <div class="completed-report">
       {#if reportTab==='result'}<ResultRenderer value={displayedResult}/>
       {:else if artifactError}<div class="alert">{artifactError}</div>
-      {:else if resolvedArtifacts.length}<ArtifactList artifacts={resolvedArtifacts}/>{:else}<div class="empty-state"><strong>No structured artifacts</strong><p>The result did not include recognizable files or an artifacts/files array.</p></div>{/if}
+      {:else if resolvedArtifacts.length}<ArtifactList artifacts={resolvedArtifacts} runId={selectedRun.runId}/>{:else}<div class="empty-state"><strong>No structured artifacts</strong><p>The result did not include recognizable files or an artifacts/files array.</p></div>{/if}
     </div>
   {:else}<ActivityNarrative events={activity} {now}/>{/if}
   {#if !activity.length && result === undefined && !error}<div class="empty-state"><strong>{selectedRun.occupiesSlot?'Working…':'No result available'}</strong><p>Live activity and the final result appear here.</p></div>{/if}

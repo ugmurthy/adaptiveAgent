@@ -1,6 +1,7 @@
 <script lang="ts">
   import BrandMark from './BrandMark.svelte';
   import { filterRailItems, type RailGroup, type RailItem, type WorkbenchSelection } from './workbench-state';
+  import { formatTimestamp } from './timestamp';
 
   export let items: RailItem[] = [];
   export let selection: WorkbenchSelection;
@@ -21,10 +22,7 @@
   }
 
   function historyDate(item: RailItem): string {
-    const date = new Date(Number(item.createdAt));
-    return Number.isNaN(date.valueOf())
-      ? 'Earlier'
-      : new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(date);
+    return formatTimestamp(item.createdAt, { dateStyle: 'medium' }, 'Earlier');
   }
 </script>
 

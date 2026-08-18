@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "test": "bun test ./src/activity.bun.ts ./src/result-renderer.bun.ts ./src/workbench-state.bun.ts ./src/workbench-ux.bun.ts ./src/agent-studio.bun.ts ./src/refresh-coordinator.bun.ts",
+    "test": "bunx vitest run ./src/timestamp-components.test.ts && bun test ./src/activity.bun.ts ./src/result-renderer.bun.ts ./src/workbench-state.bun.ts ./src/workbench-ux.bun.ts ./src/agent-studio.bun.ts ./src/refresh-coordinator.bun.ts ./src/timestamp.bun.ts",
     "web:build": "vite build",
     "sidecar:prepare": "bun run scripts/prepare-sidecar.ts",
     "tauri:dev": "bun run sidecar:prepare && tauri dev",
@@ -31,6 +31,7 @@
     "jsdom": "^26.1.0",
     "svelte-check": "^4.2.2",
     "typescript": "^5.8.3",
-    "vite": "^7.0.2"
+    "vite": "^7.0.2",
+    "vitest": "^3.1.1"
   }
 }

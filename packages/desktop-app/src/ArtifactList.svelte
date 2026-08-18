@@ -5,7 +5,8 @@
 
   const { readArtifact } = desktopApi();
 
-  export let artifacts: Array<{ path: string; detail?: string }> = [];
+  export let artifacts: Array<{ path: string; detail?: string; runId?: string }> = [];
+  export let runId: string | undefined = undefined;
   let preview: ArtifactPreview | undefined;
   let previewPath = '';
   let previewError = '';
@@ -16,14 +17,14 @@
     return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
   }
 
-  async function show(path: string) {
+  async function show(path: string, artifactRunId?: string) {
     const current = ++generation;
     previewPath = path;
     preview = undefined;
     previewError = '';
     loading = true;
     try {
-      const loaded = await readArtifact(path);
+      const loaded = await readArtifact(path, artifactRunId ?? runId);
       if (current === generation) preview = loaded;
     } catch (error) {
       if (current === generation) previewError = String(error);
@@ -49,8 +50,8 @@
 <svelte:window on:keydown={(event) => { if (event.key === 'Escape' && previewPath) close(); }} />
 
 <div class="artifact-list">
-  {#each artifacts as artifact (artifact.path)}
-    <button class="artifact-file" title={artifact.path} on:click={() => show(artifact.path)}>{baseName(artifact.path)}</button>
+  {#each artifacts as artifact (`${artifact.runId ?? runId ?? ''}:${artifact.path}`)}
+    <button class="artifact-file" title={artifact.path} on:click={() => show(artifact.path, artifact.runId)}>{baseName(artifact.path)}</button>
   {/each}
 </div>
 

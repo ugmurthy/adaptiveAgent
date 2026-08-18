@@ -176,7 +176,7 @@ export interface DesktopApi {
   getRunResult(runId:string):Promise<unknown|null>; getRunOverview(runId:string):Promise<TraceReport>; resolveApproval(pending:PendingApproval,approved:boolean):Promise<void>;
   createChat(title:string):Promise<Chat>; listChats():Promise<Chat[]>; loadChat(itemId:string):Promise<Chat>; sendChatTurn(itemId:string,content:string,attachmentIds?:string[]):Promise<StartedRun>;
   previewHistoryDeletion(target:ProductDeletionTarget):Promise<DeletionPreview>; deleteHistory(target:ProductDeletionTarget):Promise<void>;
-  listWorkspaceArtifacts():Promise<WorkspaceArtifact[]>; readArtifact(path:string):Promise<ArtifactPreview>; selectTrace(rootRunId?:string):Promise<number>;
+  listWorkspaceArtifacts(runId?:string):Promise<WorkspaceArtifact[]>; readArtifact(path:string,runId?:string):Promise<ArtifactPreview>; selectTrace(rootRunId?:string):Promise<number>;
   getTracePrivacy():Promise<TracePrivacy>; setTracePrivacy(privacy:TracePrivacy):Promise<TracePrivacy>;
   subscribe(activity:(event:AgentActivityEvent)=>void,finished:(event:RunFinishedEvent)=>void,state:(event:DesktopState)=>void,trace:(event:TraceEvent)=>void):Promise<UnlistenFn>;
 }
@@ -205,7 +205,7 @@ export function createDesktopApi(agentId:string):DesktopApi {
     recoverRun:(plan)=>invoke('recover_run',args({runId:plan.runId,expectedStatus:plan.status,expectedAction:plan.action})), steerRun:(runId,message)=>invoke('steer_run',args({runId,message})),
     getRunResult:(runId)=>invoke('get_run_result',args({runId})), getRunOverview:(runId)=>invoke('get_run_overview',args({runId})), resolveApproval:(pending,approved)=>invoke('resolve_approval',args({rootRunId:pending.rootRunId,approvalRunId:pending.approvalRunId,approvalId:pending.approvalId,approved})),
     createChat:(title)=>invoke('create_chat',args({title})), listChats:()=>invoke('list_chats',args()), loadChat:(itemId)=>invoke('load_chat',args({itemId})), sendChatTurn:(itemId,content,attachmentIds=[])=>invoke('send_chat_turn',args({itemId,content,attachmentIds})),
-    previewHistoryDeletion:(target)=>invoke('preview_history_deletion',args({target})), deleteHistory:(target)=>invoke('delete_history',args({target})), listWorkspaceArtifacts:()=>invoke('list_workspace_artifacts',args()), readArtifact:(path)=>invoke('read_artifact',args({path})),
+    previewHistoryDeletion:(target)=>invoke('preview_history_deletion',args({target})), deleteHistory:(target)=>invoke('delete_history',args({target})), listWorkspaceArtifacts:(runId)=>invoke('list_workspace_artifacts',args({runId})), readArtifact:(path,runId)=>invoke('read_artifact',args({path,runId})),
     selectTrace:(rootRunId)=>invoke('select_trace',args({rootRunId})), getTracePrivacy:()=>invoke('get_trace_privacy',args()), setTracePrivacy:(privacy)=>invoke('set_trace_privacy',args({privacy})),
     subscribe:async(activity,finished,state,trace)=>{ const registrations=await Promise.allSettled([
       listen<AgentActivityEvent>('adaptive-agent://activity',({payload})=>{if(payload.agentId===agentId)activity(payload)}),
@@ -238,8 +238,8 @@ export const loadChat=(id:string)=>currentApi().then(api=>api.loadChat(id));
 export const sendChatTurn=(id:string,content:string,ids:string[]=[])=>currentApi().then(api=>api.sendChatTurn(id,content,ids));
 export const previewHistoryDeletion=(target:ProductDeletionTarget)=>currentApi().then(api=>api.previewHistoryDeletion(target));
 export const deleteHistory=(target:ProductDeletionTarget)=>currentApi().then(api=>api.deleteHistory(target));
-export const listWorkspaceArtifacts=()=>currentApi().then(api=>api.listWorkspaceArtifacts());
-export const readArtifact=(path:string)=>currentApi().then(api=>api.readArtifact(path));
+export const listWorkspaceArtifacts=(runId?:string)=>currentApi().then(api=>api.listWorkspaceArtifacts(runId));
+export const readArtifact=(path:string,runId?:string)=>currentApi().then(api=>api.readArtifact(path,runId));
 export const selectTrace=(id?:string)=>currentApi().then(api=>api.selectTrace(id));
 export const getTracePrivacy=()=>currentApi().then(api=>api.getTracePrivacy());
 export const setTracePrivacy=(privacy:TracePrivacy)=>currentApi().then(api=>api.setTracePrivacy(privacy));
