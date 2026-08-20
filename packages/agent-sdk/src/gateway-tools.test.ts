@@ -19,6 +19,7 @@ import {
   createGatewayProxyTool,
   inspectAgentSdkResolution,
 } from './index.js';
+import { testEnvironment } from './test-environment.js';
 
 describe('gateway proxy tools', () => {
   it('preserves local schemas while forwarding protected permit and tool idempotency', async () => {
@@ -167,7 +168,7 @@ describe('Agent SDK gateway tool wiring', () => {
     };
     const inspection = await inspectAgentSdkResolution({
       cwd: process.cwd(),
-      env: {},
+      env: testEnvironment(),
       inferenceMode: 'gateway',
       gateway: { remoteTools: ['web_search'] },
       gatewayClient: {} as GatewayClient,
@@ -253,7 +254,7 @@ describe('Agent SDK gateway tool wiring', () => {
     const toolExecutionStore = new InMemoryToolExecutionStore();
     const sdk = await createAgentSdk({
       cwd: process.cwd(),
-      env: {},
+      env: testEnvironment(),
       runtimeMode: 'memory',
       inferenceMode: 'gateway',
       gateway: { remoteTools: ['web_search'] },

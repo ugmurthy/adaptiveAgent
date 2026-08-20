@@ -14,6 +14,7 @@ import {
   resolveProfileNamespace,
   resolveServerProfile,
 } from './server-profiles.js';
+import { testEnvironment } from './test-environment.js';
 
 const directories: string[] = [];
 
@@ -100,7 +101,7 @@ describe('server profile resolution', () => {
       gatewayClient,
       profileCachePath: await temporaryDirectory(),
       runtimeMode: 'memory',
-      env: {},
+      env: testEnvironment(),
     });
 
     try {

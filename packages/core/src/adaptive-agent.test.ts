@@ -1,8 +1,7 @@
 import { PassThrough } from 'node:stream';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
 
 import pino from 'pino';
 import { describe, expect, it, vi } from 'vitest';
@@ -15,6 +14,7 @@ import { InMemoryPlanStore } from './in-memory-plan-store.js';
 import { InMemoryRunStore } from './in-memory-run-store.js';
 import { InMemorySnapshotStore } from './in-memory-snapshot-store.js';
 import { InMemoryToolExecutionStore } from './in-memory-tool-execution-store.js';
+import { createCanonicalTempDirectory } from './test-utils.js';
 import { createReadFileTool } from './tools/read-file.js';
 import { createWriteFileTool } from './tools/write-file.js';
 import type { AgentEvent, ModelAdapter, ModelRequest, ModelResponse, RuntimeStores, ToolDefinition } from './types.js';
@@ -190,9 +190,9 @@ describe('AdaptiveAgent', () => {
   });
 
   it('authorizes path-backed inputs only within canonical execution file roots', async () => {
-    const workspaceRoot = await mkdtemp(join(tmpdir(), 'agent-workspace-'));
-    const attachmentRoot = await mkdtemp(join(tmpdir(), 'agent-attachment-'));
-    const outsideRoot = await mkdtemp(join(tmpdir(), 'agent-outside-'));
+    const workspaceRoot = await createCanonicalTempDirectory('agent-workspace-');
+    const attachmentRoot = await createCanonicalTempDirectory('agent-attachment-');
+    const outsideRoot = await createCanonicalTempDirectory('agent-outside-');
     try {
       const attachedPath = join(attachmentRoot, 'notes.txt');
       const outsidePath = join(outsideRoot, 'secret.txt');
@@ -604,7 +604,7 @@ describe('AdaptiveAgent', () => {
   });
 
   it('rewrites file content parts to read_file instructions when native file input is unavailable', async () => {
-    const tempDir = await mkdtemp(join(tmpdir(), 'agent-file-policy-'));
+    const tempDir = await createCanonicalTempDirectory('agent-file-policy-');
     try {
       const filePath = join(tempDir, 'brief.docx');
       await writeFile(filePath, 'placeholder');
@@ -1467,7 +1467,7 @@ describe('AdaptiveAgent', () => {
   });
 
   it('retries a read_file not_found failure after the file is created', async () => {
-    const tempDir = await mkdtemp(join(tmpdir(), 'adaptive-agent-read-retry-'));
+    const tempDir = await createCanonicalTempDirectory('adaptive-agent-read-retry-');
     try {
       const runStore = new InMemoryRunStore();
       const eventStore = new InMemoryEventStore();
@@ -2796,7 +2796,7 @@ describe('AdaptiveAgent', () => {
   });
 
   it('repairs malformed normal tool input before executing write_file', async () => {
-    const tempDir = await mkdtemp(join(tmpdir(), 'adaptive-agent-write-repair-'));
+    const tempDir = await createCanonicalTempDirectory('adaptive-agent-write-repair-');
     try {
       const runStore = new InMemoryRunStore();
       const eventStore = new InMemoryEventStore();
@@ -2879,7 +2879,7 @@ describe('AdaptiveAgent', () => {
     ['md', 'article.md'],
     ['txt', 'article.txt'],
   ])('accepts write_file outputFormat %s without invalid tool-call repair', async (outputFormat, path) => {
-    const tempDir = await mkdtemp(join(tmpdir(), 'adaptive-agent-write-text-'));
+    const tempDir = await createCanonicalTempDirectory('adaptive-agent-write-text-');
     try {
       const runStore = new InMemoryRunStore();
       const eventStore = new InMemoryEventStore();

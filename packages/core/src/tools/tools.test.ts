@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-import { mkdtemp, writeFile, mkdir, rm, readFile, stat, symlink } from 'node:fs/promises';
+import { writeFile, mkdir, rm, readFile, stat, symlink } from 'node:fs/promises';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
 import JSZip from 'jszip';
 
 import type { ToolContext } from '../types.js';
+import { createCanonicalTempDirectory } from '../test-utils.js';
 import { createReadFileTool } from './read-file.js';
 import { createListDirectoryTool } from './list-directory.js';
 import { createWriteFileTool } from './write-file.js';
@@ -41,7 +41,7 @@ describe('createReadFileTool', () => {
   let tempDir: string;
 
   beforeEach(async () => {
-    tempDir = await mkdtemp(join(tmpdir(), 'read-file-test-'));
+    tempDir = await createCanonicalTempDirectory('read-file-test-');
     await writeFile(join(tempDir, 'hello.txt'), 'Hello world');
   });
 
@@ -67,7 +67,7 @@ describe('createReadFileTool', () => {
   });
 
   it('reads workspace-relative and execution-scoped absolute attachment paths', async () => {
-    const attachmentRoot = await mkdtemp(join(tmpdir(), 'read-file-attachment-'));
+    const attachmentRoot = await createCanonicalTempDirectory('read-file-attachment-');
     await writeFile(join(attachmentRoot, 'owned.txt'), 'owned attachment');
     const tool = createReadFileTool({
       allowedRoots: (context) => [tempDir, ...context.executionContext!.fileAccess!.attachmentRoots],
@@ -95,7 +95,7 @@ describe('createReadFileTool', () => {
   });
 
   it('rejects symlink escapes and roots belonging to another execution', async () => {
-    const otherRoot = await mkdtemp(join(tmpdir(), 'read-file-other-'));
+    const otherRoot = await createCanonicalTempDirectory('read-file-other-');
     await writeFile(join(otherRoot, 'secret.txt'), 'secret');
     await symlink(join(otherRoot, 'secret.txt'), join(tempDir, 'escape.txt'));
     const tool = createReadFileTool({ allowedRoots: [tempDir] });
@@ -411,7 +411,7 @@ describe('createListDirectoryTool', () => {
   let tempDir: string;
 
   beforeEach(async () => {
-    tempDir = await mkdtemp(join(tmpdir(), 'list-dir-test-'));
+    tempDir = await createCanonicalTempDirectory('list-dir-test-');
     await writeFile(join(tempDir, 'file-a.txt'), 'A');
     await writeFile(join(tempDir, 'file-b.md'), 'B');
     await mkdir(join(tempDir, 'subdir'));
@@ -495,7 +495,7 @@ describe('createWriteFileTool', () => {
   let tempDir: string;
 
   beforeEach(async () => {
-    tempDir = await mkdtemp(join(tmpdir(), 'write-file-test-'));
+    tempDir = await createCanonicalTempDirectory('write-file-test-');
   });
 
   afterEach(async () => {

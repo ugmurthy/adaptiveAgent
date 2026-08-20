@@ -9,6 +9,7 @@ import {
   type ResolvedAgentSdkConfig,
 } from './index.js';
 import { runSwarmDecomposition } from './swarm-runner.js';
+import { testEnvironment } from './test-environment.js';
 
 const openSdks: AgentSdk[] = [];
 
@@ -52,7 +53,7 @@ describe('SwarmSdk', () => {
 
   it('classifies persisted decomposition and active execution without owning the caller SDK', async () => {
     const runtime = createAdaptiveAgentRuntime();
-    const coordinator = await AgentSdk.create({ agentConfig: agentConfig('coordinator'), runtime });
+    const coordinator = await AgentSdk.create({ agentConfig: agentConfig('coordinator'), runtime, env: testEnvironment() });
     openSdks.push(coordinator);
     const runStore = coordinator.created.runtime.runStore;
     const lifecycle: string[] = [];

@@ -18,7 +18,10 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{
+    webview::PageLoadEvent, AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow,
+    WebviewWindowBuilder,
+};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent},
@@ -4975,7 +4978,15 @@ fn open_agent_window_blocking(agent_id: String, app: AppHandle) -> Result<AgentW
         )
         .min_inner_size(680.0, 600.0)
         .resizable(true)
-        .visible(false);
+        .visible(false)
+        .on_page_load(|window, payload| {
+            if payload.event() != PageLoadEvent::Finished {
+                return;
+            }
+            if let Err(error) = window.show().and_then(|_| window.set_focus()) {
+                eprintln!("Unable to reveal loaded agent window: {error}");
+            }
+        });
     let window = builder
         .build()
         .map_err(|error| format!("Unable to create agent window: {error}"))?;
@@ -4985,12 +4996,6 @@ fn open_agent_window_blocking(agent_id: String, app: AppHandle) -> Result<AgentW
             .map_err(|error| format!("Unable to restore agent window position: {error}"))?;
     }
     ensure_agent_window_visible(&window)?;
-    window
-        .show()
-        .map_err(|error| format!("Unable to show agent window: {error}"))?;
-    window
-        .set_focus()
-        .map_err(|error| format!("Unable to focus agent window: {error}"))?;
     Ok(AgentWindowOpen {
         agent_id,
         disposition: "created",

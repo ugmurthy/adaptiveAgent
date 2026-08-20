@@ -16,6 +16,7 @@ import {
 
 import { main as runCli } from './adaptive-agent.js';
 import { AgentSettingsValidationError, createAgentSdk, inspectAgentSdkResolution, loadAgentSdkConfig } from './index.js';
+import { testEnvironment } from './test-environment.js';
 
 const bunIt = typeof Bun === 'undefined' ? it.skip : it;
 
@@ -33,7 +34,7 @@ describe('agent-sdk config resolution', () => {
   it('loads agent.json and falls back from default postgres to memory without DATABASE_URL', async () => {
     await writeAgentConfig(join(tempDir, 'agent.json'));
 
-    const config = await loadAgentSdkConfig({ cwd: tempDir, env: { ADAPTIVE_AGENT_HOME: join(tempDir, 'home') } });
+    const config = await loadAgentSdkConfig({ cwd: tempDir, env: testEnvironment({ ADAPTIVE_AGENT_HOME: join(tempDir, 'home') }) });
 
     expect(config.runtime.requestedMode).toBe('postgres');
     expect(config.runtime.mode).toBe('memory');
@@ -49,7 +50,7 @@ describe('agent-sdk config resolution', () => {
     await writeAgentConfig(join(tempDir, 'catalog', 'researcher.json'), 'researcher');
     await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({ agents: { dirs: ['./catalog'] } }));
 
-    const config = await loadAgentSdkConfig({ cwd: tempDir, agentConfigPath: 'researcher', env: {} });
+    const config = await loadAgentSdkConfig({ cwd: tempDir, agentConfigPath: 'researcher', env: testEnvironment() });
 
     expect(config.agent.id).toBe('researcher');
     expect(config.agents.dirs).toEqual([join(tempDir, 'catalog')]);
@@ -60,7 +61,7 @@ describe('agent-sdk config resolution', () => {
     await writeAgentConfig(join(tempDir, 'catalog', 'gaia2-improved.json'), 'gaia-agent-improved');
     await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({ agents: { dirs: ['./catalog'] } }));
 
-    const config = await loadAgentSdkConfig({ cwd: tempDir, agentConfigPath: 'gaia-agent-improved', env: {} });
+    const config = await loadAgentSdkConfig({ cwd: tempDir, agentConfigPath: 'gaia-agent-improved', env: testEnvironment() });
 
     expect(config.agent.id).toBe('gaia-agent-improved');
   });
@@ -72,7 +73,7 @@ describe('agent-sdk config resolution', () => {
     await writeAgentConfig(join(tempDir, 'catalog-b', 'worker.json'), 'worker-b');
     await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({ agents: { dirs: ['./catalog-a', './catalog-b'] } }));
 
-    await expect(loadAgentSdkConfig({ cwd: tempDir, agentConfigPath: 'worker', env: {} })).rejects.toThrow('Ambiguous agent config "worker"');
+    await expect(loadAgentSdkConfig({ cwd: tempDir, agentConfigPath: 'worker', env: testEnvironment() })).rejects.toThrow('Ambiguous agent config "worker"');
   });
 
   it('uses settings provider/model only as fallbacks', async () => {
@@ -92,7 +93,7 @@ describe('agent-sdk config resolution', () => {
       JSON.stringify({ model: { overrideProvider: 'openrouter', overrideModel: 'openai/gpt-5-mini' } }),
     );
 
-    const config = await loadAgentSdkConfig({ cwd: tempDir, env: {} });
+    const config = await loadAgentSdkConfig({ cwd: tempDir, env: testEnvironment() });
 
     expect(config.model.provider).toBe('ollama');
     expect(config.model.model).toBe('qwen3.5');
@@ -102,7 +103,7 @@ describe('agent-sdk config resolution', () => {
     await writeAgentConfig(join(tempDir, 'agent.json'));
     await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({ runtime: { mode: 'postgres' } }));
 
-    await expect(loadAgentSdkConfig({ cwd: tempDir, env: {} })).rejects.toThrow(AgentSettingsValidationError);
+    await expect(loadAgentSdkConfig({ cwd: tempDir, env: testEnvironment() })).rejects.toThrow(AgentSettingsValidationError);
   });
 
   it('loads ground truth calendar policy from settings', async () => {
@@ -121,7 +122,7 @@ describe('agent-sdk config resolution', () => {
       }),
     );
 
-    const config = await loadAgentSdkConfig({ cwd: tempDir, env: {} });
+    const config = await loadAgentSdkConfig({ cwd: tempDir, env: testEnvironment() });
 
     expect(config.groundTruth).toMatchObject({
       enabled: true,
@@ -150,7 +151,7 @@ describe('agent-sdk config resolution', () => {
 
     const config = await loadAgentSdkConfig({
       cwd: tempDir,
-      env: { GATEWAY_URL: 'wss://gateway.example/rpc' },
+      env: testEnvironment({ GATEWAY_URL: 'wss://gateway.example/rpc' }),
     });
 
     expect(config.inference).toEqual({ mode: 'gateway', tier: 'high' });
@@ -167,13 +168,13 @@ describe('agent-sdk config resolution', () => {
     await writeAgentConfig(join(tempDir, 'agent.json'));
     await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({ groundTruth: { fiscalYearStartMonth: 13 } }));
 
-    await expect(loadAgentSdkConfig({ cwd: tempDir, env: {} })).rejects.toThrow(AgentSettingsValidationError);
+    await expect(loadAgentSdkConfig({ cwd: tempDir, env: testEnvironment() })).rejects.toThrow(AgentSettingsValidationError);
   });
 
   it('inspects resolved tools without creating a runtime bundle', async () => {
     await writeAgentConfig(join(tempDir, 'agent.json'));
 
-    const inspection = await inspectAgentSdkResolution({ cwd: tempDir, env: {} });
+    const inspection = await inspectAgentSdkResolution({ cwd: tempDir, env: testEnvironment() });
 
     expect(inspection.config.agent.id).toBe('agent');
     expect(inspection.tools.map((tool) => tool.name)).toEqual(['read_file']);
@@ -189,7 +190,7 @@ describe('agent-sdk gateway integration', () => {
     const generate = vi.fn(async () => ({ finishReason: 'stop' as const, text: 'injected adapter result' }));
     const sdk = await createAgentSdk({
       cwd: process.cwd(),
-      env: {},
+      env: testEnvironment(),
       runtimeMode: 'memory',
       inferenceMode: 'local',
       modelAdapter: {
@@ -231,7 +232,7 @@ describe('agent-sdk gateway integration', () => {
     const localGenerate = vi.fn(async () => ({ finishReason: 'stop' as const, text: `${inferenceMode} complete` }));
     const sdk = await createAgentSdk({
       cwd: process.cwd(),
-      env: { OPENROUTER_API_KEY: 'client-owned-provider-key' },
+      env: testEnvironment({ OPENROUTER_API_KEY: 'client-owned-provider-key' }),
       runtimeMode: 'memory',
       inferenceMode,
       gateway: { requireRunPermit: true },
@@ -282,7 +283,7 @@ describe('agent-sdk gateway integration', () => {
   it('fails actionably before creating a local run when authorization is unavailable', async () => {
     const sdk = await createAgentSdk({
       cwd: process.cwd(),
-      env: {},
+      env: testEnvironment(),
       runtimeMode: 'memory',
       inferenceMode: 'gateway',
       gatewayClient: {
@@ -341,7 +342,7 @@ describe('agent-sdk gateway integration', () => {
     const localTool = vi.fn(async (input: { text: string }) => ({ echoed: input.text }));
     const sdk = await createAgentSdk({
       cwd: process.cwd(),
-      env: {},
+      env: testEnvironment(),
       runtimeMode: 'memory',
       inferenceMode: 'gateway',
       inferenceTier: 'medium',
@@ -519,7 +520,7 @@ describe('agent-sdk gateway integration', () => {
     const localTool = vi.fn(async (input: { text: string }) => ({ uppercased: input.text.toUpperCase() }));
     const sdk = await createAgentSdk({
       cwd: process.cwd(),
-      env: {},
+      env: testEnvironment(),
       runtimeMode: 'memory',
       inferenceMode: 'gateway',
       inferenceTier: 'medium',

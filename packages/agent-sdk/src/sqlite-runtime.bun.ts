@@ -16,6 +16,7 @@ import {
 import type { ModelAdapter } from '@adaptive-agent/core';
 
 import { AgentSdk, loadAgentSdkConfig, type AgentConfigFile } from './index.js';
+import { testEnvironment } from './test-environment.js';
 
 const temporaryDirectories: string[] = [];
 const openSdks: AgentSdk[] = [];
@@ -31,7 +32,7 @@ describe('Agent SDK SQLite runtime', () => {
     const home = join(directory, 'home');
     const config = await loadAgentSdkConfig({
       cwd: directory,
-      env: { ADAPTIVE_AGENT_HOME: home },
+      env: testEnvironment({ HOME: home, ADAPTIVE_AGENT_HOME: home }),
       runtimeMode: 'sqlite',
       agentConfig: agentConfig([]),
     });
@@ -45,7 +46,7 @@ describe('Agent SDK SQLite runtime', () => {
 
     const sdk = await AgentSdk.create({
       cwd: directory,
-      env: { ADAPTIVE_AGENT_HOME: home },
+      env: testEnvironment({ HOME: home, ADAPTIVE_AGENT_HOME: home }),
       runtimeMode: 'sqlite',
       agentConfig: agentConfig([]),
       modelAdapter: finalModel({ durable: true }),
@@ -60,7 +61,7 @@ describe('Agent SDK SQLite runtime', () => {
     const executeCalls: unknown[] = [];
     const options = {
       cwd: directory,
-      env: {},
+      env: testEnvironment({ HOME: directory, ADAPTIVE_AGENT_HOME: join(directory, 'home') }),
       runtimeMode: 'sqlite' as const,
       sqlitePath,
       agentConfig: agentConfig(['lookup']),
@@ -206,7 +207,7 @@ describe('Agent SDK SQLite runtime', () => {
     let localToolCalls = 0;
     const sdkOptions = {
       cwd: directory,
-      env: {},
+      env: testEnvironment({ HOME: directory, ADAPTIVE_AGENT_HOME: join(directory, 'home') }),
       runtimeMode: 'sqlite' as const,
       sqlitePath,
       inferenceMode: 'gateway' as const,
