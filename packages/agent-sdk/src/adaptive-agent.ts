@@ -27,6 +27,7 @@ import {
   inspectAgentSdkCatalog,
   inspectAgentSdkResolution,
   loadAgentSdkConfig,
+  prepareSkillDirectory,
   runAmbientStart,
   type AgentSdkOptions,
   type AgentSdkChatOptions,
@@ -163,6 +164,7 @@ Setup and inspection:
   config                Print resolved SDK configuration
   catalog               List available agents, tools, and delegate skills
   context               Create and manage project-scoped context bundles
+  skill                 Prepare handler-backed skills for binary execution
 
 Other commands:
   agent-create          Generate and write a new agent config JSON file
@@ -641,6 +643,19 @@ Context options:
   --cwd <path>            Project root that owns the bundle registry.
   --output <format>       Output format: pretty, json, or jsonl.`;
 
+const SKILL_HELP_TEXT = `adaptive-agent skill
+
+Prepare a handler-backed skill for execution by the binary CLI or desktop sidecar.
+Ordinary TypeScript and JavaScript dependencies are bundled into a cached artifact.
+
+Usage:
+  adaptive-agent skill prepare <skill-directory> [options]
+
+Options:
+  --cwd <path>            Base directory for a relative skill path.
+  --force                 Rebuild even when a valid cached artifact exists.
+  --output <format>       Output format: pretty, json, or jsonl.`;
+
 const VERSION_HELP_TEXT = `adaptive-agent --version
 
 Print adaptive-agent version.
@@ -695,6 +710,8 @@ function getHelpText(topic?: ManualTestCliOptions['helpTopic']): string {
       return AGENT_CREATE_HELP_TEXT;
     case 'context':
       return CONTEXT_HELP_TEXT;
+    case 'skill':
+      return SKILL_HELP_TEXT;
     case 'version':
       return VERSION_HELP_TEXT;
     default:
@@ -759,6 +776,10 @@ export async function main(argv = Bun.argv.slice(2)): Promise<number> {
 
   if (cli.command === 'context') {
     return runContextCommand(cli);
+  }
+
+  if (cli.command === 'skill') {
+    return runSkillCommand(cli);
   }
 
   if (cli.command === 'config') {
@@ -948,6 +969,27 @@ async function runContextCommand(cli: ManualTestCliOptions): Promise<number> {
   }
 
   console.log(renderContextCommandOutput(output, cli.output));
+  return 0;
+}
+
+async function runSkillCommand(cli: ManualTestCliOptions): Promise<number> {
+  const [, skillPath] = cli.goalArgs;
+  const cwd = resolve(cli.cwd ?? process.cwd());
+  const prepared = await prepareSkillDirectory(resolve(cwd, skillPath!), {
+    env: process.env,
+    force: cli.force,
+  });
+  if (cli.output === 'json') {
+    console.log(JSON.stringify(prepared, null, 2));
+  } else if (cli.output === 'jsonl') {
+    console.log(JSON.stringify(prepared));
+  } else {
+    console.log(`skill: ${prepared.skillName}`);
+    console.log(`mode: ${prepared.mode}`);
+    console.log(`source: ${prepared.sourcePath}`);
+    console.log(`module: ${prepared.modulePath}`);
+    console.log(`cache: ${prepared.mode === 'package' ? 'not used' : prepared.cacheHit ? 'hit' : 'built'}`);
+  }
   return 0;
 }
 
@@ -2364,7 +2406,7 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
         options.output = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['pretty', 'json', 'jsonl']);
         break;
       default:
-        if (options.command === 'run' || options.command === 'chat' || options.command === 'swarm-run' || options.command === 'ambient' || options.command === 'inspect' || options.command === 'resume' || options.command === 'retry' || options.command === 'recover' || options.command === 'continue' || options.command === 'interrupt' || options.command === 'replay' || options.command === 'agent-create' || options.command === 'context') {
+        if (options.command === 'run' || options.command === 'chat' || options.command === 'swarm-run' || options.command === 'ambient' || options.command === 'inspect' || options.command === 'resume' || options.command === 'retry' || options.command === 'recover' || options.command === 'continue' || options.command === 'interrupt' || options.command === 'replay' || options.command === 'agent-create' || options.command === 'context' || options.command === 'skill') {
           options.goalArgs.push(arg);
           break;
         }
@@ -2454,6 +2496,12 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
       if (options.contextBundleDescription !== undefined) throw new Error('--description is supported for context create only');
       if (options.force) throw new Error('--force is supported for context create only');
     }
+  }
+
+  if (!options.help && options.command === 'skill') {
+    const [action, skillPath, ...extra] = options.goalArgs;
+    if (action !== 'prepare') throw new Error('skill requires: adaptive-agent skill prepare <skill-directory>');
+    if (!skillPath || extra.length > 0) throw new Error('skill prepare requires exactly one skill directory');
   }
 
   if (!options.help && options.command !== 'context') {

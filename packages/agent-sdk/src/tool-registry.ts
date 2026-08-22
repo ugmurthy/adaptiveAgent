@@ -31,6 +31,7 @@ import type { GatewayClient } from '@adaptive-agent/gateway-client';
 import { createGatewayProxyTool } from './gateway-tools.js';
 import { resolveAgentSdkConfig } from './config-resolve.js';
 import { validateAgent } from './config-validate.js';
+import { prepareSkillHandlerModule } from './skill-handler-preparation.js';
 import { agentConfigurationFingerprint, expandStrings, parseNonNegativeNumber, parsePositiveInteger, pathExists, readJson } from './sdk-utils.js';
 
 const DEFAULT_MODULE_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
@@ -51,7 +52,7 @@ export async function resolveToolsAndDelegates(config: ResolvedAgentSdkConfig, o
   const missing = config.agent.tools.filter((name) => !registry.has(name));
   if (missing.length) throw new Error(`Unknown tool reference(s): ${missing.join(', ')}. Registered tools: ${registeredToolNames.join(', ') || '(none)'}.`);
   const tools = config.agent.tools.map((name) => registry.get(name)!);
-  const delegates = [...(options.delegates ?? []), ...(await loadDelegates(config.agent.delegates ?? [], config.skills.dirs, new Set(tools.map((tool) => tool.name))))];
+  const delegates = [...(options.delegates ?? []), ...(await loadDelegates(config.agent.delegates ?? [], config.skills.dirs, new Set(tools.map((tool) => tool.name)), env))];
   for (const delegate of delegates) {
     const unavailable = delegate.allowedTools.filter((name) => !registry.has(name));
     if (unavailable.length) throw new Error(`Delegate "${delegate.name}" requires unavailable tool(s): ${unavailable.join(', ')}.`);
@@ -117,7 +118,7 @@ function resolveReadWebPageCostPerRequest(env: NodeJS.ProcessEnv, provider: Read
     ?? parseNonNegativeNumber(env.WEB_READ_PAGE_COST_USD_PER_REQUEST);
 }
 
-async function loadDelegates(names: string[], dirs: string[], availableTools: Set<string>): Promise<DelegateDefinition[]> {
+async function loadDelegates(names: string[], dirs: string[], availableTools: Set<string>, env: NodeJS.ProcessEnv): Promise<DelegateDefinition[]> {
   const delegates = new Map<string, DelegateDefinition>();
   for (const dir of dirs) {
     if (!(await pathExists(dir))) continue;
@@ -125,7 +126,9 @@ async function loadDelegates(names: string[], dirs: string[], availableTools: Se
       if (delegates.has(name)) continue;
       const skillDir = resolve(dir, name);
       if (!(await pathExists(skillDir))) continue;
-      const delegate = skillToDelegate(await loadSkillFromDirectory(skillDir));
+      const delegate = skillToDelegate(await loadSkillFromDirectory(skillDir, {
+        resolveHandlerModule: async (request) => (await prepareSkillHandlerModule(request, { env })).modulePath,
+      }));
       if (delegate.name !== name) throw new Error(`Delegate "${name}" loaded from ${skillDir} declared skill name "${delegate.name}".`);
       const missing = delegate.allowedTools.filter((tool) => !availableTools.has(tool));
       if (missing.length) throw new Error(`Delegate "${name}" requires unavailable tool(s): ${missing.join(', ')}.`);

@@ -1,3 +1,5 @@
+import { realpath } from 'node:fs/promises';
+
 import {
   createAdaptiveAgent,
   createAdaptiveAgentLogger,
@@ -53,6 +55,7 @@ export * from './errors.js';
 export * from './ambient.js';
 export * from './swarm-sdk.js';
 export * from './context-bundles.js';
+export * from './skill-handler-preparation.js';
 export { agentConfigurationFingerprint } from './sdk-utils.js';
 export * from './server-profiles.js';
 export { createGatewayProxyTool, type GatewayProxyToolFactoryOptions, type GatewayRemoteToolName } from './gateway-tools.js';
@@ -115,6 +118,7 @@ export class AgentSdk {
     options = await resolveServerProfileOptions(options);
     const resolved = await resolveAgentSdkConfigWithSources(options);
     const config = resolved.config;
+    config.workspaceRoot = await realpath(config.workspaceRoot);
     const runtime = options.runtime
       ? { mode: config.runtime.mode, runtime: options.runtime }
       : await resolveRuntimeBundle(
@@ -233,7 +237,10 @@ export class AgentSdk {
     requestedTier: InferenceTier | undefined,
     executionContext: JsonObject | undefined,
   ): Promise<{ runId?: UUID; executionContext: JsonObject }> {
-    const base = withoutGatewayExecutionFields(executionContext);
+    const base = withWorkspaceFileAccess(
+      withoutGatewayExecutionFields(executionContext),
+      this.config.workspaceRoot,
+    );
     if (!this.authorization) {
       if (requestedTier !== undefined) {
         throw new Error('inferenceTier may be selected per run only in gateway inference mode');
@@ -341,6 +348,24 @@ function withoutGatewayExecutionFields(context: JsonObject | undefined): JsonObj
     delete result[key];
   }
   return result;
+}
+
+function withWorkspaceFileAccess(context: JsonObject, workspaceRoot: string): JsonObject {
+  const existing = context.fileAccess;
+  if (existing !== undefined && (!existing || typeof existing !== 'object' || Array.isArray(existing))) {
+    throw new TypeError('executionContext.fileAccess must be an object');
+  }
+
+  const fileAccess = existing as JsonObject | undefined;
+  return {
+    ...context,
+    fileAccess: {
+      ...(fileAccess ?? {}),
+      version: 1,
+      workspaceRoot,
+      attachmentRoots: fileAccess?.attachmentRoots ?? [],
+    },
+  };
 }
 
 async function resolveServerProfileOptions(options: AgentSdkOptions): Promise<AgentSdkOptions> {

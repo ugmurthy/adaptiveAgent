@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, writeFile, mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -527,6 +527,35 @@ export async function execute(input) {
 
     expect(skill.handlerTools).toHaveLength(1);
     expect(skill.handlerTools![0].name).toBe('skill.anon-skill.handler');
+  });
+
+  it('loads a handler module resolved by the host', async () => {
+    const skillDir = join(tempDir, 'prepared');
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(
+      join(skillDir, 'SKILL.md'),
+      `---
+name: prepared
+description: Prepared handler
+handler: handler.ts
+---
+
+Use the prepared handler.
+`,
+    );
+    await writeFile(join(skillDir, 'handler.ts'), `throw new Error('source handler must not load');\n`);
+    const preparedPath = join(skillDir, 'prepared.js');
+    await writeFile(preparedPath, `export async function execute() { return { prepared: true }; }\n`);
+    const resolver = vi.fn(async () => preparedPath);
+
+    const skill = await loadSkillFromDirectory(skillDir, { resolveHandlerModule: resolver });
+
+    expect(resolver).toHaveBeenCalledWith({
+      skillDir,
+      skillName: 'prepared',
+      handlerPath: join(skillDir, 'handler.ts'),
+    });
+    await expect(skill.handlerTools![0].execute({} as any, {} as any)).resolves.toEqual({ prepared: true });
   });
 
   it('throws when handler module does not exist', async () => {

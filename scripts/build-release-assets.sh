@@ -204,7 +204,6 @@ compile_target() {
 
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
-bun run --cwd "$ROOT_DIR/packages/agent-sdk" bundle:skills
 write_bundled_assets
 
 compile_target darwin-arm64 bun-darwin-arm64 adaptive-agent trace-session agent-runtime "adaptive-agent-$TAG-darwin-arm64.tar.gz" "adaptive-agent-runtime-$TAG-darwin-arm64.tar.gz"

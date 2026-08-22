@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -183,6 +183,69 @@ describe('desktop runtime protocol', () => {
       const result = await runtime.handleRpc(request({ id: 'runtime', method: 'runtime/initialize', params: { cwd, runtimeMode: 'memory', agentSelection: { id: descriptor.id, configPath: descriptor.configPath, configurationFingerprint: descriptor.configurationFingerprint } } })) as any;
       expect(result).toMatchObject({ agent: { id: 'desktop-agent' }, runtimeMode: 'memory' });
       await expect(runtime.handleRpc(request({ id: 'again', method: 'catalog/inspect', params: { cwd } }))).rejects.toMatchObject({ code: 'ALREADY_INITIALIZED' });
+    } finally {
+      await runtime.close();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('prepares a handler-backed delegate during sidecar runtime initialization', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'desktop-skill-handler-'));
+    const skillDir = join(cwd, 'skills', 'sidecar-skill');
+    const dependencyDir = join(skillDir, 'node_modules', 'sidecar-dependency');
+    await mkdir(dependencyDir, { recursive: true });
+    await writeFile(join(skillDir, 'SKILL.md'), `---
+name: sidecar-skill
+description: Sidecar handler skill
+handler: handler.ts
+---
+
+Use the sidecar handler.
+`);
+    await writeFile(join(skillDir, 'handler.ts'), `import { value } from 'sidecar-dependency';
+export async function execute() { return { value }; }
+`);
+    await writeFile(join(skillDir, 'package.json'), JSON.stringify({ type: 'module', dependencies: { 'sidecar-dependency': '1.0.0' } }));
+    await writeFile(join(dependencyDir, 'package.json'), JSON.stringify({ name: 'sidecar-dependency', version: '1.0.0', type: 'module', exports: './index.js' }));
+    await writeFile(join(dependencyDir, 'index.js'), `export const value = 'sidecar';\n`);
+    const agentPath = join(cwd, 'agent.json');
+    await writeFile(agentPath, JSON.stringify({
+      id: 'desktop-skill-agent',
+      name: 'Desktop Skill Agent',
+      invocationModes: ['run'],
+      defaultInvocationMode: 'run',
+      model: { provider: 'ollama', model: 'test-model' },
+      tools: [],
+      delegates: ['sidecar-skill'],
+    }));
+    const home = join(cwd, 'home');
+    await writeFile(join(cwd, 'agent.settings.json'), JSON.stringify({
+      runtime: { mode: 'memory' },
+      skills: { dirs: [join(cwd, 'skills')] },
+      interaction: { approvalMode: 'manual', clarificationMode: 'interactive' },
+      env: { ADAPTIVE_AGENT_HOME: home },
+    }));
+    const { runtime } = createRuntime();
+    try {
+      await runtime.handleRpc(request({ id: 'protocol', method: 'initialize', params: { protocolVersion: '1.16', clientInfo: { name: 'desktop' } } }));
+      const catalog = await runtime.handleRpc(request({ id: 'catalog', method: 'catalog/inspect', params: { cwd } })) as any;
+      const descriptor = catalog.currentAgent;
+      const result = await runtime.handleRpc(request({
+        id: 'runtime',
+        method: 'runtime/initialize',
+        params: {
+          cwd,
+          runtimeMode: 'memory',
+          agentSelection: {
+            id: descriptor.id,
+            configPath: descriptor.configPath,
+            configurationFingerprint: descriptor.configurationFingerprint,
+          },
+        },
+      })) as any;
+
+      expect(result.agent.id).toBe('desktop-skill-agent');
+      expect(await readdir(join(home, 'cache', 'skill-handlers'))).toHaveLength(1);
     } finally {
       await runtime.close();
       await rm(cwd, { recursive: true, force: true });

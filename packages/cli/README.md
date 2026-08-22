@@ -184,6 +184,93 @@ exact expanded refs are persisted in consuming run metadata for inspection.
 Values after `run:` must be complete run UUIDs; session IDs remain free-form
 strings.
 
+## Preparing handler-backed skills
+
+A skill can expose a scoped tool by declaring a handler in `SKILL.md`:
+
+```text
+my-skill/
+|-- SKILL.md
+|-- handler.ts
+|-- package.json
+`-- bun.lock
+```
+
+```md
+---
+name: my-skill
+description: Run the custom skill handler
+handler: handler.ts
+---
+
+Use the handler to complete the delegated objective.
+```
+
+Put packages imported by `handler.ts` in the skill's `package.json`, then
+install them in the skill directory or an enclosing project. AdaptiveAgent
+prepares referenced handlers automatically when it loads an agent. You can
+also prepare and validate one explicitly:
+
+```bash
+adaptive-agent skill prepare ./skills/my-skill
+adaptive-agent skill prepare ./skills/my-skill --force
+```
+
+Preparation uses the Bun runtime embedded in the binary CLI or `agent-runtime`
+sidecar. It compiles TypeScript, bundles ordinary JavaScript dependencies, and
+writes a platform-specific, content-addressed artifact under
+`~/.adaptiveAgent/cache/skill-handlers`. The CLI and desktop sidecars use the
+same Agent SDK preparation path and resolve skills by absolute path, so sidecar
+behavior does not depend on its working directory.
+
+Some dependencies cannot be bundled safely, including native `.node` addons,
+packages that discover modules dynamically, and packages that require files or
+executables beside `node_modules`. Keep those dependencies materialized beside
+the skill and select package mode in the skill's `package.json`:
+
+```json
+{
+  "type": "module",
+  "dependencies": {
+    "native-or-dynamic-package": "1.2.3"
+  },
+  "adaptiveAgent": {
+    "handlerMode": "package"
+  }
+}
+```
+
+In package mode, the handler is loaded from the skill directory and normal
+module resolution finds its local or enclosing `node_modules`. The dependency
+must be compatible with Bun and with the sidecar's operating system and CPU.
+
+### Skills preparation do's and don'ts
+
+Do:
+
+- Commit `package.json` and a lockfile with the skill source.
+- Declare every runtime dependency used by the handler.
+- Run `adaptive-agent skill prepare <dir>` before selecting or running a new
+  handler-backed skill; automatic preparation remains a startup fallback.
+- Use the default bundled mode for portable JavaScript and TypeScript packages.
+- Use package mode for native addons, dynamic module loading, or package-owned
+  runtime assets, and test it on every target platform.
+- Treat handler code and dependencies as trusted executable code. A handler
+  runs with the permissions of the CLI or sidecar process.
+
+Don't:
+
+- Expect a package embedded inside the AdaptiveAgent binary to be visible to an
+  external handler. Handler dependencies belong to the skill package.
+- Expect preparation to download missing dependencies silently. Install or
+  vendor them first; missing imports fail with an actionable error.
+- Copy only `handler.ts` when the handler depends on `package.json`, a lockfile,
+  assets, native modules, or package-mode `node_modules`.
+- Share a package-mode artifact across operating systems or CPU architectures
+  unless all of its dependencies are platform independent.
+- Edit files in `~/.adaptiveAgent/cache/skill-handlers`; change the skill source
+  and prepare it again instead.
+
 ## Repository packages
 
 The current workspace packages are:

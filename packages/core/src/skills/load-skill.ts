@@ -1,13 +1,22 @@
 import { readFile, access } from 'node:fs/promises';
 import { join, basename, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { createModelAdapter, type ModelAdapterConfig } from '../adapters/create-model-adapter.js';
 import type { AgentDefaults, ToolDefinition, JsonValue } from '../types.js';
 import type { SkillDefinition } from './types.js';
 
+export interface SkillHandlerModuleRequest {
+  skillDir: string;
+  skillName: string;
+  handlerPath: string;
+}
+
 export interface LoadSkillOptions {
   /** Override the allowed tools (frontmatter cannot express these). */
   allowedTools?: string[];
+  /** Prepare or otherwise resolve the handler module before core imports it. */
+  resolveHandlerModule?: (request: SkillHandlerModuleRequest) => Promise<string>;
 }
 
 /**
@@ -38,7 +47,18 @@ export async function loadSkillFromDirectory(
   if (skill.handler) {
     const handlerPath = resolve(skillDir, skill.handler);
     await assertFileExists(handlerPath, skillDir);
-    const handlerTool = await loadHandlerModule(handlerPath, skill.name, skillDir);
+    let modulePath = handlerPath;
+    if (options?.resolveHandlerModule) {
+      try {
+        modulePath = await options.resolveHandlerModule({ skillDir, skillName: skill.name, handlerPath });
+      } catch (error) {
+        throw new SkillLoadError(
+          `Failed to prepare handler module '${handlerPath}' for skill '${skill.name}': ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      await assertFileExists(modulePath, skillDir);
+    }
+    const handlerTool = await loadHandlerModule(modulePath, skill.name, skillDir);
     skill.handlerTools = [handlerTool];
   }
 
@@ -472,7 +492,7 @@ async function loadHandlerModule(
 ): Promise<ToolDefinition> {
   let mod: Record<string, unknown>;
   try {
-    mod = await import(handlerPath);
+    mod = await import(pathToFileURL(handlerPath).href);
   } catch (error) {
     throw new SkillLoadError(
       `Failed to import handler module '${handlerPath}' for skill '${skillName}': ${error instanceof Error ? error.message : String(error)}`,

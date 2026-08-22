@@ -192,13 +192,14 @@ describe('adaptive-agent cli parsing', () => {
     expect(ADAPTIVE_AGENT_CLI_COMMANDS).toEqual([
       'run', 'chat', 'spec', 'swarm-run', 'ambient', 'retry', 'inspect', 'resume', 'recover', 'continue',
       'interrupt', 'replay', 'eval', 'config', 'catalog', 'init', 'doctor', 'update', 'uninstall',
-      'agent-create', 'context', 'version',
+      'agent-create', 'context', 'skill', 'version',
     ]);
     expect(ADAPTIVE_AGENT_POSITIONAL_COMMANDS).toEqual(ADAPTIVE_AGENT_CLI_COMMANDS.filter((command) => command !== 'version'));
     expect(ADAPTIVE_AGENT_CLI_SUBCOMMANDS).toEqual({
       ambient: ['start'],
       eval: ['cases', 'gaia'],
       context: ['create', 'list', 'show', 'delete'],
+      skill: ['prepare'],
     });
 
     for (const command of ADAPTIVE_AGENT_POSITIONAL_COMMANDS) {
@@ -215,6 +216,7 @@ describe('adaptive-agent cli parsing', () => {
     expect(parseCliArgs(['help', 'ambient'])).toMatchObject({ help: true, helpTopic: 'ambient' });
     expect(parseCliArgs(['help', 'replay'])).toMatchObject({ help: true, helpTopic: 'replay' });
     expect(parseCliArgs(['help', 'context'])).toMatchObject({ help: true, helpTopic: 'context' });
+    expect(parseCliArgs(['help', 'skill'])).toMatchObject({ help: true, helpTopic: 'skill' });
   });
 
   it('parses ambient start requests', () => {
@@ -239,6 +241,17 @@ describe('adaptive-agent cli parsing', () => {
       approvalMode: 'reject',
       clarificationMode: 'fail',
     });
+  });
+
+  it('parses skill preparation requests', () => {
+    expect(parseCliArgs(['skill', 'prepare', './skills/custom', '--force', '--output', 'json'])).toMatchObject({
+      command: 'skill',
+      goalArgs: ['prepare', './skills/custom'],
+      force: true,
+      output: 'json',
+    });
+    expect(() => parseCliArgs(['skill', 'prepare'])).toThrow('exactly one skill directory');
+    expect(() => parseCliArgs(['skill', 'remove', './skills/custom'])).toThrow('skill requires');
   });
 
   it('parses common flags', () => {

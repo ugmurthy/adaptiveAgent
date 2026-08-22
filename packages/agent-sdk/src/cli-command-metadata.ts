@@ -20,6 +20,7 @@ export const ADAPTIVE_AGENT_CLI_COMMANDS = [
   'uninstall',
   'agent-create',
   'context',
+  'skill',
   'version',
 ] as const;
 
@@ -35,4 +36,5 @@ export const ADAPTIVE_AGENT_CLI_SUBCOMMANDS = {
   ambient: ['start'],
   eval: ['cases', 'gaia'],
   context: ['create', 'list', 'show', 'delete'],
+  skill: ['prepare'],
 } as const satisfies Partial<Record<AdaptiveAgentCliCommand, readonly string[]>>;

@@ -1,7 +1,7 @@
 ---
 name: persistent-code-executor
 description: Execute multiple related code cells in one persistent E2B sandbox for the duration of a delegated run.
-handler: handler.js
+handler: handler.ts
 allowedTools: []
 defaults.maxSteps: 16
 defaults.toolTimeoutMs: 180000

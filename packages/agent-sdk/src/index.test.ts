@@ -210,9 +210,28 @@ describe('agent-sdk gateway integration', () => {
     });
 
     try {
-      await expect(sdk.runRaw('use the injected model')).resolves.toMatchObject({
+      const result = await sdk.runRaw('use the injected model', {
+        executionContext: {
+          callerContext: 'preserved',
+          fileAccess: {
+            version: 1,
+            workspaceRoot: '/caller-selected-workspace',
+            attachmentRoots: [],
+          },
+        },
+      });
+      expect(result).toMatchObject({
         status: 'success',
         output: 'injected adapter result',
+      });
+      const inspection = await sdk.inspect(result.runId);
+      expect(inspection.run?.executionContext).toMatchObject({
+        fileAccess: {
+          version: 1,
+          workspaceRoot: process.cwd(),
+          attachmentRoots: [],
+        },
+        callerContext: 'preserved',
       });
       expect(generate).toHaveBeenCalledTimes(1);
     } finally {

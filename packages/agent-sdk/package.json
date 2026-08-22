@@ -17,7 +17,6 @@
     "adaptive-agent-gaia-eval": "./dist/evaluate-gaia-jsonl.js"
   },
   "scripts": {
-    "bundle:skills": "bun run ./scripts/build-bundled-skills.ts",
     "build": "bun build ./src/index.ts ./src/agent-create.ts ./src/cli-api.ts ./src/adaptive-agent.ts ./src/adaptive-agent-tui.ts ./src/evaluate-gaia-jsonl.ts --outdir dist --target bun",
     "adaptive-agent": "bun run ./dist/adaptive-agent.js",
     "adaptive-agent:tui": "bun run ./src/adaptive-agent-tui.ts",
