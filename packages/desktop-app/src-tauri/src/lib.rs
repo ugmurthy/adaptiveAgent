@@ -4720,6 +4720,24 @@ async fn validate_agent_config(
     .map_err(|error| format!("Agent validation failed: {error}"))?
 }
 
+fn refresh_catalog_in_background(app: AppHandle) {
+    app.state::<AppState>()
+        .manager
+        .catalog_loading
+        .store(true, Ordering::SeqCst);
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        if let Err(error) = state.manager.refresh_catalog() {
+            *state.manager.bootstrap_error.lock().unwrap() = Some(error);
+        }
+        state.manager.catalog_loading.store(false, Ordering::SeqCst);
+        let _ = app.emit(
+            "adaptive-agent://catalog-status-changed",
+            json!({ "catalogRefreshComplete": true }),
+        );
+    });
+}
+
 #[tauri::command]
 async fn save_agent_config(
     agent: Value,
@@ -4751,7 +4769,6 @@ async fn save_agent_config(
     })
     .await
     .map_err(|error| format!("Agent save failed: {error}"))??;
-    state.manager.refresh_catalog()?;
     if let Some(agent_id) = saved_agent_id {
         state
             .manager
@@ -4760,6 +4777,7 @@ async fn save_agent_config(
             .unwrap()
             .remove(&agent_id);
     }
+    refresh_catalog_in_background(state.manager.app.clone());
     Ok(result)
 }
 
@@ -4857,7 +4875,7 @@ async fn archive_agent_config(
     })
     .await
     .map_err(|error| format!("Agent archive failed: {error}"))??;
-    state.manager.refresh_catalog()?;
+    refresh_catalog_in_background(state.manager.app.clone());
     Ok(result)
 }
 
@@ -4880,7 +4898,7 @@ async fn restore_agent_config(
     })
     .await
     .map_err(|error| format!("Agent restore failed: {error}"))??;
-    state.manager.refresh_catalog()?;
+    refresh_catalog_in_background(state.manager.app.clone());
     Ok(result)
 }
 
