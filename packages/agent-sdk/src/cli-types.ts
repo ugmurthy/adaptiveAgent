@@ -13,6 +13,7 @@ import type {
   InferenceMode,
   InferenceTier,
   RuntimeMode,
+  TaskPreparationMode,
   createAgentSdk,
 } from './index.js';
 import type { AdaptiveAgentCliCommand } from './cli-command-metadata.js';
@@ -34,6 +35,7 @@ export interface ManualTestCliOptions {
   imagePaths: string[];
   audioPaths: string[];
   fileAttachmentPaths: string[];
+  enhanceMode?: TaskPreparationMode;
   orchestrate: boolean;
   agentCatalogPaths: string[];
   workerCatalogPaths: string[];
@@ -142,6 +144,7 @@ export interface ManualTestJsonOutput {
   request: JsonValue;
   warnings: string[];
   result: JsonValue;
+  taskPreparation?: JsonValue;
   inspection?: JsonValue;
   orchestration?: JsonValue;
 }

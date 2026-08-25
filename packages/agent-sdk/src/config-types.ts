@@ -69,6 +69,14 @@ export interface GroundTruthSettingsConfig {
   businessDays?: WeekdayName[];
 }
 
+export type TaskPreparationMode = 'never' | 'auto' | 'always';
+
+export interface TaskPreparationSettingsConfig {
+  mode?: TaskPreparationMode;
+  agent?: string;
+  showPreparedTask?: boolean;
+}
+
 export interface AgentConfigFile {
   $schema?: string;
   version?: 1;
@@ -104,6 +112,7 @@ export interface AgentSettingsFile {
   workspace?: { overrideRoot?: string; overrideShellCwd?: string };
   model?: { overrideProvider?: string; overrideModel?: string; overrideBaseUrl?: string; overrideApiKeyEnv?: string; overrideStructuredOutputMode?: ModelAdapterConfig['structuredOutputMode'] };
   inference?: { mode?: InferenceMode; tier?: InferenceTier };
+  taskPreparation?: TaskPreparationSettingsConfig;
   gateway?: {
     url?: string;
     clientName?: string;

@@ -56,6 +56,7 @@ export * from './ambient.js';
 export * from './swarm-sdk.js';
 export * from './context-bundles.js';
 export * from './skill-handler-preparation.js';
+export * from './task-preparation.js';
 export { agentConfigurationFingerprint } from './sdk-utils.js';
 export * from './server-profiles.js';
 export { createGatewayProxyTool, type GatewayProxyToolFactoryOptions, type GatewayRemoteToolName } from './gateway-tools.js';

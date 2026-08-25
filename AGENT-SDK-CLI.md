@@ -99,6 +99,7 @@ Global options should map directly to existing SDK config concepts:
 
 --approval auto|manual|reject
 --clarification interactive|fail
+--enhance never|auto|always
 --events
 --inspect
 --output pretty|json|jsonl
@@ -130,6 +131,7 @@ adaptive-agent run --file ./prompt.md
 adaptive-agent run --input-json '{"question":"...","level":2}'
 adaptive-agent run --image ./diagram.png "Answer the question using the image"
 adaptive-agent run --output json "What is 2+2?"
+adaptive-agent run --dry-run "review the auth code"
 ```
 
 Behavior:
@@ -137,8 +139,12 @@ Behavior:
 - accept goal from positional args, `--file`, or stdin;
 - support repeatable attachments such as `--image <path>`;
 - support an advanced `--content-part <json>` escape hatch;
+- optionally run the configured task-preparation agent before the resolved execution agent;
+- include the preparation decision, prepared objective, assumptions, questions, reason, and preparation run id in dry-run and JSON output;
 - internally build the same request shape currently used by the spec runner: `goal`, `input`, `images`, `contentParts`, `context`, `outputSchema`, and `metadata`;
 - call `sdk.run(goal, options)`.
+
+When task preparation is enabled, `--dry-run` invokes the preparer and may incur a model call, but it does not execute the target agent.
 
 Useful default output:
 

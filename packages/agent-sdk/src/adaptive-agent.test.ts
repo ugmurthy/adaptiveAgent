@@ -323,6 +323,14 @@ describe('adaptive-agent cli parsing', () => {
     });
   });
 
+  it('limits task preparation overrides to run requests', () => {
+    expect(parseCliArgs(['run', '--enhance', 'auto', 'review the auth code'])).toMatchObject({
+      command: 'run',
+      enhanceMode: 'auto',
+    });
+    expect(() => parseCliArgs(['chat', '--enhance', 'auto', 'hello'])).toThrow('--enhance is supported for run requests only');
+  });
+
   it('parses explicit context refs and rejects ambiguous shorthand', () => {
     expect(parseCliArgs(['run', '--context-ref', `run:${RUN_REF_ID}`, '--context-ref', 'session:session-456', 'summarize'])).toMatchObject({
       command: 'run',

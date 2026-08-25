@@ -22,6 +22,7 @@ import {
   loadAgentSdkConfig,
   type OrchestratedRunResult,
   type OrchestrationLifecycleEvent,
+  type TaskPreparationResult,
   type TuiMessageType,
   type TuiSettingsConfig,
   type TuiTextStyleName,
@@ -145,6 +146,7 @@ export function summarizeCli(cli: ManualTestCliOptions): Record<string, JsonValu
     ...(cli.imagePaths.length > 0 ? { imagePaths: cli.imagePaths.map(resolvePathUnlessUrl) } : {}),
     ...(cli.audioPaths.length > 0 ? { audioPaths: cli.audioPaths.map((path) => resolve(path)) } : {}),
     ...(cli.fileAttachmentPaths.length > 0 ? { fileAttachmentPaths: cli.fileAttachmentPaths.map((path) => resolve(path)) } : {}),
+    ...(cli.enhanceMode ? { enhanceMode: cli.enhanceMode } : {}),
     orchestrate: cli.orchestrate,
     ...(cli.agentCatalogPaths.length > 0 ? { agentCatalogPaths: cli.agentCatalogPaths.map((path) => resolve(path)) } : {}),
     ...(cli.workerCatalogPaths.length > 0 ? { workerCatalogPaths: cli.workerCatalogPaths.map((path) => resolve(path)) } : {}),
@@ -1086,8 +1088,9 @@ export function printDryRun(
   inspection: Awaited<ReturnType<typeof inspectAgentSdkResolution>>,
   spec: ManualTestSpec,
   warnings: string[],
+  taskPreparation?: TaskPreparationResult,
 ): void {
-  const output = summarizeDryRun(cli, inspection, spec, warnings);
+  const output = summarizeDryRun(cli, inspection, spec, warnings, taskPreparation);
   if (cli.output === 'json') {
     console.log(JSON.stringify(output, null, 2));
     return;
@@ -1097,12 +1100,13 @@ export function printDryRun(
     return;
   }
 
-  console.log(renderPrettyString(formatDryRunMarkdown(inspection, spec, warnings)));
+  console.log(renderPrettyString(formatDryRunMarkdown(inspection, spec, warnings, taskPreparation)));
 }
 export function formatDryRunMarkdown(
   inspection: Awaited<ReturnType<typeof inspectAgentSdkResolution>>,
   spec: ManualTestSpec,
   warnings: string[],
+  taskPreparation?: TaskPreparationResult,
 ): string {
   const config = inspection.config;
   const webSearchProvider = resolvedWebSearchProviderForConfig(config);
@@ -1158,6 +1162,24 @@ export function formatDryRunMarkdown(
     `- \`registeredTools\`: ${formatNameList(inspection.registeredToolNames)}`,
   ];
 
+  if (taskPreparation) {
+    lines.push(
+      '',
+      '## Task preparation',
+      '',
+      `- \`agent\`: \`${taskPreparation.preparationAgentId}\``,
+      `- \`runId\`: \`${taskPreparation.preparationRunId}\``,
+      `- \`decision\`: \`${taskPreparation.decision}\``,
+      `- \`reason\`: ${taskPreparation.reason}`,
+      `- \`assumptions\`: ${formatNameList(taskPreparation.assumptions)}`,
+      `- \`clarificationQuestions\`: ${formatNameList(taskPreparation.clarificationQuestions)}`,
+      '',
+      '### Prepared objective',
+      '',
+      taskPreparation.preparedObjective || '(none)',
+    );
+  }
+
   if (warnings.length > 0) {
     lines.push('', '## Warnings', '', ...warnings.map((warning) => `- ${warning}`));
   }
@@ -1170,6 +1192,7 @@ export function summarizeDryRun(
   inspection: Awaited<ReturnType<typeof inspectAgentSdkResolution>>,
   spec: ManualTestSpec,
   warnings: string[],
+  taskPreparation?: TaskPreparationResult,
 ): Record<string, JsonValue> {
   return {
     dryRun: true,
@@ -1181,8 +1204,39 @@ export function summarizeDryRun(
     tools: inspection.tools.map((tool) => tool.name),
     delegates: inspection.delegates as unknown as JsonValue,
     registeredToolNames: inspection.registeredToolNames,
+    ...(taskPreparation ? { taskPreparation: summarizeTaskPreparationResult(taskPreparation) } : {}),
     warnings,
   };
+}
+
+export function summarizeTaskPreparationResult(result: TaskPreparationResult): JsonValue {
+  return {
+    decision: result.decision,
+    preparedObjective: result.preparedObjective,
+    assumptions: result.assumptions,
+    clarificationQuestions: result.clarificationQuestions,
+    reason: result.reason,
+    preparationAgentId: result.preparationAgentId,
+    preparationRunId: result.preparationRunId,
+  };
+}
+
+export function printTaskPreparationResult(result: TaskPreparationResult): void {
+  console.log('task preparation:');
+  console.log(`agent: ${result.preparationAgentId}`);
+  console.log(`runId: ${result.preparationRunId}`);
+  console.log(`decision: ${result.decision}`);
+  console.log(`reason: ${result.reason}`);
+  if (result.assumptions.length > 0) console.log(`assumptions: ${result.assumptions.join('; ')}`);
+  if (result.clarificationQuestions.length > 0) {
+    console.log('clarification questions:');
+    for (const question of result.clarificationQuestions) console.log(`- ${question}`);
+  }
+  if (result.preparedObjective) {
+    console.log('prepared objective:');
+    console.log(renderPrettyString(result.preparedObjective));
+  }
+  console.log('');
 }
 
 function resolvedWebSearchProviderForConfig(config: Awaited<ReturnType<typeof loadAgentSdkConfig>>): string {

@@ -35,6 +35,9 @@ import {
   type AmbientStartResult,
   type OrchestrationLifecycleEvent,
   type OrchestrationSdk,
+  type TaskPreparationMode,
+  type TaskPreparationResult,
+  prepareTask,
 } from './index.js';
 import { doctorExitCode, renderDoctorReport, runDoctor } from './install/doctor.js';
 import { renderInitReport, runInit, type InitProfile } from './install/init.js';
@@ -93,6 +96,7 @@ import {
   printSwarmExecutionPlan,
   printSwarmResult,
   printSwarmRetryResult,
+  printTaskPreparationResult,
   renderPrettyValue,
   renderPrettyString,
   renderStyledPrettyMessage,
@@ -108,6 +112,7 @@ import {
   summarizeResult,
   summarizeSwarmRetry,
   summarizeSwarmRun,
+  summarizeTaskPreparationResult,
 } from './cli-render.js';
 import {
   ADAPTIVE_AGENT_POSITIONAL_COMMANDS,
@@ -217,7 +222,7 @@ const RUN_OUTPUT_OPTIONS_TEXT = `Output/debug options:
   --events                Print lifecycle events as they arrive.
   --show-lines <n>        Maximum pretty-rendered progress lines to show. Default: 3.
   --wrap-width <n>        Fold progress/event text after this many columns. Default: terminal width or 100.
-  --dry-run               Resolve config, request, tools, and delegates without running.`;
+  --dry-run               Resolve without executing the target agent. Runs configured task preparation.`;
 
 const INSPECTION_OPTIONS_TEXT = `Inspection options:
   --inspect               Print a compact inspection summary after completion.`;
@@ -246,6 +251,7 @@ Run options:
   --audio <path>          Add an audio attachment to a run request. Repeatable.
   --file-attachment <path>
                           Add a file attachment to a run request. Repeatable.
+  --enhance <mode>        Task preparation mode: never, auto, or always.
   --orchestrate           Route run requests through the orchestration SDK.
   --catalog <path>        Agent config path to add to orchestration catalog. Repeatable.
 
@@ -1226,6 +1232,7 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
   const sdkOptions = buildSdkOptions(cli, resolvedCwd);
   const inspection = cli.dryRun ? await inspectAgentSdkResolution(sdkOptions) : undefined;
   const resolvedConfig = inspection?.config ?? await loadAgentSdkConfig(sdkOptions);
+  const taskPreparationMode = resolveTaskPreparationMode(cli, resolvedConfig.settings.taskPreparation?.mode);
   const warnings = collectProviderWarnings(spec, resolvedConfig.model.provider);
   const eventLog: Array<Record<string, JsonValue>> = [];
   const lastProgressContentByRun = new Map<string, string>();
@@ -1258,43 +1265,77 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
     printInlineConfigSummary(cli, resolvedConfig, spec, warnings);
   }
 
-  if (cli.dryRun) {
+  if (cli.dryRun && taskPreparationMode === 'never') {
     printDryRun(cli, inspection!, spec, warnings);
     return 0;
   }
 
-  const sdk = await createAgentSdk({
-    ...sdkOptions,
-    eventListener,
-  });
-  const orchestrationSdk = cli.orchestrate && spec.mode === 'run'
-    ? await createOrchestrationSdk({
-        ...sdkOptions,
-        requestedAgentConfig: sdk.config.agent,
-        agentCatalogPaths: cli.agentCatalogPaths,
-        runtime: sdk.created.runtime,
-        eventListener,
-        orchestrationListener,
-      })
-    : undefined;
+  const sdk = await createAgentSdk({ ...sdkOptions, eventListener });
+  let orchestrationSdk: OrchestrationSdk | undefined;
 
   try {
-    const orchestrated = orchestrationSdk && spec.mode === 'run'
-      ? await orchestrationSdk.runRaw(spec.goal, buildRunOptions(spec))
+    const taskPreparation = spec.mode === 'run' && taskPreparationMode !== 'never'
+      ? await prepareInlineTask({
+          cli,
+          mode: taskPreparationMode,
+          originalSpec: spec,
+          targetSdk: sdk,
+          sdkOptions,
+          resolvedCwd,
+          eventListener,
+        })
       : undefined;
-    const result = orchestrated?.finalResult ?? (spec.mode === 'chat'
-      ? await sdk.chat(spec.messages, buildChatOptions(spec))
-      : await sdk.run(spec.goal, buildRunOptions(spec)));
-    const inspection = cli.inspect ? await summarizeInspection(sdk, result.runId) : undefined;
+    const executionSpec = spec.mode === 'run' && taskPreparation
+      ? applyTaskPreparation(spec, taskPreparation)
+      : spec;
+
+    if (taskPreparation && !cli.dryRun && resolvedConfig.settings.taskPreparation?.showPreparedTask !== false && cli.output === 'pretty') {
+      printTaskPreparationResult(taskPreparation);
+    }
+
+    if (cli.dryRun) {
+      printDryRun(cli, inspection!, executionSpec, warnings, taskPreparation);
+      return 0;
+    }
+
+    if (taskPreparation && (taskPreparation.decision === 'clarify' || taskPreparation.decision === 'invalid')) {
+      if (cli.output !== 'pretty') {
+        console.log(JSON.stringify({
+          status: 'task_preparation_stopped',
+          taskPreparation: summarizeTaskPreparationResult(taskPreparation),
+          request: executionSpec as unknown as JsonValue,
+        }, null, cli.output === 'json' ? 2 : undefined));
+      }
+      return 1;
+    }
+
+    orchestrationSdk = cli.orchestrate && executionSpec.mode === 'run'
+      ? await createOrchestrationSdk({
+          ...sdkOptions,
+          requestedAgentConfig: sdk.config.agent,
+          agentCatalogPaths: cli.agentCatalogPaths,
+          runtime: sdk.created.runtime,
+          eventListener,
+          orchestrationListener,
+        })
+      : undefined;
+    const orchestrated = orchestrationSdk && executionSpec.mode === 'run'
+      ? await orchestrationSdk.runRaw(executionSpec.goal, buildRunOptions(executionSpec))
+      : undefined;
+    const result = orchestrated?.finalResult ?? (executionSpec.mode === 'chat'
+      ? await sdk.chat(executionSpec.messages, buildChatOptions(executionSpec))
+      : await sdk.run(executionSpec.goal, buildRunOptions(executionSpec)));
+    const runInspection = cli.inspect ? await summarizeInspection(sdk, result.runId) : undefined;
 
     if (cli.output === 'json') {
       const jsonOutput: ManualTestJsonOutput = {
         cli: summarizeCli(cli),
         resolvedConfig: summarizeResolvedConfig(resolvedConfig, spec),
-        request: spec as unknown as JsonValue,
+        request: executionSpec as unknown as JsonValue,
         warnings,
         result: summarizeResult(result),
-        ...(inspection ? { inspection: inspection as unknown as JsonValue } : {}),
+        ...(taskPreparation ? { taskPreparation: summarizeTaskPreparationResult(taskPreparation) } : {}),
+        ...(runInspection ? { inspection: runInspection as unknown as JsonValue } : {}),
         ...(orchestrated ? { orchestration: summarizeOrchestration(orchestrated) } : {}),
       };
       console.log(JSON.stringify(jsonOutput, null, 2));
@@ -1302,13 +1343,105 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
     }
 
     if (orchestrated) printOrchestration(orchestrated);
-    printResult(result, spec.mode === 'chat' ? 'assistant' : 'run', resolvedConfig.tui);
-    if (cli.inspect && inspection) printInspection(inspection);
+    printResult(result, executionSpec.mode === 'chat' ? 'assistant' : 'run', resolvedConfig.tui);
+    if (cli.inspect && runInspection) printInspection(runInspection);
     if (cli.events && eventLog.length > 0) console.error(`event log captured: ${eventLog.length}`);
     return isSuccessfulResult(result) ? 0 : 1;
   } finally {
     await orchestrationSdk?.close();
     await sdk.close();
+  }
+}
+
+async function prepareInlineTask(args: {
+  cli: ManualTestCliOptions;
+  mode: Exclude<TaskPreparationMode, 'never'>;
+  originalSpec: ManualRunSpec;
+  targetSdk: Awaited<ReturnType<typeof createAgentSdk>>;
+  sdkOptions: AgentSdkOptions;
+  resolvedCwd: string;
+  eventListener?: (event: AgentEvent) => void;
+}): Promise<TaskPreparationResult> {
+  const configuredAgent = args.targetSdk.config.settings.taskPreparation?.agent;
+  if (!configuredAgent) {
+    throw new Error(`Task preparation mode "${args.mode}" requires settings.taskPreparation.agent.`);
+  }
+  const preparationSettings = { ...args.targetSdk.config.settings, agent: undefined };
+  const preparationSdk = await createAgentSdk({
+    ...args.sdkOptions,
+    cwd: args.resolvedCwd,
+    agentConfigPath: configuredAgent,
+    settingsConfigPath: undefined,
+    settingsConfig: preparationSettings,
+    settingsOverrides: undefined,
+    model: undefined,
+    runtime: args.targetSdk.created.runtime,
+    eventListener: args.eventListener,
+  });
+  try {
+    const request = {
+      mode: args.mode,
+      originalObjective: args.originalSpec.goal,
+      targetAgent: args.targetSdk.config.agent,
+      workspaceRoot: args.targetSdk.config.workspaceRoot,
+      attachments: {
+        images: args.cli.imagePaths,
+        files: args.cli.fileAttachmentPaths,
+        audio: args.cli.audioPaths,
+      },
+    } as const;
+    let prepared = await prepareTask(preparationSdk, request);
+    if (
+      prepared.decision === 'clarify'
+      && !args.cli.dryRun
+      && args.targetSdk.config.interaction.clarificationMode === 'interactive'
+      && process.stdin.isTTY
+    ) {
+      const clarificationAnswers = await promptForTaskClarifications(prepared.clarificationQuestions);
+      prepared = await prepareTask(preparationSdk, { ...request, clarificationAnswers });
+    }
+    return prepared;
+  } finally {
+    await preparationSdk.close();
+  }
+}
+
+function resolveTaskPreparationMode(cli: ManualTestCliOptions, configuredMode: TaskPreparationMode | undefined): TaskPreparationMode {
+  return cli.enhanceMode ?? configuredMode ?? 'never';
+}
+
+function applyTaskPreparation(spec: ManualRunSpec, result: TaskPreparationResult): ManualRunSpec {
+  const executable = result.decision === 'complete' || result.decision === 'enhance';
+  const goal = executable ? result.preparedObjective : spec.goal;
+  return {
+    ...spec,
+    goal,
+    metadata: {
+      ...(spec.metadata ?? {}),
+      taskPreparation: {
+        originalObjective: spec.goal,
+        preparedObjective: result.preparedObjective,
+        decision: result.decision,
+        assumptions: result.assumptions,
+        clarificationQuestions: result.clarificationQuestions,
+        reason: result.reason,
+        preparationAgentId: result.preparationAgentId,
+        preparationRunId: result.preparationRunId,
+      },
+    },
+  };
+}
+
+async function promptForTaskClarifications(questions: string[]): Promise<Record<string, string>> {
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    const answers: Record<string, string> = {};
+    for (const question of questions) {
+      answers[question] = (await rl.question(`${question}\n> `)).trim();
+    }
+    return answers;
+  } finally {
+    rl.close();
   }
 }
 
@@ -2311,6 +2444,9 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
       case '--file-attachment':
         options.fileAttachmentPaths.push(requireOptionValue(arg, argv[++index]));
         break;
+      case '--enhance':
+        options.enhanceMode = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['never', 'auto', 'always']);
+        break;
       case '--orchestrate':
         options.orchestrate = true;
         break;
@@ -2589,6 +2725,10 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
 
   if (!options.help && options.command === 'chat' && options.orchestrate) {
     throw new Error('--orchestrate is supported for run requests, not chat requests');
+  }
+
+  if (!options.help && options.enhanceMode && options.command !== 'run') {
+    throw new Error('--enhance is supported for run requests only');
   }
 
   if (!options.help && options.orchestrate && contextBundleInputCount > 0) {

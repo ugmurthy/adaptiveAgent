@@ -41,7 +41,7 @@ Common options:
 | `--progress` | Print assistant progress summaries while the run executes. |
 | `--events` | Print lifecycle events while the run executes. |
 | `--inspect` | Print a compact run/event summary after completion. |
-| `--dry-run` | Resolve config, request, tools, and delegates without executing. |
+| `--dry-run` | Resolve without executing the target agent. Configured task preparation still runs and may incur a model call. |
 
 Use `adaptive-agent catalog` to print a human-readable inventory of the active agent, every agent found in `settings.agents.dirs`, every registered tool, and delegate skills found in `settings.skills.dirs`. Add `--output json` or `--output jsonl` for scripts.
 
@@ -144,6 +144,31 @@ Minimal `agent.settings.json`:
   }
 }
 ```
+
+### Task preparation
+
+`adaptive-agent run` can use a separate agent to assess and improve the objective before the resolved `--agent` or default agent executes it:
+
+```json
+{
+  "taskPreparation": {
+    "mode": "auto",
+    "agent": "task-preparer",
+    "showPreparedTask": true
+  }
+}
+```
+
+The preparer is resolved by path or name through `agents.dirs`. Modes are `never`, `auto`, and `always`; override the configured mode for one request with `--enhance <mode>`. In `auto`, the preparer may preserve an already executable objective, enhance an underspecified objective, request clarification, or reject invalid input. The execution agent, tools, model, permissions, and execution strategy remain unchanged.
+
+Task preparation returns a strict structured result. Both the original and prepared objectives, the decision, assumptions, reason, preparation agent id, and preparation run id are recorded in execution metadata. With `--dry-run`, the preparation agent runs and its full result is printed, but the target agent does not run:
+
+```bash
+adaptive-agent run --dry-run "review the auth code"
+adaptive-agent run --enhance never "use this objective verbatim"
+```
+
+Because preparation is a real model-backed run, `--dry-run` may have latency and cost when preparation is enabled.
 
 Built-in tool names available to `agent.json` are:
 

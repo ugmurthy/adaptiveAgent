@@ -162,6 +162,7 @@ function mergeSettings(base: AgentSettingsFile, overrides: AgentSettingsFile | u
     ...(base.workspace || overrides.workspace ? { workspace: { ...(base.workspace ?? {}), ...(overrides.workspace ?? {}) } } : {}),
     ...(base.model || overrides.model ? { model: { ...(base.model ?? {}), ...(overrides.model ?? {}) } } : {}),
     ...(base.inference || overrides.inference ? { inference: { ...(base.inference ?? {}), ...(overrides.inference ?? {}) } } : {}),
+    ...(base.taskPreparation || overrides.taskPreparation ? { taskPreparation: { ...(base.taskPreparation ?? {}), ...(overrides.taskPreparation ?? {}) } } : {}),
     ...(base.gateway || overrides.gateway ? { gateway: { ...(base.gateway ?? {}), ...(overrides.gateway ?? {}) } } : {}),
     ...(base.defaults || overrides.defaults ? { defaults: { ...(base.defaults ?? {}), ...(overrides.defaults ?? {}) } } : {}),
     ...(base.env || overrides.env ? { env: { ...(base.env ?? {}), ...(overrides.env ?? {}) } } : {}),

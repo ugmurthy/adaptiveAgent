@@ -8,6 +8,65 @@ This project follows semantic versioning for release notes.
 
 ### Added
 
+- Added configurable CLI task preparation that can validate, clarify, or
+  enhance objectives before execution.
+
+### Changed
+
+- Updated the release workflow to build gateway workspace dependencies before
+  release-critical tests and to run those tests with Bun in an isolated home.
+
+### Fixed
+
+- Fixed the desktop application hanging after an agent profile is saved.
+- Fixed the release gate failing to resolve unbuilt gateway packages and
+  loading `bun:sqlite` through Node-hosted Vitest.
+
+## [0.1.43] - 2026-08-21
+
+### Added
+
+- Added Desktop Agent Studio with a durable agent catalog, agent-scoped runtime
+  generations, native agent windows, profile creation and editing, and profile
+  lifecycle controls.
+- Added secure generic file attachments and native settings path pickers to the
+  desktop application.
+- Added filtered artifact views, export workflows, and in-app artifact
+  previews to the desktop workbench.
+
+### Changed
+
+- Redesigned the desktop workbench and expanded recovery, retry, resume,
+  export, artifact, and settings workflows around durable workbench state.
+
+### Fixed
+
+- Hardened desktop startup, shutdown, refresh, renderer teardown, sidecar
+  response routing, runtime locking, and persisted projection handling to
+  prevent hangs, deadlocks, stale loading states, and catalog recovery races.
+- Fixed macOS file-picker hangs, run-result jitter, screen flashing, invalid
+  attachment diagnostics, artifact access, and run deletion behavior.
+- Fixed Markdown and Mermaid rendering, including preservation of generated
+  Mermaid styles in desktop previews.
+- Fixed imported-module resolution for skill handlers, including portable
+  persistent code-executor and E2B handling.
+
+## [0.1.42] - 2026-08-04
+
+### Added
+
+- Added a durable desktop workbench with concurrent runs, persistent chat,
+  manual approvals, activity narratives, trace inspection, history deletion,
+  history search, and Markdown and Mermaid result rendering.
+
+### Fixed
+
+- Fixed desktop progress rendering and SQLite-backed runtime cost accounting.
+
+## [0.1.41] - 2026-08-02
+
+### Added
+
 - Added a Tauri desktop MVP backed by the local desktop bridge, including
   runtime lifecycle controls, run and chat workflows, native release assets,
   and cross-platform application icons.

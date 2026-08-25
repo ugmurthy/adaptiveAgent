@@ -134,6 +134,22 @@ describe('agent-sdk config resolution', () => {
     });
   });
 
+  it('loads task preparation settings and requires a preparer when enabled', async () => {
+    await writeAgentConfig(join(tempDir, 'agent.json'));
+    await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({
+      taskPreparation: { mode: 'auto', agent: 'task-preparer', showPreparedTask: true },
+    }));
+
+    const config = await loadAgentSdkConfig({ cwd: tempDir, env: testEnvironment() });
+
+    expect(config.settings.taskPreparation).toEqual({ mode: 'auto', agent: 'task-preparer', showPreparedTask: true });
+
+    await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({ taskPreparation: { mode: 'always' } }));
+    await expect(loadAgentSdkConfig({ cwd: tempDir, env: testEnvironment() })).rejects.toThrow(
+      'settings.taskPreparation.agent is required',
+    );
+  });
+
   it('resolves non-secret gateway settings and inference defaults', async () => {
     await writeAgentConfig(join(tempDir, 'agent.json'));
     await writeFile(
