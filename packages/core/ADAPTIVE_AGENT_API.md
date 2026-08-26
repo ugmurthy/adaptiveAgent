@@ -232,6 +232,8 @@ Options used above:
 - `defaults.maxSteps`: Caps how many model/tool steps a run may use before failing with `MAX_STEPS`.
 - `defaults.toolTimeoutMs`: Sets the default timeout for each tool execution.
 - `defaults.modelTimeoutMs`: Sets the default timeout and lease heartbeat window for model execution.
+- `defaults.modelInactivityTimeoutMs`: Optionally aborts a stream-capable model call when no text, reasoning, or tool-argument delta arrives within the interval. It is disabled by default.
+- `defaults.maxOutputTokens`: Optionally passes a provider output-token limit. It is disabled by default; a response ending with `finishReason: "length"` fails as incomplete.
 - `defaults.capture`: Controls how much tool input/output detail is captured in logs and persisted summaries.
 - `recovery.continuation.enabled`: Turns on support for creating continuation runs after safe recovery analysis.
 - `recovery.continuation.defaultStrategy`: Chooses the default continuation strategy when the caller does not override it.

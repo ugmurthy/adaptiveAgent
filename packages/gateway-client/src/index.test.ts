@@ -441,6 +441,7 @@ describe('gateway model adapter', () => {
     });
     const request: ModelRequest = {
       messages: [{ role: 'user', content: 'hello' }],
+      maxOutputTokens: 4096,
       metadata: { accessToken: 'must-not-transit' },
       executionContext: {
         inferenceMode: 'gateway',
@@ -477,6 +478,7 @@ describe('gateway model adapter', () => {
       providerDurationMs: 7,
       routeAttempts: 1,
     });
+    expect(generateModel.mock.calls[0]?.[0]).toMatchObject({ maxOutputTokens: 4096 });
     expect(generateModel.mock.calls[0]?.[0]).not.toHaveProperty('metadata');
     expect(JSON.stringify(generateModel.mock.calls[0]?.[0])).not.toContain('must-not-transit');
   });

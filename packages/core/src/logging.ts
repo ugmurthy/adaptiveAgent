@@ -29,6 +29,7 @@ export function summarizeModelRequestForLog(request: ModelRequest) {
     messages: request.messages.map(summarizeModelMessageForLog),
     toolNames: request.tools?.map((tool) => tool.name) ?? [],
     outputSchema: request.outputSchema ? summarizeValueForLog(request.outputSchema) : undefined,
+    maxOutputTokens: request.maxOutputTokens,
     metadata: captureValueForLog(request.metadata),
     performance: modelRequestPerformanceMetrics(request),
   };

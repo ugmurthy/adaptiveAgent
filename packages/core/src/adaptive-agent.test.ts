@@ -4344,6 +4344,157 @@ describe('AdaptiveAgent', () => {
     });
   });
 
+  it('does not blindly retry a failed model stream after receiving progress', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    let attempts = 0;
+    const model: ModelAdapter = {
+      provider: 'test',
+      model: 'progress-then-timeout',
+      capabilities: {
+        toolCalling: true,
+        jsonOutput: true,
+        streaming: true,
+        usage: false,
+      },
+      async generate() {
+        throw new Error('generate() should not be used when stream() is available');
+      },
+      async stream(_request, onEvent) {
+        attempts += 1;
+        await onEvent({ type: 'reasoning_delta', delta: 'I am still working.' });
+        throw new DOMException('The operation timed out.', 'TimeoutError');
+      },
+    };
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore,
+      eventStore,
+      snapshotStore,
+      defaults: {
+        modelRetryPolicy: {
+          maxRetries: 1,
+          baseDelayMs: 0,
+          maxDelayMs: 0,
+          jitter: false,
+        },
+      },
+    });
+
+    const result = await agent.run({ goal: 'Do not duplicate a long generation' });
+
+    expect(result).toMatchObject({ status: 'failure', code: 'MODEL_ERROR' });
+    expect(attempts).toBe(1);
+    const events = await eventStore.listByRun(result.runId);
+    expect(events.some((event) => event.type === 'model.retry')).toBe(false);
+    expect(events.find((event) => event.type === 'model.failed')).toMatchObject({
+      payload: expect.objectContaining({
+        timeoutSource: 'model_transport_timeout',
+        retryable: false,
+        retrySuppressedReason: 'stream_progress',
+        performance: expect.objectContaining({
+          streamProgressed: true,
+          streamDeltaEventCount: 1,
+          streamProgressBytes: 19,
+        }),
+      }),
+    });
+  });
+
+  it('fails with an accurate inactivity timeout when a model stream stalls', async () => {
+    const eventStore = new InMemoryEventStore();
+    const model: ModelAdapter = {
+      provider: 'test',
+      model: 'stalled-stream',
+      capabilities: {
+        toolCalling: true,
+        jsonOutput: true,
+        streaming: true,
+        usage: false,
+      },
+      async generate() {
+        throw new Error('generate() should not be used when stream() is available');
+      },
+      async stream(request) {
+        return new Promise((_resolve, reject) => {
+          request.signal?.addEventListener(
+            'abort',
+            () => reject(request.signal?.reason ?? new Error('aborted')),
+            { once: true },
+          );
+        });
+      },
+    };
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore: new InMemoryRunStore(),
+      eventStore,
+      snapshotStore: new InMemorySnapshotStore(),
+      defaults: {
+        modelTimeoutMs: 1000,
+        modelInactivityTimeoutMs: 5,
+      },
+    });
+
+    const result = await agent.run({ goal: 'Detect a stalled stream' });
+
+    expect(result).toMatchObject({
+      status: 'failure',
+      code: 'MODEL_ERROR',
+      error: 'Model stream made no progress for 5ms',
+    });
+    const events = await eventStore.listByRun(result.runId);
+    expect(events.find((event) => event.type === 'model.failed')).toMatchObject({
+      payload: expect.objectContaining({
+        timeoutSource: 'agent_model_inactivity_timeout',
+        timedOut: true,
+      }),
+    });
+  });
+
+  it('passes an optional output token limit to the model', async () => {
+    const model = new SequenceModel([{ finishReason: 'stop', text: 'Bounded response.' }]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [],
+      runStore: new InMemoryRunStore(),
+      eventStore: new InMemoryEventStore(),
+      snapshotStore: new InMemorySnapshotStore(),
+      defaults: { maxOutputTokens: 4096 },
+    });
+
+    await expect(agent.run({ goal: 'Use a bounded response' })).resolves.toMatchObject({ status: 'success' });
+    expect(model.receivedRequests[0]?.maxOutputTokens).toBe(4096);
+  });
+
+  it('fails a length-truncated model response without executing partial tool calls', async () => {
+    let toolExecutions = 0;
+    const model = new SequenceModel([{
+      finishReason: 'length',
+      text: 'Partial response',
+      toolCalls: [{ id: 'partial-call', name: 'lookup', input: { topic: 'partial' } }],
+    }]);
+    const agent = new AdaptiveAgent({
+      model,
+      tools: [createLookupTool(() => { toolExecutions += 1; })],
+      runStore: new InMemoryRunStore(),
+      eventStore: new InMemoryEventStore(),
+      snapshotStore: new InMemorySnapshotStore(),
+    });
+
+    const result = await agent.run({ goal: 'Reject incomplete output' });
+
+    expect(result).toMatchObject({
+      status: 'failure',
+      code: 'MODEL_ERROR',
+      error: expect.stringContaining('output was incomplete'),
+    });
+    expect(toolExecutions).toBe(0);
+  });
+
   it('retries a transient provider model error when modelRetryPolicy allows it', async () => {
     const runStore = new InMemoryRunStore();
     const eventStore = new InMemoryEventStore();
@@ -6850,7 +7001,7 @@ describe('AdaptiveAgent', () => {
       failurePhase: 'http_request',
       failureAttempt: 1,
     });
-    expect(failureLog?.timeoutSource).toBeUndefined();
+    expect(failureLog?.timeoutSource).toBe('model_transport_timeout');
     expect(failureLog?.error).toMatchObject({
       name: 'TimeoutError',
       message: 'The operation timed out.',

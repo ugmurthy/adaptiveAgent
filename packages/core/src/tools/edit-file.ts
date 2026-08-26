@@ -81,6 +81,17 @@ interface EditFileOutput {
   backupPath?: string;
 }
 
+class ExpectedSha256MismatchError extends Error {
+  constructor(
+    public readonly filePath: string,
+    public readonly expectedSha256: string,
+    public readonly actualSha256: string,
+  ) {
+    super(`edit_file expectedSha256 mismatch for ${filePath}`);
+    this.name = 'ExpectedSha256MismatchError';
+  }
+}
+
 const DEFAULT_MAX_FILE_SIZE_BYTES = 10 * 1_048_576; // 10 MiB
 const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
 
@@ -183,6 +194,19 @@ export function createEditFileTool(config?: EditFileToolConfig): ToolDefinition 
       if (error instanceof PathOutsideRootError) {
         return buildWorkspacePathRecovery('edit_file', filePath, error);
       }
+      if (error instanceof ExpectedSha256MismatchError) {
+        return {
+          ok: false,
+          recoveryKind: 'stale_file',
+          toolName: 'edit_file',
+          path: error.filePath,
+          expectedSha256: error.expectedSha256,
+          actualSha256: error.actualSha256,
+          message: error.message,
+          correctiveAction:
+            'Read the current file, revise the edit against that content, then retry using actualSha256 as expectedSha256 only if the file is still unchanged.',
+        };
+      }
 
       return undefined;
     },
@@ -207,7 +231,7 @@ export function createEditFileTool(config?: EditFileToolConfig): ToolDefinition 
 
       const originalSha256 = sha256(originalBuffer);
       if (input.expectedSha256 !== undefined && input.expectedSha256 !== originalSha256) {
-        throw new Error(`edit_file expectedSha256 mismatch for ${resolved}`);
+        throw new ExpectedSha256MismatchError(resolved, input.expectedSha256, originalSha256);
       }
 
       const originalContent = decodeUtf8TextFile(originalBuffer, resolved);

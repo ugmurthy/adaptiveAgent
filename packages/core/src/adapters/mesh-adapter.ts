@@ -257,8 +257,14 @@ class MeshStreamAccumulator {
       }
       if (typeof delta.reasoning === 'string') {
         this.reasoning += delta.reasoning;
+        if (delta.reasoning.length > 0) {
+          events.push({ type: 'reasoning_delta', delta: delta.reasoning });
+        }
       } else if (typeof delta.reasoning_content === 'string') {
         this.reasoning += delta.reasoning_content;
+        if (delta.reasoning_content.length > 0) {
+          events.push({ type: 'reasoning_delta', delta: delta.reasoning_content });
+        }
       }
       if (Array.isArray(delta.reasoning_details)) {
         this.reasoningDetails = delta.reasoning_details as JsonValue[];

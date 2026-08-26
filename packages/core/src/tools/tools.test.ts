@@ -502,7 +502,7 @@ describe('createWriteFileTool', () => {
     await rm(tempDir, { recursive: true, force: true });
   });
 
-  it('writes a file and returns path and size', async () => {
+  it('writes a file and returns path, size, and SHA-256', async () => {
     const tool = createWriteFileTool({ allowedRoot: tempDir });
     const result = (await tool.execute(
       { path: 'output.txt', content: 'written content' } as any,
@@ -511,6 +511,7 @@ describe('createWriteFileTool', () => {
 
     expect(result.path).toBe(join(tempDir, 'output.txt'));
     expect(result.sizeBytes).toBe(15);
+    expect(result.sha256).toBe(createHash('sha256').update('written content').digest('hex'));
 
     const actual = await readFile(join(tempDir, 'output.txt'), 'utf-8');
     expect(actual).toBe('written content');
@@ -582,6 +583,7 @@ describe('createWriteFileTool', () => {
     expect(result.intermediatePath).toMatch(/\.md$/);
     expect(result.stderr).toBe('warning text');
     expect(result.sizeBytes).toBe(Buffer.byteLength('pptx:markdown:# Deck'));
+    expect(result.sha256).toBe(createHash('sha256').update('pptx:markdown:# Deck').digest('hex'));
 
     await expect(readFile(result.intermediatePath, 'utf-8')).resolves.toBe('# Deck');
     await expect(readFile(join(tempDir, 'slides.pptx'), 'utf-8')).resolves.toBe('pptx:markdown:# Deck');

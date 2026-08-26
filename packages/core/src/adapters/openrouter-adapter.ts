@@ -153,6 +153,8 @@ function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
 function toSdkRequest(body: Record<string, unknown>): Record<string, unknown> {
   return {
     ...body,
+    max_tokens: undefined,
+    maxTokens: body.max_tokens,
     messages: Array.isArray(body.messages) ? body.messages.map(toSdkMessage) : body.messages,
     response_format: undefined,
     responseFormat: toProviderSdkResponseFormat(body.response_format),

@@ -301,6 +301,8 @@ export interface AgentDefaults {
   maxSteps?: number;
   toolTimeoutMs?: number;
   modelTimeoutMs?: number;
+  modelInactivityTimeoutMs?: number;
+  maxOutputTokens?: number;
   modelRetryPolicy?: ModelRetryPolicy;
   maxRetriesPerStep?: number;
   fileInputPolicy?: FileInputPolicy;
@@ -611,6 +613,7 @@ export interface ModelRequest {
   outputSchema?: JsonSchema;
   signal?: AbortSignal;
   modelTimeoutMs?: number;
+  maxOutputTokens?: number;
   metadata?: Record<string, JsonValue>;
   /** Opaque host-owned policy, separate from provider-visible metadata and messages. */
   executionContext?: JsonObject;
@@ -646,6 +649,7 @@ export interface ModelResponse {
 export type ModelStreamEvent =
   | { type: 'start'; provider: string; model: string }
   | { type: 'text_delta'; delta: string }
+  | { type: 'reasoning_delta'; delta: string }
   | { type: 'tool_call_start'; toolCallId: string; name: string }
   | { type: 'tool_call_delta'; toolCallId: string; argumentsDelta: string }
   | { type: 'tool_call_end'; toolCall: ModelToolCall }

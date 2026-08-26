@@ -463,6 +463,20 @@ describe('BaseOpenAIChatAdapter', () => {
     ]);
   });
 
+  it('emits reasoning deltas as observable stream progress', async () => {
+    const adapter = createAdapter();
+    const events: ModelStreamEvent[] = [];
+    mockFetchSseResponse([
+      openAIStreamDelta({ reasoning_content: 'Checking sources.' }),
+      openAIStreamDelta({}, { finishReason: 'stop' }),
+    ]);
+
+    const result = await adapter.stream(simpleRequest(), (event) => events.push(event));
+
+    expect(result.reasoning).toBe('Checking sources.');
+    expect(events).toContainEqual({ type: 'reasoning_delta', delta: 'Checking sources.' });
+  });
+
   it('reconstructs fragmented OpenAI-compatible streaming tool calls by index', async () => {
     const adapter = createAdapter();
     const events: ModelStreamEvent[] = [];
@@ -865,6 +879,16 @@ describe('BaseOpenAIChatAdapter', () => {
 
     const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
     expect(body.response_format).toBeUndefined();
+  });
+
+  it('sends an optional output token limit', async () => {
+    const adapter = createAdapter();
+    mockFetchResponse(STOP_RESPONSE);
+
+    await adapter.generate(simpleRequest({ maxOutputTokens: 4096 }));
+
+    const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    expect(body.max_tokens).toBe(4096);
   });
 
   it('sends response_format when strict structured output is configured', async () => {

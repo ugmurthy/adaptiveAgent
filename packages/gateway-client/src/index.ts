@@ -453,6 +453,7 @@ export class GatewayModelAdapter implements ModelAdapter {
       messages,
       tools: request.tools?.map(tool => ({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema as CoreJsonObject })),
       responseSchema: request.outputSchema as CoreJsonObject | undefined,
+      maxOutputTokens: request.maxOutputTokens,
     };
     let result: ModelGenerateResult;
     try {

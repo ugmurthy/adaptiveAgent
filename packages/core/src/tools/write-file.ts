@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { createReadStream } from 'node:fs';
 import { writeFile, mkdir, rm, stat } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
@@ -26,6 +27,7 @@ interface WriteFileInput {
 interface WriteFileOutput {
   path: string;
   sizeBytes: number;
+  sha256: string;
   inputFormat?: string;
   outputFormat?: string;
   intermediatePath?: string;
@@ -69,7 +71,7 @@ export function createWriteFileTool(config?: WriteFileToolConfig): ToolDefinitio
   return {
     name: 'write_file',
     description:
-      'Write UTF-8 text content to a file at the given path. For plain text or Markdown, omit outputFormat; txt, plain, md, and markdown are accepted aliases that write content unchanged. Optionally converts content to docx, pptx, or latex with pandoc. Creates parent directories if needed. Requires approval.',
+      'Write UTF-8 text content to a file at the given path and return the SHA-256 of the written bytes. For plain text or Markdown, omit outputFormat; txt, plain, md, and markdown are accepted aliases that write content unchanged. Optionally converts content to docx, pptx, or latex with pandoc. Creates parent directories if needed. Requires approval.',
     inputSchema: {
       type: 'object',
       required: ['path', 'content'],
@@ -150,12 +152,13 @@ export function createWriteFileTool(config?: WriteFileToolConfig): ToolDefinitio
         await mkdir(dirname(resolved), { recursive: true });
       }
 
-      await writeFile(resolved, content, 'utf-8');
-      const sizeBytes = Buffer.byteLength(content, 'utf-8');
+      const contentBuffer = Buffer.from(content, 'utf8');
+      await writeFile(resolved, contentBuffer);
 
       return {
         path: resolved,
-        sizeBytes,
+        sizeBytes: contentBuffer.byteLength,
+        sha256: sha256(contentBuffer),
       } satisfies WriteFileOutput as unknown as ReturnType<ToolDefinition['execute']>;
     },
   };
@@ -202,6 +205,7 @@ async function writeConvertedFile(options: {
     return {
       path: options.resolvedOutputPath,
       sizeBytes: outputStats.size,
+      sha256: await sha256File(options.resolvedOutputPath),
       inputFormat: options.inputFormat,
       outputFormat: options.outputFormat,
       ...(options.keepIntermediate ? { intermediatePath: sourcePath } : {}),
@@ -212,6 +216,19 @@ async function writeConvertedFile(options: {
       await rm(sourcePath, { force: true });
     }
   }
+}
+
+function sha256(content: Buffer): string {
+  return createHash('sha256').update(content).digest('hex');
+}
+
+async function sha256File(filePath: string): Promise<string> {
+  const hash = createHash('sha256');
+  const stream = createReadStream(filePath);
+  for await (const chunk of stream) {
+    hash.update(chunk);
+  }
+  return hash.digest('hex');
 }
 
 function normalizeInputFormat(inputFormat: string | undefined): string {

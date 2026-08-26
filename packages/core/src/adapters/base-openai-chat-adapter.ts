@@ -471,6 +471,13 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
       }
     }
 
+    if (request.maxOutputTokens !== undefined) {
+      if (!Number.isInteger(request.maxOutputTokens) || request.maxOutputTokens <= 0) {
+        throw new Error('maxOutputTokens must be a positive integer');
+      }
+      body.max_tokens = request.maxOutputTokens;
+    }
+
     return body;
   }
 
@@ -620,6 +627,9 @@ export class OpenAIChatStreamAccumulator {
       const reasoning = readStringProperty(delta, 'reasoning') ?? readStringProperty(delta, 'reasoning_content');
       if (reasoning !== undefined) {
         this.reasoning += reasoning;
+        if (reasoning.length > 0) {
+          events.push({ type: 'reasoning_delta', delta: reasoning });
+        }
       }
 
       const reasoningDetails = readArrayProperty(delta, 'reasoning_details') ?? readArrayProperty(delta, 'reasoningDetails');

@@ -69,6 +69,7 @@ import type {
   ModelMessageContent,
   ModelRequest,
   ModelRetryPolicy,
+  ModelStreamEvent,
   ModelToolCall,
   ModelResponse,
   PlanCondition,
@@ -267,6 +268,8 @@ export class AdaptiveAgent {
     maxSteps: number;
     toolTimeoutMs: number;
     modelTimeoutMs: number;
+    modelInactivityTimeoutMs?: number;
+    maxOutputTokens?: number;
     modelRetryPolicy: ResolvedModelRetryPolicy;
     maxRetriesPerStep: number;
   };
@@ -279,10 +282,20 @@ export class AdaptiveAgent {
   private readonly logger?: Logger;
 
   constructor(private readonly options: AdaptiveAgentOptions) {
+    if (options.defaults?.modelInactivityTimeoutMs !== undefined
+      && (!Number.isFinite(options.defaults.modelInactivityTimeoutMs) || options.defaults.modelInactivityTimeoutMs <= 0)) {
+      throw new Error('modelInactivityTimeoutMs must be a positive finite number');
+    }
+    if (options.defaults?.maxOutputTokens !== undefined
+      && (!Number.isInteger(options.defaults.maxOutputTokens) || options.defaults.maxOutputTokens <= 0)) {
+      throw new Error('maxOutputTokens must be a positive integer');
+    }
     this.defaults = {
       maxSteps: options.defaults?.maxSteps ?? DEFAULT_AGENT_DEFAULTS.maxSteps,
       toolTimeoutMs: options.defaults?.toolTimeoutMs ?? DEFAULT_AGENT_DEFAULTS.toolTimeoutMs,
       modelTimeoutMs: options.defaults?.modelTimeoutMs ?? resolveDefaultModelTimeoutMs(options.model.provider),
+      modelInactivityTimeoutMs: options.defaults?.modelInactivityTimeoutMs,
+      maxOutputTokens: options.defaults?.maxOutputTokens,
       modelRetryPolicy: resolveModelRetryPolicy(options.defaults?.modelRetryPolicy),
       maxRetriesPerStep: options.defaults?.maxRetriesPerStep ?? DEFAULT_AGENT_DEFAULTS.maxRetriesPerStep,
     };
@@ -1970,6 +1983,15 @@ export class AdaptiveAgent {
 
         if (response.finishReason === 'error') {
           return this.failRun(currentRun, state, 'Model returned finishReason=error', 'MODEL_ERROR');
+        }
+
+        if (response.finishReason === 'length') {
+          return this.failRun(
+            currentRun,
+            state,
+            'Model output was incomplete because it reached the configured or provider output-token limit',
+            'MODEL_ERROR',
+          );
         }
 
         if (response.toolCalls && response.toolCalls.length > 0) {
@@ -4131,6 +4153,7 @@ export class AdaptiveAgent {
       messages: normalizeSystemMessagesAtStart(normalizeToolResultMessagesForModel(state.messages)),
       tools: this.plannerVisibleTools(state),
       outputSchema: state.outputSchema,
+      maxOutputTokens: this.defaults.maxOutputTokens,
       metadata: run.metadata,
       executionContext: run.executionContext,
     };
@@ -4144,7 +4167,39 @@ export class AdaptiveAgent {
     for (let attempt = 1; ; attempt += 1) {
       const invocation = createModelInvocationContext(run, 'agent_turn', attempt, modelRequest);
       const startedAt = Date.now();
-      const timeoutContext = createAbortTimeoutContext(modelTimeoutMs);
+      const timeoutContext = createAbortTimeoutContext(
+        modelTimeoutMs,
+        this.options.model.stream ? this.defaults.modelInactivityTimeoutMs : undefined,
+      );
+      const streamProgress = {
+        deltaEventCount: 0,
+        bytes: 0,
+        firstAt: undefined as number | undefined,
+        lastAt: undefined as number | undefined,
+      };
+      const recordStreamProgress = (event: ModelStreamEvent): void => {
+        const delta = event.type === 'text_delta'
+          ? event.delta
+          : event.type === 'reasoning_delta'
+            ? event.delta
+            : event.type === 'tool_call_delta'
+              ? event.argumentsDelta
+              : undefined;
+        if (!delta) return;
+        const now = Date.now();
+        streamProgress.deltaEventCount += 1;
+        streamProgress.bytes += Buffer.byteLength(delta, 'utf8');
+        streamProgress.firstAt ??= now;
+        streamProgress.lastAt = now;
+        timeoutContext.recordProgress();
+      };
+      const streamProgressMetrics = (): JsonObject => compactJsonObject({
+        streamProgressed: streamProgress.deltaEventCount > 0,
+        streamDeltaEventCount: streamProgress.deltaEventCount,
+        streamProgressBytes: streamProgress.bytes,
+        firstStreamProgressMs: streamProgress.firstAt === undefined ? undefined : streamProgress.firstAt - startedAt,
+        lastStreamProgressMs: streamProgress.lastAt === undefined ? undefined : streamProgress.lastAt - startedAt,
+      });
 
       this.logLifecycle('debug', 'model.request', {
         ...runLogBindings(run),
@@ -4165,6 +4220,8 @@ export class AdaptiveAgent {
           callId: invocation.callId,
           purpose: invocation.purpose,
           modelTimeoutMs,
+          modelInactivityTimeoutMs: this.defaults.modelInactivityTimeoutMs,
+          maxOutputTokens: this.defaults.maxOutputTokens,
           provider: modelProvider,
           model: modelName,
           startedAt: new Date(startedAt).toISOString(),
@@ -4178,7 +4235,7 @@ export class AdaptiveAgent {
       let caughtError: unknown;
       let didCatch = false;
       try {
-        response = await this.options.model.generate({
+        const request: ModelRequest = {
           ...modelRequest,
           invocation,
           signal: timeoutContext.signal,
@@ -4232,7 +4289,10 @@ export class AdaptiveAgent {
               }),
             });
           },
-        });
+        };
+        response = this.options.model.stream
+          ? await this.options.model.stream(request, recordStreamProgress)
+          : await this.options.model.generate(request);
       } catch (error) {
         didCatch = true;
         caughtError = error;
@@ -4242,23 +4302,35 @@ export class AdaptiveAgent {
 
       if (didCatch) {
         const timedOut = timeoutContext.didTimeout();
-        const modelError = timedOut
+        const agentTimeoutSource = timeoutContext.timeoutSource();
+        const modelError = agentTimeoutSource === 'agent_model_timeout'
           ? createModelTimeoutError(modelTimeoutMs, caughtError)
-          : caughtError;
+          : agentTimeoutSource === 'agent_model_inactivity_timeout'
+            ? createModelInactivityTimeoutError(this.defaults.modelInactivityTimeoutMs!, caughtError)
+            : caughtError;
         const failureKind = classifyModelErrorKind(modelError, timedOut);
-        const retryDelayMs = resolveModelRetryDelayMs(retryPolicy, attempt, failureKind);
+        const streamProgressed = streamProgress.deltaEventCount > 0;
+        const policyRetryDelayMs = resolveModelRetryDelayMs(retryPolicy, attempt, failureKind);
+        const retrySuppressed = streamProgressed && policyRetryDelayMs !== undefined;
+        const retryDelayMs = streamProgressed
+          ? undefined
+          : policyRetryDelayMs;
         const willRetry = retryDelayMs !== undefined;
+        const timeoutSource = agentTimeoutSource ?? (failureKind === 'timeout' ? 'model_transport_timeout' : undefined);
         const durationMs = Date.now() - startedAt;
         const failurePerformance = compactJsonObject({
           ...requestPerformance,
+          ...streamProgressMetrics(),
           durationMs,
           timedOut,
+          timeoutSource,
           modelTimeoutMs,
           attempt,
           maxAttempts,
           failureKind,
           retryDelayMs,
           willRetry,
+          retrySuppressedReason: retrySuppressed ? 'stream_progress' : undefined,
         });
         this.logLifecycle('error', 'model.failed', {
           ...runLogBindings(run),
@@ -4268,7 +4340,8 @@ export class AdaptiveAgent {
           performance: failurePerformance,
           ...summarizeModelFailureForLog(modelError, {
             modelTimeoutMs,
-            timedOut,
+            modelInactivityTimeoutMs: this.defaults.modelInactivityTimeoutMs,
+            timeoutSource,
           }),
           attempt,
           maxAttempts,
@@ -4287,13 +4360,17 @@ export class AdaptiveAgent {
               callId: invocation.callId,
               durationMs,
               timedOut,
+              timeoutSource,
               modelTimeoutMs,
+              modelInactivityTimeoutMs: this.defaults.modelInactivityTimeoutMs,
+              maxOutputTokens: this.defaults.maxOutputTokens,
               provider: modelProvider,
               model: modelName,
               attempt,
               maxAttempts,
               failureKind,
               retryable: willRetry,
+              retrySuppressedReason: retrySuppressed ? 'stream_progress' : undefined,
               performance: failurePerformance,
               error: errorToMessage(modelError),
             }),
@@ -4363,6 +4440,7 @@ export class AdaptiveAgent {
       const actualModel = response.usage?.model ?? modelName;
       const responsePerformance = compactJsonObject({
         ...modelResponsePerformanceMetrics(response),
+        ...streamProgressMetrics(),
         durationMs,
         pendingToolCallCount: response.toolCalls?.length ?? 0,
         attempt,
@@ -4418,6 +4496,7 @@ export class AdaptiveAgent {
       messages: buildOutputSchemaRepairMessages(text, outputSchema),
       tools: [],
       outputSchema,
+      maxOutputTokens: this.defaults.maxOutputTokens,
       executionContext: run.executionContext,
       metadata: mergeMetadata(
         run.metadata,
@@ -7378,35 +7457,68 @@ function truncateUtf8String(text: string, maxBytes: number): { text: string; byt
   };
 }
 
-function createAbortTimeoutContext(timeoutMs: number): {
+function createAbortTimeoutContext(timeoutMs: number, inactivityTimeoutMs?: number): {
   signal: AbortSignal | undefined;
   didTimeout: () => boolean;
+  timeoutSource: () => 'agent_model_timeout' | 'agent_model_inactivity_timeout' | undefined;
+  recordProgress: () => void;
   dispose: () => void;
 } {
-  if (!timeoutMs || timeoutMs <= 0) {
+  const hasAbsoluteTimeout = Boolean(timeoutMs && timeoutMs > 0);
+  const hasInactivityTimeout = Boolean(inactivityTimeoutMs && inactivityTimeoutMs > 0);
+  if (!hasAbsoluteTimeout && !hasInactivityTimeout) {
     return {
       signal: undefined,
       didTimeout: () => false,
+      timeoutSource: () => undefined,
+      recordProgress: () => undefined,
       dispose: () => undefined,
     };
   }
 
   const controller = new AbortController();
-  let timedOut = false;
-  const timeoutId = setTimeout(() => {
-    timedOut = true;
-    controller.abort(createModelTimeoutError(timeoutMs));
-  }, timeoutMs);
+  let source: 'agent_model_timeout' | 'agent_model_inactivity_timeout' | undefined;
+  let inactivityTimeoutId: ReturnType<typeof setTimeout> | undefined;
+  const abortForInactivity = () => {
+    if (source) return;
+    source = 'agent_model_inactivity_timeout';
+    controller.abort(createModelInactivityTimeoutError(inactivityTimeoutMs!));
+  };
+  const resetInactivityTimeout = () => {
+    if (!hasInactivityTimeout || source) return;
+    if (inactivityTimeoutId) clearTimeout(inactivityTimeoutId);
+    inactivityTimeoutId = setTimeout(abortForInactivity, inactivityTimeoutMs);
+  };
+  const timeoutId = hasAbsoluteTimeout
+    ? setTimeout(() => {
+      if (source) return;
+      source = 'agent_model_timeout';
+      controller.abort(createModelTimeoutError(timeoutMs));
+    }, timeoutMs)
+    : undefined;
+  resetInactivityTimeout();
 
   return {
     signal: controller.signal,
-    didTimeout: () => timedOut,
-    dispose: () => clearTimeout(timeoutId),
+    didTimeout: () => source !== undefined,
+    timeoutSource: () => source,
+    recordProgress: resetInactivityTimeout,
+    dispose: () => {
+      if (timeoutId) clearTimeout(timeoutId);
+      if (inactivityTimeoutId) clearTimeout(inactivityTimeoutId);
+    },
   };
 }
 
 function createModelTimeoutError(timeoutMs: number, cause?: unknown): ModelTimeoutError {
   return new ModelTimeoutError(`Model timed out after ${timeoutMs}ms`, cause === undefined ? undefined : { cause });
+}
+
+function createModelInactivityTimeoutError(timeoutMs: number, cause?: unknown): ModelTimeoutError {
+  return new ModelTimeoutError(
+    `Model stream made no progress for ${timeoutMs}ms`,
+    cause === undefined ? undefined : { cause },
+  );
 }
 
 function sleep(delayMs: number): Promise<void> {
@@ -7445,15 +7557,22 @@ async function runWithTimeout<T>(timeoutMs: number, context: RuntimeToolContext,
 
 function summarizeModelFailureForLog(
   error: unknown,
-  options: { modelTimeoutMs: number; timedOut: boolean },
+  options: {
+    modelTimeoutMs: number;
+    modelInactivityTimeoutMs?: number;
+    timeoutSource?: string;
+  },
 ): Record<string, JsonValue | undefined> {
   return {
     failurePhase: extractErrorField(error, 'modelInvocationPhase') as string | undefined,
     failureAttempt: extractNumericErrorField(error, 'modelInvocationAttempt'),
     statusCode: extractNumericErrorField(error, 'modelInvocationStatusCode'),
     retryDelayMs: extractNumericErrorField(error, 'modelInvocationRetryDelayMs'),
-    timeoutSource: options.timedOut ? 'agent_model_timeout' : undefined,
-    configuredModelTimeoutMs: options.timedOut ? options.modelTimeoutMs : undefined,
+    timeoutSource: options.timeoutSource,
+    configuredModelTimeoutMs: options.timeoutSource === 'agent_model_timeout' ? options.modelTimeoutMs : undefined,
+    configuredModelInactivityTimeoutMs: options.timeoutSource === 'agent_model_inactivity_timeout'
+      ? options.modelInactivityTimeoutMs
+      : undefined,
   };
 }
 

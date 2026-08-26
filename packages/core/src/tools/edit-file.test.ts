@@ -172,6 +172,28 @@ describe('createEditFileTool', () => {
     await expect(readFile(join(tempDir, 'file.txt'), 'utf8')).resolves.toBe('original');
   });
 
+  it('returns recoverable current-state metadata for expectedSha256 mismatches', async () => {
+    await writeFile(join(tempDir, 'file.txt'), 'current');
+
+    const tool = createEditFileTool({ allowedRoot: tempDir });
+    const result = await executeRecoverableTool(tool, {
+      path: 'file.txt',
+      expectedSha256: sha256('stale'),
+      edits: [{ type: 'replace', oldText: 'current', newText: 'changed' }],
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      recoveryKind: 'stale_file',
+      toolName: 'edit_file',
+      path: join(tempDir, 'file.txt'),
+      expectedSha256: sha256('stale'),
+      actualSha256: sha256('current'),
+      correctiveAction: expect.stringContaining('Read the current file'),
+    });
+    await expect(readFile(join(tempDir, 'file.txt'), 'utf8')).resolves.toBe('current');
+  });
+
   it('returns recoverable output for paths outside the allowed root', async () => {
     const tool = createEditFileTool({ allowedRoot: tempDir });
     const result = await executeRecoverableTool(tool, {

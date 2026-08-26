@@ -151,6 +151,8 @@ export interface AgentConfigFile {
     maxSteps?: number;
     toolTimeoutMs?: number;
     modelTimeoutMs?: number;
+    modelInactivityTimeoutMs?: number;
+    maxOutputTokens?: number;
     maxRetriesPerStep?: number;
     requireApprovalForWriteTools?: boolean;
     autoApproveAll?: boolean;
@@ -286,6 +288,8 @@ export interface AgentSettingsFile {
     maxSteps?: number;
     toolTimeoutMs?: number;
     modelTimeoutMs?: number;
+    modelInactivityTimeoutMs?: number;
+    maxOutputTokens?: number;
   };
 
   env?: Record<string, string>;
