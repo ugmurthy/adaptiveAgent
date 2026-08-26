@@ -38,6 +38,7 @@ import {
   type TaskPreparationMode,
   type TaskPreparationResult,
   prepareTask,
+  restoreTaskPreparation,
 } from './index.js';
 import { doctorExitCode, renderDoctorReport, runDoctor } from './install/doctor.js';
 import { renderInitReport, runInit, type InitProfile } from './install/init.js';
@@ -252,6 +253,8 @@ Run options:
   --file-attachment <path>
                           Add a file attachment to a run request. Repeatable.
   --enhance <mode>        Task preparation mode: never, auto, or always.
+  --from-preparation <runId>
+                          Reuse a successful task preparation run.
   --orchestrate           Route run requests through the orchestration SDK.
   --catalog <path>        Agent config path to add to orchestration catalog. Repeatable.
 
@@ -1200,13 +1203,17 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
   const resolvedCwd = resolve(cli.cwd ?? process.cwd());
   const promptLabel = mode === 'run' ? 'run goal' : 'chat message';
   let goal: string;
-  try {
-    goal = await readInlinePrompt(cli, promptLabel);
-  } catch (error) {
-    if (mode === 'chat' && cli.output === 'pretty' && isMissingInlinePromptError(error, promptLabel)) {
-      return runInteractiveChatCommand(cli);
+  if (mode === 'run' && cli.fromPreparationRunId) {
+    goal = '';
+  } else {
+    try {
+      goal = await readInlinePrompt(cli, promptLabel);
+    } catch (error) {
+      if (mode === 'chat' && cli.output === 'pretty' && isMissingInlinePromptError(error, promptLabel)) {
+        return runInteractiveChatCommand(cli);
+      }
+      throw error;
     }
-    throw error;
   }
   const preparedContext = await prepareCliContext(cli, resolvedCwd);
   const spec: ManualTestSpec = mode === 'run'
@@ -1233,7 +1240,7 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
   const inspection = cli.dryRun ? await inspectAgentSdkResolution(sdkOptions) : undefined;
   const resolvedConfig = inspection?.config ?? await loadAgentSdkConfig(sdkOptions);
   const taskPreparationMode = resolveTaskPreparationMode(cli, resolvedConfig.settings.taskPreparation?.mode);
-  const warnings = collectProviderWarnings(spec, resolvedConfig.model.provider);
+  let warnings = collectProviderWarnings(spec, resolvedConfig.model.provider);
   const eventLog: Array<Record<string, JsonValue>> = [];
   const lastProgressContentByRun = new Map<string, string>();
   const progressRunColors = cli.progress && cli.output === 'pretty' ? new RunColorRegistry() : undefined;
@@ -1257,15 +1264,11 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
     }
   } : undefined;
 
-  for (const warning of warnings) {
-    if (cli.output === 'pretty') console.error(`warning: ${warning}`);
-  }
-
-  if (cli.output === 'pretty') {
-    printInlineConfigSummary(cli, resolvedConfig, spec, warnings);
-  }
-
-  if (cli.dryRun && taskPreparationMode === 'never') {
+  if (cli.dryRun && taskPreparationMode === 'never' && !cli.fromPreparationRunId) {
+    for (const warning of warnings) {
+      if (cli.output === 'pretty') console.error(`warning: ${warning}`);
+    }
+    if (cli.output === 'pretty') printInlineConfigSummary(cli, resolvedConfig, spec, warnings);
     printDryRun(cli, inspection!, spec, warnings);
     return 0;
   }
@@ -1274,20 +1277,36 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
   let orchestrationSdk: OrchestrationSdk | undefined;
 
   try {
-    const taskPreparation = spec.mode === 'run' && taskPreparationMode !== 'never'
-      ? await prepareInlineTask({
-          cli,
-          mode: taskPreparationMode,
+    const taskPreparations = spec.mode === 'run' && cli.fromPreparationRunId
+      ? [await loadTaskPreparation({
+          runId: cli.fromPreparationRunId,
           originalSpec: spec,
           targetSdk: sdk,
-          sdkOptions,
-          resolvedCwd,
-          eventListener,
-        })
-      : undefined;
-    const executionSpec = spec.mode === 'run' && taskPreparation
-      ? applyTaskPreparation(spec, taskPreparation)
+          cli,
+        })]
+      : spec.mode === 'run' && taskPreparationMode !== 'never'
+        ? await prepareInlineTask({
+            cli,
+            mode: taskPreparationMode,
+            originalSpec: spec,
+            targetSdk: sdk,
+            sdkOptions,
+            resolvedCwd,
+            eventListener,
+          })
+        : undefined;
+    const taskPreparation = taskPreparations?.at(-1);
+    const executionSpec = spec.mode === 'run' && taskPreparations
+      ? applyTaskPreparation(spec, taskPreparations, cli.fromPreparationRunId ? 'reused' : 'inline')
       : spec;
+    warnings = collectProviderWarnings(executionSpec, resolvedConfig.model.provider);
+
+    for (const warning of warnings) {
+      if (cli.output === 'pretty') console.error(`warning: ${warning}`);
+    }
+    if (cli.output === 'pretty') {
+      printInlineConfigSummary(cli, resolvedConfig, executionSpec, warnings);
+    }
 
     if (taskPreparation && !cli.dryRun && resolvedConfig.settings.taskPreparation?.showPreparedTask !== false && cli.output === 'pretty') {
       printTaskPreparationResult(taskPreparation);
@@ -1361,7 +1380,7 @@ async function prepareInlineTask(args: {
   sdkOptions: AgentSdkOptions;
   resolvedCwd: string;
   eventListener?: (event: AgentEvent) => void;
-}): Promise<TaskPreparationResult> {
+}): Promise<TaskPreparationResult[]> {
   const configuredAgent = args.targetSdk.config.settings.taskPreparation?.agent;
   if (!configuredAgent) {
     throw new Error(`Task preparation mode "${args.mode}" requires settings.taskPreparation.agent.`);
@@ -1391,6 +1410,7 @@ async function prepareInlineTask(args: {
       },
     } as const;
     let prepared = await prepareTask(preparationSdk, request);
+    const preparations = [prepared];
     if (
       prepared.decision === 'clarify'
       && !args.cli.dryRun
@@ -1399,8 +1419,9 @@ async function prepareInlineTask(args: {
     ) {
       const clarificationAnswers = await promptForTaskClarifications(prepared.clarificationQuestions);
       prepared = await prepareTask(preparationSdk, { ...request, clarificationAnswers });
+      preparations.push(prepared);
     }
-    return prepared;
+    return preparations;
   } finally {
     await preparationSdk.close();
   }
@@ -1410,7 +1431,35 @@ function resolveTaskPreparationMode(cli: ManualTestCliOptions, configuredMode: T
   return cli.enhanceMode ?? configuredMode ?? 'never';
 }
 
-function applyTaskPreparation(spec: ManualRunSpec, result: TaskPreparationResult): ManualRunSpec {
+async function loadTaskPreparation(args: {
+  runId: string;
+  originalSpec: ManualRunSpec;
+  targetSdk: Awaited<ReturnType<typeof createAgentSdk>>;
+  cli: ManualTestCliOptions;
+}): Promise<TaskPreparationResult> {
+  const expected = {
+    targetAgentId: args.targetSdk.config.agent.id,
+    workspaceRoot: args.targetSdk.config.workspaceRoot,
+    attachments: {
+      images: args.cli.imagePaths,
+      files: args.cli.fileAttachmentPaths,
+      audio: args.cli.audioPaths,
+    },
+  };
+  const run = await args.targetSdk.created.runtime.runStore.getRun(args.runId);
+  if (!run) {
+    throw new Error(`Task preparation run ${args.runId} was not found. Use the same durable runtime that created it; memory runtime cannot reuse preparations across CLI invocations.`);
+  }
+  return restoreTaskPreparation(run, expected);
+}
+
+function applyTaskPreparation(
+  spec: ManualRunSpec,
+  results: TaskPreparationResult[],
+  application: 'inline' | 'reused',
+): ManualRunSpec {
+  const result = results.at(-1);
+  if (!result) return spec;
   const executable = result.decision === 'complete' || result.decision === 'enhance';
   const goal = executable ? result.preparedObjective : spec.goal;
   return {
@@ -1419,7 +1468,9 @@ function applyTaskPreparation(spec: ManualRunSpec, result: TaskPreparationResult
     metadata: {
       ...(spec.metadata ?? {}),
       taskPreparation: {
-        originalObjective: spec.goal,
+        schemaVersion: 1,
+        application,
+        originalObjective: result.originalObjective,
         preparedObjective: result.preparedObjective,
         decision: result.decision,
         assumptions: result.assumptions,
@@ -1427,6 +1478,17 @@ function applyTaskPreparation(spec: ManualRunSpec, result: TaskPreparationResult
         reason: result.reason,
         preparationAgentId: result.preparationAgentId,
         preparationRunId: result.preparationRunId,
+        preparationRunIds: results.map((preparation) => preparation.preparationRunId),
+        runs: results.map((preparation) => ({
+          originalObjective: preparation.originalObjective,
+          decision: preparation.decision,
+          preparedObjective: preparation.preparedObjective,
+          assumptions: preparation.assumptions,
+          clarificationQuestions: preparation.clarificationQuestions,
+          reason: preparation.reason,
+          preparationAgentId: preparation.preparationAgentId,
+          preparationRunId: preparation.preparationRunId,
+        })),
       },
     },
   };
@@ -2447,6 +2509,10 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
       case '--enhance':
         options.enhanceMode = parseEnumOption(arg, requireOptionValue(arg, argv[++index]), ['never', 'auto', 'always']);
         break;
+      case '--from-preparation':
+        if (options.fromPreparationRunId) throw new Error('--from-preparation may only be specified once');
+        options.fromPreparationRunId = requireOptionValue(arg, argv[++index]);
+        break;
       case '--orchestrate':
         options.orchestrate = true;
         break;
@@ -2729,6 +2795,18 @@ export function parseCliArgs(argv: string[]): ManualTestCliOptions {
 
   if (!options.help && options.enhanceMode && options.command !== 'run') {
     throw new Error('--enhance is supported for run requests only');
+  }
+
+  if (!options.help && options.fromPreparationRunId && options.command !== 'run') {
+    throw new Error('--from-preparation is supported for run requests only');
+  }
+
+  if (!options.help && options.fromPreparationRunId && options.enhanceMode) {
+    throw new Error('--from-preparation cannot be combined with --enhance');
+  }
+
+  if (!options.help && options.fromPreparationRunId && (options.goalArgs.length > 0 || options.promptFilePath)) {
+    throw new Error('--from-preparation supplies the original goal and cannot be combined with positional goal text or --file');
   }
 
   if (!options.help && options.orchestrate && contextBundleInputCount > 0) {

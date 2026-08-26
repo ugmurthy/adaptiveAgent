@@ -118,6 +118,13 @@ export interface RootRun {
   completedAt?: string | null;
   status: string | null;
   goal: string | null;
+  taskPreparation?: {
+    originalGoal: string;
+    preparedGoal: string;
+    decision?: string;
+    application?: string;
+    preparationRunIds: string[];
+  };
   result: unknown;
   errorCode?: string | null;
   errorMessage?: string | null;

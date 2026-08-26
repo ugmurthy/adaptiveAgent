@@ -331,6 +331,24 @@ describe('adaptive-agent cli parsing', () => {
     expect(() => parseCliArgs(['chat', '--enhance', 'auto', 'hello'])).toThrow('--enhance is supported for run requests only');
   });
 
+  it('parses one reusable task preparation only for run requests', () => {
+    expect(parseCliArgs([
+      'run',
+      '--from-preparation', RUN_REF_ID,
+    ])).toMatchObject({
+      command: 'run',
+      fromPreparationRunId: RUN_REF_ID,
+    });
+    expect(() => parseCliArgs(['run', '--from-preparation', RUN_REF_ID, '--from-preparation', BEFORE_RUN_ID, 'hello']))
+      .toThrow('--from-preparation may only be specified once');
+    expect(() => parseCliArgs(['run', '--from-preparation', RUN_REF_ID, 'review the auth code']))
+      .toThrow('--from-preparation supplies the original goal');
+    expect(() => parseCliArgs(['chat', '--from-preparation', RUN_REF_ID, 'hello']))
+      .toThrow('--from-preparation is supported for run requests only');
+    expect(() => parseCliArgs(['run', '--enhance', 'auto', '--from-preparation', RUN_REF_ID, 'hello']))
+      .toThrow('--from-preparation cannot be combined with --enhance');
+  });
+
   it('parses explicit context refs and rejects ambiguous shorthand', () => {
     expect(parseCliArgs(['run', '--context-ref', `run:${RUN_REF_ID}`, '--context-ref', 'session:session-456', 'summarize'])).toMatchObject({
       command: 'run',

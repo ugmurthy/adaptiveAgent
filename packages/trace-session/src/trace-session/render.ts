@@ -1277,7 +1277,8 @@ function renderHtmlWorkflow(report: TraceReport): string {
     statusCell(run.status ?? 'unknown'),
     formatDuration(durationMs(run.startedAt ?? null, run.completedAt ?? run.updatedAt ?? null)),
     formatRunModel(run) ?? 'unknown',
-    run.errorMessage ?? run.errorCode ?? run.goal ?? '-',
+    run.taskPreparation?.originalGoal ?? '-',
+    run.errorMessage ?? run.errorCode ?? run.taskPreparation?.preparedGoal ?? run.goal ?? '-',
   ]);
   const runTree = report.runTree && report.runTree.length > 0
     ? htmlSubsection('Run tree', htmlTable(
@@ -1324,7 +1325,7 @@ function renderHtmlWorkflow(report: TraceReport): string {
     'Workflow',
     'Root runs, child-run shape, snapshots, and tool timeline for studying how the agent executed the objective.',
     [
-      htmlSubsection('Root runs', rootRows.length === 0 ? '<p class="empty">No root runs were found.</p>' : htmlTable(['Root', 'Linked run', 'Status', 'Duration', 'Model', 'Goal/error'], rootRows)),
+      htmlSubsection('Root runs', rootRows.length === 0 ? '<p class="empty">No root runs were found.</p>' : htmlTable(['Root', 'Linked run', 'Status', 'Duration', 'Model', 'Original goal', 'Prepared goal/error'], rootRows)),
       runTree,
       snapshots,
       htmlSubsection(formatTimelineTitle(report.timeline, report.session), timeline),
@@ -2431,9 +2432,21 @@ function renderGoal(rootRuns: RootRun[]): string {
     return chalk.gray('No root run goal was found.');
   }
   if (rootsWithGoals.length === 1) {
-    return markdownInline(rootsWithGoals[0]!.goal!);
+    return renderRunGoal(rootsWithGoals[0]!);
   }
-  return rootsWithGoals.map((run) => `${chalk.green(shortId(run.rootRunId))}: ${markdownInline(run.goal!)}`).join('\n');
+  return rootsWithGoals.map((run) => `${chalk.green(shortId(run.rootRunId))}:\n${renderRunGoal(run)}`).join('\n');
+}
+
+function renderRunGoal(run: RootRun): string {
+  const preparation = run.taskPreparation;
+  if (!preparation) return markdownInline(run.goal!);
+  return [
+    `${chalk.cyan('original')} ${markdownInline(preparation.originalGoal)}`,
+    `${chalk.cyan('prepared')} ${markdownInline(preparation.preparedGoal)}`,
+    ...(preparation.preparationRunIds.length > 0
+      ? [`${chalk.cyan('preparation runs')} ${preparation.preparationRunIds.join(', ')}`]
+      : []),
+  ].join('\n');
 }
 
 function renderFinalOutput(rootRuns: RootRun[]): string {

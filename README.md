@@ -79,6 +79,104 @@ adaptive-agent run "Hello, confirm you are working"
 
 That is it. You now have a configured local agent that can run goals, use tools, and produce inspectable runtime history.
 
+## Four CLI demonstrations
+
+These examples progress from a single default-agent run to scoped delegation
+and capability-based specialist routing. Run them from the repository or
+project that you want the agents to inspect.
+
+### 1. Run one useful goal
+
+Ask the default agent to inspect the current repository while showing progress
+and a compact post-run summary:
+
+```bash
+adaptive-agent run \
+  --progress \
+  --inspect \
+  "Explain this repository to a new contributor in five bullets."
+```
+
+This exercises default agent resolution, one-shot goal execution, local tools,
+progress updates, and persisted run inspection. Add `--events` to display the
+full lifecycle event stream.
+
+### 2. Refine an idea through chat
+
+Start an interactive conversation:
+
+```bash
+adaptive-agent chat
+```
+
+For example, develop a release plan over several turns:
+
+```text
+You: Help me plan the next release of this project.
+You: Adapt the plan for a small open-source team with one maintainer.
+You: Turn it into a checklist ordered by release risk.
+```
+
+You can also provide the first message directly or pipe it from a file:
+
+```bash
+adaptive-agent chat "Help me review this implementation plan."
+cat implementation-plan.md | adaptive-agent chat
+```
+
+Use `chat` while shaping a goal through conversation. Use `run` when the desired
+outcome is already clear enough to execute as one objective.
+
+### 3. Delegate focused research to a skill
+
+The default `core` bundle includes a `planner` agent and a scoped `research`
+skill. Give the planner a goal that combines local repository evidence with
+external research:
+
+```bash
+adaptive-agent run \
+  --agent planner \
+  --events \
+  --inspect \
+  "Compare this project's retry and recovery model with current agent-runtime practices. Produce a concise plan for communicating three meaningful differentiators, cite the external sources used, and identify claims that still need verification."
+```
+
+The planner owns the top-level objective and can delegate the research portion
+to a skill-backed child run. The delegate receives focused instructions and a
+scoped tool set, then returns its findings to the parent for synthesis. The
+event stream makes the parent and child-run boundaries visible.
+
+### 4. Route a request to a specialist
+
+Orchestration routes work using agent catalog metadata instead of asking a
+model to choose arbitrary profiles. The installed `reviewer` profile declares
+`code review` as a preferred subject, so it can handle the specialist stage
+before the requested default agent synthesizes the final response:
+
+```bash
+adaptive-agent run \
+  --agent default-agent \
+  --orchestrate \
+  --catalog reviewer \
+  --events \
+  --inspect \
+  "Perform a code review of the current changes and prioritize correctness, security, and missing tests."
+```
+
+Catalog profiles can also declare supported and preferred `text`, `image`,
+`file`, and `audio` modalities. With multiple matching specialists,
+orchestration can run independent stages before final synthesis. Preview the
+resolved configuration and request without spending model tokens by adding
+`--dry-run`.
+
+Delegation, orchestration, and swarms serve different scopes:
+
+| Capability | Best use |
+| --- | --- |
+| Delegate skill | One running agent hands off a bounded responsibility to a scoped child run. |
+| Orchestration | The SDK routes known input modalities or subjects to catalog specialists. |
+| `swarm-run` | A coordinator dynamically decomposes a broad objective into independent worker runs and synthesizes their results. |
+
 ### Choose the right CLI command
 
 Use `run` for a one-shot goal. The command accepts the goal directly or reads
@@ -88,6 +186,35 @@ it from a file:
 adaptive-agent run "Summarize this repository and identify the main packages"
 adaptive-agent run --file ./prompts/release-notes.md
 ```
+
+Task preparation can assess and improve a goal before the execution agent runs
+it. Configure `taskPreparation` in `agent.settings.json`, or override its mode
+for one command with `--enhance never|auto|always`. A dry run performs task
+preparation but does not start the execution agent:
+
+```bash
+adaptive-agent run --dry-run --enhance auto \
+  "Gather last week's AI news and write a styled HTML bulletin"
+```
+
+Preparation is a real model-backed run, so this kind of dry run can have
+latency and cost. Its output includes a preparation run ID. Reuse that exact
+prepared goal later without another preparation model call:
+
+```bash
+adaptive-agent run \
+  --from-preparation 62e5b46f-18d8-49aa-ae55-e78f7980ca75 \
+  --progress
+```
+
+`--from-preparation` supplies both the original and prepared goals from the
+persisted preparation, so do not add positional goal text or `--file`. It is
+also mutually exclusive with `--enhance`. Reuse requires the same SQLite or
+Postgres runtime; an in-memory preparation is not available after its CLI
+process exits. The consuming run records the original goal, prepared goal,
+preparation decision, and preparation run ID in metadata. `trace-session`
+reports both goals and the preparation run ID while keeping the preparation
+run separate from the execution trace.
 
 Use `chat` for an interactive conversation, or provide the first message on
 the command line:

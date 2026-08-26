@@ -36,6 +36,7 @@ export interface ManualTestCliOptions {
   audioPaths: string[];
   fileAttachmentPaths: string[];
   enhanceMode?: TaskPreparationMode;
+  fromPreparationRunId?: string;
   orchestrate: boolean;
   agentCatalogPaths: string[];
   workerCatalogPaths: string[];

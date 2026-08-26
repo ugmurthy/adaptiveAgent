@@ -1070,6 +1070,7 @@ async function loadRootRuns(
       completed_at: string | null;
       status: string | null;
       goal: string | null;
+      metadata: unknown;
       result: unknown;
       error_code: string | null;
       error_message: string | null;
@@ -1095,6 +1096,7 @@ async function loadRootRuns(
           r.completed_at as completed_at,
           r.status,
           r.goal,
+          r.metadata,
           r.result,
           r.error_code,
           r.error_message,
@@ -1122,6 +1124,7 @@ async function loadRootRuns(
     completed_at: string | null;
     status: string | null;
     goal: string | null;
+    metadata: unknown;
     result: unknown;
     error_code: string | null;
     error_message: string | null;
@@ -1147,6 +1150,7 @@ async function loadRootRuns(
         r.completed_at as completed_at,
         r.status,
         r.goal,
+        r.metadata,
         r.result,
         r.error_code,
         r.error_message,
@@ -1184,6 +1188,7 @@ function rootRunRowsToRootRuns(rows: Array<{
   completed_at: string | null;
   status: string | null;
   goal: string | null;
+  metadata: unknown;
   result: unknown;
   error_code: string | null;
   error_message: string | null;
@@ -1204,6 +1209,7 @@ function rootRunRowsToRootRuns(rows: Array<{
     completedAt: row.completed_at,
     status: row.status,
     goal: row.goal,
+    taskPreparation: taskPreparationFromMetadata(row.metadata),
     result: row.result,
     errorCode: row.error_code,
     errorMessage: row.error_message,
@@ -1213,6 +1219,26 @@ function rootRunRowsToRootRuns(rows: Array<{
     leaseExpiresAt: row.lease_expires_at,
     heartbeatAt: row.heartbeat_at,
   }));
+}
+
+export function taskPreparationFromMetadata(metadata: unknown): RootRun['taskPreparation'] {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return undefined;
+  const value = (metadata as Record<string, unknown>).taskPreparation;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const preparation = value as Record<string, unknown>;
+  if (typeof preparation.originalObjective !== 'string' || typeof preparation.preparedObjective !== 'string') return undefined;
+  const runIds = Array.isArray(preparation.preparationRunIds)
+    ? preparation.preparationRunIds.filter((runId): runId is string => typeof runId === 'string')
+    : typeof preparation.preparationRunId === 'string'
+      ? [preparation.preparationRunId]
+      : [];
+  return {
+    originalGoal: preparation.originalObjective,
+    preparedGoal: preparation.preparedObjective,
+    ...(typeof preparation.decision === 'string' ? { decision: preparation.decision } : {}),
+    ...(typeof preparation.application === 'string' ? { application: preparation.application } : {}),
+    preparationRunIds: runIds,
+  };
 }
 
 async function loadSessionUsage(

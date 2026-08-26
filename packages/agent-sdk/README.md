@@ -166,9 +166,10 @@ Task preparation returns a strict structured result. Both the original and prepa
 ```bash
 adaptive-agent run --dry-run "review the auth code"
 adaptive-agent run --enhance never "use this objective verbatim"
+adaptive-agent run --from-preparation <runId>
 ```
 
-Because preparation is a real model-backed run, `--dry-run` may have latency and cost when preparation is enabled.
+Because preparation is a real model-backed run, `--dry-run` may have latency and cost when preparation is enabled. A successful preparation from a SQLite or Postgres runtime can be reused without another preparation model call by passing its run id to `--from-preparation`; the stored preparation supplies both the original and prepared objectives. Memory runtime cannot reuse a preparation after the originating CLI process exits.
 
 Built-in tool names available to `agent.json` are:
 

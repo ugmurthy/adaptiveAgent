@@ -1998,6 +1998,47 @@ describe('trace-session CLI helpers', () => {
     expect(output).not.toContain('Final Output');
   });
 
+  it('renders original and prepared goals for enhanced runs', () => {
+    const report = reliabilityReport({
+      rootRuns: [{
+        ...reliabilityReport().rootRuns[0]!,
+        goal: 'Review authentication code and report prioritized findings.',
+        taskPreparation: {
+          originalGoal: 'review auth',
+          preparedGoal: 'Review authentication code and report prioritized findings.',
+          decision: 'enhance',
+          application: 'reused',
+          preparationRunIds: ['prep-1', 'prep-2'],
+        },
+      }],
+    });
+
+    const terminal = stripAnsi(renderTraceReport(report, {
+      json: false,
+      includePlans: false,
+      onlyDelegates: false,
+      messages: false,
+      systemOnly: false,
+      view: 'timeline',
+    }));
+    expect(terminal).toContain('original review auth');
+    expect(terminal).toContain('prepared Review authentication code and report prioritized findings.');
+    expect(terminal).toContain('preparation runs prep-1, prep-2');
+
+    const json = JSON.parse(renderTraceReport(report, {
+      json: true,
+      includePlans: false,
+      onlyDelegates: false,
+      messages: false,
+      systemOnly: false,
+    })) as TraceReport;
+    expect(json.rootRuns[0]?.taskPreparation).toMatchObject({
+      originalGoal: 'review auth',
+      preparedGoal: 'Review authentication code and report prioritized findings.',
+      preparationRunIds: ['prep-1', 'prep-2'],
+    });
+  });
+
   it('prints JSON as machine-readable report output', () => {
     const output = renderTraceReport(
       {

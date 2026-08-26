@@ -147,6 +147,7 @@ export function summarizeCli(cli: ManualTestCliOptions): Record<string, JsonValu
     ...(cli.audioPaths.length > 0 ? { audioPaths: cli.audioPaths.map((path) => resolve(path)) } : {}),
     ...(cli.fileAttachmentPaths.length > 0 ? { fileAttachmentPaths: cli.fileAttachmentPaths.map((path) => resolve(path)) } : {}),
     ...(cli.enhanceMode ? { enhanceMode: cli.enhanceMode } : {}),
+    ...(cli.fromPreparationRunId ? { fromPreparationRunId: cli.fromPreparationRunId } : {}),
     orchestrate: cli.orchestrate,
     ...(cli.agentCatalogPaths.length > 0 ? { agentCatalogPaths: cli.agentCatalogPaths.map((path) => resolve(path)) } : {}),
     ...(cli.workerCatalogPaths.length > 0 ? { workerCatalogPaths: cli.workerCatalogPaths.map((path) => resolve(path)) } : {}),

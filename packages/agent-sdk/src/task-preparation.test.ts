@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { RunResult } from '@adaptive-agent/core';
+import type { AgentRun, RunResult } from '@adaptive-agent/core';
 
-import { prepareTask, validateTaskPreparationOutput, type TaskPreparationRunner } from './task-preparation.js';
+import { prepareTask, restoreTaskPreparation, validateTaskPreparationOutput, type TaskPreparationRunner } from './task-preparation.js';
 import type { AgentConfigFile } from './config-types.js';
 
 describe('task preparation', () => {
@@ -30,6 +30,7 @@ describe('task preparation', () => {
     });
 
     expect(result).toMatchObject({
+      originalObjective: 'review the auth code',
       decision: 'enhance',
       preparationAgentId: 'task-preparer',
       preparationRunId: '11111111-1111-4111-8111-111111111111',
@@ -38,7 +39,52 @@ describe('task preparation', () => {
       forbiddenTools: [],
       outputSchema: expect.objectContaining({ type: 'object' }),
       input: expect.objectContaining({ originalObjective: 'review the auth code' }),
+      metadata: expect.objectContaining({
+        taskPreparation: expect.objectContaining({ originalObjective: 'review the auth code' }),
+      }),
     }));
+  });
+
+  it('restores and validates a successful persisted preparation', () => {
+    const run = {
+      id: '11111111-1111-4111-8111-111111111111',
+      status: 'succeeded',
+      input: {
+        originalObjective: 'review the auth code',
+        workspaceRoot: '/workspace',
+        attachments: { images: [], files: [], audio: [] },
+      },
+      result: {
+        decision: 'enhance',
+        preparedObjective: 'Review authentication code and report prioritized findings.',
+        assumptions: [],
+        clarificationQuestions: [],
+        reason: 'Made the deliverable explicit.',
+      },
+      metadata: {
+        agentId: 'task-preparer',
+        command: 'task-preparation',
+        role: 'task-preparer',
+        targetAgentId: 'reviewer',
+        preparationMode: 'auto',
+      },
+    } as unknown as AgentRun;
+
+    expect(restoreTaskPreparation(run, {
+      targetAgentId: 'reviewer',
+      workspaceRoot: '/workspace',
+      attachments: { images: [], files: [], audio: [] },
+    })).toMatchObject({
+      originalObjective: 'review the auth code',
+      decision: 'enhance',
+      preparationAgentId: 'task-preparer',
+      preparationRunId: run.id,
+    });
+    expect(() => restoreTaskPreparation(run, {
+      targetAgentId: 'another-agent',
+      workspaceRoot: '/workspace',
+      attachments: { images: [], files: [], audio: [] },
+    })).toThrow('targets agent');
   });
 
   it('preserves complete objectives in auto mode', () => {

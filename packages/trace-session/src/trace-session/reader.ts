@@ -4,6 +4,7 @@ import type { Database } from 'bun:sqlite';
 import {
   aggregateSessionPerformance, buildAggregateObservation, filterSessions, listSessionlessRuns,
   listSessionPerformance, listSessions, loadUsageForTraceTarget, runMessageTraceFromRow, traceSession,
+  taskPreparationFromMetadata,
   type ListFilterOptions, type PostgresClient,
 } from './data.js';
 import {
@@ -112,7 +113,7 @@ function parse(text:string,table:string,id:string,column:string):Json { try{retu
 function message(e:unknown){return e instanceof Error?e.message:String(e);}
 function marks(n:number){return n?Array(n).fill('?').join(','):`''`;}
 function sumUsage(items:any[]):UsageSummary{return items.reduce((a,u)=>{u=u??{};const reasoning=Number(u.reasoningTokens??0);a.promptTokens+=Number(u.promptTokens??0);a.completionTokens+=Number(u.completionTokens??0);a.reasoningTokens=(a.reasoningTokens??0)+reasoning;a.totalTokens+=Number(u.totalTokens??(Number(u.promptTokens??0)+Number(u.completionTokens??0)+reasoning));a.estimatedCostUSD+=Number(u.estimatedCostUSD??0);return a;},{promptTokens:0,completionTokens:0,reasoningTokens:0,totalTokens:0,estimatedCostUSD:0} as UsageSummary);}
-function toRoot(r:DbRun&{record:Json}):RootRun{const x=r.record;return{rootRunId:r.root_run_id,runId:r.id,invocationKind:'run',turnIndex:null,linkedAt:x.createdAt,startedAt:x.createdAt,updatedAt:x.updatedAt,completedAt:x.completedAt??null,status:x.status,goal:x.goal??null,result:x.result??null,errorCode:x.errorCode??x.error?.code??null,errorMessage:x.errorMessage??x.error?.message??null,modelProvider:x.modelProvider??null,modelName:x.modelName??null,leaseOwner:x.leaseOwner??null,leaseExpiresAt:x.leaseExpiresAt??null,heartbeatAt:x.heartbeatAt??null};}
+function toRoot(r:DbRun&{record:Json}):RootRun{const x=r.record;return{rootRunId:r.root_run_id,runId:r.id,invocationKind:'run',turnIndex:null,linkedAt:x.createdAt,startedAt:x.createdAt,updatedAt:x.updatedAt,completedAt:x.completedAt??null,status:x.status,goal:x.goal??null,taskPreparation:taskPreparationFromMetadata(x.metadata),result:x.result??null,errorCode:x.errorCode??x.error?.code??null,errorMessage:x.errorMessage??x.error?.message??null,modelProvider:x.modelProvider??null,modelName:x.modelName??null,leaseOwner:x.leaseOwner??null,leaseExpiresAt:x.leaseExpiresAt??null,heartbeatAt:x.heartbeatAt??null};}
 function delegateReason(status:string){return status==='succeeded'?'returned successfully':status==='failed'?'failed':status==='cancelled'?'cancelled':['queued','planning','running'].includes(status)?'still running':'state requires manual inspection';}
 function sessionStatus(statuses:string[]):string{return statuses.every(status=>status==='succeeded')?'succeeded':statuses.includes('failed')?'failed':statuses[0]??'unknown';}
 function classifyRun(record:Json):{type:'run'|'chat'|'swarm'|'swarm-run';swarmRole?:'coordinator'|'worker'|'quality'|'synthesizer'}{const orchestration=record.metadata?.orchestration??{};const role=['coordinator','worker','quality','synthesizer'].includes(orchestration.role)?orchestration.role:undefined;if(orchestration.kind==='swarm'&&role==='coordinator')return{type:'swarm',swarmRole:role};if(orchestration.kind==='swarm'&&role)return{type:'swarm-run',swarmRole:role};return{type:record.metadata?.invocationMode==='chat'||record.context?.invocationMode==='chat'?'chat':'run'};}

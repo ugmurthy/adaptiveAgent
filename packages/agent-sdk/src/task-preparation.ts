@@ -1,10 +1,11 @@
-import type { JsonObject, JsonSchema, JsonValue, RunResult } from '@adaptive-agent/core';
+import type { AgentRun, JsonObject, JsonSchema, JsonValue, RunResult } from '@adaptive-agent/core';
 
 import type { AgentConfigFile, AgentSdkRunOptions, TaskPreparationMode } from './config-types.js';
 
 export type TaskPreparationDecision = 'complete' | 'enhance' | 'clarify' | 'invalid';
 
 export interface TaskPreparationResult {
+  originalObjective: string;
   decision: TaskPreparationDecision;
   preparedObjective: string;
   assumptions: string[];
@@ -12,6 +13,14 @@ export interface TaskPreparationResult {
   reason: string;
   preparationAgentId: string;
   preparationRunId: string;
+}
+
+export interface StoredTaskPreparationRequest {
+  mode: Exclude<TaskPreparationMode, 'never'>;
+  originalObjective: string;
+  targetAgentId: string;
+  workspaceRoot: string;
+  attachments: TaskPreparationAttachmentSummary;
 }
 
 export interface TaskPreparationAttachmentSummary {
@@ -63,16 +72,93 @@ export async function prepareTask(runner: TaskPreparationRunner, request: Prepar
       role: 'task-preparer',
       targetAgentId: request.targetAgent.id,
       preparationMode: request.mode,
+      taskPreparation: {
+        role: 'preparer',
+        originalObjective: request.originalObjective,
+        targetAgentId: request.targetAgent.id,
+        preparationMode: request.mode,
+        workspaceRoot: request.workspaceRoot,
+        attachments: request.attachments as unknown as JsonValue,
+      },
     },
   });
   if (result.status !== 'success') {
     throw new Error(formatTaskPreparationFailure(result));
   }
   return {
+    originalObjective: request.originalObjective,
     ...validateTaskPreparationOutput(result.output, request),
     preparationAgentId: runner.config.agent.id,
     preparationRunId: result.runId,
   };
+}
+
+export function restoreTaskPreparation(
+  run: AgentRun,
+  expected: Omit<StoredTaskPreparationRequest, 'mode' | 'originalObjective'>,
+): TaskPreparationResult {
+  const stored = readStoredTaskPreparationRequest(run);
+  if (run.status !== 'succeeded' || run.result === undefined) {
+    throw new Error(`Task preparation run ${run.id} is not a successful completed run.`);
+  }
+  if (stored.targetAgentId !== expected.targetAgentId) {
+    throw new Error(`Task preparation run ${run.id} targets agent "${stored.targetAgentId}", not "${expected.targetAgentId}".`);
+  }
+  if (stored.workspaceRoot !== expected.workspaceRoot) {
+    throw new Error(`Task preparation run ${run.id} was created for a different workspace.`);
+  }
+  if (!sameAttachmentSummary(stored.attachments, expected.attachments)) {
+    throw new Error(`Task preparation run ${run.id} was created with different attachments.`);
+  }
+  const preparationAgentId = readNonEmptyMetadataString(run.metadata?.agentId, 'agentId', run.id);
+  return {
+    originalObjective: stored.originalObjective,
+    ...validateTaskPreparationOutput(run.result, stored),
+    preparationAgentId,
+    preparationRunId: run.id,
+  };
+}
+
+function readStoredTaskPreparationRequest(run: AgentRun): StoredTaskPreparationRequest {
+  const metadata = run.metadata;
+  if (metadata?.command !== 'task-preparation' || metadata.role !== 'task-preparer') {
+    throw new Error(`Run ${run.id} is not a task preparation run.`);
+  }
+  if (!isRecord(run.input)) {
+    throw new Error(`Task preparation run ${run.id} does not contain its preparation input.`);
+  }
+  const mode = metadata.preparationMode;
+  if (mode !== 'auto' && mode !== 'always') {
+    throw new Error(`Task preparation run ${run.id} has an invalid preparation mode.`);
+  }
+  const attachments = readAttachmentSummary(run.input.attachments, run.id);
+  return {
+    mode,
+    originalObjective: readNonEmptyMetadataString(run.input.originalObjective, 'originalObjective', run.id),
+    targetAgentId: readNonEmptyMetadataString(metadata.targetAgentId, 'targetAgentId', run.id),
+    workspaceRoot: readNonEmptyMetadataString(run.input.workspaceRoot, 'workspaceRoot', run.id),
+    attachments,
+  };
+}
+
+function readAttachmentSummary(value: JsonValue | undefined, runId: string): TaskPreparationAttachmentSummary {
+  if (!isRecord(value)) throw new Error(`Task preparation run ${runId} has invalid attachment metadata.`);
+  return {
+    images: readStringArray(value.images, 'attachments.images'),
+    files: readStringArray(value.files, 'attachments.files'),
+    audio: readStringArray(value.audio, 'attachments.audio'),
+  };
+}
+
+function readNonEmptyMetadataString(value: JsonValue | undefined, name: string, runId: string): string {
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new Error(`Task preparation run ${runId} has an invalid ${name}.`);
+  }
+  return value;
+}
+
+function sameAttachmentSummary(left: TaskPreparationAttachmentSummary, right: TaskPreparationAttachmentSummary): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 export function validateTaskPreparationOutput(output: JsonValue, request: Pick<PrepareTaskRequest, 'mode' | 'originalObjective'>): Omit<TaskPreparationResult, 'preparationAgentId' | 'preparationRunId'> {
@@ -133,7 +219,7 @@ function formatTaskPreparationFailure(result: Exclude<RunResult, { status: 'succ
   return `Task preparation stopped with status ${result.status}: ${result.message}`;
 }
 
-function isRecord(value: JsonValue): value is JsonObject {
+function isRecord(value: JsonValue | undefined): value is JsonObject {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
 }
 
