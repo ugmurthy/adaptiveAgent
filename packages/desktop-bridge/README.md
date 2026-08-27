@@ -13,9 +13,9 @@ object per line to stdout and reserves stderr for diagnostics. Requests may run
 concurrently, so clients must correlate responses by `id` and process
 notifications independently.
 
-The bridge currently exposes protocol `1.13` over JSON-RPC 2.0 and continues
-to accept protocols `1.10` through `1.12`. Attachment descriptors and the
-`execution/*` envelope require explicit `1.13` negotiation. There is no
+The bridge currently exposes protocol `1.16` over JSON-RPC 2.0 and continues
+to accept protocols `1.10` through `1.15`. Attachment descriptors and the
+`execution/*` envelope require explicit `1.13` or later negotiation. There is no
 legacy custom-envelope compatibility: every request must use JSON-RPC,
 including before initialization.
 
@@ -25,10 +25,17 @@ Protocol versions are intentionally strings. In JSON, numeric values such as
 At startup the bridge emits this JSON-RPC notification:
 
 ```json
-{"jsonrpc":"2.0","method":"runtime/ready","params":{"protocolVersion":"1.13","bridgeVersion":"0.1.0","pid":1234}}
+{"jsonrpc":"2.0","method":"runtime/ready","params":{"protocolVersion":"1.16","bridgeVersion":"0.1.0","pid":1234}}
 ```
 
-## Protocol 1.13 attachments
+## Versioned protocol capabilities
+
+Protocol `1.13` adds attachment descriptors and the `execution/*` envelope.
+Protocol `1.14` adds `catalog/inspect` and exact agent selection during runtime
+initialization. Protocol `1.15` adds agent draft creation, validation, and
+saving. Protocol `1.16` adds reading, archiving, and restoring agent profiles.
+
+### Attachments
 
 Native code initializes `managedAttachmentRoot` and sends only relative,
 hashed descriptors. The bridge rejects traversal, symlinks, stale size/hash
@@ -42,13 +49,13 @@ The first JSON-RPC request must negotiate the protocol. Once successful, the
 connection is sticky: subsequent input and agent events use JSON-RPC only.
 
 ```json
-{"jsonrpc":"2.0","id":"initialize","method":"initialize","params":{"protocolVersion":"1.13","clientInfo":{"name":"adaptive-agent-desktop","version":"1.0.0"},"capabilities":{}}}
+{"jsonrpc":"2.0","id":"initialize","method":"initialize","params":{"protocolVersion":"1.16","clientInfo":{"name":"adaptive-agent-desktop","version":"1.0.0"},"capabilities":{}}}
 ```
 
 The result advertises supported methods, notifications, and CLI commands:
 
 ```json
-{"jsonrpc":"2.0","id":"initialize","result":{"protocolVersion":"1.13","bridgeVersion":"0.1.0","serverInfo":{"name":"@adaptive-agent/desktop-bridge","version":"0.1.0"},"capabilities":{"methods":["initialize","runtime/initialize","runtime/info","runtime/shutdown","settings/update","auth/updateAccessToken","agent/run","agent/chat","run/resume","run/retry","run/recover","run/continue","run/interrupt","run/inspect","run/replay","run/steer","execution/inspect","execution/interrupt","execution/resume","interaction/resolveApproval","interaction/resolveClarification","history/previewDeletion","history/delete","cli/commands","cli/execute"],"notifications":["runtime/ready","agent/event","cli/output"]}}}
+{"jsonrpc":"2.0","id":"initialize","result":{"protocolVersion":"1.16","bridgeVersion":"0.1.0","serverInfo":{"name":"@adaptive-agent/desktop-bridge","version":"0.1.0"},"capabilities":{"methods":["initialize","catalog/inspect","runtime/initialize","runtime/info","runtime/shutdown","settings/update","auth/updateAccessToken","agent/run","agent/chat","run/resume","run/retry","run/recover","run/continue","run/interrupt","run/inspect","run/replay","run/steer","execution/inspect","execution/interrupt","execution/resume","interaction/resolveApproval","interaction/resolveClarification","history/previewDeletion","history/delete","agent/createDraft","agent/validateConfig","agent/saveConfig","agent/readConfig","agent/archiveConfig","agent/restoreConfig","cli/commands","cli/execute"],"notifications":["runtime/ready","agent/event","cli/output"]}}}
 ```
 
 Initialize the persistent agent runtime separately. This allows setup,
@@ -205,7 +212,7 @@ Postgres runtime for cross-process inspection and recovery.
 
 ## Errors
 
-Protocol 1.11 uses standard JSON-RPC codes and adds a stable protocol code in
+Protocol 1.11 and later use standard JSON-RPC codes and add a stable protocol code in
 `error.data.protocolCode`.
 
 | JSON-RPC code | Meaning |
@@ -229,7 +236,7 @@ ids may be strings or finite numbers and are echoed without coercion.
 ```sh
 bun run compile
 printf '%s\n' \
-  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1.11","clientInfo":{"name":"smoke"}}}' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1.16","clientInfo":{"name":"smoke"}}}' \
   '{"jsonrpc":"2.0","id":2,"method":"cli/execute","params":{"argv":["--version"]}}' \
   | dist/agent-runtime
 ```
