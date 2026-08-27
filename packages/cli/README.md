@@ -219,6 +219,151 @@ filesystem inbox or cron triggers into durable agent runs:
 adaptive-agent ambient start --config ./ambient.config.json
 ```
 
+The `--config` path is resolved from the directory where the command is run.
+Paths inside the config are resolved as described below.
+
+### Ambient filesystem inbox config
+
+This complete example watches `agent_inbox/pending` for Markdown files. Each
+file's contents become the goal for one agent run.
+
+```json
+{
+  "version": 1,
+  "workspaceRoot": ".",
+  "artifactsRoot": "./artifacts/ambient",
+  "agent": {
+    "configPath": "./agents/inbox-agent.json"
+  },
+  "settings": {
+    "configPath": "./agent.settings.json"
+  },
+  "runtime": {
+    "mode": "sqlite"
+  },
+  "interaction": {
+    "approvalMode": "reject",
+    "clarificationMode": "fail"
+  },
+  "defaults": {
+    "maxSteps": 30,
+    "toolTimeoutMs": 120000,
+    "modelTimeoutMs": 300000,
+    "requireApprovalForWriteTools": true
+  },
+  "triggers": [
+    {
+      "id": "inbox",
+      "type": "filesystem",
+      "inboxDir": "./agent_inbox",
+      "pattern": "*.md",
+      "pollIntervalMs": 30000,
+      "stabilityDelayMs": 1000
+    }
+  ]
+}
+```
+
+The supervisor creates and manages this layout:
+
+```text
+agent_inbox/
+  pending/      # Put new .md task files here.
+  processing/   # Files claimed by active runs.
+  processed/    # Files whose runs succeeded.
+  failed/       # Failed, interrupted, approval, or clarification cases.
+  .ambient/
+    tasks.jsonl # Append-only task ledger.
+```
+
+For example:
+
+```bash
+mkdir -p agent_inbox/pending
+printf '%s\n' 'Summarize the release changes in CHANGELOG.md.' \
+  > agent_inbox/pending/release-summary.md
+adaptive-agent ambient start --config ./ambient.config.json
+```
+
+`inboxDir` is relative to `workspaceRoot`; the legacy-equivalent field name
+`path` is also accepted. `pattern` supports `*` wildcards and defaults to
+`*.md`. The supervisor waits `stabilityDelayMs` after detecting a file and
+only claims it if its size and modification time remain unchanged.
+
+### Ambient cron config
+
+This complete example starts one run at 8:00 AM every weekday in New York:
+
+```json
+{
+  "version": 1,
+  "workspaceRoot": ".",
+  "artifactsRoot": "./artifacts/ambient",
+  "agent": "./agents/daily-summary-agent.json",
+  "settings": "./agent.settings.json",
+  "runtime": {
+    "mode": "sqlite"
+  },
+  "interaction": {
+    "approvalMode": "reject",
+    "clarificationMode": "fail"
+  },
+  "defaults": {
+    "maxSteps": 30,
+    "toolTimeoutMs": 120000,
+    "modelTimeoutMs": 300000,
+    "requireApprovalForWriteTools": true
+  },
+  "triggers": [
+    {
+      "id": "weekday-repo-summary",
+      "type": "cron",
+      "schedule": "0 8 * * MON-FRI",
+      "timezone": "America/New_York",
+      "goalFile": "./tasks/weekday-repo-summary.md",
+      "artifactPath": "artifacts/ambient/weekday-repo-summary/{{yyyyMMdd}}-{{HH}}{{mm}}",
+      "pollIntervalMs": 30000,
+      "concurrency": 1,
+      "misfirePolicy": "skip"
+    }
+  ]
+}
+```
+
+The `schedule` is a five-field cron expression: minute, hour, day of month,
+month, and day of week. Lists, ranges, steps, three-letter month/weekday names,
+and `0` or `7` for Sunday are supported. `timezone` must be an IANA timezone
+and defaults to `UTC`.
+
+Use exactly one of `goalFile` or an inline `goal`:
+
+```json
+{
+  "goal": "Review the repository and write today's engineering status summary."
+}
+```
+
+`goalFile` is relative to `workspaceRoot` and is read for each occurrence.
+`artifactPath` is also relative to `workspaceRoot` and supports `{{taskId}}`,
+`{{occurrenceId}}`, `{{triggerId}}`, `{{scheduledAt}}`, `{{yyyy}}`, `{{MM}}`,
+`{{dd}}`, `{{HH}}`, `{{mm}}`, and `{{yyyyMMdd}}`. Cron task ledgers are stored
+under `<artifactsRoot>/.ambient/`. The current release supports only
+`concurrency: 1` and `misfirePolicy: "skip"`; missed occurrences are not run
+later.
+
+For both trigger types, `workspaceRoot`, `agent`, and `settings` paths are
+resolved relative to the ambient config file. A bare `agent` value such as
+`"news-bulletin-agent"` selects a discoverable agent by name. `runtime.mode`
+accepts `memory`, `sqlite`, or `postgres`. The safe unattended defaults are
+`approvalMode: "reject"` and `clarificationMode: "fail"`; approval or
+clarification requests therefore finish the ambient task without blocking the
+supervisor. Validate the config and inspect its resolved paths and defaults
+before starting:
+
+```bash
+adaptive-agent ambient start --config ./ambient.config.json --dry-run
+```
+
 For persisted runs, choose the control command based on what you need:
 
 - `inspect <runId>`: show the current run state and a compact event summary.
