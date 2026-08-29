@@ -15,6 +15,7 @@
     "trace-session": "bun run ./src/trace-session.ts",
     "trace-sidecar": "bun run ./src/trace-sidecar.ts",
     "test": "bunx vitest run && bun test ./src/sqlite-reader.bun.ts",
+    "compile": "bun build src/trace-sidecar.ts --compile --outfile dist/trace-session-sidecar"
     "typecheck": "bunx tsc --noEmit"
   },
   "dependencies": {
