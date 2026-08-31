@@ -53,6 +53,13 @@ interface ReadFileOutput {
   next?: Partial<ReadFileInput>;
 }
 
+class ReadFileDirectoryError extends Error {
+  constructor(public readonly requestedPath: string) {
+    super(`read_file expected a file but received a directory path: ${requestedPath}`);
+    this.name = 'ReadFileDirectoryError';
+  }
+}
+
 const DEFAULT_MAX_SIZE = 10 * 1_048_576; // 10 MiB
 const DEFAULT_PARQUET_MAX_ROWS = 50;
 const DEFAULT_PARQUET_MAX_CELL_LENGTH = 500;
@@ -313,7 +320,7 @@ export function createReadFileTool(config?: ReadFileToolConfig): ToolDefinition 
   return {
     name: 'read_file',
     description:
-      'Read the textual content of a file at the given path. Supports optional line or byte ranges. Uses pandoc for supported document and spreadsheet formats.',
+      'Read the textual content of a file at the given path. For a directory path, use list_directory instead. Supports optional line or byte ranges. Uses pandoc for supported document and spreadsheet formats.',
     maxModelResultBytes: DEFAULT_MODEL_RESULT_MAX_BYTES,
     retryPolicy: {
       retryable: true,
@@ -358,6 +365,20 @@ export function createReadFileTool(config?: ReadFileToolConfig): ToolDefinition 
         return buildWorkspacePathRecovery('read_file', filePath, error);
       }
 
+      if (error instanceof ReadFileDirectoryError) {
+        return {
+          ok: false,
+          recoveryKind: 'path_is_directory',
+          toolName: 'read_file',
+          requestedPath: error.requestedPath,
+          message: error.message,
+          correctiveAction:
+            'Call list_directory with this path to inspect its entries, then call read_file with a file path.',
+          suggestedTool: 'list_directory',
+          suggestedInput: { path: error.requestedPath },
+        };
+      }
+
       return undefined;
     },
     async execute(rawInput, context) {
@@ -373,6 +394,9 @@ export function createReadFileTool(config?: ReadFileToolConfig): ToolDefinition 
       const resolved = await resolvePathWithinRoots(roots, zipPath?.archivePath ?? filePath);
 
       const fileStats = await stat(resolved);
+      if (fileStats.isDirectory()) {
+        throw new ReadFileDirectoryError(filePath);
+      }
       if (fileStats.size > maxSizeBytes) {
         throw new Error(`File ${resolved} exceeds maximum size of ${maxSizeBytes} bytes`);
       }

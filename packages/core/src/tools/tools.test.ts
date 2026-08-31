@@ -147,6 +147,25 @@ describe('createReadFileTool', () => {
     });
   });
 
+  it('returns actionable recoverable output when the path is a directory', async () => {
+    await mkdir(join(tempDir, 'documents'));
+    const tool = createReadFileTool({ allowedRoot: tempDir });
+
+    const result = await executeRecoverableTool(tool as any, { path: 'documents' });
+
+    expect(result).toEqual({
+      ok: false,
+      recoveryKind: 'path_is_directory',
+      toolName: 'read_file',
+      requestedPath: 'documents',
+      message: 'read_file expected a file but received a directory path: documents',
+      correctiveAction:
+        'Call list_directory with this path to inspect its entries, then call read_file with a file path.',
+      suggestedTool: 'list_directory',
+      suggestedInput: { path: 'documents' },
+    });
+  });
+
   it('formats generic read_file recovery outputs without requiring content', () => {
     const tool = createReadFileTool({ allowedRoot: tempDir });
     const recoveryOutput = {
