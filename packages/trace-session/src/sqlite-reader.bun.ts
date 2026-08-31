@@ -56,7 +56,9 @@ async function fixture(): Promise<string> {
 
   insertEvent(database, { id: 'event-1', runId: 'root-1', seq: 1, type: 'tool.started', stepId: 'delegate-step', toolCallId: 'call-1', payload: { toolName: 'delegate', input: { goal: 'Inspect SQLite' } }, createdAt: '2026-07-01T10:00:01.000Z' });
   insertEvent(database, { id: 'event-2', runId: 'root-1', seq: 2, type: 'tool.completed', stepId: 'delegate-step', toolCallId: 'call-1', payload: { toolName: 'delegate' }, createdAt: '2026-07-01T10:00:03.000Z' });
-  insertEvent(database, { id: 'event-3', runId: 'child-1', seq: 1, type: 'run.completed', payload: {}, createdAt: '2026-07-01T10:00:03.000Z' });
+  insertEvent(database, { id: 'event-3', runId: 'child-1', seq: 1, type: 'model.completed', payload: { provider: 'mesh' }, createdAt: '2026-07-01T10:00:02.000Z' });
+  insertEvent(database, { id: 'event-4', runId: 'child-1', seq: 2, type: 'usage.updated', payload: { usage: { model: 'child-model' } }, createdAt: '2026-07-01T10:00:02.500Z' });
+  insertEvent(database, { id: 'event-5', runId: 'child-1', seq: 3, type: 'run.completed', payload: {}, createdAt: '2026-07-01T10:00:03.000Z' });
 
   const tool = { runId: 'root-1', stepId: 'delegate-step', toolCallId: 'call-1', toolName: 'delegate', idempotencyKey: 'root-1:delegate-step:call-1', status: 'completed', inputHash: 'hash', input: { goal: 'Inspect SQLite' }, childRunId: 'child-1', output: { childRunId: 'child-1' }, startedAt: '2026-07-01T10:00:01.000Z', completedAt: '2026-07-01T10:00:03.000Z' };
   database.run('insert into tool_executions (idempotency_key,run_id,step_id,tool_call_id,status,child_run_id,started_at,completed_at,record_json) values (?,?,?,?,?,?,?,?,?)', [tool.idempotencyKey, tool.runId, tool.stepId, tool.toolCallId, tool.status, tool.childRunId, tool.startedAt, tool.completedAt, JSON.stringify(tool)]);
@@ -118,7 +120,7 @@ describe('SqliteTraceReader', () => {
       expect(usage.byRootRun).toHaveLength(1);
       expect(usage.byProviderModel).toMatchObject([
         { provider: 'openrouter', model: 'test-model', runCount: 1 },
-        { provider: 'unknown', model: 'unknown', runCount: 1 },
+        { provider: 'mesh', model: 'child-model', runCount: 1 },
       ]);
       expect(usage.toolOutputByProviderModel).toMatchObject([
         { provider: 'mesh', model: 'tool-model', toolCallCount: 1, usage: { totalTokens: 8, estimatedCostUSD: 0.01 } },

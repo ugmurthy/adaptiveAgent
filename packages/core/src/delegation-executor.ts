@@ -643,6 +643,7 @@ export class DelegationExecutor {
     delegate: DelegateDefinition;
     input: DelegateToolInput;
   }): Parameters<RunStore['createRun']>[0] {
+    const model = params.delegate.model ?? this.options.model;
     return {
       id: params.childRunId,
       sessionId: params.parentContext.sessionId,
@@ -655,6 +656,8 @@ export class DelegationExecutor {
       input: params.input.input,
       context: params.input.context,
       executionContext: params.parentContext.executionContext,
+      modelProvider: model.provider,
+      modelName: model.model,
       metadata: params.input.metadata,
       status: 'queued',
     };

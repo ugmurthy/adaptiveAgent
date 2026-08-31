@@ -4707,7 +4707,13 @@ describe('AdaptiveAgent', () => {
       parentRunId: rootRunId,
       toolName: 'secure.lookup',
     });
-    expect(await runStore.getRun(childRunId)).toMatchObject({ status: 'awaiting_approval', rootRunId, parentRunId: rootRunId });
+    expect(await runStore.getRun(childRunId)).toMatchObject({
+      status: 'awaiting_approval',
+      rootRunId,
+      parentRunId: rootRunId,
+      modelProvider: 'child-model',
+      modelName: 'sequence',
+    });
     expect(await runStore.getRun(rootRunId)).toMatchObject({ status: 'awaiting_subagent' });
     expect((await snapshotStore.getLatest(rootRunId))?.state).toMatchObject({ waitingOnChildRunId: childRunId });
     expect(await toolExecutionStore.getByIdempotencyKey(`${rootRunId}:step-1:delegate-approval-1`)).toMatchObject({ status: 'started', childRunId });
