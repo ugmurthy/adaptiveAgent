@@ -4,7 +4,52 @@ All notable changes to this project will be documented in this file.
 
 This project follows semantic versioning for release notes.
 
-## Unreleased
+## [0.1.46] - 2026-09-01
+
+### Added
+
+- Added a trace-session compile script for producing the standalone sidecar
+  executable.
+
+### Changed
+
+- Updated desktop bridge documentation for JSON-RPC protocol `1.16` and the
+  capabilities introduced in protocols `1.13` through `1.16`.
+
+### Fixed
+
+- Fixed `read_file` recovery for directory paths by directing agents to
+  `list_directory` with structured corrective metadata.
+- Fixed SQLite usage reports attributing delegate runs to unknown models by
+  persisting delegate model identity and recovering it from runtime events.
+
+## [0.1.45] - 2026-08-27
+
+### Added
+
+- Added optional output-token and stream-inactivity limits across core model
+  requests and supported model adapters.
+- Added SHA-256 digests to `write_file` results and structured stale-file
+  recovery metadata to `edit_file` for safe incremental editing.
+- Added a bundled News Bulletin Agent using source-grounded research and the
+  incremental artifact workflow.
+- Added `--from-preparation` so a successful task-preparation run can be reused,
+  with multi-run clarification provenance preserved in execution metadata.
+
+### Changed
+
+- Improved task-preparation dry runs so preparation results are shown without
+  consuming an execution run.
+- Simplified the bundled coding agents and removed obsolete bundled code
+  generation skills.
+- Expanded CLI documentation for cron schedules and inbox-triggered agents.
+
+### Fixed
+
+- Treated length-truncated model responses as incomplete and prevented retries
+  after streamed progress to avoid duplicate long-form generation.
+
+## [0.1.44] - 2026-08-24
 
 ### Added
 
