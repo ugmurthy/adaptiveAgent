@@ -146,8 +146,29 @@ describe('desktop runtime protocol', () => {
       params: { protocolVersion: '2.0', clientInfo: { name: 'desktop' } },
     }))).rejects.toMatchObject({
       code: 'UNSUPPORTED_PROTOCOL_VERSION',
-      data: { supportedProtocolVersions: ['1.10', '1.11', '1.12', '1.13', '1.14', '1.15', '1.16'] },
+      data: { supportedProtocolVersions: ['1.10', '1.11', '1.12', '1.13', '1.14', '1.15', '1.16', '1.17'] },
     });
+  });
+
+  it('advertises managed image and audio capabilities in protocol 1.17', async () => {
+    const current = createRuntime().runtime;
+    const initialized = await current.handleRpc(request({
+      id: 'current', method: 'initialize', params: { protocolVersion: '1.17', clientInfo: { name: 'desktop' } },
+    })) as any;
+    expect(initialized.capabilities.attachments).toMatchObject({
+      enabled: false,
+      acceptedKinds: ['file', 'image', 'audio'],
+      supportedImageMimeTypes: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'],
+      supportedAudioMimeTypes: ['audio/wav', 'audio/x-wav', 'audio/mpeg', 'audio/flac', 'audio/mp4', 'audio/ogg', 'audio/aac', 'audio/aiff'],
+      supportedAudioFormats: ['wav', 'mp3', 'flac', 'm4a', 'ogg', 'aac', 'aiff', 'pcm16', 'pcm24'],
+      routing: { taskImage: 'direct', taskAudio: 'direct', chatImage: 'direct', chatAudio: 'direct' },
+    });
+
+    const legacy = createRuntime().runtime;
+    const legacyInitialized = await legacy.handleRpc(request({
+      id: 'legacy', method: 'initialize', params: { protocolVersion: '1.16', clientInfo: { name: 'desktop' } },
+    })) as any;
+    expect(legacyInitialized.capabilities.attachments).toMatchObject({ acceptedKinds: ['file'] });
   });
 
   it('exposes agent builder methods only in protocol 1.15', async () => {
@@ -308,51 +329,84 @@ export async function execute() { return { value }; }
     }
   });
 
-  it('translates only immutable files contained by the managed attachment root', async () => {
+  it('translates managed file, image, and audio attachments for runs and chats', async () => {
     const root = await mkdtemp(join(tmpdir(), 'desktop-attachments-'));
     const canonicalRoot = await realpath(root);
     const workspace = await mkdtemp(join(tmpdir(), 'desktop-workspace-'));
-    await mkdir(join(root, 'attachment-1'));
-    const content = Buffer.from('attachment contents');
-    await writeFile(join(root, 'attachment-1', 'note.txt'), content);
-    const attachment = {
+    const stage = async (attachmentId: string, name: string, content: Buffer) => {
+      await mkdir(join(root, attachmentId));
+      await writeFile(join(root, attachmentId, name), content);
+      return {
+        attachmentId,
+        stagedRelativePath: `${attachmentId}/${name}`,
+        name,
+        sizeBytes: content.length,
+        sha256: createHash('sha256').update(content).digest('hex'),
+      };
+    };
+    const fileContent = Buffer.from('attachment contents');
+    const file = {
+      ...await stage('attachment-1', 'note.txt', fileContent),
       attachmentId: 'attachment-1',
       kind: 'file' as const,
-      stagedRelativePath: 'attachment-1/note.txt',
-      name: 'note.txt',
       mimeType: 'text/plain',
-      sizeBytes: content.length,
-      sha256: createHash('sha256').update(content).digest('hex'),
     };
+    const image = { ...await stage('attachment-image', 'photo.png', Buffer.from('image bytes')), kind: 'image' as const, mimeType: 'image/png' };
+    const audio = { ...await stage('attachment-audio', 'recording.mp3', Buffer.from('audio bytes')), kind: 'audio' as const, mimeType: 'audio/mpeg', audioFormat: 'mp3' as const };
     const runRaw = vi.fn(async () => ({ status: 'success', runId: 'execution-1', output: 'done', stepsUsed: 1, usage: {} }));
+    const chatRaw = vi.fn(async () => ({ status: 'success', runId: 'execution-chat', output: 'done', stepsUsed: 1, usage: {} }));
     const { runtime } = createRuntime();
     await runtime.handleRpc(request({
-      id: 'init', method: 'initialize', params: { protocolVersion: '1.13', clientInfo: { name: 'desktop' } },
+      id: 'init', method: 'initialize', params: { protocolVersion: '1.17', clientInfo: { name: 'desktop' } },
     }));
     Object.assign(runtime as unknown as Record<string, unknown>, {
       managedAttachmentRoot: root,
-      sdk: { runRaw, config: { workspaceRoot: workspace } },
+      sdk: { runRaw, chatRaw, config: { workspaceRoot: workspace } },
     });
 
     await expect(runtime.handleRpc(request({
-      id: 'run', method: 'agent/run', params: { executionId: 'execution-1', goal: 'read it', attachments: [attachment] },
+      id: 'run', method: 'agent/run', params: { executionId: 'execution-1', goal: 'analyze them', attachments: [file, image, audio] },
     }))).resolves.toMatchObject({ executionId: 'execution-1', mode: 'direct', result: { status: 'success' } });
-    expect(runRaw).toHaveBeenCalledWith('read it', expect.objectContaining({
-      contentParts: [expect.objectContaining({ type: 'file', file: expect.objectContaining({ name: 'note.txt' }) })],
+    expect(runRaw).toHaveBeenCalledWith('analyze them', expect.objectContaining({
+      contentParts: [
+        expect.objectContaining({ type: 'file', file: expect.objectContaining({ name: 'note.txt', mimeType: 'text/plain' }) }),
+        expect.objectContaining({ type: 'image', image: expect.objectContaining({ name: 'photo.png', mimeType: 'image/png' }) }),
+        expect.objectContaining({ type: 'audio', audio: expect.objectContaining({ name: 'recording.mp3', mimeType: 'audio/mpeg', format: 'mp3' }) }),
+      ],
       executionContext: { fileAccess: {
         version: 1,
         workspaceRoot: workspace,
-        attachmentRoots: [join(canonicalRoot, 'attachment-1')],
-        files: [{ path: join(canonicalRoot, 'attachment-1', 'note.txt'), sizeBytes: content.length, sha256: attachment.sha256 }],
+        attachmentRoots: [join(canonicalRoot, 'attachment-1'), join(canonicalRoot, 'attachment-image'), join(canonicalRoot, 'attachment-audio')],
+        files: expect.arrayContaining([
+          { path: join(canonicalRoot, 'attachment-1', 'note.txt'), sizeBytes: fileContent.length, sha256: file.sha256 },
+          { path: join(canonicalRoot, 'attachment-image', 'photo.png'), sizeBytes: image.sizeBytes, sha256: image.sha256 },
+          { path: join(canonicalRoot, 'attachment-audio', 'recording.mp3'), sizeBytes: audio.sizeBytes, sha256: audio.sha256 },
+        ]),
       } },
     }));
 
+    await expect(runtime.handleRpc(request({
+      id: 'chat', method: 'agent/chat', params: {
+        executionId: 'execution-chat',
+        chatSessionId: 'chat-session',
+        transcript: [{ role: 'user', text: 'What is in these?', attachments: [image, audio] }],
+      },
+    }))).resolves.toMatchObject({ executionId: 'execution-chat', mode: 'direct', result: { status: 'success' } });
+    expect(chatRaw).toHaveBeenCalledWith([{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'What is in these?' },
+        expect.objectContaining({ type: 'image', image: expect.objectContaining({ path: join(canonicalRoot, 'attachment-image', 'photo.png') }) }),
+        expect.objectContaining({ type: 'audio', audio: expect.objectContaining({ source: { kind: 'path', path: join(canonicalRoot, 'attachment-audio', 'recording.mp3') }, format: 'mp3' }) }),
+      ],
+    }], expect.objectContaining({ runId: 'execution-chat', sessionId: 'chat-session' }));
+
     const outside = `${root}-outside.txt`;
-    await writeFile(outside, content);
+    await writeFile(outside, fileContent);
     await mkdir(join(root, 'attachment-2'));
     await symlink(outside, join(root, 'attachment-2', 'note.txt'));
     await expect(runtime.handleRpc(request({
-      id: 'escape', method: 'agent/run', params: { executionId: 'execution-2', goal: 'read it', attachments: [{ ...attachment, attachmentId: 'attachment-2', stagedRelativePath: 'attachment-2/note.txt' }] },
+      id: 'escape', method: 'agent/run', params: { executionId: 'execution-2', goal: 'read it', attachments: [{ ...file, attachmentId: 'attachment-2', stagedRelativePath: 'attachment-2/note.txt' }] },
     }))).rejects.toMatchObject({ code: 'ATTACHMENT_PATH_INVALID' });
     await rm(root, { recursive: true });
     await rm(workspace, { recursive: true });

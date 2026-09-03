@@ -149,23 +149,23 @@ export class DesktopRuntime {
       && (request.method.startsWith('history/') || request.method === 'settings/update')) {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', `${request.method} requires desktop protocol 1.12.`, JSON_RPC_ERROR_CODES.methodNotFound);
     }
-    if (!['1.13', '1.14', '1.15', '1.16'].includes(this.negotiatedProtocolVersion)
+    if (!['1.13', '1.14', '1.15', '1.16', '1.17'].includes(this.negotiatedProtocolVersion)
       && request.method.startsWith('execution/')) {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', `${request.method} requires desktop protocol 1.13.`, JSON_RPC_ERROR_CODES.methodNotFound);
     }
-    if (!['1.14', '1.15', '1.16'].includes(this.negotiatedProtocolVersion) && request.method === 'catalog/inspect') {
+    if (!['1.14', '1.15', '1.16', '1.17'].includes(this.negotiatedProtocolVersion) && request.method === 'catalog/inspect') {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', 'catalog/inspect requires desktop protocol 1.14.', JSON_RPC_ERROR_CODES.methodNotFound);
     }
-    if (!['1.15', '1.16'].includes(this.negotiatedProtocolVersion) && ['agent/createDraft', 'agent/validateConfig', 'agent/saveConfig'].includes(request.method)) {
+    if (!['1.15', '1.16', '1.17'].includes(this.negotiatedProtocolVersion) && ['agent/createDraft', 'agent/validateConfig', 'agent/saveConfig'].includes(request.method)) {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', `${request.method} requires desktop protocol 1.15.`, JSON_RPC_ERROR_CODES.methodNotFound);
     }
-    if (this.negotiatedProtocolVersion !== '1.16' && ['agent/readConfig', 'agent/archiveConfig', 'agent/restoreConfig'].includes(request.method)) {
+    if (!['1.16', '1.17'].includes(this.negotiatedProtocolVersion) && ['agent/readConfig', 'agent/archiveConfig', 'agent/restoreConfig'].includes(request.method)) {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', `${request.method} requires desktop protocol 1.16.`, JSON_RPC_ERROR_CODES.methodNotFound);
     }
-    if (!['1.14', '1.15', '1.16'].includes(this.negotiatedProtocolVersion) && request.method === 'runtime/initialize' && request.params?.agentSelection) {
+    if (!['1.14', '1.15', '1.16', '1.17'].includes(this.negotiatedProtocolVersion) && request.method === 'runtime/initialize' && request.params?.agentSelection) {
       throw new DesktopProtocolError('INVALID_PARAMS', 'Exact agent selection requires desktop protocol 1.14.', JSON_RPC_ERROR_CODES.invalidParams);
     }
-    if (!['1.13', '1.14', '1.15', '1.16'].includes(this.negotiatedProtocolVersion) && hasV113Fields(request)) {
+    if (!['1.13', '1.14', '1.15', '1.16', '1.17'].includes(this.negotiatedProtocolVersion) && hasV113Fields(request)) {
       throw new DesktopProtocolError('INVALID_PARAMS', 'Attachment and execution-envelope fields require desktop protocol 1.13.', JSON_RPC_ERROR_CODES.invalidParams);
     }
 
@@ -190,7 +190,7 @@ export class DesktopRuntime {
         this.validateExecutionSelection(params);
         const sdk = this.requireSdk();
         const executionId = params.executionId ?? params.runId!;
-        rejectUnsupportedMedia(params.attachments ?? []);
+        rejectUnsupportedMedia(params.attachments ?? [], this.negotiatedProtocolVersion);
         const parts = await this.validateAndTranslateAttachments(params.attachments ?? []);
         const fileAccess = await this.fileAccessContext(params.attachments ?? []);
         const result = await sdk.runRaw(params.goal, {
@@ -208,7 +208,7 @@ export class DesktopRuntime {
         this.validateExecutionSelection(params);
         const executionId = params.executionId ?? params.runId!;
         const attachments = params.executionId ? desktopTranscriptAttachments(params.transcript as DesktopChatMessage[]) : [];
-        rejectUnsupportedMedia(attachments);
+        rejectUnsupportedMedia(attachments, this.negotiatedProtocolVersion);
         const transcript = params.executionId ? await this.translateDesktopTranscript(params.transcript as DesktopChatMessage[]) : params.transcript as ChatMessage[];
         const fileAccess = await this.fileAccessContext(attachments);
         const result = await this.requireSdk().chatRaw(transcript, {
@@ -405,10 +405,10 @@ export class DesktopRuntime {
         methods: DESKTOP_RPC_METHODS.filter((method) => {
           if (this.negotiatedProtocolVersion === '1.10' && method === 'auth/updateAccessToken') return false;
           if (this.negotiatedProtocolVersion === '1.10' || this.negotiatedProtocolVersion === '1.11') if (method.startsWith('history/') || method === 'settings/update') return false;
-          if (!['1.13', '1.14', '1.15', '1.16'].includes(this.negotiatedProtocolVersion) && method.startsWith('execution/')) return false;
-          if (!['1.14', '1.15', '1.16'].includes(this.negotiatedProtocolVersion) && method === 'catalog/inspect') return false;
-          if (!['1.15', '1.16'].includes(this.negotiatedProtocolVersion) && ['agent/createDraft', 'agent/validateConfig', 'agent/saveConfig'].includes(method)) return false;
-          if (this.negotiatedProtocolVersion !== '1.16' && ['agent/readConfig', 'agent/archiveConfig', 'agent/restoreConfig'].includes(method)) return false;
+          if (!['1.13', '1.14', '1.15', '1.16', '1.17'].includes(this.negotiatedProtocolVersion) && method.startsWith('execution/')) return false;
+          if (!['1.14', '1.15', '1.16', '1.17'].includes(this.negotiatedProtocolVersion) && method === 'catalog/inspect') return false;
+          if (!['1.15', '1.16', '1.17'].includes(this.negotiatedProtocolVersion) && ['agent/createDraft', 'agent/validateConfig', 'agent/saveConfig'].includes(method)) return false;
+          if (!['1.16', '1.17'].includes(this.negotiatedProtocolVersion) && ['agent/readConfig', 'agent/archiveConfig', 'agent/restoreConfig'].includes(method)) return false;
           return true;
         }),
         notifications: ['runtime/ready', 'agent/event', 'cli/output'],
@@ -418,7 +418,7 @@ export class DesktopRuntime {
           transport: 'child-process',
           output: 'streamed-notifications',
         },
-        ...(['1.13', '1.14', '1.15', '1.16'].includes(this.negotiatedProtocolVersion) ? { attachments: attachmentCapabilities(false, 'Initialize the runtime with managedAttachmentRoot.') } : {}),
+        ...(['1.13', '1.14', '1.15', '1.16', '1.17'].includes(this.negotiatedProtocolVersion) ? { attachments: attachmentCapabilities(false, this.negotiatedProtocolVersion, 'Initialize the runtime with managedAttachmentRoot.') } : {}),
       },
     };
   }
@@ -624,7 +624,7 @@ export class DesktopRuntime {
           sqlite: sdk.config.runtime.mode === 'sqlite' ? 'connected' : 'not_configured',
           gateway: gatewayClient?.connectionState ?? 'not_configured',
         },
-        attachments: attachmentCapabilities(Boolean(this.managedAttachmentRoot), this.managedAttachmentRoot ? undefined : 'managedAttachmentRoot was not configured.'),
+        attachments: attachmentCapabilities(Boolean(this.managedAttachmentRoot), this.negotiatedProtocolVersion, this.managedAttachmentRoot ? undefined : 'managedAttachmentRoot was not configured.'),
       };
     } catch (error) {
       await this.sdk?.close().catch(() => undefined);
@@ -868,9 +868,24 @@ export class DesktopRuntime {
 
 function desktopTranscriptAttachments(messages: DesktopChatMessage[]): DesktopAttachmentInput[] { return messages.flatMap((message) => message.attachments ?? []); }
 function attachmentError(code: string, id: string): DesktopProtocolError { return new DesktopProtocolError(code, `Attachment ${id} failed managed-file validation.`, JSON_RPC_ERROR_CODES.invalidParams); }
-function attachmentCapabilities(enabled: boolean, reason?: string): JsonValue { return { enabled, maxFileBytes: 10 * 1024 * 1024, maxAttachmentCount: 8, maxSubmissionBytes: 40 * 1024 * 1024, acceptedKinds: ['file'], supportedGenericMimeTypes: ['application/octet-stream', 'application/pdf', 'text/plain', 'application/json'], routing: { taskGeneric: 'direct', chatGeneric: 'direct' }, ...(reason ? { reason } : {}) }; }
-function rejectUnsupportedMedia(inputs: DesktopAttachmentInput[]): void {
-  if (inputs.some((input) => input.kind !== 'file')) throw new DesktopProtocolError('UNSUPPORTED_ATTACHMENT_KIND', 'Desktop protocol 1.13 currently supports generic file attachments only.', JSON_RPC_ERROR_CODES.commandRejected);
+function attachmentCapabilities(enabled: boolean, protocolVersion: DesktopProtocolVersion, reason?: string): JsonValue {
+  const supportsMedia = protocolVersion === '1.17';
+  return {
+    enabled,
+    maxFileBytes: 10 * 1024 * 1024,
+    maxAttachmentCount: 8,
+    maxSubmissionBytes: 40 * 1024 * 1024,
+    acceptedKinds: supportsMedia ? ['file', 'image', 'audio'] : ['file'],
+    supportedImageMimeTypes: supportsMedia ? ['image/png', 'image/jpeg', 'image/webp', 'image/gif'] : [],
+    supportedAudioMimeTypes: supportsMedia ? ['audio/wav', 'audio/x-wav', 'audio/mpeg', 'audio/flac', 'audio/mp4', 'audio/ogg', 'audio/aac', 'audio/aiff'] : [],
+    supportedAudioFormats: supportsMedia ? ['wav', 'mp3', 'flac', 'm4a', 'ogg', 'aac', 'aiff', 'pcm16', 'pcm24'] : [],
+    supportedGenericMimeTypes: ['application/octet-stream', 'application/pdf', 'text/plain', 'application/json'],
+    routing: { taskGeneric: 'direct', chatGeneric: 'direct', ...(supportsMedia ? { taskImage: 'direct', taskAudio: 'direct', chatImage: 'direct', chatAudio: 'direct' } : {}) },
+    ...(reason ? { reason } : {}),
+  };
+}
+function rejectUnsupportedMedia(inputs: DesktopAttachmentInput[], protocolVersion: DesktopProtocolVersion): void {
+  if (protocolVersion !== '1.17' && inputs.some((input) => input.kind !== 'file')) throw new DesktopProtocolError('UNSUPPORTED_ATTACHMENT_KIND', 'Managed image and audio attachments require desktop protocol 1.17.', JSON_RPC_ERROR_CODES.commandRejected);
 }
 function executionResult(executionId: string, mode: 'direct' | 'catalog', result: any, stages?: any[]): JsonValue { return asJsonValue({ executionId, mode, status: result.status, finalRunId: result.runId, traceTarget: mode === 'direct' ? { kind: 'root-run', rootRunId: executionId } : { kind: 'session', sessionId: executionId }, ...(stages ? { stages } : {}), result }); }
 

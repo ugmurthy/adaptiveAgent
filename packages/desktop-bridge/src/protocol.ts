@@ -7,8 +7,8 @@ export {
 } from '@adaptive-agent/agent-sdk/cli';
 
 /** Keep versions as strings: JSON numbers cannot distinguish 1.10 from 1.1. */
-export const DESKTOP_PROTOCOL_VERSION = '1.16' as const;
-export const SUPPORTED_DESKTOP_PROTOCOL_VERSIONS = ['1.10', '1.11', '1.12', '1.13', '1.14', '1.15', DESKTOP_PROTOCOL_VERSION] as const;
+export const DESKTOP_PROTOCOL_VERSION = '1.17' as const;
+export const SUPPORTED_DESKTOP_PROTOCOL_VERSIONS = ['1.10', '1.11', '1.12', '1.13', '1.14', '1.15', '1.16', DESKTOP_PROTOCOL_VERSION] as const;
 export const DESKTOP_BRIDGE_VERSION = '0.1.0';
 
 export type DesktopProtocolVersion = (typeof SUPPORTED_DESKTOP_PROTOCOL_VERSIONS)[number];

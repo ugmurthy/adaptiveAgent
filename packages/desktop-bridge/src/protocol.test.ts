@@ -34,8 +34,8 @@ describe('desktop bridge protocol', () => {
     );
   });
 
-  it('uses a string for protocol 1.16', () => {
-    expect(DESKTOP_PROTOCOL_VERSION).toBe('1.16');
+  it('uses a string for protocol 1.17', () => {
+    expect(DESKTOP_PROTOCOL_VERSION).toBe('1.17');
   });
 
   it('validates agent builder requests', () => {
@@ -51,6 +51,14 @@ describe('desktop bridge protocol', () => {
   it('strictly validates managed attachment descriptors', () => {
     const attachment = { attachmentId: 'a1', kind: 'file', stagedRelativePath: 'a1/note.txt', name: 'note.txt', sizeBytes: 3, sha256: 'a'.repeat(64), mimeType: 'text/plain' };
     expect(parseDesktopRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'agent/run', params: { executionId: 'e1', goal: 'read', attachments: [attachment] } }))).toMatchObject({ method: 'agent/run' });
+    expect(parseDesktopRpcRequest(JSON.stringify({
+      jsonrpc: '2.0', id: 2, method: 'agent/run', params: {
+        executionId: 'e2', goal: 'analyze', attachments: [
+          { ...attachment, attachmentId: 'image', kind: 'image', stagedRelativePath: 'image/photo.png', name: 'photo.png', mimeType: 'image/png' },
+          { ...attachment, attachmentId: 'audio', kind: 'audio', stagedRelativePath: 'audio/recording.mp3', name: 'recording.mp3', mimeType: 'audio/mpeg', audioFormat: 'mp3' },
+        ],
+      },
+    }))).toMatchObject({ method: 'agent/run' });
     for (const invalid of [{ ...attachment, source: { kind: 'url' } }, { ...attachment, audioFormat: 'wav' }, { ...attachment, sha256: 'bad' }]) {
       expect(() => parseDesktopRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'agent/run', params: { executionId: 'e1', goal: 'read', attachments: [invalid] } }))).toThrowError(expect.objectContaining({ code: 'INVALID_PARAMS' }));
     }
