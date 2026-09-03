@@ -1009,9 +1009,27 @@ export interface RuntimeDeletionPreview {
   preservedPlanIds: UUID[];
 }
 
+export interface RunDeletionResult {
+  deleted: true;
+  rootRunId: UUID;
+}
+
+export type RuntimeDeletionErrorCode = 'RUN_NOT_FOUND' | 'RUN_NOT_TERMINAL';
+
+export class RuntimeDeletionError extends Error {
+  constructor(
+    readonly code: RuntimeDeletionErrorCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'RuntimeDeletionError';
+  }
+}
+
 export interface RuntimeMaintenanceStore {
   previewDeletion(target: RuntimeDeletionTarget): Promise<RuntimeDeletionPreview>;
   deleteHistory(target: RuntimeDeletionTarget): Promise<RuntimeDeletionPreview>;
+  deleteRun(runId: UUID): Promise<RunDeletionResult>;
 }
 
 export interface OrchestrationMetadata {

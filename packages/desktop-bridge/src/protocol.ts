@@ -195,6 +195,11 @@ export interface RunIdParams {
   runId: string;
 }
 
+export interface DeleteRunResult {
+  deleted: true;
+  rootRunId: string;
+}
+
 export interface ContinueParams extends RunIdParams {
   continuationRunId?: string;
 }
@@ -241,6 +246,7 @@ export type DesktopRpcRequest =
   | RpcRequest<'run/recover', RecoverParams>
   | RpcRequest<'run/continue', ContinueParams>
   | RpcRequest<'run/interrupt', RunIdParams>
+  | RpcRequest<'run/delete', RunIdParams>
   | RpcRequest<'run/inspect', RunIdParams>
   | RpcRequest<'run/replay', RunIdParams>
   | RpcRequest<'run/steer', SteerParams>
@@ -271,6 +277,7 @@ export const DESKTOP_RPC_METHODS = [
   'run/recover',
   'run/continue',
   'run/interrupt',
+  'run/delete',
   'run/inspect',
   'run/replay',
   'run/steer',
@@ -484,6 +491,7 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
     case 'run/resume':
     case 'run/retry':
     case 'run/interrupt':
+    case 'run/delete':
     case 'run/inspect':
     case 'run/replay':
       requiredString(requiredParams(method, params), 'runId');

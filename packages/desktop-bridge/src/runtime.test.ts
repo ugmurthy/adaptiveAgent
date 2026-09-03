@@ -537,6 +537,66 @@ export async function execute() { return { value }; }
     }))).rejects.toMatchObject({ code: 'COMMAND_REJECTED' });
   });
 
+  it('advertises and dispatches run/delete only in protocol 1.17 after runtime initialization', async () => {
+    const deleteRun = vi.fn(async () => ({ deleted: true as const, rootRunId: 'root-run' }));
+    const { runtime } = createRuntime();
+
+    await expect(runtime.handleRpc(request({
+      id: 'before-protocol', method: 'run/delete', params: { runId: 'child-run' },
+    }))).rejects.toMatchObject({ code: 'NOT_INITIALIZED' });
+
+    const initialized = await runtime.handleRpc(request({
+      id: 'init', method: 'initialize', params: { protocolVersion: '1.17', clientInfo: { name: 'desktop' } },
+    })) as { capabilities: { methods: string[] } };
+    expect(initialized.capabilities.methods).toContain('run/delete');
+    await expect(runtime.handleRpc(request({
+      id: 'before-runtime', method: 'run/delete', params: { runId: 'child-run' },
+    }))).rejects.toMatchObject({ code: 'NOT_INITIALIZED' });
+
+    (runtime as unknown as { sdk: unknown }).sdk = {
+      config: { runtime: { mode: 'sqlite' } },
+      created: { runtime: { maintenanceStore: { deleteRun } } },
+    };
+    await expect(runtime.handleRpc(request({
+      id: 'delete', method: 'run/delete', params: { runId: 'child-run' },
+    }))).resolves.toEqual({ deleted: true, rootRunId: 'root-run' });
+    expect(deleteRun).toHaveBeenCalledWith('child-run');
+
+    const { runtime: legacy } = createRuntime();
+    const legacyInitialized = await legacy.handleRpc(request({
+      id: 'legacy-init', method: 'initialize', params: { protocolVersion: '1.16', clientInfo: { name: 'desktop' } },
+    })) as { capabilities: { methods: string[] } };
+    expect(legacyInitialized.capabilities.methods).not.toContain('run/delete');
+    await expect(legacy.handleRpc(request({
+      id: 'legacy-delete', method: 'run/delete', params: { runId: 'root-run' },
+    }))).rejects.toMatchObject({ code: 'METHOD_NOT_FOUND' });
+  });
+
+  it('returns stable run deletion errors and rejects memory mode without a CLI fallback', async () => {
+    const { RuntimeDeletionError } = await import('@adaptive-agent/core');
+    const execute = vi.fn();
+    const { runtime } = createRuntime({ execute });
+    await runtime.handleRpc(request({
+      id: 'init', method: 'initialize', params: { protocolVersion: '1.17', clientInfo: { name: 'desktop' } },
+    }));
+    (runtime as unknown as { sdk: unknown }).sdk = {
+      config: { runtime: { mode: 'sqlite' } },
+      created: { runtime: { maintenanceStore: { deleteRun: vi.fn(async () => { throw new RuntimeDeletionError('RUN_NOT_FOUND', 'Run unknown does not exist.'); }) } } },
+    };
+    await expect(runtime.handleRpc(request({
+      id: 'unknown', method: 'run/delete', params: { runId: 'unknown' },
+    }))).rejects.toMatchObject({ code: 'RUN_NOT_FOUND' });
+
+    (runtime as unknown as { sdk: unknown }).sdk = {
+      config: { runtime: { mode: 'memory' } },
+      created: { runtime: {} },
+    };
+    await expect(runtime.handleRpc(request({
+      id: 'memory', method: 'run/delete', params: { runId: 'run' },
+    }))).rejects.toMatchObject({ code: 'UNSUPPORTED_OPERATION' });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
   it('lists the complete CLI command surface and its execution restrictions', async () => {
     const { runtime } = createRuntime({ execute: vi.fn() });
     await initialize(runtime);

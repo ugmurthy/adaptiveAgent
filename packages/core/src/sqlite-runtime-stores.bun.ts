@@ -204,13 +204,13 @@ describe('SQLite runtime stores', () => {
     openBundles.push(bundle);
     await bundle.runStore.createRun({ id: 'root', sessionId: 'session', goal: 'Root', status: 'succeeded' });
     await bundle.runStore.createRun({ id: 'child', sessionId: 'child-session', rootRunId: 'root', parentRunId: 'root', goal: 'Child', status: 'failed' });
-    await bundle.runStore.createRun({ id: 'unrelated', sessionId: 'other', goal: 'Keep', status: 'succeeded' });
+    await bundle.runStore.createRun({ id: 'unrelated', sessionId: 'session', goal: 'Keep', status: 'succeeded' });
     await bundle.eventStore.append({ runId: 'child', type: 'run.failed', schemaVersion: 1, payload: {} });
-    await bundle.snapshotStore.save({ runId: 'child', snapshotSeq: 1, status: 'failed', state: {} });
+    await bundle.snapshotStore.save({ runId: 'child', snapshotSeq: 1, status: 'failed', summary: {}, state: {} });
     await bundle.toolExecutionStore.markStarted({ runId: 'child', stepId: 'step', toolCallId: 'call', toolName: 'tool', idempotencyKey: 'tool-key', inputHash: 'hash' });
-    await bundle.continuationStore.createContinuation({ sourceRunId: 'root', continuationRunId: 'child', strategy: 'latest_snapshot', sourceSnapshotId: 'snapshot' });
-    await bundle.planStore.createPlan({ id: 'owned-plan', status: 'approved', objective: 'Delete', toolsetHash: 'tools', createdFromRunId: 'root', steps: [] });
-    await bundle.planStore.createPlan({ id: 'shared-plan', status: 'approved', objective: 'Keep', toolsetHash: 'tools', createdFromRunId: 'root', steps: [] });
+    await bundle.continuationStore.createContinuation({ sourceRunId: 'root', continuationRunId: 'child', strategy: 'latest_snapshot', failureClass: 'unknown', reason: 'test', sourceSnapshotId: 'snapshot' });
+    await bundle.planStore.createPlan({ id: 'owned-plan', version: 1, status: 'approved', goal: 'Delete', summary: 'Delete', toolsetHash: 'tools', createdFromRunId: 'root', steps: [] });
+    await bundle.planStore.createPlan({ id: 'shared-plan', version: 1, status: 'approved', goal: 'Keep', summary: 'Keep', toolsetHash: 'tools', createdFromRunId: 'root', steps: [] });
     await bundle.planStore.createExecution({ id: 'shared-execution', planId: 'shared-plan', runId: 'unrelated', attempt: 1, status: 'succeeded' });
 
     await expect(bundle.maintenanceStore.previewDeletion({ kind: 'root-run', rootRunId: 'root' })).resolves.toEqual({
@@ -220,11 +220,7 @@ describe('SQLite runtime stores', () => {
       ownedPlanIds: ['owned-plan'],
       preservedPlanIds: ['shared-plan'],
     });
-    await expect(bundle.maintenanceStore.previewDeletion({ kind: 'session', sessionId: 'session' })).resolves.toMatchObject({
-      runIds: ['child', 'root'],
-      rootRunIds: ['root'],
-    });
-    await bundle.maintenanceStore.deleteHistory({ kind: 'root-run', rootRunId: 'root' });
+    await expect(bundle.maintenanceStore.deleteRun('child')).resolves.toEqual({ deleted: true, rootRunId: 'root' });
 
     expect(await bundle.runStore.getRun('root')).toBeNull();
     expect(await bundle.runStore.getRun('child')).toBeNull();
@@ -238,20 +234,43 @@ describe('SQLite runtime stores', () => {
     expect(database.query('pragma foreign_key_check').all()).toEqual([]);
   });
 
-  it('rejects occupied trees and rolls back an injected deletion failure', async () => {
+  it('deletes a terminal tree when addressed by its root ID', async () => {
     const database = new Database(':memory:', { strict: true });
     const bundle = createSqliteRuntimeStores({ database });
     openBundles.push(bundle);
+    await bundle.runStore.createRun({ id: 'root', goal: 'Root', status: 'succeeded' });
+    await expect(bundle.maintenanceStore.deleteRun('root')).resolves.toEqual({ deleted: true, rootRunId: 'root' });
+    expect(await bundle.runStore.getRun('root')).toBeNull();
+  });
+
+  it('returns typed not-found and rejects occupied trees and interaction-blocked runs', async () => {
+    const database = new Database(':memory:', { strict: true });
+    const bundle = createSqliteRuntimeStores({ database });
+    openBundles.push(bundle);
+    await expect(bundle.maintenanceStore.deleteRun('missing'))
+      .rejects.toMatchObject({ code: 'RUN_NOT_FOUND' });
     await bundle.runStore.createRun({ id: 'active', goal: 'Active', status: 'awaiting_approval' });
-    await expect(bundle.maintenanceStore.deleteHistory({ kind: 'root-run', rootRunId: 'active' }))
-      .rejects.toThrow('occupy execution slots');
+    await expect(bundle.maintenanceStore.deleteRun('active'))
+      .rejects.toMatchObject({ code: 'RUN_NOT_TERMINAL' });
     expect(await bundle.runStore.getRun('active')).not.toBeNull();
 
+    await bundle.runStore.createRun({ id: 'clarification', goal: 'Clarify', status: 'clarification_requested' });
+    await expect(bundle.maintenanceStore.deleteRun('clarification'))
+      .rejects.toMatchObject({ code: 'RUN_NOT_TERMINAL' });
+    expect(await bundle.runStore.getRun('clarification')).not.toBeNull();
+  });
+
+  it('rolls back every run-tree mutation when deletion fails partway', async () => {
+    const database = new Database(':memory:', { strict: true });
+    const bundle = createSqliteRuntimeStores({ database });
+    openBundles.push(bundle);
     await bundle.runStore.createRun({ id: 'rollback', goal: 'Rollback', status: 'failed' });
+    await bundle.runStore.createRun({ id: 'rollback-child', rootRunId: 'rollback', parentRunId: 'rollback', goal: 'Child', status: 'failed' });
     database.exec("create trigger inject_deletion_failure before delete on agent_runs when old.id='rollback' begin select raise(abort, 'injected failure'); end");
-    await expect(bundle.maintenanceStore.deleteHistory({ kind: 'root-run', rootRunId: 'rollback' }))
+    await expect(bundle.maintenanceStore.deleteRun('rollback-child'))
       .rejects.toThrow('injected failure');
     expect(await bundle.runStore.getRun('rollback')).not.toBeNull();
+    expect(await bundle.runStore.getRun('rollback-child')).toMatchObject({ parentRunId: 'rollback' });
     expect(database.query('pragma foreign_key_check').all()).toEqual([]);
   });
 });

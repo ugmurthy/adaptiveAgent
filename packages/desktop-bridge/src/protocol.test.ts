@@ -38,6 +38,18 @@ describe('desktop bridge protocol', () => {
     expect(DESKTOP_PROTOCOL_VERSION).toBe('1.17');
   });
 
+  it('validates the typed run/delete request', () => {
+    expect(parseDesktopRpcRequest(JSON.stringify({
+      jsonrpc: '2.0', id: 'delete-run-1', method: 'run/delete', params: { runId: 'run-1' },
+    }))).toEqual({
+      jsonrpc: '2.0', id: 'delete-run-1', method: 'run/delete', params: { runId: 'run-1' },
+    });
+    for (const params of [undefined, {}, { runId: '' }, { runId: '   ' }, { runId: 1 }]) {
+      expect(() => parseDesktopRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'run/delete', ...(params === undefined ? {} : { params }) })))
+        .toThrowError(expect.objectContaining({ code: 'INVALID_PARAMS' }));
+    }
+  });
+
   it('validates agent builder requests', () => {
     expect(parseDesktopRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'agent/createDraft', params: { brief: 'Build a reviewer' } }))).toMatchObject({ method: 'agent/createDraft' });
     expect(parseDesktopRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'agent/validateConfig', params: { agent: { id: 'reviewer' } } }))).toMatchObject({ method: 'agent/validateConfig' });

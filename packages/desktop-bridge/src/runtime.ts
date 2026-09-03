@@ -23,7 +23,7 @@ import {
   type AdaptiveAgentCliCommand,
   type ManualTestCliOptions,
 } from '@adaptive-agent/agent-sdk/cli';
-import type { AgentEvent, ChatMessage, JsonValue, ModelContentPart, UUID } from '@adaptive-agent/core';
+import { RuntimeDeletionError, type AgentEvent, type ChatMessage, type JsonValue, type ModelContentPart, type UUID } from '@adaptive-agent/core';
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve } from 'node:path';
@@ -162,6 +162,9 @@ export class DesktopRuntime {
     if (!['1.16', '1.17'].includes(this.negotiatedProtocolVersion) && ['agent/readConfig', 'agent/archiveConfig', 'agent/restoreConfig'].includes(request.method)) {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', `${request.method} requires desktop protocol 1.16.`, JSON_RPC_ERROR_CODES.methodNotFound);
     }
+    if (this.negotiatedProtocolVersion !== '1.17' && request.method === 'run/delete') {
+      throw new DesktopProtocolError('METHOD_NOT_FOUND', 'run/delete requires desktop protocol 1.17.', JSON_RPC_ERROR_CODES.methodNotFound);
+    }
     if (!['1.14', '1.15', '1.16', '1.17'].includes(this.negotiatedProtocolVersion) && request.method === 'runtime/initialize' && request.params?.agentSelection) {
       throw new DesktopProtocolError('INVALID_PARAMS', 'Exact agent selection requires desktop protocol 1.14.', JSON_RPC_ERROR_CODES.invalidParams);
     }
@@ -254,6 +257,8 @@ export class DesktopRuntime {
       case 'run/interrupt':
         await this.requireSdk().interrupt(asRunId(request.params!.runId));
         return { runId: request.params!.runId, interrupted: true };
+      case 'run/delete':
+        return this.deleteRun(request.params!.runId);
       case 'run/inspect':
         return sanitizeInspection(await this.requireSdk().inspect(asRunId(request.params!.runId)));
       case 'run/replay': {
@@ -409,6 +414,7 @@ export class DesktopRuntime {
           if (!['1.14', '1.15', '1.16', '1.17'].includes(this.negotiatedProtocolVersion) && method === 'catalog/inspect') return false;
           if (!['1.15', '1.16', '1.17'].includes(this.negotiatedProtocolVersion) && ['agent/createDraft', 'agent/validateConfig', 'agent/saveConfig'].includes(method)) return false;
           if (!['1.16', '1.17'].includes(this.negotiatedProtocolVersion) && ['agent/readConfig', 'agent/archiveConfig', 'agent/restoreConfig'].includes(method)) return false;
+          if (this.negotiatedProtocolVersion !== '1.17' && method === 'run/delete') return false;
           return true;
         }),
         notifications: ['runtime/ready', 'agent/event', 'cli/output'],
@@ -694,11 +700,31 @@ export class DesktopRuntime {
     if (!store) {
       throw new DesktopProtocolError(
         'COMMAND_REJECTED',
-        'History deletion is available only for the SQLite runtime.',
+        'History deletion requires a persistent runtime maintenance store.',
         JSON_RPC_ERROR_CODES.commandRejected,
       );
     }
     return store;
+  }
+
+  private async deleteRun(runId: string): Promise<JsonValue> {
+    const sdk = this.requireSdk();
+    const store = sdk.created.runtime.maintenanceStore;
+    if (!store) {
+      throw new DesktopProtocolError(
+        'UNSUPPORTED_OPERATION',
+        `Permanent run deletion is unsupported in ${sdk.config.runtime.mode} runtime mode.`,
+        JSON_RPC_ERROR_CODES.commandRejected,
+      );
+    }
+    try {
+      return asJsonValue(await store.deleteRun(asRunId(runId)));
+    } catch (error) {
+      if (error instanceof RuntimeDeletionError) {
+        throw new DesktopProtocolError(error.code, error.message, JSON_RPC_ERROR_CODES.commandRejected);
+      }
+      throw error;
+    }
   }
 
   private cliCommands(): JsonValue {

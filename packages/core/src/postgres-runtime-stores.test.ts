@@ -837,4 +837,77 @@ describe('createPostgresRuntimeStores', () => {
     expect(transactionClient.calls).toEqual(['BEGIN', 'ROLLBACK']);
     expect(transactionClient.release).toHaveBeenCalledOnce();
   });
+
+  it('transactionally resolves a descendant and deletes its complete terminal root tree', async () => {
+    const rootRunId = '00000000-0000-4000-8000-000000000001';
+    const childRunId = '00000000-0000-4000-8000-000000000002';
+    const calls: string[] = [];
+    const query = vi.fn(async (sql: string) => {
+      calls.push(sql);
+      if (sql.startsWith('SELECT root_run_id')) return { rows: [{ root_run_id: rootRunId }], rowCount: 1 };
+      if (sql.startsWith('SELECT id FROM agent_runs')) return { rows: [{ id: rootRunId }], rowCount: 1 };
+      if (sql.startsWith('SELECT id, root_run_id')) return { rows: [{ id: childRunId, root_run_id: rootRunId }, { id: rootRunId, root_run_id: rootRunId }], rowCount: 2 };
+      if (sql.includes('FROM plans p')) return { rows: [{ id: 'owned-plan', owned: true }, { id: 'shared-plan', owned: false }], rowCount: 2 };
+      if (sql.startsWith('SELECT id, status')) return { rows: [{ id: rootRunId, status: 'succeeded', lease_owner: null }, { id: childRunId, status: 'failed', lease_owner: null }], rowCount: 2 };
+      return { rows: [], rowCount: 0 };
+    });
+    const transactionClient: PostgresTransactionClient = {
+      query: query as unknown as PostgresTransactionClient['query'],
+      release: vi.fn(),
+    };
+    const stores = createPostgresRuntimeStores({ client: { query: vi.fn(), connect: vi.fn(async () => transactionClient) } });
+
+    await expect(stores.maintenanceStore.deleteRun(childRunId)).resolves.toEqual({ deleted: true, rootRunId });
+    expect(calls[0]).toBe('BEGIN');
+    expect(calls.at(-1)).toBe('COMMIT');
+    expect(calls).toEqual(expect.arrayContaining([
+      'DELETE FROM plans WHERE id = ANY($1::uuid[])',
+      'UPDATE agent_runs SET parent_run_id = NULL, current_child_run_id = NULL WHERE id = ANY($1::uuid[])',
+      'DELETE FROM agent_runs WHERE id = ANY($1::uuid[]) AND NOT (id = ANY($2::uuid[]))',
+      'DELETE FROM agent_runs WHERE id = ANY($1::uuid[])',
+    ]));
+  });
+
+  it('rolls back Postgres run deletion for unknown, occupied, and partial-failure trees', async () => {
+    const rootRunId = '00000000-0000-4000-8000-000000000001';
+    const makeStores = (mode: 'missing' | 'occupied' | 'failure') => {
+      const calls: string[] = [];
+      const query = vi.fn(async (sql: string) => {
+        calls.push(sql);
+        if (sql.startsWith('SELECT root_run_id')) {
+          return mode === 'missing' ? { rows: [], rowCount: 0 } : { rows: [{ root_run_id: rootRunId }], rowCount: 1 };
+        }
+        if (sql.startsWith('SELECT id FROM agent_runs')) return { rows: [{ id: rootRunId }], rowCount: 1 };
+        if (sql.startsWith('SELECT id, root_run_id')) return { rows: [{ id: rootRunId, root_run_id: rootRunId }], rowCount: 1 };
+        if (sql.includes('FROM plans p')) return { rows: [], rowCount: 0 };
+        if (sql.startsWith('SELECT id, status')) {
+          return { rows: [{ id: rootRunId, status: mode === 'occupied' ? 'awaiting_approval' : 'failed', lease_owner: null }], rowCount: 1 };
+        }
+        if (mode === 'failure' && sql.startsWith('DELETE FROM agent_runs')) throw new Error('injected failure');
+        return { rows: [], rowCount: 0 };
+      });
+      const transactionClient: PostgresTransactionClient = {
+        query: query as unknown as PostgresTransactionClient['query'],
+        release: vi.fn(),
+      };
+      return {
+        calls,
+        stores: createPostgresRuntimeStores({ client: { query: vi.fn(), connect: vi.fn(async () => transactionClient) } }),
+      };
+    };
+
+    const missing = makeStores('missing');
+    await expect(missing.stores.maintenanceStore.deleteRun('not-a-uuid')).rejects.toMatchObject({ code: 'RUN_NOT_FOUND' });
+    await expect(missing.stores.maintenanceStore.deleteRun(rootRunId)).rejects.toMatchObject({ code: 'RUN_NOT_FOUND' });
+    expect(missing.calls.at(-1)).toBe('ROLLBACK');
+
+    const occupied = makeStores('occupied');
+    await expect(occupied.stores.maintenanceStore.deleteRun(rootRunId)).rejects.toMatchObject({ code: 'RUN_NOT_TERMINAL' });
+    expect(occupied.calls.at(-1)).toBe('ROLLBACK');
+    expect(occupied.calls.some((sql) => sql.startsWith('DELETE'))).toBe(false);
+
+    const failure = makeStores('failure');
+    await expect(failure.stores.maintenanceStore.deleteRun(rootRunId)).rejects.toThrow('injected failure');
+    expect(failure.calls.at(-1)).toBe('ROLLBACK');
+  });
 });

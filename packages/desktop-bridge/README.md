@@ -57,7 +57,7 @@ connection is sticky: subsequent input and agent events use JSON-RPC only.
 The result advertises supported methods, notifications, and CLI commands:
 
 ```json
-{"jsonrpc":"2.0","id":"initialize","result":{"protocolVersion":"1.17","bridgeVersion":"0.1.0","serverInfo":{"name":"@adaptive-agent/desktop-bridge","version":"0.1.0"},"capabilities":{"methods":["initialize","catalog/inspect","runtime/initialize","runtime/info","runtime/shutdown","settings/update","auth/updateAccessToken","agent/run","agent/chat","run/resume","run/retry","run/recover","run/continue","run/interrupt","run/inspect","run/replay","run/steer","execution/inspect","execution/interrupt","execution/resume","interaction/resolveApproval","interaction/resolveClarification","history/previewDeletion","history/delete","agent/createDraft","agent/validateConfig","agent/saveConfig","agent/readConfig","agent/archiveConfig","agent/restoreConfig","cli/commands","cli/execute"],"notifications":["runtime/ready","agent/event","cli/output"]}}}
+{"jsonrpc":"2.0","id":"initialize","result":{"protocolVersion":"1.17","bridgeVersion":"0.1.0","serverInfo":{"name":"@adaptive-agent/desktop-bridge","version":"0.1.0"},"capabilities":{"methods":["initialize","catalog/inspect","runtime/initialize","runtime/info","runtime/shutdown","settings/update","auth/updateAccessToken","agent/run","agent/chat","run/resume","run/retry","run/recover","run/continue","run/interrupt","run/delete","run/inspect","run/replay","run/steer","execution/inspect","execution/interrupt","execution/resume","interaction/resolveApproval","interaction/resolveClarification","history/previewDeletion","history/delete","agent/createDraft","agent/validateConfig","agent/saveConfig","agent/readConfig","agent/archiveConfig","agent/restoreConfig","cli/commands","cli/execute"],"notifications":["runtime/ready","agent/event","cli/output"]}}}
 ```
 
 Initialize the persistent agent runtime separately. This allows setup,
@@ -125,6 +125,7 @@ steering, and in-memory run state.
 | `run/recover` | `runId` | `strategy` (`auto`, `resume`, `retry`, `continue`), `dryRun` |
 | `run/continue` | `runId` | - |
 | `run/interrupt` | `runId` | - |
+| `run/delete` | `runId` | - |
 | `run/inspect` | `runId` | - |
 | `run/replay` | `runId` | - |
 | `run/steer` | `runId`, `message` | `role`, `metadata` |
@@ -144,6 +145,30 @@ Events are notifications and have no `id`:
 ```json
 {"jsonrpc":"2.0","method":"agent/event","params":{"schemaVersion":1,"type":"run.status_changed","runId":"..."}}
 ```
+
+### Permanent run deletion (protocol 1.17)
+
+`run/delete` permanently deletes one complete root-run tree. `runId` may name
+the root or any descendant; the result always returns the canonical root ID.
+
+```json
+{"jsonrpc":"2.0","id":"delete-run-1","method":"run/delete","params":{"runId":"<root-or-descendant-run-id>"}}
+{"jsonrpc":"2.0","id":"delete-run-1","result":{"deleted":true,"rootRunId":"<resolved-root-run-id>"}}
+```
+
+Deletion is atomic and is available for SQLite and Postgres runtimes. It
+removes descendants and run-owned events, snapshots, tool executions, plan
+executions, continuations, and plans that are not shared with another root.
+Other roots remain intact even when they use the same `sessionId`; sessions are
+run relationships rather than separately owned persistence records. Memory
+mode returns `UNSUPPORTED_OPERATION` because it has no durable atomic
+multi-store deletion contract.
+
+Every run in the resolved tree must be terminal and no run may retain a runtime
+lease. Approval- or clarification-blocked runs are rejected without implicit
+interruption. An unknown ID returns `RUN_NOT_FOUND`; an active, blocked, or
+otherwise runtime-owned tree returns `RUN_NOT_TERMINAL`. Both are stable
+`error.data.protocolCode` values and leave persistence unchanged.
 
 ## CLI command coverage
 

@@ -1,3 +1,4 @@
+import { RuntimeDeletionError } from './types.js';
 import type {
   AgentEvent,
   AgentRun,
@@ -15,9 +16,13 @@ import type {
   RecoveryScanReason,
   PlanStore,
   RunContinuation,
+  RunDeletionResult,
   RunSnapshot,
   RunStatus,
   RunStore,
+  RuntimeDeletionPreview,
+  RuntimeDeletionTarget,
+  RuntimeMaintenanceStore,
   RuntimeRecoveryCandidate,
   RuntimeStores,
   RuntimeTransactionStore,
@@ -205,6 +210,14 @@ const TERMINAL_RUN_STATUSES = new Set<RunStatus>([
 ]);
 
 const TERMINAL_PLAN_EXECUTION_STATUSES = new Set<PlanExecutionStatus>([
+  'succeeded',
+  'failed',
+  'replan_required',
+  'cancelled',
+]);
+
+const DELETABLE_RUN_STATUSES = new Set<RunStatus>([
+  'interrupted',
   'succeeded',
   'failed',
   'replan_required',
@@ -1107,6 +1120,55 @@ export class PostgresRecoveryScanner {
   }
 }
 
+export class PostgresRuntimeMaintenanceStore implements RuntimeMaintenanceStore {
+  constructor(private readonly client: PostgresClient | PostgresPoolClient) {}
+
+  previewDeletion(target: RuntimeDeletionTarget): Promise<RuntimeDeletionPreview> {
+    return runPostgresTransaction(this.client, (client) => previewPostgresDeletion(client, target));
+  }
+
+  deleteHistory(target: RuntimeDeletionTarget): Promise<RuntimeDeletionPreview> {
+    return runPostgresTransaction(this.client, async (client) => {
+      const preview = await previewPostgresDeletion(client, target, true);
+      if (preview.runIds.length === 0) return preview;
+      const runs = await lockedPostgresRuns(client, preview.rootRunIds);
+      const occupied = runs.filter((run) => !DELETABLE_RUN_STATUSES.has(run.status as RunStatus) && run.status !== 'clarification_requested');
+      if (occupied.length > 0) {
+        throw new Error(`Cannot delete history while runs occupy execution slots: ${occupied.map((run) => run.id).sort().join(', ')}`);
+      }
+      await deletePostgresPreview(client, preview);
+      return preview;
+    });
+  }
+
+  deleteRun(runId: UUID): Promise<RunDeletionResult> {
+    return runPostgresTransaction(this.client, async (client) => {
+      if (!isPostgresUuid(runId)) {
+        throw new RuntimeDeletionError('RUN_NOT_FOUND', `Run ${runId} does not exist.`);
+      }
+      const resolved = await client.query<{ root_run_id: string }>(
+        'SELECT root_run_id FROM agent_runs WHERE id = $1 FOR UPDATE',
+        [runId],
+      );
+      const rootRunId = resolved.rows[0]?.root_run_id;
+      if (!rootRunId) throw new RuntimeDeletionError('RUN_NOT_FOUND', `Run ${runId} does not exist.`);
+
+      const runs = await lockedPostgresRuns(client, [rootRunId]);
+      const occupied = runs.filter((run) => !DELETABLE_RUN_STATUSES.has(run.status as RunStatus) || run.lease_owner);
+      if (occupied.length > 0) {
+        throw new RuntimeDeletionError(
+          'RUN_NOT_TERMINAL',
+          `Cannot delete run tree ${rootRunId}; nonterminal or runtime-owned runs: ${occupied.map((run) => run.id).sort().join(', ')}.`,
+        );
+      }
+
+      const preview = await previewPostgresDeletion(client, { kind: 'root-run', rootRunId });
+      await deletePostgresPreview(client, preview);
+      return { deleted: true, rootRunId };
+    });
+  }
+}
+
 export class PostgresRuntimeStoreBundle implements RuntimeTransactionStore {
   readonly runStore: PostgresRunStore;
   readonly eventStore: PostgresEventStore;
@@ -1115,6 +1177,7 @@ export class PostgresRuntimeStoreBundle implements RuntimeTransactionStore {
   readonly continuationStore: PostgresContinuationStore;
   readonly toolExecutionStore: PostgresToolExecutionStore;
   readonly recoveryScanner: PostgresRecoveryScanner;
+  readonly maintenanceStore: PostgresRuntimeMaintenanceStore;
 
   constructor(private readonly client: PostgresClient | PostgresPoolClient) {
     this.runStore = new PostgresRunStore(client);
@@ -1124,6 +1187,7 @@ export class PostgresRuntimeStoreBundle implements RuntimeTransactionStore {
     this.continuationStore = new PostgresContinuationStore(client);
     this.toolExecutionStore = new PostgresToolExecutionStore(client);
     this.recoveryScanner = new PostgresRecoveryScanner(client);
+    this.maintenanceStore = new PostgresRuntimeMaintenanceStore(client);
   }
 
   async runInTransaction<T>(operation: (stores: RuntimeStores) => Promise<T>): Promise<T> {
@@ -1142,6 +1206,66 @@ export class PostgresRuntimeStoreBundle implements RuntimeTransactionStore {
 
 export function createPostgresRuntimeStores(options: { client: PostgresClient | PostgresPoolClient }): PostgresRuntimeStoreBundle {
   return new PostgresRuntimeStoreBundle(options.client);
+}
+
+async function previewPostgresDeletion(
+  client: PostgresClient,
+  target: RuntimeDeletionTarget,
+  lock = false,
+): Promise<RuntimeDeletionPreview> {
+  const roots = target.kind === 'root-run'
+    ? await client.query<{ id: string }>('SELECT id FROM agent_runs WHERE id = $1 AND root_run_id = id', [target.rootRunId])
+    : await client.query<{ id: string }>('SELECT DISTINCT root_run_id AS id FROM agent_runs WHERE session_id = $1 ORDER BY id', [target.sessionId]);
+  const rootRunIds = roots.rows.map((row) => row.id);
+  if (rootRunIds.length === 0) return { target, runIds: [], rootRunIds: [], ownedPlanIds: [], preservedPlanIds: [] };
+
+  const runs = await client.query<{ id: string; root_run_id: string }>(
+    `SELECT id, root_run_id FROM agent_runs WHERE root_run_id = ANY($1::uuid[]) ORDER BY created_at, id${lock ? ' FOR UPDATE' : ''}`,
+    [rootRunIds],
+  );
+  const rootIds = new Set(rootRunIds);
+  const runIds = runs.rows.filter((run) => !rootIds.has(run.id)).map((run) => run.id)
+    .concat(runs.rows.filter((run) => rootIds.has(run.id)).map((run) => run.id));
+  const plans = await client.query<{ id: string; owned: boolean }>(`
+    SELECT p.id, NOT EXISTS (
+      SELECT 1 FROM plan_executions pe WHERE pe.plan_id = p.id AND NOT (pe.run_id = ANY($1::uuid[]))
+    ) AS owned
+    FROM plans p WHERE p.created_from_run_id = ANY($1::uuid[]) ORDER BY p.id
+  `, [runIds]);
+  return {
+    target,
+    runIds,
+    rootRunIds,
+    ownedPlanIds: plans.rows.filter((plan) => plan.owned).map((plan) => plan.id),
+    preservedPlanIds: plans.rows.filter((plan) => !plan.owned).map((plan) => plan.id),
+  };
+}
+
+async function lockedPostgresRuns(client: PostgresClient, rootRunIds: UUID[]) {
+  const result = await client.query<{ id: string; status: string; lease_owner: string | null }>(
+    'SELECT id, status, lease_owner FROM agent_runs WHERE root_run_id = ANY($1::uuid[]) FOR UPDATE',
+    [rootRunIds],
+  );
+  return result.rows;
+}
+
+async function deletePostgresPreview(client: PostgresClient, preview: RuntimeDeletionPreview): Promise<void> {
+  if (preview.ownedPlanIds.length > 0) {
+    await client.query('DELETE FROM plans WHERE id = ANY($1::uuid[])', [preview.ownedPlanIds]);
+  }
+  await client.query(
+    'UPDATE agent_runs SET parent_run_id = NULL, current_child_run_id = NULL WHERE id = ANY($1::uuid[])',
+    [preview.runIds],
+  );
+  await client.query(
+    'DELETE FROM agent_runs WHERE id = ANY($1::uuid[]) AND NOT (id = ANY($2::uuid[]))',
+    [preview.runIds, preview.rootRunIds],
+  );
+  await client.query('DELETE FROM agent_runs WHERE id = ANY($1::uuid[])', [preview.rootRunIds]);
+}
+
+function isPostgresUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
 function runRowToRecord(row: AgentRunRow): AgentRun {

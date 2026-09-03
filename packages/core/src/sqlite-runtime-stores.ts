@@ -1,6 +1,7 @@
 import { Database } from 'bun:sqlite';
 
 import { runSqliteRuntimeMigrations } from './sqlite-runtime-migrations.js';
+import { RuntimeDeletionError } from './types.js';
 import type {
   AgentEvent,
   AgentRun,
@@ -20,6 +21,7 @@ import type {
   RuntimeRecoveryCandidate,
   RuntimeDeletionPreview,
   RuntimeDeletionTarget,
+  RunDeletionResult,
   RuntimeMaintenanceStore,
   RuntimeStores,
   RuntimeTransactionStore,
@@ -881,32 +883,34 @@ export class SqliteRuntimeMaintenanceStore implements RuntimeMaintenanceStore {
         throw new Error(`Cannot delete history while runs occupy execution slots: ${occupied.map((run) => run.id).sort().join(', ')}`);
       }
 
-      if (preview.ownedPlanIds.length > 0) {
-        this.database.run(
-          `delete from plans where id in (${placeholders(preview.ownedPlanIds.length)})`,
-          preview.ownedPlanIds,
-        );
-      }
-      this.database.run(
-        `update agent_runs set parent_run_id = null, current_child_run_id = null where id in (${placeholders(preview.runIds.length)})`,
-        preview.runIds,
-      );
-      const childRunIds = preview.runIds.filter((runId) => !preview.rootRunIds.includes(runId));
-      if (childRunIds.length > 0) {
-        this.database.run(
-          `delete from agent_runs where id in (${placeholders(childRunIds.length)})`,
-          childRunIds,
-        );
-      }
-      if (preview.rootRunIds.length > 0) {
-        this.database.run(
-          `delete from agent_runs where id in (${placeholders(preview.rootRunIds.length)})`,
-          preview.rootRunIds,
-        );
-      }
-      const foreignKeyFailures = this.database.query('pragma foreign_key_check').all();
-      if (foreignKeyFailures.length > 0) throw new Error('Runtime deletion failed foreign key verification.');
+      deleteRuntimePreview(this.database, preview);
       return preview;
+    }));
+  }
+
+  deleteRun(runId: UUID): Promise<RunDeletionResult> {
+    return this.executor.run(() => this.inImmediateTransaction(() => {
+      const resolved = this.database
+        .query('select root_run_id from agent_runs where id = ?')
+        .get(runId) as { root_run_id: string } | null;
+      if (!resolved) {
+        throw new RuntimeDeletionError('RUN_NOT_FOUND', `Run ${runId} does not exist.`);
+      }
+
+      const preview = previewRuntimeDeletion(this.database, { kind: 'root-run', rootRunId: resolved.root_run_id });
+      const runs = this.database
+        .query(`select id, status, lease_owner from agent_runs where id in (${placeholders(preview.runIds.length)})`)
+        .all(...preview.runIds) as Array<{ id: string; status: RunStatus; lease_owner: string | null }>;
+      const occupied = runs.filter((run) => !DELETABLE_RUN_STATUSES.has(run.status) || run.status === 'clarification_requested' || run.lease_owner);
+      if (occupied.length > 0) {
+        throw new RuntimeDeletionError(
+          'RUN_NOT_TERMINAL',
+          `Cannot delete run tree ${resolved.root_run_id}; nonterminal or runtime-owned runs: ${occupied.map((run) => run.id).sort().join(', ')}.`,
+        );
+      }
+
+      deleteRuntimePreview(this.database, preview);
+      return { deleted: true, rootRunId: resolved.root_run_id };
     }));
   }
 
@@ -1023,6 +1027,32 @@ function previewRuntimeDeletion(database: Database, target: RuntimeDeletionTarge
     (unrelated.value ? preservedPlanIds : ownedPlanIds).push(id);
   }
   return { target, runIds, rootRunIds, ownedPlanIds, preservedPlanIds };
+}
+
+function deleteRuntimePreview(database: Database, preview: RuntimeDeletionPreview): void {
+  if (preview.ownedPlanIds.length > 0) {
+    database.run(
+      `delete from plans where id in (${placeholders(preview.ownedPlanIds.length)})`,
+      preview.ownedPlanIds,
+    );
+  }
+  database.run(
+    `update agent_runs set parent_run_id = null, current_child_run_id = null where id in (${placeholders(preview.runIds.length)})`,
+    preview.runIds,
+  );
+  const childRunIds = preview.runIds.filter((runId) => !preview.rootRunIds.includes(runId));
+  if (childRunIds.length > 0) {
+    database.run(
+      `delete from agent_runs where id in (${placeholders(childRunIds.length)})`,
+      childRunIds,
+    );
+  }
+  database.run(
+    `delete from agent_runs where id in (${placeholders(preview.rootRunIds.length)})`,
+    preview.rootRunIds,
+  );
+  const foreignKeyFailures = database.query('pragma foreign_key_check').all();
+  if (foreignKeyFailures.length > 0) throw new Error('Runtime deletion failed foreign key verification.');
 }
 
 function placeholders(count: number): string {
