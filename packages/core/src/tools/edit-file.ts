@@ -2,7 +2,7 @@ import { copyFile, lstat, readFile, rename, rm, writeFile } from 'node:fs/promis
 import { createHash, randomUUID } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
 
-import type { ToolContext, ToolDefinition } from '../types.js';
+import type { JsonObject, ToolContext, ToolDefinition } from '../types.js';
 import { buildWorkspacePathRecovery, PathOutsideRootError, resolvePathWithinRoot } from './path-utils.js';
 
 export interface EditFileToolConfig {
@@ -81,6 +81,53 @@ interface EditFileOutput {
   backupPath?: string;
 }
 
+interface MatchLocation extends JsonObject {
+  line: number;
+  column: number;
+  excerpt: string;
+}
+
+class EditMatchConflictError extends Error {
+  constructor(
+    public readonly filePath: string,
+    public readonly editIndex: number,
+    public readonly operation: NormalizedEditOperation['type'],
+    public readonly targetText: string,
+    public readonly expectedMatches: number,
+    public readonly actualMatches: number,
+    public readonly fileSha256: string,
+    public readonly candidateLocations: MatchLocation[],
+    public readonly replacementAlreadyPresent: boolean,
+    public readonly normalizedLineEndingMatches: number,
+  ) {
+    const targetName = operation === 'replace' ? 'oldText' : 'anchorText';
+    super(
+      `edit_file ${operation} edit ${editIndex} expected ${formatMatchCount(expectedMatches)} ` +
+        `for ${targetName} but found ${actualMatches}`,
+    );
+    this.name = 'EditMatchConflictError';
+  }
+}
+
+type EditFileConstraintKind =
+  | 'file_not_found'
+  | 'path_not_file'
+  | 'symbolic_link'
+  | 'file_too_large'
+  | 'unsupported_text_file';
+
+class EditFileConstraintError extends Error {
+  constructor(
+    public readonly recoveryKind: EditFileConstraintKind,
+    public readonly filePath: string,
+    message: string,
+    public readonly correctiveAction: string,
+  ) {
+    super(message);
+    this.name = 'EditFileConstraintError';
+  }
+}
+
 class ExpectedSha256MismatchError extends Error {
   constructor(
     public readonly filePath: string,
@@ -107,7 +154,7 @@ export function createEditFileTool(config?: EditFileToolConfig): ToolDefinition 
   return {
     name: 'edit_file',
     description:
-      'Apply conservative text edits to any existing UTF-8 text or code file, regardless of file extension. Supports exact replace and anchored insert operations. Requires approval.',
+      'Apply conservative, atomic text edits to an existing UTF-8 text or code file. Exact target text must have the expected match count (default 1); include surrounding unchanged text to make a target unique, or set expectedMatches explicitly only when every occurrence should be edited. Recoverable conflicts return retry guidance without changing the file. Requires approval.',
     inputSchema: {
       type: 'object',
       required: ['path', 'edits'],
@@ -130,10 +177,11 @@ export function createEditFileTool(config?: EditFileToolConfig): ToolDefinition 
                 additionalProperties: false,
                 properties: {
                   type: { type: 'string', enum: ['replace'] },
-                  oldText: { type: 'string', description: 'Exact text to replace. Must be non-empty.' },
+                  oldText: { type: 'string', minLength: 1, description: 'Exact text to replace. Must be non-empty.' },
                   newText: { type: 'string', description: 'Replacement text. May be empty to delete oldText.' },
                   expectedMatches: {
-                    type: 'number',
+                    type: 'integer',
+                    minimum: 0,
                     description: 'Expected non-overlapping match count. Defaults to 1.',
                   },
                 },
@@ -143,10 +191,11 @@ export function createEditFileTool(config?: EditFileToolConfig): ToolDefinition 
                 required: ['oldText', 'newText'],
                 additionalProperties: false,
                 properties: {
-                  oldText: { type: 'string', description: 'Exact text to replace. Must be non-empty.' },
+                  oldText: { type: 'string', minLength: 1, description: 'Exact text to replace. Must be non-empty.' },
                   newText: { type: 'string', description: 'Replacement text. May be empty to delete oldText.' },
                   expectedMatches: {
-                    type: 'number',
+                    type: 'integer',
+                    minimum: 0,
                     description: 'Expected non-overlapping match count. Defaults to 1.',
                   },
                 },
@@ -157,10 +206,11 @@ export function createEditFileTool(config?: EditFileToolConfig): ToolDefinition 
                 additionalProperties: false,
                 properties: {
                   type: { type: 'string', enum: ['insert_after'] },
-                  anchorText: { type: 'string', description: 'Exact anchor text to insert after. Must be non-empty.' },
-                  text: { type: 'string', description: 'Text to insert. Must be non-empty.' },
+                  anchorText: { type: 'string', minLength: 1, description: 'Exact anchor text to insert after. Must be non-empty.' },
+                  text: { type: 'string', minLength: 1, description: 'Text to insert. Must be non-empty.' },
                   expectedMatches: {
-                    type: 'number',
+                    type: 'integer',
+                    minimum: 0,
                     description: 'Expected non-overlapping anchor count. Defaults to 1.',
                   },
                 },
@@ -171,10 +221,11 @@ export function createEditFileTool(config?: EditFileToolConfig): ToolDefinition 
                 additionalProperties: false,
                 properties: {
                   type: { type: 'string', enum: ['insert_before'] },
-                  anchorText: { type: 'string', description: 'Exact anchor text to insert before. Must be non-empty.' },
-                  text: { type: 'string', description: 'Text to insert. Must be non-empty.' },
+                  anchorText: { type: 'string', minLength: 1, description: 'Exact anchor text to insert before. Must be non-empty.' },
+                  text: { type: 'string', minLength: 1, description: 'Text to insert. Must be non-empty.' },
                   expectedMatches: {
-                    type: 'number',
+                    type: 'integer',
+                    minimum: 0,
                     description: 'Expected non-overlapping anchor count. Defaults to 1.',
                   },
                 },
@@ -184,6 +235,7 @@ export function createEditFileTool(config?: EditFileToolConfig): ToolDefinition 
         },
         expectedSha256: {
           type: 'string',
+          pattern: '^[a-f0-9]{64}$',
           description: 'Optional lowercase hex SHA-256 digest of the original file bytes for optimistic safety.',
         },
       },
@@ -207,26 +259,87 @@ export function createEditFileTool(config?: EditFileToolConfig): ToolDefinition 
             'Read the current file, revise the edit against that content, then retry using actualSha256 as expectedSha256 only if the file is still unchanged.',
         };
       }
+      if (error instanceof EditMatchConflictError) {
+        const conflictKind = error.actualMatches === 0
+          ? 'no_match'
+          : error.expectedMatches === 1 && error.actualMatches > 1
+            ? 'ambiguous_match'
+            : 'match_count_mismatch';
+        return {
+          ok: false,
+          recoveryKind: 'edit_conflict',
+          conflictKind,
+          toolName: 'edit_file',
+          path: error.filePath,
+          editIndex: error.editIndex,
+          operation: error.operation,
+          targetText: truncateDiagnosticText(error.targetText),
+          expectedMatches: error.expectedMatches,
+          actualMatches: error.actualMatches,
+          fileSha256: error.fileSha256,
+          fileChanged: false,
+          ...(error.candidateLocations.length === 0
+            ? {}
+            : { candidateLocations: error.candidateLocations }),
+          ...(error.replacementAlreadyPresent ? { replacementAlreadyPresent: true } : {}),
+          ...(error.normalizedLineEndingMatches === 0
+            ? {}
+            : { normalizedLineEndingMatches: error.normalizedLineEndingMatches }),
+          message: error.message,
+          correctiveAction: buildMatchConflictCorrectiveAction(error),
+        };
+      }
+      if (error instanceof EditFileConstraintError) {
+        return {
+          ok: false,
+          recoveryKind: error.recoveryKind,
+          toolName: 'edit_file',
+          path: error.filePath,
+          fileChanged: false,
+          message: error.message,
+          correctiveAction: error.correctiveAction,
+        };
+      }
 
       return undefined;
     },
     async execute(rawInput, context: ToolContext) {
       const input = normalizeEditFileInput(rawInput);
       const resolved = resolvePathWithinRoot(allowedRoot, input.path);
-      const fileStats = await lstat(resolved);
+      const fileStats = await lstat(resolved).catch((error: unknown) => {
+        if (isNodeErrorWithCode(error, 'ENOENT')) {
+          throw new EditFileConstraintError(
+            'file_not_found',
+            resolved,
+            `edit_file requires an existing file, but ${resolved} was not found`,
+            'Check the path or list the containing directory, then retry with an existing file.',
+          );
+        }
+        throw error;
+      });
       if (fileStats.isSymbolicLink()) {
-        throw new Error(`edit_file refuses to edit symbolic links: ${resolved}`);
+        throw new EditFileConstraintError(
+          'symbolic_link',
+          resolved,
+          `edit_file refuses to edit symbolic links: ${resolved}`,
+          'Resolve the link and retry with the real target path under the allowed root.',
+        );
       }
       if (!fileStats.isFile()) {
-        throw new Error(`edit_file requires an existing file path: ${resolved}`);
+        throw new EditFileConstraintError(
+          'path_not_file',
+          resolved,
+          `edit_file requires an existing file path: ${resolved}`,
+          'Choose an existing file rather than a directory or special filesystem entry, then retry.',
+        );
       }
       if (fileStats.size > maxFileSizeBytes) {
-        throw new Error(`File ${resolved} exceeds maximum size of ${maxFileSizeBytes} bytes`);
+        throw fileTooLargeError(resolved, fileStats.size, maxFileSizeBytes);
       }
 
       const originalBuffer = await readFile(resolved);
       if (originalBuffer.byteLength > maxFileSizeBytes) {
-        throw new Error(`File ${resolved} exceeds maximum size of ${maxFileSizeBytes} bytes`);
+        throw fileTooLargeError(resolved, originalBuffer.byteLength, maxFileSizeBytes);
       }
 
       const originalSha256 = sha256(originalBuffer);
@@ -236,9 +349,13 @@ export function createEditFileTool(config?: EditFileToolConfig): ToolDefinition 
 
       const originalContent = decodeUtf8TextFile(originalBuffer, resolved);
       let editedContent = originalContent;
-      for (const edit of input.edits) {
+      for (const [editIndex, edit] of input.edits.entries()) {
         context.signal.throwIfAborted();
-        editedContent = applyEditOperation(editedContent, edit);
+        editedContent = applyEditOperation(editedContent, edit, {
+          filePath: resolved,
+          fileSha256: originalSha256,
+          editIndex,
+        });
       }
 
       const changed = editedContent !== originalContent;
@@ -254,7 +371,12 @@ export function createEditFileTool(config?: EditFileToolConfig): ToolDefinition 
 
       const editedBuffer = Buffer.from(editedContent, 'utf8');
       if (editedBuffer.byteLength > maxFileSizeBytes) {
-        throw new Error(`Edited file ${resolved} exceeds maximum size of ${maxFileSizeBytes} bytes`);
+        throw fileTooLargeError(resolved, editedBuffer.byteLength, maxFileSizeBytes);
+      }
+
+      const currentSha256 = sha256(await readFile(resolved));
+      if (currentSha256 !== originalSha256) {
+        throw new ExpectedSha256MismatchError(resolved, originalSha256, currentSha256);
       }
 
       const backupPath = createBackup ? await createBackupFile(resolved) : undefined;
@@ -346,7 +468,7 @@ function normalizeEditOperation(value: unknown, index: number): NormalizedEditOp
         throw new Error(`edit_file ${edit.type} edit ${index} requires non-empty "text"`);
       }
       return {
-        type: edit.type,
+        type: editType,
         anchorText: edit.anchorText,
         text: edit.text,
         expectedMatches,
@@ -375,23 +497,35 @@ function validateExpectedSha256(value: unknown): asserts value is string {
   }
 }
 
-function applyEditOperation(content: string, edit: NormalizedEditOperation): string {
+function applyEditOperation(
+  content: string,
+  edit: NormalizedEditOperation,
+  context: { filePath: string; fileSha256: string; editIndex: number },
+): string {
+  const targetText = edit.type === 'replace' ? edit.oldText : edit.anchorText;
+  const actualMatches = countOccurrences(content, targetText);
+  if (actualMatches !== edit.expectedMatches) {
+    const normalizedLineEndingMatches = actualMatches === 0 && targetText.includes('\n')
+      ? countOccurrences(normalizeLineEndings(content), normalizeLineEndings(targetText))
+      : 0;
+    throw new EditMatchConflictError(
+      context.filePath,
+      context.editIndex,
+      edit.type,
+      targetText,
+      edit.expectedMatches,
+      actualMatches,
+      context.fileSha256,
+      actualMatches === 0 ? [] : findMatchLocations(content, targetText),
+      edit.type === 'replace' && edit.newText.length > 0 && content.includes(edit.newText),
+      normalizedLineEndingMatches,
+    );
+  }
+
   if (edit.type === 'replace') {
-    const actualMatches = countOccurrences(content, edit.oldText);
-    if (actualMatches !== edit.expectedMatches) {
-      throw new Error(
-        `edit_file replace expected ${edit.expectedMatches} matches for oldText but found ${actualMatches}`,
-      );
-    }
     return actualMatches === 0 ? content : content.split(edit.oldText).join(edit.newText);
   }
 
-  const actualMatches = countOccurrences(content, edit.anchorText);
-  if (actualMatches !== edit.expectedMatches) {
-    throw new Error(
-      `edit_file ${edit.type} expected ${edit.expectedMatches} matches for anchorText but found ${actualMatches}`,
-    );
-  }
   if (actualMatches === 0) {
     return content;
   }
@@ -415,16 +549,89 @@ function countOccurrences(content: string, needle: string): number {
   return count;
 }
 
+function findMatchLocations(content: string, needle: string): MatchLocation[] {
+  const locations: MatchLocation[] = [];
+  let searchStart = 0;
+  while (locations.length < 5) {
+    const index = content.indexOf(needle, searchStart);
+    if (index === -1) {
+      break;
+    }
+    const lineStart = content.lastIndexOf('\n', index - 1) + 1;
+    const lineEnd = content.indexOf('\n', index);
+    const linePrefix = content.slice(0, index);
+    locations.push({
+      line: countOccurrences(linePrefix, '\n') + 1,
+      column: index - lineStart + 1,
+      excerpt: truncateDiagnosticText(content.slice(lineStart, lineEnd === -1 ? content.length : lineEnd)),
+    });
+    searchStart = index + needle.length;
+  }
+  return locations;
+}
+
+function buildMatchConflictCorrectiveAction(error: EditMatchConflictError): string {
+  if (error.actualMatches === 0) {
+    const alreadyPresent = error.replacementAlreadyPresent
+      ? ' The replacement text is already present, so first check whether the edit was already applied.'
+      : '';
+    const lineEndings = error.normalizedLineEndingMatches > 0
+      ? ` The target would match ${formatMatchCount(error.normalizedLineEndingMatches)} after normalizing CRLF/LF line endings; copy the exact current line endings or use a smaller unique target.`
+      : '';
+    return `Read the current file and retry with target text copied exactly, including indentation, blank lines, comments, and line endings.${alreadyPresent}${lineEndings}`;
+  }
+  if (error.expectedMatches === 1 && error.actualMatches > 1) {
+    return 'Add surrounding unchanged text so exactly one location matches. Set expectedMatches to the actual count only if every occurrence should receive the same edit.';
+  }
+  return 'Read the current file, confirm which occurrences should change, then revise the target text or expectedMatches and retry.';
+}
+
+function formatMatchCount(count: number): string {
+  return `${count} ${count === 1 ? 'match' : 'matches'}`;
+}
+
+function truncateDiagnosticText(text: string): string {
+  const maxLength = 500;
+  return text.length <= maxLength ? text : `${text.slice(0, maxLength)}…`;
+}
+
+function normalizeLineEndings(text: string): string {
+  return text.replace(/\r\n/g, '\n');
+}
+
 function decodeUtf8TextFile(buffer: Buffer, filePath: string): string {
   if (buffer.includes(0)) {
-    throw new Error(`edit_file only supports UTF-8 text files and rejects binary files: ${filePath}`);
+    throw new EditFileConstraintError(
+      'unsupported_text_file',
+      filePath,
+      `edit_file only supports UTF-8 text files and rejects binary files: ${filePath}`,
+      'Use a tool designed for binary files, or choose a UTF-8 text file.',
+    );
   }
 
   try {
     return UTF8_DECODER.decode(buffer);
   } catch {
-    throw new Error(`edit_file only supports UTF-8 text files: ${filePath}`);
+    throw new EditFileConstraintError(
+      'unsupported_text_file',
+      filePath,
+      `edit_file only supports UTF-8 text files: ${filePath}`,
+      'Convert the file to UTF-8 or use a tool that supports its encoding, then retry.',
+    );
   }
+}
+
+function fileTooLargeError(filePath: string, actualSizeBytes: number, maxFileSizeBytes: number): EditFileConstraintError {
+  return new EditFileConstraintError(
+    'file_too_large',
+    filePath,
+    `File ${filePath} is ${actualSizeBytes} bytes and exceeds the edit_file maximum of ${maxFileSizeBytes} bytes`,
+    'Use a tool suitable for large files or reduce the file size before retrying.',
+  );
+}
+
+function isNodeErrorWithCode(error: unknown, code: string): boolean {
+  return error instanceof Error && 'code' in error && error.code === code;
 }
 
 async function createBackupFile(filePath: string): Promise<string> {

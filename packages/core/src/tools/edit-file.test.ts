@@ -4,7 +4,7 @@ import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type { ToolContext } from '../types.js';
+import type { ToolContext, ToolDefinition } from '../types.js';
 import { createEditFileTool } from './edit-file.js';
 
 function stubToolContext(overrides?: Partial<ToolContext>): ToolContext {
@@ -22,10 +22,7 @@ function stubToolContext(overrides?: Partial<ToolContext>): ToolContext {
 }
 
 async function executeRecoverableTool(
-  tool: {
-    execute: (input: any, context: ToolContext) => Promise<unknown>;
-    recoverError?: (error: unknown, input: unknown) => unknown;
-  },
+  tool: Pick<ToolDefinition<any, any>, 'execute' | 'recoverError'>,
   input: unknown,
 ) {
   try {
@@ -60,6 +57,9 @@ describe('createEditFileTool', () => {
       required: ['path', 'edits'],
       additionalProperties: false,
     });
+    expect(JSON.stringify(tool.inputSchema)).toContain('"type":"integer","minimum":0');
+    expect(JSON.stringify(tool.inputSchema)).toContain('"minLength":1');
+    expect(JSON.stringify(tool.inputSchema)).toContain('"pattern":"^[a-f0-9]{64}$"');
   });
 
   it('applies an exact replace and returns updated metadata', async () => {
@@ -137,21 +137,100 @@ describe('createEditFileTool', () => {
     await expect(readFile(join(tempDir, 'file.txt'), 'utf8')).resolves.toBe('ALPHA!\nB:beta\n');
   });
 
-  it('fails match mismatches without writing', async () => {
-    await writeFile(join(tempDir, 'file.txt'), 'one two');
+  it('returns a recoverable no-match conflict with current-state guidance and does not write', async () => {
+    await writeFile(join(tempDir, 'file.txt'), 'one found');
 
     const tool = createEditFileTool({ allowedRoot: tempDir });
-    await expect(
-      tool.execute(
-        {
-          path: 'file.txt',
-          edits: [{ type: 'replace', oldText: 'missing', newText: 'found' }],
-        } as any,
-        stubToolContext(),
-      ),
-    ).rejects.toThrow('expected 1 matches');
+    const result = await executeRecoverableTool(tool, {
+      path: 'file.txt',
+      edits: [{ type: 'replace', oldText: 'missing', newText: 'found' }],
+    });
 
-    await expect(readFile(join(tempDir, 'file.txt'), 'utf8')).resolves.toBe('one two');
+    expect(result).toMatchObject({
+      ok: false,
+      recoveryKind: 'edit_conflict',
+      conflictKind: 'no_match',
+      toolName: 'edit_file',
+      path: join(tempDir, 'file.txt'),
+      editIndex: 0,
+      operation: 'replace',
+      targetText: 'missing',
+      expectedMatches: 1,
+      actualMatches: 0,
+      fileSha256: sha256('one found'),
+      fileChanged: false,
+      replacementAlreadyPresent: true,
+      message: 'edit_file replace edit 0 expected 1 match for oldText but found 0',
+      correctiveAction: expect.stringContaining('Read the current file'),
+    });
+    await expect(readFile(join(tempDir, 'file.txt'), 'utf8')).resolves.toBe('one found');
+  });
+
+  it('returns candidate locations for an ambiguous match and does not guess', async () => {
+    await writeFile(join(tempDir, 'file.txt'), 'target first\nother\ntarget second\n');
+
+    const tool = createEditFileTool({ allowedRoot: tempDir });
+    const result = await executeRecoverableTool(tool, {
+      path: 'file.txt',
+      edits: [{ type: 'replace', oldText: 'target', newText: 'changed' }],
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      recoveryKind: 'edit_conflict',
+      conflictKind: 'ambiguous_match',
+      expectedMatches: 1,
+      actualMatches: 2,
+      fileChanged: false,
+      candidateLocations: [
+        { line: 1, column: 1, excerpt: 'target first' },
+        { line: 3, column: 1, excerpt: 'target second' },
+      ],
+      correctiveAction: expect.stringContaining('surrounding unchanged text'),
+    });
+    await expect(readFile(join(tempDir, 'file.txt'), 'utf8')).resolves.toBe(
+      'target first\nother\ntarget second\n',
+    );
+  });
+
+  it('reports likely CRLF/LF mismatch without applying a fuzzy edit', async () => {
+    await writeFile(join(tempDir, 'file.txt'), 'alpha\r\nbeta\r\n');
+
+    const tool = createEditFileTool({ allowedRoot: tempDir });
+    const result = await executeRecoverableTool(tool, {
+      path: 'file.txt',
+      edits: [{ type: 'replace', oldText: 'alpha\nbeta', newText: 'changed' }],
+    });
+
+    expect(result).toMatchObject({
+      recoveryKind: 'edit_conflict',
+      conflictKind: 'no_match',
+      actualMatches: 0,
+      normalizedLineEndingMatches: 1,
+      fileChanged: false,
+      correctiveAction: expect.stringContaining('CRLF/LF'),
+    });
+    await expect(readFile(join(tempDir, 'file.txt'), 'utf8')).resolves.toBe('alpha\r\nbeta\r\n');
+  });
+
+  it('keeps a multi-edit request atomic when a later edit conflicts', async () => {
+    await writeFile(join(tempDir, 'file.txt'), 'alpha\nbeta\n');
+
+    const tool = createEditFileTool({ allowedRoot: tempDir });
+    const result = await executeRecoverableTool(tool, {
+      path: 'file.txt',
+      edits: [
+        { type: 'replace', oldText: 'alpha', newText: 'ALPHA' },
+        { type: 'replace', oldText: 'missing', newText: 'changed' },
+      ],
+    });
+
+    expect(result).toMatchObject({
+      recoveryKind: 'edit_conflict',
+      editIndex: 1,
+      fileChanged: false,
+    });
+    await expect(readFile(join(tempDir, 'file.txt'), 'utf8')).resolves.toBe('alpha\nbeta\n');
   });
 
   it('fails expectedSha256 mismatches without writing', async () => {
@@ -210,6 +289,23 @@ describe('createEditFileTool', () => {
     });
   });
 
+  it('returns recoverable output when the file does not exist', async () => {
+    const tool = createEditFileTool({ allowedRoot: tempDir });
+    const result = await executeRecoverableTool(tool, {
+      path: 'missing.txt',
+      edits: [{ type: 'replace', oldText: 'a', newText: 'b' }],
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      recoveryKind: 'file_not_found',
+      toolName: 'edit_file',
+      path: join(tempDir, 'missing.txt'),
+      fileChanged: false,
+      correctiveAction: expect.stringContaining('list the containing directory'),
+    });
+  });
+
   it('rejects binary files without writing', async () => {
     await writeFile(join(tempDir, 'binary.txt'), new Uint8Array([0x61, 0x00, 0x62]));
 
@@ -225,6 +321,24 @@ describe('createEditFileTool', () => {
     ).rejects.toThrow('rejects binary files');
 
     expect(await readFile(join(tempDir, 'binary.txt'))).toEqual(Buffer.from([0x61, 0x00, 0x62]));
+  });
+
+  it('returns recoverable output for unsupported binary files', async () => {
+    await writeFile(join(tempDir, 'binary.txt'), new Uint8Array([0x61, 0x00, 0x62]));
+
+    const tool = createEditFileTool({ allowedRoot: tempDir });
+    const result = await executeRecoverableTool(tool, {
+      path: 'binary.txt',
+      edits: [{ type: 'replace', oldText: 'a', newText: 'b' }],
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      recoveryKind: 'unsupported_text_file',
+      path: join(tempDir, 'binary.txt'),
+      fileChanged: false,
+      correctiveAction: expect.stringContaining('binary files'),
+    });
   });
 
   it('creates an adjacent backup only after validation succeeds', async () => {
@@ -262,5 +376,14 @@ describe('createEditFileTool', () => {
 
     expect((await lstat(join(tempDir, 'link.txt'))).isSymbolicLink()).toBe(true);
     await expect(readFile(join(tempDir, 'nested', 'target.txt'), 'utf8')).resolves.toBe('target');
+  });
+
+  it('does not recover unexpected operational failures', () => {
+    const tool = createEditFileTool({ allowedRoot: tempDir });
+
+    expect(tool.recoverError?.(new Error('permission denied'), {
+      path: 'file.txt',
+      edits: [{ type: 'replace', oldText: 'a', newText: 'b' }],
+    })).toBeUndefined();
   });
 });
