@@ -186,6 +186,13 @@ output format is supplied.
 Child stdout and stderr are opaque lines carried in notifications. They can
 never corrupt the parent protocol stream.
 
+When the runtime is initialized, `context` commands without an explicit
+`--cwd` use the runtime's resolved workspace root. This keeps project-scoped
+bundles under the selected project's `.adaptiveAgent/context-bundles`
+directory rather than the sidecar process directory. An explicit `--cwd`
+continues to take precedence. Before runtime initialization, the CLI child
+uses the sidecar process working directory as normal.
+
 ```json
 {"jsonrpc":"2.0","method":"cli/output","params":{"requestId":"catalog","stream":"stdout","line":"{...}"}}
 {"jsonrpc":"2.0","id":"catalog","result":{"command":"catalog","argv":["catalog","--cwd","/workspace","--output","json"],"exitCode":0,"timedOut":false}}

@@ -808,6 +808,9 @@ export class DesktopRuntime {
     const argv = parsed.output === 'pretty' && !params.argv.includes('--output')
       ? [...params.argv, '--output', 'json']
       : [...params.argv];
+    if (parsed.command === 'context' && parsed.cwd === undefined && this.sdk) {
+      argv.push('--cwd', this.sdk.config.workspaceRoot);
+    }
     if (runtime?.mode === 'sqlite' && parsed.runtimeMode === undefined) {
       argv.push('--runtime', 'sqlite');
     }

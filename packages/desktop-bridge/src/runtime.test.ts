@@ -639,6 +639,36 @@ export async function execute() { return { value }; }
     expect(result).toMatchObject({ command: 'config', exitCode: 0 });
   });
 
+  it('scopes context commands to the initialized workspace unless cwd is explicit', async () => {
+    const execute = vi.fn<CliExecutor['execute']>(async () => ({ exitCode: 0, timedOut: false }));
+    const { runtime } = createRuntime({ execute });
+    await initialize(runtime);
+    (runtime as unknown as { sdk: unknown }).sdk = {
+      config: {
+        runtime: { mode: 'memory' },
+        workspaceRoot: '/workspace/project',
+      },
+    };
+
+    await runtime.handleRpc(request({
+      id: 'default-project',
+      method: 'cli/execute',
+      params: { argv: ['context', 'list'] },
+    }));
+    await runtime.handleRpc(request({
+      id: 'explicit-project',
+      method: 'cli/execute',
+      params: { argv: ['context', 'show', 'release', '--cwd', '/other/project'] },
+    }));
+
+    expect(execute).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      argv: ['context', 'list', '--output', 'json', '--cwd', '/workspace/project'],
+    }));
+    expect(execute).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      argv: ['context', 'show', 'release', '--cwd', '/other/project', '--output', 'json'],
+    }));
+  });
+
   it('rejects sidecar-unsafe and interactive CLI invocations', async () => {
     const { runtime } = createRuntime({ execute: vi.fn() });
     await initialize(runtime);
