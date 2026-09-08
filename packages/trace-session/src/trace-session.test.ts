@@ -10,8 +10,42 @@ import { cacheKey, databaseIdentity, effectiveCacheTtl, parseCacheDuration, read
 import { usageForArgs } from './trace-session/constants.js';
 import type { EventType, MilestoneEntry, TraceAggregateObservation, TraceReport, TraceRow } from './trace-session.js';
 import { SQLITE_TRACE_DATABASE_OPTIONS } from './trace-session/reader.js';
+import { filterSessions } from './trace-session/data.js';
+import type { SessionListItem } from './trace-session/types.js';
 
 describe('trace-session CLI helpers', () => {
+  it('orders filtered session groups by newest matching goal and pages timestamp ties without skipping siblings', () => {
+    const goal = (id: string, day: number, text = 'match'): SessionListItem['goals'][number] => ({
+      rootRunId: id, runId: id, status: 'succeeded', startedAt: `2026-07-${String(day).padStart(2, '0')}T00:00:00Z`,
+      completedAt: null, goal: text, linkedAt: '2026-07-01T00:00:00Z',
+    });
+    const sessions: SessionListItem[] = [
+      { sessionId: 'tie-b', startedAt: '2026-07-09T00:00:00Z', goals: [goal('b', 9)] },
+      { sessionId: 'middle', startedAt: '2026-07-08T00:00:00Z', goals: [goal('middle', 8)] },
+      { sessionId: 'old-session', startedAt: '2026-07-01T00:00:00Z', goals: [goal('old', 1), goal('new-z', 10), goal('new-a', 10)] },
+      { sessionId: 'tie-a', startedAt: '2026-07-09T00:00:00Z', goals: [goal('a', 9)] },
+      { sessionId: 'empty', startedAt: '2026-07-11T00:00:00Z', goals: [] },
+      { sessionId: 'filtered', startedAt: '2026-07-12T00:00:00Z', goals: [goal('exclude', 12, 'other'), goal('include', 2)] },
+      { sessionId: null, startedAt: 'invalid', goals: [ { ...goal('unknown', 1), startedAt: 'invalid' } ] },
+    ];
+    const first = filterSessions(sessions, { hasGoal: true, goals: ['match'], limit: 1 });
+    expect(first[0]?.sessionId).toBe('old-session');
+    expect(first[0]?.goals.map(g => g.runId)).toEqual(['new-a', 'new-z', 'old']);
+    expect(filterSessions(sessions, { limit: 1 })[0]?.sessionId).toBe('filtered');
+    expect(filterSessions(sessions, { until: '2026-07-11T00:00:00Z', limit: 1 })[0]?.sessionId).toBe('empty');
+    const seen: Array<string | null> = [];
+    let after: SessionListItem['cursor'];
+    for (let i = 0; i < sessions.length + 1; i++) {
+      const page = filterSessions(sessions, { hasGoal: true, goals: ['match'], limit: 1, after });
+      if (!page.length) break;
+      seen.push(page[0]!.sessionId);
+      after = page[0]!.cursor;
+    }
+    expect(seen).toEqual(['old-session', 'tie-a', 'tie-b', 'middle', 'filtered', null]);
+    expect(after?.startedAt).toBeNull();
+    expect(sessions[2]?.goals[0]?.runId).toBe('old');
+  });
+
   it('resolves an exact trusted SQLite path without settings inference', async () => {
     await expect(resolveTraceRuntimeTarget({ sqlitePath: './exact.sqlite', databaseUrl: 'postgres://ignored/runtime', cwd: '/tmp' }))
       .resolves.toMatchObject({ kind: 'sqlite', path: '/tmp/exact.sqlite' });
@@ -926,6 +960,67 @@ describe('trace-session CLI helpers', () => {
     expect(deleteSessions[0]?.sessionId).toBeNull();
   });
 
+  it('merges gateway and recovered session identities before paging tied timestamps', async () => {
+    const timestamp = '2026-07-10T00:00:00.000Z';
+    const goal = (rootRunId: string, runId = rootRunId): SessionListItem['goals'][number] => ({
+      rootRunId, runId, status: 'succeeded', startedAt: timestamp, completedAt: timestamp, goal: runId, linkedAt: timestamp,
+    });
+    const gateway = [{ session_id: 'shared', started_at: '2026-07-01T00:00:00.000Z', status: 'succeeded', goals: [goal('linked'), goal('linked', 'linked-child')] }];
+    const recovered = [
+      { session_id: 'shared', root_run_id: 'recovered-a' },
+      { session_id: 'shared', root_run_id: 'recovered-b' },
+      // A concurrent gateway-link write between the two queries can overlap a root.
+      { session_id: 'shared', root_run_id: 'linked' },
+      { session_id: 'recovered-only', root_run_id: 'only-a' },
+      { session_id: 'recovered-only', root_run_id: 'only-b' },
+      { session_id: 'z-last', root_run_id: 'last' },
+      { session_id: null, root_run_id: 'detached' },
+      // Malformed client boundary record: never produce session:undefined.
+      { root_run_id: 'missing-session-field' },
+    ].map(row => ({ ...row, started_at: timestamp, completed_at: timestamp, status: 'succeeded', goal: row.root_run_id }));
+    const client = {
+      query: async <TRow extends Record<string, unknown>>(sql: string) => {
+        if (sql.includes('from gateway_sessions s')) return { rows: gateway } as unknown as { rows: TRow[] };
+        if (sql.includes('from agent_runs r') && sql.includes('l.root_run_id is null')) {
+          expect(sql).not.toContain('r.session_id is null');
+          return { rows: recovered } as unknown as { rows: TRow[] };
+        }
+        throw new Error(`Unexpected SQL: ${sql}`);
+      },
+    };
+    const support = { hasTraceView: false, hasToolObservabilityColumns: true, hasRunModelColumns: true, hasGatewaySessionTables: true };
+    const pages: SessionListItem[] = [];
+    let after: SessionListItem['cursor'];
+    for (let i = 0; i < 8; i++) {
+      const page = await listSessions(client as never, { limit: 1, after }, support);
+      if (!page.length) break;
+      pages.push(page[0]!);
+      after = page[0]!.cursor;
+    }
+    expect(pages.map(page => page.cursor?.key)).toEqual(['run:detached', 'run:missing-session-field', 'session:recovered-only', 'session:shared', 'session:z-last']);
+    expect(pages[1]?.sessionId).toBeNull();
+    expect(pages[2]?.goals.map(item => item.runId)).toEqual(['only-a', 'only-b']);
+    expect(pages[3]?.goals.map(item => [item.rootRunId, item.runId])).toEqual([
+      ['linked', 'linked'], ['linked', 'linked-child'], ['recovered-a', 'recovered-a'], ['recovered-b', 'recovered-b'],
+    ]);
+    expect(pages[3]?.startedAt).toBe('2026-07-01T00:00:00.000Z');
+    expect(gateway[0]!.goals).toHaveLength(2);
+    const filtered = await listSessions(client as never, { goals: ['recovered-b'], limit: 1 }, support);
+    expect(filtered[0]?.goals.map(item => item.runId)).toEqual(['recovered-b']);
+    const unrecovered = await listSessions(client as never, { recoverAgentRunSessionIds: false }, support);
+    expect(unrecovered.filter(item => item.sessionId === 'shared')[0]?.goals).toHaveLength(2);
+    expect(unrecovered.find(item => item.goals[0]?.runId === 'recovered-a')?.sessionId).toBeNull();
+  });
+
+  it('normalizes missing or invalid session IDs before cursor creation without combining detached runs', () => {
+    const items = [undefined, null, '', 42].map((sessionId, index) => ({
+      sessionId, startedAt: now(), goals: [{ rootRunId: `root-${index}`, runId: `run-${index}`, status: 'succeeded', startedAt: now(), completedAt: null, goal: 'test', linkedAt: now() }],
+    })) as unknown as SessionListItem[];
+    const result = filterSessions(items, {});
+    expect(result.map(item => item.sessionId)).toEqual([null, null, null, null]);
+    expect(result.map(item => item.cursor?.key)).toEqual(['run:root-0', 'run:root-1', 'run:root-2', 'run:root-3']);
+  });
+
   it('lists core runtime sessions when gateway session tables are absent', async () => {
     const client = {
       query: async <TRow extends Record<string, unknown>>(sql: string) => {
@@ -1017,7 +1112,7 @@ describe('trace-session CLI helpers', () => {
           return { rows: [] } as unknown as { rows: TRow[] };
         }
         if (sql.includes('with recursive root_runs as') && sql.includes('left join agent_events e')) {
-          expect([['worker-run'], ['coordinator-run', 'worker-run']]).toContainEqual(params?.[0]);
+          expect([['worker-run'], ['worker-run', 'coordinator-run']]).toContainEqual(params?.[0]);
           return { rows: [] } as unknown as { rows: TRow[] };
         }
         throw new Error(`Unexpected SQL in test:\n${sql}`);
@@ -1043,7 +1138,7 @@ describe('trace-session CLI helpers', () => {
     expect(stripAnsi(output)).toContain('session  swarm-session-1\nrun  worker-run\nroot  worker-run\ntype  swarm-run\nrole  worker');
 
     const allRows = await listSessionPerformance(client as never);
-    expect(allRows.map((row) => row.runId)).toEqual(['coordinator-run', 'worker-run']);
+    expect(allRows.map((row) => row.runId)).toEqual(['worker-run', 'coordinator-run']);
     const sessions = await listSessions(client as never);
     expect(sessions.some((item) => item.sessionId === 'empty-session' && item.goals.length === 0)).toBe(true);
   });

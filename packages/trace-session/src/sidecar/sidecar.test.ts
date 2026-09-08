@@ -41,6 +41,21 @@ describe('trace sidecar protocol', () => {
       jsonrpc: '2.0', id: 1, method: 'trace/listSessions', params: { since: 'now-ish' },
     }))).toThrowError(/ISO timestamp or relative duration/);
   });
+
+  it('validates and forwards session-group cursors without changing the original time window', async () => {
+    const service = serviceReturning(report());
+    const runtime = new TraceSidecarRuntime(service, 'sqlite', { allowMessages: false, allowReasoning: false, allowRawToolPayloads: false });
+    await initialize(runtime);
+    const after = { startedAt: '2026-07-01T00:00:00.000Z', key: 'session:tie-a' };
+    const params = { after, until: '2026-07-02T00:00:00Z', limit: 1 };
+    await runtime.handle(parseTraceSidecarRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'trace/listSessions', params })));
+    expect(service.listSessions).toHaveBeenCalledWith(params);
+    for (const invalid of [{ key: 'x' }, { startedAt: '7d', key: 'x' }, { startedAt: null, key: '' }, { ...after, extra: true }]) {
+      expect(() => parseTraceSidecarRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'trace/listSessions', params: { after: invalid } }))).toThrow();
+    }
+    expect(parseTraceSidecarRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'trace/listSessions', params: { after: { startedAt: null, key: 'run:unknown' } } }))).toMatchObject({ method: 'trace/listSessions' });
+    expect(() => parseTraceSidecarRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'trace/aggregate', params: { groupBy: 'model', after } }))).toThrow(/unsupported field/);
+  });
 });
 
 describe('trace sidecar runtime policy', () => {

@@ -54,6 +54,7 @@ export type {
   RunMessageTrace,
   RunSnapshotSummary,
   RunTreeEntry,
+  SessionListCursor,
   SessionListItem,
   SessionPerformanceListItem,
   SessionOverview,

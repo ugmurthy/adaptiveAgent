@@ -1384,7 +1384,7 @@ function buildPerformanceDigest(
   };
 }
 
-function buildToolAccountingSummary(timeline: TimelineEntry[]): ToolAccountingSummary {
+export function buildToolAccountingSummary(timeline: Pick<TimelineEntry, 'accounting'>[]): ToolAccountingSummary {
   const groups = new Map<string, ToolAccountingSummary['byProviderOperation'][number]>();
   let totalRequests = 0;
   let billableRequests = 0;

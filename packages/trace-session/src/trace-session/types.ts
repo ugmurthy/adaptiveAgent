@@ -162,9 +162,16 @@ export interface SessionUsageSummary {
   toolAccounting?: ToolAccountingSummary;
 }
 
+/** Exclusive session-group paging boundary; keep the original filters fixed between pages. */
+export interface SessionListCursor {
+  startedAt: string | null;
+  key: string;
+}
+
 export interface SessionListItem {
   sessionId: string | null;
   startedAt: string;
+  cursor?: SessionListCursor;
   status?: string;
   goals: Array<{
     rootRunId: string;

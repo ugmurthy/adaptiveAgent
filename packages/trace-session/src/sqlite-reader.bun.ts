@@ -6,7 +6,9 @@ import { Database } from 'bun:sqlite';
 import { afterEach, describe, expect, it } from 'bun:test';
 
 import { SqliteTraceReader, TraceService } from './trace-session/reader.js';
-import type { CliOptions } from './trace-session/types.js';
+import type { CliOptions, SessionListItem, SessionUsageSummary, ToolAccountingSummary, TraceReport } from './trace-session/types.js';
+import { TraceSidecarRuntime } from './sidecar/runtime.js';
+import { parseTraceSidecarRpcRequest } from './sidecar/protocol.js';
 
 const temporaryDirectories: string[] = [];
 
@@ -101,7 +103,7 @@ describe('SqliteTraceReader', () => {
         ['system', 'persisted'], ['user', 'persisted'], ['assistant', 'persisted'], ['user', 'pending'],
       ]);
       expect(report.llmMessages?.[0]?.initialMessages?.[0]?.category).toBe('initial-runtime-system');
-      expect(report.warnings.join(' ')).toMatch(/External tool provider accounting is unavailable/);
+      expect(report.warnings.join(' ')).toMatch(/accounting covers only persisted accounting events/);
 
       const byRoot = await service.trace(options({ rootRunId: 'root-1' }));
       expect(byRoot.target).toMatchObject({ kind: 'root-run', resolvedRootRunId: 'root-1' });
@@ -133,13 +135,108 @@ describe('SqliteTraceReader', () => {
       expect(performance[0]!.performance.tools.started).toBe(1);
 
       const aggregate = await service.aggregate({ groupBy: 'model' });
-      expect(aggregate.population).toMatchObject({ runCount: 1, terminalRuns: 1, missingUsage: 0, missingCost: 1 });
+      expect(aggregate.population).toMatchObject({ runCount: 1, terminalRuns: 1, missingUsage: 0, missingCost: 0 });
       expect(aggregate.groups[0]?.key).toBe('openrouter/test-model');
-      expect(aggregate.notes.join(' ')).toMatch(/no external tool provider accounting/i);
+      expect(aggregate.notes.join(' ')).toMatch(/accounting covers only persisted accounting events/);
       expect(await service.listSessionless()).toEqual([]);
     } finally {
       await service.close();
     }
+  });
+
+  it('recovers terminal accounting after reopen and exposes only the safe summary through RPC', async () => {
+    const path = await fixture();
+    const database = new Database(path);
+    const priced = { provider: 'serper', operation: 'web_search', billable: true, units: { requests: 2 }, estimatedCostUSD: 0.006 };
+    const cached = { ...priced, cached: true, units: { requests: 0 }, estimatedCostUSD: 0 };
+    const unpriced = { provider: 'parallel', operation: 'read_web_page', billable: true, units: { requests: 3 } };
+    const free = { provider: 'direct', operation: 'read_web_page', billable: false, units: { requests: 1 }, estimatedCostUSD: 0 };
+    const append = (id: string, runId: string, seq: number, toolCallId: string | null, type: string, accounting?: unknown) => insertEvent(database, {
+      id, runId, seq, toolCallId, type, createdAt: `2026-07-01T10:00:${String(seq).padStart(2, '0')}.000Z`,
+      payload: { toolName: 'web_search', input: { secret: 'sensitive-input' }, output: { secret: 'sensitive-output' }, ...(accounting ? { accounting: { ...accounting as object, secret: 'sensitive-accounting' } } : {}) },
+    });
+    append('started', 'root-1', 3, 'priced', 'tool.started');
+    append('priced', 'root-1', 4, 'priced', 'tool.completed', { ...priced, units: { requests: 9 }, estimatedCostUSD: 9 });
+    append('priced-latest', 'root-1', 5, 'priced', 'tool.completed', priced);
+    append('cached', 'root-1', 6, 'cached', 'tool.completed', cached);
+    // Same call ID in another run must not collide with the root's priced call.
+    append('unpriced', 'child-1', 4, 'priced', 'tool.failed', unpriced);
+    append('free', 'child-1', 5, null, 'tool.completed', free);
+    append('free-anonymous', 'child-1', 6, null, 'tool.completed', free);
+    append('no-accounting', 'root-1', 7, 'priced', 'tool.completed');
+    append('nonterminal', 'root-1', 8, 'pending', 'tool.started', { ...priced, units: { requests: 99 } });
+    database.close();
+
+    const expected: ToolAccountingSummary = {
+      totalRequests: 7, billableRequests: 5, cachedToolCalls: 1, unpricedRequests: 3, estimatedCostUSD: 0.006,
+      byProviderOperation: [
+        { provider: 'serper', operation: 'web_search', toolCalls: 2, requests: 2, billableRequests: 2, cachedToolCalls: 1, unpricedRequests: 0, estimatedCostUSD: 0.006 },
+        { provider: 'parallel', operation: 'read_web_page', toolCalls: 1, requests: 3, billableRequests: 3, cachedToolCalls: 0, unpricedRequests: 3, estimatedCostUSD: 0 },
+        { provider: 'direct', operation: 'read_web_page', toolCalls: 2, requests: 2, billableRequests: 0, cachedToolCalls: 0, unpricedRequests: 0, estimatedCostUSD: 0 },
+      ],
+    };
+    const service = new TraceService(new SqliteTraceReader(path));
+    try {
+      for (const target of [{ sessionId: 'session-1' }, { rootRunId: 'root-1' }, { runId: 'child-1' }]) {
+        const usage = await service.usage(options(target));
+        expect(usage.toolAccounting).toEqual(expected);
+        expect(usage.total.estimatedCostUSD).toBe(0.19);
+      }
+      expect((await service.usage(options({ rootRunId: 'absent' }))).toolAccounting).toMatchObject({ totalRequests: 0, byProviderOperation: [] });
+      const runtime = new TraceSidecarRuntime(service, 'sqlite', { allowMessages: false, allowReasoning: false, allowRawToolPayloads: true });
+      const rpc = (method: string, params: unknown) => runtime.handle(parseTraceSidecarRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 1, method, params })));
+      await rpc('initialize', { protocolVersion: '1.0', clientInfo: { name: 'test' } });
+      const usage = await rpc('trace/usage', { target: { kind: 'root-run', rootRunId: 'root-1' } }) as SessionUsageSummary;
+      expect(usage.toolAccounting).toEqual(expected);
+      expect(JSON.stringify(usage)).not.toContain('sensitive');
+      for (const rawToolPayloads of [false, true]) {
+        const report = JSON.parse(JSON.stringify(await rpc('trace/get', { target: { kind: 'root-run', rootRunId: 'root-1' }, include: { rawToolPayloads } }))) as TraceReport;
+        expect(report.usage.toolAccounting).toEqual(expected);
+        expect(report.diagnostics).toBeUndefined();
+        expect(report.warnings).toEqual([]);
+        expect(report.timeline.every(entry => entry.accounting === undefined)).toBe(true);
+        expect(JSON.stringify(report)).not.toContain('sensitive-accounting');
+        if (!rawToolPayloads) expect(JSON.stringify(report)).not.toContain('sensitive');
+      }
+      expect((await service.aggregate({ groupBy: 'model' })).overall.successfulRuns.averageExternalToolProviderCostUSD).toBeNull();
+    } finally { await service.close(); }
+
+    // Once all recorded requests are priced, aggregate cost must no longer be gated off for SQLite.
+    const writer = new Database(path);
+    writer.run("delete from agent_events where id in ('unpriced','nonterminal')");
+    writer.close();
+    const pricedService = new TraceService(new SqliteTraceReader(path));
+    try {
+      const aggregate = await pricedService.aggregate({ groupBy: 'model' });
+      expect(aggregate.overall.successfulRuns.averageExternalToolProviderCostUSD).toBe(0.006);
+      expect(aggregate.overall.successfulRuns.averageEstimatedGrandTotalUSD).toBeCloseTo(0.196);
+    } finally { await pricedService.close(); }
+  });
+
+  it('pages reopened SQLite sessions by newest matching root through the sidecar', async () => {
+    const path = await fixture();
+    const writer = new Database(path);
+    for (const [id, sessionId, day] of [['newest', 'session-1', '05'], ['tie-b', 'session-b', '04'], ['tie-a', 'session-a', '04']]) {
+      const createdAt = `2026-07-${day}T00:00:00.000Z`;
+      insertRun(writer, run({ id, rootRunId: id, sessionId, goal: id, status: 'succeeded', createdAt, updatedAt: createdAt }));
+    }
+    writer.close();
+    const service = new TraceService(new SqliteTraceReader(path));
+    try {
+      const runtime = new TraceSidecarRuntime(service, 'sqlite', { allowMessages: false, allowReasoning: false, allowRawToolPayloads: false });
+      const rpc = (method: string, params: unknown) => runtime.handle(parseTraceSidecarRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 1, method, params })));
+      await rpc('initialize', { protocolVersion: '1.0', clientInfo: { name: 'test' } });
+      let after: SessionListItem['cursor'];
+      const ids: Array<string | null> = [];
+      for (let i = 0; i < 4; i++) {
+        const page = await rpc('trace/listSessions', { limit: 1, until: '2026-07-06T00:00:00Z', ...(after ? { after } : {}) }) as SessionListItem[];
+        if (!page.length) break;
+        if (i === 0) expect(page[0]!.goals.map(goal => goal.runId)).toEqual(['newest', 'root-1']);
+        ids.push(page[0]!.sessionId);
+        after = page[0]!.cursor;
+      }
+      expect(ids).toEqual(['session-1', 'session-a', 'session-b']);
+    } finally { await service.close(); }
   });
 
   it('runs the CLI against a settings-inferred SQLite runtime', async () => {

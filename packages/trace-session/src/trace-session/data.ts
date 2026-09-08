@@ -21,6 +21,7 @@ import type {
   RootRun,
   RunMessageTrace,
   RunSnapshotSummary,
+  SessionListCursor,
   SessionListItem,
   SessionPerformanceListItem,
   SessionOverview,
@@ -42,7 +43,7 @@ import type {
   SwarmRole,
 } from './types.js';
 
-export type ListFilterOptions = Pick<CliOptions, 'goals' | 'goalRegex' | 'hasGoal' | 'noGoal' | 'statuses' | 'limit' | 'types' | 'swarmRole' | 'since' | 'until'>;
+export type ListFilterOptions = Pick<CliOptions, 'goals' | 'goalRegex' | 'hasGoal' | 'noGoal' | 'statuses' | 'limit' | 'types' | 'swarmRole' | 'since' | 'until'> & { after?: SessionListCursor };
 
 interface TraceSupport {
   hasTraceView: boolean;
@@ -263,10 +264,7 @@ export async function listSessions(
     }],
   }));
 
-  return filterSessions([...sessions, ...sessionless].sort((left, right) =>
-    Date.parse(right.startedAt) - Date.parse(left.startedAt)
-    || (right.sessionId ?? right.goals[0]?.rootRunId ?? '').localeCompare(left.sessionId ?? left.goals[0]?.rootRunId ?? ''),
-  ), options);
+  return filterSessions([...sessions, ...sessionless], options);
 }
 
 export async function listSessionPerformance(client: PostgresClient, options: ListFilterOptions = {}): Promise<SessionPerformanceListItem[]> {
@@ -701,7 +699,7 @@ export function filterSessions(sessions: SessionListItem[], options: ListFilterO
   const now = Date.now();
   const since = parseListTimeBoundary(options.since, now);
   const until = parseListTimeBoundary(options.until, now);
-  const filtered = sessions.flatMap((session) => {
+  const filtered = mergeSessionGroups(sessions).flatMap((session) => {
     if (session.goals.length === 0) {
       const statusMatches = statuses.size === 0 || statuses.has(session.status ?? 'unknown');
       const requestsGoalContent = options.hasGoal || textGoals.length > 0 || options.goalRegex !== undefined;
@@ -719,10 +717,61 @@ export function filterSessions(sessions: SessionListItem[], options: ListFilterO
       if (types.size && !types.has(item.type ?? 'run')) return false;
       if (options.swarmRole && item.swarmRole !== options.swarmRole) return false;
       return true;
-    });
+    }).sort((left, right) => listTimestamp(right.startedAt ?? right.linkedAt) - listTimestamp(left.startedAt ?? left.linkedAt)
+      || compareListKey(left.rootRunId, right.rootRunId) || compareListKey(left.runId, right.runId));
     return goals.length ? [{ ...session, goals }] : [];
-  });
-  return options.limit === undefined ? filtered : filtered.slice(0, options.limit);
+  }).map((session) => {
+    const newest = session.goals[0];
+    const timestamp = listTimestamp(newest ? newest.startedAt ?? newest.linkedAt : session.startedAt);
+    return {
+      ...session,
+      cursor: {
+        startedAt: Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null,
+        key: session.sessionId === null ? `run:${newest?.rootRunId ?? ''}` : `session:${session.sessionId}`,
+      },
+    };
+  }).sort((left, right) => compareSessionCursor(left.cursor, right.cursor));
+  const page = options.after ? filtered.filter(session => compareSessionCursor(session.cursor, options.after!) > 0) : filtered;
+  return options.limit === undefined ? page : page.slice(0, options.limit);
+}
+
+function mergeSessionGroups(sessions: SessionListItem[]): SessionListItem[] {
+  const groups: SessionListItem[] = [];
+  const bySessionId = new Map<string, SessionListItem>();
+  for (const session of sessions) {
+    // SQL returns string/null, but normalize incomplete boundary records as sessionless too.
+    const sessionId = typeof session.sessionId === 'string' && session.sessionId.trim() ? session.sessionId : null;
+    const existing = sessionId === null ? undefined : bySessionId.get(sessionId);
+    if (!existing) {
+      const group = { ...session, sessionId, goals: [...session.goals] };
+      groups.push(group);
+      if (sessionId !== null) bySessionId.set(sessionId, group);
+      continue;
+    }
+    // Gateway metadata takes precedence over recovered groups. Merge goal identities,
+    // not just root IDs: separate linked runs within a root must remain visible.
+    const goals = new Map(existing.goals.map(goal => [JSON.stringify([goal.rootRunId, goal.runId]), goal]));
+    for (const goal of session.goals) {
+      const key = JSON.stringify([goal.rootRunId, goal.runId]);
+      if (!goals.has(key)) goals.set(key, goal);
+    }
+    existing.goals = [...goals.values()];
+    if (listTimestamp(session.startedAt) < listTimestamp(existing.startedAt)) existing.startedAt = session.startedAt;
+  }
+  return groups;
+}
+
+function listTimestamp(value: string | null): number {
+  const parsed = value === null ? NaN : Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : -Infinity;
+}
+
+function compareListKey(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function compareSessionCursor(left: SessionListCursor, right: SessionListCursor): number {
+  return listTimestamp(right.startedAt) - listTimestamp(left.startedAt) || compareListKey(left.key, right.key);
 }
 
 function parseListTimeBoundary(value: string | undefined, now: number): number | null {

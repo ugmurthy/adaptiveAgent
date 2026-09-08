@@ -1,4 +1,4 @@
-import type { SwarmRole, TraceAggregateGroupBy, TraceListType } from '../trace-session/types.js';
+import type { SessionListCursor, SwarmRole, TraceAggregateGroupBy, TraceListType } from '../trace-session/types.js';
 
 export const TRACE_SIDECAR_PROTOCOL_VERSION = '1.0' as const;
 export const TRACE_SIDECAR_VERSION = '0.1.0';
@@ -51,6 +51,7 @@ export interface TraceListFilters {
 }
 
 export interface TraceUsageParams { target: TraceTarget }
+export interface TraceListSessionsParams extends TraceListFilters { after?: SessionListCursor }
 export interface TraceCompareParams { baselineRunId: string; candidateRunId: string }
 export interface TraceAggregateParams extends TraceListFilters { groupBy: TraceAggregateGroupBy }
 export interface TraceListSessionlessParams { limit?: number }
@@ -62,7 +63,7 @@ export type TraceSidecarRpcRequest =
   | Request<'initialize', InitializeParams>
   | RequestWithoutParams<'runtime/info'>
   | Request<'trace/get', TraceGetParams>
-  | Request<'trace/listSessions', TraceListFilters>
+  | Request<'trace/listSessions', TraceListSessionsParams>
   | Request<'trace/listSessionlessRuns', TraceListSessionlessParams>
   | Request<'trace/usage', TraceUsageParams>
   | Request<'trace/compare', TraceCompareParams>
@@ -182,9 +183,19 @@ function validateParams(method: TraceSidecarRpcRequest['method'], params: Record
       if (baseline === candidate) invalidParams('trace/compare requires two different run IDs.');
       return;
     }
-    case 'trace/listSessions':
-      validateListFilters(params ?? {}, method);
+    case 'trace/listSessions': {
+      const value = params ?? {};
+      validateListFilters(value, method, ['after']);
+      if (value.after !== undefined) {
+        const after = requiredObject(value, 'after');
+        exactKeys(after, ['startedAt', 'key'], 'after');
+        requiredString(after, 'key');
+        if (after.startedAt !== null && (typeof after.startedAt !== 'string' || !Number.isFinite(Date.parse(after.startedAt)))) {
+          invalidParams('after.startedAt must be an absolute timestamp or null.');
+        }
+      }
       return;
+    }
     case 'trace/listSessionlessRuns': {
       const value = params ?? {};
       exactKeys(value, ['limit'], method);

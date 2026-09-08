@@ -49,7 +49,7 @@ export class TraceSidecarRuntime {
       case 'trace/get':
         return this.getTrace(request.params!);
       case 'trace/listSessions':
-        return this.service.listSessions(listFilters(request.params ?? {}));
+        return this.service.listSessions({ ...listFilters(request.params ?? {}), ...(request.params?.after ? { after: request.params.after } : {}) });
       case 'trace/listSessionlessRuns':
         return this.service.listSessionless(request.params?.limit ?? TRACE_SIDECAR_DEFAULT_LIMIT);
       case 'trace/usage':

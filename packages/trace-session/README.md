@@ -91,6 +91,37 @@ their startup policy flags are explicitly enabled.
 bun run --cwd packages/trace-session trace-sidecar --settings ./agent.settings.json
 ```
 
+`trace/usage` returns `SessionUsageSummary`, including `toolAccounting` for
+SQLite and Postgres. This is separate from model/token and tool-output usage:
+`byProviderOperation` includes tool calls, requests, billable requests, cached
+calls, unpriced requests, and known estimated cost. Missing prices are not free
+requests; check `unpricedRequests` before treating cost as complete. SQLite
+reads terminal accounting events already persisted in the runtime database,
+deduplicating by run/tool-call identity and retaining the latest accounting.
+Events without a tool-call identity remain distinct. Older or uninstrumented
+calls without accounting cannot be reconstructed. SQLite `trace/get` also
+retains this safe usage summary; raw timeline accounting and diagnostics remain
+excluded by the sidecar projection.
+
+`trace/listSessions` returns an array of session groups sorted by the newest
+matching goal timestamp descending, then deterministic session/run identity.
+Gateway and recovered groups sharing a non-null session ID are merged before
+filtering and paging. Duplicate `(rootRunId, runId)` pairs collapse, while
+distinct linked runs remain visible. Missing or invalid session IDs normalize
+to null and retain run-based identities rather than `session:undefined`.
+Goals within each group are newest-first; empty groups use session `startedAt`.
+Every returned group includes `cursor: { startedAt: string | null, key: string }`.
+For another page, pass the last group's cursor unchanged as `after`, keeping
+the original filters and absolute `since`/`until` fixed. `after` is exclusive,
+including its identity tie-break, so equal timestamps do not skip groups.
+Continue until an empty or short page. Never set `until` to the oldest goal in
+the page: older siblings can precede unseen groups. This pages groups, not a
+globally interleaved root stream; consumers should deduplicate and globally
+sort accumulated goals. Use a fixed absolute `until` for a browsing window and
+refresh from the first page to discover newly inserted runs; cursors are not
+database snapshots. Older helpers without `cursor` do not support safe tied
+timestamp paging and must be upgraded rather than guessing a boundary.
+
 ## Views
 
 | View | Question answered |
