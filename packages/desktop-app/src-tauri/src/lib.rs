@@ -6843,6 +6843,17 @@ fn state_for_execution_result(result: &Value) -> RunState {
         Some("clarification_requested") => {
             state_for_durable_status("clarification_requested", true)
         }
+        Some("task_preparation_stopped") => RunState {
+            cached_status: if result.get("decision").and_then(Value::as_str) == Some("clarify") {
+                "clarification_required"
+            } else {
+                "invalid_task"
+            },
+            submission_state: "terminal",
+            pending_interaction: None,
+            occupies_slot: false,
+            proves_existing: false,
+        },
         _ => recovery_required(true),
     }
 }
@@ -7426,6 +7437,22 @@ mod tests {
             state_for_execution_result(&json!({ "status": "failure", "code": "INTERRUPTED" }));
         assert_eq!(interrupted.cached_status, "interrupted");
         assert!(!interrupted.occupies_slot);
+
+        let clarification = state_for_execution_result(&json!({
+            "status": "task_preparation_stopped",
+            "decision": "clarify"
+        }));
+        assert_eq!(clarification.cached_status, "clarification_required");
+        assert_eq!(clarification.submission_state, "terminal");
+        assert!(!clarification.occupies_slot);
+        assert!(!clarification.proves_existing);
+
+        let invalid = state_for_execution_result(&json!({
+            "status": "task_preparation_stopped",
+            "decision": "invalid"
+        }));
+        assert_eq!(invalid.cached_status, "invalid_task");
+        assert!(!invalid.occupies_slot);
     }
 
     #[test]

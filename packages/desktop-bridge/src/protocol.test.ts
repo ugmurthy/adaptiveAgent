@@ -188,6 +188,7 @@ describe('desktop bridge protocol', () => {
       inference: { mode: 'byok', tier: 'medium' },
       workspace: { root: '/workspace', shellCwd: '/workspace/project' },
       interaction: { approvalMode: 'manual', clarificationMode: 'fail' },
+      taskPreparation: { mode: 'auto' },
     };
     expect(parseDesktopRpcRequest(JSON.stringify({
       jsonrpc: '2.0', id: 'settings', method: 'settings/update', params: { settings },
@@ -200,6 +201,9 @@ describe('desktop bridge protocol', () => {
     }))).toThrowError(expect.objectContaining<Partial<DesktopProtocolError>>({ code: 'INVALID_PARAMS' }));
     expect(() => parseDesktopRpcRequest(JSON.stringify({
       jsonrpc: '2.0', id: 'settings', method: 'settings/update', params: { settings: { ...settings, agent: { configPath: './agent.json', id: '' } } },
+    }))).toThrowError(expect.objectContaining<Partial<DesktopProtocolError>>({ code: 'INVALID_PARAMS' }));
+    expect(() => parseDesktopRpcRequest(JSON.stringify({
+      jsonrpc: '2.0', id: 'settings', method: 'settings/update', params: { settings: { ...settings, taskPreparation: { mode: 'sometimes' } } },
     }))).toThrowError(expect.objectContaining<Partial<DesktopProtocolError>>({ code: 'INVALID_PARAMS' }));
   });
 

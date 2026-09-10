@@ -16,6 +16,7 @@ export type RuntimeMode = 'memory' | 'sqlite' | 'postgres';
 export type ProviderName = 'openrouter' | 'ollama' | 'mistral' | 'mesh';
 export type ApprovalMode = 'auto' | 'manual' | 'reject';
 export type ClarificationMode = 'interactive' | 'fail';
+export type TaskPreparationMode = 'never' | 'auto' | 'always';
 
 export type JsonRpcId = string | number;
 
@@ -119,6 +120,7 @@ export interface EditableDesktopSettings {
   inference: { mode: InferenceMode; tier: InferenceTier };
   workspace: { root: string; shellCwd: string };
   interaction: { approvalMode: ApprovalMode; clarificationMode: ClarificationMode };
+  taskPreparation?: { mode: TaskPreparationMode };
 }
 
 export interface SettingsUpdateParams {
@@ -452,6 +454,12 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
       if (interaction.approvalMode === undefined) invalidParams('settings.interaction.approvalMode is required.');
       optionalEnum(interaction, 'clarificationMode', ['interactive', 'fail']);
       if (interaction.clarificationMode === undefined) invalidParams('settings.interaction.clarificationMode is required.');
+      if (settings.taskPreparation !== undefined) {
+        requiredObject(settings, 'taskPreparation');
+        const taskPreparation = settings.taskPreparation as Record<string, unknown>;
+        optionalEnum(taskPreparation, 'mode', ['never', 'auto', 'always']);
+        if (taskPreparation.mode === undefined) invalidParams('settings.taskPreparation.mode is required.');
+      }
       return;
     }
     case 'agent/run': {

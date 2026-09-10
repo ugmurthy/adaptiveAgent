@@ -61,6 +61,7 @@
     : '';
   $: resultValue = output(result);
   $: displayedResult = resultDisplayContent(resultValue);
+  $: preparationStop = stoppedPreparation(resultValue);
 
   async function submitSteer() {
     const message = steerMessage.trim();
@@ -71,6 +72,20 @@
   function output(value: unknown): unknown {
     if (value && typeof value === 'object' && 'status' in value && 'output' in value && value.status === 'success') return value.output;
     return value;
+  }
+
+  function stoppedPreparation(value: unknown): { decision: string; message: string; questions: string[] } | undefined {
+    if (!value || typeof value !== 'object' || !('status' in value) || value.status !== 'task_preparation_stopped') return undefined;
+    const preparation = 'taskPreparation' in value && value.taskPreparation && typeof value.taskPreparation === 'object'
+      ? value.taskPreparation as Record<string, unknown>
+      : {};
+    return {
+      decision: typeof preparation.decision === 'string' ? preparation.decision : 'stopped',
+      message: typeof preparation.reason === 'string' ? preparation.reason : 'Task preparation stopped before execution.',
+      questions: Array.isArray(preparation.clarificationQuestions)
+        ? preparation.clarificationQuestions.filter((question): question is string => typeof question === 'string')
+        : [],
+    };
   }
 
   function download(text: string, extension: 'json' | 'md', type: string) {
@@ -149,7 +164,9 @@
     <div class="report-tabs">{#each ['result','artifacts'] as tab}<button class:active={reportTab===tab} disabled={tab==='artifacts' && !selectedRun.artifactsAvailable} title={tab==='artifacts' ? selectedRun.artifactsUnavailableReason : undefined} on:click={() => selectReportTab(tab as typeof reportTab)}>{tab}</button>{/each}</div>
     {#if !selectedRun.artifactsAvailable}<div class="run-status">{selectedRun.artifactsUnavailableReason}</div>{/if}
     <div class="completed-report">
-      {#if reportTab==='result'}<ResultRenderer value={displayedResult}/>
+      {#if reportTab==='result' && preparationStop}
+        <div class="result"><h3>Task preparation: {preparationStop.decision}</h3><p>{preparationStop.message}</p>{#if preparationStop.questions.length}<strong>Clarification needed</strong><ul>{#each preparationStop.questions as question}<li>{question}</li>{/each}</ul>{/if}</div>
+      {:else if reportTab==='result'}<ResultRenderer value={displayedResult}/>
       {:else if artifactError}<div class="alert">{artifactError}</div>
       {:else if resolvedArtifacts.length}<ArtifactList artifacts={resolvedArtifacts} runId={selectedRun.runId}/>{:else}<div class="empty-state"><strong>No structured artifacts</strong><p>The result did not include recognizable files or an artifacts/files array.</p></div>{/if}
     </div>

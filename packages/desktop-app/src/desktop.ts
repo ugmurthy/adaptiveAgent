@@ -9,6 +9,7 @@ export interface ResolvedConfiguration {
   runtime: { mode: string; sqlitePath?: string };
   workspace: { root: string; shellCwd: string };
   interaction: { approvalMode: string; clarificationMode: string };
+  taskPreparation?: { mode: 'never' | 'auto' | 'always' };
 }
 
 export interface EditableDesktopSettings {
@@ -16,6 +17,7 @@ export interface EditableDesktopSettings {
   inference: { mode: 'byok' | 'local' | 'gateway'; tier: 'low' | 'medium' | 'high' | 'xtra-high' };
   workspace: { root: string; shellCwd: string };
   interaction: { approvalMode: 'auto' | 'manual' | 'reject'; clarificationMode: 'interactive' | 'fail' };
+  taskPreparation: { mode: 'never' | 'auto' | 'always' };
 }
 
 export interface DesktopState {

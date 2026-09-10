@@ -22,6 +22,7 @@
         approvalMode: desktop.configuration.interaction.approvalMode as EditableDesktopSettings['interaction']['approvalMode'],
         clarificationMode: desktop.configuration.interaction.clarificationMode as EditableDesktopSettings['interaction']['clarificationMode'],
       },
+      taskPreparation: { mode: desktop.configuration.taskPreparation?.mode ?? 'never' },
     };
   }
 
@@ -67,6 +68,7 @@
         <label><span>Inference mode</span><select bind:value={settings.inference.mode} disabled={pending}><option value="byok">BYOK</option><option value="local">Local</option><option value="gateway">Gateway</option></select></label>
         <label><span>Inference tier</span><select bind:value={settings.inference.tier} disabled={pending}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xtra-high">Extra high</option></select></label>
         <label><span>Approval mode</span><select bind:value={settings.interaction.approvalMode} disabled={pending}><option value="auto">Auto</option><option value="manual">Manual</option><option value="reject">Reject</option></select></label>
+        <label><span>Task preparation</span><select bind:value={settings.taskPreparation.mode} disabled={pending}><option value="never">Never</option><option value="auto">Auto</option><option value="always">Always enhance</option></select></label>
         <label class="settings-wide"><span>Workspace root</span><span class="path-picker"><input required value={settings.workspace.root} readonly disabled={pending} /><button type="button" disabled={pending} on:click={() => selectDirectory('root')}>Choose folder…</button></span></label>
         <label class="settings-wide"><span>Shell directory</span><span class="path-picker"><input required value={settings.workspace.shellCwd} readonly disabled={pending} /><button type="button" disabled={pending} on:click={() => selectDirectory('shellCwd')}>Choose folder…</button></span></label>
       </div>

@@ -133,4 +133,33 @@ describe('mounted component lifecycle ownership', () => {
     expect(target.textContent).toContain(plan.reason);
     finishRefresh(plan);
   });
+
+  test('renders task-preparation clarification as a terminal result', async () => {
+    const run: RunSummary = {
+      itemId: 'item-2', runId: 'run-2', title: 'Deploy it', createdAt: '2026-08-17T12:00:00Z',
+      invocationKind: 'run', status: 'clarification_required', cancelRequested: false, occupiesSlot: false,
+      steerable: false, artifactsAvailable: false, artifactsUnavailableReason: 'No target run was started',
+    };
+    const desktopApi = api({
+      getDesktopState: vi.fn().mockResolvedValue({ ...state, runs: [run] }),
+      getRunResult: vi.fn().mockResolvedValue({
+        status: 'task_preparation_stopped', decision: 'clarify', message: 'A target is required.',
+        taskPreparation: {
+          decision: 'clarify', reason: 'A target is required.',
+          clarificationQuestions: ['Which environment should receive the deployment?'],
+        },
+      }),
+      getRunRecoveryPlan: vi.fn().mockRejectedValue(new Error('No target run')),
+    });
+    const target = document.createElement('div');
+    document.body.append(target);
+    const component = mount(App, { target, props: { api: desktopApi } });
+    mounted.push(component);
+
+    await vi.waitFor(() => expect(target.querySelector<HTMLButtonElement>('.rail-item')).toBeTruthy());
+    target.querySelector<HTMLButtonElement>('.rail-item')!.click();
+    await vi.waitFor(() => expect(target.textContent).toContain('Which environment should receive the deployment?'));
+    expect(target.textContent).toContain('Task preparation: clarify');
+    expect(target.textContent).toContain('A target is required.');
+  });
 });

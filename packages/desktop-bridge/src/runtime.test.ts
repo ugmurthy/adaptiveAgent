@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { ADAPTIVE_AGENT_CLI_COMMANDS } from '@adaptive-agent/agent-sdk/cli';
-import type { ResolvedAgentSdkConfig } from '@adaptive-agent/agent-sdk';
+import { AgentSdk, type ResolvedAgentSdkConfig } from '@adaptive-agent/agent-sdk';
 
 import { JSON_RPC_ERROR_CODES, type DesktopMessage, type DesktopRpcRequest } from './protocol.js';
 import { DesktopRuntime, safeResolvedConfiguration, updateDesktopSettings, validateRestrictedDesktopConfiguration, type CliExecutor } from './runtime.js';
@@ -33,12 +33,13 @@ async function initialize(runtime: DesktopRuntime): Promise<void> {
 describe('desktop runtime protocol', () => {
   it('updates editable settings without dropping advanced configuration', () => {
     const updated = updateDesktopSettings(
-      { env: { EXISTING: 'value' }, gateway: { url: 'ws://gateway' }, model: { overrideBaseUrl: 'https://models' } },
+      { env: { EXISTING: 'value' }, gateway: { url: 'ws://gateway' }, model: { overrideBaseUrl: 'https://models' }, taskPreparation: { agent: './agents/task-preparer.json' } },
       {
         agent: { configPath: ' ./agents/researcher.json ', id: 'researcher' },
         inference: { mode: 'byok', tier: 'high' },
         workspace: { root: ' /workspace ', shellCwd: ' /workspace/project ' },
         interaction: { approvalMode: 'manual', clarificationMode: 'fail' },
+        taskPreparation: { mode: 'auto' },
       },
     );
     expect(updated).toMatchObject({
@@ -49,7 +50,90 @@ describe('desktop runtime protocol', () => {
       inference: { mode: 'byok', tier: 'high' },
       workspace: { overrideRoot: '/workspace', overrideShellCwd: '/workspace/project' },
       interaction: { approvalMode: 'manual', clarificationMode: 'fail' },
+      taskPreparation: { mode: 'auto', agent: './agents/task-preparer.json' },
     });
+  });
+
+  it('applies enhanced task preparation to bridge-initiated runs', async () => {
+    const runRaw = vi.fn(async () => ({ status: 'success', runId: 'execution-1', output: 'done', stepsUsed: 1, usage: {} }));
+    const preparation = {
+      originalObjective: 'fix it', decision: 'enhance', preparedObjective: 'Fix the failing test and verify it.',
+      assumptions: [], clarificationQuestions: [], reason: 'Added completion criteria.',
+      preparationAgentId: 'task-preparer', preparationRunId: 'preparation-1',
+    } as const;
+    const { runtime } = createRuntime();
+    await runtime.handleRpc(request({ id: 'init', method: 'initialize', params: { protocolVersion: '1.17', clientInfo: { name: 'desktop' } } }));
+    Object.assign(runtime as unknown as Record<string, unknown>, {
+      sdk: { runRaw, config: { workspaceRoot: '/workspace', settings: { taskPreparation: { mode: 'auto' } } } },
+      prepareRunTask: vi.fn(async () => preparation),
+    });
+
+    await expect(runtime.handleRpc(request({
+      id: 'run', method: 'agent/run', params: { executionId: 'execution-1', goal: 'fix it' },
+    }))).resolves.toMatchObject({ status: 'success', finalRunId: 'execution-1' });
+    expect(runRaw).toHaveBeenCalledWith('Fix the failing test and verify it.', expect.objectContaining({
+      runId: 'execution-1',
+      metadata: { taskPreparation: expect.objectContaining({ originalObjective: 'fix it', preparationRunId: 'preparation-1' }) },
+    }));
+  });
+
+  it('returns a terminal preparation result when auto mode needs clarification', async () => {
+    const runRaw = vi.fn();
+    const preparation = {
+      originalObjective: 'deploy it', decision: 'clarify', preparedObjective: '', assumptions: [],
+      clarificationQuestions: ['Which environment should receive the deployment?'], reason: 'The target environment changes the operation.',
+      preparationAgentId: 'task-preparer', preparationRunId: 'preparation-2',
+    } as const;
+    const { runtime } = createRuntime();
+    await runtime.handleRpc(request({ id: 'init', method: 'initialize', params: { protocolVersion: '1.17', clientInfo: { name: 'desktop' } } }));
+    Object.assign(runtime as unknown as Record<string, unknown>, {
+      sdk: { runRaw, config: { workspaceRoot: '/workspace', settings: { taskPreparation: { mode: 'auto' } } } },
+      prepareRunTask: vi.fn(async () => preparation),
+    });
+
+    await expect(runtime.handleRpc(request({
+      id: 'run', method: 'agent/run', params: { executionId: 'execution-2', goal: 'deploy it' },
+    }))).resolves.toMatchObject({
+      executionId: 'execution-2', status: 'task_preparation_stopped', finalRunId: 'preparation-2',
+      result: { decision: 'clarify', taskPreparation: { clarificationQuestions: ['Which environment should receive the deployment?'] } },
+    });
+    expect(runRaw).not.toHaveBeenCalled();
+  });
+
+  it('runs configured task preparation in the shared runtime with attachment summaries', async () => {
+    const sharedRuntime = {};
+    const preparationRunRaw = vi.fn(async () => ({
+      status: 'success', runId: 'preparation-3', stepsUsed: 1, usage: {},
+      output: { decision: 'complete', preparedObjective: 'Review the files', assumptions: [], clarificationQuestions: [], reason: 'Already executable.' },
+    }));
+    const close = vi.fn(async () => undefined);
+    const create = vi.spyOn(AgentSdk, 'create').mockResolvedValue({
+      config: { agent: { id: 'task-preparer', tools: [] } }, runRaw: preparationRunRaw, close,
+    } as unknown as AgentSdk);
+    const { runtime } = createRuntime();
+    Object.assign(runtime as unknown as Record<string, unknown>, { sdkOptions: { cwd: '/workspace' }, settingsCwd: '/workspace' });
+    const target = {
+      config: {
+        settings: { taskPreparation: { mode: 'auto', agent: './agents/task-preparer.json' } },
+        agent: { id: 'target', name: 'Target', invocationModes: ['run'], defaultInvocationMode: 'run', model: {}, tools: [] },
+        workspaceRoot: '/workspace',
+      },
+      created: { runtime: sharedRuntime },
+    } as unknown as AgentSdk;
+    const attachments = [
+      { attachmentId: 'file-1', kind: 'file', stagedRelativePath: 'file-1/notes.txt', name: 'notes.txt', sizeBytes: 1, sha256: 'a'.repeat(64) },
+      { attachmentId: 'image-1', kind: 'image', stagedRelativePath: 'image-1/photo.png', name: 'photo.png', sizeBytes: 1, sha256: 'b'.repeat(64) },
+    ] as const;
+
+    await expect((runtime as unknown as { prepareRunTask: Function }).prepareRunTask(target, 'Review the files', attachments))
+      .resolves.toMatchObject({ decision: 'complete', preparationRunId: 'preparation-3' });
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({
+      agentConfigPath: './agents/task-preparer.json', runtime: sharedRuntime, settingsOverrides: undefined,
+    }));
+    expect(preparationRunRaw).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+      input: expect.objectContaining({ attachments: { files: ['file-1/notes.txt'], images: ['image-1/photo.png'], audio: [] } }),
+    }));
+    expect(close).toHaveBeenCalledOnce();
   });
 
   it('projects only allowlisted resolved settings and credential availability', () => {

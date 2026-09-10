@@ -3,10 +3,12 @@ import {
   agentConfigurationFingerprint,
   inspectAgentSdkCatalog,
   inspectAgentSdkResolution,
+  prepareTask,
   resolveRuntimeTarget,
   type AgentSdkOptions,
   type AgentSettingsFile,
   type ResolvedAgentSdkConfig,
+  type TaskPreparationResult,
 } from '@adaptive-agent/agent-sdk';
 import {
   archiveAgentProfile,
@@ -23,7 +25,7 @@ import {
   type AdaptiveAgentCliCommand,
   type ManualTestCliOptions,
 } from '@adaptive-agent/agent-sdk/cli';
-import { RuntimeDeletionError, type AgentEvent, type ChatMessage, type JsonValue, type ModelContentPart, type UUID } from '@adaptive-agent/core';
+import { RuntimeDeletionError, type AgentEvent, type ChatMessage, type JsonObject, type JsonValue, type ModelContentPart, type UUID } from '@adaptive-agent/core';
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve } from 'node:path';
@@ -83,6 +85,7 @@ export interface SafeResolvedConfiguration {
   runtime: { mode: string; sqlitePath?: string };
   workspace: { root: string; shellCwd: string };
   interaction: { approvalMode: string; clarificationMode: string };
+  taskPreparation: { mode: 'never' | 'auto' | 'always' };
 }
 
 const CLI_EXECUTE_DENYLIST = new Map<AdaptiveAgentCliCommand, string>([
@@ -103,6 +106,7 @@ const RUN_REFERENCING_CLI_COMMANDS = new Set<ManualTestCliOptions['command']>([
 export class DesktopRuntime {
   private sdk: AgentSdk | undefined;
   private sdkInitialization: Promise<AgentSdk> | undefined;
+  private sdkOptions: AgentSdkOptions | undefined;
   private managedAttachmentRoot: string | undefined;
   private rpcInitialized = false;
   private clientInfo: DesktopClientInfo | undefined;
@@ -196,13 +200,25 @@ export class DesktopRuntime {
         rejectUnsupportedMedia(params.attachments ?? [], this.negotiatedProtocolVersion);
         const parts = await this.validateAndTranslateAttachments(params.attachments ?? []);
         const fileAccess = await this.fileAccessContext(params.attachments ?? []);
-        const result = await sdk.runRaw(params.goal, {
+        const preparation = await this.prepareRunTask(sdk, params.goal, params.attachments ?? []);
+        if (preparation && preparation.decision !== 'complete' && preparation.decision !== 'enhance') {
+          const result = {
+            status: 'task_preparation_stopped',
+            runId: preparation.preparationRunId,
+            decision: preparation.decision,
+            message: preparation.reason,
+            taskPreparation: preparation,
+          };
+          return params.executionId ? executionResult(executionId, 'direct', result) : asJsonValue(result);
+        }
+        const result = await sdk.runRaw(preparation?.preparedObjective ?? params.goal, {
           runId: asRunId(executionId),
           ...(params.sessionId ? { sessionId: params.sessionId } : {}),
           ...(params.input === undefined ? {} : { input: params.input }),
           ...(parts.length ? { contentParts: parts } : {}),
           ...(fileAccess ? { executionContext: { fileAccess } } : {}),
           ...(params.inferenceTier ? { inferenceTier: params.inferenceTier } : {}),
+          ...(preparation ? { metadata: taskPreparationMetadata(preparation) } : {}),
         });
         return params.executionId ? executionResult(executionId, 'direct', result) : asJsonValue(result);
       }
@@ -361,6 +377,7 @@ export class DesktopRuntime {
     if (initialization) await initialization.catch(() => undefined);
     const sdk = this.sdk;
     this.sdk = undefined;
+    this.sdkOptions = undefined;
     await sdk?.close();
     this.gatewayClient?.close();
     this.gatewayClient = undefined;
@@ -606,6 +623,7 @@ export class DesktopRuntime {
         }
       }
       this.sdk = sdk;
+      this.sdkOptions = options;
       this.configurationDriven = params.configurationDriven ?? false;
       this.executionSelection = {
         inferenceMode: sdk.config.inference.mode,
@@ -668,6 +686,52 @@ export class DesktopRuntime {
       return { saved: true };
     } finally {
       this.settingsUpdateInProgress = false;
+    }
+  }
+
+  private async prepareRunTask(
+    targetSdk: AgentSdk,
+    originalObjective: string,
+    attachments: DesktopAttachmentInput[],
+  ): Promise<TaskPreparationResult | undefined> {
+    const mode = targetSdk.config.settings?.taskPreparation?.mode ?? 'never';
+    if (mode === 'never') return undefined;
+    const configuredAgent = targetSdk.config.settings?.taskPreparation?.agent;
+    if (!configuredAgent) {
+      throw new DesktopProtocolError(
+        'INVALID_CONFIGURATION',
+        `Task preparation mode "${mode}" requires settings.taskPreparation.agent.`,
+        JSON_RPC_ERROR_CODES.commandFailed,
+      );
+    }
+    const options = this.sdkOptions;
+    if (!options) {
+      throw new DesktopProtocolError('NOT_INITIALIZED', 'The runtime configuration is unavailable.', JSON_RPC_ERROR_CODES.notInitialized);
+    }
+    const preparationSdk = await AgentSdk.create({
+      ...options,
+      cwd: this.settingsCwd,
+      agentConfigPath: configuredAgent,
+      settingsConfigPath: undefined,
+      settingsConfig: { ...targetSdk.config.settings, agent: undefined },
+      settingsOverrides: undefined,
+      model: undefined,
+      runtime: targetSdk.created.runtime,
+      eventListener: (event: AgentEvent) => this.writeAgentEvent(event),
+    });
+    try {
+      const paths = (kind: DesktopAttachmentInput['kind']) => attachments
+        .filter((attachment) => attachment.kind === kind)
+        .map((attachment) => attachment.stagedRelativePath);
+      return await prepareTask(preparationSdk, {
+        mode,
+        originalObjective,
+        targetAgent: targetSdk.config.agent,
+        workspaceRoot: targetSdk.config.workspaceRoot,
+        attachments: { images: paths('image'), files: paths('file'), audio: paths('audio') },
+      });
+    } finally {
+      await preparationSdk.close();
     }
   }
 
@@ -991,6 +1055,9 @@ export function updateDesktopSettings(
       overrideShellCwd: settings.workspace.shellCwd.trim(),
     },
     interaction: { ...current.interaction, ...settings.interaction },
+    ...(settings.taskPreparation ? {
+      taskPreparation: { ...current.taskPreparation, mode: settings.taskPreparation.mode },
+    } : {}),
   };
 }
 
@@ -1016,6 +1083,35 @@ export function safeResolvedConfiguration(config: ResolvedAgentSdkConfig, agentP
     },
     workspace: { root: config.workspaceRoot, shellCwd: config.shellCwd },
     interaction: { ...config.interaction },
+    taskPreparation: { mode: config.settings?.taskPreparation?.mode ?? 'never' },
+  };
+}
+
+function taskPreparationMetadata(result: TaskPreparationResult): JsonObject {
+  return {
+    taskPreparation: {
+      schemaVersion: 1,
+      application: 'inline',
+      originalObjective: result.originalObjective,
+      preparedObjective: result.preparedObjective,
+      decision: result.decision,
+      assumptions: result.assumptions,
+      clarificationQuestions: result.clarificationQuestions,
+      reason: result.reason,
+      preparationAgentId: result.preparationAgentId,
+      preparationRunId: result.preparationRunId,
+      preparationRunIds: [result.preparationRunId],
+      runs: [{
+        originalObjective: result.originalObjective,
+        decision: result.decision,
+        preparedObjective: result.preparedObjective,
+        assumptions: result.assumptions,
+        clarificationQuestions: result.clarificationQuestions,
+        reason: result.reason,
+        preparationAgentId: result.preparationAgentId,
+        preparationRunId: result.preparationRunId,
+      }],
+    },
   };
 }
 
