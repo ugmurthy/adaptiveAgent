@@ -134,6 +134,7 @@ describe('desktop runtime protocol', () => {
       input: expect.objectContaining({ attachments: { files: ['file-1/notes.txt'], images: ['image-1/photo.png'], audio: [] } }),
     }));
     expect(close).toHaveBeenCalledOnce();
+    create.mockRestore();
   });
 
   it('projects only allowlisted resolved settings and credential availability', () => {
