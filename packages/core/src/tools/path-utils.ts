@@ -1,5 +1,6 @@
 import { basename, isAbsolute, relative, resolve, sep } from 'node:path';
 import { realpath } from 'node:fs/promises';
+import { homedir } from 'node:os';
 
 export class PathOutsideRootError extends Error {
   constructor(
@@ -37,13 +38,14 @@ export function buildWorkspacePathRecovery(
 
 export function resolvePathWithinRoot(allowedRoot: string, requestedPath: string): string {
   const resolvedRoot = resolve(allowedRoot);
-  const resolvedPath = resolve(resolvedRoot, requestedPath);
+  const expandedPath = expandHomePath(requestedPath);
+  const resolvedPath = resolve(resolvedRoot, expandedPath);
 
   if (isPathWithinRoot(resolvedRoot, resolvedPath)) {
     return resolvedPath;
   }
 
-  const normalizedPath = tryNormalizePathWithinRoot(resolvedRoot, requestedPath);
+  const normalizedPath = tryNormalizePathWithinRoot(resolvedRoot, expandedPath);
   if (normalizedPath) {
     return normalizedPath;
   }
@@ -64,17 +66,18 @@ export async function resolvePathWithinRoots(allowedRoots: readonly string[], re
   if (canonicalRoots.some((root, index) => root !== resolvedRoots[index])) {
     throw new TypeError('Allowed roots must remain canonical paths');
   }
+  const expandedPath = expandHomePath(requestedPath);
   let candidate: string;
-  if (!isAbsolute(requestedPath)) {
-    candidate = resolvePathWithinRoot(canonicalRoots[0]!, requestedPath);
+  if (!isAbsolute(expandedPath)) {
+    candidate = resolvePathWithinRoot(canonicalRoots[0]!, expandedPath);
   } else {
-    const containingRoot = canonicalRoots.find((root) => isPathWithinRoot(root, resolve(requestedPath)));
+    const containingRoot = canonicalRoots.find((root) => isPathWithinRoot(root, resolve(expandedPath)));
     if (containingRoot) {
-      candidate = resolve(requestedPath);
+      candidate = resolve(expandedPath);
     } else {
       // Preserve the established workspace-path recovery for model-generated
       // absolute paths while never rebasing paths into attachment roots.
-      candidate = resolvePathWithinRoot(canonicalRoots[0]!, requestedPath);
+      candidate = resolvePathWithinRoot(canonicalRoots[0]!, expandedPath);
     }
   }
   const canonicalPath = await realpath(candidate);
@@ -87,6 +90,16 @@ export async function resolvePathWithinRoots(allowedRoots: readonly string[], re
 export function isPathWithinRoot(resolvedRoot: string, resolvedPath: string): boolean {
   const relativePath = relative(resolvedRoot, resolvedPath);
   return relativePath === '' || (!relativePath.startsWith('..') && !isAbsolute(relativePath));
+}
+
+function expandHomePath(requestedPath: string): string {
+  if (requestedPath === '~') {
+    return homedir();
+  }
+  if (requestedPath.startsWith('~/')) {
+    return resolve(homedir(), requestedPath.slice(2));
+  }
+  return requestedPath;
 }
 
 function tryNormalizePathWithinRoot(resolvedRoot: string, requestedPath: string): string | undefined {
