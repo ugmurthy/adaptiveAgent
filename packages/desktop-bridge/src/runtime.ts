@@ -1093,6 +1093,8 @@ function taskPreparationMetadata(result: TaskPreparationResult): JsonObject {
       schemaVersion: 1,
       application: 'inline',
       originalObjective: result.originalObjective,
+      title: result.title,
+      name: result.name,
       preparedObjective: result.preparedObjective,
       decision: result.decision,
       assumptions: result.assumptions,
@@ -1103,6 +1105,8 @@ function taskPreparationMetadata(result: TaskPreparationResult): JsonObject {
       preparationRunIds: [result.preparationRunId],
       runs: [{
         originalObjective: result.originalObjective,
+        title: result.title,
+        name: result.name,
         decision: result.decision,
         preparedObjective: result.preparedObjective,
         assumptions: result.assumptions,

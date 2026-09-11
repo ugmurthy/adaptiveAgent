@@ -161,7 +161,7 @@ Minimal `agent.settings.json`:
 
 The preparer is resolved by path or name through `agents.dirs`. Modes are `never`, `auto`, and `always`; override the configured mode for one request with `--enhance <mode>`. In `auto`, the preparer may preserve an already executable objective, enhance an underspecified objective, request clarification, or reject invalid input. The execution agent, tools, model, permissions, and execution strategy remain unchanged.
 
-Task preparation returns a strict structured result. Both the original and prepared objectives, the decision, assumptions, reason, preparation agent id, and preparation run id are recorded in execution metadata. With `--dry-run`, the preparation agent runs and its full result is printed, but the target agent does not run:
+Task preparation returns a strict structured result. Its human-readable title, kebab-case name, original and prepared objectives, decision, assumptions, reason, preparation agent id, and preparation run id are recorded in execution metadata. With `--dry-run`, the preparation agent runs and its full result is printed, but the target agent does not run:
 
 ```bash
 adaptive-agent run --dry-run "review the auth code"

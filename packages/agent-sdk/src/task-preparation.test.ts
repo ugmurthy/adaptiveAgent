@@ -10,6 +10,8 @@ describe('task preparation', () => {
       status: 'success',
       runId: '11111111-1111-4111-8111-111111111111',
       output: {
+        title: 'Review Authentication Code',
+        name: 'review-authentication-code',
         decision: 'enhance',
         preparedObjective: 'Review authentication code and report prioritized findings with evidence.',
         assumptions: ['Review means security and correctness review.'],
@@ -31,13 +33,19 @@ describe('task preparation', () => {
 
     expect(result).toMatchObject({
       originalObjective: 'review the auth code',
+      title: 'Review Authentication Code',
+      name: 'review-authentication-code',
       decision: 'enhance',
       preparationAgentId: 'task-preparer',
       preparationRunId: '11111111-1111-4111-8111-111111111111',
     });
     expect(runRaw).toHaveBeenCalledWith(expect.stringContaining('Enhancement mode is auto'), expect.objectContaining({
       forbiddenTools: [],
-      outputSchema: expect.objectContaining({ type: 'object' }),
+      outputSchema: expect.objectContaining({
+        type: 'object',
+        required: expect.arrayContaining(['title', 'name']),
+        properties: expect.objectContaining({ title: expect.any(Object), name: expect.any(Object) }),
+      }),
       input: expect.objectContaining({ originalObjective: 'review the auth code' }),
       metadata: expect.objectContaining({
         taskPreparation: expect.objectContaining({ originalObjective: 'review the auth code' }),
@@ -46,6 +54,52 @@ describe('task preparation', () => {
   });
 
   it('restores and validates a successful persisted preparation', () => {
+    const run = {
+      id: '11111111-1111-4111-8111-111111111111',
+      status: 'succeeded',
+      input: {
+        originalObjective: 'review the auth code',
+        workspaceRoot: '/workspace',
+        attachments: { images: [], files: [], audio: [] },
+      },
+      result: {
+        title: 'Review Authentication Code',
+        name: 'review-authentication-code',
+        decision: 'enhance',
+        preparedObjective: 'Review authentication code and report prioritized findings.',
+        assumptions: [],
+        clarificationQuestions: [],
+        reason: 'Made the deliverable explicit.',
+      },
+      metadata: {
+        agentId: 'task-preparer',
+        command: 'task-preparation',
+        role: 'task-preparer',
+        targetAgentId: 'reviewer',
+        preparationMode: 'auto',
+      },
+    } as unknown as AgentRun;
+
+    expect(restoreTaskPreparation(run, {
+      targetAgentId: 'reviewer',
+      workspaceRoot: '/workspace',
+      attachments: { images: [], files: [], audio: [] },
+    })).toMatchObject({
+      originalObjective: 'review the auth code',
+      title: 'Review Authentication Code',
+      name: 'review-authentication-code',
+      decision: 'enhance',
+      preparationAgentId: 'task-preparer',
+      preparationRunId: run.id,
+    });
+    expect(() => restoreTaskPreparation(run, {
+      targetAgentId: 'another-agent',
+      workspaceRoot: '/workspace',
+      attachments: { images: [], files: [], audio: [] },
+    })).toThrow('targets agent');
+  });
+
+  it('keeps preparations stored before title and name reusable', () => {
     const run = {
       id: '11111111-1111-4111-8111-111111111111',
       status: 'succeeded',
@@ -74,21 +128,13 @@ describe('task preparation', () => {
       targetAgentId: 'reviewer',
       workspaceRoot: '/workspace',
       attachments: { images: [], files: [], audio: [] },
-    })).toMatchObject({
-      originalObjective: 'review the auth code',
-      decision: 'enhance',
-      preparationAgentId: 'task-preparer',
-      preparationRunId: run.id,
-    });
-    expect(() => restoreTaskPreparation(run, {
-      targetAgentId: 'another-agent',
-      workspaceRoot: '/workspace',
-      attachments: { images: [], files: [], audio: [] },
-    })).toThrow('targets agent');
+    })).toMatchObject({ title: 'review the auth code', name: 'task-11111111' });
   });
 
   it('preserves complete objectives in auto mode', () => {
     expect(validateTaskPreparationOutput({
+      title: 'Run Test Suite',
+      name: 'run-test-suite',
       decision: 'complete',
       preparedObjective: 'An unnecessary rewrite',
       assumptions: [],
@@ -102,6 +148,8 @@ describe('task preparation', () => {
 
   it('turns complete into enhance in always mode and rejects empty enhancements', () => {
     expect(validateTaskPreparationOutput({
+      title: 'Run Test Suite',
+      name: 'run-test-suite',
       decision: 'complete',
       preparedObjective: 'Run all tests and report any failures.',
       assumptions: [],
@@ -112,6 +160,8 @@ describe('task preparation', () => {
       preparedObjective: 'Run all tests and report any failures.',
     });
     expect(() => validateTaskPreparationOutput({
+      title: 'Run Test Suite',
+      name: 'run-test-suite',
       decision: 'enhance',
       preparedObjective: '',
       assumptions: [],
@@ -122,12 +172,33 @@ describe('task preparation', () => {
 
   it('requires questions when clarification is requested', () => {
     expect(() => validateTaskPreparationOutput({
+      title: 'Deploy Application',
+      name: 'deploy-application',
       decision: 'clarify',
       preparedObjective: '',
       assumptions: [],
       clarificationQuestions: [],
       reason: 'The requested release action is ambiguous.',
     }, { mode: 'auto', originalObjective: 'update the release' })).toThrow('without returning any questions');
+  });
+
+  it('requires a concise title and kebab-case name', () => {
+    const output = {
+      title: 'Run Test Suite',
+      name: 'run-test-suite',
+      decision: 'complete',
+      preparedObjective: 'Run the test suite.',
+      assumptions: [],
+      clarificationQuestions: [],
+      reason: 'The task is already executable.',
+    };
+
+    expect(validateTaskPreparationOutput(output, { mode: 'auto', originalObjective: 'Run the test suite.' }))
+      .toMatchObject({ title: 'Run Test Suite', name: 'run-test-suite' });
+    expect(() => validateTaskPreparationOutput(
+      { ...output, name: 'Run Test Suite' },
+      { mode: 'auto', originalObjective: 'Run the test suite.' },
+    )).toThrow('invalid name');
   });
 });
 

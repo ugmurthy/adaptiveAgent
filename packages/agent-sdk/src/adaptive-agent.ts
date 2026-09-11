@@ -1471,6 +1471,8 @@ function applyTaskPreparation(
         schemaVersion: 1,
         application,
         originalObjective: result.originalObjective,
+        title: result.title,
+        name: result.name,
         preparedObjective: result.preparedObjective,
         decision: result.decision,
         assumptions: result.assumptions,
@@ -1481,6 +1483,8 @@ function applyTaskPreparation(
         preparationRunIds: results.map((preparation) => preparation.preparationRunId),
         runs: results.map((preparation) => ({
           originalObjective: preparation.originalObjective,
+          title: preparation.title,
+          name: preparation.name,
           decision: preparation.decision,
           preparedObjective: preparation.preparedObjective,
           assumptions: preparation.assumptions,

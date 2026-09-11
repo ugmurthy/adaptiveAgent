@@ -1170,6 +1170,8 @@ export function formatDryRunMarkdown(
       '',
       `- \`agent\`: \`${taskPreparation.preparationAgentId}\``,
       `- \`runId\`: \`${taskPreparation.preparationRunId}\``,
+      `- \`title\`: ${taskPreparation.title}`,
+      `- \`name\`: \`${taskPreparation.name}\``,
       `- \`decision\`: \`${taskPreparation.decision}\``,
       `- \`reason\`: ${taskPreparation.reason}`,
       `- \`assumptions\`: ${formatNameList(taskPreparation.assumptions)}`,
@@ -1212,6 +1214,8 @@ export function summarizeDryRun(
 
 export function summarizeTaskPreparationResult(result: TaskPreparationResult): JsonValue {
   return {
+    title: result.title,
+    name: result.name,
     decision: result.decision,
     preparedObjective: result.preparedObjective,
     assumptions: result.assumptions,
@@ -1226,6 +1230,8 @@ export function printTaskPreparationResult(result: TaskPreparationResult): void 
   console.log('task preparation:');
   console.log(`agent: ${result.preparationAgentId}`);
   console.log(`runId: ${result.preparationRunId}`);
+  console.log(`title: ${result.title}`);
+  console.log(`name: ${result.name}`);
   console.log(`decision: ${result.decision}`);
   console.log(`reason: ${result.reason}`);
   if (result.assumptions.length > 0) console.log(`assumptions: ${result.assumptions.join('; ')}`);

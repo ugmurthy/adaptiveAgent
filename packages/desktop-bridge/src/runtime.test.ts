@@ -58,6 +58,7 @@ describe('desktop runtime protocol', () => {
     const runRaw = vi.fn(async () => ({ status: 'success', runId: 'execution-1', output: 'done', stepsUsed: 1, usage: {} }));
     const preparation = {
       originalObjective: 'fix it', decision: 'enhance', preparedObjective: 'Fix the failing test and verify it.',
+      title: 'Fix Failing Test', name: 'fix-failing-test',
       assumptions: [], clarificationQuestions: [], reason: 'Added completion criteria.',
       preparationAgentId: 'task-preparer', preparationRunId: 'preparation-1',
     } as const;
@@ -73,7 +74,12 @@ describe('desktop runtime protocol', () => {
     }))).resolves.toMatchObject({ status: 'success', finalRunId: 'execution-1' });
     expect(runRaw).toHaveBeenCalledWith('Fix the failing test and verify it.', expect.objectContaining({
       runId: 'execution-1',
-      metadata: { taskPreparation: expect.objectContaining({ originalObjective: 'fix it', preparationRunId: 'preparation-1' }) },
+      metadata: { taskPreparation: expect.objectContaining({
+        originalObjective: 'fix it',
+        title: 'Fix Failing Test',
+        name: 'fix-failing-test',
+        preparationRunId: 'preparation-1',
+      }) },
     }));
   });
 
@@ -81,6 +87,7 @@ describe('desktop runtime protocol', () => {
     const runRaw = vi.fn();
     const preparation = {
       originalObjective: 'deploy it', decision: 'clarify', preparedObjective: '', assumptions: [],
+      title: 'Deploy Application', name: 'deploy-application',
       clarificationQuestions: ['Which environment should receive the deployment?'], reason: 'The target environment changes the operation.',
       preparationAgentId: 'task-preparer', preparationRunId: 'preparation-2',
     } as const;
@@ -104,7 +111,7 @@ describe('desktop runtime protocol', () => {
     const sharedRuntime = {};
     const preparationRunRaw = vi.fn(async () => ({
       status: 'success', runId: 'preparation-3', stepsUsed: 1, usage: {},
-      output: { decision: 'complete', preparedObjective: 'Review the files', assumptions: [], clarificationQuestions: [], reason: 'Already executable.' },
+      output: { title: 'Review Files', name: 'review-files', decision: 'complete', preparedObjective: 'Review the files', assumptions: [], clarificationQuestions: [], reason: 'Already executable.' },
     }));
     const close = vi.fn(async () => undefined);
     const create = vi.spyOn(AgentSdk, 'create').mockResolvedValue({

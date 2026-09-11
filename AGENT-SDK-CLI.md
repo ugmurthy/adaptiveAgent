@@ -141,7 +141,7 @@ Behavior:
 - support repeatable attachments such as `--image <path>`;
 - support an advanced `--content-part <json>` escape hatch;
 - optionally run the configured task-preparation agent before the resolved execution agent;
-- include the preparation decision, prepared objective, assumptions, questions, reason, and preparation run id in dry-run and JSON output;
+- include the preparation title, kebab-case name, decision, prepared objective, assumptions, questions, reason, and preparation run id in dry-run and JSON output;
 - reuse a successful persisted preparation run with `--from-preparation <runId>` without repeating the original goal or invoking the preparer again;
 - internally build the same request shape currently used by the spec runner: `goal`, `input`, `images`, `contentParts`, `context`, `outputSchema`, and `metadata`;
 - call `sdk.run(goal, options)`.

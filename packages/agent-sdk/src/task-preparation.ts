@@ -6,6 +6,8 @@ export type TaskPreparationDecision = 'complete' | 'enhance' | 'clarify' | 'inva
 
 export interface TaskPreparationResult {
   originalObjective: string;
+  title: string;
+  name: string;
   decision: TaskPreparationDecision;
   preparedObjective: string;
   assumptions: string[];
@@ -46,8 +48,10 @@ export interface TaskPreparationRunner {
 export const TASK_PREPARATION_OUTPUT_SCHEMA: JsonSchema = {
   type: 'object',
   additionalProperties: false,
-  required: ['decision', 'preparedObjective', 'assumptions', 'clarificationQuestions', 'reason'],
+  required: ['title', 'name', 'decision', 'preparedObjective', 'assumptions', 'clarificationQuestions', 'reason'],
   properties: {
+    title: { type: 'string', minLength: 1, maxLength: 80 },
+    name: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$' },
     decision: { enum: ['complete', 'enhance', 'clarify', 'invalid'] },
     preparedObjective: { type: 'string' },
     assumptions: { type: 'array', items: { type: 'string' } },
@@ -111,9 +115,17 @@ export function restoreTaskPreparation(
     throw new Error(`Task preparation run ${run.id} was created with different attachments.`);
   }
   const preparationAgentId = readNonEmptyMetadataString(run.metadata?.agentId, 'agentId', run.id);
+  const storedResult = isRecord(run.result)
+    ? {
+        ...run.result,
+        // Preparations persisted before title/name were added remain reusable.
+        title: run.result.title ?? stored.originalObjective.slice(0, 80).trim(),
+        name: run.result.name ?? `task-${run.id.slice(0, 8).toLowerCase()}`,
+      }
+    : run.result;
   return {
     originalObjective: stored.originalObjective,
-    ...validateTaskPreparationOutput(run.result, stored),
+    ...validateTaskPreparationOutput(storedResult, stored),
     preparationAgentId,
     preparationRunId: run.id,
   };
@@ -161,8 +173,14 @@ function sameAttachmentSummary(left: TaskPreparationAttachmentSummary, right: Ta
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-export function validateTaskPreparationOutput(output: JsonValue, request: Pick<PrepareTaskRequest, 'mode' | 'originalObjective'>): Omit<TaskPreparationResult, 'preparationAgentId' | 'preparationRunId'> {
+export function validateTaskPreparationOutput(output: JsonValue, request: Pick<PrepareTaskRequest, 'mode' | 'originalObjective'>): Omit<TaskPreparationResult, 'originalObjective' | 'preparationAgentId' | 'preparationRunId'> {
   if (!isRecord(output)) throw new Error('Task preparer returned a non-object result.');
+  const title = readString(output.title, 'title').trim();
+  if (!title || title.length > 80) throw new Error('Task preparer returned an invalid title.');
+  const name = readString(output.name, 'name').trim();
+  if (name.length > 64 || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name)) {
+    throw new Error('Task preparer returned an invalid name.');
+  }
   const decision = output.decision;
   if (decision !== 'complete' && decision !== 'enhance' && decision !== 'clarify' && decision !== 'invalid') {
     throw new Error('Task preparer returned an invalid decision.');
@@ -180,6 +198,8 @@ export function validateTaskPreparationOutput(output: JsonValue, request: Pick<P
     throw new Error('Task preparer requested clarification without returning any questions.');
   }
   return {
+    title,
+    name,
     decision: normalizedDecision,
     preparedObjective: normalizedDecision === 'complete' ? request.originalObjective : preparedObjective.trim(),
     assumptions,
@@ -192,6 +212,8 @@ function buildTaskPreparationGoal(mode: Exclude<TaskPreparationMode, 'never'>): 
   return [
     'Prepare the supplied original objective for the resolved target agent.',
     'Return only the object required by outputSchema.',
+    'Set title to a concise, human-readable label for the task (80 characters or fewer).',
+    'Set name to a stable, descriptive identifier derived from the task using only lowercase letters, numbers, and single hyphens (64 characters or fewer).',
     mode === 'always'
       ? 'Enhancement mode is always: return enhance with a useful preparedObjective unless essential missing information requires clarify or the request is invalid.'
       : 'Enhancement mode is auto: return complete when the original objective is already executable; otherwise return enhance, clarify, or invalid.',
