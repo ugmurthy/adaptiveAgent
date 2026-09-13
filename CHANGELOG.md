@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 This project follows semantic versioning for release notes.
 
+## [0.1.47] - 2026-09-11
+
+### Added
+
+- Added managed image and audio attachments to desktop bridge protocol `1.17`.
+- Added permanent deletion of terminal root-run trees for SQLite and Postgres
+  runtimes through the desktop bridge.
+
+### Changed
+
+- Extended desktop runs to honor configured task preparation and added
+  human-readable titles and kebab-case names to preparation results.
+- Scoped desktop bridge `context` commands to the initialized workspace when
+  no explicit working directory is provided.
+
+### Fixed
+
+- Made `edit_file` conflicts recoverable with structured guidance for missing,
+  ambiguous, line-ending-mismatched, nonexistent, and binary-file edits while
+  preserving atomic multi-edit behavior.
+- Fixed home-relative tool paths so they expand before workspace-boundary
+  validation.
+- Fixed SQLite trace-session usage reports to expose tool accounting and made
+  newest-first session pagination safe for merged groups and tied timestamps.
+
 ## [0.1.46] - 2026-09-01
 
 ### Added
