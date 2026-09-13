@@ -24,6 +24,7 @@ import {
   createSwarmSdk,
   SwarmSdk,
   createOrchestrationSdk,
+  discoverAgentSdkAgents,
   inspectAgentSdkCatalog,
   inspectAgentSdkResolution,
   loadAgentSdkConfig,
@@ -76,6 +77,7 @@ import type {
 } from './cli-types.js';
 import {
   collectContentParts,
+  formatAgentDiscoveryMarkdown,
   formatCatalogMarkdown,
   formatCoordinatorDecompositionFailure,
   formatInteractiveChatResult,
@@ -103,6 +105,7 @@ import {
   renderStyledPrettyMessage,
   RunColorRegistry,
   shouldListenForCliEvents,
+  summarizeAgentDiscovery,
   summarizeCatalog,
   summarizeCli,
   summarizeEvent,
@@ -168,6 +171,7 @@ Setup and inspection:
   init                  Create first-run configuration under ~/.adaptiveAgent
   doctor                Check CLI installation and local configuration
   config                Print resolved SDK configuration
+  agents                Discover agents and print safe selection descriptors
   catalog               List available agents, tools, and delegate skills
   context               Create and manage project-scoped context bundles
   skill                 Prepare handler-backed skills for binary execution
@@ -502,6 +506,15 @@ Usage:
 
 ${COMMON_AGENT_OPTIONS_TEXT}`;
 
+const AGENTS_HELP_TEXT = `adaptive-agent agents
+
+Discover agents and print safe descriptors for selecting an exact profile.
+
+Usage:
+  adaptive-agent agents [options]
+
+${COMMON_AGENT_OPTIONS_TEXT}`;
+
 const CATALOG_HELP_TEXT = `adaptive-agent catalog
 
 List available agents, tools, and delegate skills.
@@ -703,6 +716,8 @@ function getHelpText(topic?: ManualTestCliOptions['helpTopic']): string {
       return SPEC_HELP_TEXT;
     case 'config':
       return CONFIG_HELP_TEXT;
+    case 'agents':
+      return AGENTS_HELP_TEXT;
     case 'catalog':
       return CATALOG_HELP_TEXT;
     case 'eval':
@@ -793,6 +808,10 @@ export async function main(argv = Bun.argv.slice(2)): Promise<number> {
 
   if (cli.command === 'config') {
     return runConfigCommand(cli);
+  }
+
+  if (cli.command === 'agents') {
+    return runAgentsCommand(cli);
   }
 
   if (cli.command === 'catalog') {
@@ -2169,6 +2188,23 @@ async function runCatalogCommand(cli: ManualTestCliOptions): Promise<number> {
   }
 
   console.log(renderPrettyString(formatCatalogMarkdown(catalog)));
+  return 0;
+}
+
+async function runAgentsCommand(cli: ManualTestCliOptions): Promise<number> {
+  const resolvedCwd = resolve(cli.cwd ?? process.cwd());
+  const discovery = await discoverAgentSdkAgents(buildSdkOptions(cli, resolvedCwd));
+  const output = summarizeAgentDiscovery(discovery);
+  if (cli.output === 'json') {
+    console.log(JSON.stringify(output, null, 2));
+    return 0;
+  }
+  if (cli.output === 'jsonl') {
+    console.log(JSON.stringify(output));
+    return 0;
+  }
+
+  console.log(renderPrettyString(formatAgentDiscoveryMarkdown(discovery)));
   return 0;
 }
 

@@ -13,6 +13,7 @@ adaptive-agent config [options]
 adaptive-agent run [options] <goal...>
 adaptive-agent chat [options] [message...]
 adaptive-agent spec <path> [options]
+adaptive-agent agents [options]
 adaptive-agent catalog [options]
 adaptive-agent context create|list|show|delete [options]
 adaptive-agent swarm-run --agent <agent> --worker-catalog <agents> [options] <task...>
@@ -43,7 +44,21 @@ Common options:
 | `--inspect` | Print a compact run/event summary after completion. |
 | `--dry-run` | Resolve without executing the target agent. Configured task preparation still runs and may incur a model call. |
 
-Use `adaptive-agent catalog` to print a human-readable inventory of the active agent, every agent found in `settings.agents.dirs`, every registered tool, and delegate skills found in `settings.skills.dirs`. Add `--output json` or `--output jsonl` for scripts.
+Use `adaptive-agent agents` to discover local agent profiles without loading
+their tools or delegate handlers. Machine output includes the exact
+`id`/`configPath`/`configurationFingerprint` descriptor used by
+`desktop-bridge` hosts to pin runtime initialization, plus duplicate/invalid
+profile diagnostics. The output excludes credentials and system instructions:
+
+```bash
+adaptive-agent agents --output json
+adaptive-agent run --agent reviewer "Review the current changes"
+```
+
+The programmatic equivalent is `discoverAgentSdkAgents(options)`. Use
+`adaptive-agent catalog` for the broader human-readable inventory of the active
+agent, registered tools, and delegate skills. Add `--output json` or `--output
+jsonl` to either command for scripts.
 
 Runtime stores may be ephemeral `memory`, embedded durable `sqlite`, or
 shared `postgres`. Inference may be local (Ollama), direct BYOK, or routed via

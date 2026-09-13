@@ -1,4 +1,5 @@
 import type { ChatMessage, JsonValue, RuntimeDeletionTarget } from '@adaptive-agent/core';
+import type { AgentSdkAgentDiscovery, AgentSdkCatalogAgent } from '@adaptive-agent/agent-sdk';
 import type { InferenceMode, InferenceTier, ProfileRef } from '@adaptive-agent/gateway-client';
 
 export {
@@ -7,8 +8,8 @@ export {
 } from '@adaptive-agent/agent-sdk/cli';
 
 /** Keep versions as strings: JSON numbers cannot distinguish 1.10 from 1.1. */
-export const DESKTOP_PROTOCOL_VERSION = '1.17' as const;
-export const SUPPORTED_DESKTOP_PROTOCOL_VERSIONS = ['1.10', '1.11', '1.12', '1.13', '1.14', '1.15', '1.16', DESKTOP_PROTOCOL_VERSION] as const;
+export const DESKTOP_PROTOCOL_VERSION = '1.18' as const;
+export const SUPPORTED_DESKTOP_PROTOCOL_VERSIONS = ['1.10', '1.11', '1.12', '1.13', '1.14', '1.15', '1.16', '1.17', DESKTOP_PROTOCOL_VERSION] as const;
 export const DESKTOP_BRIDGE_VERSION = '0.1.0';
 
 export type DesktopProtocolVersion = (typeof SUPPORTED_DESKTOP_PROTOCOL_VERSIONS)[number];
@@ -87,7 +88,7 @@ export interface RuntimeInitializeParams {
   gatewayUrl?: string;
   requireRunPermit?: boolean;
   managedAttachmentRoot?: string;
-  /** Protocol 1.14: pin the runtime to the exact descriptor returned by catalog/inspect. */
+  /** Pin the runtime to the exact descriptor returned by agents/list or catalog/inspect. */
   agentSelection?: DesktopAgentSelection;
 }
 
@@ -101,6 +102,10 @@ export interface CatalogInspectParams {
   cwd?: string;
   settingsConfigPath?: string;
 }
+
+export type AgentsListParams = CatalogInspectParams;
+export type DesktopAgentDescriptor = AgentSdkCatalogAgent;
+export type AgentsListResult = AgentSdkAgentDiscovery;
 
 export type DesktopAttachmentKind = 'file' | 'image' | 'audio';
 export type DesktopAudioFormat = 'wav' | 'mp3' | 'flac' | 'm4a' | 'ogg' | 'aac' | 'aiff' | 'pcm16' | 'pcm24';
@@ -235,6 +240,7 @@ type RpcRequestWithoutParams<TMethod extends string> = JsonRpcRequest<TMethod, n
 
 export type DesktopRpcRequest =
   | RpcRequest<'initialize', InitializeParams>
+  | RpcRequest<'agents/list', AgentsListParams>
   | RpcRequest<'catalog/inspect', CatalogInspectParams>
   | RpcRequest<'runtime/initialize', RuntimeInitializeParams>
   | RpcRequestWithoutParams<'runtime/info'>
@@ -266,6 +272,7 @@ export type DesktopRpcRequest =
 
 export const DESKTOP_RPC_METHODS = [
   'initialize',
+  'agents/list',
   'catalog/inspect',
   'runtime/initialize',
   'runtime/info',
@@ -378,6 +385,7 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
     case 'cli/commands':
       if (params && Object.keys(params).length > 0) invalidParams(`${method} does not accept params.`);
       return;
+    case 'agents/list':
     case 'catalog/inspect':
       optionalString(params ?? {}, 'cwd');
       optionalString(params ?? {}, 'settingsConfigPath');

@@ -5,11 +5,12 @@ function cloneSnapshot(snapshot: RunSnapshot): RunSnapshot {
 }
 
 export class InMemorySnapshotStore implements SnapshotStore {
-  private readonly snapshotsByRun = new Map<UUID, RunSnapshot[]>();
+  private readonly latestSnapshotByRun = new Map<UUID, RunSnapshot>();
+  private readonly snapshotSequencesByRun = new Map<UUID, Set<number>>();
 
   async save(snapshot: Omit<RunSnapshot, 'id' | 'createdAt'>): Promise<RunSnapshot> {
-    const snapshots = this.snapshotsByRun.get(snapshot.runId) ?? [];
-    if (snapshots.some((existing) => existing.snapshotSeq === snapshot.snapshotSeq)) {
+    const sequences = this.snapshotSequencesByRun.get(snapshot.runId) ?? new Set<number>();
+    if (sequences.has(snapshot.snapshotSeq)) {
       throw new Error(`Snapshot ${snapshot.runId}@${snapshot.snapshotSeq} already exists`);
     }
 
@@ -19,15 +20,17 @@ export class InMemorySnapshotStore implements SnapshotStore {
       createdAt: new Date().toISOString(),
     };
 
-    snapshots.push(nextSnapshot);
-    snapshots.sort((left, right) => left.snapshotSeq - right.snapshotSeq);
-    this.snapshotsByRun.set(snapshot.runId, snapshots);
+    sequences.add(nextSnapshot.snapshotSeq);
+    this.snapshotSequencesByRun.set(snapshot.runId, sequences);
+    const latest = this.latestSnapshotByRun.get(snapshot.runId);
+    if (!latest || nextSnapshot.snapshotSeq > latest.snapshotSeq) {
+      this.latestSnapshotByRun.set(snapshot.runId, nextSnapshot);
+    }
     return cloneSnapshot(nextSnapshot);
   }
 
   async getLatest(runId: UUID): Promise<RunSnapshot | null> {
-    const snapshots = this.snapshotsByRun.get(runId) ?? [];
-    const latest = snapshots[snapshots.length - 1];
+    const latest = this.latestSnapshotByRun.get(runId);
     return latest ? cloneSnapshot(latest) : null;
   }
 }

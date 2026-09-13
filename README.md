@@ -101,6 +101,19 @@ This exercises default agent resolution, one-shot goal execution, local tools,
 progress updates, and persisted run inspection. Add `--events` to display the
 full lifecycle event stream.
 
+Discover available profiles before selecting one by name:
+
+```bash
+adaptive-agent agents
+adaptive-agent run --agent reviewer "Review the current changes."
+```
+
+Use `adaptive-agent agents --output json` when embedding discovery in a host.
+It returns safe metadata and the exact `id`, `configPath`, and
+`configurationFingerprint` selection descriptor used by `desktop-bridge`.
+Discovery does not load agent tools or delegate handlers and does not expose
+credentials or system instructions.
+
 ### 2. Refine an idea through chat
 
 Start an interactive conversation:
@@ -552,7 +565,7 @@ The current workspace packages are:
 - `@adaptive-agent/trace-session` in `packages/trace-session`: decision-oriented SQLite/Postgres trace reporter with a read-only NDJSON JSON-RPC 2.0 stdio sidecar for native and desktop trace consumers.
 - `@adaptive-agent/trace-workbench` in `packages/trace-workbench`: Bun + Svelte trace workbench for choosing persisted sessions/runs, exploring timelines, resource spend, messages, diagnostics, and exporting markdown/PDF reports.
 - `@adaptive-agent/gateway-protocol`, `@adaptive-agent/gateway-client`, and `@adaptive-agent/capability-gateway`: shared JSON-RPC contracts, client integration, and the authenticated capability/inference gateway.
-- `@adaptive-agent/desktop-bridge`: the NDJSON JSON-RPC 2.0 stdio sidecar for runtime initialization, agent execution, run control, interactions, events, and safe CLI access.
+- `@adaptive-agent/desktop-bridge`: the NDJSON JSON-RPC 2.0 stdio sidecar for agent discovery and exact selection, runtime initialization, execution, run control, interactions, events, and safe CLI access.
 - `@adaptive-agent/desktop-app`: the Tauri 2 + Svelte desktop client backed by `desktop-bridge`.
 
 Useful local commands:

@@ -36,6 +36,7 @@ import {
 } from '@adaptive-agent/gateway-client';
 
 import type {
+  AgentSdkAgentDiscovery,
   AgentSdkCatalogInspection,
   AgentSdkChatOptions,
   AgentSdkOptions,
@@ -413,6 +414,12 @@ export async function inspectAgentSdkResolution(options: AgentSdkOptions = {}): 
   };
 }
 
+/** Discover safe, selectable agent descriptors without loading tools or delegate handlers. */
+export async function discoverAgentSdkAgents(options: AgentSdkOptions = {}): Promise<AgentSdkAgentDiscovery> {
+  const resolved = await resolveAgentSdkConfigWithSources(options);
+  return discoverAgentsFromResolvedConfig(resolved, options);
+}
+
 export async function inspectAgentSdkCatalog(options: AgentSdkOptions = {}): Promise<AgentSdkCatalogInspection> {
   const resolved = await resolveAgentSdkConfigWithSources(options);
   const client = resolved.config.inference.mode === 'gateway' && resolved.config.gateway.remoteTools.length
@@ -421,19 +428,33 @@ export async function inspectAgentSdkCatalog(options: AgentSdkOptions = {}): Pro
   const modules = await resolveToolsAndDelegates(resolved.config, options, client);
   const configuredToolNames = new Set(resolved.config.agent.tools);
   const configuredDelegateNames = new Set(resolved.config.agent.delegates ?? []);
-  const agentInventory = await discoverCatalogAgentInventory(resolved.config, resolved.agentPath, options);
+  const discovery = await discoverAgentsFromResolvedConfig(resolved, options);
 
   return {
     config: resolved.config,
     agentPath: resolved.agentPath,
     ...(resolved.settingsPath ? { settingsPath: resolved.settingsPath } : {}),
-    agents: agentInventory.agents,
-    diagnostics: agentInventory.diagnostics,
+    agents: discovery.agents,
+    diagnostics: discovery.diagnostics,
     tools: modules.registeredTools.map((tool) => ({
       ...pickToolInspectionFields(tool),
       configured: configuredToolNames.has(tool.name),
     })),
     delegates: await discoverCatalogDelegates(resolved.config, configuredDelegateNames),
+  };
+}
+
+async function discoverAgentsFromResolvedConfig(
+  resolved: Awaited<ReturnType<typeof resolveAgentSdkConfigWithSources>>,
+  options: AgentSdkOptions,
+): Promise<AgentSdkAgentDiscovery> {
+  const inventory = await discoverCatalogAgentInventory(resolved.config, resolved.agentPath, options);
+  const currentAgent = inventory.agents.find((agent) => agent.configPath === resolved.agentPath);
+  return {
+    agents: inventory.agents,
+    diagnostics: inventory.diagnostics,
+    ...(currentAgent ? { currentAgent } : {}),
+    ...(resolved.settingsPath ? { settingsPath: resolved.settingsPath } : {}),
   };
 }
 

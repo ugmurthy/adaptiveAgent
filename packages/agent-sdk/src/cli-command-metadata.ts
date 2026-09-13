@@ -13,6 +13,7 @@ export const ADAPTIVE_AGENT_CLI_COMMANDS = [
   'replay',
   'eval',
   'config',
+  'agents',
   'catalog',
   'init',
   'doctor',

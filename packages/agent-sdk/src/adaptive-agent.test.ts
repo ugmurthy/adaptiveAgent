@@ -191,7 +191,7 @@ describe('adaptive-agent cli parsing', () => {
   it('derives parser commands and subcommands from canonical CLI metadata', () => {
     expect(ADAPTIVE_AGENT_CLI_COMMANDS).toEqual([
       'run', 'chat', 'spec', 'swarm-run', 'ambient', 'retry', 'inspect', 'resume', 'recover', 'continue',
-      'interrupt', 'replay', 'eval', 'config', 'catalog', 'init', 'doctor', 'update', 'uninstall',
+      'interrupt', 'replay', 'eval', 'config', 'agents', 'catalog', 'init', 'doctor', 'update', 'uninstall',
       'agent-create', 'context', 'skill', 'version',
     ]);
     expect(ADAPTIVE_AGENT_POSITIONAL_COMMANDS).toEqual(ADAPTIVE_AGENT_CLI_COMMANDS.filter((command) => command !== 'version'));
@@ -508,6 +508,14 @@ describe('adaptive-agent cli parsing', () => {
     expect(parseCliArgs(['catalog', '--agent', 'reviewer', '--output', 'json'])).toMatchObject({
       command: 'catalog',
       agentConfigPath: 'reviewer',
+      output: 'json',
+    });
+  });
+
+  it('parses agent discovery command flags', () => {
+    expect(parseCliArgs(['agents', '--settings', './settings.json', '--output', 'json'])).toMatchObject({
+      command: 'agents',
+      settingsConfigPath: './settings.json',
       output: 'json',
     });
   });
@@ -968,6 +976,38 @@ describe('adaptive-agent catalog command', () => {
       expect(output.delegates).toEqual([
         expect.objectContaining({ name: 'researcher', configured: true, allowedTools: ['read_file'], triggers: ['research'] }),
       ]);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('prints exact safe selection descriptors without loading catalog modules', async () => {
+    await writeCatalogFixtures();
+    await writeFile(join(tempDir, 'agent.json'), JSON.stringify({
+      id: 'agent',
+      name: 'Agent',
+      invocationModes: ['run'],
+      defaultInvocationMode: 'run',
+      model: { provider: 'ollama', model: 'qwen3.5', apiKey: 'must-not-leak' },
+      tools: ['not-registered'],
+      systemInstructions: 'private instructions',
+    }));
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      const exitCode = await main(['agents', '--cwd', tempDir, '--output', 'json']);
+      const output = JSON.parse(String(log.mock.calls[0]?.[0])) as Record<string, any>;
+
+      expect(exitCode).toBe(0);
+      expect(output.command).toBe('agents');
+      expect(output.currentAgent).toMatchObject({
+        id: 'agent',
+        configPath: join(tempDir, 'agent.json'),
+        validationState: 'valid',
+      });
+      expect(output.currentAgent.configurationFingerprint).toMatch(/^[a-f0-9]{64}$/);
+      expect(JSON.stringify(output)).not.toContain('must-not-leak');
+      expect(JSON.stringify(output)).not.toContain('private instructions');
     } finally {
       log.mockRestore();
     }

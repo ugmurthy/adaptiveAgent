@@ -651,13 +651,13 @@ impl AgentRuntimeManager {
             &probe_selection,
         )?;
         let result = (|| {
-            let negotiated = probe.request_wait("initialize", json!({ "protocolVersion": "1.16", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }), REQUEST_TIMEOUT)?;
-            if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.16") {
-                return Err("The sidecar did not negotiate desktop protocol 1.16.".into());
+            let negotiated = probe.request_wait("initialize", json!({ "protocolVersion": "1.18", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }), REQUEST_TIMEOUT)?;
+            if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.18") {
+                return Err("The sidecar did not negotiate desktop protocol 1.18.".into());
             }
-            let value = probe.request_wait("catalog/inspect", json!({}), REQUEST_TIMEOUT)?;
+            let value = probe.request_wait("agents/list", json!({}), REQUEST_TIMEOUT)?;
             serde_json::from_value(value)
-                .map_err(|error| format!("Invalid catalog response: {error}"))
+                .map_err(|error| format!("Invalid agent discovery response: {error}"))
         })();
         probe.shutdown();
         result
@@ -2271,11 +2271,11 @@ impl Bridge {
     fn initialize(self: &Arc<Self>) -> Result<(), String> {
         let negotiated = self.request_wait(
             "initialize",
-            json!({ "protocolVersion": "1.16", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }),
+            json!({ "protocolVersion": "1.18", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }),
             REQUEST_TIMEOUT,
         ).map_err(|error| format!("The runtime handshake failed before profile loading: {error}"))?;
-        if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.16") {
-            return Err("The sidecar did not negotiate desktop protocol 1.16.".into());
+        if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.18") {
+            return Err("The sidecar did not negotiate desktop protocol 1.18.".into());
         }
         let initialized = self.request_wait(
             "runtime/initialize",

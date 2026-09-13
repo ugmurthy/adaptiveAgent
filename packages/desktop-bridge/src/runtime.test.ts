@@ -238,8 +238,46 @@ describe('desktop runtime protocol', () => {
       params: { protocolVersion: '2.0', clientInfo: { name: 'desktop' } },
     }))).rejects.toMatchObject({
       code: 'UNSUPPORTED_PROTOCOL_VERSION',
-      data: { supportedProtocolVersions: ['1.10', '1.11', '1.12', '1.13', '1.14', '1.15', '1.16', '1.17'] },
+      data: { supportedProtocolVersions: ['1.10', '1.11', '1.12', '1.13', '1.14', '1.15', '1.16', '1.17', '1.18'] },
     });
+  });
+
+  it('lists safe agent selection descriptors in protocol 1.18', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'desktop-agents-'));
+    const agentPath = join(cwd, 'agent.json');
+    await writeFile(agentPath, JSON.stringify({
+      id: 'desktop-agent',
+      name: 'Desktop Agent',
+      invocationModes: ['run'],
+      defaultInvocationMode: 'run',
+      model: { provider: 'ollama', model: 'test-model', apiKey: 'must-not-leak' },
+      tools: ['not-registered'],
+      systemInstructions: 'private prompt',
+    }));
+    await writeFile(join(cwd, 'agent.settings.json'), JSON.stringify({ runtime: { mode: 'memory' } }));
+    const legacy = createRuntime().runtime;
+    const current = createRuntime().runtime;
+    try {
+      const legacyHandshake = await legacy.handleRpc(request({ id: 'legacy', method: 'initialize', params: { protocolVersion: '1.17', clientInfo: { name: 'desktop' } } })) as any;
+      expect(legacyHandshake.capabilities.methods).not.toContain('agents/list');
+      await expect(legacy.handleRpc(request({ id: 'agents', method: 'agents/list', params: { cwd } }))).rejects.toMatchObject({ code: 'METHOD_NOT_FOUND' });
+
+      const handshake = await current.handleRpc(request({ id: 'current', method: 'initialize', params: { protocolVersion: '1.18', clientInfo: { name: 'desktop' } } })) as any;
+      expect(handshake.capabilities.methods).toContain('agents/list');
+      const discovery = await current.handleRpc(request({ id: 'agents', method: 'agents/list', params: { cwd } })) as any;
+      expect(discovery).toMatchObject({
+        currentAgent: { id: 'desktop-agent', configPath: agentPath, validationState: 'valid' },
+        settingsPath: join(cwd, 'agent.settings.json'),
+        diagnostics: [],
+      });
+      expect(discovery.currentAgent.configurationFingerprint).toMatch(/^[a-f0-9]{64}$/);
+      expect(JSON.stringify(discovery)).not.toContain('must-not-leak');
+      expect(JSON.stringify(discovery)).not.toContain('private prompt');
+    } finally {
+      await legacy.close();
+      await current.close();
+      await rm(cwd, { recursive: true, force: true });
+    }
   });
 
   it('advertises managed image and audio capabilities in protocol 1.17', async () => {

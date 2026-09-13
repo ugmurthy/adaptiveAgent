@@ -194,6 +194,13 @@ export interface AgentSdkCatalogDiagnostic {
   relatedPaths?: string[];
 }
 
+export interface AgentSdkAgentDiscovery {
+  agents: AgentSdkCatalogAgent[];
+  diagnostics: AgentSdkCatalogDiagnostic[];
+  currentAgent?: AgentSdkCatalogAgent;
+  settingsPath?: string;
+}
+
 export interface AgentSdkCatalogTool extends Pick<ToolDefinition<JsonValue, JsonValue>, 'name' | 'description' | 'inputSchema' | 'requiresApproval'> {
   configured: boolean;
 }

@@ -34,8 +34,17 @@ describe('desktop bridge protocol', () => {
     );
   });
 
-  it('uses a string for protocol 1.17', () => {
-    expect(DESKTOP_PROTOCOL_VERSION).toBe('1.17');
+  it('uses a string for protocol 1.18', () => {
+    expect(DESKTOP_PROTOCOL_VERSION).toBe('1.18');
+  });
+
+  it('validates agent discovery requests', () => {
+    expect(parseDesktopRpcRequest(JSON.stringify({
+      jsonrpc: '2.0', id: 'agents', method: 'agents/list', params: { cwd: '/workspace' },
+    }))).toMatchObject({ method: 'agents/list', params: { cwd: '/workspace' } });
+    expect(() => parseDesktopRpcRequest(JSON.stringify({
+      jsonrpc: '2.0', id: 'agents', method: 'agents/list', params: { cwd: 7 },
+    }))).toThrowError(expect.objectContaining({ code: 'INVALID_PARAMS' }));
   });
 
   it('validates the typed run/delete request', () => {

@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { agentConfigurationFingerprint, inspectAgentSdkCatalog } from './index.js';
+import { agentConfigurationFingerprint, discoverAgentSdkAgents, inspectAgentSdkCatalog } from './index.js';
 
 describe('agent SDK catalog inspection', () => {
   let cwd: string;
@@ -37,6 +37,29 @@ describe('agent SDK catalog inspection', () => {
     expect(worker?.configurationFingerprint).toBe(second.agents.find((agent) => agent.id === 'worker')?.configurationFingerprint);
     expect(active?.configurationFingerprint).toBe(agentConfigurationFingerprint(first.config));
     expect(first.diagnostics).toEqual([]);
+  });
+
+  it('returns a typed current selection without resolving tools or exposing secrets', async () => {
+    await writeFile(join(cwd, 'agent.json'), JSON.stringify({
+      id: 'active',
+      name: 'active',
+      invocationModes: ['run'],
+      defaultInvocationMode: 'run',
+      model: { provider: 'test', model: 'test-model', apiKey: 'private-key' },
+      tools: ['unknown-tool'],
+      systemInstructions: 'private prompt',
+    }));
+
+    const discovery = await discoverAgentSdkAgents({ cwd, env: {} });
+
+    expect(discovery.currentAgent).toMatchObject({
+      id: 'active',
+      configPath: join(cwd, 'agent.json'),
+      validationState: 'valid',
+    });
+    expect(discovery.settingsPath).toBe(join(cwd, 'agent.settings.json'));
+    expect(JSON.stringify(discovery)).not.toContain('private-key');
+    expect(JSON.stringify(discovery)).not.toContain('private prompt');
   });
 
   it('marks the selected profile archived when it is loaded from .archive', async () => {

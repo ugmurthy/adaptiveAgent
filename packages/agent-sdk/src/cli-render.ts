@@ -20,6 +20,7 @@ import {
   inspectAgentSdkCatalog,
   inspectAgentSdkResolution,
   loadAgentSdkConfig,
+  type AgentSdkAgentDiscovery,
   type OrchestratedRunResult,
   type OrchestrationLifecycleEvent,
   type TaskPreparationResult,
@@ -232,6 +233,54 @@ export function summarizeResolvedConfig(
 }
 
 export type CatalogInspection = Awaited<ReturnType<typeof inspectAgentSdkCatalog>>;
+
+export type AgentDiscovery = AgentSdkAgentDiscovery;
+
+export function summarizeAgentDiscovery(discovery: AgentDiscovery): Record<string, JsonValue> {
+  return {
+    command: 'agents',
+    agents: discovery.agents as unknown as JsonValue,
+    diagnostics: discovery.diagnostics as unknown as JsonValue,
+    ...(discovery.currentAgent ? { currentAgent: discovery.currentAgent as unknown as JsonValue } : {}),
+    ...(discovery.settingsPath ? { settingsPath: discovery.settingsPath } : {}),
+  };
+}
+
+export function formatAgentDiscoveryMarkdown(discovery: AgentDiscovery): string {
+  const lines = [
+    '# Agents',
+    '',
+    ...(discovery.settingsPath ? [`- **Settings:** ${formatMarkdownInlineCode(discovery.settingsPath)}`] : []),
+    `- **Discovered:** ${discovery.agents.length}`,
+    `- **Diagnostics:** ${discovery.diagnostics.length}`,
+    '',
+    ...discovery.agents.flatMap(formatDiscoveredAgentMarkdown),
+  ];
+  if (discovery.diagnostics.length > 0) {
+    lines.push(
+      '',
+      '## Diagnostics',
+      '',
+      ...discovery.diagnostics.map((diagnostic) => `- **${formatMarkdownInlineCode(diagnostic.code)}** ${formatMarkdownInlineCode(diagnostic.path)}: ${oneLine(diagnostic.message)}`),
+    );
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+function formatDiscoveredAgentMarkdown(agent: AgentDiscovery['agents'][number]): string[] {
+  const state = [
+    agent.active ? 'current' : undefined,
+    agent.archived ? 'archived' : undefined,
+    agent.validationState !== 'valid' ? agent.validationState : undefined,
+  ].filter((value): value is string => Boolean(value));
+  return [
+    `- **${formatMarkdownInlineCode(agent.id)}** (${agent.name})${state.length ? ` - **${state.join(', ')}**` : ''}`,
+    `  - configPath: ${formatMarkdownInlineCode(agent.configPath)}`,
+    `  - configurationFingerprint: ${formatMarkdownInlineCode(agent.configurationFingerprint)}`,
+    ...(agent.description ? [`  - description: ${oneLine(agent.description)}`] : []),
+    `  - modes: ${formatMarkdownNameList(agent.invocationModes)} (default ${formatMarkdownInlineCode(agent.defaultInvocationMode)})`,
+  ];
+}
 
 export function summarizeCatalog(catalog: CatalogInspection): Record<string, JsonValue> {
   return {
