@@ -4210,7 +4210,7 @@ describe('AdaptiveAgent', () => {
     );
   });
 
-  it('fails the run cleanly when the model exceeds modelTimeoutMs', async () => {
+  it('reports a generation deadline when an active model stream exceeds modelTimeoutMs', async () => {
     const runStore = new InMemoryRunStore();
     const eventStore = new InMemoryEventStore();
     const snapshotStore = new InMemorySnapshotStore();
@@ -4222,11 +4222,15 @@ describe('AdaptiveAgent', () => {
       capabilities: {
         toolCalling: true,
         jsonOutput: true,
-        streaming: false,
+        streaming: true,
         usage: false,
       },
-      async generate(request) {
+      async generate() {
+        throw new Error('generate() should not be used when stream() is available');
+      },
+      async stream(request, onEvent) {
         receivedSignal = request.signal;
+        await onEvent({ type: 'reasoning_delta', delta: 'Still reasoning.' });
         return new Promise<ModelResponse>((_resolve, reject) => {
           request.signal?.addEventListener(
             'abort',
@@ -4251,14 +4255,29 @@ describe('AdaptiveAgent', () => {
     const result = await agent.run({ goal: 'Wait for a model response that never arrives' });
     expect(result).toMatchObject({
       status: 'failure',
-      code: 'MODEL_ERROR',
+      code: 'MODEL_GENERATION_DEADLINE_EXCEEDED',
       error: 'Model timed out after 5ms',
     });
     expect(receivedSignal).toBeDefined();
     expect(receivedSignal?.aborted).toBe(true);
 
     const storedRun = await runStore.getRun(result.runId);
-    expect(storedRun?.status).toBe('failed');
+    expect(storedRun).toMatchObject({
+      status: 'failed',
+      errorCode: 'MODEL_GENERATION_DEADLINE_EXCEEDED',
+    });
+    const events = await eventStore.listByRun(result.runId);
+    expect(events.find((event) => event.type === 'run.failed')).toMatchObject({
+      payload: expect.objectContaining({
+        code: 'MODEL_GENERATION_DEADLINE_EXCEEDED',
+      }),
+    });
+    expect(events.find((event) => event.type === 'model.failed')).toMatchObject({
+      payload: expect.objectContaining({
+        timeoutSource: 'agent_model_timeout',
+        performance: expect.objectContaining({ streamProgressed: true }),
+      }),
+    });
   });
 
   it('retries a model timeout when modelRetryPolicy allows it', async () => {

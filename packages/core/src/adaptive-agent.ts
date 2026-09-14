@@ -1972,7 +1972,9 @@ export class AdaptiveAgent {
             currentRun,
             state,
             error instanceof Error ? error.message : String(error),
-            'MODEL_ERROR',
+            error instanceof ModelGenerationDeadlineExceededError
+              ? 'MODEL_GENERATION_DEADLINE_EXCEEDED'
+              : 'MODEL_ERROR',
           );
         }
 
@@ -2157,7 +2159,7 @@ export class AdaptiveAgent {
       };
     }
 
-    if (run.errorCode === 'MODEL_ERROR') {
+    if (run.errorCode === 'MODEL_ERROR' || run.errorCode === 'MODEL_GENERATION_DEADLINE_EXCEEDED') {
       if (isRetryableModelFailureKind(failureKind)) {
         return { retryable: true, failureKind };
       }
@@ -5131,6 +5133,8 @@ class ModelTimeoutError extends Error {
   }
 }
 
+class ModelGenerationDeadlineExceededError extends ModelTimeoutError {}
+
 function createCompositeEventSink(
   eventStore: AdaptiveAgentOptions['eventStore'],
   downstreamSink: AdaptiveAgentOptions['eventSink'],
@@ -7510,8 +7514,11 @@ function createAbortTimeoutContext(timeoutMs: number, inactivityTimeoutMs?: numb
   };
 }
 
-function createModelTimeoutError(timeoutMs: number, cause?: unknown): ModelTimeoutError {
-  return new ModelTimeoutError(`Model timed out after ${timeoutMs}ms`, cause === undefined ? undefined : { cause });
+function createModelTimeoutError(timeoutMs: number, cause?: unknown): ModelGenerationDeadlineExceededError {
+  return new ModelGenerationDeadlineExceededError(
+    `Model timed out after ${timeoutMs}ms`,
+    cause === undefined ? undefined : { cause },
+  );
 }
 
 function createModelInactivityTimeoutError(timeoutMs: number, cause?: unknown): ModelTimeoutError {
