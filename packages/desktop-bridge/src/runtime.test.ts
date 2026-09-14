@@ -35,7 +35,7 @@ describe('desktop runtime protocol', () => {
     const updated = updateDesktopSettings(
       { env: { EXISTING: 'value' }, gateway: { url: 'ws://gateway' }, model: { overrideBaseUrl: 'https://models' }, taskPreparation: { agent: './agents/task-preparer.json' } },
       {
-        agent: { configPath: ' ./agents/researcher.json ', id: 'researcher' },
+        agent: { mode: 'auto', configPath: ' ./agents/researcher.json ', id: 'researcher' },
         inference: { mode: 'byok', tier: 'high' },
         workspace: { root: ' /workspace ', shellCwd: ' /workspace/project ' },
         interaction: { approvalMode: 'manual', clarificationMode: 'fail' },
@@ -46,7 +46,7 @@ describe('desktop runtime protocol', () => {
       env: { EXISTING: 'value' },
       gateway: { url: 'ws://gateway' },
       model: { overrideBaseUrl: 'https://models' },
-      agent: { configPath: './agents/researcher.json', id: 'researcher' },
+      agent: { mode: 'auto', configPath: './agents/researcher.json', id: 'researcher' },
       inference: { mode: 'byok', tier: 'high' },
       workspace: { overrideRoot: '/workspace', overrideShellCwd: '/workspace/project' },
       interaction: { approvalMode: 'manual', clarificationMode: 'fail' },
@@ -64,21 +64,56 @@ describe('desktop runtime protocol', () => {
     } as const;
     const { runtime } = createRuntime();
     await runtime.handleRpc(request({ id: 'init', method: 'initialize', params: { protocolVersion: '1.17', clientInfo: { name: 'desktop' } } }));
+    const prepareRunTask = vi.fn(async () => preparation);
     Object.assign(runtime as unknown as Record<string, unknown>, {
       sdk: { runRaw, config: { workspaceRoot: '/workspace', settings: { taskPreparation: { mode: 'auto' } } } },
-      prepareRunTask: vi.fn(async () => preparation),
+      prepareRunTask,
     });
 
     await expect(runtime.handleRpc(request({
       id: 'run', method: 'agent/run', params: { executionId: 'execution-1', goal: 'fix it' },
     }))).resolves.toMatchObject({ status: 'success', finalRunId: 'execution-1' });
+    const generatedSessionId = prepareRunTask.mock.calls[0]?.[3];
+    expect(generatedSessionId).toMatch(/^[0-9a-f-]{36}$/);
     expect(runRaw).toHaveBeenCalledWith('Fix the failing test and verify it.', expect.objectContaining({
       runId: 'execution-1',
+      sessionId: generatedSessionId,
       metadata: { taskPreparation: expect.objectContaining({
         originalObjective: 'fix it',
         title: 'Fix Failing Test',
         name: 'fix-failing-test',
         preparationRunId: 'preparation-1',
+      }) },
+    }));
+  });
+
+  it('executes an auto-selected profile in the same session and records the selection', async () => {
+    const selectedRunRaw = vi.fn(async () => ({ status: 'success', runId: 'execution-auto', output: 'done', stepsUsed: 1, usage: {} }));
+    const fallback = { config: { workspaceRoot: '/workspace', settings: {} } };
+    const selectedSdk = { runRaw: selectedRunRaw, config: { workspaceRoot: '/workspace', settings: {} } };
+    const selection = {
+      selectedAgentId: 'researcher',
+      reason: 'The objective requires research.',
+      selectionAgentId: 'task-preparer',
+      selectionRunId: 'selection-1',
+    };
+    const { runtime } = createRuntime();
+    await runtime.handleRpc(request({ id: 'init', method: 'initialize', params: { protocolVersion: '1.18', clientInfo: { name: 'desktop' } } }));
+    Object.assign(runtime as unknown as Record<string, unknown>, {
+      sdk: fallback,
+      selectDesktopRunSdk: vi.fn(async () => ({ sdk: selectedSdk, selection })),
+      prepareRunTask: vi.fn(async () => undefined),
+    });
+
+    await expect(runtime.handleRpc(request({
+      id: 'run-auto', method: 'agent/run', params: { executionId: 'execution-auto', goal: 'research it', sessionId: 'session-auto' },
+    }))).resolves.toMatchObject({ status: 'success', finalRunId: 'execution-auto' });
+    expect(selectedRunRaw).toHaveBeenCalledWith('research it', expect.objectContaining({
+      runId: 'execution-auto',
+      sessionId: 'session-auto',
+      metadata: { agentSelection: expect.objectContaining({
+        selectedAgentId: 'researcher',
+        selectionRunId: 'selection-1',
       }) },
     }));
   });
@@ -132,12 +167,13 @@ describe('desktop runtime protocol', () => {
       { attachmentId: 'image-1', kind: 'image', stagedRelativePath: 'image-1/photo.png', name: 'photo.png', sizeBytes: 1, sha256: 'b'.repeat(64) },
     ] as const;
 
-    await expect((runtime as unknown as { prepareRunTask: Function }).prepareRunTask(target, 'Review the files', attachments))
+    await expect((runtime as unknown as { prepareRunTask: Function }).prepareRunTask(target, 'Review the files', attachments, 'session-3'))
       .resolves.toMatchObject({ decision: 'complete', preparationRunId: 'preparation-3' });
     expect(create).toHaveBeenCalledWith(expect.objectContaining({
       agentConfigPath: './agents/task-preparer.json', runtime: sharedRuntime, settingsOverrides: undefined,
     }));
     expect(preparationRunRaw).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+      sessionId: 'session-3',
       input: expect.objectContaining({ attachments: { files: ['file-1/notes.txt'], images: ['image-1/photo.png'], audio: [] } }),
     }));
     expect(close).toHaveBeenCalledOnce();

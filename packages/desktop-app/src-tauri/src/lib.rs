@@ -3090,6 +3090,7 @@ impl Bridge {
             );
         }
         let run_id = uuid::Uuid::new_v4().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
         let drafts = self.validated_drafts(&attachment_ids)?;
         reject_unsupported_media(&drafts)?;
         let mode = "direct";
@@ -3117,7 +3118,7 @@ impl Bridge {
             run_id: run_id.clone(),
             title: task.clone(),
             created_at: created_at.clone(),
-            session_id: None,
+            session_id: Some(session_id.clone()),
             agent_id: required_agent_value("id")?,
             agent_name: required_agent_value("name")?,
             agent_fingerprint: required_agent_value("configurationFingerprint")?,
@@ -3175,7 +3176,7 @@ impl Bridge {
             return Err(format!("SUBMISSION_CLAIMED: The task reservation is durable but could not be submitted: {error}"));
         }
         let (_request_id, receiver) =
-            match self.request("agent/run", json!({ "executionId": run_id, "goal": task, "attachments":trusted_descriptors(&drafts) })) {
+            match self.request("agent/run", json!({ "executionId": run_id, "sessionId": session_id, "goal": task, "attachments":trusted_descriptors(&drafts) })) {
                 Ok(request) => request,
                 Err(error) => {
                     if let Some(record) = self.registry.lock().unwrap().get_mut(&run_id) {

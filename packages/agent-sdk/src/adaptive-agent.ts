@@ -32,6 +32,7 @@ import {
   runAmbientStart,
   type AgentSdkOptions,
   type AgentSdkChatOptions,
+  type AgentSelectionResult,
   type AgentSdkRunOptions,
   type AmbientStartResult,
   type OrchestrationLifecycleEvent,
@@ -40,6 +41,7 @@ import {
   type TaskPreparationResult,
   prepareTask,
   restoreTaskPreparation,
+  selectAgentProfile,
 } from './index.js';
 import { doctorExitCode, renderDoctorReport, runDoctor } from './install/doctor.js';
 import { renderInitReport, runInit, type InitProfile } from './install/init.js';
@@ -1124,9 +1126,10 @@ async function runSpecCommand(cli: ManualTestCliOptions): Promise<number> {
   const spec = await parseAndValidateSpec(specPath, cli.mode);
   const resolvedCwd = resolve(cli.cwd ?? process.cwd());
   const sdkOptions = buildSdkOptions(cli, resolvedCwd);
+  const sessionId = cli.sessionId ?? crypto.randomUUID();
   const inspection = cli.dryRun ? await inspectAgentSdkResolution(sdkOptions) : undefined;
-  const resolvedConfig = inspection?.config ?? await loadAgentSdkConfig(sdkOptions);
-  const warnings = collectProviderWarnings(spec, resolvedConfig.model.provider);
+  let resolvedConfig = inspection?.config ?? await loadAgentSdkConfig(sdkOptions);
+  let warnings = collectProviderWarnings(spec, resolvedConfig.model.provider);
   const eventLog: Array<Record<string, JsonValue>> = [];
   const lastProgressContentByRun = new Map<string, string>();
   const progressRunColors = cli.progress && cli.output === 'pretty' ? new RunColorRegistry() : undefined;
@@ -1150,50 +1153,68 @@ async function runSpecCommand(cli: ManualTestCliOptions): Promise<number> {
     }
   } : undefined;
 
-  for (const warning of warnings) {
-    if (cli.output === 'pretty') {
-      console.error(`warning: ${warning}`);
-    }
-  }
-
-  if (cli.output === 'pretty') {
-    printResolvedConfigSummary(cli, resolvedConfig, spec, warnings);
-  }
-
   if (cli.dryRun) {
+    for (const warning of warnings) {
+      if (cli.output === 'pretty') console.error(`warning: ${warning}`);
+    }
+    if (cli.output === 'pretty') printResolvedConfigSummary(cli, resolvedConfig, spec, warnings);
     printDryRun(cli, inspection!, spec, warnings);
     return 0;
   }
 
-  const sdk = await createAgentSdk({
+  const fallbackSdk = await createAgentSdk({
     ...sdkOptions,
     eventListener,
   });
-  const orchestrationSdk = cli.orchestrate && spec.mode === 'run'
-    ? await createOrchestrationSdk({
-        ...sdkOptions,
-        requestedAgentConfig: sdk.config.agent,
-        agentCatalogPaths: cli.agentCatalogPaths,
-        runtime: sdk.created.runtime,
-        eventListener,
-        orchestrationListener,
-      })
-    : undefined;
+  let sdk = fallbackSdk;
+  let selectedSdk: Awaited<ReturnType<typeof createAgentSdk>> | undefined;
+  let orchestrationSdk: OrchestrationSdk | undefined;
 
   try {
-    const orchestrated = orchestrationSdk && spec.mode === 'run'
-      ? await orchestrationSdk.runRaw(spec.goal, buildRunOptions(spec))
+    let executionSpec = spec;
+    if (spec.mode === 'run' && !cli.agentConfigPath && resolvedConfig.settings.agent?.mode === 'auto') {
+      const selected = await selectInlineAgent({
+        originalObjective: spec.goal,
+        cli,
+        fallbackSdk,
+        sdkOptions,
+        resolvedCwd,
+        eventListener,
+        sessionId,
+      });
+      sdk = selected.sdk;
+      selectedSdk = selected.sdk === fallbackSdk ? undefined : selected.sdk;
+      resolvedConfig = sdk.config;
+      executionSpec = withAgentSelection(spec, selected.selection);
+    }
+    warnings = collectProviderWarnings(executionSpec, resolvedConfig.model.provider);
+    for (const warning of warnings) {
+      if (cli.output === 'pretty') console.error(`warning: ${warning}`);
+    }
+    if (cli.output === 'pretty') printResolvedConfigSummary(cli, resolvedConfig, executionSpec, warnings);
+    orchestrationSdk = cli.orchestrate && executionSpec.mode === 'run'
+      ? await createOrchestrationSdk({
+          ...sdkOptions,
+          requestedAgentConfig: sdk.config.agent,
+          agentCatalogPaths: cli.agentCatalogPaths,
+          runtime: sdk.created.runtime,
+          eventListener,
+          orchestrationListener,
+        })
       : undefined;
-    const result = orchestrated?.finalResult ?? (spec.mode === 'chat'
-      ? await sdk.chat(spec.messages, buildChatOptions(spec))
-      : await sdk.run(spec.goal, buildRunOptions(spec)));
+    const orchestrated = orchestrationSdk && executionSpec.mode === 'run'
+      ? await orchestrationSdk.runRaw(executionSpec.goal, { ...buildRunOptions(executionSpec), sessionId })
+      : undefined;
+    const result = orchestrated?.finalResult ?? (executionSpec.mode === 'chat'
+      ? await sdk.chat(executionSpec.messages, { ...buildChatOptions(executionSpec), sessionId })
+      : await sdk.run(executionSpec.goal, { ...buildRunOptions(executionSpec), sessionId }));
 
     const inspection = cli.inspect ? await summarizeInspection(sdk, result.runId) : undefined;
     if (cli.output === 'json') {
       const jsonOutput: ManualTestJsonOutput = {
         cli: summarizeCli(cli),
         resolvedConfig: summarizeResolvedConfig(resolvedConfig, spec),
-        request: spec as unknown as JsonValue,
+        request: executionSpec as unknown as JsonValue,
         warnings,
         result: summarizeResult(result),
         ...(inspection ? { inspection: inspection as unknown as JsonValue } : {}),
@@ -1204,7 +1225,7 @@ async function runSpecCommand(cli: ManualTestCliOptions): Promise<number> {
     }
 
     if (orchestrated) printOrchestration(orchestrated);
-    printResult(result, spec.mode === 'chat' ? 'assistant' : 'run', resolvedConfig.tui);
+    printResult(result, executionSpec.mode === 'chat' ? 'assistant' : 'run', resolvedConfig.tui);
     if (cli.inspect && inspection) {
       printInspection(inspection);
     }
@@ -1214,7 +1235,8 @@ async function runSpecCommand(cli: ManualTestCliOptions): Promise<number> {
     return isSuccessfulResult(result) ? 0 : 1;
   } finally {
     await orchestrationSdk?.close();
-    await sdk.close();
+    await selectedSdk?.close();
+    await fallbackSdk.close();
   }
 }
 
@@ -1256,8 +1278,9 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
   await validateLocalPaths(spec);
 
   const sdkOptions = buildSdkOptions(cli, resolvedCwd);
+  let sessionId = cli.sessionId ?? crypto.randomUUID();
   const inspection = cli.dryRun ? await inspectAgentSdkResolution(sdkOptions) : undefined;
-  const resolvedConfig = inspection?.config ?? await loadAgentSdkConfig(sdkOptions);
+  let resolvedConfig = inspection?.config ?? await loadAgentSdkConfig(sdkOptions);
   const taskPreparationMode = resolveTaskPreparationMode(cli, resolvedConfig.settings.taskPreparation?.mode);
   let warnings = collectProviderWarnings(spec, resolvedConfig.model.provider);
   const eventLog: Array<Record<string, JsonValue>> = [];
@@ -1283,7 +1306,12 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
     }
   } : undefined;
 
-  if (cli.dryRun && taskPreparationMode === 'never' && !cli.fromPreparationRunId) {
+  if (
+    cli.dryRun
+    && taskPreparationMode === 'never'
+    && !cli.fromPreparationRunId
+    && resolvedConfig.settings.agent?.mode !== 'auto'
+  ) {
     for (const warning of warnings) {
       if (cli.output === 'pretty') console.error(`warning: ${warning}`);
     }
@@ -1292,10 +1320,32 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
     return 0;
   }
 
-  const sdk = await createAgentSdk({ ...sdkOptions, eventListener });
+  const fallbackSdk = await createAgentSdk({ ...sdkOptions, eventListener });
+  let sdk = fallbackSdk;
+  let selectedSdk: Awaited<ReturnType<typeof createAgentSdk>> | undefined;
+  let agentSelection: AgentSelectionResult | undefined;
   let orchestrationSdk: OrchestrationSdk | undefined;
 
   try {
+    if (cli.fromPreparationRunId && !cli.sessionId) {
+      const preparationRun = await fallbackSdk.created.runtime.runStore.getRun(cli.fromPreparationRunId);
+      sessionId = preparationRun?.sessionId ?? sessionId;
+    }
+    if (spec.mode === 'run' && !cli.fromPreparationRunId && !cli.agentConfigPath && resolvedConfig.settings.agent?.mode === 'auto') {
+      const selected = await selectInlineAgent({
+        originalObjective: spec.goal,
+        cli,
+        fallbackSdk,
+        sdkOptions,
+        resolvedCwd,
+        eventListener,
+        sessionId,
+      });
+      sdk = selected.sdk;
+      selectedSdk = selected.sdk === fallbackSdk ? undefined : selected.sdk;
+      agentSelection = selected.selection;
+      resolvedConfig = sdk.config;
+    }
     const taskPreparations = spec.mode === 'run' && cli.fromPreparationRunId
       ? [await loadTaskPreparation({
           runId: cli.fromPreparationRunId,
@@ -1312,12 +1362,14 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
             sdkOptions,
             resolvedCwd,
             eventListener,
+            sessionId,
           })
         : undefined;
     const taskPreparation = taskPreparations?.at(-1);
-    const executionSpec = spec.mode === 'run' && taskPreparations
+    let executionSpec = spec.mode === 'run' && taskPreparations
       ? applyTaskPreparation(spec, taskPreparations, cli.fromPreparationRunId ? 'reused' : 'inline')
       : spec;
+    if (executionSpec.mode === 'run' && agentSelection) executionSpec = withAgentSelection(executionSpec, agentSelection);
     warnings = collectProviderWarnings(executionSpec, resolvedConfig.model.provider);
 
     for (const warning of warnings) {
@@ -1358,11 +1410,11 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
         })
       : undefined;
     const orchestrated = orchestrationSdk && executionSpec.mode === 'run'
-      ? await orchestrationSdk.runRaw(executionSpec.goal, buildRunOptions(executionSpec))
+      ? await orchestrationSdk.runRaw(executionSpec.goal, { ...buildRunOptions(executionSpec), sessionId })
       : undefined;
     const result = orchestrated?.finalResult ?? (executionSpec.mode === 'chat'
-      ? await sdk.chat(executionSpec.messages, buildChatOptions(executionSpec))
-      : await sdk.run(executionSpec.goal, buildRunOptions(executionSpec)));
+      ? await sdk.chat(executionSpec.messages, { ...buildChatOptions(executionSpec), sessionId })
+      : await sdk.run(executionSpec.goal, { ...buildRunOptions(executionSpec), sessionId }));
     const runInspection = cli.inspect ? await summarizeInspection(sdk, result.runId) : undefined;
 
     if (cli.output === 'json') {
@@ -1387,7 +1439,81 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
     return isSuccessfulResult(result) ? 0 : 1;
   } finally {
     await orchestrationSdk?.close();
-    await sdk.close();
+    await selectedSdk?.close();
+    await fallbackSdk.close();
+  }
+}
+
+function withAgentSelection(spec: ManualRunSpec, selection: AgentSelectionResult): ManualRunSpec {
+  return {
+    ...spec,
+    metadata: {
+      ...(spec.metadata ?? {}),
+      agentSelection: {
+        mode: 'auto',
+        selectedAgentId: selection.selectedAgentId,
+        reason: selection.reason,
+        selectionAgentId: selection.selectionAgentId,
+        selectionRunId: selection.selectionRunId,
+      },
+    },
+  };
+}
+
+async function selectInlineAgent(args: {
+  originalObjective: string;
+  cli: ManualTestCliOptions;
+  fallbackSdk: Awaited<ReturnType<typeof createAgentSdk>>;
+  sdkOptions: AgentSdkOptions;
+  resolvedCwd: string;
+  eventListener?: (event: AgentEvent) => void;
+  sessionId: string;
+}): Promise<{ sdk: Awaited<ReturnType<typeof createAgentSdk>>; selection: AgentSelectionResult }> {
+  const configuredAgent = args.fallbackSdk.config.settings.taskPreparation?.agent;
+  if (!configuredAgent) throw new Error('Auto agent selection requires settings.taskPreparation.agent.');
+  const discovery = await discoverAgentSdkAgents(args.sdkOptions);
+  const preparationSdk = await createAgentSdk({
+    ...args.sdkOptions,
+    cwd: args.resolvedCwd,
+    agentConfigPath: configuredAgent,
+    settingsConfigPath: undefined,
+    settingsConfig: { ...args.fallbackSdk.config.settings, agent: undefined },
+    settingsOverrides: undefined,
+    model: undefined,
+    runtime: args.fallbackSdk.created.runtime,
+    eventListener: args.eventListener,
+  });
+  try {
+    const selection = await selectAgentProfile(preparationSdk, {
+      originalObjective: args.originalObjective,
+      candidates: discovery.agents,
+      workspaceRoot: args.fallbackSdk.config.workspaceRoot,
+      attachments: {
+        images: args.cli.imagePaths,
+        files: args.cli.fileAttachmentPaths,
+        audio: args.cli.audioPaths,
+      },
+      sessionId: args.sessionId,
+    });
+    const selected = discovery.agents.find((candidate) => candidate.id === selection.selectedAgentId && candidate.validationState === 'valid');
+    if (!selected) throw new Error(`Selected agent profile "${selection.selectedAgentId}" is no longer available.`);
+    if (selected.configPath === args.fallbackSdk.agentPath) return { sdk: args.fallbackSdk, selection };
+    const sdk = await createAgentSdk({
+      ...args.sdkOptions,
+      cwd: args.resolvedCwd,
+      agentConfigPath: selected.configPath,
+      settingsConfigPath: undefined,
+      settingsConfig: {
+        ...args.fallbackSdk.config.settings,
+        agent: { mode: 'fixed', id: selected.id, configPath: selected.configPath },
+      },
+      settingsOverrides: undefined,
+      runtime: args.fallbackSdk.created.runtime,
+      eventListener: args.eventListener,
+    });
+    return { sdk, selection };
+  } finally {
+    await preparationSdk.close();
   }
 }
 
@@ -1399,6 +1525,7 @@ async function prepareInlineTask(args: {
   sdkOptions: AgentSdkOptions;
   resolvedCwd: string;
   eventListener?: (event: AgentEvent) => void;
+  sessionId: string;
 }): Promise<TaskPreparationResult[]> {
   const configuredAgent = args.targetSdk.config.settings.taskPreparation?.agent;
   if (!configuredAgent) {
@@ -1427,6 +1554,7 @@ async function prepareInlineTask(args: {
         files: args.cli.fileAttachmentPaths,
         audio: args.cli.audioPaths,
       },
+      sessionId: args.sessionId,
     } as const;
     let prepared = await prepareTask(preparationSdk, request);
     const preparations = [prepared];

@@ -48,7 +48,7 @@ import { resolveAgentSdkConfig, resolveAgentSdkConfigWithSources } from './confi
 import { groundTruthSystemInstructions, mergeGroundTruthContext } from './ground-truth-context.js';
 import { resolveRuntimeBundle } from './postgres-runtime.js';
 import { discoverCatalogAgentInventory, discoverCatalogDelegates, resolveToolsAndDelegates } from './tool-registry.js';
-import { mergeMetadata, normalizeRecovery, promptText, promptYesNo } from './sdk-utils.js';
+import { agentConfigurationFingerprint, mergeMetadata, normalizeRecovery, promptText, promptYesNo } from './sdk-utils.js';
 import { resolveServerProfile } from './server-profiles.js';
 
 export * from './config-types.js';
@@ -58,6 +58,7 @@ export * from './swarm-sdk.js';
 export * from './context-bundles.js';
 export * from './skill-handler-preparation.js';
 export * from './task-preparation.js';
+export * from './agent-selection.js';
 export { agentConfigurationFingerprint } from './sdk-utils.js';
 export * from './server-profiles.js';
 export { createGatewayProxyTool, type GatewayProxyToolFactoryOptions, type GatewayRemoteToolName } from './gateway-tools.js';
@@ -146,7 +147,14 @@ export class AgentSdk {
       config.inference.mode === 'gateway' ? authorization?.client : undefined,
     );
     const logger = options.logger ?? (config.logging.enabled ? createAdaptiveAgentLogger(config.logging) : undefined);
-    const metadata: JsonObject = { agentId: config.agent.id, agentName: config.agent.name, runtimeMode: config.runtime.mode, ...(config.agent.metadata ?? {}) };
+    const metadata: JsonObject = {
+      agentId: config.agent.id,
+      agentName: config.agent.name,
+      runtimeMode: config.runtime.mode,
+      ...(config.agent.metadata ?? {}),
+      agentConfigPath: resolved.agentPath,
+      agentConfigurationFingerprint: agentConfigurationFingerprint(config),
+    };
     let model: ModelAdapter | ResolvedAgentSdkConfig['model'] = options.modelAdapter ?? config.model;
     if (config.inference.mode === 'gateway' && authorization) {
       model = options.modelAdapter ?? new GatewayModelAdapter({ client: authorization.client, defaultTier: config.inference.tier });
@@ -218,7 +226,11 @@ export class AgentSdk {
       ...prepared,
       goal,
       context: this.enrichContext(request.context),
-      metadata: mergeMetadata(this.metadata, request.metadata),
+      metadata: {
+        ...mergeMetadata(this.metadata, request.metadata),
+        agentConfigPath: this.agentPath,
+        agentConfigurationFingerprint: this.metadata.agentConfigurationFingerprint!,
+      },
     });
   }
 
@@ -230,7 +242,11 @@ export class AgentSdk {
       ...prepared,
       messages,
       context: this.enrichContext(request.context),
-      metadata: mergeMetadata(this.metadata, request.metadata),
+      metadata: {
+        ...mergeMetadata(this.metadata, request.metadata),
+        agentConfigPath: this.agentPath,
+        agentConfigurationFingerprint: this.metadata.agentConfigurationFingerprint!,
+      },
     });
   }
 

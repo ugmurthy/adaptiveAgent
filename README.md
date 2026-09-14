@@ -229,6 +229,38 @@ preparation decision, and preparation run ID in metadata. `trace-session`
 reports both goals and the preparation run ID while keeping the preparation
 run separate from the execution trace.
 
+Every run or chat start has a core `sessionId`. When a caller does not provide
+one, the runtime generates it. Inline task selection, task preparation,
+clarification attempts, and execution share the same session so their usage is
+accounted together. `--from-preparation` reuses the stored preparation session
+unless `--session-id` is supplied explicitly.
+
+To select the execution profile for each task, set `agent.mode` to `auto`.
+The configured `agent.id` and `agent.configPath` remain the bootstrap profile,
+while `taskPreparation.agent` performs a tool-free structured selection from
+the valid, active run profiles in `agents.dirs`:
+
+```json
+{
+  "agent": {
+    "mode": "auto",
+    "id": "byok-agent",
+    "configPath": "/Users/ugmurthy/.adaptiveAgent/agents/byok-agent.json"
+  },
+  "agents": {
+    "dirs": ["$HOME/.adaptiveAgent/agents"]
+  },
+  "taskPreparation": {
+    "agent": "task-preparer",
+    "mode": "auto"
+  }
+}
+```
+
+Omitting `agent.mode` preserves fixed-profile behavior. An explicit CLI
+`--agent` or exact desktop runtime profile selection also remains fixed for
+that invocation.
+
 Use `chat` for an interactive conversation, or provide the first message on
 the command line:
 

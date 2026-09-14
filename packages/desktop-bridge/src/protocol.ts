@@ -121,7 +121,7 @@ export interface DesktopAttachmentInput {
 }
 
 export interface EditableDesktopSettings {
-  agent: { configPath?: string; id: string };
+  agent: { mode?: 'fixed' | 'auto'; configPath?: string; id: string };
   inference: { mode: InferenceMode; tier: InferenceTier };
   workspace: { root: string; shellCwd: string };
   interaction: { approvalMode: ApprovalMode; clarificationMode: ClarificationMode };
@@ -444,6 +444,7 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
       const settings = request.settings as Record<string, unknown>;
       requiredObject(settings, 'agent');
       const agent = settings.agent as Record<string, unknown>;
+      optionalEnum(agent, 'mode', ['fixed', 'auto']);
       optionalStringAllowEmpty(agent, 'configPath');
       requiredString(agent, 'id');
       requiredObject(settings, 'inference');

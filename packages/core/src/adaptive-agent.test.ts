@@ -295,6 +295,29 @@ describe('AdaptiveAgent', () => {
     });
   });
 
+  it('generates a sessionId for run and chat root runs when the caller omits one', async () => {
+    const runStore = new InMemoryRunStore();
+    const agent = new AdaptiveAgent({
+      model: new SequenceModel([
+        { finishReason: 'stop', text: 'run done' },
+        { finishReason: 'stop', text: 'chat done' },
+      ]),
+      tools: [],
+      runStore,
+      eventStore: new InMemoryEventStore(),
+      snapshotStore: new InMemorySnapshotStore(),
+    });
+
+    const run = await agent.run({ goal: 'Run without a supplied session' });
+    const chat = await agent.chat({ messages: [{ role: 'user', content: 'Chat without one too' }] });
+
+    const runSessionId = (await runStore.getRun(run.runId))?.sessionId;
+    const chatSessionId = (await runStore.getRun(chat.runId))?.sessionId;
+    expect(runSessionId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(chatSessionId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(chatSessionId).not.toBe(runSessionId);
+  });
+
   it('uses a host-assigned identity for run and chat root runs', async () => {
     const runStore = new InMemoryRunStore();
     const model = new SequenceModel([

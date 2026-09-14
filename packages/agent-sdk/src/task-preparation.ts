@@ -37,6 +37,7 @@ export interface PrepareTaskRequest {
   targetAgent: AgentConfigFile;
   workspaceRoot: string;
   attachments: TaskPreparationAttachmentSummary;
+  sessionId?: string;
   clarificationAnswers?: Record<string, string>;
 }
 
@@ -62,6 +63,7 @@ export const TASK_PREPARATION_OUTPUT_SCHEMA: JsonSchema = {
 
 export async function prepareTask(runner: TaskPreparationRunner, request: PrepareTaskRequest): Promise<TaskPreparationResult> {
   const result = await runner.runRaw(buildTaskPreparationGoal(request.mode), {
+    ...(request.sessionId ? { sessionId: request.sessionId } : {}),
     input: {
       originalObjective: request.originalObjective,
       targetAgent: targetAgentSummary(request.targetAgent),

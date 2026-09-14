@@ -29,6 +29,7 @@ describe('task preparation', () => {
       targetAgent: agent('reviewer', ['read_file']),
       workspaceRoot: '/workspace',
       attachments: { images: [], files: [], audio: [] },
+      sessionId: 'session-1',
     });
 
     expect(result).toMatchObject({
@@ -40,6 +41,7 @@ describe('task preparation', () => {
       preparationRunId: '11111111-1111-4111-8111-111111111111',
     });
     expect(runRaw).toHaveBeenCalledWith(expect.stringContaining('Enhancement mode is auto'), expect.objectContaining({
+      sessionId: 'session-1',
       forbiddenTools: [],
       outputSchema: expect.objectContaining({
         type: 'object',

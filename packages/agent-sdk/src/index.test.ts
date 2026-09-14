@@ -169,16 +169,23 @@ describe('agent-sdk config resolution', () => {
   it('loads task preparation settings and requires a preparer when enabled', async () => {
     await writeAgentConfig(join(tempDir, 'agent.json'));
     await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({
+      agent: { mode: 'auto' },
       taskPreparation: { mode: 'auto', agent: 'task-preparer', showPreparedTask: true },
     }));
 
     const config = await loadAgentSdkConfig({ cwd: tempDir, env: testEnvironment() });
 
     expect(config.settings.taskPreparation).toEqual({ mode: 'auto', agent: 'task-preparer', showPreparedTask: true });
+    expect(config.settings.agent?.mode).toBe('auto');
 
     await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({ taskPreparation: { mode: 'always' } }));
     await expect(loadAgentSdkConfig({ cwd: tempDir, env: testEnvironment() })).rejects.toThrow(
       'settings.taskPreparation.agent is required',
+    );
+
+    await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({ agent: { mode: 'auto' } }));
+    await expect(loadAgentSdkConfig({ cwd: tempDir, env: testEnvironment() })).rejects.toThrow(
+      'settings.taskPreparation.agent is required when settings.agent.mode is "auto"',
     );
   });
 

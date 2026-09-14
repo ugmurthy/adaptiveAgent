@@ -5,6 +5,9 @@ import {
   inspectAgentSdkResolution,
   prepareTask,
   resolveRuntimeTarget,
+  selectAgentProfile,
+  type AgentSelectionResult,
+  type AgentSdkCatalogAgent,
   type AgentSdkOptions,
   type AgentSettingsFile,
   type ResolvedAgentSdkConfig,
@@ -26,7 +29,7 @@ import {
   type ManualTestCliOptions,
 } from '@adaptive-agent/agent-sdk/cli';
 import { RuntimeDeletionError, type AgentEvent, type ChatMessage, type JsonObject, type JsonValue, type ModelContentPart, type UUID } from '@adaptive-agent/core';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve } from 'node:path';
 import {
@@ -79,7 +82,7 @@ export interface CliExecutor {
 }
 
 export interface SafeResolvedConfiguration {
-  agent: { id: string; configPath?: string; name: string; configurationFingerprint: string; description?: string; defaultInvocationMode: string };
+  agent: { id: string; configPath?: string; name: string; configurationFingerprint: string; description?: string; defaultInvocationMode: string; selectionMode: 'fixed' | 'auto' };
   model: { provider: string; model: string; credentialAvailable: boolean };
   inference: { mode: string; tier: string };
   runtime: { mode: string; sqlitePath?: string };
@@ -105,6 +108,8 @@ const RUN_REFERENCING_CLI_COMMANDS = new Set<ManualTestCliOptions['command']>([
 
 export class DesktopRuntime {
   private sdk: AgentSdk | undefined;
+  private readonly selectedAgentSdks = new Map<string, AgentSdk>();
+  private readonly runSdks = new Map<string, AgentSdk>();
   private sdkInitialization: Promise<AgentSdk> | undefined;
   private sdkOptions: AgentSdkOptions | undefined;
   private managedAttachmentRoot: string | undefined;
@@ -200,12 +205,15 @@ export class DesktopRuntime {
       case 'agent/run': {
         const params = request.params!;
         this.validateExecutionSelection(params);
-        const sdk = this.requireSdk();
+        const fallbackSdk = this.requireSdk();
         const executionId = params.executionId ?? params.runId!;
+        const sessionId = params.sessionId ?? randomUUID();
         rejectUnsupportedMedia(params.attachments ?? [], this.negotiatedProtocolVersion);
         const parts = await this.validateAndTranslateAttachments(params.attachments ?? []);
-        const fileAccess = await this.fileAccessContext(params.attachments ?? []);
-        const preparation = await this.prepareRunTask(sdk, params.goal, params.attachments ?? []);
+        const selected = await this.selectDesktopRunSdk(fallbackSdk, params.goal, params.attachments ?? [], sessionId);
+        const sdk = selected.sdk;
+        const fileAccess = await this.fileAccessContext(params.attachments ?? [], sdk);
+        const preparation = await this.prepareRunTask(sdk, params.goal, params.attachments ?? [], sessionId);
         if (preparation && preparation.decision !== 'complete' && preparation.decision !== 'enhance') {
           const result = {
             status: 'task_preparation_stopped',
@@ -218,13 +226,20 @@ export class DesktopRuntime {
         }
         const result = await sdk.runRaw(preparation?.preparedObjective ?? params.goal, {
           runId: asRunId(executionId),
-          ...(params.sessionId ? { sessionId: params.sessionId } : {}),
+          sessionId,
           ...(params.input === undefined ? {} : { input: params.input }),
           ...(parts.length ? { contentParts: parts } : {}),
           ...(fileAccess ? { executionContext: { fileAccess } } : {}),
           ...(params.inferenceTier ? { inferenceTier: params.inferenceTier } : {}),
-          ...(preparation ? { metadata: taskPreparationMetadata(preparation) } : {}),
+          ...((preparation || selected.selection) ? {
+            metadata: {
+              ...(preparation ? taskPreparationMetadata(preparation) : {}),
+              ...(selected.selection ? { agentSelection: agentSelectionMetadata(selected.selection) } : {}),
+            },
+          } : {}),
         });
+        this.runSdks.set(executionId, sdk);
+        this.runSdks.set(result.runId, sdk);
         return params.executionId ? executionResult(executionId, 'direct', result) : asJsonValue(result);
       }
       case 'agent/chat': {
@@ -251,32 +266,32 @@ export class DesktopRuntime {
       }
       case 'execution/interrupt': {
         const id = request.params!.executionId;
-        await this.requireSdk().interrupt(asRunId(id));
+        await (await this.sdkForRun(id)).interrupt(asRunId(id));
         return { executionId: id, interrupted: true };
       }
       case 'execution/resume': {
         const id = request.params!.executionId;
-        return asJsonValue(executionResult(id, 'direct', await this.requireSdk().resumeRaw(asRunId(id))));
+        return asJsonValue(executionResult(id, 'direct', await (await this.sdkForRun(id)).resumeRaw(asRunId(id))));
       }
       case 'run/resume':
-        return asJsonValue(await this.requireSdk().resumeRaw(asRunId(request.params!.runId)));
+        return asJsonValue(await (await this.sdkForRun(request.params!.runId)).resumeRaw(asRunId(request.params!.runId)));
       case 'run/retry':
-        return asJsonValue(await this.requireSdk().retryRaw(asRunId(request.params!.runId)));
+        return asJsonValue(await (await this.sdkForRun(request.params!.runId)).retryRaw(asRunId(request.params!.runId)));
       case 'run/recover': {
         const params = request.params!;
-        const sdk = this.requireSdk();
+        const sdk = await this.sdkForRun(params.runId);
         if (params.dryRun) return asJsonValue(await sdk.getRecoveryPlan(asRunId(params.runId)));
         return asJsonValue(await sdk.recoverRaw({ runId: asRunId(params.runId), strategy: params.strategy ?? 'auto' }));
       }
       case 'run/continue': {
         const params = request.params!;
-        return asJsonValue(await this.requireSdk().continueRunRaw({
+        return asJsonValue(await (await this.sdkForRun(params.runId)).continueRunRaw({
           fromRunId: asRunId(params.runId),
           ...(params.continuationRunId ? { continuationRunId: asRunId(params.continuationRunId) } : {}),
         }));
       }
       case 'run/interrupt':
-        await this.requireSdk().interrupt(asRunId(request.params!.runId));
+        await (await this.sdkForRun(request.params!.runId)).interrupt(asRunId(request.params!.runId));
         return { runId: request.params!.runId, interrupted: true };
       case 'run/delete':
         return this.deleteRun(request.params!.runId);
@@ -289,7 +304,7 @@ export class DesktopRuntime {
       }
       case 'run/steer': {
         const params = request.params!;
-        await this.requireSdk().steer(asRunId(params.runId), {
+        await (await this.sdkForRun(params.runId)).steer(asRunId(params.runId), {
           message: params.message,
           ...(params.role ? { role: params.role } : {}),
           ...(params.metadata ? { metadata: params.metadata } : {}),
@@ -299,7 +314,7 @@ export class DesktopRuntime {
       case 'interaction/resolveApproval':
         return this.resolveApproval(request.params!.runId, request.params!.approvalId, request.params!.approved);
       case 'interaction/resolveClarification':
-        return asJsonValue(await this.requireSdk().agent.resolveClarification(
+        return asJsonValue(await (await this.sdkForRun(request.params!.runId)).agent.resolveClarification(
           asRunId(request.params!.runId),
           request.params!.answer,
         ));
@@ -383,6 +398,10 @@ export class DesktopRuntime {
     const sdk = this.sdk;
     this.sdk = undefined;
     this.sdkOptions = undefined;
+    const selectedSdks = [...this.selectedAgentSdks.values()];
+    this.selectedAgentSdks.clear();
+    this.runSdks.clear();
+    await Promise.all(selectedSdks.map((selected) => selected.close()));
     await sdk?.close();
     this.gatewayClient?.close();
     this.gatewayClient = undefined;
@@ -551,10 +570,13 @@ export class DesktopRuntime {
     this.gatewayClient = gatewayClient;
 
     const settingsOverrides: NonNullable<AgentSdkOptions['settingsOverrides']> = {
-      ...(params.agentSelection ? {
+      ...(params.agentSelection || params.agentConfigPath ? {
         agent: {
-          id: params.agentSelection.id,
-          configPath: params.agentSelection.configPath,
+          mode: 'fixed',
+          ...(params.agentSelection ? {
+            id: params.agentSelection.id,
+            configPath: params.agentSelection.configPath,
+          } : {}),
         },
       } : {}),
       logging: { enabled: false },
@@ -688,10 +710,64 @@ export class DesktopRuntime {
     }
   }
 
+  private async selectDesktopRunSdk(
+    fallbackSdk: AgentSdk,
+    originalObjective: string,
+    attachments: DesktopAttachmentInput[],
+    sessionId: string,
+  ): Promise<{ sdk: AgentSdk; selection?: AgentSelectionResult }> {
+    if (fallbackSdk.config.settings?.agent?.mode !== 'auto') return { sdk: fallbackSdk };
+    const configuredAgent = fallbackSdk.config.settings.taskPreparation?.agent;
+    if (!configuredAgent) {
+      throw new DesktopProtocolError(
+        'INVALID_CONFIGURATION',
+        'Auto agent selection requires settings.taskPreparation.agent.',
+        JSON_RPC_ERROR_CODES.commandFailed,
+      );
+    }
+    const options = this.sdkOptions;
+    if (!options) throw new DesktopProtocolError('NOT_INITIALIZED', 'The runtime configuration is unavailable.', JSON_RPC_ERROR_CODES.notInitialized);
+    const discovery = await discoverAgentSdkAgents(options);
+    const preparationSdk = await AgentSdk.create({
+      ...options,
+      cwd: this.settingsCwd,
+      agentConfigPath: configuredAgent,
+      settingsConfigPath: undefined,
+      settingsConfig: { ...fallbackSdk.config.settings, agent: undefined },
+      settingsOverrides: undefined,
+      model: undefined,
+      runtime: fallbackSdk.created.runtime,
+      eventListener: (event: AgentEvent) => this.writeAgentEvent(event),
+    });
+    try {
+      const paths = (kind: DesktopAttachmentInput['kind']) => attachments
+        .filter((attachment) => attachment.kind === kind)
+        .map((attachment) => attachment.stagedRelativePath);
+      const selection = await selectAgentProfile(preparationSdk, {
+        originalObjective,
+        candidates: discovery.agents,
+        workspaceRoot: fallbackSdk.config.workspaceRoot,
+        attachments: { images: paths('image'), files: paths('file'), audio: paths('audio') },
+        sessionId,
+      });
+      const selected = discovery.agents.find((candidate) =>
+        candidate.id === selection.selectedAgentId
+        && candidate.validationState === 'valid'
+        && !candidate.archived,
+      );
+      if (!selected) throw new Error(`Selected agent profile "${selection.selectedAgentId}" is no longer available.`);
+      if (selected.configPath === fallbackSdk.agentPath) return { sdk: fallbackSdk, selection };
+      return { sdk: await this.sdkForSelectedAgent(fallbackSdk, selected), selection };
+    } finally {
+      await preparationSdk.close();
+    }
+  }
+
   private async prepareRunTask(
     targetSdk: AgentSdk,
     originalObjective: string,
     attachments: DesktopAttachmentInput[],
+    sessionId: string,
   ): Promise<TaskPreparationResult | undefined> {
     const mode = targetSdk.config.settings?.taskPreparation?.mode ?? 'never';
     if (mode === 'never') return undefined;
@@ -728,6 +804,7 @@ export class DesktopRuntime {
         targetAgent: targetSdk.config.agent,
         workspaceRoot: targetSdk.config.workspaceRoot,
         attachments: { images: paths('image'), files: paths('file'), audio: paths('audio') },
+        sessionId,
       });
     } finally {
       await preparationSdk.close();
@@ -753,7 +830,7 @@ export class DesktopRuntime {
   }
 
   private async resolveApproval(runId: string, approvalId: string, approved: boolean): Promise<JsonValue> {
-    const sdk = this.requireSdk();
+    const sdk = await this.sdkForRun(runId);
     await sdk.agent.resolveApproval(asRunId(runId), approvalId, approved);
     return { runId, approvalId, approved, resolved: true };
   }
@@ -915,6 +992,64 @@ export class DesktopRuntime {
     return this.sdk;
   }
 
+  private async sdkForRun(runId: string): Promise<AgentSdk> {
+    const direct = this.runSdks.get(runId);
+    if (direct) return direct;
+    const fallback = this.requireSdk();
+    const runStore = fallback.created?.runtime?.runStore;
+    if (!runStore) return fallback;
+    const run = await runStore.getRun(asRunId(runId));
+    if (!run) return fallback;
+    const rootSdk = this.runSdks.get(run.rootRunId);
+    if (rootSdk) return rootSdk;
+    const agentConfigPath = run.metadata?.agentConfigPath;
+    const fingerprint = run.metadata?.agentConfigurationFingerprint;
+    if (typeof agentConfigPath !== 'string' || typeof fingerprint !== 'string' || agentConfigPath === fallback.agentPath) {
+      return fallback;
+    }
+    const options = this.sdkOptions;
+    if (!options) return fallback;
+    const discovery = await discoverAgentSdkAgents(options);
+    const selected = discovery.agents.find((candidate) =>
+      candidate.configPath === agentConfigPath
+      && candidate.configurationFingerprint === fingerprint
+      && candidate.validationState === 'valid',
+    );
+    if (!selected) {
+      throw new DesktopProtocolError(
+        'AGENT_SELECTION_MISMATCH',
+        'The exact agent profile used by this run is no longer available.',
+        JSON_RPC_ERROR_CODES.commandRejected,
+      );
+    }
+    const sdk = await this.sdkForSelectedAgent(fallback, selected);
+    this.runSdks.set(run.rootRunId, sdk);
+    return sdk;
+  }
+
+  private async sdkForSelectedAgent(fallbackSdk: AgentSdk, selected: AgentSdkCatalogAgent): Promise<AgentSdk> {
+    const cacheKey = `${selected.configPath}:${selected.configurationFingerprint}`;
+    const cached = this.selectedAgentSdks.get(cacheKey);
+    if (cached) return cached;
+    const options = this.sdkOptions;
+    if (!options) throw new DesktopProtocolError('NOT_INITIALIZED', 'The runtime configuration is unavailable.', JSON_RPC_ERROR_CODES.notInitialized);
+    const sdk = await AgentSdk.create({
+      ...options,
+      cwd: this.settingsCwd,
+      agentConfigPath: selected.configPath,
+      settingsConfigPath: undefined,
+      settingsConfig: {
+        ...fallbackSdk.config.settings,
+        agent: { mode: 'fixed', id: selected.id, configPath: selected.configPath },
+      },
+      settingsOverrides: undefined,
+      runtime: fallbackSdk.created.runtime,
+      eventListener: (event: AgentEvent) => this.writeAgentEvent(event),
+    });
+    this.selectedAgentSdks.set(cacheKey, sdk);
+    return sdk;
+  }
+
   private async validateAndTranslateAttachments(inputs: DesktopAttachmentInput[]): Promise<ModelContentPart[]> {
     if (!inputs.length) return [];
     if (!this.managedAttachmentRoot) throw new DesktopProtocolError('ATTACHMENTS_UNAVAILABLE', 'managedAttachmentRoot is not configured.', JSON_RPC_ERROR_CODES.commandRejected);
@@ -941,7 +1076,7 @@ export class DesktopRuntime {
     return Promise.all(messages.map(async (message) => ({ role: message.role, content: message.attachments?.length ? [{ type: 'text', text: message.text }, ...await this.validateAndTranslateAttachments(message.attachments)] : message.text })));
   }
 
-  private async fileAccessContext(inputs: DesktopAttachmentInput[]) {
+  private async fileAccessContext(inputs: DesktopAttachmentInput[], sdk = this.requireSdk()) {
     if (!inputs.length || !this.managedAttachmentRoot) return undefined;
     const managedRoot = await realpath(this.managedAttachmentRoot);
     const files = await Promise.all(inputs.map(async (input) => ({
@@ -951,7 +1086,7 @@ export class DesktopRuntime {
     })));
     return {
       version: 1 as const,
-      workspaceRoot: this.requireSdk().config.workspaceRoot,
+      workspaceRoot: sdk.config.workspaceRoot,
       attachmentRoots: [...new Set(inputs.map((input) => resolve(managedRoot, input.attachmentId)))],
       files,
     };
@@ -1044,6 +1179,7 @@ export function updateDesktopSettings(
     ...current,
     agent: {
       ...current.agent,
+      ...(settings.agent.mode ? { mode: settings.agent.mode } : {}),
       ...(settings.agent.configPath?.trim() ? { configPath: settings.agent.configPath.trim() } : { configPath: undefined }),
       id: settings.agent.id.trim(),
     },
@@ -1069,6 +1205,7 @@ export function safeResolvedConfiguration(config: ResolvedAgentSdkConfig, agentP
       configurationFingerprint: agentConfigurationFingerprint(config),
       ...(config.agent.description ? { description: config.agent.description } : {}),
       defaultInvocationMode: config.agent.defaultInvocationMode,
+      selectionMode: config.settings?.agent?.mode ?? 'fixed',
     },
     model: {
       provider: config.model.provider,
@@ -1115,6 +1252,16 @@ function taskPreparationMetadata(result: TaskPreparationResult): JsonObject {
         preparationRunId: result.preparationRunId,
       }],
     },
+  };
+}
+
+function agentSelectionMetadata(result: AgentSelectionResult): JsonObject {
+  return {
+    mode: 'auto',
+    selectedAgentId: result.selectedAgentId,
+    reason: result.reason,
+    selectionAgentId: result.selectionAgentId,
+    selectionRunId: result.selectionRunId,
   };
 }
 

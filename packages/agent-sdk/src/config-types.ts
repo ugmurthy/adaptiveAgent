@@ -102,7 +102,7 @@ export interface AgentConfigFile {
 export interface AgentSettingsFile {
   $schema?: string;
   version?: 1;
-  agent?: { configPath?: string; id?: string };
+  agent?: { mode?: 'fixed' | 'auto'; configPath?: string; id?: string };
   agents?: { dirs?: string[] };
   runtime?: { mode?: RuntimeMode; autoMigrate?: boolean; sqlitePath?: string };
   logging?: { enabled?: boolean; level?: LogLevel; destination?: LogDestination; filePath?: string; pretty?: boolean };

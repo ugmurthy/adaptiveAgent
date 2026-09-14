@@ -361,6 +361,7 @@ export class AdaptiveAgent {
   async run(request: RunRequest): Promise<RunResult> {
     assertValidExecutionContext(request.executionContext);
     request = await authorizeRunFileInputs(request, this.resolveFileInputPolicy() === 'provider_native');
+    const sessionId = request.sessionId ?? crypto.randomUUID();
     if (request.outputSchema !== undefined) {
       assertValidOutputSchema(request.outputSchema);
     }
@@ -375,12 +376,12 @@ export class AdaptiveAgent {
       throw new Error('fileInputPolicy=read_file requires read_file to be visible for this run');
     }
     const normalizedContentParts = await this.normalizeFileInputsForReadFile(request.contentParts);
-    const contextRefResolution = await this.prepareContextRefResolution(request.contextRefs, request.context, request.sessionId, request.metadata);
+    const contextRefResolution = await this.prepareContextRefResolution(request.contextRefs, request.context, sessionId, request.metadata);
     const resolvedContext = injectResolvedContextRefs(request.context, contextRefResolution);
     const resolvedMetadata = mergeContextRefMetadata(request.metadata, contextRefResolution);
     const { run: createdRun, state } = await this.createRunWithInitialSnapshot({
       id: request.runId,
-      sessionId: request.sessionId,
+      sessionId,
       goal: request.goal,
       input: request.input,
       context: resolvedContext,
@@ -416,12 +417,13 @@ export class AdaptiveAgent {
   async chat(request: ChatRequest): Promise<ChatResult> {
     assertValidExecutionContext(request.executionContext);
     request = await authorizeChatFileInputs(request, this.resolveFileInputPolicy() === 'provider_native');
+    const sessionId = request.sessionId ?? crypto.randomUUID();
     if (request.outputSchema !== undefined) {
       assertValidOutputSchema(request.outputSchema);
     }
 
     const normalizedMessages = await this.normalizeChatFileInputsForReadFile(request.messages);
-    const contextRefResolution = await this.prepareContextRefResolution(request.contextRefs, request.context, request.sessionId, request.metadata);
+    const contextRefResolution = await this.prepareContextRefResolution(request.contextRefs, request.context, sessionId, request.metadata);
     const resolvedContext = injectResolvedContextRefs(request.context, contextRefResolution);
     const resolvedMetadata = mergeContextRefMetadata(request.metadata, contextRefResolution);
     const initialMessages = buildInitialChatMessages(
@@ -434,7 +436,7 @@ export class AdaptiveAgent {
     const goal = summarizeChatGoal(normalizedMessages);
     const { run: createdRun, state } = await this.createRunWithInitialSnapshot({
       id: request.runId,
-      sessionId: request.sessionId,
+      sessionId,
       goal,
       context: resolvedContext,
       executionContext: request.executionContext,
