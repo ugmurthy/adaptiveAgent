@@ -78,7 +78,7 @@ export class MeshAdapter extends BaseOpenAIChatAdapter {
       baseUrl: toMeshSdkBaseUrl(baseUrl),
       token: config.apiKey,
       maxRetries: 0,
-      fetch: ((input, init) => globalThis.fetch(input, {
+      fetch: ((input: string | URL | Request, init?: RequestInit) => globalThis.fetch(input, {
         ...init,
         headers: {
           ...(init?.headers as Record<string, string> | undefined),
