@@ -15,7 +15,7 @@ const agentValidator = ajv.compile({ type: 'object', required: ['id', 'name', 'i
   invocationModes: { type: 'array', items: { enum: ['run', 'chat'] }, minItems: 1, uniqueItems: true }, defaultInvocationMode: { enum: ['run', 'chat'] },
   workspace: { type: 'object', nullable: true, additionalProperties: false, properties: { root: { type: 'string', nullable: true }, shellCwd: { type: 'string', nullable: true } } },
   workspaceRoot: { type: 'string', nullable: true }, systemInstructions: { type: 'string', nullable: true },
-  model: { type: 'object', additionalProperties: false, properties: { provider: { type: 'string', nullable: true }, model: { type: 'string', nullable: true }, apiKeyEnv: { type: 'string', nullable: true }, apiKey: { type: 'string', nullable: true }, baseUrl: { type: 'string', nullable: true }, maxConcurrentRequests: { type: 'integer', minimum: 1, nullable: true }, structuredOutputMode: { type: 'string', enum: STRUCTURED_OUTPUT_MODES, nullable: true } } },
+  model: { type: 'object', additionalProperties: false, properties: { provider: { type: 'string', nullable: true }, model: { type: 'string', nullable: true }, apiKeyEnv: { type: 'string', nullable: true }, apiKey: { type: 'string', nullable: true }, baseUrl: { type: 'string', nullable: true }, maxConcurrentRequests: { type: 'integer', minimum: 1, nullable: true }, structuredOutputMode: { type: 'string', enum: STRUCTURED_OUTPUT_MODES, nullable: true }, reasoning: { type: 'object', nullable: true, additionalProperties: false, properties: { enabled: { type: 'boolean', nullable: true }, maxTokens: { type: 'integer', minimum: 1024, maximum: 128000, nullable: true }, retryWithoutReasoningAfterMs: { type: 'integer', minimum: 1, nullable: true } } } } },
   tools: { type: 'array', items: { type: 'string', minLength: 1 }, uniqueItems: true }, delegates: { type: 'array', items: { type: 'string', minLength: 1 }, uniqueItems: true, nullable: true },
   defaults: { type: 'object', nullable: true },
   delegation: { type: 'object', nullable: true, additionalProperties: false, properties: { maxDepth: { type: 'integer', minimum: 0, nullable: true }, maxChildrenPerRun: { type: 'integer', minimum: 0, nullable: true }, allowRecursiveDelegation: { type: 'boolean', nullable: true }, childRunsMayRequestApproval: { type: 'boolean', nullable: true }, childRunsMayRequestClarification: { type: 'boolean', nullable: true } } },
@@ -29,6 +29,12 @@ export function validateAgent(value: unknown, path: string): AgentConfigFile {
   const config = value as AgentConfigFile;
   if (!config.invocationModes.includes(config.defaultInvocationMode)) throw new AgentConfigValidationError(path, ['agent.defaultInvocationMode must be included in agent.invocationModes']);
   validateStructuredOutputMode(config.model.structuredOutputMode, path, 'agent.model.structuredOutputMode', AgentConfigValidationError);
+  if (config.model.reasoning?.enabled === false && config.model.reasoning.maxTokens !== undefined) {
+    throw new AgentConfigValidationError(path, ['agent.model.reasoning.maxTokens cannot be set when reasoning.enabled is false']);
+  }
+  if (config.model.reasoning?.enabled === false && config.model.reasoning.retryWithoutReasoningAfterMs !== undefined) {
+    throw new AgentConfigValidationError(path, ['agent.model.reasoning.retryWithoutReasoningAfterMs cannot be set when reasoning.enabled is false']);
+  }
   return { ...config, delegates: config.delegates ?? [] };
 }
 

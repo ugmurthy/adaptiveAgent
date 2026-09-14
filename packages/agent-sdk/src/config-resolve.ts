@@ -85,6 +85,10 @@ export async function resolveAgentSdkConfigWithSources(options: AgentSdkOptions)
   const provider = expandEnvironmentVariables(options.model?.provider ?? agent.model.provider ?? settings.model?.overrideProvider ?? '', env);
   const modelName = expandEnvironmentVariables(options.model?.model ?? agent.model.model ?? settings.model?.overrideModel ?? '', env);
   if (!provider || !modelName) throw new AgentConfigValidationError(agentLoaded.path, ['resolved model.provider and model.model are required']);
+  const reasoning = options.model?.reasoning ?? agent.model.reasoning;
+  if (reasoning && provider !== 'mesh') {
+    throw new AgentConfigValidationError(agentLoaded.path, ['model.reasoning is supported only when the resolved provider is mesh']);
+  }
   const apiKeyEnv = expandEnvironmentVariables(options.model?.apiKeyEnv ?? settings.model?.overrideApiKeyEnv ?? agent.model.apiKeyEnv ?? defaultApiKeyEnv(provider) ?? '', env);
   const apiKey = apiKeyEnv ? env[apiKeyEnv] : agent.model.apiKey;
   const requestedMode = options.runtimeMode ?? settings.runtime?.mode ?? 'postgres';
@@ -108,6 +112,7 @@ export async function resolveAgentSdkConfigWithSources(options: AgentSdkOptions)
       baseUrl: expandOptional(options.model?.baseUrl ?? settings.model?.overrideBaseUrl ?? agent.model.baseUrl, env),
       maxConcurrentRequests: options.model?.maxConcurrentRequests ?? agent.model.maxConcurrentRequests,
       structuredOutputMode: options.model?.structuredOutputMode ?? settings.model?.overrideStructuredOutputMode ?? agent.model.structuredOutputMode ?? 'prompted',
+      reasoning,
       ...(apiKey ? { apiKey } : {}),
     },
     inference: {

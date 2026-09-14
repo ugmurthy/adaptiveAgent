@@ -16,9 +16,19 @@ import {
 } from './base-openai-chat-adapter.js';
 
 const MESH_BASE_URL = 'https://api.meshapi.ai/v1';
+const MESH_API_VERSION = '2026-09';
 const DISABLED_MODEL_TIMEOUT_MESH_HTTP_TIMEOUT_MS = 900_000;
 const MESH_MODEL_RATE_CACHE_TTL_MS = 30 * 60 * 1000;
 const MESH_MODEL_PRICING_TIMEOUT_MS = 5_000;
+
+export interface MeshReasoningConfig {
+  /** Enable or disable provider reasoning. Omit to use the model default. */
+  enabled?: boolean;
+  /** Mesh/Qwen reasoning-token budget. This does not limit final-answer tokens. */
+  maxTokens?: number;
+  /** Retry once with reasoning disabled if the stream produces only reasoning for this long. */
+  retryWithoutReasoningAfterMs?: number;
+}
 
 export interface MeshAdapterConfig {
   model: string;
@@ -26,14 +36,17 @@ export interface MeshAdapterConfig {
   baseUrl?: string;
   maxConcurrentRequests?: number;
   structuredOutputMode?: StructuredOutputMode;
+  reasoning?: MeshReasoningConfig;
 }
 
 export class MeshAdapter extends BaseOpenAIChatAdapter {
   private readonly client: MeshAPI;
   private readonly baseUrl: string;
   private readonly apiKey: string;
+  private readonly reasoning: MeshReasoningConfig | undefined;
 
   constructor(config: MeshAdapterConfig) {
+    validateMeshReasoningConfig(config.reasoning);
     const baseUrl = config.baseUrl ?? MESH_BASE_URL;
     const baseConfig: BaseOpenAIChatAdapterConfig = {
       provider: 'mesh',
@@ -59,11 +72,19 @@ export class MeshAdapter extends BaseOpenAIChatAdapter {
 
     this.baseUrl = baseUrl;
     this.apiKey = config.apiKey;
+    this.reasoning = config.reasoning;
 
     this.client = new MeshAPI({
       baseUrl: toMeshSdkBaseUrl(baseUrl),
       token: config.apiKey,
       maxRetries: 0,
+      fetch: ((input, init) => globalThis.fetch(input, {
+        ...init,
+        headers: {
+          ...(init?.headers as Record<string, string> | undefined),
+          'X-Mesh-Version': MESH_API_VERSION,
+        },
+      })) as unknown as typeof fetch,
     });
   }
 
@@ -74,36 +95,108 @@ export class MeshAdapter extends BaseOpenAIChatAdapter {
     const emitter = createModelStreamEmitter(onEvent);
     await emitter.emit({ type: 'start', provider: this.provider, model: this.model });
     try {
-      const body = await this.buildRequestBody(request);
-      const chunks: unknown[] = [];
+      const baseBody = await this.buildRequestBody(request);
+      const allChunks: unknown[] = [];
       const startedAt = Date.now();
-      const stream = this.client.chat.completions.create(
-        {
-          ...body,
-          stream: true,
-        } as never,
-        { signal: request.signal, timeoutMs: resolveMeshHttpTimeoutMs(request.modelTimeoutMs) },
-      );
-      const accumulator = new MeshStreamAccumulator();
-      for await (const chunk of stream as AsyncIterable<unknown>) {
-        chunks.push(chunk);
-        await emitModelStreamEvents(emitter.emit, accumulator.add(chunk));
+      let completion: Record<string, unknown> | undefined;
+      let adapterAttemptCount = 0;
+      let reasoningFallbackTriggered = false;
+
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        adapterAttemptCount = attempt;
+        const fallbackAttempt = attempt === 2;
+        const fallbackAfterMs = !fallbackAttempt && this.reasoning?.enabled !== false
+          ? this.reasoning?.retryWithoutReasoningAfterMs
+          : undefined;
+        const fallbackController = fallbackAfterMs === undefined ? undefined : new AbortController();
+        const attemptSignal = combineAbortSignals(request.signal, fallbackController?.signal);
+        let sawReasoning = false;
+        let sawActionableOutput = false;
+        let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
+        const fallbackDeadlineAt = fallbackAfterMs === undefined ? undefined : Date.now() + fallbackAfterMs;
+
+        if (fallbackController && fallbackAfterMs !== undefined) {
+          fallbackTimer = setTimeout(() => {
+            if (sawReasoning && !sawActionableOutput && !request.signal?.aborted) {
+              reasoningFallbackTriggered = true;
+              fallbackController.abort(new Error(`Mesh produced reasoning only for ${fallbackAfterMs}ms`));
+            }
+          }, fallbackAfterMs);
+        }
+
+        try {
+          const body = {
+            ...baseBody,
+            ...meshReasoningRequest(this.reasoning, fallbackAttempt),
+            stream: true,
+          };
+          const stream = this.client.chat.completions.create(
+            body as never,
+            { signal: attemptSignal, timeoutMs: resolveMeshHttpTimeoutMs(request.modelTimeoutMs) },
+          );
+          const accumulator = new MeshStreamAccumulator();
+          for await (const chunk of stream as unknown as AsyncIterable<unknown>) {
+            allChunks.push(chunk);
+            const events = accumulator.add(chunk);
+            for (const event of events) {
+              if (event.type === 'reasoning_delta' && event.delta.length > 0) {
+                sawReasoning = true;
+                if (
+                  fallbackController
+                  && fallbackDeadlineAt !== undefined
+                  && Date.now() >= fallbackDeadlineAt
+                  && !sawActionableOutput
+                  && !request.signal?.aborted
+                ) {
+                  reasoningFallbackTriggered = true;
+                  fallbackController.abort(new Error(`Mesh produced reasoning only for ${fallbackAfterMs}ms`));
+                }
+              } else if (
+                (event.type === 'text_delta' && event.delta.length > 0)
+                || event.type === 'tool_call_start'
+                || event.type === 'tool_call_delta'
+                || event.type === 'tool_call_end'
+              ) {
+                sawActionableOutput = true;
+              }
+            }
+            await emitModelStreamEvents(emitter.emit, events);
+          }
+          completion = accumulator.toCompletion();
+          break;
+        } catch (error) {
+          const shouldRetryWithoutReasoning = reasoningFallbackTriggered
+            && !fallbackAttempt
+            && !request.signal?.aborted;
+          if (!shouldRetryWithoutReasoning) {
+            throw error;
+          }
+        } finally {
+          if (fallbackTimer !== undefined) {
+            clearTimeout(fallbackTimer);
+          }
+        }
       }
 
-      const completion = accumulator.toCompletion();
+      if (!completion) {
+        throw new Error('Mesh did not return a completion');
+      }
       const providerReportedCost = hasPositiveProviderReportedCost(completion);
       const parsed = this.parseResponse(completion as never);
       const priced = await this.withEstimatedMeshCost(parsed, completion, providerReportedCost, request.signal);
       const response = {
         ...priced,
         providerResponseId: priced.providerResponseId || undefined,
-        rawProviderResponse: chunks,
+        rawProviderResponse: allChunks,
         performance: compactJsonObject({
           ...(priced.performance ?? {}),
-          adapterAttemptCount: 1,
+          adapterAttemptCount,
+          reasoningFallbackTriggered: reasoningFallbackTriggered || undefined,
+          abortedAdapterAttemptCount: reasoningFallbackTriggered ? 1 : undefined,
+          usageMayExcludeAbortedAttempt: reasoningFallbackTriggered || undefined,
           adapterResponseLatencyMs: Date.now() - startedAt,
-          adapterRequestBytes: approximateSerializedByteLength(body),
-          adapterResponseBytes: approximateSerializedByteLength(chunks),
+          adapterRequestBytes: approximateSerializedByteLength(baseBody),
+          adapterResponseBytes: approximateSerializedByteLength(allChunks),
         }),
       };
       await emitTerminalModelStreamEvents(emitter.emit, response, emitter.startedToolCallIds);
@@ -554,6 +647,60 @@ function resolveMeshHttpTimeoutMs(modelTimeoutMs: number | undefined): number | 
   }
 
   return modelTimeoutMs > 0 ? modelTimeoutMs : DISABLED_MODEL_TIMEOUT_MESH_HTTP_TIMEOUT_MS;
+}
+
+function validateMeshReasoningConfig(config: MeshReasoningConfig | undefined): void {
+  if (!config) {
+    return;
+  }
+
+  if (
+    config.maxTokens !== undefined
+    && (!Number.isInteger(config.maxTokens) || config.maxTokens < 1024 || config.maxTokens > 128_000)
+  ) {
+    throw new Error('Mesh reasoning.maxTokens must be an integer from 1024 to 128000');
+  }
+  if (
+    config.retryWithoutReasoningAfterMs !== undefined
+    && (!Number.isInteger(config.retryWithoutReasoningAfterMs) || config.retryWithoutReasoningAfterMs <= 0)
+  ) {
+    throw new Error('Mesh reasoning.retryWithoutReasoningAfterMs must be a positive integer');
+  }
+  if (config.enabled === false && config.maxTokens !== undefined) {
+    throw new Error('Mesh reasoning.maxTokens cannot be set when reasoning.enabled is false');
+  }
+  if (config.enabled === false && config.retryWithoutReasoningAfterMs !== undefined) {
+    throw new Error('Mesh reasoning.retryWithoutReasoningAfterMs cannot be set when reasoning.enabled is false');
+  }
+}
+
+function meshReasoningRequest(
+  config: MeshReasoningConfig | undefined,
+  fallbackAttempt: boolean,
+): Record<string, unknown> {
+  if (fallbackAttempt) {
+    return { reasoning: { enabled: false } };
+  }
+  if (!config || (config.enabled === undefined && config.maxTokens === undefined)) {
+    return {};
+  }
+
+  return {
+    reasoning: {
+      ...(config.enabled === undefined ? {} : { enabled: config.enabled }),
+      ...(config.maxTokens === undefined ? {} : { max_tokens: config.maxTokens }),
+    },
+  };
+}
+
+function combineAbortSignals(
+  primary: AbortSignal | undefined,
+  secondary: AbortSignal | undefined,
+): AbortSignal | undefined {
+  if (primary && secondary) {
+    return AbortSignal.any([primary, secondary]);
+  }
+  return primary ?? secondary;
 }
 
 function enrichMeshError(error: unknown): Error {

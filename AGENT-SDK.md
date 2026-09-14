@@ -140,6 +140,11 @@ export interface AgentConfigFile {
     apiKey?: string;
     baseUrl?: string;
     maxConcurrentRequests?: number;
+    reasoning?: {
+      enabled?: boolean;
+      maxTokens?: number;
+      retryWithoutReasoningAfterMs?: number;
+    };
   };
 
   systemInstructions?: string;

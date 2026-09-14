@@ -1843,6 +1843,7 @@ describe('MeshAdapter', () => {
 
     expect(fetchSpy.mock.calls[0][0]).toBe('https://api.meshapi.ai/v1/chat/completions');
     expect(fetchSpy.mock.calls[0][1].headers['Authorization']).toBe('Bearer mesh-key');
+    expect(fetchSpy.mock.calls[0][1].headers['X-Mesh-Version']).toBe('2026-09');
     expect(adapter.provider).toBe('mesh');
     expect(adapter.capabilities.usage).toBe(true);
     expect(response.rawProviderResponse).toEqual(chunks);
@@ -1883,6 +1884,110 @@ describe('MeshAdapter', () => {
       tool_call_id: 'call-1',
     });
     expect(body.stream).toBe(true);
+  });
+
+  it('sends a Mesh reasoning budget separately from the output-token limit', async () => {
+    const adapter = new MeshAdapter({
+      model: 'qwen/qwen3.8-max',
+      apiKey: 'mesh-key',
+      reasoning: { enabled: true, maxTokens: 4096 },
+    });
+    mockFetchSseResponse(meshTextChunks('Completed'));
+
+    await adapter.generate(simpleRequest({ maxOutputTokens: 16_384 }));
+
+    const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    expect(body.reasoning).toEqual({ enabled: true, max_tokens: 4096 });
+    expect(body.max_tokens).toBe(16_384);
+  });
+
+  it('retries a reasoning-only Mesh stream once with reasoning disabled', async () => {
+    const adapter = new MeshAdapter({
+      model: 'qwen/qwen3.8-max',
+      apiKey: 'mesh-key',
+      reasoning: { maxTokens: 4096, retryWithoutReasoningAfterMs: 10 },
+    });
+    const encoder = new TextEncoder();
+    fetchSpy.mockImplementationOnce((_url: string, init: RequestInit) => Promise.resolve(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(meshDelta({ reasoning: 'Still thinking.' }))}\n\n`));
+            init.signal?.addEventListener('abort', () => {
+              controller.error(new DOMException('The operation was aborted.', 'AbortError'));
+            }, { once: true });
+          },
+        }),
+        {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        },
+      ),
+    ));
+    mockFetchSseResponse(meshTextChunks('Used the tool and completed the task'));
+
+    const response = await adapter.generate(simpleRequest());
+
+    expect(response.text).toBe('Used the tool and completed the task');
+    expect(response.performance).toMatchObject({
+      adapterAttemptCount: 2,
+      reasoningFallbackTriggered: true,
+      abortedAdapterAttemptCount: 1,
+      usageMayExcludeAbortedAttempt: true,
+    });
+    const chatCalls = fetchSpy.mock.calls.filter((call) => call[0] === 'https://api.meshapi.ai/v1/chat/completions');
+    expect(chatCalls).toHaveLength(2);
+    const firstBody = JSON.parse(chatCalls[0][1].body);
+    const secondBody = JSON.parse(chatCalls[1][1].body);
+    expect(firstBody.reasoning).toEqual({ max_tokens: 4096 });
+    expect(secondBody.reasoning).toEqual({ enabled: false });
+  });
+
+  it('does not retry after a Mesh stream starts producing answer text', async () => {
+    const adapter = new MeshAdapter({
+      model: 'qwen/qwen3.8-max',
+      apiKey: 'mesh-key',
+      reasoning: { retryWithoutReasoningAfterMs: 5 },
+    });
+    const encoder = new TextEncoder();
+    fetchSpy.mockImplementationOnce(() => Promise.resolve(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(meshDelta({ reasoning: 'Checking.' }))}\n\n`));
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(meshDelta({ content: 'Answer started.' }))}\n\n`));
+            setTimeout(() => {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(meshDelta({}, { finishReason: 'stop' }))}\n\n`));
+              controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+              controller.close();
+            }, 15);
+          },
+        }),
+        {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        },
+      ),
+    ));
+
+    const response = await adapter.generate(simpleRequest());
+
+    expect(response.text).toBe('Answer started.');
+    expect(response.performance).toMatchObject({ adapterAttemptCount: 1 });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects invalid Mesh reasoning controls', () => {
+    expect(() => new MeshAdapter({
+      model: 'qwen/qwen3.8-max',
+      apiKey: 'mesh-key',
+      reasoning: { maxTokens: 1023 },
+    })).toThrow('reasoning.maxTokens');
+    expect(() => new MeshAdapter({
+      model: 'qwen/qwen3.8-max',
+      apiKey: 'mesh-key',
+      reasoning: { enabled: false, retryWithoutReasoningAfterMs: 1000 },
+    })).toThrow('retryWithoutReasoningAfterMs');
   });
 
   it('aggregates Mesh streaming text chunks into the final response', async () => {

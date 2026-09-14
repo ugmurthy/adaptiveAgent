@@ -99,6 +99,38 @@ describe('agent-sdk config resolution', () => {
     expect(config.model.model).toBe('qwen3.5');
   });
 
+  it('resolves Mesh reasoning controls from the agent profile', async () => {
+    await writeFile(
+      join(tempDir, 'agent.json'),
+      JSON.stringify({
+        id: 'mesh-agent',
+        name: 'Mesh Agent',
+        invocationModes: ['run'],
+        defaultInvocationMode: 'run',
+        model: {
+          provider: 'mesh',
+          model: 'qwen/qwen3.8-max',
+          apiKeyEnv: 'MESH_API_KEY',
+          reasoning: {
+            maxTokens: 4096,
+            retryWithoutReasoningAfterMs: 120_000,
+          },
+        },
+        tools: ['read_file'],
+      }),
+    );
+
+    const config = await loadAgentSdkConfig({
+      cwd: tempDir,
+      env: testEnvironment({ MESH_API_KEY: 'mesh-key' }),
+    });
+
+    expect(config.model.reasoning).toEqual({
+      maxTokens: 4096,
+      retryWithoutReasoningAfterMs: 120_000,
+    });
+  });
+
   it('fails explicit postgres without DATABASE_URL', async () => {
     await writeAgentConfig(join(tempDir, 'agent.json'));
     await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({ runtime: { mode: 'postgres' } }));

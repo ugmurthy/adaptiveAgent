@@ -1,5 +1,5 @@
 import type { ModelAdapter, StructuredOutputMode } from '../types.js';
-import { MeshAdapter } from './mesh-adapter.js';
+import { MeshAdapter, type MeshReasoningConfig } from './mesh-adapter.js';
 import { MistralAdapter } from './mistral-adapter.js';
 import { OllamaAdapter } from './ollama-adapter.js';
 import { OpenRouterAdapter } from './openrouter-adapter.js';
@@ -13,9 +13,15 @@ export interface ModelAdapterConfig {
   siteName?: string;
   maxConcurrentRequests?: number;
   structuredOutputMode?: StructuredOutputMode;
+  /** Mesh-only provider reasoning controls. */
+  reasoning?: MeshReasoningConfig;
 }
 
 export function createModelAdapter(config: ModelAdapterConfig): ModelAdapter {
+  if (config.reasoning && config.provider !== 'mesh') {
+    throw new Error('reasoning controls are supported only by the Mesh adapter');
+  }
+
   switch (config.provider) {
     case 'openrouter': {
       if (!config.apiKey) {
@@ -66,6 +72,7 @@ export function createModelAdapter(config: ModelAdapterConfig): ModelAdapter {
         baseUrl: config.baseUrl,
         maxConcurrentRequests: config.maxConcurrentRequests,
         structuredOutputMode: config.structuredOutputMode,
+        reasoning: config.reasoning,
       });
     }
 

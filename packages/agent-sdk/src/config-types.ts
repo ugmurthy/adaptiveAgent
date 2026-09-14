@@ -87,7 +87,7 @@ export interface AgentConfigFile {
   defaultInvocationMode: InvocationMode;
   workspace?: { root?: string; shellCwd?: string };
   workspaceRoot?: string;
-  model: { provider?: string; model?: string; apiKeyEnv?: string; apiKey?: string; baseUrl?: string; maxConcurrentRequests?: number; structuredOutputMode?: ModelAdapterConfig['structuredOutputMode'] };
+  model: { provider?: string; model?: string; apiKeyEnv?: string; apiKey?: string; baseUrl?: string; maxConcurrentRequests?: number; structuredOutputMode?: ModelAdapterConfig['structuredOutputMode']; reasoning?: ModelAdapterConfig['reasoning'] };
   systemInstructions?: string;
   tools: string[];
   delegates?: string[];

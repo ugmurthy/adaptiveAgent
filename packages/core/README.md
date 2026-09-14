@@ -395,6 +395,25 @@ switch (result.status) {
 - `mistral`
 - `mesh`
 
+Mesh profiles may set a reasoning budget independently from the final output
+limit. They can also retry once with reasoning disabled when a stream produces
+reasoning but no answer text or tool call before the configured threshold:
+
+```ts
+createModelAdapter({
+  provider: 'mesh',
+  model: 'qwen/qwen3.8-max',
+  apiKey: process.env.MESH_API_KEY,
+  reasoning: {
+    maxTokens: 4096,
+    retryWithoutReasoningAfterMs: 120_000,
+  },
+});
+```
+
+`reasoning.maxTokens` is sent to Mesh as `reasoning.max_tokens`; it does not
+limit final-answer tokens. Mesh requests pin API contract version `2026-09`.
+
 You can also supply your own `ModelAdapter` implementation directly in `createAdaptiveAgent({ model })`.
 
 ### Tools
