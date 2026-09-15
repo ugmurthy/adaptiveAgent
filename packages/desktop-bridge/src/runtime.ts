@@ -158,29 +158,33 @@ export class DesktopRuntime {
       && (request.method.startsWith('history/') || request.method === 'settings/update')) {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', `${request.method} requires desktop protocol 1.12.`, JSON_RPC_ERROR_CODES.methodNotFound);
     }
-    if (!['1.13', '1.14', '1.15', '1.16', '1.17', '1.18'].includes(this.negotiatedProtocolVersion)
+    if (!['1.13', '1.14', '1.15', '1.16', '1.17', '1.18', '1.19'].includes(this.negotiatedProtocolVersion)
       && request.method.startsWith('execution/')) {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', `${request.method} requires desktop protocol 1.13.`, JSON_RPC_ERROR_CODES.methodNotFound);
     }
-    if (!['1.14', '1.15', '1.16', '1.17', '1.18'].includes(this.negotiatedProtocolVersion) && request.method === 'catalog/inspect') {
+    if (!['1.14', '1.15', '1.16', '1.17', '1.18', '1.19'].includes(this.negotiatedProtocolVersion) && request.method === 'catalog/inspect') {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', 'catalog/inspect requires desktop protocol 1.14.', JSON_RPC_ERROR_CODES.methodNotFound);
     }
-    if (!['1.15', '1.16', '1.17', '1.18'].includes(this.negotiatedProtocolVersion) && ['agent/createDraft', 'agent/validateConfig', 'agent/saveConfig'].includes(request.method)) {
+    if (!['1.15', '1.16', '1.17', '1.18', '1.19'].includes(this.negotiatedProtocolVersion) && ['agent/createDraft', 'agent/validateConfig', 'agent/saveConfig'].includes(request.method)) {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', `${request.method} requires desktop protocol 1.15.`, JSON_RPC_ERROR_CODES.methodNotFound);
     }
-    if (!['1.16', '1.17', '1.18'].includes(this.negotiatedProtocolVersion) && ['agent/readConfig', 'agent/archiveConfig', 'agent/restoreConfig'].includes(request.method)) {
+    if (!['1.16', '1.17', '1.18', '1.19'].includes(this.negotiatedProtocolVersion) && ['agent/readConfig', 'agent/archiveConfig', 'agent/restoreConfig'].includes(request.method)) {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', `${request.method} requires desktop protocol 1.16.`, JSON_RPC_ERROR_CODES.methodNotFound);
     }
-    if (!['1.17', '1.18'].includes(this.negotiatedProtocolVersion) && request.method === 'run/delete') {
+    if (!['1.17', '1.18', '1.19'].includes(this.negotiatedProtocolVersion) && request.method === 'run/delete') {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', 'run/delete requires desktop protocol 1.17.', JSON_RPC_ERROR_CODES.methodNotFound);
     }
-    if (this.negotiatedProtocolVersion !== '1.18' && request.method === 'agents/list') {
+    if (!['1.18', '1.19'].includes(this.negotiatedProtocolVersion) && request.method === 'agents/list') {
       throw new DesktopProtocolError('METHOD_NOT_FOUND', 'agents/list requires desktop protocol 1.18.', JSON_RPC_ERROR_CODES.methodNotFound);
     }
-    if (!['1.14', '1.15', '1.16', '1.17', '1.18'].includes(this.negotiatedProtocolVersion) && request.method === 'runtime/initialize' && request.params?.agentSelection) {
+    if (this.negotiatedProtocolVersion !== '1.19' && request.method === 'agent/createDraft'
+      && (request.params?.id !== undefined || request.params?.provider !== undefined || request.params?.model !== undefined)) {
+      throw new DesktopProtocolError('INVALID_PARAMS', 'Agent draft id, provider, and model overrides require desktop protocol 1.19.', JSON_RPC_ERROR_CODES.invalidParams);
+    }
+    if (!['1.14', '1.15', '1.16', '1.17', '1.18', '1.19'].includes(this.negotiatedProtocolVersion) && request.method === 'runtime/initialize' && request.params?.agentSelection) {
       throw new DesktopProtocolError('INVALID_PARAMS', 'Exact agent selection requires desktop protocol 1.14.', JSON_RPC_ERROR_CODES.invalidParams);
     }
-    if (!['1.13', '1.14', '1.15', '1.16', '1.17', '1.18'].includes(this.negotiatedProtocolVersion) && hasV113Fields(request)) {
+    if (!['1.13', '1.14', '1.15', '1.16', '1.17', '1.18', '1.19'].includes(this.negotiatedProtocolVersion) && hasV113Fields(request)) {
       throw new DesktopProtocolError('INVALID_PARAMS', 'Attachment and execution-envelope fields require desktop protocol 1.13.', JSON_RPC_ERROR_CODES.invalidParams);
     }
 
@@ -330,6 +334,9 @@ export class DesktopRuntime {
             cwd: this.settingsCwd,
             settingsConfigPath: this.settingsPath,
             generatorAgent,
+            id: request.params!.id,
+            provider: request.params!.provider,
+            model: request.params!.model,
           });
           const preview = await prepareAgentConfigSave({
             agent: prepared.agent,
@@ -451,12 +458,12 @@ export class DesktopRuntime {
         methods: DESKTOP_RPC_METHODS.filter((method) => {
           if (this.negotiatedProtocolVersion === '1.10' && method === 'auth/updateAccessToken') return false;
           if (this.negotiatedProtocolVersion === '1.10' || this.negotiatedProtocolVersion === '1.11') if (method.startsWith('history/') || method === 'settings/update') return false;
-          if (!['1.13', '1.14', '1.15', '1.16', '1.17', '1.18'].includes(this.negotiatedProtocolVersion) && method.startsWith('execution/')) return false;
-          if (!['1.14', '1.15', '1.16', '1.17', '1.18'].includes(this.negotiatedProtocolVersion) && method === 'catalog/inspect') return false;
-          if (!['1.15', '1.16', '1.17', '1.18'].includes(this.negotiatedProtocolVersion) && ['agent/createDraft', 'agent/validateConfig', 'agent/saveConfig'].includes(method)) return false;
-          if (!['1.16', '1.17', '1.18'].includes(this.negotiatedProtocolVersion) && ['agent/readConfig', 'agent/archiveConfig', 'agent/restoreConfig'].includes(method)) return false;
-          if (!['1.17', '1.18'].includes(this.negotiatedProtocolVersion) && method === 'run/delete') return false;
-          if (this.negotiatedProtocolVersion !== '1.18' && method === 'agents/list') return false;
+          if (!['1.13', '1.14', '1.15', '1.16', '1.17', '1.18', '1.19'].includes(this.negotiatedProtocolVersion) && method.startsWith('execution/')) return false;
+          if (!['1.14', '1.15', '1.16', '1.17', '1.18', '1.19'].includes(this.negotiatedProtocolVersion) && method === 'catalog/inspect') return false;
+          if (!['1.15', '1.16', '1.17', '1.18', '1.19'].includes(this.negotiatedProtocolVersion) && ['agent/createDraft', 'agent/validateConfig', 'agent/saveConfig'].includes(method)) return false;
+          if (!['1.16', '1.17', '1.18', '1.19'].includes(this.negotiatedProtocolVersion) && ['agent/readConfig', 'agent/archiveConfig', 'agent/restoreConfig'].includes(method)) return false;
+          if (!['1.17', '1.18', '1.19'].includes(this.negotiatedProtocolVersion) && method === 'run/delete') return false;
+          if (!['1.18', '1.19'].includes(this.negotiatedProtocolVersion) && method === 'agents/list') return false;
           return true;
         }),
         notifications: ['runtime/ready', 'agent/event', 'cli/output'],
@@ -466,7 +473,7 @@ export class DesktopRuntime {
           transport: 'child-process',
           output: 'streamed-notifications',
         },
-        ...(['1.13', '1.14', '1.15', '1.16', '1.17', '1.18'].includes(this.negotiatedProtocolVersion) ? { attachments: attachmentCapabilities(false, this.negotiatedProtocolVersion, 'Initialize the runtime with managedAttachmentRoot.') } : {}),
+        ...(['1.13', '1.14', '1.15', '1.16', '1.17', '1.18', '1.19'].includes(this.negotiatedProtocolVersion) ? { attachments: attachmentCapabilities(false, this.negotiatedProtocolVersion, 'Initialize the runtime with managedAttachmentRoot.') } : {}),
       },
     };
   }
@@ -1096,7 +1103,7 @@ export class DesktopRuntime {
 function desktopTranscriptAttachments(messages: DesktopChatMessage[]): DesktopAttachmentInput[] { return messages.flatMap((message) => message.attachments ?? []); }
 function attachmentError(code: string, id: string): DesktopProtocolError { return new DesktopProtocolError(code, `Attachment ${id} failed managed-file validation.`, JSON_RPC_ERROR_CODES.invalidParams); }
 function attachmentCapabilities(enabled: boolean, protocolVersion: DesktopProtocolVersion, reason?: string): JsonValue {
-  const supportsMedia = protocolVersion === '1.17' || protocolVersion === '1.18';
+  const supportsMedia = ['1.17', '1.18', '1.19'].includes(protocolVersion);
   return {
     enabled,
     maxFileBytes: 10 * 1024 * 1024,
@@ -1112,7 +1119,7 @@ function attachmentCapabilities(enabled: boolean, protocolVersion: DesktopProtoc
   };
 }
 function rejectUnsupportedMedia(inputs: DesktopAttachmentInput[], protocolVersion: DesktopProtocolVersion): void {
-  if (!['1.17', '1.18'].includes(protocolVersion) && inputs.some((input) => input.kind !== 'file')) throw new DesktopProtocolError('UNSUPPORTED_ATTACHMENT_KIND', 'Managed image and audio attachments require desktop protocol 1.17.', JSON_RPC_ERROR_CODES.commandRejected);
+  if (!['1.17', '1.18', '1.19'].includes(protocolVersion) && inputs.some((input) => input.kind !== 'file')) throw new DesktopProtocolError('UNSUPPORTED_ATTACHMENT_KIND', 'Managed image and audio attachments require desktop protocol 1.17.', JSON_RPC_ERROR_CODES.commandRejected);
 }
 function executionResult(executionId: string, mode: 'direct' | 'catalog', result: any, stages?: any[]): JsonValue { return asJsonValue({ executionId, mode, status: result.status, finalRunId: result.runId, traceTarget: mode === 'direct' ? { kind: 'root-run', rootRunId: executionId } : { kind: 'session', sessionId: executionId }, ...(stages ? { stages } : {}), result }); }
 

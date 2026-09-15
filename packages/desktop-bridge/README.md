@@ -13,8 +13,8 @@ object per line to stdout and reserves stderr for diagnostics. Requests may run
 concurrently, so clients must correlate responses by `id` and process
 notifications independently.
 
-The bridge currently exposes protocol `1.18` over JSON-RPC 2.0 and continues
-to accept protocols `1.10` through `1.17`. Attachment descriptors and the
+The bridge currently exposes protocol `1.19` over JSON-RPC 2.0 and continues
+to accept protocols `1.10` through `1.18`. Attachment descriptors and the
 `execution/*` envelope require explicit `1.13` or later negotiation. There is no
 legacy custom-envelope compatibility: every request must use JSON-RPC,
 including before initialization.
@@ -25,7 +25,7 @@ Protocol versions are intentionally strings. In JSON, numeric values such as
 At startup the bridge emits this JSON-RPC notification:
 
 ```json
-{"jsonrpc":"2.0","method":"runtime/ready","params":{"protocolVersion":"1.18","bridgeVersion":"0.1.0","pid":1234}}
+{"jsonrpc":"2.0","method":"runtime/ready","params":{"protocolVersion":"1.19","bridgeVersion":"0.1.0","pid":1234}}
 ```
 
 ## Versioned protocol capabilities
@@ -35,7 +35,8 @@ Protocol `1.14` adds `catalog/inspect` and exact agent selection during runtime
 initialization. Protocol `1.15` adds agent draft creation, validation, and
 saving. Protocol `1.16` adds reading, archiving, and restoring agent profiles.
 Protocol `1.17` adds managed image and audio attachments. Protocol `1.18` adds
-metadata-only agent discovery through `agents/list`.
+metadata-only agent discovery through `agents/list`. Protocol `1.19` adds
+generator-agent, ID, provider, and model controls to `agent/createDraft`.
 
 ### Agent discovery and selection
 
@@ -76,13 +77,13 @@ The first JSON-RPC request must negotiate the protocol. Once successful, the
 connection is sticky: subsequent input and agent events use JSON-RPC only.
 
 ```json
-{"jsonrpc":"2.0","id":"initialize","method":"initialize","params":{"protocolVersion":"1.18","clientInfo":{"name":"adaptive-agent-desktop","version":"1.0.0"},"capabilities":{}}}
+{"jsonrpc":"2.0","id":"initialize","method":"initialize","params":{"protocolVersion":"1.19","clientInfo":{"name":"adaptive-agent-desktop","version":"1.0.0"},"capabilities":{}}}
 ```
 
 The result advertises supported methods, notifications, and CLI commands:
 
 ```json
-{"jsonrpc":"2.0","id":"initialize","result":{"protocolVersion":"1.18","bridgeVersion":"0.1.0","serverInfo":{"name":"@adaptive-agent/desktop-bridge","version":"0.1.0"},"capabilities":{"methods":["initialize","agents/list","catalog/inspect","runtime/initialize","runtime/info","runtime/shutdown","settings/update","auth/updateAccessToken","agent/run","agent/chat","run/resume","run/retry","run/recover","run/continue","run/interrupt","run/delete","run/inspect","run/replay","run/steer","execution/inspect","execution/interrupt","execution/resume","interaction/resolveApproval","interaction/resolveClarification","history/previewDeletion","history/delete","agent/createDraft","agent/validateConfig","agent/saveConfig","agent/readConfig","agent/archiveConfig","agent/restoreConfig","cli/commands","cli/execute"],"notifications":["runtime/ready","agent/event","cli/output"]}}}
+{"jsonrpc":"2.0","id":"initialize","result":{"protocolVersion":"1.19","bridgeVersion":"0.1.0","serverInfo":{"name":"@adaptive-agent/desktop-bridge","version":"0.1.0"},"capabilities":{"methods":["initialize","agents/list","catalog/inspect","runtime/initialize","runtime/info","runtime/shutdown","settings/update","auth/updateAccessToken","agent/run","agent/chat","run/resume","run/retry","run/recover","run/continue","run/interrupt","run/delete","run/inspect","run/replay","run/steer","execution/inspect","execution/interrupt","execution/resume","interaction/resolveApproval","interaction/resolveClarification","history/previewDeletion","history/delete","agent/createDraft","agent/validateConfig","agent/saveConfig","agent/readConfig","agent/archiveConfig","agent/restoreConfig","cli/commands","cli/execute"],"notifications":["runtime/ready","agent/event","cli/output"]}}}
 ```
 
 Initialize the persistent agent runtime separately. This allows setup,
@@ -297,7 +298,7 @@ ids may be strings or finite numbers and are echoed without coercion.
 ```sh
 bun run compile
 printf '%s\n' \
-  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1.18","clientInfo":{"name":"smoke"}}}' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1.19","clientInfo":{"name":"smoke"}}}' \
   '{"jsonrpc":"2.0","id":2,"method":"cli/execute","params":{"argv":["--version"]}}' \
   | dist/agent-runtime
 ```

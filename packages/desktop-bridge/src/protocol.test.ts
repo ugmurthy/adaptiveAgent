@@ -34,8 +34,8 @@ describe('desktop bridge protocol', () => {
     );
   });
 
-  it('uses a string for protocol 1.18', () => {
-    expect(DESKTOP_PROTOCOL_VERSION).toBe('1.18');
+  it('uses a string for protocol 1.19', () => {
+    expect(DESKTOP_PROTOCOL_VERSION).toBe('1.19');
   });
 
   it('validates agent discovery requests', () => {
@@ -61,12 +61,26 @@ describe('desktop bridge protocol', () => {
 
   it('validates agent builder requests', () => {
     expect(parseDesktopRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'agent/createDraft', params: { brief: 'Build a reviewer' } }))).toMatchObject({ method: 'agent/createDraft' });
+    expect(parseDesktopRpcRequest(JSON.stringify({
+      jsonrpc: '2.0', id: 'overrides', method: 'agent/createDraft',
+      params: { brief: 'Build a reviewer', generatorAgent: 'architect', id: 'reviewer', provider: 'mistral', model: 'codestral-latest' },
+    }))).toMatchObject({
+      params: { generatorAgent: 'architect', id: 'reviewer', provider: 'mistral', model: 'codestral-latest' },
+    });
     expect(parseDesktopRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'agent/validateConfig', params: { agent: { id: 'reviewer' } } }))).toMatchObject({ method: 'agent/validateConfig' });
     expect(() => parseDesktopRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'agent/createDraft', params: { brief: 7 } }))).toThrowError(expect.objectContaining({ code: 'INVALID_PARAMS' }));
     expect(() => parseDesktopRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'agent/saveConfig', params: { agent: [] } }))).toThrowError(expect.objectContaining({ code: 'INVALID_PARAMS' }));
     expect(() => parseDesktopRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'agent/saveConfig', params: { agent: { id: 'reviewer' } } }))).toThrowError(expect.objectContaining({ code: 'INVALID_PARAMS' }));
     expect(parseDesktopRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 6, method: 'agent/archiveConfig', params: { agentId: 'reviewer', configPath: '/agents/reviewer.json' } }))).toMatchObject({ method: 'agent/archiveConfig' });
     expect(() => parseDesktopRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'agent/restoreConfig', params: { agentId: 'reviewer' } }))).toThrowError(expect.objectContaining({ code: 'INVALID_PARAMS' }));
+    for (const params of [
+      { brief: 'Build a reviewer', id: 7 },
+      { brief: 'Build a reviewer', provider: 'unknown' },
+      { brief: 'Build a reviewer', model: '' },
+    ]) {
+      expect(() => parseDesktopRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 8, method: 'agent/createDraft', params })))
+        .toThrowError(expect.objectContaining({ code: 'INVALID_PARAMS' }));
+    }
   });
 
   it('strictly validates managed attachment descriptors', () => {

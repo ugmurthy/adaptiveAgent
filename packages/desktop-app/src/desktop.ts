@@ -101,6 +101,14 @@ export interface AgentCreatePrepared extends AgentConfigPreview {
   notes: string[];
   recommendations: string[];
 }
+export type AgentCreateProvider = 'openrouter' | 'ollama' | 'mistral' | 'mesh';
+export interface AgentCreateDraftOptions {
+  brief: string;
+  generatorAgent?: string;
+  id?: string;
+  provider?: AgentCreateProvider;
+  model?: string;
+}
 export interface AgentProfileMove {
   agentId: string;
   previousPath: string;
@@ -187,7 +195,7 @@ export const desktopBootstrap=()=>invoke<DesktopBootstrap>('desktop_bootstrap');
 export const desktopWindowBootstrap=()=>invoke<DesktopWindowBootstrap>('desktop_window_bootstrap');
 export const getDesktopCatalogStatus=()=>invoke<DesktopCatalogStatus>('desktop_catalog_status');
 export const openAgentWindow=(agentId:string)=>invoke<AgentWindowOpen>('open_agent_window',{agentId});
-export const generateAgentDraft=(brief:string,generatorAgent?:string)=>invoke<AgentCreatePrepared>('generate_agent_draft',{brief,generatorAgent});
+export const generateAgentDraft=(options:AgentCreateDraftOptions)=>invoke<AgentCreatePrepared>('generate_agent_draft',{...options});
 export const validateAgentConfig=(agent:Record<string,unknown>,generatorAgent?:string,targetPath?:string)=>invoke<AgentConfigPreview>('validate_agent_config',{agent,generatorAgent,targetPath});
 export const saveAgentConfig=(agent:Record<string,unknown>,generatorAgent:string|undefined,targetPath:string|undefined,overwrite:boolean,expectedPath:string,expectedTargetFingerprint:string)=>invoke<AgentConfigPreview>('save_agent_config',{agent,generatorAgent,targetPath,overwrite,expectedPath,expectedTargetFingerprint});
 export const readAgentConfig=(agentId:string,configPath:string)=>invoke<AgentProfileContent>('read_agent_config',{agentId,configPath});

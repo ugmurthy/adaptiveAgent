@@ -384,6 +384,7 @@ dd small { display: block; margin-top: 3px; }
 .agent-builder .code-editor { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; tab-size: 2; }
 .builder-tabs { display: flex; gap: 6px; }
 .builder-tabs button.active { border-color: #4a8978; background: #15352d; color: #77e3c1; }
+.builder-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .builder-help { margin: 0; color: #84959d; font-size: 11px; }
 .builder-summary { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; border: 1px solid #2c3d45; border-radius: 10px; background: #0b1419; padding: 12px; }
 .builder-summary div { display: grid; gap: 5px; min-width: 0; }
@@ -391,5 +392,5 @@ dd small { display: block; margin-top: 3px; }
 .builder-advice { border-left: 2px solid #427a6b; padding-left: 13px; color: #aab9bf; font-size: 11px; }
 .builder-advice ul { margin: 7px 0 0; padding-left: 18px; }
 .studio-back { position: fixed; z-index: 80; top: 14px; left: 272px; border-color: #3d665b; background: #10231e; color: #74dfbd; }
-@media (max-width:760px) { .studio-header { align-items: flex-start; gap: 12px; } .studio-header-actions { flex-wrap: wrap; justify-content: flex-end; } .studio-content { padding-top: 28px; } .studio-hero { align-items: stretch; flex-direction: column; } .studio-controls { align-items: stretch; flex-direction: column; } .studio-controls label { min-width: 0; } .studio-controls .archive-toggle { padding: 0; } .studio-lower, .builder-summary { grid-template-columns: 1fr; } .studio-back { left: auto; right: 12px; top: 13px; } }
+@media (max-width:760px) { .studio-header { align-items: flex-start; gap: 12px; } .studio-header-actions { flex-wrap: wrap; justify-content: flex-end; } .studio-content { padding-top: 28px; } .studio-hero { align-items: stretch; flex-direction: column; } .studio-controls { align-items: stretch; flex-direction: column; } .studio-controls label { min-width: 0; } .studio-controls .archive-toggle { padding: 0; } .studio-lower, .builder-summary, .builder-options { grid-template-columns: 1fr; } .studio-back { left: auto; right: 12px; top: 13px; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; } }

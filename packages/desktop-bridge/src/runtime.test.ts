@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 
 import { ADAPTIVE_AGENT_CLI_COMMANDS } from '@adaptive-agent/agent-sdk/cli';
 import { AgentSdk, type ResolvedAgentSdkConfig } from '@adaptive-agent/agent-sdk';
+import * as agentCreate from '@adaptive-agent/agent-sdk/agent-create';
 
 import { JSON_RPC_ERROR_CODES, type DesktopMessage, type DesktopRpcRequest } from './protocol.js';
 import { DesktopRuntime, safeResolvedConfiguration, updateDesktopSettings, validateRestrictedDesktopConfiguration, type CliExecutor } from './runtime.js';
@@ -274,7 +275,7 @@ describe('desktop runtime protocol', () => {
       params: { protocolVersion: '2.0', clientInfo: { name: 'desktop' } },
     }))).rejects.toMatchObject({
       code: 'UNSUPPORTED_PROTOCOL_VERSION',
-      data: { supportedProtocolVersions: ['1.10', '1.11', '1.12', '1.13', '1.14', '1.15', '1.16', '1.17', '1.18'] },
+      data: { supportedProtocolVersions: ['1.10', '1.11', '1.12', '1.13', '1.14', '1.15', '1.16', '1.17', '1.18', '1.19'] },
     });
   });
 
@@ -351,6 +352,54 @@ describe('desktop runtime protocol', () => {
     const lifecycle = createRuntime().runtime;
     const lifecycleInitialized = await lifecycle.handleRpc(request({ id: 'lifecycle', method: 'initialize', params: { protocolVersion: '1.16', clientInfo: { name: 'desktop' } } })) as any;
     expect(lifecycleInitialized.capabilities.methods).toEqual(expect.arrayContaining(['agent/readConfig', 'agent/archiveConfig', 'agent/restoreConfig']));
+  });
+
+  it('forwards protocol 1.19 draft controls to the shared Agent SDK workflow', async () => {
+    const prepared = {
+      command: 'agent-create', brief: 'Build a reviewer',
+      generatorAgent: { requested: 'architect', id: 'architect', name: 'Architect' },
+      agentsDir: '/workspace/agents', path: '/workspace/agents/reviewer.json', exists: false,
+      agent: { version: 1, id: 'reviewer', name: 'Reviewer' }, draft: { agent: { id: 'reviewer', name: 'Reviewer', systemInstructions: 'Review code.' } },
+      notes: [], recommendations: [],
+    } as any;
+    const preview = {
+      path: prepared.path, agentsDir: prepared.agentsDir, exists: false, duplicatePaths: [],
+      targetFingerprint: 'absent', agent: prepared.agent,
+    };
+    const prepare = vi.spyOn(agentCreate, 'prepareAgentCreate').mockResolvedValue(prepared);
+    const validate = vi.spyOn(agentCreate, 'prepareAgentConfigSave').mockResolvedValue(preview as any);
+    const { runtime } = createRuntime();
+    try {
+      await runtime.handleRpc(request({ id: 'init', method: 'initialize', params: { protocolVersion: '1.19', clientInfo: { name: 'desktop' } } }));
+      Object.assign(runtime as unknown as Record<string, unknown>, {
+        sdk: { config: { agent: { id: 'current-agent' } }, close: vi.fn() },
+        settingsCwd: '/workspace',
+        settingsPath: '/workspace/agent.settings.json',
+      });
+
+      await expect(runtime.handleRpc(request({
+        id: 'draft', method: 'agent/createDraft', params: {
+          brief: 'Build a reviewer', generatorAgent: 'architect', id: 'reviewer', provider: 'mistral', model: 'codestral-latest',
+        },
+      }))).resolves.toMatchObject({ path: prepared.path, agent: prepared.agent, targetFingerprint: 'absent' });
+      expect(prepare).toHaveBeenCalledWith({
+        brief: 'Build a reviewer', cwd: '/workspace', settingsConfigPath: '/workspace/agent.settings.json',
+        generatorAgent: 'architect', id: 'reviewer', provider: 'mistral', model: 'codestral-latest',
+      });
+      expect(validate).toHaveBeenCalledWith(expect.objectContaining({ agent: prepared.agent, generatorAgent: 'architect' }));
+    } finally {
+      prepare.mockRestore();
+      validate.mockRestore();
+      await runtime.close();
+    }
+  });
+
+  it('rejects draft overrides negotiated before protocol 1.19', async () => {
+    const { runtime } = createRuntime();
+    await runtime.handleRpc(request({ id: 'init', method: 'initialize', params: { protocolVersion: '1.18', clientInfo: { name: 'desktop' } } }));
+    await expect(runtime.handleRpc(request({
+      id: 'draft', method: 'agent/createDraft', params: { brief: 'Build a reviewer', id: 'reviewer' },
+    }))).rejects.toMatchObject({ code: 'INVALID_PARAMS', jsonRpcCode: JSON_RPC_ERROR_CODES.invalidParams });
   });
 
   it('inspects the desktop-safe catalog and pins an exact agent in protocol 1.14', async () => {

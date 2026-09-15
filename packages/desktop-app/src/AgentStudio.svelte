@@ -3,7 +3,7 @@
   import BrandMark from './BrandMark.svelte';
   import { aggregateRecentWork, agentsNeedingAttention, filterAndSortAgents, isInspectable, parseAgentJson } from './agent-studio';
   import { formatTimestamp } from './timestamp';
-  import { archiveAgentConfig, exportAgentConfig, generateAgentDraft, getDesktopCatalogStatus, listenCatalogStatusChanged, openAgentWindow, quitCancel, quitTerminate, quitWait, readAgentConfig, restoreAgentConfig, saveAgentConfig, validateAgentConfig, type AgentConfigPreview, type DesktopCatalogAgent, type DesktopCatalogStatus } from './desktop';
+  import { archiveAgentConfig, exportAgentConfig, generateAgentDraft, getDesktopCatalogStatus, listenCatalogStatusChanged, openAgentWindow, quitCancel, quitTerminate, quitWait, readAgentConfig, restoreAgentConfig, saveAgentConfig, validateAgentConfig, type AgentConfigPreview, type AgentCreateProvider, type DesktopCatalogAgent, type DesktopCatalogStatus } from './desktop';
 
   let catalog: DesktopCatalogStatus | undefined;
   let loading = true;
@@ -20,6 +20,10 @@
   let builderMode: 'describe' | 'json' = 'describe';
   let builderStep: 'input' | 'review' = 'input';
   let builderBrief = '';
+  let builderGeneratorAgent = '';
+  let builderId = '';
+  let builderProvider: AgentCreateProvider | '' = '';
+  let builderModel = '';
   let builderJson = '';
   let builderNotes: string[] = [];
   let builderRecommendations: string[] = [];
@@ -31,6 +35,7 @@
   $: agents = filterAndSortAgents(catalog?.agents ?? [], query, showArchived);
   $: recent = aggregateRecentWork(catalog?.agents ?? []);
   $: attention = agentsNeedingAttention(catalog?.agents ?? []);
+  $: generatorAgents = (catalog?.agents ?? []).filter((agent) => !agent.archived && agent.validationState === 'valid');
 
   async function loadCatalog() {
     try {
@@ -106,6 +111,7 @@
   }
   function openBuilder(mode: 'describe' | 'json') {
     builderOpen = true; builderMode = mode; builderStep = 'input'; builderBrief = ''; builderJson = '';
+    builderGeneratorAgent = catalog?.currentAgentId ?? ''; builderId = ''; builderProvider = ''; builderModel = '';
     builderNotes = []; builderRecommendations = []; builderPreview = undefined; builderError = ''; builderEditing = undefined;
   }
   async function editProfile(agent: DesktopCatalogAgent) {
@@ -126,7 +132,13 @@
     builderBusy = true; builderError = '';
     try {
       if (builderMode === 'describe') {
-        const prepared = await generateAgentDraft(builderBrief);
+        const prepared = await generateAgentDraft({
+          brief: builderBrief,
+          ...(builderGeneratorAgent ? { generatorAgent: builderGeneratorAgent } : {}),
+          ...(builderId.trim() ? { id: builderId.trim() } : {}),
+          ...(builderProvider ? { provider: builderProvider } : {}),
+          ...(builderModel.trim() ? { model: builderModel.trim() } : {}),
+        });
         builderPreview = prepared; builderNotes = prepared.notes; builderRecommendations = prepared.recommendations;
         builderJson = JSON.stringify(prepared.agent, null, 2);
       } else {
@@ -184,7 +196,14 @@
         <header><div><span>Agent builder</span><h2 id="agent-builder-title">{builderEditing ? `Edit ${builderEditing.name}` : builderStep === 'input' ? 'Create a specialist agent' : 'Review agent profile'}</h2></div><button type="button" aria-label="Close" on:click={() => builderOpen = false}>×</button></header>
         {#if builderStep === 'input'}
           <div class="builder-tabs"><button class:active={builderMode === 'describe'} on:click={() => builderMode = 'describe'}>Describe agent</button><button class:active={builderMode === 'json'} on:click={() => builderMode = 'json'}>Paste JSON</button></div>
-          {#if builderMode === 'describe'}<label><span>Description</span><textarea rows="8" bind:value={builderBrief} placeholder="Build a security review agent that inspects TypeScript changes, explains risks, and recommends focused tests."></textarea></label>
+          {#if builderMode === 'describe'}
+            <label><span>Description</span><textarea rows="8" bind:value={builderBrief} placeholder="Build a security review agent that inspects TypeScript changes, explains risks, and recommends focused tests."></textarea></label>
+            <div class="builder-options">
+              <label><span>Generator agent</span><select bind:value={builderGeneratorAgent}><option value="">Current agent</option>{#each generatorAgents as agent}<option value={agent.id}>{agent.name} ({agent.id})</option>{/each}</select></label>
+              <label><span>Agent ID</span><input bind:value={builderId} placeholder="Generate automatically" /></label>
+              <label><span>Provider</span><select bind:value={builderProvider}><option value="">Inherit from generator</option><option value="openrouter">OpenRouter</option><option value="ollama">Ollama</option><option value="mistral">Mistral</option><option value="mesh">Mesh</option></select></label>
+              <label><span>Model</span><input bind:value={builderModel} placeholder="Inherit from generator" /></label>
+            </div>
           {:else}<label><span>Agent JSON</span><textarea class="code-editor" rows="16" bind:value={builderJson} placeholder={'{"version":1,"id":"security-reviewer",...}'}></textarea></label>{/if}
           <p class="builder-help">Description mode uses the existing <code>adaptive-agent agent-create</code> generation path. Nothing is written until you review and confirm.</p>
           {#if builderError}<div class="alert" role="alert">{builderError}</div>{/if}

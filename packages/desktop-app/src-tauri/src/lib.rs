@@ -651,9 +651,9 @@ impl AgentRuntimeManager {
             &probe_selection,
         )?;
         let result = (|| {
-            let negotiated = probe.request_wait("initialize", json!({ "protocolVersion": "1.18", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }), REQUEST_TIMEOUT)?;
-            if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.18") {
-                return Err("The sidecar did not negotiate desktop protocol 1.18.".into());
+            let negotiated = probe.request_wait("initialize", json!({ "protocolVersion": "1.19", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }), REQUEST_TIMEOUT)?;
+            if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.19") {
+                return Err("The sidecar did not negotiate desktop protocol 1.19.".into());
             }
             let value = probe.request_wait("agents/list", json!({}), REQUEST_TIMEOUT)?;
             serde_json::from_value(value)
@@ -2271,11 +2271,11 @@ impl Bridge {
     fn initialize(self: &Arc<Self>) -> Result<(), String> {
         let negotiated = self.request_wait(
             "initialize",
-            json!({ "protocolVersion": "1.18", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }),
+            json!({ "protocolVersion": "1.19", "clientInfo": { "name": "adaptive-agent-desktop", "version": "0.1.0" } }),
             REQUEST_TIMEOUT,
         ).map_err(|error| format!("The runtime handshake failed before profile loading: {error}"))?;
-        if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.18") {
-            return Err("The sidecar did not negotiate desktop protocol 1.18.".into());
+        if negotiated.get("protocolVersion").and_then(Value::as_str) != Some("1.19") {
+            return Err("The sidecar did not negotiate desktop protocol 1.19.".into());
         }
         let initialized = self.request_wait(
             "runtime/initialize",
@@ -4678,6 +4678,9 @@ async fn desktop_catalog_status(app: AppHandle) -> Result<DesktopCatalogStatus, 
 async fn generate_agent_draft(
     brief: String,
     generator_agent: Option<String>,
+    id: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<Value, String> {
     if brief.trim().is_empty() {
@@ -4692,6 +4695,15 @@ async fn generate_agent_draft(
         let mut params = json!({ "brief": brief });
         if let Some(generator_agent) = generator_agent {
             params["generatorAgent"] = Value::String(generator_agent);
+        }
+        if let Some(id) = id {
+            params["id"] = Value::String(id);
+        }
+        if let Some(provider) = provider {
+            params["provider"] = Value::String(provider);
+        }
+        if let Some(model) = model {
+            params["model"] = Value::String(model);
         }
         bridge.request_wait("agent/createDraft", params, AGENT_BUILDER_TIMEOUT)
     })
