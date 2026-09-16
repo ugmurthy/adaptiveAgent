@@ -10,27 +10,36 @@ import { cacheKey, databaseIdentity, effectiveCacheTtl, parseCacheDuration, read
 import { usageForArgs } from './trace-session/constants.js';
 import type { EventType, MilestoneEntry, TraceAggregateObservation, TraceReport, TraceRow } from './trace-session.js';
 import { SQLITE_TRACE_DATABASE_OPTIONS } from './trace-session/reader.js';
-import { filterSessions, sessionTitleFromRuns } from './trace-session/data.js';
+import { filterSessions, sessionPresentationFromRuns } from './trace-session/data.js';
 import type { SessionListItem } from './trace-session/types.js';
 
-describe('session title projection', () => {
-  it('prefers preparation output and never falls back to internal orchestration prompts', () => {
-    const selection = { goal: 'Select the single best agent profile.', metadata: { command: 'agent-selection', role: 'agent-selector' } };
-    const preparation = {
-      goal: 'Prepare the supplied original objective.',
-      metadata: { command: 'task-preparation', role: 'task-preparer', taskPreparation: { originalObjective: 'Train for a trail race' } },
-      result: { title: '30K Trail Race Training Plan' },
-    };
-    const execution = {
-      goal: 'Prepared execution instructions',
-      metadata: { taskPreparation: { title: 'Propagated Title', originalObjective: 'Train for a trail race' } },
-    };
+describe('session presentation projection', () => {
+  it('uses persisted task-preparation title and name from the earliest non-internal root', () => {
+    const runs = [
+      { rootRunId: 'selector', startedAt: '2026-01-01T00:00:00Z', goal: 'Select an agent', metadata: { command: 'agent-selection' } },
+      { rootRunId: 'later', startedAt: '2026-01-03T00:00:00Z', goal: 'Later goal', metadata: { taskPreparation: { title: 'Later title', name: 'later-name' } } },
+      { rootRunId: 'owner', startedAt: '2026-01-02T00:00:00Z', goal: 'Prepared execution goal', metadata: { taskPreparation: { title: 'Trail Race Plan', name: 'trail-race-plan' } } },
+    ];
+    expect(sessionPresentationFromRuns(runs, 'session-1')).toEqual({ title: 'Trail Race Plan', name: 'trail-race-plan' });
+  });
 
-    expect(sessionTitleFromRuns([selection, preparation, execution])).toBe('30K Trail Race Training Plan');
-    expect(sessionTitleFromRuns([selection, { ...preparation, result: undefined }, execution])).toBe('Propagated Title');
-    expect(sessionTitleFromRuns([selection, { ...preparation, result: undefined }, { goal: execution.goal }])).toBe('Train for a trail race');
-    expect(sessionTitleFromRuns([selection, { goal: 'Actual task' }])).toBe('Actual task');
-    expect(sessionTitleFromRuns([selection])).toBeUndefined();
+  it('falls back deterministically for missing, blank, and malformed preparation values', () => {
+    expect(sessionPresentationFromRuns([{
+      rootRunId: 'root-abcdef12', startedAt: '2026-01-01T00:00:00Z', goal: '  Original goal  ',
+      metadata: { taskPreparation: { title: ' ', name: 'Not Kebab', preparationRunId: '12345678-abcd' } },
+    }], 'session-1')).toEqual({ title: 'Original goal', name: 'task-12345678' });
+    expect(sessionPresentationFromRuns([{
+      rootRunId: 'root-abcdef12', startedAt: '2026-01-01T00:00:00Z', goal: null, metadata: { taskPreparation: 'malformed' },
+    }], 'session-1')).toEqual({ title: 'session-1', name: 'task-root-abc' });
+  });
+
+  it('uses timestamp then root ID to choose the owner independently of input ordering', () => {
+    const tied = [
+      { rootRunId: 'root-b', startedAt: '2026-01-01T00:00:00Z', goal: 'B' },
+      { rootRunId: 'root-a', startedAt: '2026-01-01T00:00:00Z', goal: 'A' },
+    ];
+    expect(sessionPresentationFromRuns(tied, null)).toEqual({ title: 'A', name: 'task-root-a' });
+    expect(sessionPresentationFromRuns(tied.reverse(), null)).toEqual({ title: 'A', name: 'task-root-a' });
   });
 });
 
@@ -41,13 +50,13 @@ describe('trace-session CLI helpers', () => {
       completedAt: null, goal: text, linkedAt: '2026-07-01T00:00:00Z',
     });
     const sessions: SessionListItem[] = [
-      { sessionId: 'tie-b', startedAt: '2026-07-09T00:00:00Z', goals: [goal('b', 9)] },
-      { sessionId: 'middle', startedAt: '2026-07-08T00:00:00Z', goals: [goal('middle', 8)] },
-      { sessionId: 'old-session', startedAt: '2026-07-01T00:00:00Z', goals: [goal('old', 1), goal('new-z', 10), goal('new-a', 10)] },
-      { sessionId: 'tie-a', startedAt: '2026-07-09T00:00:00Z', goals: [goal('a', 9)] },
-      { sessionId: 'empty', startedAt: '2026-07-11T00:00:00Z', goals: [] },
-      { sessionId: 'filtered', startedAt: '2026-07-12T00:00:00Z', goals: [goal('exclude', 12, 'other'), goal('include', 2)] },
-      { sessionId: null, startedAt: 'invalid', goals: [ { ...goal('unknown', 1), startedAt: 'invalid' } ] },
+      { sessionId: 'tie-b', startedAt: '2026-07-09T00:00:00Z', title: 'tie-b', name: 'tie-b', goals: [goal('b', 9)] },
+      { sessionId: 'middle', startedAt: '2026-07-08T00:00:00Z', title: 'middle', name: 'middle', goals: [goal('middle', 8)] },
+      { sessionId: 'old-session', startedAt: '2026-07-01T00:00:00Z', title: 'old', name: 'old', goals: [goal('old', 1), goal('new-z', 10), goal('new-a', 10)] },
+      { sessionId: 'tie-a', startedAt: '2026-07-09T00:00:00Z', title: 'tie-a', name: 'tie-a', goals: [goal('a', 9)] },
+      { sessionId: 'empty', startedAt: '2026-07-11T00:00:00Z', title: 'empty', name: 'empty', goals: [] },
+      { sessionId: 'filtered', startedAt: '2026-07-12T00:00:00Z', title: 'filtered', name: 'filtered', goals: [goal('exclude', 12, 'other'), goal('include', 2)] },
+      { sessionId: null, startedAt: 'invalid', title: 'unknown', name: 'unknown', goals: [ { ...goal('unknown', 1), startedAt: 'invalid' } ] },
     ];
     const first = filterSessions(sessions, { hasGoal: true, goals: ['match'], limit: 1 });
     expect(first[0]?.sessionId).toBe('old-session');
@@ -832,6 +841,8 @@ describe('trace-session CLI helpers', () => {
         {
           sessionId: 'session-newest-full-id',
           startedAt: '2026-04-16T10:00:00.000Z',
+          title: 'Incident timeline',
+          name: 'incident-timeline',
           status: 'succeeded',
           goals: [
             {
@@ -848,12 +859,16 @@ describe('trace-session CLI helpers', () => {
         {
           sessionId: 'session-older-full-id',
           startedAt: '2026-04-16T09:00:00.000Z',
+          title: 'Older session',
+          name: 'older-session',
           status: 'unknown',
           goals: [],
         },
         {
           sessionId: null,
           startedAt: '2026-04-16T08:00:00.000Z',
+          title: 'SDK-only run',
+          name: 'sdk-only-run',
           status: 'succeeded',
           goals: [
             {
@@ -886,6 +901,8 @@ describe('trace-session CLI helpers', () => {
       [{
         sessionId: 'session-1',
         startedAt: now(),
+        title: 'Finish the task',
+        name: 'finish-the-task',
         goals: [{
           rootRunId: 'root-1',
           runId: 'root-1',
@@ -903,6 +920,8 @@ describe('trace-session CLI helpers', () => {
       {
         sessionId: 'session-1',
         startedAt: now(),
+        title: 'Finish the task',
+        name: 'finish-the-task',
         goals: [{
           rootRunId: 'root-1',
           runId: 'root-1',
@@ -946,7 +965,10 @@ describe('trace-session CLI helpers', () => {
                 completed_at: '2026-04-16T11:00:05.000Z',
                 status: 'succeeded',
                 goal: 'CLI swarm run',
-                metadata: { orchestration: { kind: 'swarm', coordinatorRunId: 'root-from-swarm', role: 'coordinator' } },
+                metadata: {
+                  orchestration: { kind: 'swarm', coordinatorRunId: 'root-from-swarm', role: 'coordinator' },
+                  taskPreparation: { title: 'Prepared swarm title', name: 'prepared-swarm-name' },
+                },
               },
               {
                 session_id: null,
@@ -969,10 +991,14 @@ describe('trace-session CLI helpers', () => {
     expect(sessions).toEqual([
       expect.objectContaining({
         sessionId: 'swarm-session-1',
+        title: 'Prepared swarm title',
+        name: 'prepared-swarm-name',
         goals: [expect.objectContaining({ rootRunId: 'root-from-swarm', type: 'swarm', swarmRole: 'coordinator' })],
       }),
       expect.objectContaining({
         sessionId: null,
+        title: 'Detached SDK run',
+        name: 'task-root-wit',
         goals: [expect.objectContaining({ rootRunId: 'root-without-session' })],
       }),
     ]);
@@ -986,7 +1012,13 @@ describe('trace-session CLI helpers', () => {
     const goal = (rootRunId: string, runId = rootRunId): SessionListItem['goals'][number] => ({
       rootRunId, runId, status: 'succeeded', startedAt: timestamp, completedAt: timestamp, goal: runId, linkedAt: timestamp,
     });
-    const gateway = [{ session_id: 'shared', started_at: '2026-07-01T00:00:00.000Z', status: 'succeeded', goals: [goal('linked'), goal('linked', 'linked-child')] }];
+    const gateway = [{
+      session_id: 'shared', started_at: '2026-07-01T00:00:00.000Z', status: 'succeeded',
+      goals: [
+        { ...goal('linked'), metadata: { taskPreparation: { title: 'Authoritative title', name: 'authoritative-name' } } },
+        goal('linked', 'linked-child'),
+      ],
+    }];
     const recovered = [
       { session_id: 'shared', root_run_id: 'recovered-a' },
       { session_id: 'shared', root_run_id: 'recovered-b' },
@@ -1024,10 +1056,13 @@ describe('trace-session CLI helpers', () => {
     expect(pages[3]?.goals.map(item => [item.rootRunId, item.runId])).toEqual([
       ['linked', 'linked'], ['linked', 'linked-child'], ['recovered-a', 'recovered-a'], ['recovered-b', 'recovered-b'],
     ]);
+    expect(pages[3]).toMatchObject({ title: 'Authoritative title', name: 'authoritative-name' });
     expect(pages[3]?.startedAt).toBe('2026-07-01T00:00:00.000Z');
     expect(gateway[0]!.goals).toHaveLength(2);
     const filtered = await listSessions(client as never, { goals: ['recovered-b'], limit: 1 }, support);
     expect(filtered[0]?.goals.map(item => item.runId)).toEqual(['recovered-b']);
+    expect(filtered[0]).toMatchObject({ title: 'Authoritative title', name: 'authoritative-name' });
+    expect(JSON.stringify(filtered)).not.toContain('metadata');
     const unrecovered = await listSessions(client as never, { recoverAgentRunSessionIds: false }, support);
     expect(unrecovered.filter(item => item.sessionId === 'shared')[0]?.goals).toHaveLength(2);
     expect(unrecovered.find(item => item.goals[0]?.runId === 'recovered-a')?.sessionId).toBeNull();
@@ -1070,6 +1105,7 @@ describe('trace-session CLI helpers', () => {
                 startedAt: '2026-04-16T11:00:00.000Z',
                 completedAt: '2026-04-16T11:00:05.000Z',
                 goal: 'Core-only CLI run',
+                metadata: { taskPreparation: { title: 'Core authoritative title', name: 'core-authoritative-name' } },
                 linkedAt: '2026-04-16T11:00:00.000Z',
               }],
             }],
@@ -1087,6 +1123,8 @@ describe('trace-session CLI helpers', () => {
     await expect(listSessions(client as never)).resolves.toEqual([
       expect.objectContaining({
         sessionId: 'core-session-1',
+        title: 'Core authoritative title',
+        name: 'core-authoritative-name',
         goals: [expect.objectContaining({ rootRunId: 'core-root-1' })],
       }),
     ]);
@@ -1342,21 +1380,29 @@ describe('trace-session CLI helpers', () => {
         {
           sessionId: 'session-empty',
           startedAt: now(),
+          title: 'session-empty',
+          name: 'session-empty',
           goals: [],
         },
         {
           sessionId: 'session-null',
           startedAt: now(),
+          title: 'session-null',
+          name: 'session-null',
           goals: [{ rootRunId: 'root-null', runId: 'root-null', status: 'succeeded', startedAt: now(), completedAt: now(), goal: null, linkedAt: now() }],
         },
         {
           sessionId: 'session-blank',
           startedAt: now(),
+          title: 'session-blank',
+          name: 'session-blank',
           goals: [{ rootRunId: 'root-blank', runId: 'root-blank', status: 'succeeded', startedAt: now(), completedAt: now(), goal: '   ', linkedAt: now() }],
         },
         {
           sessionId: 'session-keep',
           startedAt: now(),
+          title: 'Keep me',
+          name: 'keep-me',
           goals: [{ rootRunId: 'root-keep', runId: 'root-keep', status: 'succeeded', startedAt: now(), completedAt: now(), goal: 'Keep me', linkedAt: now() }],
         },
       ],

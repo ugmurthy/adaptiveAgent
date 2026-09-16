@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 This project follows semantic versioning for release notes.
 
+## Unreleased
+
+### Changed
+
+- Made trace-session the authority for session-list `title` and `name` across
+  gateway Postgres, core-only Postgres, and SQLite, and bumped the read-only
+  sidecar protocol to `1.1` so consumers can require the new result contract.
+
 ## [0.1.47] - 2026-09-11
 
 ### Added

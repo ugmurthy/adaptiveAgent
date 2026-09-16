@@ -43,6 +43,7 @@ async function fixture(): Promise<string> {
 
   const root = run({
     id: 'root-1', context: { sessionId: 'session-1' }, rootRunId: 'root-1', goal: 'Modernize tracing',
+    metadata: { taskPreparation: { title: 'Modernize Trace Session', name: 'modernize-trace-session' } },
     status: 'succeeded', modelProvider: 'openrouter', modelName: 'test-model',
     usage: { promptTokens: 100, completionTokens: 40, reasoningTokens: 10, totalTokens: 150, estimatedCostUSD: 0.15 },
     result: { answer: 'done' }, createdAt: '2026-07-01T10:00:00.000Z', updatedAt: '2026-07-01T10:00:05.000Z', completedAt: '2026-07-01T10:00:05.000Z',
@@ -128,7 +129,9 @@ describe('SqliteTraceReader', () => {
         { provider: 'mesh', model: 'tool-model', toolCallCount: 1, usage: { totalTokens: 8, estimatedCostUSD: 0.01 } },
       ]);
 
-      expect(await service.listSessions()).toMatchObject([{ sessionId: 'session-1', status: 'succeeded' }]);
+      expect(await service.listSessions()).toMatchObject([{
+        sessionId: 'session-1', title: 'Modernize Trace Session', name: 'modernize-trace-session', status: 'succeeded',
+      }]);
       const performance = await service.listPerformance();
       expect(performance).toHaveLength(1);
       expect(performance[0]).toMatchObject({ rootRunId: 'root-1', totalDurationMs: 5_000 });
@@ -185,7 +188,7 @@ describe('SqliteTraceReader', () => {
       expect((await service.usage(options({ rootRunId: 'absent' }))).toolAccounting).toMatchObject({ totalRequests: 0, byProviderOperation: [] });
       const runtime = new TraceSidecarRuntime(service, 'sqlite', { allowMessages: false, allowReasoning: false, allowRawToolPayloads: true });
       const rpc = (method: string, params: unknown) => runtime.handle(parseTraceSidecarRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 1, method, params })));
-      await rpc('initialize', { protocolVersion: '1.0', clientInfo: { name: 'test' } });
+      await rpc('initialize', { protocolVersion: '1.1', clientInfo: { name: 'test' } });
       const usage = await rpc('trace/usage', { target: { kind: 'root-run', rootRunId: 'root-1' } }) as SessionUsageSummary;
       expect(usage.toolAccounting).toEqual(expected);
       expect(JSON.stringify(usage)).not.toContain('sensitive');
@@ -225,13 +228,17 @@ describe('SqliteTraceReader', () => {
     try {
       const runtime = new TraceSidecarRuntime(service, 'sqlite', { allowMessages: false, allowReasoning: false, allowRawToolPayloads: false });
       const rpc = (method: string, params: unknown) => runtime.handle(parseTraceSidecarRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 1, method, params })));
-      await rpc('initialize', { protocolVersion: '1.0', clientInfo: { name: 'test' } });
+      await rpc('initialize', { protocolVersion: '1.1', clientInfo: { name: 'test' } });
       let after: SessionListItem['cursor'];
       const ids: Array<string | null> = [];
       for (let i = 0; i < 4; i++) {
         const page = await rpc('trace/listSessions', { limit: 1, until: '2026-07-06T00:00:00Z', ...(after ? { after } : {}) }) as SessionListItem[];
         if (!page.length) break;
-        if (i === 0) expect(page[0]!.goals.map(goal => goal.runId)).toEqual(['newest', 'root-1']);
+        if (i === 0) {
+          expect(page[0]).toMatchObject({ title: 'Modernize Trace Session', name: 'modernize-trace-session' });
+          expect(page[0]!.goals.map(goal => goal.runId)).toEqual(['newest', 'root-1']);
+          expect(JSON.stringify(page[0])).not.toContain('metadata');
+        }
         ids.push(page[0]!.sessionId);
         after = page[0]!.cursor;
       }

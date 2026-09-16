@@ -128,6 +128,7 @@ export class TraceSidecarRuntime {
     return {
       compare: true,
       aggregate: true,
+      authoritativeSessionPresentation: true,
       messages: this.policy.allowMessages || this.policy.allowReasoning,
       reasoning: this.policy.allowReasoning,
       rawToolPayloads: this.policy.allowRawToolPayloads,

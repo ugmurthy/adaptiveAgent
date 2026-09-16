@@ -43,6 +43,12 @@ import type {
   SwarmRole,
 } from './types.js';
 
+const SESSION_PRESENTATION_RUNS = Symbol('sessionPresentationRuns');
+const sessionlessPresentationRuns = new WeakMap<object, PresentationRun>();
+
+type PresentationRun = Record<string, unknown>;
+type InternalSessionListItem = SessionListItem & { [SESSION_PRESENTATION_RUNS]?: PresentationRun[] };
+
 export type ListFilterOptions = Pick<CliOptions, 'goals' | 'goalRegex' | 'hasGoal' | 'noGoal' | 'statuses' | 'limit' | 'types' | 'swarmRole' | 'since' | 'until'> & { after?: SessionListCursor };
 
 interface TraceSupport {
@@ -241,18 +247,16 @@ export async function listSessions(
     listSessionlessRuns(client, support),
   ]);
 
-  const sessions = sessionResult.rows.map((row) => ({
+  const sessions = sessionResult.rows.map((row) => withSessionPresentation({
     sessionId: row.session_id,
     startedAt: row.started_at,
-    ...(sessionTitleFromRuns(row.goals) ? { title: sessionTitleFromRuns(row.goals) } : {}),
     status: row.status,
     goals: parseSessionGoals(row.goals),
-  }));
+  }, presentationRuns(row.goals)));
 
-  const sessionless = sessionlessRuns.map((run): SessionListItem => ({
+  const sessionless = sessionlessRuns.map((run): SessionListItem => withSessionPresentation({
     sessionId: recoverAgentRunSessionIds ? run.sessionId ?? null : null,
     startedAt: run.startedAt,
-    ...(nonEmptyString(run.goal) ? { title: nonEmptyString(run.goal) } : {}),
     status: run.status ?? undefined,
     goals: [{
       rootRunId: run.rootRunId,
@@ -265,7 +269,9 @@ export async function listSessions(
       type: run.type,
       swarmRole: run.swarmRole,
     }],
-  }));
+  }, [sessionlessPresentationRuns.get(run) ?? {
+    rootRunId: run.rootRunId, startedAt: run.startedAt, goal: run.goal,
+  }]));
 
   return filterSessions([...sessions, ...sessionless], options);
 }
@@ -537,15 +543,24 @@ export async function listSessionlessRuns(
     ${limit === undefined ? '' : 'limit $1'}
   `, limit === undefined ? undefined : [limit]);
 
-  return result.rows.map((row) => ({
-    sessionId: row.session_id,
-    rootRunId: row.root_run_id,
-    startedAt: row.started_at,
-    completedAt: row.completed_at,
-    status: row.status,
-    goal: row.goal,
-    ...classifyListItem({ metadata: row.metadata }),
-  }));
+  return result.rows.map((row) => {
+    const item: SessionlessRunListItem = {
+      sessionId: row.session_id,
+      rootRunId: row.root_run_id,
+      startedAt: row.started_at,
+      completedAt: row.completed_at,
+      status: row.status,
+      goal: row.goal,
+      ...classifyListItem({ metadata: row.metadata }),
+    };
+    sessionlessPresentationRuns.set(item, {
+      rootRunId: row.root_run_id,
+      startedAt: row.started_at,
+      goal: row.goal,
+      metadata: row.metadata,
+    });
+    return item;
+  });
 }
 
 async function listCoreSessions(client: PostgresClient): Promise<SessionListItem[]> {
@@ -587,17 +602,15 @@ async function listCoreSessions(client: PostgresClient): Promise<SessionListItem
     order by min(r.created_at) desc, r.session_id desc
   `);
 
-  const sessions = result.rows.map((row): SessionListItem => ({
+  const sessions = result.rows.map((row): SessionListItem => withSessionPresentation({
     sessionId: row.session_id,
     startedAt: row.started_at,
-    ...(sessionTitleFromRuns(row.goals) ? { title: sessionTitleFromRuns(row.goals) } : {}),
     status: row.status,
     goals: parseSessionGoals(row.goals),
-  }));
-  const sessionless = (await listCoreSessionlessRuns(client)).map((run): SessionListItem => ({
+  }, presentationRuns(row.goals)));
+  const sessionless = (await listCoreSessionlessRuns(client)).map((run): SessionListItem => withSessionPresentation({
     sessionId: null,
     startedAt: run.startedAt,
-    ...(nonEmptyString(run.goal) ? { title: nonEmptyString(run.goal) } : {}),
     status: run.status ?? undefined,
     goals: [{
       rootRunId: run.rootRunId,
@@ -610,7 +623,9 @@ async function listCoreSessions(client: PostgresClient): Promise<SessionListItem
       type: run.type,
       swarmRole: run.swarmRole,
     }],
-  }));
+  }, [sessionlessPresentationRuns.get(run) ?? {
+    rootRunId: run.rootRunId, startedAt: run.startedAt, goal: run.goal,
+  }]));
 
   return [...sessions, ...sessionless].sort((left, right) =>
     Date.parse(right.startedAt) - Date.parse(left.startedAt)
@@ -643,15 +658,24 @@ async function listCoreSessionlessRuns(client: PostgresClient, limit?: number): 
     ${limit === undefined ? '' : 'limit $1'}
   `, limit === undefined ? undefined : [limit]);
 
-  return result.rows.map((row) => ({
-    sessionId: row.session_id,
-    rootRunId: row.root_run_id,
-    startedAt: row.started_at,
-    completedAt: row.completed_at,
-    status: row.status,
-    goal: row.goal,
-    ...classifyListItem({ metadata: row.metadata }),
-  }));
+  return result.rows.map((row) => {
+    const item: SessionlessRunListItem = {
+      sessionId: row.session_id,
+      rootRunId: row.root_run_id,
+      startedAt: row.started_at,
+      completedAt: row.completed_at,
+      status: row.status,
+      goal: row.goal,
+      ...classifyListItem({ metadata: row.metadata }),
+    };
+    sessionlessPresentationRuns.set(item, {
+      rootRunId: row.root_run_id,
+      startedAt: row.started_at,
+      goal: row.goal,
+      metadata: row.metadata,
+    });
+    return item;
+  });
 }
 
 function parseSessionGoals(value: unknown): SessionListItem['goals'] {
@@ -687,11 +711,9 @@ function parseSessionGoals(value: unknown): SessionListItem['goals'] {
   });
 }
 
-export function sessionTitleFromRuns(value: unknown): string | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const runs = value.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object' && !Array.isArray(item)));
+export function sessionPresentationFromRuns(value: unknown, sessionId: string | null): { title: string; name: string } {
+  const runs = presentationRuns(value);
   const metadata = (run: Record<string, unknown>) => asRecord(run.metadata);
-  const preparation = (run: Record<string, unknown>) => asRecord(metadata(run)?.taskPreparation);
   const isInternal = (run: Record<string, unknown>) => {
     const details = metadata(run);
     return details?.command === 'task-preparation'
@@ -699,11 +721,62 @@ export function sessionTitleFromRuns(value: unknown): string | undefined {
       || details?.role === 'task-preparer'
       || details?.role === 'agent-selector';
   };
-  const preparationTitle = runs.find((run) => metadata(run)?.command === 'task-preparation');
-  return nonEmptyString(asRecord(preparationTitle?.result)?.title)
-    ?? runs.map((run) => nonEmptyString(preparation(run)?.title)).find(Boolean)
-    ?? runs.map((run) => nonEmptyString(preparation(run)?.originalObjective)).find(Boolean)
-    ?? runs.filter((run) => !isInternal(run)).map((run) => nonEmptyString(run.goal)).find(Boolean);
+  const ordered = [...runs].sort(comparePresentationRuns);
+  const owner = ordered.find((run) => !isInternal(run)) ?? ordered[0];
+  const preparation = asRecord(metadata(owner ?? {})?.taskPreparation);
+  const rootRunId = nonEmptyString(owner?.rootRunId) ?? nonEmptyString(owner?.runId);
+  const identifier = nonEmptyString(sessionId) ?? rootRunId ?? 'unknown-session';
+  const title = validPreparationTitle(preparation?.title) ?? nonEmptyString(owner?.goal) ?? identifier;
+  const name = validPreparationName(preparation?.name)
+    ?? taskNameFromId(nonEmptyString(preparation?.preparationRunId) ?? firstString(preparation?.preparationRunIds) ?? rootRunId ?? identifier);
+  return { title, name };
+}
+
+function presentationRuns(value: unknown): PresentationRun[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is PresentationRun => Boolean(item && typeof item === 'object' && !Array.isArray(item)))
+    : [];
+}
+
+function comparePresentationRuns(left: PresentationRun, right: PresentationRun): number {
+  const leftTime = presentationTimestamp(left);
+  const rightTime = presentationTimestamp(right);
+  return leftTime - rightTime
+    || compareListKey(nonEmptyString(left.rootRunId) ?? nonEmptyString(left.runId) ?? '', nonEmptyString(right.rootRunId) ?? nonEmptyString(right.runId) ?? '');
+}
+
+function presentationTimestamp(run: PresentationRun): number {
+  const parsed = Date.parse(nonEmptyString(run.startedAt) ?? nonEmptyString(run.createdAt) ?? '');
+  return Number.isFinite(parsed) ? parsed : Number.POSITIVE_INFINITY;
+}
+
+function validPreparationTitle(value: unknown): string | undefined {
+  const title = nonEmptyString(value);
+  return title && title.length <= 80 ? title : undefined;
+}
+
+function validPreparationName(value: unknown): string | undefined {
+  const name = nonEmptyString(value);
+  return name && name.length <= 64 && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name) ? name : undefined;
+}
+
+function firstString(value: unknown): string | undefined {
+  return Array.isArray(value) ? value.map(nonEmptyString).find(Boolean) : undefined;
+}
+
+function taskNameFromId(value: string): string {
+  const prefix = value.slice(0, 8).toLowerCase();
+  if (/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(prefix)) return `task-${prefix}`;
+  let hash = 2166136261;
+  for (const character of value) hash = Math.imul(hash ^ character.charCodeAt(0), 16777619);
+  return `task-${(hash >>> 0).toString(16).padStart(8, '0')}`;
+}
+
+function withSessionPresentation<T extends Omit<SessionListItem, 'title' | 'name'>>(
+  session: T,
+  runs: PresentationRun[],
+): T & SessionListItem {
+  return Object.assign(session, sessionPresentationFromRuns(runs, session.sessionId), { [SESSION_PRESENTATION_RUNS]: runs });
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -732,7 +805,7 @@ export function filterSessions(sessions: SessionListItem[], options: ListFilterO
   const now = Date.now();
   const since = parseListTimeBoundary(options.since, now);
   const until = parseListTimeBoundary(options.until, now);
-  const filtered = mergeSessionGroups(sessions).flatMap((session) => {
+  const filtered = mergeSessionGroups(sessions).map(resolveInternalPresentation).flatMap((session) => {
     if (session.goals.length === 0) {
       const statusMatches = statuses.size === 0 || statuses.has(session.status ?? 'unknown');
       const requestsGoalContent = options.hasGoal || textGoals.length > 0 || options.goalRegex !== undefined;
@@ -765,7 +838,7 @@ export function filterSessions(sessions: SessionListItem[], options: ListFilterO
     };
   }).sort((left, right) => compareSessionCursor(left.cursor, right.cursor));
   const page = options.after ? filtered.filter(session => compareSessionCursor(session.cursor, options.after!) > 0) : filtered;
-  return options.limit === undefined ? page : page.slice(0, options.limit);
+  return (options.limit === undefined ? page : page.slice(0, options.limit)).map(withoutInternalPresentation);
 }
 
 function mergeSessionGroups(sessions: SessionListItem[]): SessionListItem[] {
@@ -789,10 +862,24 @@ function mergeSessionGroups(sessions: SessionListItem[]): SessionListItem[] {
       if (!goals.has(key)) goals.set(key, goal);
     }
     existing.goals = [...goals.values()];
-    if (!existing.title && session.title) existing.title = session.title;
+    const existingRuns = (existing as InternalSessionListItem)[SESSION_PRESENTATION_RUNS] ?? [];
+    const addedRuns = (session as InternalSessionListItem)[SESSION_PRESENTATION_RUNS] ?? [];
+    if (existingRuns.length || addedRuns.length) {
+      (existing as InternalSessionListItem)[SESSION_PRESENTATION_RUNS] = [...existingRuns, ...addedRuns];
+    }
     if (listTimestamp(session.startedAt) < listTimestamp(existing.startedAt)) existing.startedAt = session.startedAt;
   }
   return groups;
+}
+
+function resolveInternalPresentation(session: SessionListItem): SessionListItem {
+  const runs = (session as InternalSessionListItem)[SESSION_PRESENTATION_RUNS];
+  return runs ? Object.assign(session, sessionPresentationFromRuns(runs, session.sessionId)) : session;
+}
+
+function withoutInternalPresentation(session: SessionListItem): SessionListItem {
+  const { [SESSION_PRESENTATION_RUNS]: _runs, ...publicSession } = session as InternalSessionListItem;
+  return publicSession;
 }
 
 function listTimestamp(value: string | null): number {
