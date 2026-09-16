@@ -216,6 +216,7 @@ export class DesktopRuntime {
         const parts = await this.validateAndTranslateAttachments(params.attachments ?? []);
         const selected = await this.selectDesktopRunSdk(fallbackSdk, params.goal, params.attachments ?? [], sessionId);
         const sdk = selected.sdk;
+        this.writeRunAgentSelected(executionId, sdk);
         const fileAccess = await this.fileAccessContext(params.attachments ?? [], sdk);
         const preparation = await this.prepareRunTask(sdk, params.goal, params.attachments ?? [], sessionId);
         if (preparation && preparation.decision !== 'complete' && preparation.decision !== 'enhance') {
@@ -834,6 +835,23 @@ export class DesktopRuntime {
 
   private writeAgentEvent(event: AgentEvent): void {
     this.write({ jsonrpc: '2.0', method: 'agent/event', params: asJsonValue(event) });
+  }
+
+  private writeRunAgentSelected(runId: string, sdk: AgentSdk): void {
+    if (this.negotiatedProtocolVersion !== '1.19') return;
+    this.write({
+      jsonrpc: '2.0',
+      method: 'agent/event',
+      params: {
+        schemaVersion: 1,
+        type: 'run.agent_selected',
+        runId,
+        payload: {
+          agentId: sdk.config.agent.id,
+          agentName: sdk.config.agent.name,
+        },
+      },
+    });
   }
 
   private async resolveApproval(runId: string, approvalId: string, approved: boolean): Promise<JsonValue> {

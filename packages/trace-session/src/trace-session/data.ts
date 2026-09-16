@@ -222,6 +222,7 @@ export async function listSessions(
             'completedAt', r.completed_at,
             'goal', r.goal,
             'metadata', r.metadata,
+            'result', r.result,
             'invocationKind', l.invocation_kind,
             'invocationMode', s.invocation_mode,
             'linkedAt', l.created_at
@@ -243,6 +244,7 @@ export async function listSessions(
   const sessions = sessionResult.rows.map((row) => ({
     sessionId: row.session_id,
     startedAt: row.started_at,
+    ...(sessionTitleFromRuns(row.goals) ? { title: sessionTitleFromRuns(row.goals) } : {}),
     status: row.status,
     goals: parseSessionGoals(row.goals),
   }));
@@ -250,6 +252,7 @@ export async function listSessions(
   const sessionless = sessionlessRuns.map((run): SessionListItem => ({
     sessionId: recoverAgentRunSessionIds ? run.sessionId ?? null : null,
     startedAt: run.startedAt,
+    ...(nonEmptyString(run.goal) ? { title: nonEmptyString(run.goal) } : {}),
     status: run.status ?? undefined,
     goals: [{
       rootRunId: run.rootRunId,
@@ -570,6 +573,7 @@ async function listCoreSessions(client: PostgresClient): Promise<SessionListItem
             'completedAt', r.completed_at,
             'goal', r.goal,
             'metadata', r.metadata,
+            'result', r.result,
             'linkedAt', r.created_at
           )
           order by r.created_at asc, r.id asc
@@ -586,12 +590,14 @@ async function listCoreSessions(client: PostgresClient): Promise<SessionListItem
   const sessions = result.rows.map((row): SessionListItem => ({
     sessionId: row.session_id,
     startedAt: row.started_at,
+    ...(sessionTitleFromRuns(row.goals) ? { title: sessionTitleFromRuns(row.goals) } : {}),
     status: row.status,
     goals: parseSessionGoals(row.goals),
   }));
   const sessionless = (await listCoreSessionlessRuns(client)).map((run): SessionListItem => ({
     sessionId: null,
     startedAt: run.startedAt,
+    ...(nonEmptyString(run.goal) ? { title: nonEmptyString(run.goal) } : {}),
     status: run.status ?? undefined,
     goals: [{
       rootRunId: run.rootRunId,
@@ -681,6 +687,33 @@ function parseSessionGoals(value: unknown): SessionListItem['goals'] {
   });
 }
 
+export function sessionTitleFromRuns(value: unknown): string | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const runs = value.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object' && !Array.isArray(item)));
+  const metadata = (run: Record<string, unknown>) => asRecord(run.metadata);
+  const preparation = (run: Record<string, unknown>) => asRecord(metadata(run)?.taskPreparation);
+  const isInternal = (run: Record<string, unknown>) => {
+    const details = metadata(run);
+    return details?.command === 'task-preparation'
+      || details?.command === 'agent-selection'
+      || details?.role === 'task-preparer'
+      || details?.role === 'agent-selector';
+  };
+  const preparationTitle = runs.find((run) => metadata(run)?.command === 'task-preparation');
+  return nonEmptyString(asRecord(preparationTitle?.result)?.title)
+    ?? runs.map((run) => nonEmptyString(preparation(run)?.title)).find(Boolean)
+    ?? runs.map((run) => nonEmptyString(preparation(run)?.originalObjective)).find(Boolean)
+    ?? runs.filter((run) => !isInternal(run)).map((run) => nonEmptyString(run.goal)).find(Boolean);
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
 function classifyListItem(record: Record<string, unknown>): { type: TraceListType; swarmRole?: SwarmRole } {
   const metadata = record.metadata && typeof record.metadata === 'object' ? record.metadata as Record<string, unknown> : {};
   const orchestration = metadata.orchestration && typeof metadata.orchestration === 'object' ? metadata.orchestration as Record<string, unknown> : {};
@@ -756,6 +789,7 @@ function mergeSessionGroups(sessions: SessionListItem[]): SessionListItem[] {
       if (!goals.has(key)) goals.set(key, goal);
     }
     existing.goals = [...goals.values()];
+    if (!existing.title && session.title) existing.title = session.title;
     if (listTimestamp(session.startedAt) < listTimestamp(existing.startedAt)) existing.startedAt = session.startedAt;
   }
   return groups;

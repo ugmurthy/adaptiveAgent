@@ -10,8 +10,29 @@ import { cacheKey, databaseIdentity, effectiveCacheTtl, parseCacheDuration, read
 import { usageForArgs } from './trace-session/constants.js';
 import type { EventType, MilestoneEntry, TraceAggregateObservation, TraceReport, TraceRow } from './trace-session.js';
 import { SQLITE_TRACE_DATABASE_OPTIONS } from './trace-session/reader.js';
-import { filterSessions } from './trace-session/data.js';
+import { filterSessions, sessionTitleFromRuns } from './trace-session/data.js';
 import type { SessionListItem } from './trace-session/types.js';
+
+describe('session title projection', () => {
+  it('prefers preparation output and never falls back to internal orchestration prompts', () => {
+    const selection = { goal: 'Select the single best agent profile.', metadata: { command: 'agent-selection', role: 'agent-selector' } };
+    const preparation = {
+      goal: 'Prepare the supplied original objective.',
+      metadata: { command: 'task-preparation', role: 'task-preparer', taskPreparation: { originalObjective: 'Train for a trail race' } },
+      result: { title: '30K Trail Race Training Plan' },
+    };
+    const execution = {
+      goal: 'Prepared execution instructions',
+      metadata: { taskPreparation: { title: 'Propagated Title', originalObjective: 'Train for a trail race' } },
+    };
+
+    expect(sessionTitleFromRuns([selection, preparation, execution])).toBe('30K Trail Race Training Plan');
+    expect(sessionTitleFromRuns([selection, { ...preparation, result: undefined }, execution])).toBe('Propagated Title');
+    expect(sessionTitleFromRuns([selection, { ...preparation, result: undefined }, { goal: execution.goal }])).toBe('Train for a trail race');
+    expect(sessionTitleFromRuns([selection, { goal: 'Actual task' }])).toBe('Actual task');
+    expect(sessionTitleFromRuns([selection])).toBeUndefined();
+  });
+});
 
 describe('trace-session CLI helpers', () => {
   it('orders filtered session groups by newest matching goal and pages timestamp ties without skipping siblings', () => {

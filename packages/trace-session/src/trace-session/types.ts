@@ -171,6 +171,7 @@ export interface SessionListCursor {
 export interface SessionListItem {
   sessionId: string | null;
   startedAt: string;
+  title?: string;
   cursor?: SessionListCursor;
   status?: string;
   goals: Array<{

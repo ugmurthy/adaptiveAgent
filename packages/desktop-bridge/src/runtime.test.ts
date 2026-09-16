@@ -67,7 +67,7 @@ describe('desktop runtime protocol', () => {
     await runtime.handleRpc(request({ id: 'init', method: 'initialize', params: { protocolVersion: '1.17', clientInfo: { name: 'desktop' } } }));
     const prepareRunTask = vi.fn(async () => preparation);
     Object.assign(runtime as unknown as Record<string, unknown>, {
-      sdk: { runRaw, config: { workspaceRoot: '/workspace', settings: { taskPreparation: { mode: 'auto' } } } },
+      sdk: { runRaw, config: { agent: { id: 'developer', name: 'Developer' }, workspaceRoot: '/workspace', settings: { taskPreparation: { mode: 'auto' } } } },
       prepareRunTask,
     });
 
@@ -91,15 +91,18 @@ describe('desktop runtime protocol', () => {
   it('executes an auto-selected profile in the same session and records the selection', async () => {
     const selectedRunRaw = vi.fn(async () => ({ status: 'success', runId: 'execution-auto', output: 'done', stepsUsed: 1, usage: {} }));
     const fallback = { config: { workspaceRoot: '/workspace', settings: {} } };
-    const selectedSdk = { runRaw: selectedRunRaw, config: { workspaceRoot: '/workspace', settings: {} } };
+    const selectedSdk = {
+      runRaw: selectedRunRaw,
+      config: { agent: { id: 'researcher', name: 'Research Agent' }, workspaceRoot: '/workspace', settings: {} },
+    };
     const selection = {
       selectedAgentId: 'researcher',
       reason: 'The objective requires research.',
       selectionAgentId: 'task-preparer',
       selectionRunId: 'selection-1',
     };
-    const { runtime } = createRuntime();
-    await runtime.handleRpc(request({ id: 'init', method: 'initialize', params: { protocolVersion: '1.18', clientInfo: { name: 'desktop' } } }));
+    const { runtime, messages } = createRuntime();
+    await runtime.handleRpc(request({ id: 'init', method: 'initialize', params: { protocolVersion: '1.19', clientInfo: { name: 'desktop' } } }));
     Object.assign(runtime as unknown as Record<string, unknown>, {
       sdk: fallback,
       selectDesktopRunSdk: vi.fn(async () => ({ sdk: selectedSdk, selection })),
@@ -117,6 +120,16 @@ describe('desktop runtime protocol', () => {
         selectionRunId: 'selection-1',
       }) },
     }));
+    expect(messages).toContainEqual({
+      jsonrpc: '2.0',
+      method: 'agent/event',
+      params: {
+        schemaVersion: 1,
+        type: 'run.agent_selected',
+        runId: 'execution-auto',
+        payload: { agentId: 'researcher', agentName: 'Research Agent' },
+      },
+    });
   });
 
   it('returns a terminal preparation result when auto mode needs clarification', async () => {
@@ -130,7 +143,7 @@ describe('desktop runtime protocol', () => {
     const { runtime } = createRuntime();
     await runtime.handleRpc(request({ id: 'init', method: 'initialize', params: { protocolVersion: '1.17', clientInfo: { name: 'desktop' } } }));
     Object.assign(runtime as unknown as Record<string, unknown>, {
-      sdk: { runRaw, config: { workspaceRoot: '/workspace', settings: { taskPreparation: { mode: 'auto' } } } },
+      sdk: { runRaw, config: { agent: { id: 'deployer', name: 'Deployer' }, workspaceRoot: '/workspace', settings: { taskPreparation: { mode: 'auto' } } } },
       prepareRunTask: vi.fn(async () => preparation),
     });
 
@@ -576,7 +589,7 @@ export async function execute() { return { value }; }
     }));
     Object.assign(runtime as unknown as Record<string, unknown>, {
       managedAttachmentRoot: root,
-      sdk: { runRaw, chatRaw, config: { workspaceRoot: workspace } },
+      sdk: { runRaw, chatRaw, config: { agent: { id: 'file-agent', name: 'File Agent' }, workspaceRoot: workspace } },
     });
 
     await expect(runtime.handleRpc(request({
