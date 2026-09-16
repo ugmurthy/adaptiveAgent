@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import type { TraceService } from '../trace-session/reader.js';
-import type { TraceReport } from '../trace-session/types.js';
+import type { SessionListItem, TraceReport } from '../trace-session/types.js';
 import { parseSidecarArgs, readBoundedNdjsonFrames } from '../trace-sidecar.js';
 import {
   JSON_RPC_ERROR_CODES,
@@ -59,6 +59,15 @@ describe('trace sidecar protocol', () => {
 });
 
 describe('trace sidecar runtime policy', () => {
+  it('rejects protocol 1.0 so clients cannot mistake legacy session presentation for authoritative fields', async () => {
+    const runtime = new TraceSidecarRuntime(serviceReturning(report()), 'sqlite', {
+      allowMessages: false, allowReasoning: false, allowRawToolPayloads: false,
+    });
+    await expect(runtime.handle(request('initialize', {
+      protocolVersion: '1.0', clientInfo: { name: 'legacy-client' },
+    }))).rejects.toMatchObject({ code: 'UNSUPPORTED_PROTOCOL_VERSION', data: { supportedVersions: ['1.1'] } });
+  });
+
   it('requires initialization and reports host-authorized capabilities', async () => {
     const runtime = new TraceSidecarRuntime(serviceReturning(report()), 'sqlite', {
       allowMessages: true,
@@ -68,9 +77,9 @@ describe('trace sidecar runtime policy', () => {
     await expect(runtime.handle(request('runtime/info'))).rejects.toMatchObject({ code: 'NOT_INITIALIZED' });
 
     const initialized = await runtime.handle(request('initialize', {
-      protocolVersion: '1.0', clientInfo: { name: 'test-client' },
+      protocolVersion: '1.1', clientInfo: { name: 'test-client' },
     })) as { capabilities: Record<string, boolean>; backend: Record<string, unknown> };
-    expect(initialized.capabilities).toMatchObject({ messages: true, reasoning: false, rawToolPayloads: false });
+    expect(initialized.capabilities).toMatchObject({ authoritativeSessionPresentation: true, messages: true, reasoning: false, rawToolPayloads: false });
     expect(initialized.backend).toEqual({ kind: 'sqlite', readOnly: true });
   });
 
@@ -153,6 +162,43 @@ describe('trace sidecar runtime policy', () => {
     await runtime.handle(request('trace/listSessionlessRuns'));
     expect(service.listSessionless).toHaveBeenCalledWith(100);
   });
+
+  it('returns the authoritative trace/listSessions result shape without raw metadata', async () => {
+    const service = serviceReturning(report());
+    const sessions: SessionListItem[] = [{
+      sessionId: 'session-1',
+      startedAt: '2026-07-01T00:00:00.000Z',
+      title: 'Prepared title',
+      name: 'prepared-name',
+      status: 'succeeded',
+      cursor: { startedAt: '2026-07-01T00:00:00.000Z', key: 'session:session-1' },
+      goals: [{
+        rootRunId: 'root-1', runId: 'root-1', status: 'succeeded',
+        startedAt: '2026-07-01T00:00:00.000Z', completedAt: '2026-07-01T00:00:01.000Z',
+        goal: 'Prepared goal', linkedAt: '2026-07-01T00:00:00.000Z', type: 'run',
+      }],
+    }];
+    service.listSessions = vi.fn(async () => sessions);
+    const runtime = new TraceSidecarRuntime(service, 'postgres', {
+      allowMessages: false, allowReasoning: false, allowRawToolPayloads: false,
+    });
+    await initialize(runtime);
+    const result = await runtime.handle(request('trace/listSessions'));
+    expect(JSON.parse(JSON.stringify(result))).toEqual([{
+      sessionId: 'session-1',
+      startedAt: '2026-07-01T00:00:00.000Z',
+      title: 'Prepared title',
+      name: 'prepared-name',
+      status: 'succeeded',
+      cursor: { startedAt: '2026-07-01T00:00:00.000Z', key: 'session:session-1' },
+      goals: [{
+        rootRunId: 'root-1', runId: 'root-1', status: 'succeeded',
+        startedAt: '2026-07-01T00:00:00.000Z', completedAt: '2026-07-01T00:00:01.000Z',
+        goal: 'Prepared goal', linkedAt: '2026-07-01T00:00:00.000Z', type: 'run',
+      }],
+    }]);
+    expect(JSON.stringify(result)).not.toContain('metadata');
+  });
 });
 
 describe('trace sidecar startup policy', () => {
@@ -187,7 +233,7 @@ function request(method: string, params?: Record<string, unknown>) {
 }
 
 async function initialize(runtime: TraceSidecarRuntime): Promise<void> {
-  await runtime.handle(request('initialize', { protocolVersion: '1.0', clientInfo: { name: 'test' } }));
+  await runtime.handle(request('initialize', { protocolVersion: '1.1', clientInfo: { name: 'test' } }));
 }
 
 function serviceReturning(value: TraceReport): TraceService & { trace: ReturnType<typeof vi.fn> } {

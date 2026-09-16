@@ -171,7 +171,10 @@ export interface SessionListCursor {
 export interface SessionListItem {
   sessionId: string | null;
   startedAt: string;
-  title?: string;
+  /** Authoritative human-readable session label resolved by trace-session. */
+  title: string;
+  /** Authoritative stable kebab-case task identifier resolved by trace-session. */
+  name: string;
   cursor?: SessionListCursor;
   status?: string;
   goals: Array<{

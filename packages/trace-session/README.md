@@ -82,7 +82,7 @@ is `sqlite` (and optional `runtime.sqlitePath`) with `--settings <path>`.
 
 The `trace-session-sidecar` binary exposes the same `TraceService` over bounded
 NDJSON JSON-RPC 2.0 for desktop/native hosts. It supports SQLite and Postgres,
-requires an `initialize` handshake for protocol `1.0`, and provides runtime
+requires an `initialize` handshake for protocol `1.1`, and provides runtime
 info, trace lookup/listing, usage, comparison, aggregation, and shutdown
 methods. Persisted messages, reasoning, and raw tool payloads are denied unless
 their startup policy flags are explicitly enabled.
@@ -105,6 +105,44 @@ excluded by the sidecar projection.
 
 `trace/listSessions` returns an array of session groups sorted by the newest
 matching goal timestamp descending, then deterministic session/run identity.
+Each item has this result shape (the whole JSON-RPC result is an array):
+
+```ts
+interface SessionListItem {
+  sessionId: string | null;
+  startedAt: string;
+  title: string;
+  name: string;
+  status?: string;
+  cursor: { startedAt: string | null; key: string };
+  goals: Array<{
+    rootRunId: string;
+    runId: string;
+    status: string | null;
+    startedAt: string | null;
+    completedAt: string | null;
+    goal: string | null;
+    linkedAt: string;
+    type?: "run" | "chat" | "swarm" | "swarm-run";
+    swarmRole?: "coordinator" | "worker" | "quality" | "synthesizer";
+  }>;
+}
+```
+
+`title` and `name` are authoritative presentation values resolved by this
+package identically for gateway Postgres, core-only Postgres, and SQLite. The
+owning root is the earliest non-internal root by persisted start timestamp,
+with root-run ID as the tie-breaker; if a group contains only internal
+agent-selection/task-preparation roots, the earliest of those owns it. The
+owner is selected before filtering, ordering, or pagination. `title` uses a
+valid `metadata.taskPreparation.title`, then the owner's non-blank goal, then
+the non-blank session ID or root-run ID. `name` uses a valid kebab-case
+`metadata.taskPreparation.name`; legacy preparations use the existing Agent SDK
+rule `task-<first 8 characters of preparationRunId>`, and otherwise the same
+rule uses the owning root-run ID. Invalid ID prefixes use a deterministic hash.
+Blank, wrong-type, over-limit, or non-kebab preparation values are ignored.
+Raw run metadata is not included in the result.
+
 Gateway and recovered groups sharing a non-null session ID are merged before
 filtering and paging. Duplicate `(rootRunId, runId)` pairs collapse, while
 distinct linked runs remain visible. Missing or invalid session IDs normalize
@@ -121,6 +159,11 @@ sort accumulated goals. Use a fixed absolute `until` for a browsing window and
 refresh from the first page to discover newly inserted runs; cursors are not
 database snapshots. Older helpers without `cursor` do not support safe tied
 timestamp paging and must be upgraded rather than guessing a boundary.
+
+Protocol `1.1` makes `title` and `name` required and advertises
+`capabilities.authoritativeSessionPresentation: true`. This intentional
+handshake bump prevents consumers from silently accepting a protocol `1.0`
+sidecar whose session-list schema does not provide authoritative presentation.
 
 ## Views
 

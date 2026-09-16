@@ -1,7 +1,7 @@
-import type { SessionListCursor, SwarmRole, TraceAggregateGroupBy, TraceListType } from '../trace-session/types.js';
+import type { SessionListCursor, SessionListItem, SwarmRole, TraceAggregateGroupBy, TraceListType } from '../trace-session/types.js';
 
-export const TRACE_SIDECAR_PROTOCOL_VERSION = '1.0' as const;
-export const TRACE_SIDECAR_VERSION = '0.1.0';
+export const TRACE_SIDECAR_PROTOCOL_VERSION = '1.1' as const;
+export const TRACE_SIDECAR_VERSION = '0.2.0';
 export const TRACE_SIDECAR_DEFAULT_LIMIT = 100;
 export const TRACE_SIDECAR_MAX_LIMIT = 500;
 export const TRACE_SIDECAR_MAX_REQUEST_BYTES = 1024 * 1024;
@@ -52,6 +52,7 @@ export interface TraceListFilters {
 
 export interface TraceUsageParams { target: TraceTarget }
 export interface TraceListSessionsParams extends TraceListFilters { after?: SessionListCursor }
+export type TraceListSessionsResult = SessionListItem[];
 export interface TraceCompareParams { baselineRunId: string; candidateRunId: string }
 export interface TraceAggregateParams extends TraceListFilters { groupBy: TraceAggregateGroupBy }
 export interface TraceListSessionlessParams { limit?: number }

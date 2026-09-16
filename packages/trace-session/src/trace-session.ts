@@ -6,6 +6,8 @@ export type { TraceConfigOptions, TracePostgresConfig, TracePostgresPool, TraceR
 export { aggregateSessionPerformance, listSessionlessRuns, listSessionPerformance, listSessions, loadUsageForTraceTarget, traceSession } from './trace-session/data.js';
 export { PostgresTraceReader, SqliteTraceReader, TraceService } from './trace-session/reader.js';
 export type { TraceReader } from './trace-session/reader.js';
+export { TRACE_SIDECAR_PROTOCOL_VERSION, TRACE_SIDECAR_VERSION } from './sidecar/protocol.js';
+export type { TraceListSessionsResult } from './sidecar/protocol.js';
 export {
   buildTraceAggregateReport,
   buildTraceDiagnostics,
