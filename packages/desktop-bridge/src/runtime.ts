@@ -4,11 +4,13 @@ import {
   discoverAgentSdkAgents,
   inspectAgentSdkResolution,
   prepareTask,
+  restoreTaskPreparation,
   resolveRuntimeTarget,
   selectAgentProfile,
   type AgentSelectionResult,
   type AgentSdkCatalogAgent,
   type AgentSdkOptions,
+  type AgentSdkRunOptions,
   type AgentSettingsFile,
   type ResolvedAgentSdkConfig,
   type TaskPreparationResult,
@@ -28,7 +30,7 @@ import {
   type AdaptiveAgentCliCommand,
   type ManualTestCliOptions,
 } from '@adaptive-agent/agent-sdk/cli';
-import { RuntimeDeletionError, type AgentEvent, type ChatMessage, type JsonObject, type JsonValue, type ModelContentPart, type UUID } from '@adaptive-agent/core';
+import { RuntimeDeletionError, type AgentEvent, type ChatMessage, type FileAccessExecutionContext, type JsonObject, type JsonValue, type ModelContentPart, type UUID } from '@adaptive-agent/core';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve } from 'node:path';
@@ -56,8 +58,24 @@ import {
   type DesktopRpcRequest,
   type EditableDesktopSettings,
   type JsonRpcId,
+  type RunParams,
   type RuntimeInitializeParams,
 } from './protocol.js';
+
+interface PendingDesktopTaskPreparation {
+  schemaVersion: 1;
+  executionId: string;
+  sessionId: string;
+  originalObjective: string;
+  targetAgent: { id: string; configPath: string; configurationFingerprint: string };
+  attachments: { images: string[]; files: string[]; audio: string[] };
+  contentParts: ModelContentPart[];
+  input?: JsonValue;
+  fileAccess?: FileAccessExecutionContext;
+  inferenceTier?: InferenceTier;
+  agentSelection?: JsonObject;
+  preparations: TaskPreparationResult[];
+}
 
 export type DesktopMessageWriter = (message: DesktopMessage) => void;
 
@@ -220,6 +238,21 @@ export class DesktopRuntime {
         const fileAccess = await this.fileAccessContext(params.attachments ?? [], sdk);
         const preparation = await this.prepareRunTask(sdk, params.goal, params.attachments ?? [], sessionId);
         if (preparation && preparation.decision !== 'complete' && preparation.decision !== 'enhance') {
+          if (preparation.decision === 'clarify' && sdk.config.interaction.clarificationMode === 'interactive') {
+            const pending = this.pendingTaskPreparation(
+              executionId,
+              sessionId,
+              params,
+              sdk,
+              parts,
+              fileAccess,
+              selected.selection,
+              [preparation],
+            );
+            await this.persistPendingTaskPreparation(preparation.preparationRunId, pending);
+            const result = taskPreparationClarification(preparation);
+            return params.executionId ? executionResult(executionId, 'direct', result) : asJsonValue(result);
+          }
           const result = {
             status: 'task_preparation_stopped',
             runId: preparation.preparationRunId,
@@ -319,10 +352,7 @@ export class DesktopRuntime {
       case 'interaction/resolveApproval':
         return this.resolveApproval(request.params!.runId, request.params!.approvalId, request.params!.approved);
       case 'interaction/resolveClarification':
-        return asJsonValue(await (await this.sdkForRun(request.params!.runId)).agent.resolveClarification(
-          asRunId(request.params!.runId),
-          request.params!.answer,
-        ));
+        return this.resolveClarification(request.params!.runId, request.params!.answer);
       case 'history/previewDeletion':
         return asJsonValue(await this.requireMaintenanceStore().previewDeletion(request.params!.target));
       case 'history/delete':
@@ -776,6 +806,8 @@ export class DesktopRuntime {
     originalObjective: string,
     attachments: DesktopAttachmentInput[],
     sessionId: string,
+    clarificationAnswers?: Record<string, string>,
+    attachmentSummary?: PendingDesktopTaskPreparation['attachments'],
   ): Promise<TaskPreparationResult | undefined> {
     const mode = targetSdk.config.settings?.taskPreparation?.mode ?? 'never';
     if (mode === 'never') return undefined;
@@ -811,8 +843,9 @@ export class DesktopRuntime {
         originalObjective,
         targetAgent: targetSdk.config.agent,
         workspaceRoot: targetSdk.config.workspaceRoot,
-        attachments: { images: paths('image'), files: paths('file'), audio: paths('audio') },
+        attachments: attachmentSummary ?? { images: paths('image'), files: paths('file'), audio: paths('audio') },
         sessionId,
+        ...(clarificationAnswers ? { clarificationAnswers } : {}),
       });
     } finally {
       await preparationSdk.close();
@@ -858,6 +891,147 @@ export class DesktopRuntime {
     const sdk = await this.sdkForRun(runId);
     await sdk.agent.resolveApproval(asRunId(runId), approvalId, approved);
     return { runId, approvalId, approved, resolved: true };
+  }
+
+  private pendingTaskPreparation(
+    executionId: string,
+    sessionId: string,
+    params: RunParams,
+    sdk: AgentSdk,
+    contentParts: ModelContentPart[],
+    fileAccess: FileAccessExecutionContext | undefined,
+    selection: AgentSelectionResult | undefined,
+    preparations: TaskPreparationResult[],
+  ): PendingDesktopTaskPreparation {
+    const paths = (kind: DesktopAttachmentInput['kind']) => (params.attachments ?? [])
+      .filter((attachment) => attachment.kind === kind)
+      .map((attachment) => attachment.stagedRelativePath);
+    return {
+      schemaVersion: 1,
+      executionId,
+      sessionId,
+      originalObjective: params.goal,
+      targetAgent: {
+        id: sdk.config.agent.id,
+        configPath: sdk.agentPath,
+        configurationFingerprint: agentConfigurationFingerprint(sdk.config),
+      },
+      attachments: { images: paths('image'), files: paths('file'), audio: paths('audio') },
+      contentParts: structuredClone(contentParts),
+      ...(params.input === undefined ? {} : { input: structuredClone(params.input) }),
+      ...(fileAccess ? { fileAccess: structuredClone(fileAccess) } : {}),
+      ...(params.inferenceTier ? { inferenceTier: params.inferenceTier } : {}),
+      ...(selection ? { agentSelection: agentSelectionMetadata(selection) } : {}),
+      preparations: structuredClone(preparations),
+    };
+  }
+
+  private async persistPendingTaskPreparation(runId: string, pending: PendingDesktopTaskPreparation): Promise<void> {
+    const store = this.requireSdk().created.runtime.runStore;
+    const run = await store.getRun(asRunId(runId));
+    if (!run) throw new Error(`Task preparation run ${runId} does not exist.`);
+    await store.updateRun(run.id, {
+      metadata: { ...run.metadata, desktopTaskPreparation: pending as unknown as JsonValue },
+    }, run.version);
+  }
+
+  private async clearPendingTaskPreparation(runId: string): Promise<void> {
+    const store = this.requireSdk().created.runtime.runStore;
+    const run = await store.getRun(asRunId(runId));
+    if (!run?.metadata?.desktopTaskPreparation) return;
+    const { desktopTaskPreparation: _pending, ...metadata } = run.metadata;
+    await store.updateRun(run.id, { metadata }, run.version);
+  }
+
+  private async resolveClarification(runId: string, answer: string): Promise<JsonValue> {
+    const fallback = this.requireSdk();
+    const run = await fallback.created.runtime.runStore.getRun(asRunId(runId));
+    const pending = readPendingTaskPreparation(run?.metadata?.desktopTaskPreparation);
+    if (!run || !pending) {
+      return asJsonValue(await (await this.sdkForRun(runId)).agent.resolveClarification(asRunId(runId), answer));
+    }
+    const trimmedAnswer = answer.trim();
+    if (!trimmedAnswer) throw new Error('Clarification message must not be empty');
+    const targetSdk = await this.sdkForPendingTaskPreparation(pending);
+    const current = restoreTaskPreparation(run, {
+      targetAgentId: pending.targetAgent.id,
+      workspaceRoot: targetSdk.config.workspaceRoot,
+      attachments: pending.attachments,
+    });
+    const clarificationAnswers = Object.fromEntries(
+      current.clarificationQuestions.map((question) => [question, trimmedAnswer]),
+    );
+    const preparation = await this.prepareRunTask(
+      targetSdk,
+      pending.originalObjective,
+      [],
+      pending.sessionId,
+      clarificationAnswers,
+      pending.attachments,
+    );
+    if (!preparation) throw new Error('Task preparation is no longer enabled for the selected agent.');
+    const preparations = [...pending.preparations, preparation];
+    if (preparation.decision === 'clarify') {
+      const next = { ...pending, preparations };
+      await this.persistPendingTaskPreparation(preparation.preparationRunId, next);
+      await this.clearPendingTaskPreparation(runId).catch(() => undefined);
+      return asJsonValue(taskPreparationClarification(preparation));
+    }
+    if (preparation.decision === 'invalid') {
+      await this.clearPendingTaskPreparation(runId).catch(() => undefined);
+      return asJsonValue({
+        status: 'task_preparation_stopped',
+        runId: preparation.preparationRunId,
+        decision: preparation.decision,
+        message: preparation.reason,
+        taskPreparation: preparation,
+      });
+    }
+    const result = await targetSdk.runRaw(preparation.preparedObjective, {
+      runId: asRunId(pending.executionId),
+      sessionId: pending.sessionId,
+      ...(pending.input === undefined ? {} : { input: pending.input }),
+      ...(pending.contentParts.length ? { contentParts: pending.contentParts } : {}),
+      ...(pending.fileAccess ? {
+        executionContext: { fileAccess: pending.fileAccess } as unknown as NonNullable<AgentSdkRunOptions['executionContext']>,
+      } : {}),
+      ...(pending.inferenceTier ? { inferenceTier: pending.inferenceTier } : {}),
+      metadata: {
+        ...taskPreparationMetadata(preparations),
+        ...(pending.agentSelection ? { agentSelection: pending.agentSelection } : {}),
+      },
+    });
+    this.runSdks.set(pending.executionId, targetSdk);
+    this.runSdks.set(result.runId, targetSdk);
+    await this.clearPendingTaskPreparation(runId).catch(() => undefined);
+    return asJsonValue(result);
+  }
+
+  private async sdkForPendingTaskPreparation(pending: PendingDesktopTaskPreparation): Promise<AgentSdk> {
+    const fallback = this.requireSdk();
+    const expected = pending.targetAgent;
+    if (fallback.config.agent.id === expected.id
+      && fallback.agentPath === expected.configPath
+      && agentConfigurationFingerprint(fallback.config) === expected.configurationFingerprint) {
+      return fallback;
+    }
+    const options = this.sdkOptions;
+    if (!options) throw new DesktopProtocolError('NOT_INITIALIZED', 'The runtime configuration is unavailable.', JSON_RPC_ERROR_CODES.notInitialized);
+    const discovery = await discoverAgentSdkAgents(options);
+    const selected = discovery.agents.find((candidate) =>
+      candidate.id === expected.id
+      && candidate.configPath === expected.configPath
+      && candidate.configurationFingerprint === expected.configurationFingerprint
+      && candidate.validationState === 'valid',
+    );
+    if (!selected) {
+      throw new DesktopProtocolError(
+        'AGENT_SELECTION_MISMATCH',
+        'The exact agent profile selected before task clarification is no longer available.',
+        JSON_RPC_ERROR_CODES.commandRejected,
+      );
+    }
+    return this.sdkForSelectedAgent(fallback, selected);
   }
 
   private requireMaintenanceStore() {
@@ -1248,7 +1422,9 @@ export function safeResolvedConfiguration(config: ResolvedAgentSdkConfig, agentP
   };
 }
 
-function taskPreparationMetadata(result: TaskPreparationResult): JsonObject {
+function taskPreparationMetadata(value: TaskPreparationResult | TaskPreparationResult[]): JsonObject {
+  const results = Array.isArray(value) ? value : [value];
+  const result = results.at(-1)!;
   return {
     taskPreparation: {
       schemaVersion: 1,
@@ -1263,21 +1439,55 @@ function taskPreparationMetadata(result: TaskPreparationResult): JsonObject {
       reason: result.reason,
       preparationAgentId: result.preparationAgentId,
       preparationRunId: result.preparationRunId,
-      preparationRunIds: [result.preparationRunId],
-      runs: [{
-        originalObjective: result.originalObjective,
-        title: result.title,
-        name: result.name,
-        decision: result.decision,
-        preparedObjective: result.preparedObjective,
-        assumptions: result.assumptions,
-        clarificationQuestions: result.clarificationQuestions,
-        reason: result.reason,
-        preparationAgentId: result.preparationAgentId,
-        preparationRunId: result.preparationRunId,
-      }],
+      preparationRunIds: results.map((entry) => entry.preparationRunId),
+      runs: results.map((entry) => ({
+        originalObjective: entry.originalObjective,
+        title: entry.title,
+        name: entry.name,
+        decision: entry.decision,
+        preparedObjective: entry.preparedObjective,
+        assumptions: entry.assumptions,
+        clarificationQuestions: entry.clarificationQuestions,
+        reason: entry.reason,
+        preparationAgentId: entry.preparationAgentId,
+        preparationRunId: entry.preparationRunId,
+      })),
     },
   };
+}
+
+function taskPreparationClarification(result: TaskPreparationResult) {
+  const multiple = result.clarificationQuestions.length > 1;
+  return {
+    status: 'clarification_requested' as const,
+    runId: result.preparationRunId,
+    message: multiple
+      ? `Task preparation needs clarification:\n${result.clarificationQuestions.map((question, index) => `${index + 1}. ${question}`).join('\n')}\n\nProvide one free-form answer covering all questions.`
+      : result.clarificationQuestions[0]!,
+    suggestedQuestions: result.clarificationQuestions,
+  };
+}
+
+function readPendingTaskPreparation(value: JsonValue | undefined): PendingDesktopTaskPreparation | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const pending = value as unknown as PendingDesktopTaskPreparation;
+  if (pending.schemaVersion !== 1
+    || typeof pending.executionId !== 'string'
+    || typeof pending.sessionId !== 'string'
+    || typeof pending.originalObjective !== 'string'
+    || !pending.targetAgent
+    || typeof pending.targetAgent.id !== 'string'
+    || typeof pending.targetAgent.configPath !== 'string'
+    || typeof pending.targetAgent.configurationFingerprint !== 'string'
+    || !pending.attachments
+    || !Array.isArray(pending.attachments.images)
+    || !Array.isArray(pending.attachments.files)
+    || !Array.isArray(pending.attachments.audio)
+    || !Array.isArray(pending.contentParts)
+    || !Array.isArray(pending.preparations)) {
+    throw new Error('Pending desktop task preparation metadata is invalid.');
+  }
+  return pending;
 }
 
 function agentSelectionMetadata(result: AgentSelectionResult): JsonObject {

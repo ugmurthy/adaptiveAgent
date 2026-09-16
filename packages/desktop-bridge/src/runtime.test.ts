@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { ADAPTIVE_AGENT_CLI_COMMANDS } from '@adaptive-agent/agent-sdk/cli';
-import { AgentSdk, type ResolvedAgentSdkConfig } from '@adaptive-agent/agent-sdk';
+import { AgentSdk, type ResolvedAgentSdkConfig, type TaskPreparationResult } from '@adaptive-agent/agent-sdk';
 import * as agentCreate from '@adaptive-agent/agent-sdk/agent-create';
 
 import { JSON_RPC_ERROR_CODES, type DesktopMessage, type DesktopRpcRequest } from './protocol.js';
@@ -29,6 +29,66 @@ async function initialize(runtime: DesktopRuntime): Promise<void> {
     method: 'initialize',
     params: { protocolVersion: '1.10', clientInfo: { name: 'test-client' } },
   }));
+}
+
+function taskPreparationResult(runId: string, decision: 'clarify' | 'invalid', questions: string[]) {
+  return {
+    originalObjective: 'deploy',
+    title: 'Deploy Application',
+    name: 'deploy-application',
+    decision,
+    preparedObjective: '',
+    assumptions: [],
+    clarificationQuestions: questions,
+    reason: decision === 'clarify' ? 'More detail is required.' : 'The request cannot be executed.',
+    preparationAgentId: 'task-preparer',
+    preparationRunId: runId,
+  };
+}
+
+function preparationRun(preparation: TaskPreparationResult) {
+  return {
+    id: preparation.preparationRunId,
+    rootRunId: preparation.preparationRunId,
+    status: 'succeeded',
+    version: 1,
+    input: {
+      originalObjective: preparation.originalObjective,
+      workspaceRoot: '/workspace',
+      attachments: { images: [], files: preparation.originalObjective === 'deploy it' ? ['file-1/release.txt'] : [], audio: [] },
+    },
+    result: {
+      title: preparation.title,
+      name: preparation.name,
+      decision: preparation.decision,
+      preparedObjective: preparation.preparedObjective,
+      assumptions: preparation.assumptions,
+      clarificationQuestions: preparation.clarificationQuestions,
+      reason: preparation.reason,
+    },
+    metadata: {
+      agentId: 'task-preparer', command: 'task-preparation', role: 'task-preparer',
+      targetAgentId: 'deployer', preparationMode: 'auto',
+    },
+  };
+}
+
+function desktopPreparationTarget(runStore: unknown, runRaw: ReturnType<typeof vi.fn>) {
+  return {
+    agentPath: '/agents/deployer.json',
+    runRaw,
+    created: { runtime: { runStore } },
+    config: {
+      agent: {
+        id: 'deployer', name: 'Deployer', invocationModes: ['run'], defaultInvocationMode: 'run', tools: [],
+      },
+      model: { provider: 'ollama', model: 'test-model' },
+      inference: { mode: 'byok', tier: 'medium' },
+      interaction: { approvalMode: 'manual', clarificationMode: 'interactive' },
+      workspaceRoot: '/workspace',
+      settings: { taskPreparation: { mode: 'auto', agent: './task-preparer.json' } },
+    },
+  } as unknown as AgentSdk;
 }
 
 describe('desktop runtime protocol', () => {
@@ -74,7 +134,7 @@ describe('desktop runtime protocol', () => {
     await expect(runtime.handleRpc(request({
       id: 'run', method: 'agent/run', params: { executionId: 'execution-1', goal: 'fix it' },
     }))).resolves.toMatchObject({ status: 'success', finalRunId: 'execution-1' });
-    const generatedSessionId = prepareRunTask.mock.calls[0]?.[3];
+    const generatedSessionId = (prepareRunTask.mock.calls as unknown[][])[0]?.[3];
     expect(generatedSessionId).toMatch(/^[0-9a-f-]{36}$/);
     expect(runRaw).toHaveBeenCalledWith('Fix the failing test and verify it.', expect.objectContaining({
       runId: 'execution-1',
@@ -132,7 +192,7 @@ describe('desktop runtime protocol', () => {
     });
   });
 
-  it('returns a terminal preparation result when auto mode needs clarification', async () => {
+  it('returns a terminal preparation result when fail mode needs clarification', async () => {
     const runRaw = vi.fn();
     const preparation = {
       originalObjective: 'deploy it', decision: 'clarify', preparedObjective: '', assumptions: [],
@@ -143,7 +203,7 @@ describe('desktop runtime protocol', () => {
     const { runtime } = createRuntime();
     await runtime.handleRpc(request({ id: 'init', method: 'initialize', params: { protocolVersion: '1.17', clientInfo: { name: 'desktop' } } }));
     Object.assign(runtime as unknown as Record<string, unknown>, {
-      sdk: { runRaw, config: { agent: { id: 'deployer', name: 'Deployer' }, workspaceRoot: '/workspace', settings: { taskPreparation: { mode: 'auto' } } } },
+      sdk: { runRaw, config: { agent: { id: 'deployer', name: 'Deployer' }, interaction: { clarificationMode: 'fail' }, workspaceRoot: '/workspace', settings: { taskPreparation: { mode: 'auto' } } } },
       prepareRunTask: vi.fn(async () => preparation),
     });
 
@@ -154,6 +214,161 @@ describe('desktop runtime protocol', () => {
       result: { decision: 'clarify', taskPreparation: { clarificationQuestions: ['Which environment should receive the deployment?'] } },
     });
     expect(runRaw).not.toHaveBeenCalled();
+  });
+
+  it('durably resumes interactive task preparation without losing the target execution request', async () => {
+    const firstPreparation: TaskPreparationResult = {
+      originalObjective: 'deploy it', decision: 'clarify', preparedObjective: '', assumptions: [],
+      title: 'Deploy Application', name: 'deploy-application',
+      clarificationQuestions: ['Which environment?', 'Which release?'], reason: 'Deployment details are required.',
+      preparationAgentId: 'task-preparer', preparationRunId: 'preparation-interactive-1',
+    };
+    const completedPreparation: TaskPreparationResult = {
+      ...firstPreparation,
+      decision: 'enhance' as const,
+      preparedObjective: 'Deploy release 42 to staging.',
+      clarificationQuestions: [],
+      reason: 'The answer supplied the deployment details.',
+      preparationRunId: 'preparation-interactive-2',
+    };
+    const runs = new Map<string, any>([[firstPreparation.preparationRunId, preparationRun(firstPreparation)]]);
+    const runStore = {
+      getRun: vi.fn(async (id: string) => runs.get(id) ?? null),
+      updateRun: vi.fn(async (id: string, patch: any) => {
+        const updated = { ...runs.get(id), ...patch, version: runs.get(id).version + 1 };
+        runs.set(id, updated);
+        return updated;
+      }),
+    };
+    const runRaw = vi.fn(async () => ({ status: 'success', runId: 'execution-interactive', output: 'done', stepsUsed: 1, usage: {} }));
+    const sdk = desktopPreparationTarget(runStore, runRaw);
+    const selection = {
+      selectedAgentId: 'deployer', reason: 'Deployment task', selectionAgentId: 'selector', selectionRunId: 'selection-1',
+    };
+    const attachment = {
+      attachmentId: 'file-1', kind: 'file' as const, stagedRelativePath: 'file-1/release.txt', name: 'release.txt',
+      sizeBytes: 12, sha256: 'a'.repeat(64), mimeType: 'text/plain',
+    };
+    const parts = [{ type: 'file', file: { source: { kind: 'path', path: '/managed/file-1/release.txt' }, name: 'release.txt' } }];
+    const fileAccess = {
+      version: 1, workspaceRoot: '/workspace', attachmentRoots: ['/managed/file-1'],
+      files: [{ path: '/managed/file-1/release.txt', sizeBytes: 12, sha256: 'a'.repeat(64) }],
+    };
+    const first = createRuntime().runtime;
+    await first.handleRpc(request({ id: 'init', method: 'initialize', params: { protocolVersion: '1.19', clientInfo: { name: 'desktop' } } }));
+    Object.assign(first as unknown as Record<string, unknown>, {
+      sdk,
+      selectDesktopRunSdk: vi.fn(async () => ({ sdk, selection })),
+      validateAndTranslateAttachments: vi.fn(async () => parts),
+      fileAccessContext: vi.fn(async () => fileAccess),
+      prepareRunTask: vi.fn(async () => firstPreparation),
+    });
+
+    await expect(first.handleRpc(request({
+      id: 'run', method: 'agent/run', params: {
+        executionId: 'execution-interactive', sessionId: 'session-interactive', goal: 'deploy it',
+        input: { releaseId: 42 }, inferenceTier: 'high', attachments: [attachment],
+      },
+    }))).resolves.toMatchObject({
+      executionId: 'execution-interactive', status: 'clarification_requested', finalRunId: firstPreparation.preparationRunId,
+      result: {
+        status: 'clarification_requested', runId: firstPreparation.preparationRunId,
+        suggestedQuestions: ['Which environment?', 'Which release?'],
+        message: expect.stringContaining('one free-form answer covering all questions'),
+      },
+    });
+    expect(runRaw).not.toHaveBeenCalled();
+
+    // A new bridge instance proves resolution depends on the durable run marker, not an in-memory map.
+    runs.set(completedPreparation.preparationRunId, preparationRun(completedPreparation));
+    const restarted = createRuntime().runtime;
+    await restarted.handleRpc(request({ id: 'restart-init', method: 'initialize', params: { protocolVersion: '1.19', clientInfo: { name: 'desktop' } } }));
+    const prepareRunTask = vi.fn(async () => completedPreparation);
+    Object.assign(restarted as unknown as Record<string, unknown>, { sdk, prepareRunTask });
+
+    await expect(restarted.handleRpc(request({
+      id: 'answer', method: 'interaction/resolveClarification',
+      params: { runId: firstPreparation.preparationRunId, answer: 'Use staging and release 42.' },
+    }))).resolves.toMatchObject({ status: 'success', runId: 'execution-interactive' });
+    expect(prepareRunTask).toHaveBeenCalledWith(
+      sdk,
+      'deploy it',
+      [],
+      'session-interactive',
+      {
+        'Which environment?': 'Use staging and release 42.',
+        'Which release?': 'Use staging and release 42.',
+      },
+      { images: [], files: ['file-1/release.txt'], audio: [] },
+    );
+    expect(runRaw).toHaveBeenCalledWith('Deploy release 42 to staging.', expect.objectContaining({
+      runId: 'execution-interactive',
+      sessionId: 'session-interactive',
+      input: { releaseId: 42 },
+      contentParts: parts,
+      executionContext: { fileAccess },
+      inferenceTier: 'high',
+      metadata: {
+        agentSelection: expect.objectContaining({ selectedAgentId: 'deployer', selectionRunId: 'selection-1' }),
+        taskPreparation: expect.objectContaining({
+          preparationRunIds: ['preparation-interactive-1', 'preparation-interactive-2'],
+          runs: [expect.objectContaining({ decision: 'clarify' }), expect.objectContaining({ decision: 'enhance' })],
+        }),
+      },
+    }));
+  });
+
+  it('keeps repeated preparation clarification pending and terminates an invalid follow-up', async () => {
+    const initial = taskPreparationResult('preparation-repeat-1', 'clarify', ['Choose a region.']);
+    const repeated = taskPreparationResult('preparation-repeat-2', 'clarify', ['Confirm us-west-2.']);
+    const invalid = taskPreparationResult('preparation-repeat-3', 'invalid', []);
+    const runs = new Map<string, any>([[initial.preparationRunId, preparationRun(initial)]]);
+    const runStore = {
+      getRun: vi.fn(async (id: string) => runs.get(id) ?? null),
+      updateRun: vi.fn(async (id: string, patch: any) => {
+        const updated = { ...runs.get(id), ...patch, version: runs.get(id).version + 1 };
+        runs.set(id, updated);
+        return updated;
+      }),
+    };
+    const runRaw = vi.fn();
+    const sdk = desktopPreparationTarget(runStore, runRaw);
+    const runtime = createRuntime().runtime;
+    await runtime.handleRpc(request({ id: 'init', method: 'initialize', params: { protocolVersion: '1.19', clientInfo: { name: 'desktop' } } }));
+    Object.assign(runtime as unknown as Record<string, unknown>, { sdk, prepareRunTask: vi.fn(async () => initial) });
+    await runtime.handleRpc(request({ id: 'run', method: 'agent/run', params: { executionId: 'execution-repeat', goal: 'deploy' } }));
+
+    runs.set(repeated.preparationRunId, preparationRun(repeated));
+    Object.assign(runtime as unknown as Record<string, unknown>, { prepareRunTask: vi.fn(async () => repeated) });
+    await expect(runtime.handleRpc(request({
+      id: 'again', method: 'interaction/resolveClarification', params: { runId: initial.preparationRunId, answer: 'us-west-2' },
+    }))).resolves.toMatchObject({ status: 'clarification_requested', runId: repeated.preparationRunId });
+    expect(runs.get(initial.preparationRunId).metadata.desktopTaskPreparation).toBeUndefined();
+    expect(runs.get(repeated.preparationRunId).metadata.desktopTaskPreparation).toBeDefined();
+    expect(runRaw).not.toHaveBeenCalled();
+
+    runs.set(invalid.preparationRunId, preparationRun(invalid));
+    Object.assign(runtime as unknown as Record<string, unknown>, { prepareRunTask: vi.fn(async () => invalid) });
+    await expect(runtime.handleRpc(request({
+      id: 'invalid', method: 'interaction/resolveClarification', params: { runId: repeated.preparationRunId, answer: 'confirmed' },
+    }))).resolves.toMatchObject({ status: 'task_preparation_stopped', decision: 'invalid', runId: invalid.preparationRunId });
+    expect(runRaw).not.toHaveBeenCalled();
+  });
+
+  it('still routes ordinary core clarification to the core resolver', async () => {
+    const resolveClarification = vi.fn(async () => ({ status: 'success', runId: 'ordinary-run', output: 'done', stepsUsed: 1, usage: {} }));
+    const sdk = {
+      created: { runtime: { runStore: { getRun: vi.fn(async () => ({ id: 'ordinary-run', metadata: {}, rootRunId: 'ordinary-run' })) } } },
+      agent: { resolveClarification },
+      config: { agent: { id: 'agent' } },
+    };
+    const runtime = createRuntime().runtime;
+    await initialize(runtime);
+    Object.assign(runtime as unknown as Record<string, unknown>, { sdk });
+    await expect(runtime.handleRpc(request({
+      id: 'ordinary', method: 'interaction/resolveClarification', params: { runId: 'ordinary-run', answer: 'Use Markdown.' },
+    }))).resolves.toMatchObject({ status: 'success', runId: 'ordinary-run' });
+    expect(resolveClarification).toHaveBeenCalledWith('ordinary-run', 'Use Markdown.');
   });
 
   it('runs configured task preparation in the shared runtime with attachment summaries', async () => {

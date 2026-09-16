@@ -161,6 +161,25 @@ steering, and in-memory run state.
 | `cli/commands` | - | - |
 | `cli/execute` | `argv` | `stdin`, `timeoutMs` (maximum 24 hours) |
 
+### Task-preparation clarification
+
+When task preparation returns `clarify` and the selected target agent resolves
+`interaction.clarificationMode` to `interactive`, `agent/run` returns the
+standard `clarification_requested` result. Its `runId` identifies the durable
+preparation run and is passed unchanged to `interaction/resolveClarification`.
+The bridge reruns preparation with the answer and starts the target run only
+after preparation returns `complete` or `enhance`. The target run keeps the
+original execution ID, session, selected agent, attachments, input, inference
+selection, and the complete preparation-run history. This survives a bridge
+restart when the configured runtime is durable.
+
+The desktop clarification UI supplies one free-form `answer`. If preparation
+asks multiple questions, the result lists and exposes all questions, and that
+same free-form response is supplied as the answer context for each question;
+users should cover every question in one response. A repeated `clarify` returns
+another `clarification_requested` result. `clarificationMode: fail` and
+`invalid` decisions retain the terminal `task_preparation_stopped` behavior.
+
 Example run request:
 
 ```json
