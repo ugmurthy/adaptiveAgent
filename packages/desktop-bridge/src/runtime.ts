@@ -775,7 +775,7 @@ export class DesktopRuntime {
       settingsOverrides: undefined,
       model: undefined,
       runtime: fallbackSdk.created.runtime,
-      eventListener: (event: AgentEvent) => this.writeAgentEvent(event),
+      eventListener: undefined,
     });
     try {
       const paths = (kind: DesktopAttachmentInput['kind']) => attachments
@@ -832,7 +832,7 @@ export class DesktopRuntime {
       settingsOverrides: undefined,
       model: undefined,
       runtime: targetSdk.created.runtime,
-      eventListener: (event: AgentEvent) => this.writeAgentEvent(event),
+      eventListener: undefined,
     });
     try {
       const paths = (kind: DesktopAttachmentInput['kind']) => attachments

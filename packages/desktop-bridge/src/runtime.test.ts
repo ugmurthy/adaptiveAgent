@@ -192,6 +192,90 @@ describe('desktop runtime protocol', () => {
     });
   });
 
+  it('keeps selector lifecycle internal while target lifecycle and synthetic selection remain visible', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'desktop-auto-events-'));
+    const fallbackPath = join(cwd, 'agent.json');
+    const selectorPath = join(cwd, 'selector.json');
+    const targetPath = join(cwd, 'target.json');
+    const agent = (id: string, name: string) => ({
+      id, name, invocationModes: ['run'], defaultInvocationMode: 'run',
+      model: { provider: 'ollama', model: 'test-model' }, tools: [],
+    });
+    await writeFile(fallbackPath, JSON.stringify(agent('fallback', 'Fallback')));
+    await writeFile(selectorPath, JSON.stringify(agent('selector', 'Selector')));
+    await writeFile(targetPath, JSON.stringify(agent('target', 'Target')));
+    await writeFile(join(cwd, 'agent.settings.json'), JSON.stringify({ agents: { dirs: [cwd] } }));
+
+    const sharedRuntime = {};
+    const targetRunRaw = vi.fn(async () => ({ status: 'success', runId: 'execution-auto-events', output: 'done', stepsUsed: 1, usage: {} }));
+    let targetListener: ((event: any) => void) | undefined;
+    const create = vi.spyOn(AgentSdk, 'create').mockImplementation(async (options) => {
+      if (!options) throw new Error('Expected SDK options.');
+      if (options.agentConfigPath === selectorPath) {
+        options.eventListener?.({ schemaVersion: 1, type: 'run.completed', runId: 'selector-run', payload: {} } as any);
+        return {
+          config: { agent: { id: 'selector', tools: [] } },
+          runRaw: vi.fn(async () => ({
+            status: 'success', runId: 'selector-run', stepsUsed: 1, usage: {},
+            output: { selectedAgentId: 'target', reason: 'Best match.' },
+          })),
+          close: vi.fn(async () => undefined),
+        } as unknown as AgentSdk;
+      }
+      targetListener = options.eventListener;
+      return {
+        agentPath: targetPath,
+        config: { agent: agent('target', 'Target'), workspaceRoot: cwd, settings: {} },
+        created: { runtime: sharedRuntime },
+        runRaw: targetRunRaw,
+        close: vi.fn(async () => undefined),
+      } as unknown as AgentSdk;
+    });
+    const { runtime, messages } = createRuntime();
+    await runtime.handleRpc(request({ id: 'init', method: 'initialize', params: { protocolVersion: '1.19', clientInfo: { name: 'desktop' } } }));
+    const fallback = {
+      agentPath: fallbackPath,
+      config: {
+        agent: agent('fallback', 'Fallback'), workspaceRoot: cwd,
+        settings: { agent: { mode: 'auto' }, taskPreparation: { agent: selectorPath } },
+      },
+      created: { runtime: sharedRuntime },
+      close: vi.fn(async () => undefined),
+    } as unknown as AgentSdk;
+    Object.assign(runtime as unknown as Record<string, unknown>, {
+      sdk: fallback,
+      sdkOptions: { cwd, eventListener: (event: any) => (runtime as any).writeAgentEvent(event) },
+      settingsCwd: cwd,
+    });
+
+    try {
+      const selected = await (runtime as unknown as { selectDesktopRunSdk: Function })
+        .selectDesktopRunSdk(fallback, 'Research it', [], 'session-auto-events');
+      expect(selected).toMatchObject({
+        sdk: { config: { agent: { id: 'target' } } },
+        selection: { selectedAgentId: 'target', selectionAgentId: 'selector', selectionRunId: 'selector-run' },
+      });
+      expect(create.mock.calls[0]?.[0]).toMatchObject({
+        agentConfigPath: selectorPath, runtime: sharedRuntime, eventListener: undefined,
+      });
+      expect(typeof targetListener).toBe('function');
+      expect(messages).not.toContainEqual(expect.objectContaining({
+        method: 'agent/event', params: expect.objectContaining({ runId: 'selector-run' }),
+      }));
+
+      (runtime as any).writeRunAgentSelected('execution-auto-events', selected.sdk);
+      targetListener?.({ schemaVersion: 1, type: 'run.completed', runId: 'execution-auto-events', payload: {} });
+      expect(messages).toEqual(expect.arrayContaining([
+        expect.objectContaining({ method: 'agent/event', params: expect.objectContaining({ type: 'run.agent_selected', runId: 'execution-auto-events' }) }),
+        expect.objectContaining({ method: 'agent/event', params: expect.objectContaining({ type: 'run.completed', runId: 'execution-auto-events' }) }),
+      ]));
+    } finally {
+      create.mockRestore();
+      await runtime.close();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('returns a terminal preparation result when fail mode needs clarification', async () => {
     const runRaw = vi.fn();
     const preparation = {
@@ -254,7 +338,8 @@ describe('desktop runtime protocol', () => {
       version: 1, workspaceRoot: '/workspace', attachmentRoots: ['/managed/file-1'],
       files: [{ path: '/managed/file-1/release.txt', sizeBytes: 12, sha256: 'a'.repeat(64) }],
     };
-    const first = createRuntime().runtime;
+    const firstBridge = createRuntime();
+    const first = firstBridge.runtime;
     await first.handleRpc(request({ id: 'init', method: 'initialize', params: { protocolVersion: '1.19', clientInfo: { name: 'desktop' } } }));
     Object.assign(first as unknown as Record<string, unknown>, {
       sdk,
@@ -278,10 +363,14 @@ describe('desktop runtime protocol', () => {
       },
     });
     expect(runRaw).not.toHaveBeenCalled();
+    expect(firstBridge.messages).not.toContainEqual(expect.objectContaining({
+      method: 'agent/event', params: expect.objectContaining({ runId: firstPreparation.preparationRunId }),
+    }));
 
     // A new bridge instance proves resolution depends on the durable run marker, not an in-memory map.
     runs.set(completedPreparation.preparationRunId, preparationRun(completedPreparation));
-    const restarted = createRuntime().runtime;
+    const restartedBridge = createRuntime();
+    const restarted = restartedBridge.runtime;
     await restarted.handleRpc(request({ id: 'restart-init', method: 'initialize', params: { protocolVersion: '1.19', clientInfo: { name: 'desktop' } } }));
     const prepareRunTask = vi.fn(async () => completedPreparation);
     Object.assign(restarted as unknown as Record<string, unknown>, { sdk, prepareRunTask });
@@ -316,6 +405,9 @@ describe('desktop runtime protocol', () => {
         }),
       },
     }));
+    expect(restartedBridge.messages).not.toContainEqual(expect.objectContaining({
+      method: 'agent/event', params: expect.objectContaining({ runId: completedPreparation.preparationRunId }),
+    }));
   });
 
   it('keeps repeated preparation clarification pending and terminates an invalid follow-up', async () => {
@@ -333,7 +425,8 @@ describe('desktop runtime protocol', () => {
     };
     const runRaw = vi.fn();
     const sdk = desktopPreparationTarget(runStore, runRaw);
-    const runtime = createRuntime().runtime;
+    const bridge = createRuntime();
+    const runtime = bridge.runtime;
     await runtime.handleRpc(request({ id: 'init', method: 'initialize', params: { protocolVersion: '1.19', clientInfo: { name: 'desktop' } } }));
     Object.assign(runtime as unknown as Record<string, unknown>, { sdk, prepareRunTask: vi.fn(async () => initial) });
     await runtime.handleRpc(request({ id: 'run', method: 'agent/run', params: { executionId: 'execution-repeat', goal: 'deploy' } }));
@@ -346,6 +439,9 @@ describe('desktop runtime protocol', () => {
     expect(runs.get(initial.preparationRunId).metadata.desktopTaskPreparation).toBeUndefined();
     expect(runs.get(repeated.preparationRunId).metadata.desktopTaskPreparation).toBeDefined();
     expect(runRaw).not.toHaveBeenCalled();
+    expect(bridge.messages).not.toContainEqual(expect.objectContaining({
+      method: 'agent/event', params: expect.objectContaining({ runId: repeated.preparationRunId }),
+    }));
 
     runs.set(invalid.preparationRunId, preparationRun(invalid));
     Object.assign(runtime as unknown as Record<string, unknown>, { prepareRunTask: vi.fn(async () => invalid) });
@@ -381,8 +477,11 @@ describe('desktop runtime protocol', () => {
     const create = vi.spyOn(AgentSdk, 'create').mockResolvedValue({
       config: { agent: { id: 'task-preparer', tools: [] } }, runRaw: preparationRunRaw, close,
     } as unknown as AgentSdk);
-    const { runtime } = createRuntime();
-    Object.assign(runtime as unknown as Record<string, unknown>, { sdkOptions: { cwd: '/workspace' }, settingsCwd: '/workspace' });
+    const { runtime, messages } = createRuntime();
+    Object.assign(runtime as unknown as Record<string, unknown>, {
+      sdkOptions: { cwd: '/workspace', eventListener: (event: any) => (runtime as any).writeAgentEvent(event) },
+      settingsCwd: '/workspace',
+    });
     const target = {
       config: {
         settings: { taskPreparation: { mode: 'auto', agent: './agents/task-preparer.json' } },
@@ -399,12 +498,13 @@ describe('desktop runtime protocol', () => {
     await expect((runtime as unknown as { prepareRunTask: Function }).prepareRunTask(target, 'Review the files', attachments, 'session-3'))
       .resolves.toMatchObject({ decision: 'complete', preparationRunId: 'preparation-3' });
     expect(create).toHaveBeenCalledWith(expect.objectContaining({
-      agentConfigPath: './agents/task-preparer.json', runtime: sharedRuntime, settingsOverrides: undefined,
+      agentConfigPath: './agents/task-preparer.json', runtime: sharedRuntime, settingsOverrides: undefined, eventListener: undefined,
     }));
     expect(preparationRunRaw).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
       sessionId: 'session-3',
       input: expect.objectContaining({ attachments: { files: ['file-1/notes.txt'], images: ['image-1/photo.png'], audio: [] } }),
     }));
+    expect(messages).not.toContainEqual(expect.objectContaining({ method: 'agent/event' }));
     expect(close).toHaveBeenCalledOnce();
     create.mockRestore();
   });

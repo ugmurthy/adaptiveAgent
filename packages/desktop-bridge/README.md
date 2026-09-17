@@ -192,6 +192,11 @@ Events are notifications and have no `id`:
 {"jsonrpc":"2.0","method":"agent/event","params":{"schemaVersion":1,"type":"run.status_changed","runId":"..."}}
 ```
 
+`agent/event` reports lifecycle for the selected target-agent run. Internal
+agent-selection and task-preparation lifecycle events remain persisted in
+runtime history but are not forwarded as top-level desktop lifecycle.
+Protocol 1.19 still emits the synthetic `run.agent_selected` notification.
+
 ### Permanent run deletion (protocol 1.17)
 
 `run/delete` permanently deletes one complete root-run tree. `runId` may name
