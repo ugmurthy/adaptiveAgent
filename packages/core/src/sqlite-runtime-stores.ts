@@ -1,6 +1,7 @@
 import { Database } from 'bun:sqlite';
 
 import { runSqliteRuntimeMigrations } from './sqlite-runtime-migrations.js';
+import { SqliteOrchestrationStore } from './sqlite-orchestration-store.js';
 import { RuntimeDeletionError } from './types.js';
 import type {
   AgentEvent,
@@ -928,6 +929,7 @@ export class SqliteRuntimeMaintenanceStore implements RuntimeMaintenanceStore {
 }
 
 export class SqliteRuntimeStoreBundle implements RuntimeTransactionStore {
+  readonly orchestrationStore: SqliteOrchestrationStore;
   readonly runStore: SqliteRunStore;
   readonly eventStore: SqliteEventStore;
   readonly snapshotStore: SqliteSnapshotStore;
@@ -945,6 +947,7 @@ export class SqliteRuntimeStoreBundle implements RuntimeTransactionStore {
     configureSqliteDatabase(database, options.busyTimeoutMs);
     if (options.migrate ?? true) runSqliteRuntimeMigrations(database);
     this.runStore = new SqliteRunStore(database, this.executor);
+    this.orchestrationStore = new SqliteOrchestrationStore(database, this.executor);
     this.eventStore = new SqliteEventStore(database, this.executor);
     this.snapshotStore = new SqliteSnapshotStore(database, this.executor);
     this.planStore = new SqlitePlanStore(database, this.executor);
@@ -994,6 +997,7 @@ export function openSqliteRuntimeStores(options: OpenSqliteRuntimeOptions): Sqli
 function createTransactionStores(database: Database): RuntimeStores {
   return {
     runStore: new SqliteRunStore(database),
+    orchestrationStore: new SqliteOrchestrationStore(database),
     eventStore: new SqliteEventStore(database),
     snapshotStore: new SqliteSnapshotStore(database),
     planStore: new SqlitePlanStore(database),

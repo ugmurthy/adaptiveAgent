@@ -1,6 +1,7 @@
 import {
   AgentSdk,
   agentConfigurationFingerprint,
+  createOrchestrationSdk,
   discoverAgentSdkAgents,
   inspectAgentSdkResolution,
   prepareTask,
@@ -12,6 +13,7 @@ import {
   type AgentSdkOptions,
   type AgentSdkRunOptions,
   type AgentSettingsFile,
+  type OrchestrationSdk,
   type ResolvedAgentSdkConfig,
   type TaskPreparationResult,
 } from '@adaptive-agent/agent-sdk';
@@ -99,6 +101,9 @@ export interface CliExecutor {
   execute(request: CliExecutionRequest): Promise<CliExecutionResult>;
 }
 
+type DesktopOrchestration = Pick<OrchestrationSdk, 'runRaw' | 'inspectExecution' | 'interruptExecution' | 'resumeExecution' | 'close'>;
+export type DesktopOrchestrationFactory = (options: Parameters<typeof createOrchestrationSdk>[0]) => Promise<DesktopOrchestration>;
+
 export interface SafeResolvedConfiguration {
   agent: { id: string; configPath?: string; name: string; configurationFingerprint: string; description?: string; defaultInvocationMode: string; selectionMode: 'fixed' | 'auto' };
   model: { provider: string; model: string; credentialAvailable: boolean };
@@ -128,6 +133,7 @@ export class DesktopRuntime {
   private sdk: AgentSdk | undefined;
   private readonly selectedAgentSdks = new Map<string, AgentSdk>();
   private readonly runSdks = new Map<string, AgentSdk>();
+  private readonly orchestrationSdks = new Map<string, DesktopOrchestration>();
   private sdkInitialization: Promise<AgentSdk> | undefined;
   private sdkOptions: AgentSdkOptions | undefined;
   private managedAttachmentRoot: string | undefined;
@@ -146,6 +152,7 @@ export class DesktopRuntime {
   constructor(
     private readonly write: DesktopMessageWriter,
     private readonly cliExecutor?: CliExecutor,
+    private readonly orchestrationFactory: DesktopOrchestrationFactory = createOrchestrationSdk,
   ) {}
 
   readyMessage(): DesktopMessage {
@@ -262,7 +269,7 @@ export class DesktopRuntime {
           };
           return params.executionId ? executionResult(executionId, 'direct', result) : asJsonValue(result);
         }
-        const result = await sdk.runRaw(preparation?.preparedObjective ?? params.goal, {
+        const runOptions: AgentSdkRunOptions = {
           runId: asRunId(executionId),
           sessionId,
           ...(params.input === undefined ? {} : { input: params.input }),
@@ -275,7 +282,18 @@ export class DesktopRuntime {
               ...(selected.selection ? { agentSelection: agentSelectionMetadata(selected.selection) } : {}),
             },
           } : {}),
-        });
+        };
+        if (executionMode(params.attachments ?? []) === 'catalog') {
+          const orchestration = await this.catalogOrchestration(executionId, sdk);
+          const { runId: _runId, sessionId: _sessionId, ...orchestrationOptions } = runOptions;
+          const orchestrated = await orchestration.runRaw(preparation?.preparedObjective ?? params.goal, {
+            ...orchestrationOptions,
+            executionId,
+            requestedAgentId: sdk.config.agent.id,
+          });
+          return executionResult(executionId, 'catalog', orchestrated.finalResult, orchestrated.stages);
+        }
+        const result = await sdk.runRaw(preparation?.preparedObjective ?? params.goal, runOptions);
         this.runSdks.set(executionId, sdk);
         this.runSdks.set(result.runId, sdk);
         return params.executionId ? executionResult(executionId, 'direct', result) : asJsonValue(result);
@@ -299,16 +317,32 @@ export class DesktopRuntime {
       }
       case 'execution/inspect': {
         const id = request.params!.executionId;
+        const durable = await this.requireSdk().created.runtime.orchestrationStore.getExecution(asRunId(id));
+        if (durable) {
+          const orchestration = await this.catalogOrchestration(id);
+          const inspection = await orchestration.inspectExecution(id);
+          const finalNodeId = inspection.plan?.finalNodeId;
+          const finalStage = inspection.stages.find((stage) => stage.nodeId === finalNodeId);
+          return asJsonValue({ executionId: id, mode: 'catalog', status: durable.status, finalRunId: finalStage?.runId, traceTarget: { kind: 'session', sessionId: id }, stages: inspection.stages });
+        }
         const run = await this.requireSdk().inspect(asRunId(id));
         return asJsonValue({ executionId: id, mode: 'direct', status: run.run?.status ?? 'not_found', finalRunId: run.run?.id, traceTarget: { kind: 'root-run', rootRunId: id } });
       }
       case 'execution/interrupt': {
         const id = request.params!.executionId;
+        if (await this.requireSdk().created.runtime.orchestrationStore.getExecution(asRunId(id))) {
+          await (await this.catalogOrchestration(id)).interruptExecution(id);
+          return { executionId: id, interrupted: true };
+        }
         await (await this.sdkForRun(id)).interrupt(asRunId(id));
         return { executionId: id, interrupted: true };
       }
       case 'execution/resume': {
         const id = request.params!.executionId;
+        if (await this.requireSdk().created.runtime.orchestrationStore.getExecution(asRunId(id))) {
+          const resumed = await (await this.catalogOrchestration(id)).resumeExecution(id);
+          return executionResult(id, 'catalog', resumed.finalResult, resumed.stages);
+        }
         return asJsonValue(executionResult(id, 'direct', await (await this.sdkForRun(id)).resumeRaw(asRunId(id))));
       }
       case 'run/resume':
@@ -437,8 +471,11 @@ export class DesktopRuntime {
     this.sdk = undefined;
     this.sdkOptions = undefined;
     const selectedSdks = [...this.selectedAgentSdks.values()];
+    const orchestrationSdks = [...this.orchestrationSdks.values()];
+    this.orchestrationSdks.clear();
     this.selectedAgentSdks.clear();
     this.runSdks.clear();
+    await Promise.all(orchestrationSdks.map((orchestration) => orchestration.close()));
     await Promise.all(selectedSdks.map((selected) => selected.close()));
     await sdk?.close();
     this.gatewayClient?.close();
@@ -1249,6 +1286,37 @@ export class DesktopRuntime {
     return sdk;
   }
 
+  private async catalogOrchestration(executionId: string, requestedSdk?: AgentSdk): Promise<DesktopOrchestration> {
+    const cached = this.orchestrationSdks.get(executionId);
+    if (cached) return cached;
+    const fallbackSdk = this.requireSdk();
+    const discovery = await discoverAgentSdkAgents(this.sdkOptions ?? {});
+    let targetSdk = requestedSdk;
+    if (!targetSdk) {
+      const execution = await fallbackSdk.created.runtime.orchestrationStore.getExecution(asRunId(executionId));
+      const plan = execution?.plan as { requestedAgentId?: unknown } | undefined;
+      const requestedAgentId = typeof plan?.requestedAgentId === 'string' ? plan.requestedAgentId : fallbackSdk.config.agent.id;
+      const selected = discovery.agents.find((candidate) => candidate.id === requestedAgentId && candidate.validationState === 'valid' && !candidate.archived);
+      targetSdk = selected && selected.configPath !== fallbackSdk.agentPath
+        ? await this.sdkForSelectedAgent(fallbackSdk, selected)
+        : fallbackSdk;
+    }
+    const orchestration = await this.orchestrationFactory({
+      ...(this.sdkOptions ?? {}),
+      cwd: this.settingsCwd,
+      requestedAgentConfig: targetSdk.config.agent,
+      requestedAgentConfigPath: targetSdk.agentPath,
+      agentCatalogPaths: discovery.agents
+        .filter((candidate) => candidate.validationState === 'valid' && !candidate.archived)
+        .map((candidate) => candidate.configPath),
+      runtime: targetSdk.created.runtime,
+      orchestrationStore: targetSdk.created.runtime.orchestrationStore,
+      eventListener: (event: AgentEvent) => this.writeAgentEvent(event),
+    });
+    this.orchestrationSdks.set(executionId, orchestration);
+    return orchestration;
+  }
+
   private async validateAndTranslateAttachments(inputs: DesktopAttachmentInput[]): Promise<ModelContentPart[]> {
     if (!inputs.length) return [];
     if (!this.managedAttachmentRoot) throw new DesktopProtocolError('ATTACHMENTS_UNAVAILABLE', 'managedAttachmentRoot is not configured.', JSON_RPC_ERROR_CODES.commandRejected);
@@ -1306,12 +1374,15 @@ function attachmentCapabilities(enabled: boolean, protocolVersion: DesktopProtoc
     supportedAudioMimeTypes: supportsMedia ? ['audio/wav', 'audio/x-wav', 'audio/mpeg', 'audio/flac', 'audio/mp4', 'audio/ogg', 'audio/aac', 'audio/aiff'] : [],
     supportedAudioFormats: supportsMedia ? ['wav', 'mp3', 'flac', 'm4a', 'ogg', 'aac', 'aiff', 'pcm16', 'pcm24'] : [],
     supportedGenericMimeTypes: ['application/octet-stream', 'application/pdf', 'text/plain', 'application/json'],
-    routing: { taskGeneric: 'direct', chatGeneric: 'direct', ...(supportsMedia ? { taskImage: 'direct', taskAudio: 'direct', chatImage: 'direct', chatAudio: 'direct' } : {}) },
+    routing: { taskGeneric: 'direct', chatGeneric: 'direct', ...(supportsMedia ? { taskImage: 'catalog', taskAudio: 'catalog', chatImage: 'direct', chatAudio: 'direct' } : {}) },
     ...(reason ? { reason } : {}),
   };
 }
 function rejectUnsupportedMedia(inputs: DesktopAttachmentInput[], protocolVersion: DesktopProtocolVersion): void {
   if (!['1.17', '1.18', '1.19'].includes(protocolVersion) && inputs.some((input) => input.kind !== 'file')) throw new DesktopProtocolError('UNSUPPORTED_ATTACHMENT_KIND', 'Managed image and audio attachments require desktop protocol 1.17.', JSON_RPC_ERROR_CODES.commandRejected);
+}
+function executionMode(inputs: DesktopAttachmentInput[]): 'direct' | 'catalog' {
+  return inputs.some((input) => input.kind === 'image' || input.kind === 'audio') ? 'catalog' : 'direct';
 }
 function executionResult(executionId: string, mode: 'direct' | 'catalog', result: any, stages?: any[]): JsonValue { return asJsonValue({ executionId, mode, status: result.status, finalRunId: result.runId, traceTarget: mode === 'direct' ? { kind: 'root-run', rootRunId: executionId } : { kind: 'session', sessionId: executionId }, ...(stages ? { stages } : {}), result }); }
 

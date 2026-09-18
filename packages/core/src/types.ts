@@ -988,8 +988,60 @@ export interface PlanStore {
   updateExecution(executionId: UUID, patch: Partial<PlanExecution>): Promise<PlanExecution>;
 }
 
+export type OrchestrationExecutionStatus =
+  | 'routing' | 'running' | 'paused' | 'succeeded' | 'failed' | 'cancelled';
+export type OrchestrationStageStatus =
+  | 'queued' | 'running' | 'paused' | 'succeeded' | 'failed' | 'cancelled' | 'skipped';
+
+/** Durable, profile-agnostic description of a routed execution. */
+export interface OrchestrationExecution {
+  id: UUID;
+  status: OrchestrationExecutionStatus;
+  request: JsonValue;
+  catalogFingerprint: string;
+  plan: JsonValue;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+}
+
+export interface OrchestrationStage {
+  executionId: UUID;
+  runId: UUID;
+  nodeId: string;
+  agentId: string;
+  status: OrchestrationStageStatus;
+  dependencies: string[];
+  upstreamRunIds: UUID[];
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  completedAt?: string;
+}
+
+export interface OrchestrationStore {
+  createExecution(input: {
+    id?: UUID;
+    status?: OrchestrationExecutionStatus;
+    request: JsonValue;
+    catalogFingerprint: string;
+    plan: JsonValue;
+    stages: Array<Pick<OrchestrationStage, 'runId' | 'nodeId' | 'agentId'> &
+      Partial<Pick<OrchestrationStage, 'status' | 'dependencies' | 'upstreamRunIds'>>>;
+  }): Promise<OrchestrationExecution>;
+  getExecution(id: UUID): Promise<OrchestrationExecution | null>;
+  updateExecution(id: UUID, patch: Partial<Pick<OrchestrationExecution, 'status'>>, expectedVersion: number): Promise<OrchestrationExecution>;
+  listStages(executionId: UUID): Promise<OrchestrationStage[]>;
+  updateStage(executionId: UUID, nodeId: string, patch: Partial<Pick<OrchestrationStage, 'status' | 'upstreamRunIds'>>, expectedVersion: number): Promise<OrchestrationStage>;
+  /** Atomically changes one queued stage whose dependencies are terminal to running. */
+  claimReadyStage(executionId: UUID): Promise<OrchestrationStage | null>;
+}
+
 export interface RuntimeStores {
   runStore: RunStore;
+  orchestrationStore?: OrchestrationStore;
   eventStore?: EventStore;
   snapshotStore?: SnapshotStore;
   planStore?: PlanStore;

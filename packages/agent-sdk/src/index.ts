@@ -69,10 +69,12 @@ export { createOrchestrationSdk, OrchestrationSdk } from './orchestration.js';
 export type {
   AgentCatalogEntry,
   InputClaim,
+  OrchestratedExecutionOptions,
   OrchestratedRunOptions,
   OrchestratedRunResult,
   OrchestratedRunStageResult,
   OrchestrationConcurrencyPolicy,
+  OrchestrationAgentRunner,
   OrchestrationExecutionShape,
   OrchestrationInputSelector,
   OrchestrationLifecycleEvent,

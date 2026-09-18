@@ -51,8 +51,25 @@ describe('Agent SDK SQLite runtime', () => {
       agentConfig: agentConfig([]),
       modelAdapter: finalModel({ durable: true }),
     });
-    openSdks.push(sdk);
     expect(existsSync(join(home, 'runtime.sqlite'))).toBe(true);
+    await sdk.created.runtime.orchestrationStore.createExecution({
+      id: '00000000-0000-4000-8000-000000000001',
+      request: { goal: 'persist orchestration' },
+      catalogFingerprint: 'sha256:test',
+      plan: { nodes: [] },
+      stages: [],
+    });
+    await sdk.close();
+
+    const reopened = await AgentSdk.create({
+      cwd: directory,
+      env: testEnvironment({ HOME: home, ADAPTIVE_AGENT_HOME: home }),
+      runtimeMode: 'sqlite',
+      agentConfig: agentConfig([]),
+      modelAdapter: finalModel({ durable: true }),
+    });
+    openSdks.push(reopened);
+    expect((await reopened.created.runtime.orchestrationStore.getExecution('00000000-0000-4000-8000-000000000001'))?.status).toBe('routing');
   });
 
   it('reopens persisted runs and does not rerun a completed local tool on resume', async () => {

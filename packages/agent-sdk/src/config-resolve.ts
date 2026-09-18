@@ -76,9 +76,10 @@ export async function resolveAgentSdkConfigWithSources(options: AgentSdkOptions)
   const settings = validateSettings(expandStrings(mergeSettings(settingsLoaded?.value ?? {}, options.settingsOverrides)), settingsSource);
   Object.assign(env, settings.env ?? {});
   const agentDirs = resolveAgentDirs(cwd, settings.agents?.dirs, env);
+  const explicitAgent = Boolean(options.agentConfig || options.agentConfigPath);
   const agentLoaded = options.agentConfig ? { path: '<inline agent>', value: options.agentConfig } : await loadRequiredAgent(cwd, options.agentConfigPath ?? settings.agent?.configPath, env, agentDirs);
   const agent = validateAgent(expandStrings(agentLoaded.value), agentLoaded.path);
-  if (settings.agent?.id && settings.agent.id !== agent.id) throw new AgentSettingsValidationError(settingsSource, [`settings.agent.id (${settings.agent.id}) does not match agent.id (${agent.id})`]);
+  if (!explicitAgent && settings.agent?.id && settings.agent.id !== agent.id) throw new AgentSettingsValidationError(settingsSource, [`settings.agent.id (${settings.agent.id}) does not match agent.id (${agent.id})`]);
 
   const workspaceRoot = resolvePath(cwd, optionsString(settings.workspace?.overrideRoot) ?? optionsString(agent.workspace?.root) ?? optionsString(agent.workspaceRoot) ?? cwd);
   const shellCwd = resolvePath(workspaceRoot, optionsString(settings.workspace?.overrideShellCwd) ?? optionsString(agent.workspace?.shellCwd) ?? workspaceRoot);

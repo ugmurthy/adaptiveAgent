@@ -6,6 +6,7 @@ import { InMemoryContinuationStore } from './in-memory-continuation-store.js';
 import { InMemoryEventStore } from './in-memory-event-store.js';
 import { InMemoryRunStore } from './in-memory-run-store.js';
 import { InMemorySnapshotStore } from './in-memory-snapshot-store.js';
+import { InMemoryOrchestrationStore } from './in-memory-orchestration-store.js';
 import { skillsToDelegate } from './skills/skill-to-delegate.js';
 import type { SkillDefinition } from './skills/types.js';
 import type {
@@ -15,6 +16,7 @@ import type {
   EventSink,
   EventStore,
   ModelAdapter,
+  OrchestrationStore,
   PlanStore,
   RuntimeMaintenanceStore,
   RuntimeTransactionStore,
@@ -33,6 +35,7 @@ export interface AdaptiveAgentRuntime<
   TContinuationStore extends ContinuationStore = InMemoryContinuationStore,
 > {
   runStore: TRunStore;
+  orchestrationStore: OrchestrationStore;
   eventStore: TEventStore;
   snapshotStore: TSnapshotStore;
   planStore: TPlanStore;
@@ -50,6 +53,7 @@ export interface AdaptiveAgentRuntimeOptions<
   TContinuationStore extends ContinuationStore = InMemoryContinuationStore,
 > {
   runStore?: TRunStore;
+  orchestrationStore?: OrchestrationStore;
   eventStore?: TEventStore;
   snapshotStore?: TSnapshotStore;
   planStore?: TPlanStore;
@@ -109,6 +113,7 @@ export function createAdaptiveAgentRuntime<
   const transactionStore = isRuntimeTransactionStore(options) ? options : options.transactionStore;
   return {
     runStore: (options.runStore ?? new InMemoryRunStore()) as TRunStore,
+    orchestrationStore: options.orchestrationStore ?? new InMemoryOrchestrationStore(),
     eventStore: (options.eventStore ?? new InMemoryEventStore()) as TEventStore,
     snapshotStore: (options.snapshotStore ?? new InMemorySnapshotStore()) as TSnapshotStore,
     planStore: options.planStore as TPlanStore,

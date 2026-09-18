@@ -33,6 +33,7 @@ export async function resolveRuntimeBundle(mode: RuntimeMode, autoMigrate: boole
       mode,
       runtime: {
         runStore: stores.runStore,
+        orchestrationStore: stores.orchestrationStore,
         eventStore: stores.eventStore,
         snapshotStore: stores.snapshotStore,
         planStore: stores.planStore,
@@ -58,7 +59,7 @@ function createPostgresPool(env: NodeJS.ProcessEnv): CorePool {
   if (!pgTypesConfigured) { for (const oid of TIMESTAMP_OIDS) types.setTypeParser(oid, (value) => value); pgTypesConfigured = true; }
   return new Pool({ connectionString: env.DATABASE_URL, ssl: readBooleanEnv(env.PGSSL) ? { rejectUnauthorized: false } : undefined }) as unknown as CorePool;
 }
-function postgresStoresToRuntime(stores: PostgresRuntimeStoreBundle): AdaptiveAgentRuntimeOptions<RunStore, EventStore, SnapshotStore, PlanStore | undefined, ContinuationStore> { return { runStore: stores.runStore, eventStore: stores.eventStore, snapshotStore: stores.snapshotStore, planStore: stores.planStore, continuationStore: stores.continuationStore, toolExecutionStore: stores.toolExecutionStore, transactionStore: stores, maintenanceStore: stores.maintenanceStore }; }
+function postgresStoresToRuntime(stores: PostgresRuntimeStoreBundle): AdaptiveAgentRuntimeOptions<RunStore, EventStore, SnapshotStore, PlanStore | undefined, ContinuationStore> { return { runStore: stores.runStore, orchestrationStore: stores.orchestrationStore, eventStore: stores.eventStore, snapshotStore: stores.snapshotStore, planStore: stores.planStore, continuationStore: stores.continuationStore, toolExecutionStore: stores.toolExecutionStore, transactionStore: stores, maintenanceStore: stores.maintenanceStore }; }
 const CREATE_MIGRATION_TABLE_SQL = `create table if not exists adaptive_agent_migrations (name text primary key, applied_at timestamptz not null default now())`;
 async function runPostgresRuntimeMigrations(client: PostgresClient | PostgresPoolClient): Promise<void> { await runWithPostgresTransaction(client, async (tx) => { await tx.query(CREATE_MIGRATION_TABLE_SQL); for (const migration of POSTGRES_RUNTIME_MIGRATIONS) await runMigrationIfNeeded(tx, migration); }); }
 async function runMigrationIfNeeded(client: PostgresClient, migration: PostgresMigrationDefinition): Promise<void> { const existing = await client.query<{ name: string }>('SELECT name FROM adaptive_agent_migrations WHERE name = $1', [migration.name]); if (existing.rowCount) return; await client.query(migration.sql); await client.query('INSERT INTO adaptive_agent_migrations (name) VALUES ($1)', [migration.name]); }

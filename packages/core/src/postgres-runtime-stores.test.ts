@@ -202,10 +202,11 @@ const sampleToolExecutionRow = {
 
 describe('Postgres runtime migrations', () => {
   it('adds execution context after the existing run migrations', () => {
-    expect(POSTGRES_RUNTIME_MIGRATIONS.at(-1)).toMatchObject({
+    expect(POSTGRES_RUNTIME_MIGRATIONS.find((migration) => migration.name === 'core:006_run_execution_context')).toMatchObject({
       name: 'core:006_run_execution_context',
       sql: expect.stringContaining('add column if not exists execution_context jsonb'),
     });
+    expect(POSTGRES_RUNTIME_MIGRATIONS.at(-1)?.name).toBe('core:007_orchestration');
   });
 });
 

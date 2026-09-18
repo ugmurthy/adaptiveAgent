@@ -34,7 +34,7 @@ describe('SQLite runtime stores', () => {
     expect(database.query('pragma busy_timeout').get()).toEqual({ timeout: 2_500 });
     expect(database.query('pragma user_version').get()).toEqual({ user_version: SQLITE_RUNTIME_SCHEMA_VERSION });
     expect(database.query('select name from adaptive_agent_migrations').all())
-      .toEqual([{ name: 'core:001_runtime_sqlite' }]);
+      .toEqual([{ name: 'core:001_runtime_sqlite' }, { name: 'core:002_orchestration' }]);
   });
 
   it('atomically commits or rolls back delegate child spawn boundaries', async () => {

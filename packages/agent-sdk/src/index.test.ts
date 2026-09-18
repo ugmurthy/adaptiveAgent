@@ -66,6 +66,31 @@ describe('agent-sdk config resolution', () => {
     expect(config.agent.id).toBe('gaia-agent-improved');
   });
 
+  it('lets an explicit agent override the settings startup-agent pin', async () => {
+    await mkdir(join(tempDir, 'catalog'));
+    await writeAgentConfig(join(tempDir, 'catalog', 'byok-agent.json'), 'byok-agent');
+    await writeAgentConfig(join(tempDir, 'catalog', 'gaia2-improved.json'), 'gaia-agent-improved');
+    await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({
+      agent: { id: 'byok-agent', configPath: './catalog/byok-agent.json' },
+      agents: { dirs: ['./catalog'] },
+      interaction: { approvalMode: 'manual' },
+    }));
+
+    const config = await loadAgentSdkConfig({ cwd: tempDir, agentConfigPath: 'gaia2-improved', env: testEnvironment() });
+
+    expect(config.agent.id).toBe('gaia-agent-improved');
+    expect(config.interaction.approvalMode).toBe('manual');
+  });
+
+  it('still validates the startup-agent pin when no agent override is supplied', async () => {
+    await writeAgentConfig(join(tempDir, 'agent.json'), 'different-agent');
+    await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({ agent: { id: 'byok-agent' } }));
+
+    await expect(loadAgentSdkConfig({ cwd: tempDir, env: testEnvironment() })).rejects.toThrow(
+      'settings.agent.id (byok-agent) does not match agent.id (different-agent)',
+    );
+  });
+
   it('rejects ambiguous agent filenames from settings agents dirs', async () => {
     await mkdir(join(tempDir, 'catalog-a'));
     await mkdir(join(tempDir, 'catalog-b'));

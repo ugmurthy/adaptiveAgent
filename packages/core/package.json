@@ -7,7 +7,7 @@
   "main": "src/index.ts",
   "scripts": {
     "build": "bun build src/index.ts --outdir dist --target bun",
-    "test": "bunx vitest run && bun test ./src/runtime-store-conformance.bun.ts ./src/sqlite-runtime-stores.bun.ts",
+    "test": "bunx vitest run && bun test ./src/runtime-store-conformance.bun.ts ./src/sqlite-runtime-stores.bun.ts ./src/orchestration-stores.bun.ts",
     "test:watch": "bunx vitest"
   },
   "devDependencies": {

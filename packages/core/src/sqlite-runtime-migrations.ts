@@ -6,7 +6,7 @@ export interface SqliteMigrationDefinition {
   sql: string;
 }
 
-export const SQLITE_RUNTIME_SCHEMA_VERSION = 1;
+export const SQLITE_RUNTIME_SCHEMA_VERSION = 2;
 
 export const SQLITE_RUNTIME_MIGRATIONS: SqliteMigrationDefinition[] = [
   {
@@ -120,6 +120,25 @@ create table run_continuations (
 );
 
 create index run_continuations_source_idx on run_continuations (source_run_id, created_at asc, id asc);
+`,
+  },
+  {
+    version: 2,
+    name: 'core:002_orchestration',
+    sql: `
+create table orchestration_executions (
+  id text primary key, status text not null, version integer not null default 0,
+  created_at text not null, updated_at text not null,
+  record_json text not null check (json_valid(record_json))
+);
+create index orchestration_executions_status_idx on orchestration_executions(status, updated_at, id);
+create table orchestration_stages (
+  execution_id text not null references orchestration_executions(id) on delete cascade,
+  node_id text not null, run_id text not null, status text not null,
+  version integer not null default 0, created_at text not null, updated_at text not null,
+  record_json text not null check (json_valid(record_json)), primary key(execution_id,node_id), unique(run_id)
+);
+create index orchestration_stages_ready_idx on orchestration_stages(execution_id,status,node_id);
 `,
   },
 ];

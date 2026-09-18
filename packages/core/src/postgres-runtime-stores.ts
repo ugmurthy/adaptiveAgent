@@ -1,4 +1,5 @@
 import { RuntimeDeletionError } from './types.js';
+import { PostgresOrchestrationStore } from './postgres-orchestration-store.js';
 import type {
   AgentEvent,
   AgentRun,
@@ -1170,6 +1171,7 @@ export class PostgresRuntimeMaintenanceStore implements RuntimeMaintenanceStore 
 }
 
 export class PostgresRuntimeStoreBundle implements RuntimeTransactionStore {
+  readonly orchestrationStore: PostgresOrchestrationStore;
   readonly runStore: PostgresRunStore;
   readonly eventStore: PostgresEventStore;
   readonly snapshotStore: PostgresSnapshotStore;
@@ -1180,6 +1182,7 @@ export class PostgresRuntimeStoreBundle implements RuntimeTransactionStore {
   readonly maintenanceStore: PostgresRuntimeMaintenanceStore;
 
   constructor(private readonly client: PostgresClient | PostgresPoolClient) {
+    this.orchestrationStore = new PostgresOrchestrationStore(client);
     this.runStore = new PostgresRunStore(client);
     this.eventStore = new PostgresEventStore(client);
     this.snapshotStore = new PostgresSnapshotStore(client);
@@ -1194,6 +1197,7 @@ export class PostgresRuntimeStoreBundle implements RuntimeTransactionStore {
     return runPostgresTransaction(this.client, (client) =>
       operation({
         runStore: new PostgresRunStore(client),
+        orchestrationStore: new PostgresOrchestrationStore(client),
         eventStore: new PostgresEventStore(client),
         snapshotStore: new PostgresSnapshotStore(client),
         planStore: new PostgresPlanStore(client),

@@ -1,15 +1,16 @@
+import { createHash, randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 
-import type { JsonObject, JsonValue, RunResult } from '@adaptive-agent/core';
+import { InMemoryOrchestrationStore, type AgentRun, type JsonObject, type JsonValue, type OrchestrationExecution, type OrchestrationStage, type OrchestrationStore, type RunResult } from '@adaptive-agent/core';
 
 import { AgentSdk, type AgentConfigFile, type AgentSdkOptions, type AgentSdkRunOptions, type SupportedModality } from './index.js';
 import { adaptiveAgentHome, expandStrings, readJson, resolveAgentConfigByName, resolveAgentDirs, resolvePath, pathExists } from './sdk-utils.js';
 import type { AgentSettingsFile } from './config-types.js';
 
-export type OrchestrationSessionStatus = 'routing' | 'running' | 'succeeded' | 'failed';
+export type OrchestrationSessionStatus = 'routing' | 'running' | 'paused' | 'succeeded' | 'failed' | 'cancelled';
 export type OrchestrationStageKind = 'single' | 'modality_specialist' | 'parallel_specialist' | 'subject_specialist' | 'final_synthesis';
 export type OrchestrationExecutionShape = 'single' | 'sequential' | 'parallel_fanout_then_synthesis';
-export type OrchestrationPlanNodeStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'skipped';
+export type OrchestrationPlanNodeStatus = 'queued' | 'running' | 'paused' | 'succeeded' | 'failed' | 'cancelled' | 'skipped';
 
 export interface InputClaim {
   id: string;
@@ -112,10 +113,18 @@ export interface OrchestrationConcurrencyPolicy {
 }
 
 export interface OrchestratedRunOptions extends AgentSdkRunOptions {
+  executionId?: string;
   requestedAgentId?: string;
   sessionId?: string;
+  catalogFingerprint?: string;
   finalizeWithRequestedAgent?: boolean;
   orchestrationMetadata?: JsonObject;
+}
+
+export interface OrchestratedExecutionOptions extends Omit<OrchestratedRunOptions, 'executionId' | 'sessionId' | 'requestedAgentId' | 'catalogFingerprint'> {
+  executionId: string;
+  requestedAgentId: string;
+  catalogFingerprint?: string;
 }
 
 export interface OrchestratedRunStageResult {
@@ -213,6 +222,8 @@ export interface OrchestrationSdkOptions extends AgentSdkOptions {
   agentCatalogPaths?: string[];
   sessionStore?: OrchestrationSessionStore;
   sessionRunLinkStore?: OrchestrationSessionRunLinkStore;
+  orchestrationStore?: OrchestrationStore;
+  catalogFingerprint?: string;
   sessionIdFactory?: () => string;
   now?: () => Date;
   concurrency?: OrchestrationConcurrencyPolicy;
@@ -222,7 +233,9 @@ export interface OrchestrationSdkOptions extends AgentSdkOptions {
 
 export interface OrchestrationAgentRunner {
   runRaw(goal: string, options?: AgentSdkRunOptions): Promise<RunResult>;
-  inspect(runId: string): Promise<{ run: { rootRunId?: string } | null }>;
+  resumeRaw?(runId: string): Promise<RunResult>;
+  interrupt?(runId: string): Promise<void>;
+  inspect(runId: string): Promise<{ run: (Pick<AgentRun, 'rootRunId'> & Partial<Pick<AgentRun, 'id' | 'status' | 'result' | 'errorCode' | 'errorMessage' | 'usage'>>) | null }>;
   close?(): Promise<void>;
 }
 
@@ -236,6 +249,8 @@ export class OrchestrationSdk {
   private readonly now: () => Date;
   private readonly concurrency: Required<OrchestrationConcurrencyPolicy>;
   private readonly defaultRequestedAgentId: string;
+  private orchestrationStore: OrchestrationStore;
+  private readonly catalogFingerprint: string;
 
   private constructor(private readonly options: OrchestrationSdkOptions, entries: AgentCatalogEntry[]) {
     for (const entry of entries) {
@@ -252,6 +267,8 @@ export class OrchestrationSdk {
       maxConcurrentRunsPerSession: options.concurrency?.maxConcurrentRunsPerSession ?? 2,
       failurePolicy: options.concurrency?.failurePolicy ?? 'fail_fast',
     };
+    this.orchestrationStore = options.orchestrationStore ?? new InMemoryOrchestrationStore();
+    this.catalogFingerprint = options.catalogFingerprint ?? fingerprintCatalog(entries);
   }
 
   static async create(options: OrchestrationSdkOptions = {}): Promise<OrchestrationSdk> {
@@ -267,7 +284,34 @@ export class OrchestrationSdk {
   }
 
   async inspectSession(sessionId: string): Promise<OrchestrationSessionInspection> {
-    return { session: await this.sessionStore.get(sessionId), links: await this.linkStore.listBySession(sessionId), plan: this.plans.get(sessionId) };
+    const durable = await this.inspectExecution(sessionId);
+    const plan = durable.execution ? parsePlan(durable.execution.plan) : this.plans.get(sessionId);
+    return { session: await this.sessionStore.get(sessionId), links: await this.linkStore.listBySession(sessionId), plan };
+  }
+
+  async inspectExecution(executionId: string): Promise<{ execution: OrchestrationExecution | null; stages: OrchestrationStage[]; plan?: OrchestrationPlan }> {
+    const execution = await this.orchestrationStore.getExecution(executionId);
+    return { execution, stages: execution ? await this.orchestrationStore.listStages(executionId) : [], plan: execution ? parsePlan(execution.plan) : undefined };
+  }
+
+  async interruptExecution(executionId: string): Promise<void> {
+    let execution = await this.orchestrationStore.getExecution(executionId);
+    if (!execution || ['succeeded', 'failed', 'cancelled'].includes(execution.status)) return;
+    execution = await this.orchestrationStore.updateExecution(executionId, { status: 'cancelled' }, execution.version);
+    const active = (await this.orchestrationStore.listStages(executionId)).filter((stage) => stage.status === 'running' || stage.status === 'paused');
+    await Promise.all(active.map(async (stage) => {
+      await (await this.getRunner(stage.agentId)).interrupt?.(stage.runId);
+      const current = (await this.orchestrationStore.listStages(executionId)).find((item) => item.nodeId === stage.nodeId);
+      if (current && (current.status === 'running' || current.status === 'paused')) await this.orchestrationStore.updateStage(executionId, stage.nodeId, { status: 'cancelled' }, current.version);
+    }));
+  }
+
+  async resumeExecution(executionId: string): Promise<OrchestratedRunResult> {
+    const execution = await this.orchestrationStore.getExecution(executionId);
+    if (!execution) throw new Error(`Orchestration execution ${executionId} not found.`);
+    if (execution.catalogFingerprint !== this.catalogFingerprint) throw new Error(`CATALOG_CHANGED: orchestration execution ${executionId} was created with a different catalog fingerprint.`);
+    if (execution.status === 'cancelled') throw new Error(`Orchestration execution ${executionId} is cancelled.`);
+    return this.continueExecution(execution, parseRequest(execution.request), parsePlan(execution.plan));
   }
 
   async close(): Promise<void> {
@@ -279,8 +323,12 @@ export class OrchestrationSdk {
     if (options.contextRefs && options.contextRefs.length > 0) {
       throw new Error('Context refs are not supported for orchestration until stage propagation semantics are defined.');
     }
-    const sessionId = options.sessionId ?? this.sessionIdFactory();
+    const sessionId = options.executionId ?? options.sessionId ?? this.sessionIdFactory();
     const requestedAgentId = options.requestedAgentId ?? this.defaultRequestedAgentId;
+    if (!this.options.orchestrationStore && !this.options.agentRunnerFactory) {
+      const requestedRunner = await this.getRunner(requestedAgentId);
+      if (requestedRunner instanceof AgentSdk) this.orchestrationStore = requestedRunner.created.runtime.orchestrationStore;
+    }
     const plan = buildOrchestrationPlan({ sessionId, requestedAgentId, goal, options, catalog: this.catalog, finalizeWithRequestedAgent: options.finalizeWithRequestedAgent ?? true });
     this.plans.set(sessionId, plan);
     this.emitLifecycle({
@@ -295,55 +343,197 @@ export class OrchestrationSdk {
       createdAt: this.now().toISOString(),
     });
 
+    const request = jsonSafe({ goal, options: stripOrchestrationOptions(options) });
+    const fingerprint = options.catalogFingerprint ?? this.catalogFingerprint;
+    const durable = await this.orchestrationStore.createExecution({
+      id: sessionId,
+      request,
+      catalogFingerprint: fingerprint,
+      plan: jsonSafe(plan),
+      stages: plan.nodes.map((node) => ({ runId: randomSessionId(), nodeId: node.id, agentId: node.agentId, status: 'queued', dependencies: node.dependsOn, upstreamRunIds: [] })),
+    });
     const createdAt = this.now().toISOString();
     let session = await this.sessionStore.create({ id: sessionId, requestedAgentId, status: 'routing', executionShape: plan.executionShape, detectedModalities: plan.detectedModalities, detectedSubjects: plan.detectedSubjects, routingReason: plan.routingReason, metadata: options.orchestrationMetadata, createdAt, updatedAt: createdAt });
     this.emitLifecycle({ type: 'orchestration.session.created', sessionId, requestedAgentId, status: session.status, executionShape: plan.executionShape, detectedModalities: plan.detectedModalities, detectedSubjects: plan.detectedSubjects, routingReason: plan.routingReason, createdAt: this.now().toISOString() });
     session = await this.sessionStore.update({ ...session, status: 'running', updatedAt: this.now().toISOString() });
     this.emitLifecycle({ type: 'orchestration.session.running', sessionId, requestedAgentId, status: session.status, executionShape: plan.executionShape, detectedModalities: plan.detectedModalities, detectedSubjects: plan.detectedSubjects, routingReason: plan.routingReason, createdAt: this.now().toISOString() });
 
-    const results = new Map<string, OrchestratedRunStageResult>();
-    const pending = new Set(plan.nodes.map((node) => node.id));
-    let finalResult: RunResult | undefined;
-
-    while (pending.size > 0) {
-      const ready = plan.nodes.filter((node) => pending.has(node.id) && node.dependsOn.every((dependency) => results.has(dependency)));
-      if (ready.length === 0) throw new Error(`Unable to make progress in orchestration plan ${sessionId}.`);
-
-      const batch = ready.slice(0, this.concurrency.maxConcurrentRunsPerSession);
-      const settled = await Promise.all(batch.map((node) => this.executeNode(goal, options, plan, node, results)));
-      for (const stageResult of settled) {
-        results.set(stageResult.nodeId, stageResult);
-        pending.delete(stageResult.nodeId);
-        if (stageResult.result.status === 'failure' && this.concurrency.failurePolicy === 'fail_fast') {
-          finalResult = stageResult.result;
-          pending.clear();
-          break;
-        }
-      }
-    }
-
-    finalResult ??= results.get(plan.finalNodeId)?.result ?? [...results.values()].at(-1)?.result;
-    if (!finalResult) throw new Error(`Orchestration plan ${sessionId} completed without a final result.`);
-    const completedStatus = finalResult.status === 'success' ? 'succeeded' : 'failed';
-    await this.sessionStore.update({ ...session, status: completedStatus, updatedAt: this.now().toISOString(), completedAt: this.now().toISOString() });
-    this.emitLifecycle({ type: 'orchestration.session.completed', sessionId, requestedAgentId, status: completedStatus, executionShape: plan.executionShape, finalRunId: finalResult.runId, createdAt: this.now().toISOString() });
-
-    return { sessionId, requestedAgentId, detectedModalities: plan.detectedModalities, detectedSubjects: plan.detectedSubjects, executionShape: plan.executionShape, plan, stages: plan.nodes.map((node) => results.get(node.id)).filter((result): result is OrchestratedRunStageResult => Boolean(result)), finalResult };
+    return this.continueExecution(durable, { goal, options }, plan, session);
   }
 
-  private async executeNode(goal: string, options: OrchestratedRunOptions, plan: OrchestrationPlan, node: OrchestrationPlanNode, priorResults: Map<string, OrchestratedRunStageResult>): Promise<OrchestratedRunStageResult> {
+  private async continueExecution(durable: OrchestrationExecution, request: StoredRequest, plan: OrchestrationPlan, legacySession?: OrchestrationSessionRecord): Promise<OrchestratedRunResult> {
+    let execution = durable.status === 'routing' || durable.status === 'paused'
+      ? await this.orchestrationStore.updateExecution(durable.id, { status: 'running' }, durable.version)
+      : durable;
+    const results = await this.loadCompletedResults(execution.id, plan);
+    let failedResult = this.concurrency.failurePolicy === 'fail_fast'
+      ? [...results.values()].find((stage) => stage.result.status === 'failure')?.result
+      : undefined;
+    while (true) {
+      if (failedResult) break;
+      execution = (await this.orchestrationStore.getExecution(execution.id))!;
+      if (execution.status === 'cancelled') throw new Error(`Orchestration execution ${execution.id} is cancelled.`);
+      const stages = await this.orchestrationStore.listStages(execution.id);
+      const paused = stages.find((stage) => stage.status === 'paused');
+      if (paused) {
+        const runner = await this.getRunner(paused.agentId);
+        if (!runner.resumeRaw) {
+          await this.pauseExecution(execution);
+          return this.pausedResult(plan, results, paused.runId);
+        }
+        const resumed = await runner.resumeRaw(paused.runId);
+        await this.finishStage(paused, resumed);
+        if (isPaused(resumed)) {
+          await this.pauseExecution((await this.orchestrationStore.getExecution(execution.id))!);
+          return this.pausedResult(plan, results, resumed.runId, resumed);
+        }
+        results.set(paused.nodeId, this.stageResult(plan, paused, resumed));
+        if (resumed.status === 'failure' && this.concurrency.failurePolicy === 'fail_fast') {
+          failedResult = resumed;
+          break;
+        }
+        continue;
+      }
+      const active = stages.filter((stage) => stage.status === 'running');
+      if (active.length > 0) {
+        let unresolvedRunId: string | undefined;
+        for (const stage of active) {
+          const recovered = await this.reconcileRunningStage(stage, plan);
+          if (!recovered) {
+            unresolvedRunId ??= stage.runId;
+            continue;
+          }
+          results.set(stage.nodeId, recovered);
+          if (isPaused(recovered.result)) {
+            await this.pauseExecution((await this.orchestrationStore.getExecution(execution.id))!);
+            return this.pausedResult(plan, results, recovered.runId, recovered.result);
+          }
+          if (recovered.result.status === 'failure' && this.concurrency.failurePolicy === 'fail_fast') {
+            failedResult ??= recovered.result;
+          }
+        }
+        if (failedResult) break;
+        if (unresolvedRunId) return this.pausedResult(plan, results, unresolvedRunId);
+        continue;
+      }
+      const claims: OrchestrationStage[] = [];
+      while (claims.length < this.concurrency.maxConcurrentRunsPerSession) {
+        const claimed = await this.orchestrationStore.claimReadyStage(execution.id);
+        if (!claimed) break;
+        claims.push(claimed);
+      }
+      if (claims.length === 0) break;
+      const settled = await Promise.all(claims.map((stage) => this.executeNode(request.goal, request.options, plan, plan.nodes.find((node) => node.id === stage.nodeId)!, stage, results)));
+      let pausedResult: OrchestratedRunStageResult | undefined;
+      for (const result of settled) {
+        results.set(result.nodeId, result);
+        if (isPaused(result.result)) pausedResult ??= result;
+        if (result.result.status === 'failure' && this.concurrency.failurePolicy === 'fail_fast') failedResult ??= result.result;
+      }
+      if (failedResult) break;
+      if (pausedResult) {
+        await this.pauseExecution((await this.orchestrationStore.getExecution(execution.id))!);
+        return this.pausedResult(plan, results, pausedResult.runId, pausedResult.result);
+      }
+    }
+    if (failedResult) await this.stopUnfinishedStages(execution.id);
+    const finalResult = failedResult ?? results.get(plan.finalNodeId)?.result ?? [...results.values()].at(-1)?.result;
+    if (!finalResult) throw new Error(`Orchestration plan ${execution.id} completed without a final result.`);
+    const completedStatus = finalResult.status === 'success' ? 'succeeded' : 'failed';
+    execution = await this.orchestrationStore.updateExecution(execution.id, { status: completedStatus }, execution.version);
+    if (legacySession) await this.sessionStore.update({ ...legacySession, status: completedStatus, updatedAt: this.now().toISOString(), completedAt: this.now().toISOString() });
+    this.emitLifecycle({ type: 'orchestration.session.completed', sessionId: execution.id, requestedAgentId: plan.requestedAgentId, status: completedStatus, executionShape: plan.executionShape, finalRunId: finalResult.runId, createdAt: this.now().toISOString() });
+    return this.result(plan, results, finalResult);
+  }
+
+  private async executeNode(goal: string, options: OrchestratedRunOptions, plan: OrchestrationPlan, node: OrchestrationPlanNode, stage: OrchestrationStage, priorResults: Map<string, OrchestratedRunStageResult>): Promise<OrchestratedRunStageResult> {
     this.emitLifecycle({ type: 'orchestration.stage.starting', sessionId: plan.sessionId, requestedAgentId: plan.requestedAgentId, nodeId: node.id, agentId: node.agentId, stage: node.stage, dependsOn: node.dependsOn, createdAt: this.now().toISOString() });
     const runner = await this.getRunner(node.agentId);
     const startedAt = this.now().toISOString();
     const runGoal = node.stage === 'final_synthesis' ? buildSynthesisGoal(goal) : goal;
-    const runOptions = buildNodeOptions(options, plan, node, priorResults);
-    const result = await runner.runRaw(runGoal, runOptions);
+    const runOptions = buildNodeOptions(options, plan, node, priorResults, supportedModalities(this.catalog.get(plan.requestedAgentId)!.agentConfig));
+    const result = await runner.runRaw(runGoal, { ...runOptions, runId: stage.runId, sessionId: plan.sessionId });
     const rootRunId = (await runner.inspect(result.runId)).run?.rootRunId ?? result.runId;
     const completedAt = this.now().toISOString();
-    const status = result.status === 'success' ? 'succeeded' : result.status === 'failure' ? 'failed' : 'running';
+    const status = result.status === 'success' ? 'succeeded' : result.status === 'failure' ? 'failed' : 'paused';
+    await this.finishStage(stage, result, node.dependsOn.map((dependency) => priorResults.get(dependency)?.runId).filter((runId): runId is string => Boolean(runId)));
     await this.linkStore.append({ sessionId: plan.sessionId, nodeId: node.id, runId: result.runId, rootRunId, stage: node.stage, agentId: node.agentId, requestedAgentId: plan.requestedAgentId, status, dependsOn: node.dependsOn, upstreamRunIds: node.dependsOn.map((dependency) => priorResults.get(dependency)?.runId).filter((runId): runId is string => Boolean(runId)), metadata: node.metadata, createdAt: startedAt, startedAt, completedAt });
     this.emitLifecycle({ type: 'orchestration.stage.linked', sessionId: plan.sessionId, requestedAgentId: plan.requestedAgentId, nodeId: node.id, agentId: node.agentId, stage: node.stage, runId: result.runId, rootRunId, status, createdAt: this.now().toISOString() });
     return { nodeId: node.id, stage: node.stage, agentId: node.agentId, runId: result.runId, rootRunId, result };
+  }
+
+  private async finishStage(stage: OrchestrationStage, result: RunResult, upstreamRunIds?: string[]): Promise<OrchestrationStage> {
+    const execution = await this.orchestrationStore.getExecution(stage.executionId);
+    const current = (await this.orchestrationStore.listStages(stage.executionId)).find((item) => item.nodeId === stage.nodeId);
+    if (!execution || !current) throw new Error(`Orchestration stage ${stage.nodeId} not found.`);
+    if (execution.status === 'cancelled' || current.status === 'cancelled') return current;
+    return this.orchestrationStore.updateStage(stage.executionId, stage.nodeId, {
+      status: result.status === 'success' ? 'succeeded' : result.status === 'failure' ? 'failed' : 'paused',
+      ...(upstreamRunIds ? { upstreamRunIds } : {}),
+    }, current.version);
+  }
+
+  private async reconcileRunningStage(stage: OrchestrationStage, plan: OrchestrationPlan): Promise<OrchestratedRunStageResult | undefined> {
+    const runner = await this.getRunner(stage.agentId);
+    const run = (await runner.inspect(stage.runId)).run;
+    if (!run) {
+      const request = parseRequest((await this.orchestrationStore.getExecution(stage.executionId))!.request);
+      const node = plan.nodes.find((item) => item.id === stage.nodeId)!;
+      return this.executeNode(request.goal, request.options, plan, node, stage, await this.loadCompletedResults(stage.executionId, plan));
+    }
+    const stored = resultFromStoredRun(stage.runId, run);
+    const result = stored ?? (runner.resumeRaw ? await runner.resumeRaw(stage.runId) : undefined);
+    if (!result) return undefined;
+    await this.finishStage(stage, result);
+    return this.stageResult(plan, stage, result);
+  }
+
+  private stageResult(plan: OrchestrationPlan, stage: OrchestrationStage, result: RunResult): OrchestratedRunStageResult {
+    const node = plan.nodes.find((item) => item.id === stage.nodeId)!;
+    return { nodeId: node.id, stage: node.stage, agentId: stage.agentId, runId: stage.runId, rootRunId: stage.runId, result };
+  }
+
+  private async loadCompletedResults(executionId: string, plan: OrchestrationPlan): Promise<Map<string, OrchestratedRunStageResult>> {
+    const results = new Map<string, OrchestratedRunStageResult>();
+    for (const stage of await this.orchestrationStore.listStages(executionId)) {
+      if (stage.status !== 'succeeded' && stage.status !== 'failed') continue;
+      const run = (await (await this.getRunner(stage.agentId)).inspect(stage.runId)).run;
+      if (!run) throw new Error(`ORCHESTRATION_RECOVERY_REQUIRED: stage run ${stage.runId} is unavailable.`);
+      const result: RunResult = stage.status === 'succeeded'
+        ? { status: 'success', runId: stage.runId, output: run.result ?? null, stepsUsed: 0, usage: run.usage ?? emptyUsage() }
+        : { status: 'failure', runId: stage.runId, error: run.errorMessage ?? 'Stage failed', code: (run.errorCode ?? 'MODEL_ERROR') as Extract<RunResult, { status: 'failure' }>['code'], stepsUsed: 0, usage: run.usage ?? emptyUsage() };
+      results.set(stage.nodeId, this.stageResult(plan, stage, result));
+    }
+    return results;
+  }
+
+  private pausedResult(plan: OrchestrationPlan, results: Map<string, OrchestratedRunStageResult>, runId: string, paused?: RunResult): OrchestratedRunResult {
+    const finalResult: RunResult = paused && isPaused(paused)
+      ? paused
+      : { status: 'clarification_requested', runId, message: 'Orchestration execution is paused.' };
+    return this.result(plan, results, finalResult);
+  }
+
+  private async stopUnfinishedStages(executionId: string): Promise<void> {
+    for (const stage of await this.orchestrationStore.listStages(executionId)) {
+      if (stage.status === 'queued') {
+        await this.orchestrationStore.updateStage(executionId, stage.nodeId, { status: 'skipped' }, stage.version);
+      } else if (stage.status === 'running' || stage.status === 'paused') {
+        await (await this.getRunner(stage.agentId)).interrupt?.(stage.runId);
+        const current = (await this.orchestrationStore.listStages(executionId)).find((item) => item.nodeId === stage.nodeId);
+        if (current && (current.status === 'running' || current.status === 'paused')) {
+          await this.orchestrationStore.updateStage(executionId, stage.nodeId, { status: 'cancelled' }, current.version);
+        }
+      }
+    }
+  }
+
+  private async pauseExecution(execution: OrchestrationExecution): Promise<void> {
+    if (execution.status === 'running') await this.orchestrationStore.updateExecution(execution.id, { status: 'paused' }, execution.version);
+  }
+
+  private result(plan: OrchestrationPlan, results: Map<string, OrchestratedRunStageResult>, finalResult: RunResult): OrchestratedRunResult {
+    return { sessionId: plan.sessionId, requestedAgentId: plan.requestedAgentId, detectedModalities: plan.detectedModalities, detectedSubjects: plan.detectedSubjects, executionShape: plan.executionShape, plan, stages: plan.nodes.map((node) => results.get(node.id)).filter((result): result is OrchestratedRunStageResult => Boolean(result)), finalResult };
   }
 
   private emitLifecycle(event: OrchestrationLifecycleEvent): void {
@@ -414,14 +604,15 @@ export function buildOrchestrationPlan(params: { sessionId: string; requestedAge
   return { sessionId: params.sessionId, requestedAgentId: params.requestedAgentId, detectedModalities, detectedSubjects, inputClaims, executionShape: specialistNodes.length === 1 ? 'sequential' : 'parallel_fanout_then_synthesis', nodes: [...specialistNodes, finalNode], finalNodeId: finalNode.id, routingReason: buildRoutingReason(params.requestedAgentId, specialistModalities, detectedSubjects, true), routingDiagnostics };
 }
 
-function buildNodeOptions(options: OrchestratedRunOptions, plan: OrchestrationPlan, node: OrchestrationPlanNode, priorResults: Map<string, OrchestratedRunStageResult>): AgentSdkRunOptions {
+function buildNodeOptions(options: OrchestratedRunOptions, plan: OrchestrationPlan, node: OrchestrationPlanNode, priorResults: Map<string, OrchestratedRunStageResult>, requestedModalities: SupportedModality[]): AgentSdkRunOptions {
   const priorOutputs = Object.fromEntries((node.inputSelector?.includePriorOutputs ?? node.dependsOn).map((id) => {
     const result = priorResults.get(id)?.result;
     return [id, resultToJson(result)];
   }));
-  const orchestration = { sessionId: plan.sessionId, requestedAgentId: plan.requestedAgentId, selectedAgentId: node.agentId, executionShape: plan.executionShape, stage: node.stage, nodeId: node.id, dependsOn: node.dependsOn, detectedModalities: plan.detectedModalities, routingReason: plan.routingReason } satisfies JsonObject;
+  const orchestration = { kind: 'catalog', executionId: plan.sessionId, sessionId: plan.sessionId, requestedAgentId: plan.requestedAgentId, selectedAgentId: node.agentId, executionShape: plan.executionShape, stage: node.stage, nodeId: node.id, dependsOn: node.dependsOn, detectedModalities: plan.detectedModalities, routingReason: plan.routingReason } satisfies JsonObject;
   if (node.stage === 'final_synthesis') {
-    return { input: { originalInput: options.input ?? null, upstreamResults: priorOutputs }, context: { ...(options.context ?? {}), sessionId: plan.sessionId, orchestration }, executionContext: options.executionContext, inferenceTier: options.inferenceTier, outputSchema: options.outputSchema, metadata: { ...(options.metadata ?? {}), orchestration } };
+    const raw = selectSynthesisAttachments(options, requestedModalities);
+    return { ...raw, input: { originalInput: options.input ?? null, upstreamResults: priorOutputs }, context: { ...(options.context ?? {}), sessionId: plan.sessionId, orchestration }, executionContext: options.executionContext, inferenceTier: options.inferenceTier, outputSchema: options.outputSchema, metadata: { ...(options.metadata ?? {}), orchestration } };
   }
   return { ...selectNodeInputs(options, plan, node), context: { ...(options.context ?? {}), sessionId: plan.sessionId, orchestration }, executionContext: options.executionContext, inferenceTier: options.inferenceTier, outputSchema: options.outputSchema, metadata: { ...(options.metadata ?? {}), orchestration } };
 }
@@ -451,6 +642,12 @@ function selectContentParts(options: OrchestratedRunOptions, claims: InputClaim[
     .map((claim) => options.contentParts?.[claim.index!])
     .filter((part): part is NonNullable<AgentSdkRunOptions['contentParts']>[number] => Boolean(part));
   return contentParts.length > 0 ? { contentParts } : {};
+}
+
+function selectSynthesisAttachments(options: OrchestratedRunOptions, supported: SupportedModality[]): Pick<AgentSdkRunOptions, 'images' | 'contentParts'> {
+  const images = supported.includes('image') ? options.images : undefined;
+  const contentParts = options.contentParts?.filter((part) => part.type === 'file' || (part.type === 'image' && supported.includes('image')) || (part.type === 'audio' && supported.includes('audio')) || part.type === 'text');
+  return { ...(images?.length ? { images } : {}), ...(contentParts?.length ? { contentParts } : {}) };
 }
 
 function resultToJson(result: RunResult | undefined): JsonValue {
@@ -587,6 +784,74 @@ async function findSettingsPath(options: OrchestrationSdkOptions, cwd: string, e
   return undefined;
 }
 
+interface StoredRequest { goal: string; options: OrchestratedRunOptions }
+
+function parsePlan(value: JsonValue): OrchestrationPlan {
+  return value as unknown as OrchestrationPlan;
+}
+
+function parseRequest(value: JsonValue): StoredRequest {
+  return value as unknown as StoredRequest;
+}
+
+function jsonSafe(value: unknown): JsonValue {
+  return JSON.parse(JSON.stringify(value)) as JsonValue;
+}
+
+function stripOrchestrationOptions(options: OrchestratedRunOptions): OrchestratedRunOptions {
+  const copy = { ...options };
+  delete copy.executionId;
+  delete copy.sessionId;
+  delete copy.requestedAgentId;
+  delete copy.catalogFingerprint;
+  return copy;
+}
+
+function fingerprintCatalog(entries: AgentCatalogEntry[]): string {
+  const exactCatalog = entries
+    .map((entry) => ({
+      agentId: entry.agentId,
+      configPath: entry.configPath ?? null,
+      agentConfig: {
+        ...entry.agentConfig,
+        model: { ...entry.agentConfig.model, apiKey: undefined },
+      },
+    }))
+    .sort((left, right) => left.agentId.localeCompare(right.agentId));
+  return createHash('sha256').update(stableJson(exactCatalog)).digest('hex');
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([key, child]) => `${JSON.stringify(key)}:${stableJson(child)}`).join(',')}}`;
+  return JSON.stringify(value) ?? 'null';
+}
+
+function isPaused(result: RunResult): boolean {
+  return result.status === 'approval_requested' || result.status === 'clarification_requested';
+}
+
+function emptyUsage(): Extract<RunResult, { status: 'success' }>['usage'] {
+  return { promptTokens: 0, completionTokens: 0, estimatedCostUSD: 0 };
+}
+
+function resultFromStoredRun(runId: string, run: Partial<Pick<AgentRun, 'status' | 'result' | 'errorCode' | 'errorMessage' | 'usage'>>): RunResult | undefined {
+  if (run.status === 'succeeded') {
+    return { status: 'success', runId, output: run.result ?? null, stepsUsed: 0, usage: run.usage ?? emptyUsage() };
+  }
+  if (run.status === 'failed' || run.status === 'cancelled') {
+    return {
+      status: 'failure',
+      runId,
+      error: run.errorMessage ?? (run.status === 'cancelled' ? 'Run was cancelled.' : 'Stage failed.'),
+      code: (run.errorCode ?? (run.status === 'cancelled' ? 'INTERRUPTED' : 'MODEL_ERROR')) as Extract<RunResult, { status: 'failure' }>['code'],
+      stepsUsed: 0,
+      usage: run.usage ?? emptyUsage(),
+    };
+  }
+  return undefined;
+}
+
 class InMemoryOrchestrationSessionStore implements OrchestrationSessionStore {
   private readonly sessions = new Map<string, OrchestrationSessionRecord>();
   async create(session: OrchestrationSessionRecord): Promise<OrchestrationSessionRecord> { this.sessions.set(session.id, session); return session; }
@@ -607,5 +872,5 @@ function unique<T>(values: T[]): T[] {
 }
 
 function randomSessionId(): string {
-  return globalThis.crypto?.randomUUID?.() ?? `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return randomUUID();
 }

@@ -5,21 +5,22 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { ADAPTIVE_AGENT_CLI_COMMANDS } from '@adaptive-agent/agent-sdk/cli';
-import { AgentSdk, type ResolvedAgentSdkConfig, type TaskPreparationResult } from '@adaptive-agent/agent-sdk';
+import { AgentSdk, type OrchestratedRunResult, type ResolvedAgentSdkConfig, type TaskPreparationResult } from '@adaptive-agent/agent-sdk';
 import * as agentCreate from '@adaptive-agent/agent-sdk/agent-create';
+import { InMemoryOrchestrationStore } from '@adaptive-agent/core';
 
 import { JSON_RPC_ERROR_CODES, type DesktopMessage, type DesktopRpcRequest } from './protocol.js';
-import { DesktopRuntime, safeResolvedConfiguration, updateDesktopSettings, validateRestrictedDesktopConfiguration, type CliExecutor } from './runtime.js';
+import { DesktopRuntime, safeResolvedConfiguration, updateDesktopSettings, validateRestrictedDesktopConfiguration, type CliExecutor, type DesktopOrchestrationFactory } from './runtime.js';
 
 function request(value: Omit<DesktopRpcRequest, 'jsonrpc'>): DesktopRpcRequest {
   return { jsonrpc: '2.0', ...value } as DesktopRpcRequest;
 }
 
-function createRuntime(executor?: CliExecutor) {
+function createRuntime(executor?: CliExecutor, orchestrationFactory?: DesktopOrchestrationFactory) {
   const messages: DesktopMessage[] = [];
   return {
     messages,
-    runtime: new DesktopRuntime((message) => messages.push(message), executor),
+    runtime: new DesktopRuntime((message) => messages.push(message), executor, orchestrationFactory),
   };
 }
 
@@ -656,7 +657,7 @@ describe('desktop runtime protocol', () => {
       supportedImageMimeTypes: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'],
       supportedAudioMimeTypes: ['audio/wav', 'audio/x-wav', 'audio/mpeg', 'audio/flac', 'audio/mp4', 'audio/ogg', 'audio/aac', 'audio/aiff'],
       supportedAudioFormats: ['wav', 'mp3', 'flac', 'm4a', 'ogg', 'aac', 'aiff', 'pcm16', 'pcm24'],
-      routing: { taskImage: 'direct', taskAudio: 'direct', chatImage: 'direct', chatAudio: 'direct' },
+      routing: { taskImage: 'catalog', taskAudio: 'catalog', chatImage: 'direct', chatAudio: 'direct' },
     });
 
     const legacy = createRuntime().runtime;
@@ -844,13 +845,14 @@ export async function execute() { return { value }; }
     const cwd = await mkdtemp(join(tmpdir(), 'desktop-catalog-selection-'));
     const startupPath = join(cwd, 'startup-agent.json');
     const selectedPath = join(cwd, 'selected-agent.json');
-    const agent = (id: string) => ({ id, name: id, invocationModes: ['run'], defaultInvocationMode: 'run', model: { provider: 'mesh', model: 'test-model', apiKey: 'test-key' }, tools: [] });
+    const agent = (id: string) => ({ id, name: id, invocationModes: ['run'], defaultInvocationMode: 'run', model: { provider: 'mesh', model: 'test-model', apiKeyEnv: 'TEST_MESH_API_KEY' }, tools: [] });
     await writeFile(startupPath, JSON.stringify(agent('startup-agent')));
     await writeFile(selectedPath, JSON.stringify(agent('selected-agent')));
     await writeFile(join(cwd, 'agent.settings.json'), JSON.stringify({
       agent: { id: 'startup-agent', configPath: startupPath },
       agents: { dirs: [cwd] },
       runtime: { mode: 'memory' },
+      env: { TEST_MESH_API_KEY: 'test-key' },
       inference: { mode: 'byok' },
       interaction: { approvalMode: 'auto', clarificationMode: 'fail' },
     }));
@@ -898,19 +900,51 @@ export async function execute() { return { value }; }
     const audio = { ...await stage('attachment-audio', 'recording.mp3', Buffer.from('audio bytes')), kind: 'audio' as const, mimeType: 'audio/mpeg', audioFormat: 'mp3' as const };
     const runRaw = vi.fn(async () => ({ status: 'success', runId: 'execution-1', output: 'done', stepsUsed: 1, usage: {} }));
     const chatRaw = vi.fn(async () => ({ status: 'success', runId: 'execution-chat', output: 'done', stepsUsed: 1, usage: {} }));
-    const { runtime } = createRuntime();
+    const orchestrationRun = vi.fn(async (_goal: string, options: Record<string, unknown>) => ({
+      sessionId: options.executionId,
+      requestedAgentId: 'file-agent',
+      detectedModalities: ['text', 'image', 'audio'],
+      detectedSubjects: [],
+      executionShape: 'parallel_fanout_then_synthesis',
+      plan: { finalNodeId: 'final_synthesis' },
+      stages: [
+        { nodeId: 'image_specialist', stage: 'parallel_specialist', agentId: 'image-agent', runId: 'image-run', rootRunId: 'image-run', result: { status: 'success', runId: 'image-run', output: 'image', stepsUsed: 1, usage: {} } },
+        { nodeId: 'audio_specialist', stage: 'parallel_specialist', agentId: 'audio-agent', runId: 'audio-run', rootRunId: 'audio-run', result: { status: 'success', runId: 'audio-run', output: 'audio', stepsUsed: 1, usage: {} } },
+        { nodeId: 'final_synthesis', stage: 'final_synthesis', agentId: 'file-agent', runId: 'final-run', rootRunId: 'final-run', result: { status: 'success', runId: 'final-run', output: 'done', stepsUsed: 1, usage: {} } },
+      ],
+      finalResult: { status: 'success', runId: 'final-run', output: 'done', stepsUsed: 1, usage: {} },
+    } as unknown as OrchestratedRunResult));
+    const orchestrationFactory: DesktopOrchestrationFactory = async () => ({
+      runRaw: orchestrationRun,
+      inspectExecution: vi.fn(),
+      interruptExecution: vi.fn(),
+      resumeExecution: vi.fn(),
+      close: vi.fn(),
+    });
+    const { runtime } = createRuntime(undefined, orchestrationFactory);
     await runtime.handleRpc(request({
       id: 'init', method: 'initialize', params: { protocolVersion: '1.17', clientInfo: { name: 'desktop' } },
     }));
     Object.assign(runtime as unknown as Record<string, unknown>, {
       managedAttachmentRoot: root,
-      sdk: { runRaw, chatRaw, config: { agent: { id: 'file-agent', name: 'File Agent' }, workspaceRoot: workspace } },
+      settingsCwd: workspace,
+      sdkOptions: { cwd: workspace },
+      sdk: {
+        agentPath: join(workspace, 'agent.json'),
+        runRaw,
+        chatRaw,
+        created: { runtime: { orchestrationStore: new InMemoryOrchestrationStore() } },
+        config: { agent: { id: 'file-agent', name: 'File Agent' }, workspaceRoot: workspace },
+      },
     });
+    await writeFile(join(workspace, 'agent.json'), JSON.stringify({ id: 'file-agent', name: 'File Agent', invocationModes: ['run'], defaultInvocationMode: 'run', model: { provider: 'ollama', model: 'test' }, tools: [] }));
 
     await expect(runtime.handleRpc(request({
       id: 'run', method: 'agent/run', params: { executionId: 'execution-1', goal: 'analyze them', attachments: [file, image, audio] },
-    }))).resolves.toMatchObject({ executionId: 'execution-1', mode: 'direct', result: { status: 'success' } });
-    expect(runRaw).toHaveBeenCalledWith('analyze them', expect.objectContaining({
+    }))).resolves.toMatchObject({ executionId: 'execution-1', mode: 'catalog', finalRunId: 'final-run', stages: expect.any(Array), result: { status: 'success' } });
+    expect(runRaw).not.toHaveBeenCalled();
+    expect(orchestrationRun).toHaveBeenCalledWith('analyze them', expect.objectContaining({
+      executionId: 'execution-1',
       contentParts: [
         expect.objectContaining({ type: 'file', file: expect.objectContaining({ name: 'note.txt', mimeType: 'text/plain' }) }),
         expect.objectContaining({ type: 'image', image: expect.objectContaining({ name: 'photo.png', mimeType: 'image/png' }) }),
@@ -954,6 +988,61 @@ export async function execute() { return { value }; }
     await rm(root, { recursive: true });
     await rm(workspace, { recursive: true });
     await rm(outside);
+  });
+
+  it('inspects, interrupts, and resumes durable catalog executions by execution id', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'desktop-catalog-controls-'));
+    const store = new InMemoryOrchestrationStore();
+    await writeFile(join(workspace, 'agent.json'), JSON.stringify({ id: 'general', name: 'General', invocationModes: ['run'], defaultInvocationMode: 'run', model: { provider: 'ollama', model: 'test' }, tools: [] }));
+    await store.createExecution({
+      id: 'execution-catalog',
+      status: 'paused',
+      request: { goal: 'analyze', options: {} },
+      catalogFingerprint: 'catalog',
+      plan: { sessionId: 'execution-catalog', requestedAgentId: 'general', finalNodeId: 'final_synthesis', nodes: [] },
+      stages: [{ nodeId: 'final_synthesis', runId: 'final-run', agentId: 'general', status: 'paused' }],
+    });
+    const interruptExecution = vi.fn(async () => undefined);
+    const resumeExecution = vi.fn(async () => ({
+      sessionId: 'execution-catalog', requestedAgentId: 'general', detectedModalities: [], detectedSubjects: [], executionShape: 'single',
+      plan: { finalNodeId: 'final_synthesis' }, stages: [],
+      finalResult: { status: 'success', runId: 'final-run', output: 'done', stepsUsed: 1, usage: {} },
+    } as unknown as OrchestratedRunResult));
+    const orchestrationFactory: DesktopOrchestrationFactory = async () => ({
+      runRaw: vi.fn(),
+      inspectExecution: vi.fn(async () => ({
+        execution: await store.getExecution('execution-catalog'),
+        stages: await store.listStages('execution-catalog'),
+        plan: { finalNodeId: 'final_synthesis' } as never,
+      })),
+      interruptExecution,
+      resumeExecution,
+      close: vi.fn(),
+    });
+    const { runtime } = createRuntime(undefined, orchestrationFactory);
+    await runtime.handleRpc(request({ id: 'protocol', method: 'initialize', params: { protocolVersion: '1.17', clientInfo: { name: 'desktop' } } }));
+    Object.assign(runtime as unknown as Record<string, unknown>, {
+      settingsCwd: workspace,
+      sdkOptions: { cwd: workspace },
+      sdk: {
+        agentPath: join(workspace, 'agent.json'),
+        close: vi.fn(),
+        created: { runtime: { orchestrationStore: store } },
+        config: { agent: { id: 'general', name: 'General' }, workspaceRoot: workspace },
+      },
+    });
+
+    await expect(runtime.handleRpc(request({ id: 'inspect', method: 'execution/inspect', params: { executionId: 'execution-catalog' } }))).resolves.toMatchObject({
+      executionId: 'execution-catalog', mode: 'catalog', status: 'paused', finalRunId: 'final-run', traceTarget: { kind: 'session', sessionId: 'execution-catalog' },
+    });
+    await runtime.handleRpc(request({ id: 'interrupt', method: 'execution/interrupt', params: { executionId: 'execution-catalog' } }));
+    expect(interruptExecution).toHaveBeenCalledWith('execution-catalog');
+    await expect(runtime.handleRpc(request({ id: 'resume', method: 'execution/resume', params: { executionId: 'execution-catalog' } }))).resolves.toMatchObject({
+      executionId: 'execution-catalog', mode: 'catalog', finalRunId: 'final-run', traceTarget: { kind: 'session', sessionId: 'execution-catalog' },
+    });
+    expect(resumeExecution).toHaveBeenCalledWith('execution-catalog');
+    await runtime.close();
+    await rm(workspace, { recursive: true, force: true });
   });
 
   it('redacts managed paths and file authority from inspect responses', async () => {
