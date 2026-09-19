@@ -147,7 +147,8 @@ catalog or replay persisted SQLite routing cases without modifying history:
 
 ```bash
 bun run jev-routing-study prompt --attachment-type image "Extract this diagram"
-bun run jev-routing-study history --run-id <run-id>
+bun run jev-routing-study history --session-id <session-id>
+bun run jev-routing-study history --limit 10
 ```
 
 It uses `./agent.settings.json` by default, including the configured TypeSafe

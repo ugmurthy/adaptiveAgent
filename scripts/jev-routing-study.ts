@@ -40,6 +40,7 @@ interface StudySettings {
 
 interface HistoricalCase {
   runId: string;
+  sessionId: string;
   objective: string;
   existingSelection?: string;
   selectionRunId?: string;
@@ -61,6 +62,7 @@ export interface AttachmentSummary {
 
 export interface StudyResult {
   runId: string;
+  sessionId?: string;
   repetition: number;
   objective: string;
   modalities: string;
@@ -97,7 +99,8 @@ export interface RunStudyOptions {
   databasePath?: string;
   policyPath?: string;
   allowCurrentCatalog: boolean;
-  runIds?: string[];
+  sessionIds?: string[];
+  limit?: number;
   repeat: number;
   inputPricePerMillion: number;
   cachePath?: string;
@@ -129,6 +132,9 @@ const DEFAULT_INPUT_PRICE_PER_MILLION = 0.042;
 const DEFAULT_CACHE_PATH = resolve(homedir(), '.adaptiveAgent', 'jev-routing-study-cache.jsonl');
 
 export async function runStudy(options: RunStudyOptions): Promise<StudyResult[]> {
+  if (options.mode === 'prompt' && (options.sessionIds?.length || options.limit !== undefined)) {
+    throw new Error('--session-id and --limit are available only in history mode.');
+  }
   const settingsPath = resolve(options.settingsPath);
   const settings = JSON.parse(await readFile(settingsPath, 'utf8')) as StudySettings;
   const configured = settings.agentSelection?.typesafe ?? {};
@@ -159,7 +165,10 @@ export async function runStudy(options: RunStudyOptions): Promise<StudyResult[]>
     }];
   } else {
     const databasePath = options.databasePath ?? resolveRuntimeSqlitePath(settings, env);
-    cases = extractHistoricalCases(databasePath, options.runIds);
+    cases = extractHistoricalCases(databasePath, {
+      sessionIds: options.sessionIds,
+      limit: options.limit,
+    });
     cases = cases.map((item) => {
       if (item.candidates && item.attachments) return item;
       if (!options.allowCurrentCatalog) {
@@ -212,6 +221,7 @@ export async function runStudy(options: RunStudyOptions): Promise<StudyResult[]>
           && evaluation.relevance >= (policy.minimumRelevance ?? 0.5);
         results.push({
           runId: item.runId,
+          sessionId: item.sessionId,
           repetition,
           objective: item.objective,
           modalities: modalityMarker(attachments),
@@ -237,6 +247,7 @@ export async function runStudy(options: RunStudyOptions): Promise<StudyResult[]>
       } catch (error) {
         results.push({
           runId: item.runId,
+          sessionId: item.sessionId,
           repetition,
           objective: item.objective,
           modalities: modalityMarker(attachments),
@@ -253,24 +264,60 @@ export async function runStudy(options: RunStudyOptions): Promise<StudyResult[]>
   return results;
 }
 
-export function extractHistoricalCases(databasePath: string, runIds?: string[]): HistoricalCase[] {
+export function extractHistoricalCases(
+  databasePath: string,
+  selection: { sessionIds?: string[]; limit?: number } = {},
+): HistoricalCase[] {
   if (!existsSync(databasePath)) throw new Error(`SQLite runtime database does not exist: ${databasePath}`);
+  if (selection.sessionIds?.length && selection.limit !== undefined) {
+    throw new Error('--session-id and --limit cannot be used together.');
+  }
   const database = new Database(databasePath, { readonly: true, strict: true });
   database.exec('PRAGMA query_only=ON');
   try {
-    const rows = runIds?.length
-      ? runIds.map((id) => {
-          const row = database.query('SELECT id, record_json FROM agent_runs WHERE id = ?').get(id) as RunRow | null;
-          if (!row) throw new Error(`Run ${id} was not found in the SQLite runtime.`);
-          return row;
-        })
-      : database.query(`
-          SELECT id, record_json
+    let rows: RunRow[];
+    if (selection.sessionIds?.length) {
+      rows = selection.sessionIds.flatMap((sessionId) => {
+        const matches = database.query(`
+          SELECT id, session_id, record_json
           FROM agent_runs
-          WHERE json_extract(record_json, '$.metadata.agentSelection.selectedAgentId') IS NOT NULL
-             OR json_extract(record_json, '$.metadata.agentSelection.selectionRunId') IS NOT NULL
+          WHERE session_id = ?
+            AND (${ROUTED_RUN_PREDICATE})
           ORDER BY created_at DESC
-        `).all() as RunRow[];
+        `).all(sessionId) as RunRow[];
+        if (matches.length > 0) return matches;
+        const exists = database.query('SELECT 1 FROM agent_runs WHERE session_id = ? LIMIT 1').get(sessionId);
+        if (!exists) throw new Error(`Session ${sessionId} was not found in the SQLite runtime.`);
+        throw new Error(`Session ${sessionId} has no persisted agent-selection runs.`);
+      });
+    } else if (selection.limit !== undefined) {
+      rows = database.query(`
+        WITH recent_sessions AS (
+          SELECT session_id, MAX(created_at) AS latest_created_at
+          FROM agent_runs
+          WHERE session_id IS NOT NULL
+            AND session_id <> ''
+            AND (${ROUTED_RUN_PREDICATE})
+          GROUP BY session_id
+          ORDER BY latest_created_at DESC
+          LIMIT ?
+        )
+        SELECT runs.id, runs.session_id, runs.record_json
+        FROM agent_runs AS runs
+        JOIN recent_sessions ON recent_sessions.session_id = runs.session_id
+        WHERE ${ROUTED_RUN_PREDICATE.replaceAll('record_json', 'runs.record_json')}
+        ORDER BY recent_sessions.latest_created_at DESC, runs.created_at DESC
+      `).all(selection.limit) as RunRow[];
+    } else {
+      rows = database.query(`
+        SELECT id, session_id, record_json
+        FROM agent_runs
+        WHERE session_id IS NOT NULL
+          AND session_id <> ''
+          AND (${ROUTED_RUN_PREDICATE})
+        ORDER BY created_at DESC
+      `).all() as RunRow[];
+    }
     return rows.map((row) => extractHistoricalCase(database, row));
   } finally {
     database.close();
@@ -357,6 +404,7 @@ function extractHistoricalCase(database: Database, row: RunRow): HistoricalCase 
 
   return {
     runId: row.id,
+    sessionId: row.session_id,
     objective,
     existingSelection,
     selectionRunId,
@@ -583,7 +631,12 @@ function stringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
 }
 
-interface RunRow { id: string; record_json: string }
+const ROUTED_RUN_PREDICATE = `
+  json_extract(record_json, '$.metadata.agentSelection.selectedAgentId') IS NOT NULL
+  OR json_extract(record_json, '$.metadata.agentSelection.selectionRunId') IS NOT NULL
+`;
+
+interface RunRow { id: string; session_id: string; record_json: string }
 interface SelectorRunRow { record_json: string; created_at: string; updated_at: string }
 
 interface CliOptions extends Omit<RunStudyOptions, 'mode' | 'settingsPath' | 'repeat' | 'inputPricePerMillion' | 'allowCurrentCatalog' | 'refresh' | 'showState' | 'showResponse'> {
@@ -616,7 +669,7 @@ function parseCli(argv: string[]): CliOptions {
     showResponse: false,
     output: 'table',
     attachmentTypes: [],
-    runIds: [],
+    sessionIds: [],
   };
   const promptParts: string[] = [];
   for (let index = 0; index < argv.length; index += 1) {
@@ -631,7 +684,8 @@ function parseCli(argv: string[]): CliOptions {
       case '--database': options.databasePath = value(); break;
       case '--policy': options.policyPath = value(); break;
       case '--cache': options.cachePath = value(); break;
-      case '--run-id': options.runIds!.push(value()); break;
+      case '--session-id': options.sessionIds!.push(value()); break;
+      case '--limit': options.limit = positiveInteger(value(), '--limit'); break;
       case '--attachment-type': {
         for (const type of value().split(',')) {
           if (type !== 'image' && type !== 'file' && type !== 'audio') throw new Error(`Unsupported attachment type "${type}".`);
@@ -658,8 +712,17 @@ function parseCli(argv: string[]): CliOptions {
         promptParts.push(arg);
     }
   }
-  if (mode === 'prompt') options.prompt = promptParts.join(' ');
-  else if (promptParts.length) throw new Error('history mode does not accept a prompt.');
+  if (mode === 'prompt') {
+    options.prompt = promptParts.join(' ');
+    if (options.sessionIds?.length || options.limit !== undefined) {
+      throw new Error('--session-id and --limit are available only in history mode.');
+    }
+  } else if (promptParts.length) {
+    throw new Error('history mode does not accept a prompt.');
+  }
+  if (options.sessionIds?.length && options.limit !== undefined) {
+    throw new Error('--session-id and --limit cannot be used together.');
+  }
   return options;
 }
 
@@ -687,7 +750,8 @@ Options:
   --database <path>                 Override the resolved SQLite runtime path
   --policy <path>                   Override the configured TypeSafe policy
   --attachment-type <type>          image, file, or audio; repeatable
-  --run-id <id>                     Replay one historical execution run; repeatable
+  --session-id <id>                 Replay routed runs in one session; repeatable
+  --limit <n>                       Replay the latest n routed non-null sessions
   --[no-]allow-current-catalog      Permit approximate history replay (default: enabled)
   --input-price-per-million <usd>   Estimated JEV input price (default: 0.042)
   --repeat <count>                  Repeat each evaluation (paid calls; cache disabled)
@@ -708,7 +772,9 @@ function render(results: StudyResult[], output: OutputFormat): void {
     return;
   }
   const rows = results.map((result) => ({
-    run: result.repetition > 1 ? `${short(result.runId, 8)}#${result.repetition}` : short(result.runId, 8),
+    session: result.repetition > 1
+      ? `${short(result.sessionId ?? '-', 12)}#${result.repetition}`
+      : short(result.sessionId ?? '-', 12),
     objective: short(result.objective.replace(/\s+/g, ' '), 42),
     modalities: result.modalities,
     existing: result.existingSelection ?? '-',
