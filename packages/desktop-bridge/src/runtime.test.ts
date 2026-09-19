@@ -909,10 +909,10 @@ export async function execute() { return { value }; }
       plan: { finalNodeId: 'final_synthesis' },
       stages: [
         { nodeId: 'image_specialist', stage: 'parallel_specialist', agentId: 'image-agent', runId: 'image-run', rootRunId: 'image-run', result: { status: 'success', runId: 'image-run', output: 'image', stepsUsed: 1, usage: {} } },
-        { nodeId: 'audio_specialist', stage: 'parallel_specialist', agentId: 'audio-agent', runId: 'audio-run', rootRunId: 'audio-run', result: { status: 'success', runId: 'audio-run', output: 'audio', stepsUsed: 1, usage: {} } },
-        { nodeId: 'final_synthesis', stage: 'final_synthesis', agentId: 'file-agent', runId: 'final-run', rootRunId: 'final-run', result: { status: 'success', runId: 'final-run', output: 'done', stepsUsed: 1, usage: {} } },
+        { nodeId: 'audio_specialist', stage: 'parallel_specialist', agentId: 'audio-agent', runId: 'audio-run', rootRunId: 'audio-root', result: { status: 'failure', runId: 'audio-run', error: 'audio failed', code: 'MODEL_ERROR', stepsUsed: 1, usage: {} } },
+        { nodeId: 'final_synthesis', stage: 'final_synthesis', agentId: 'file-agent', runId: 'final-run', rootRunId: 'final-root', result: { status: 'approval_requested', runId: 'final-run', approvalId: 'approval-1', rootRunId: 'final-root', message: 'Approve synthesis', toolName: 'write_report' } },
       ],
-      finalResult: { status: 'success', runId: 'final-run', output: 'done', stepsUsed: 1, usage: {} },
+      finalResult: { status: 'approval_requested', runId: 'final-run', approvalId: 'approval-1', rootRunId: 'final-root', message: 'Approve synthesis', toolName: 'write_report' },
     } as unknown as OrchestratedRunResult));
     const orchestrationFactory: DesktopOrchestrationFactory = async () => ({
       runRaw: orchestrationRun,
@@ -939,9 +939,20 @@ export async function execute() { return { value }; }
     });
     await writeFile(join(workspace, 'agent.json'), JSON.stringify({ id: 'file-agent', name: 'File Agent', invocationModes: ['run'], defaultInvocationMode: 'run', model: { provider: 'ollama', model: 'test' }, tools: [] }));
 
-    await expect(runtime.handleRpc(request({
+    const catalogResult = await runtime.handleRpc(request({
       id: 'run', method: 'agent/run', params: { executionId: 'execution-1', goal: 'analyze them', attachments: [file, image, audio] },
-    }))).resolves.toMatchObject({ executionId: 'execution-1', mode: 'catalog', finalRunId: 'final-run', stages: expect.any(Array), result: { status: 'success' } });
+    }));
+    expect(catalogResult).toMatchObject({
+      executionId: 'execution-1',
+      mode: 'catalog',
+      finalRunId: 'final-run',
+      result: { status: 'approval_requested' },
+    });
+    expect((catalogResult as { stages: unknown }).stages).toEqual([
+      { nodeId: 'image_specialist', stage: 'parallel_specialist', agentId: 'image-agent', runId: 'image-run', rootRunId: 'image-run', status: 'succeeded' },
+      { nodeId: 'audio_specialist', stage: 'parallel_specialist', agentId: 'audio-agent', runId: 'audio-run', rootRunId: 'audio-root', status: 'failed' },
+      { nodeId: 'final_synthesis', stage: 'final_synthesis', agentId: 'file-agent', runId: 'final-run', rootRunId: 'final-root', status: 'paused' },
+    ]);
     expect(runRaw).not.toHaveBeenCalled();
     expect(orchestrationRun).toHaveBeenCalledWith('analyze them', expect.objectContaining({
       executionId: 'execution-1',
@@ -1005,7 +1016,11 @@ export async function execute() { return { value }; }
     const interruptExecution = vi.fn(async () => undefined);
     const resumeExecution = vi.fn(async () => ({
       sessionId: 'execution-catalog', requestedAgentId: 'general', detectedModalities: [], detectedSubjects: [], executionShape: 'single',
-      plan: { finalNodeId: 'final_synthesis' }, stages: [],
+      plan: { finalNodeId: 'final_synthesis' },
+      stages: [{
+        nodeId: 'final_synthesis', stage: 'final_synthesis', agentId: 'general', runId: 'final-run', rootRunId: 'final-root',
+        result: { status: 'success', runId: 'final-run', output: 'done', stepsUsed: 1, usage: {} },
+      }],
       finalResult: { status: 'success', runId: 'final-run', output: 'done', stepsUsed: 1, usage: {} },
     } as unknown as OrchestratedRunResult));
     const orchestrationFactory: DesktopOrchestrationFactory = async () => ({
@@ -1037,8 +1052,10 @@ export async function execute() { return { value }; }
     });
     await runtime.handleRpc(request({ id: 'interrupt', method: 'execution/interrupt', params: { executionId: 'execution-catalog' } }));
     expect(interruptExecution).toHaveBeenCalledWith('execution-catalog');
-    await expect(runtime.handleRpc(request({ id: 'resume', method: 'execution/resume', params: { executionId: 'execution-catalog' } }))).resolves.toMatchObject({
-      executionId: 'execution-catalog', mode: 'catalog', finalRunId: 'final-run', traceTarget: { kind: 'session', sessionId: 'execution-catalog' },
+    await expect(runtime.handleRpc(request({ id: 'resume', method: 'execution/resume', params: { executionId: 'execution-catalog' } }))).resolves.toEqual({
+      executionId: 'execution-catalog', mode: 'catalog', status: 'success', finalRunId: 'final-run', traceTarget: { kind: 'session', sessionId: 'execution-catalog' },
+      stages: [{ nodeId: 'final_synthesis', stage: 'final_synthesis', agentId: 'general', runId: 'final-run', rootRunId: 'final-root', status: 'succeeded' }],
+      result: { status: 'success', runId: 'final-run', output: 'done', stepsUsed: 1, usage: {} },
     });
     expect(resumeExecution).toHaveBeenCalledWith('execution-catalog');
     await runtime.close();
