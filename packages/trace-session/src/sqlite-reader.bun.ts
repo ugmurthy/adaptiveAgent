@@ -90,6 +90,26 @@ describe('SqliteTraceReader', () => {
     expect(() => new SqliteTraceReader(invalid)).toThrow(/adaptive_agent_migrations is missing/);
   });
 
+  it('accepts the additive orchestration migration and rejects unknown newer schemas', async () => {
+    const path = await fixture();
+    const database = new Database(path, { strict: true });
+    database.run(
+      'insert into adaptive_agent_migrations values (?, ?, ?)',
+      [2, 'core:002_orchestration', '2026-09-18T00:00:00.000Z'],
+    );
+    database.close();
+
+    expect(() => new SqliteTraceReader(path)).not.toThrow();
+
+    const newer = new Database(path, { strict: true });
+    newer.run(
+      'insert into adaptive_agent_migrations values (?, ?, ?)',
+      [3, 'core:003_future', '2026-09-19T00:00:00.000Z'],
+    );
+    newer.close();
+    expect(() => new SqliteTraceReader(path)).toThrow(/newer SQLite runtime schema.*version 3/);
+  });
+
   it('reconstructs core trace views for session, root, and arbitrary run targets', async () => {
     const service = new TraceService(new SqliteTraceReader(await fixture()));
     try {

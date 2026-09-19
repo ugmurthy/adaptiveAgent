@@ -56,6 +56,11 @@ type DbRun = { id: string; session_id: string | null; root_run_id: string; recor
 
 export const SQLITE_TRACE_DATABASE_OPTIONS = Object.freeze({ readonly: true, strict: true });
 
+const SUPPORTED_SQLITE_RUNTIME_MIGRATIONS = new Map([
+  [1, 'core:001_runtime_sqlite'],
+  [2, 'core:002_orchestration'],
+]);
+
 export class SqliteTraceReader implements TraceReader {
   private readonly db: Database;
   constructor(readonly path: string) {
@@ -69,8 +74,19 @@ export class SqliteTraceReader implements TraceReader {
     let rows: Array<{ version: number; name: string }>;
     try { rows = this.db.query('select version, name from adaptive_agent_migrations order by version').all() as typeof rows; }
     catch (e) { throw new Error(`Unsupported SQLite runtime schema in ${this.path}: adaptive_agent_migrations is missing (${message(e)}).`); }
-    if (!rows.some(r => r.version === 1 && r.name === 'core:001_runtime_sqlite')) throw new Error(`Unsupported SQLite runtime schema in ${this.path}: core:001_runtime_sqlite version 1 is not installed.`);
-    if (rows.some(r => r.version > 1)) throw new Error(`Unsupported newer SQLite runtime schema in ${this.path}: version ${Math.max(...rows.map(r => r.version))}.`);
+    if (!rows.some(row => row.version === 1 && row.name === SUPPORTED_SQLITE_RUNTIME_MIGRATIONS.get(1))) {
+      throw new Error(`Unsupported SQLite runtime schema in ${this.path}: core:001_runtime_sqlite version 1 is not installed.`);
+    }
+    for (const row of rows) {
+      const expectedName = SUPPORTED_SQLITE_RUNTIME_MIGRATIONS.get(row.version);
+      if (expectedName && row.name !== expectedName) {
+        throw new Error(`Unsupported SQLite runtime schema in ${this.path}: version ${row.version} is named ${row.name}, expected ${expectedName}.`);
+      }
+    }
+    const newestVersion = Math.max(0, ...rows.map(row => row.version));
+    if (newestVersion > SUPPORTED_SQLITE_RUNTIME_MIGRATIONS.size) {
+      throw new Error(`Unsupported newer SQLite runtime schema in ${this.path}: version ${newestVersion}.`);
+    }
     for (const table of ['agent_runs','agent_events','run_snapshots','tool_executions','plans','plan_executions']) {
       if (!this.db.query("select name from sqlite_master where type='table' and name=?").get(table)) throw new Error(`Unsupported SQLite runtime schema in ${this.path}: required table ${table} is missing.`);
     }
