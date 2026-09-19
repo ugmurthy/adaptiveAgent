@@ -13,6 +13,7 @@ import {
   type AgentSdkOptions,
   type AgentSdkRunOptions,
   type AgentSettingsFile,
+  type OrchestratedRunStageResult,
   type OrchestrationSdk,
   type ResolvedAgentSdkConfig,
   type TaskPreparationResult,
@@ -291,7 +292,7 @@ export class DesktopRuntime {
             executionId,
             requestedAgentId: sdk.config.agent.id,
           });
-          return executionResult(executionId, 'catalog', orchestrated.finalResult, orchestrated.stages);
+          return executionResult(executionId, 'catalog', orchestrated.finalResult, catalogExecutionStages(orchestrated.stages));
         }
         const result = await sdk.runRaw(preparation?.preparedObjective ?? params.goal, runOptions);
         this.runSdks.set(executionId, sdk);
@@ -341,7 +342,7 @@ export class DesktopRuntime {
         const id = request.params!.executionId;
         if (await this.requireSdk().created.runtime.orchestrationStore.getExecution(asRunId(id))) {
           const resumed = await (await this.catalogOrchestration(id)).resumeExecution(id);
-          return executionResult(id, 'catalog', resumed.finalResult, resumed.stages);
+          return executionResult(id, 'catalog', resumed.finalResult, catalogExecutionStages(resumed.stages));
         }
         return asJsonValue(executionResult(id, 'direct', await (await this.sdkForRun(id)).resumeRaw(asRunId(id))));
       }
@@ -1384,7 +1385,17 @@ function rejectUnsupportedMedia(inputs: DesktopAttachmentInput[], protocolVersio
 function executionMode(inputs: DesktopAttachmentInput[]): 'direct' | 'catalog' {
   return inputs.some((input) => input.kind === 'image' || input.kind === 'audio') ? 'catalog' : 'direct';
 }
-function executionResult(executionId: string, mode: 'direct' | 'catalog', result: any, stages?: any[]): JsonValue { return asJsonValue({ executionId, mode, status: result.status, finalRunId: result.runId, traceTarget: mode === 'direct' ? { kind: 'root-run', rootRunId: executionId } : { kind: 'session', sessionId: executionId }, ...(stages ? { stages } : {}), result }); }
+function catalogExecutionStages(stages: OrchestratedRunStageResult[]): JsonValue[] {
+  return stages.map((stage) => ({
+    nodeId: stage.nodeId,
+    stage: stage.stage,
+    agentId: stage.agentId,
+    runId: stage.runId,
+    rootRunId: stage.rootRunId,
+    status: stage.result.status === 'success' ? 'succeeded' : stage.result.status === 'failure' ? 'failed' : 'paused',
+  }));
+}
+function executionResult(executionId: string, mode: 'direct' | 'catalog', result: any, stages?: JsonValue[]): JsonValue { return asJsonValue({ executionId, mode, status: result.status, finalRunId: result.runId, traceTarget: mode === 'direct' ? { kind: 'root-run', rootRunId: executionId } : { kind: 'session', sessionId: executionId }, ...(stages ? { stages } : {}), result }); }
 
 function agentSelectionMismatch(expected: RuntimeInitializeParams['agentSelection'], actual: unknown): DesktopProtocolError {
   return new DesktopProtocolError(
