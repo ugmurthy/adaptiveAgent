@@ -159,6 +159,7 @@ function mergeSettings(base: AgentSettingsFile, overrides: AgentSettingsFile | u
     ...base,
     ...overrides,
     ...(base.agent || overrides.agent ? { agent: { ...(base.agent ?? {}), ...(overrides.agent ?? {}) } } : {}),
+    ...(base.agentSelection || overrides.agentSelection ? { agentSelection: { ...(base.agentSelection ?? {}), ...(overrides.agentSelection ?? {}), typesafe: { ...(base.agentSelection?.typesafe ?? {}), ...(overrides.agentSelection?.typesafe ?? {}) } } } : {}),
     ...(base.agents || overrides.agents ? { agents: { ...(base.agents ?? {}), ...(overrides.agents ?? {}) } } : {}),
     ...(base.runtime || overrides.runtime ? { runtime: { ...(base.runtime ?? {}), ...(overrides.runtime ?? {}) } } : {}),
     ...(base.logging || overrides.logging ? { logging: { ...(base.logging ?? {}), ...(overrides.logging ?? {}) } } : {}),

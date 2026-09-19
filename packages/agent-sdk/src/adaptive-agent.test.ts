@@ -1196,6 +1196,98 @@ describe('adaptive-agent config command', () => {
   });
 });
 
+describe('adaptive-agent TypeSafe profile selection', () => {
+  let tempDir: string;
+  let originalApiKey: string | undefined;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'adaptive-agent-typesafe-selection-'));
+    originalApiKey = process.env.TEST_TYPESAFE_API_KEY;
+    process.env.TEST_TYPESAFE_API_KEY = 'test-typesafe-key';
+    await mkdir(join(tempDir, 'agents'));
+    await writeAgentConfig(join(tempDir, 'agent.json'));
+    await writeFile(join(tempDir, 'agents', 'researcher.json'), JSON.stringify({
+      id: 'researcher',
+      name: 'Researcher',
+      description: 'Researches current external information.',
+      invocationModes: ['run'],
+      defaultInvocationMode: 'run',
+      model: { provider: 'ollama', model: 'qwen3.5' },
+      tools: [],
+      capabilities: { modalitiesSupported: ['text'] },
+    }));
+    await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({
+      runtime: { mode: 'memory' },
+      agent: { mode: 'auto', configPath: './agent.json' },
+      agents: { dirs: ['./agents'] },
+      agentSelection: {
+        engine: 'typesafe',
+        typesafe: {
+          model: 'jev-1.13.0',
+          apiKeyEnv: 'TEST_TYPESAFE_API_KEY',
+          policy: { minimumConfidence: 0.7, minimumRelevance: 0.7 },
+        },
+      },
+    }));
+  });
+
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    if (originalApiKey === undefined) delete process.env.TEST_TYPESAFE_API_KEY;
+    else process.env.TEST_TYPESAFE_API_KEY = originalApiKey;
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it('routes a dry-run through JEV and records confidence metadata', async () => {
+    const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { questions: Record<string, unknown> };
+      const relevanceAnswers = Object.fromEntries(
+        Object.keys(body.questions)
+          .filter((key) => key.endsWith('_relevant'))
+          .map((key) => [key, { type: 'noul', noul: 0.94 }]),
+      );
+      return new Response(JSON.stringify({
+        model: 'jev-1.13.0',
+        answers: {
+          ...relevanceAnswers,
+          selection: {
+            type: 'choice',
+            choice: 'researcher',
+            confidence: 0.91,
+            probabilities: { agent: 0.09, researcher: 0.91 },
+          },
+        },
+        usage: { input_tokens: 100, output_tokens: 10 },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+    vi.stubGlobal('fetch', fetch);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      const exitCode = await main([
+        'run', '--dry-run', '--cwd', tempDir, '--output', 'json',
+        'Research the latest browser automation APIs.',
+      ]);
+      const output = JSON.parse(String(log.mock.calls.at(-1)?.[0])) as {
+        request?: { metadata?: { agentSelection?: Record<string, unknown> } };
+      };
+
+      expect(exitCode).toBe(0);
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(output.request?.metadata?.agentSelection).toMatchObject({
+        mode: 'auto',
+        selectedAgentId: 'researcher',
+        selectionAgentId: 'typesafe:jev-1.13.0',
+        selectionModel: 'jev-1.13.0',
+        confidence: 0.91,
+        relevance: 0.94,
+      });
+    } finally {
+      log.mockRestore();
+    }
+  });
+});
+
 describe('adaptive-agent single-run recovery commands', () => {
   let tempDir: string;
 

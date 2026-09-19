@@ -29,6 +29,7 @@
     "@adaptive-agent/gateway-client": "workspace:*",
     "@e2b/code-interpreter": "^2.6.1",
     "@earendil-works/pi-tui": "^0.75.4",
+    "@typesafe-ai/sdk": "0.6.0",
     "ajv": "^8.17.1",
     "chalk": "^5.5.0",
     "marked": "^15.0.12",

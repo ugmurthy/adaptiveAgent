@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { RunResult } from '@adaptive-agent/core';
 
 import { selectAgentProfile } from './agent-selection.js';
-import type { AgentSdkCatalogAgent } from './config-types.js';
+import type { AgentConfigFile, AgentSdkCatalogAgent } from './config-types.js';
 import type { TaskPreparationRunner } from './task-preparation.js';
 
 describe('agent selection', () => {
@@ -55,6 +55,30 @@ describe('agent selection', () => {
       sessionId: 'session-1',
     })).rejects.toThrow('unknown or ineligible');
   });
+
+  it('does not offer profiles that cannot accept every attachment modality', async () => {
+    const runRaw = vi.fn(async () => ({
+      status: 'success', runId: 'selection-run', output: { selectedAgentId: 'multimodal', reason: 'Handles both inputs.' }, stepsUsed: 1,
+      usage: { promptTokens: 1, completionTokens: 1, estimatedCostUSD: 0 },
+    }) as RunResult);
+    const runner = { config: { agent: preparer([]) }, runRaw } satisfies TaskPreparationRunner;
+
+    await selectAgentProfile(runner, {
+      originalObjective: 'Compare these inputs',
+      candidates: [
+        candidate('text-only'),
+        candidate('image-only', { capabilities: { modalitiesSupported: ['text', 'image'] } }),
+        candidate('multimodal', { capabilities: { modalitiesSupported: ['text', 'image', 'file'] } }),
+      ],
+      workspaceRoot: '/workspace',
+      attachments: { images: ['diagram.png'], files: ['notes.pdf'], audio: [] },
+      sessionId: 'session-1',
+    });
+
+    expect(runRaw).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+      input: expect.objectContaining({ candidates: [expect.objectContaining({ id: 'multimodal' })] }),
+    }));
+  });
 });
 
 function candidate(id: string, overrides: Partial<AgentSdkCatalogAgent> = {}): AgentSdkCatalogAgent {
@@ -75,13 +99,13 @@ function candidate(id: string, overrides: Partial<AgentSdkCatalogAgent> = {}): A
   };
 }
 
-function preparer(tools: string[], delegates: string[] = []) {
+function preparer(tools: string[], delegates: string[] = []): AgentConfigFile {
   return {
     id: 'task-preparer',
     name: 'Task Preparer',
-    invocationModes: ['run'] as const,
-    defaultInvocationMode: 'run' as const,
-    model: { provider: 'ollama' as const, model: 'test' },
+    invocationModes: ['run'],
+    defaultInvocationMode: 'run',
+    model: { provider: 'ollama', model: 'test' },
     tools,
     delegates,
   };

@@ -210,7 +210,53 @@ describe('agent-sdk config resolution', () => {
 
     await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({ agent: { mode: 'auto' } }));
     await expect(loadAgentSdkConfig({ cwd: tempDir, env: testEnvironment() })).rejects.toThrow(
-      'settings.taskPreparation.agent is required when settings.agent.mode is "auto"',
+      'settings.agentSelection.agent or settings.taskPreparation.agent is required when settings.agent.mode is "auto"',
+    );
+  });
+
+  it('loads TypeSafe auto-selection without requiring a task-preparation agent', async () => {
+    await writeAgentConfig(join(tempDir, 'agent.json'));
+    await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({
+      agent: { mode: 'auto' },
+      agentSelection: {
+        engine: 'typesafe',
+        typesafe: {
+          model: 'jev-1.13.0',
+          apiKeyEnv: 'TEST_TYPESAFE_API_KEY',
+          policyPath: './agent-routing-policy.json',
+          timeoutMs: 2500,
+        },
+      },
+    }));
+
+    const config = await loadAgentSdkConfig({ cwd: tempDir, env: testEnvironment() });
+
+    expect(config.settings.agentSelection).toEqual({
+      engine: 'typesafe',
+      typesafe: {
+        model: 'jev-1.13.0',
+        apiKeyEnv: 'TEST_TYPESAFE_API_KEY',
+        policyPath: './agent-routing-policy.json',
+        timeoutMs: 2500,
+      },
+    });
+  });
+
+  it('rejects conflicting inline and file-based TypeSafe selection policies', async () => {
+    await writeAgentConfig(join(tempDir, 'agent.json'));
+    await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({
+      agent: { mode: 'auto' },
+      agentSelection: {
+        engine: 'typesafe',
+        typesafe: {
+          policyPath: './agent-routing-policy.json',
+          policy: { minimumConfidence: 0.7 },
+        },
+      },
+    }));
+
+    await expect(loadAgentSdkConfig({ cwd: tempDir, env: testEnvironment() })).rejects.toThrow(
+      'settings.agentSelection.typesafe.policy and policyPath cannot both be set',
     );
   });
 

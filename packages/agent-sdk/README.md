@@ -186,6 +186,15 @@ adaptive-agent run --from-preparation <runId>
 
 Because preparation is a real model-backed run, `--dry-run` may have latency and cost when preparation is enabled. A successful preparation from a SQLite or Postgres runtime can be reused without another preparation model call by passing its run id to `--from-preparation`; the stored preparation supplies both the original and prepared objectives. Memory runtime cannot reuse a preparation after the originating CLI process exits.
 
+### TypeSafe JEV profile selection
+
+When `agent.mode` is `auto`, configure `agentSelection.engine` as `typesafe` to
+route the user objective and attachment modalities with JEV. Questions and
+confidence thresholds can be supplied inline under
+`agentSelection.typesafe.policy` or loaded from
+`agentSelection.typesafe.policyPath`. See the repository README's TypeSafe JEV
+agent-selection section for the complete settings and policy examples.
+
 Built-in tool names available to `agent.json` are:
 
 - `read_file`

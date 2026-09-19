@@ -236,9 +236,10 @@ accounted together. `--from-preparation` reuses the stored preparation session
 unless `--session-id` is supplied explicitly.
 
 To select the execution profile for each task, set `agent.mode` to `auto`.
-The configured `agent.id` and `agent.configPath` remain the bootstrap profile,
-while `taskPreparation.agent` performs a tool-free structured selection from
-the valid, active run profiles in `agents.dirs`:
+The configured `agent.id` and `agent.configPath` remain the bootstrap profile.
+By default, `agentSelection.agent` (or the legacy `taskPreparation.agent`
+fallback) performs a tool-free structured selection from the valid, active run
+profiles in `agents.dirs`:
 
 ```json
 {
@@ -250,6 +251,9 @@ the valid, active run profiles in `agents.dirs`:
   "agents": {
     "dirs": ["$HOME/.adaptiveAgent/agents"]
   },
+  "agentSelection": {
+    "agent": "task-preparer"
+  },
   "taskPreparation": {
     "agent": "task-preparer",
     "mode": "auto"
@@ -260,6 +264,56 @@ the valid, active run profiles in `agents.dirs`:
 Omitting `agent.mode` preserves fixed-profile behavior. An explicit CLI
 `--agent` or exact desktop runtime profile selection also remains fixed for
 that invocation.
+
+### TypeSafe JEV agent selection
+
+Auto-selection can use TypeSafe JEV as a fast typed decision layer instead of
+a generative selector agent. Set `TYPESAFE_API_KEY` (or configure another
+`apiKeyEnv`) and select the TypeSafe engine:
+
+```json
+{
+  "agent": { "mode": "auto", "configPath": "./agents/default.json" },
+  "agents": { "dirs": ["./agents"] },
+  "agentSelection": {
+    "engine": "typesafe",
+    "typesafe": {
+      "model": "jev-1.13.0",
+      "apiKeyEnv": "TYPESAFE_API_KEY",
+      "policyPath": "./agent-routing-policy.json",
+      "timeoutMs": 10000
+    }
+  }
+}
+```
+
+The policy file controls both JEV questions and the confidence gates without a
+code change:
+
+```json
+{
+  "relevance": {
+    "instructions": "Is the referenced profile a strong match for this objective and all requested attachment types?",
+    "criteria": {
+      "true": "The profile has the relevant specialization, tools, and attachment capabilities.",
+      "false": "The profile is mismatched or lacks a required capability."
+    }
+  },
+  "selection": {
+    "instructions": "Which candidate is the single best profile for this objective?",
+    "candidateCriteria": "Prefer the narrowest capable specialist."
+  },
+  "minimumRelevance": 0.65,
+  "minimumConfidence": 0.7
+}
+```
+
+The same object can be placed inline at `agentSelection.typesafe.policy`; do
+not set both `policy` and `policyPath`. Before calling JEV, the CLI removes
+profiles that do not declare support for every supplied image, file, or audio
+modality. The JEV request contains the prompt, attachment modality names and
+counts, and safe profile summaries; it does not contain attachment paths or
+contents. Selection fails closed when either configured threshold is missed.
 
 Use `chat` for an interactive conversation, or provide the first message on
 the command line:

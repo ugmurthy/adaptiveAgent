@@ -77,6 +77,37 @@ export interface TaskPreparationSettingsConfig {
   showPreparedTask?: boolean;
 }
 
+export interface TypeSafeAgentSelectionQuestionConfig {
+  instructions?: JsonValue;
+  criteria?: {
+    true?: JsonValue;
+    false?: JsonValue;
+  };
+}
+
+export interface TypeSafeAgentSelectionPolicyConfig {
+  relevance?: TypeSafeAgentSelectionQuestionConfig;
+  selection?: {
+    instructions?: JsonValue;
+    candidateCriteria?: JsonValue;
+  };
+  minimumRelevance?: number;
+  minimumConfidence?: number;
+}
+
+export interface AgentSelectionSettingsConfig {
+  engine?: 'agent' | 'typesafe';
+  agent?: string;
+  typesafe?: {
+    model?: string;
+    apiKeyEnv?: string;
+    baseUrl?: string;
+    timeoutMs?: number;
+    policyPath?: string;
+    policy?: TypeSafeAgentSelectionPolicyConfig;
+  };
+}
+
 export interface AgentConfigFile {
   $schema?: string;
   version?: 1;
@@ -103,6 +134,7 @@ export interface AgentSettingsFile {
   $schema?: string;
   version?: 1;
   agent?: { mode?: 'fixed' | 'auto'; configPath?: string; id?: string };
+  agentSelection?: AgentSelectionSettingsConfig;
   agents?: { dirs?: string[] };
   runtime?: { mode?: RuntimeMode; autoMigrate?: boolean; sqlitePath?: string };
   logging?: { enabled?: boolean; level?: LogLevel; destination?: LogDestination; filePath?: string; pretty?: boolean };

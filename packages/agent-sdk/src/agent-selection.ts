@@ -1,13 +1,17 @@
 import type { JsonSchema, JsonValue, RunResult } from '@adaptive-agent/core';
 
-import type { AgentSdkCatalogAgent } from './config-types.js';
+import type { AgentSdkCatalogAgent, SupportedModality } from './config-types.js';
 import type { TaskPreparationAttachmentSummary, TaskPreparationRunner } from './task-preparation.js';
 
 export interface AgentSelectionResult {
   selectedAgentId: string;
   reason: string;
   selectionAgentId: string;
-  selectionRunId: string;
+  selectionRunId?: string;
+  selectionModel?: string;
+  confidence?: number;
+  relevance?: number;
+  probabilities?: Record<string, number>;
 }
 
 export interface SelectAgentRequest {
@@ -22,12 +26,7 @@ export async function selectAgentProfile(
   runner: TaskPreparationRunner,
   request: SelectAgentRequest,
 ): Promise<AgentSelectionResult> {
-  const candidates = request.candidates.filter((candidate) =>
-    !candidate.archived
-    && candidate.validationState === 'valid'
-    && candidate.id !== runner.config.agent.id
-    && candidate.invocationModes.includes('run'),
-  );
+  const candidates = eligibleAgentSelectionCandidates(request, runner.config.agent.id);
   if (candidates.length === 0) throw new Error('Auto agent selection requires at least one valid active run profile.');
 
   const ids = candidates.map((candidate) => candidate.id);
@@ -93,7 +92,20 @@ function buildAgentSelectionGoal(): string {
   ].join('\n');
 }
 
-function safeCandidateSummary(candidate: AgentSdkCatalogAgent): Record<string, JsonValue> {
+export function eligibleAgentSelectionCandidates(
+  request: Pick<SelectAgentRequest, 'candidates' | 'attachments'>,
+  excludedAgentId?: string,
+): AgentSdkCatalogAgent[] {
+  const requiredModalities = attachmentModalities(request.attachments);
+  return request.candidates.filter((candidate) => {
+    if (candidate.archived || candidate.validationState !== 'valid' || !candidate.invocationModes.includes('run')) return false;
+    if (candidate.id === excludedAgentId) return false;
+    const supported = candidate.capabilities?.modalitiesSupported ?? ['text'];
+    return requiredModalities.every((modality) => supported.includes(modality));
+  });
+}
+
+export function safeCandidateSummary(candidate: AgentSdkCatalogAgent): Record<string, JsonValue> {
   return {
     id: candidate.id,
     name: candidate.name,
@@ -104,6 +116,14 @@ function safeCandidateSummary(candidate: AgentSdkCatalogAgent): Record<string, J
     delegates: candidate.delegates,
     capabilities: (candidate.capabilities ?? {}) as JsonValue,
   };
+}
+
+export function attachmentModalities(attachments: TaskPreparationAttachmentSummary): SupportedModality[] {
+  return [
+    ...(attachments.images.length > 0 ? ['image' as const] : []),
+    ...(attachments.files.length > 0 ? ['file' as const] : []),
+    ...(attachments.audio.length > 0 ? ['audio' as const] : []),
+  ];
 }
 
 function formatSelectionFailure(result: Exclude<RunResult, { status: 'success' }>): string {

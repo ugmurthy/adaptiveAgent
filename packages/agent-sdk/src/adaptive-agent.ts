@@ -42,6 +42,9 @@ import {
   prepareTask,
   restoreTaskPreparation,
   selectAgentProfile,
+  createTypeSafeAgentSelectionClient,
+  loadTypeSafeAgentSelectionPolicy,
+  selectAgentProfileWithTypeSafe,
 } from './index.js';
 import { doctorExitCode, renderDoctorReport, runDoctor } from './install/doctor.js';
 import { renderInitReport, runInit, type InitProfile } from './install/init.js';
@@ -1454,7 +1457,11 @@ function withAgentSelection(spec: ManualRunSpec, selection: AgentSelectionResult
         selectedAgentId: selection.selectedAgentId,
         reason: selection.reason,
         selectionAgentId: selection.selectionAgentId,
-        selectionRunId: selection.selectionRunId,
+        ...(selection.selectionRunId ? { selectionRunId: selection.selectionRunId } : {}),
+        ...(selection.selectionModel ? { selectionModel: selection.selectionModel } : {}),
+        ...(selection.confidence === undefined ? {} : { confidence: selection.confidence }),
+        ...(selection.relevance === undefined ? {} : { relevance: selection.relevance }),
+        ...(selection.probabilities ? { probabilities: selection.probabilities as unknown as JsonValue } : {}),
       },
     },
   };
@@ -1469,52 +1476,89 @@ async function selectInlineAgent(args: {
   eventListener?: (event: AgentEvent) => void;
   sessionId: string;
 }): Promise<{ sdk: Awaited<ReturnType<typeof createAgentSdk>>; selection: AgentSelectionResult }> {
-  const configuredAgent = args.fallbackSdk.config.settings.taskPreparation?.agent;
-  if (!configuredAgent) throw new Error('Auto agent selection requires settings.taskPreparation.agent.');
   const discovery = await discoverAgentSdkAgents(args.sdkOptions);
-  const preparationSdk = await createAgentSdk({
-    ...args.sdkOptions,
-    cwd: args.resolvedCwd,
-    agentConfigPath: configuredAgent,
-    settingsConfigPath: undefined,
-    settingsConfig: { ...args.fallbackSdk.config.settings, agent: undefined },
-    settingsOverrides: undefined,
-    model: undefined,
-    runtime: args.fallbackSdk.created.runtime,
-    eventListener: args.eventListener,
-  });
-  try {
-    const selection = await selectAgentProfile(preparationSdk, {
-      originalObjective: args.originalObjective,
-      candidates: discovery.agents,
-      workspaceRoot: args.fallbackSdk.config.workspaceRoot,
-      attachments: {
-        images: args.cli.imagePaths,
-        files: args.cli.fileAttachmentPaths,
-        audio: args.cli.audioPaths,
-      },
-      sessionId: args.sessionId,
-    });
-    const selected = discovery.agents.find((candidate) => candidate.id === selection.selectedAgentId && candidate.validationState === 'valid');
-    if (!selected) throw new Error(`Selected agent profile "${selection.selectedAgentId}" is no longer available.`);
-    if (selected.configPath === args.fallbackSdk.agentPath) return { sdk: args.fallbackSdk, selection };
-    const sdk = await createAgentSdk({
+  const selectionRequest = {
+    originalObjective: args.originalObjective,
+    candidates: discovery.agents,
+    workspaceRoot: args.fallbackSdk.config.workspaceRoot,
+    attachments: {
+      images: args.cli.imagePaths,
+      files: args.cli.fileAttachmentPaths,
+      audio: args.cli.audioPaths,
+    },
+    sessionId: args.sessionId,
+  };
+  const selectionSettings = args.fallbackSdk.config.settings.agentSelection;
+  let selection: AgentSelectionResult;
+
+  if (selectionSettings?.engine === 'typesafe') {
+    const typesafe = selectionSettings.typesafe;
+    if (!typesafe) throw new Error('Auto agent selection requires settings.agentSelection.typesafe.');
+    const env = {
+      ...process.env,
+      ...(args.sdkOptions.env ?? {}),
+      ...(args.fallbackSdk.config.settings.env ?? {}),
+    };
+    const apiKeyEnv = typesafe.apiKeyEnv ?? 'TYPESAFE_API_KEY';
+    const apiKey = env[apiKeyEnv];
+    if (!apiKey) throw new Error(`TypeSafe agent selection requires environment variable "${apiKeyEnv}".`);
+    const model = typesafe.model ?? 'jev-latest';
+    const policy = await loadTypeSafeAgentSelectionPolicy(
+      args.resolvedCwd,
+      typesafe.policyPath,
+      typesafe.policy,
+      env,
+    );
+    selection = await selectAgentProfileWithTypeSafe(
+      createTypeSafeAgentSelectionClient({
+        apiKey,
+        baseUrl: typesafe.baseUrl,
+        timeoutMs: typesafe.timeoutMs,
+      }),
+      selectionRequest,
+      model,
+      policy,
+    );
+  } else {
+    const configuredAgent = selectionSettings?.agent ?? args.fallbackSdk.config.settings.taskPreparation?.agent;
+    if (!configuredAgent) {
+      throw new Error('Auto agent selection requires settings.agentSelection.agent or settings.taskPreparation.agent.');
+    }
+    const preparationSdk = await createAgentSdk({
       ...args.sdkOptions,
       cwd: args.resolvedCwd,
-      agentConfigPath: selected.configPath,
+      agentConfigPath: configuredAgent,
       settingsConfigPath: undefined,
-      settingsConfig: {
-        ...args.fallbackSdk.config.settings,
-        agent: { mode: 'fixed', id: selected.id, configPath: selected.configPath },
-      },
+      settingsConfig: { ...args.fallbackSdk.config.settings, agent: undefined },
       settingsOverrides: undefined,
+      model: undefined,
       runtime: args.fallbackSdk.created.runtime,
       eventListener: args.eventListener,
     });
-    return { sdk, selection };
-  } finally {
-    await preparationSdk.close();
+    try {
+      selection = await selectAgentProfile(preparationSdk, selectionRequest);
+    } finally {
+      await preparationSdk.close();
+    }
   }
+
+  const selected = discovery.agents.find((candidate) => candidate.id === selection.selectedAgentId && candidate.validationState === 'valid');
+  if (!selected) throw new Error(`Selected agent profile "${selection.selectedAgentId}" is no longer available.`);
+  if (selected.configPath === args.fallbackSdk.agentPath) return { sdk: args.fallbackSdk, selection };
+  const sdk = await createAgentSdk({
+    ...args.sdkOptions,
+    cwd: args.resolvedCwd,
+    agentConfigPath: selected.configPath,
+    settingsConfigPath: undefined,
+    settingsConfig: {
+      ...args.fallbackSdk.config.settings,
+      agent: { mode: 'fixed', id: selected.id, configPath: selected.configPath },
+    },
+    settingsOverrides: undefined,
+    runtime: args.fallbackSdk.created.runtime,
+    eventListener: args.eventListener,
+  });
+  return { sdk, selection };
 }
 
 async function prepareInlineTask(args: {
