@@ -46,6 +46,10 @@ interface TypeSafeChoiceAnswer extends TypeSafeAnswerBase {
 export interface TypeSafeAgentSelectionResponse {
   model: string;
   answers: Record<string, TypeSafeNoulAnswer | TypeSafeChoiceAnswer>;
+  usage?: {
+    input_tokens: number;
+    output_tokens: number;
+  };
 }
 
 export interface TypeSafeAgentSelectionClient {
@@ -183,6 +187,12 @@ export async function selectAgentProfileWithTypeSafe(
     confidence,
     relevance: relevanceAnswer.noul,
     probabilities,
+    ...(response.usage ? {
+      usage: {
+        inputTokens: response.usage.input_tokens,
+        outputTokens: response.usage.output_tokens,
+      },
+    } : {}),
   };
 }
 

@@ -12,6 +12,10 @@ export interface AgentSelectionResult {
   confidence?: number;
   relevance?: number;
   probabilities?: Record<string, number>;
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+  };
 }
 
 export interface SelectAgentRequest {

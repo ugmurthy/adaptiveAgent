@@ -22,6 +22,7 @@ describe('TypeSafe agent selection', () => {
   it('asks configurable relevance and choice questions over the prompt and attachment types', async () => {
     const evaluate = vi.fn(async (request) => ({
       model: 'jev-1.13.0',
+      usage: { input_tokens: 321, output_tokens: 12 },
       answers: {
         candidate_0_relevant: { type: 'noul' as const, noul: 0.24 },
         candidate_1_relevant: { type: 'noul' as const, noul: 0.93 },
@@ -66,6 +67,7 @@ describe('TypeSafe agent selection', () => {
       confidence: 0.87,
       relevance: 0.93,
       probabilities: { general: 0.13, vision: 0.87 },
+      usage: { inputTokens: 321, outputTokens: 12 },
     });
     expect(evaluate).toHaveBeenCalledOnce();
     const request = evaluate.mock.calls[0][0];

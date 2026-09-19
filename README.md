@@ -140,6 +140,28 @@ cat implementation-plan.md | adaptive-agent chat
 Use `chat` while shaping a goal through conversation. Use `run` when the desired
 outcome is already clear enough to execute as one objective.
 
+### TypeSafe JEV routing study
+
+The repository study script can evaluate a prompt against the current agent
+catalog or replay persisted SQLite routing cases without modifying history:
+
+```bash
+bun run jev-routing-study prompt --attachment-type image "Extract this diagram"
+bun run jev-routing-study history --run-id <run-id>
+```
+
+It uses `./agent.settings.json` by default, including the configured TypeSafe
+model and selection policy. Use `--policy <path>` for a study-only policy,
+`--output json|jsonl` for machine-readable results, and `--show-state` or
+`--show-response` for diagnostics. Historical cases without linked selector
+inputs use the current catalog by default and are marked `approx`; pass
+`--no-allow-current-catalog` to require exact context. The table's
+`modalities` column uses `I`, `A`, and `F` for image, audio, and file (`-` for
+text-only). Latency, token, and cost pairs are existing/JEV; JEV latency is
+client wall-clock time and JEV cost is an input-token estimate at the
+configurable price (default `$0.042` per million input tokens). `--repeat`
+performs repeated paid calls and disables cache reuse.
+
 ### 3. Delegate focused research to a skill
 
 The default `core` bundle includes a `planner` agent and a scoped `research`
