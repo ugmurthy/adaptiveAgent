@@ -476,7 +476,10 @@ function resolveRuntimeSqlitePath(settings: StudySettings, env: NodeJS.ProcessEn
   if (settings.runtime?.mode && settings.runtime.mode !== 'sqlite') {
     throw new Error(`history mode requires a SQLite runtime, but settings.runtime.mode is "${settings.runtime.mode}".`);
   }
-  const configured = settings.runtime?.sqlitePath ?? env.ADAPTIVE_AGENT_SQLITE_PATH ?? '~/.adaptiveAgent/runtime.sqlite';
+  const configured = settings.runtime?.sqlitePath ?? env.ADAPTIVE_AGENT_SQLITE_PATH;
+  if (!configured) {
+    return resolve(env.ADAPTIVE_AGENT_HOME ?? resolve(homedir(), '.adaptiveAgent'), 'desktop.sqlite');
+  }
   const expanded = configured
     .replace(/^~(?=$|\/)/, homedir())
     .replace(/\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g, (_, braced: string, plain: string) => env[braced ?? plain] ?? '');

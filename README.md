@@ -152,11 +152,12 @@ bun run jev-routing-study history --limit 10
 ```
 
 It uses `./agent.settings.json` by default, including the configured TypeSafe
-model and selection policy. Use `--policy <path>` for a study-only policy,
-`--output json|jsonl` for machine-readable results, and `--show-state` or
-`--show-response` for diagnostics. Historical cases without linked selector
-inputs use the current catalog by default and are marked `approx`; pass
-`--no-allow-current-catalog` to require exact context. The table's
+model and selection policy. If those settings do not specify a SQLite path,
+history defaults to `~/.adaptiveAgent/desktop.sqlite`. Use `--policy <path>`
+for a study-only policy, `--output json|jsonl` for machine-readable results,
+and `--show-state` or `--show-response` for diagnostics. Historical cases
+without linked selector inputs use the current catalog by default and are
+marked `approx`; pass `--no-allow-current-catalog` to require exact context. The table's
 `modalities` column uses `I`, `A`, and `F` for image, audio, and file (`-` for
 text-only). Latency, token, and cost pairs are existing/JEV; JEV latency is
 client wall-clock time and JEV cost is an input-token estimate at the
