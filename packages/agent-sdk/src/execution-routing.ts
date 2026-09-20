@@ -77,6 +77,7 @@ export function validateExecutionRoutingDecision(
   decision: ExecutionRoutingDecision,
   detectedModalities: SupportedModality[],
   catalog: Map<string, ExecutionRoutingCatalogEntry>,
+  limits: { maxSpecialists?: number } = {},
 ): void {
   const selectedIds = new Set(decision.selectedCatalogAgentIds);
   if (!selectedIds.has(decision.primaryAgentId)) {
@@ -117,6 +118,12 @@ export function validateExecutionRoutingDecision(
   }
   if (decision.mode === 'direct' && [...assigned.values()].some((agentId) => agentId !== decision.primaryAgentId)) {
     throw new Error('Direct execution routing may assign modalities only to the primary agent.');
+  }
+  const specialists = new Set(decision.assignments
+    .map((assignment) => assignment.agentId)
+    .filter((agentId) => agentId !== decision.primaryAgentId));
+  if (limits.maxSpecialists !== undefined && specialists.size > limits.maxSpecialists) {
+    throw new Error(`Execution routing selected ${specialists.size} specialists, exceeding the configured maximum ${limits.maxSpecialists}.`);
   }
 }
 

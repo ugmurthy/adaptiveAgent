@@ -23,6 +23,11 @@ const DEFAULT_POLICY: Required<TypeSafeAgentSelectionPolicyConfig> = {
     instructions: 'Which candidate agent is the single best profile for completing the objective with the supplied attachment types?',
     candidateCriteria: 'Prefer the narrowest capable specialist. Consider profile description, capabilities, tools, and delegates.',
   },
+  routing: {
+    modeInstructions: 'Should this objective use one direct agent or specialist orchestration?',
+    primaryInstructions: 'Which candidate should own the objective and synthesize specialist results when needed?',
+    assignmentInstructions: 'Which capable candidate is the best specialist for this modality?',
+  },
   minimumRelevance: 0.5,
   minimumConfidence: 0.5,
 };
@@ -210,6 +215,9 @@ function normalizePolicy(input: unknown): Required<TypeSafeAgentSelectionPolicyC
   if (supplied?.selection !== undefined && !isRecord(supplied.selection)) {
     throw new Error('TypeSafe agent selection policy selection must be an object.');
   }
+  if (supplied?.routing !== undefined && !isRecord(supplied.routing)) {
+    throw new Error('TypeSafe agent selection policy routing must be an object.');
+  }
   const policy = {
     relevance: {
       ...DEFAULT_POLICY.relevance,
@@ -222,6 +230,10 @@ function normalizePolicy(input: unknown): Required<TypeSafeAgentSelectionPolicyC
     selection: {
       ...DEFAULT_POLICY.selection,
       ...(supplied?.selection ?? {}),
+    },
+    routing: {
+      ...DEFAULT_POLICY.routing,
+      ...(supplied?.routing ?? {}),
     },
     minimumRelevance: supplied?.minimumRelevance ?? DEFAULT_POLICY.minimumRelevance,
     minimumConfidence: supplied?.minimumConfidence ?? DEFAULT_POLICY.minimumConfidence,

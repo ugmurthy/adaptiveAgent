@@ -78,6 +78,42 @@ describe('orchestration sdk', () => {
     expect(plan.nodes[0]?.inputSelector?.claimIds).toEqual(['images.0', 'contentParts.0']);
   });
 
+  it('builds a plan from a validated engine-neutral routing decision', () => {
+    const catalog = catalogFor([
+      agent('general', ['text']),
+      agent('image-analyst', ['text', 'image']),
+      agent('audio-analyst', ['text', 'audio']),
+    ]);
+
+    const plan = buildOrchestrationPlan({
+      sessionId: 'session-adaptive',
+      requestedAgentId: 'general',
+      goal: 'compare the image and audio',
+      options: multimodalOptions(),
+      catalog,
+      routingDecision: {
+        mode: 'orchestration',
+        primaryAgentId: 'general',
+        synthesisAgentId: 'general',
+        assignments: [
+          { agentId: 'general', modalities: ['text'], reason: 'Primary' },
+          { agentId: 'image-analyst', modalities: ['image'], reason: 'Image assignment' },
+          { agentId: 'audio-analyst', modalities: ['audio'], reason: 'Audio assignment' },
+        ],
+        selectedCatalogAgentIds: ['general', 'image-analyst', 'audio-analyst'],
+        reason: 'JEV chose two modality specialists.',
+        confidence: 0.88,
+        source: 'typesafe',
+      },
+      finalizeWithRequestedAgent: true,
+    });
+
+    expect(plan.routingDecision).toMatchObject({ source: 'typesafe', confidence: 0.88 });
+    expect(plan.routingReason).toBe('JEV chose two modality specialists.');
+    expect(plan.routingDiagnostics.subjectCandidates).toEqual([]);
+    expect(plan.nodes.map((node) => node.agentId)).toEqual(['image-analyst', 'audio-analyst', 'general']);
+  });
+
   it('fails planning before starting a stage when no agent can consume a required modality', () => {
     const catalog = catalogFor([agent('general', ['text'])]);
 
@@ -223,6 +259,39 @@ describe('orchestration sdk', () => {
     ]);
     expect(events[0]).toMatchObject({ type: 'orchestration.plan.created', sessionId: 'session-1', executionShape: 'parallel_fanout_then_synthesis' });
     expect(events.at(-1)).toMatchObject({ type: 'orchestration.session.completed', sessionId: 'session-1', status: 'succeeded', finalRunId: synthesisCall.options.runId });
+  });
+
+  it('filters structured multimodal input to each assigned specialist', async () => {
+    const calls: Array<{ agentId: string; goal: string; options: AgentSdkRunOptions }> = [];
+    const sdk = await createOrchestrationSdk({
+      agentCatalog: [
+        { agentId: 'general', agentConfig: agent('general', ['text']) },
+        { agentId: 'image-analyst', agentConfig: agent('image-analyst', ['text', 'image'], ['image']) },
+        { agentId: 'audio-analyst', agentConfig: agent('audio-analyst', ['text', 'audio'], ['audio']) },
+      ],
+      requestedAgentConfig: agent('general', ['text']),
+      agentRunnerFactory: async (agentId) => fakeRunner(agentId, calls),
+    });
+
+    await sdk.run('compare the structured media', {
+      input: {
+        context: 'shared context',
+        image: { reference: 'image-1' },
+        audio: { reference: 'audio-1' },
+      },
+    });
+
+    expect(calls.find((call) => call.agentId === 'image-analyst')?.options.input).toEqual({
+      context: 'shared context',
+      image: { reference: 'image-1' },
+    });
+    expect(calls.find((call) => call.agentId === 'audio-analyst')?.options.input).toEqual({
+      context: 'shared context',
+      audio: { reference: 'audio-1' },
+    });
+    expect(calls.find((call) => call.agentId === 'general')?.options.input).toMatchObject({
+      originalInput: { context: 'shared context' },
+    });
   });
 
   it('persists allocated stage ids before invoking runners', async () => {

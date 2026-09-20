@@ -128,6 +128,7 @@ export interface OrchestratedRunOptions extends AgentSdkRunOptions {
   requestedAgentId?: string;
   sessionId?: string;
   catalogFingerprint?: string;
+  routingDecision?: ExecutionRoutingDecision;
   finalizeWithRequestedAgent?: boolean;
   orchestrationMetadata?: JsonObject;
 }
@@ -344,7 +345,7 @@ export class OrchestrationSdk {
       if (requestedRunner instanceof AgentSdk) this.orchestrationStore = requestedRunner.created.runtime.orchestrationStore;
     }
     const fingerprint = options.catalogFingerprint ?? this.catalogFingerprint;
-    const plan = buildOrchestrationPlan({ sessionId, requestedAgentId, goal, options, catalog: this.catalog, catalogFingerprint: fingerprint, finalizeWithRequestedAgent: options.finalizeWithRequestedAgent ?? true });
+    const plan = buildOrchestrationPlan({ sessionId, requestedAgentId, goal, options, catalog: this.catalog, catalogFingerprint: fingerprint, routingDecision: options.routingDecision, finalizeWithRequestedAgent: options.finalizeWithRequestedAgent ?? true });
     this.plans.set(sessionId, plan);
     this.emitLifecycle({
       type: 'orchestration.plan.created',
@@ -467,7 +468,7 @@ export class OrchestrationSdk {
     const runner = await this.getRunner(node.agentId);
     const startedAt = this.now().toISOString();
     const runGoal = node.stage === 'final_synthesis' ? buildSynthesisGoal(goal) : goal;
-    const runOptions = buildNodeOptions(options, plan, node, priorResults, supportedModalities(this.catalog.get(plan.requestedAgentId)!.agentConfig));
+    const runOptions = buildNodeOptions(options, plan, node, priorResults, supportedModalities(this.catalog.get(node.agentId)!.agentConfig));
     const result = await runner.runRaw(runGoal, { ...runOptions, runId: stage.runId, sessionId: plan.sessionId });
     const rootRunId = (await runner.inspect(result.runId)).run?.rootRunId ?? result.runId;
     const completedAt = this.now().toISOString();
@@ -590,30 +591,39 @@ export function detectInputClaims(goal: string, options: AgentSdkRunOptions): In
   return claims;
 }
 
-export function buildOrchestrationPlan(params: { sessionId: string; requestedAgentId: string; goal: string; options: AgentSdkRunOptions; catalog: Map<string, AgentCatalogEntry>; catalogFingerprint?: string; finalizeWithRequestedAgent: boolean }): OrchestrationPlan {
+export function buildOrchestrationPlan(params: { sessionId: string; requestedAgentId: string; goal: string; options: AgentSdkRunOptions; catalog: Map<string, AgentCatalogEntry>; catalogFingerprint?: string; routingDecision?: ExecutionRoutingDecision; finalizeWithRequestedAgent: boolean }): OrchestrationPlan {
   const requested = params.catalog.get(params.requestedAgentId);
   if (!requested) throw new Error(`Unknown requested agent "${params.requestedAgentId}"`);
   const inputClaims = detectInputClaims(params.goal, params.options);
   const detectedModalities = unique(inputClaims.map((claim) => claim.modality));
-  const baseDecision = buildDeterministicExecutionRoutingDecision({
-    requestedAgentId: params.requestedAgentId,
-    detectedModalities,
-    catalog: params.catalog,
-    forceOrchestration: true,
-    synthesize: params.finalizeWithRequestedAgent,
-  });
-  const subjectRouting = chooseSubjectSpecialist(params.catalog, params.goal, params.requestedAgentId);
+  if (params.routingDecision?.mode === 'direct') throw new Error('Direct execution routing cannot be launched as an orchestration plan.');
+  if (params.routingDecision && params.routingDecision.primaryAgentId !== params.requestedAgentId) {
+    throw new Error(`Execution routing primary agent "${params.routingDecision.primaryAgentId}" does not match requested agent "${params.requestedAgentId}".`);
+  }
+  const baseDecision = params.routingDecision ?? buildDeterministicExecutionRoutingDecision({
+      requestedAgentId: params.requestedAgentId,
+      detectedModalities,
+      catalog: params.catalog,
+      forceOrchestration: true,
+      synthesize: params.finalizeWithRequestedAgent,
+    });
+  validateExecutionRoutingDecision(baseDecision, detectedModalities, params.catalog);
+  const subjectRouting: { selected?: { entry: AgentCatalogEntry; matchedSubjects: string[] }; candidates: SubjectRoutingCandidateDiagnostic[] } = params.routingDecision
+    ? { candidates: [] as SubjectRoutingCandidateDiagnostic[] }
+    : chooseSubjectSpecialist(params.catalog, params.goal, params.requestedAgentId);
   const subjectSpecialist = subjectRouting.selected;
   const detectedSubjects = subjectSpecialist?.matchedSubjects ?? [];
   const routingDiagnostics = { subjectCandidates: subjectRouting.candidates };
   const modalityAssignments = baseDecision.assignments.filter((assignment) => assignment.agentId !== params.requestedAgentId);
   const hasSpecialists = modalityAssignments.length > 0 || Boolean(subjectSpecialist);
-  const routingReason = hasSpecialists
+  const routingReason = params.routingDecision
+    ? params.routingDecision.reason
+    : hasSpecialists
     ? buildRoutingReason(params.requestedAgentId, modalityAssignments.flatMap((assignment) => assignment.modalities), detectedSubjects, params.finalizeWithRequestedAgent)
     : baseDecision.reason;
   const routingDecision: ExecutionRoutingDecision = {
     ...baseDecision,
-    ...(params.finalizeWithRequestedAgent && hasSpecialists ? { synthesisAgentId: params.requestedAgentId } : {}),
+    ...(params.finalizeWithRequestedAgent && hasSpecialists && !baseDecision.synthesisAgentId ? { synthesisAgentId: params.requestedAgentId } : {}),
     selectedCatalogAgentIds: unique([
       ...baseDecision.selectedCatalogAgentIds,
       ...(subjectSpecialist ? [subjectSpecialist.entry.agentId] : []),
@@ -650,7 +660,7 @@ export function buildOrchestrationPlan(params: { sessionId: string; requestedAge
     const first = specialistNodes[0]!;
     return { sessionId: params.sessionId, requestedAgentId: params.requestedAgentId, catalogFingerprint, detectedModalities, detectedSubjects, inputClaims, executionShape: specialistNodes.length === 1 ? 'single' : 'parallel_fanout_then_synthesis', nodes: specialistNodes, finalNodeId: first.id, routingReason, routingDecision, routingDiagnostics };
   }
-  const finalNode = { id: 'final_synthesis', agentId: params.requestedAgentId, stage: 'final_synthesis' as const, dependsOn: specialistNodes.map((node) => node.id), inputSelector: { includeGoal: true, includeOriginalInput: true, includePriorOutputs: specialistNodes.map((node) => node.id) } };
+  const finalNode = { id: 'final_synthesis', agentId: routingDecision.synthesisAgentId ?? params.requestedAgentId, stage: 'final_synthesis' as const, dependsOn: specialistNodes.map((node) => node.id), inputSelector: { includeGoal: true, includeOriginalInput: true, includePriorOutputs: specialistNodes.map((node) => node.id) } };
   return { sessionId: params.sessionId, requestedAgentId: params.requestedAgentId, catalogFingerprint, detectedModalities, detectedSubjects, inputClaims, executionShape: specialistNodes.length === 1 ? 'sequential' : 'parallel_fanout_then_synthesis', nodes: [...specialistNodes, finalNode], finalNodeId: finalNode.id, routingReason, routingDecision, routingDiagnostics };
 }
 
@@ -662,7 +672,7 @@ function buildNodeOptions(options: OrchestratedRunOptions, plan: OrchestrationPl
   const orchestration = { kind: 'catalog', executionId: plan.sessionId, sessionId: plan.sessionId, requestedAgentId: plan.requestedAgentId, selectedAgentId: node.agentId, selectedCatalogAgentIds: plan.routingDecision.selectedCatalogAgentIds, modalityAssignments: plan.routingDecision.assignments as unknown as JsonValue, routingSource: plan.routingDecision.source, catalogFingerprint: plan.catalogFingerprint, executionShape: plan.executionShape, stage: node.stage, nodeId: node.id, dependsOn: node.dependsOn, detectedModalities: plan.detectedModalities, routingReason: plan.routingReason } satisfies JsonObject;
   if (node.stage === 'final_synthesis') {
     const raw = selectSynthesisAttachments(options, requestedModalities);
-    return { ...raw, input: { originalInput: options.input ?? null, upstreamResults: priorOutputs }, context: { ...(options.context ?? {}), sessionId: plan.sessionId, orchestration }, executionContext: options.executionContext, inferenceTier: options.inferenceTier, outputSchema: options.outputSchema, metadata: { ...(options.metadata ?? {}), orchestration } };
+    return { ...raw, input: { originalInput: filterInputModalities(options.input, new Set(requestedModalities)) ?? null, upstreamResults: priorOutputs }, context: { ...(options.context ?? {}), sessionId: plan.sessionId, orchestration }, executionContext: options.executionContext, inferenceTier: options.inferenceTier, outputSchema: options.outputSchema, metadata: { ...(options.metadata ?? {}), orchestration } };
   }
   return { ...selectNodeInputs(options, plan, node), context: { ...(options.context ?? {}), sessionId: plan.sessionId, orchestration }, executionContext: options.executionContext, inferenceTier: options.inferenceTier, outputSchema: options.outputSchema, metadata: { ...(options.metadata ?? {}), orchestration } };
 }
@@ -672,10 +682,27 @@ function selectNodeInputs(options: OrchestratedRunOptions, plan: OrchestrationPl
   const claimIds = new Set(node.inputSelector?.claimIds ?? []);
   const selectedClaims = plan.inputClaims.filter((claim) => claimIds.has(claim.id));
   return {
-    ...(selectedClaims.some((claim) => claim.source === 'input') ? { input: options.input } : {}),
+    ...selectStructuredInput(options, selectedClaims),
     ...selectImages(options, selectedClaims),
     ...selectContentParts(options, selectedClaims),
   };
+}
+
+function selectStructuredInput(options: OrchestratedRunOptions, claims: InputClaim[]): Pick<AgentSdkRunOptions, 'input'> {
+  if (!options.input || typeof options.input !== 'object' || Array.isArray(options.input)) return {};
+  const selectedModalities = new Set(claims
+    .filter((claim) => claim.source === 'input')
+    .map((claim) => claim.modality));
+  if (selectedModalities.size === 0) return {};
+  return { input: filterInputModalities(options.input, selectedModalities) };
+}
+
+function filterInputModalities(input: JsonValue | undefined, supported: Set<SupportedModality>): JsonValue | undefined {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return input;
+  const modalityKeys = new Set<SupportedModality>(['image', 'file', 'audio']);
+  return Object.fromEntries(Object.entries(input).filter(([key]) =>
+    !modalityKeys.has(key as SupportedModality) || supported.has(key as SupportedModality)
+  ));
 }
 
 function selectImages(options: OrchestratedRunOptions, claims: InputClaim[]): Pick<AgentSdkRunOptions, 'images'> {
@@ -696,7 +723,7 @@ function selectContentParts(options: OrchestratedRunOptions, claims: InputClaim[
 
 function selectSynthesisAttachments(options: OrchestratedRunOptions, supported: SupportedModality[]): Pick<AgentSdkRunOptions, 'images' | 'contentParts'> {
   const images = supported.includes('image') ? options.images : undefined;
-  const contentParts = options.contentParts?.filter((part) => part.type === 'file' || (part.type === 'image' && supported.includes('image')) || (part.type === 'audio' && supported.includes('audio')) || part.type === 'text');
+  const contentParts = options.contentParts?.filter((part) => (part.type === 'file' && supported.includes('file')) || (part.type === 'image' && supported.includes('image')) || (part.type === 'audio' && supported.includes('audio')) || part.type === 'text');
   return { ...(images?.length ? { images } : {}), ...(contentParts?.length ? { contentParts } : {}) };
 }
 
@@ -855,6 +882,7 @@ function stripOrchestrationOptions(options: OrchestratedRunOptions): Orchestrate
   delete copy.sessionId;
   delete copy.requestedAgentId;
   delete copy.catalogFingerprint;
+  delete copy.routingDecision;
   return copy;
 }
 

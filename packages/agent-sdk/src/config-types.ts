@@ -91,6 +91,11 @@ export interface TypeSafeAgentSelectionPolicyConfig {
     instructions?: JsonValue;
     candidateCriteria?: JsonValue;
   };
+  routing?: {
+    modeInstructions?: JsonValue;
+    primaryInstructions?: JsonValue;
+    assignmentInstructions?: JsonValue;
+  };
   minimumRelevance?: number;
   minimumConfidence?: number;
 }
@@ -106,6 +111,12 @@ export interface AgentSelectionSettingsConfig {
     policyPath?: string;
     policy?: TypeSafeAgentSelectionPolicyConfig;
   };
+}
+
+export interface ExecutionRoutingSettingsConfig {
+  mode?: 'single' | 'adaptive';
+  maxSpecialists?: number;
+  lowConfidenceFallback?: 'direct' | 'error';
 }
 
 export interface AgentConfigFile {
@@ -135,6 +146,7 @@ export interface AgentSettingsFile {
   version?: 1;
   agent?: { mode?: 'fixed' | 'auto'; configPath?: string; id?: string };
   agentSelection?: AgentSelectionSettingsConfig;
+  executionRouting?: ExecutionRoutingSettingsConfig;
   agents?: { dirs?: string[] };
   runtime?: { mode?: RuntimeMode; autoMigrate?: boolean; sqlitePath?: string };
   logging?: { enabled?: boolean; level?: LogLevel; destination?: LogDestination; filePath?: string; pretty?: boolean };

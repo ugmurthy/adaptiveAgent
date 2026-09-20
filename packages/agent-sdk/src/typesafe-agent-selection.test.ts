@@ -145,6 +145,7 @@ describe('TypeSafe agent selection', () => {
     await writeFile(join(tempDir, 'routing-policy.json'), JSON.stringify({
       relevance: { instructions: 'Does this profile fit?' },
       selection: { instructions: 'Choose the best profile.' },
+      routing: { assignmentInstructions: 'Choose the best modality specialist.' },
       minimumConfidence: 0.73,
       minimumRelevance: 0.66,
     }));
@@ -152,6 +153,7 @@ describe('TypeSafe agent selection', () => {
     await expect(loadTypeSafeAgentSelectionPolicy(tempDir, './routing-policy.json', undefined)).resolves.toMatchObject({
       relevance: { instructions: 'Does this profile fit?' },
       selection: { instructions: 'Choose the best profile.' },
+      routing: { assignmentInstructions: 'Choose the best modality specialist.' },
       minimumConfidence: 0.73,
       minimumRelevance: 0.66,
     });

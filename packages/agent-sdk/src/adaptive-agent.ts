@@ -33,11 +33,13 @@ import {
   type AgentSdkOptions,
   type AgentSdkChatOptions,
   type AgentSelectionResult,
+  type AdaptiveExecutionRoutingResult,
   type AgentSdkRunOptions,
   type AmbientStartResult,
   type OrchestrationLifecycleEvent,
   type OrchestrationSdk,
   type TaskPreparationMode,
+  type TaskPreparationAttachmentSummary,
   type TaskPreparationResult,
   prepareTask,
   restoreTaskPreparation,
@@ -45,6 +47,10 @@ import {
   createTypeSafeAgentSelectionClient,
   loadTypeSafeAgentSelectionPolicy,
   selectAgentProfileWithTypeSafe,
+  directRoutingFallback,
+  ExecutionRoutingConfidenceError,
+  selectExecutionRoutingWithAgent,
+  selectExecutionRoutingWithTypeSafe,
 } from './index.js';
 import { doctorExitCode, renderDoctorReport, runDoctor } from './install/doctor.js';
 import { renderInitReport, runInit, type InitProfile } from './install/init.js';
@@ -1171,12 +1177,13 @@ async function runSpecCommand(cli: ManualTestCliOptions): Promise<number> {
   });
   let sdk = fallbackSdk;
   let selectedSdk: Awaited<ReturnType<typeof createAgentSdk>> | undefined;
+  let executionRouting: AdaptiveExecutionRoutingResult | undefined;
   let orchestrationSdk: OrchestrationSdk | undefined;
 
   try {
     let executionSpec = spec;
     if (spec.mode === 'run' && !cli.agentConfigPath && resolvedConfig.settings.agent?.mode === 'auto') {
-      const selected = await selectInlineAgent({
+      const selectionArgs = {
         originalObjective: spec.goal,
         cli,
         fallbackSdk,
@@ -1184,18 +1191,28 @@ async function runSpecCommand(cli: ManualTestCliOptions): Promise<number> {
         resolvedCwd,
         eventListener,
         sessionId,
-      });
+        attachments: summarizeRunAttachments(spec),
+      };
+      const adaptive = !cli.orchestrate && resolvedConfig.settings.executionRouting?.mode === 'adaptive';
+      const selected = adaptive
+        ? await selectInlineExecutionRouting(selectionArgs)
+        : await selectInlineAgent(selectionArgs);
       sdk = selected.sdk;
       selectedSdk = selected.sdk === fallbackSdk ? undefined : selected.sdk;
       resolvedConfig = sdk.config;
-      executionSpec = withAgentSelection(spec, selected.selection);
+      if ('selection' in selected) executionSpec = withAgentSelection(spec, selected.selection);
+      else {
+        executionRouting = selected.routing;
+        executionSpec = withExecutionRouting(spec, selected.routing);
+      }
     }
     warnings = collectProviderWarnings(executionSpec, resolvedConfig.model.provider);
     for (const warning of warnings) {
       if (cli.output === 'pretty') console.error(`warning: ${warning}`);
     }
     if (cli.output === 'pretty') printResolvedConfigSummary(cli, resolvedConfig, executionSpec, warnings);
-    orchestrationSdk = cli.orchestrate && executionSpec.mode === 'run'
+    const shouldOrchestrate = cli.orchestrate || executionRouting?.decision.mode === 'orchestration';
+    orchestrationSdk = shouldOrchestrate && executionSpec.mode === 'run'
       ? await createOrchestrationSdk({
           ...sdkOptions,
           requestedAgentConfig: sdk.config.agent,
@@ -1207,7 +1224,11 @@ async function runSpecCommand(cli: ManualTestCliOptions): Promise<number> {
         })
       : undefined;
     const orchestrated = orchestrationSdk && executionSpec.mode === 'run'
-      ? await orchestrationSdk.runRaw(executionSpec.goal, { ...buildRunOptions(executionSpec), sessionId })
+      ? await orchestrationSdk.runRaw(executionSpec.goal, {
+          ...buildRunOptions(executionSpec),
+          sessionId,
+          ...(executionRouting?.decision.mode === 'orchestration' ? { routingDecision: executionRouting.decision } : {}),
+        })
       : undefined;
     const result = orchestrated?.finalResult ?? (executionSpec.mode === 'chat'
       ? await sdk.chat(executionSpec.messages, { ...buildChatOptions(executionSpec), sessionId })
@@ -1328,6 +1349,7 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
   let sdk = fallbackSdk;
   let selectedSdk: Awaited<ReturnType<typeof createAgentSdk>> | undefined;
   let agentSelection: AgentSelectionResult | undefined;
+  let executionRouting: AdaptiveExecutionRoutingResult | undefined;
   let orchestrationSdk: OrchestrationSdk | undefined;
 
   try {
@@ -1336,7 +1358,7 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
       sessionId = preparationRun?.sessionId ?? sessionId;
     }
     if (spec.mode === 'run' && !cli.fromPreparationRunId && !cli.agentConfigPath && resolvedConfig.settings.agent?.mode === 'auto') {
-      const selected = await selectInlineAgent({
+      const selectionArgs = {
         originalObjective: spec.goal,
         cli,
         fallbackSdk,
@@ -1344,10 +1366,16 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
         resolvedCwd,
         eventListener,
         sessionId,
-      });
+        attachments: summarizeRunAttachments(spec),
+      };
+      const adaptive = !cli.orchestrate && resolvedConfig.settings.executionRouting?.mode === 'adaptive';
+      const selected = adaptive
+        ? await selectInlineExecutionRouting(selectionArgs)
+        : await selectInlineAgent(selectionArgs);
       sdk = selected.sdk;
       selectedSdk = selected.sdk === fallbackSdk ? undefined : selected.sdk;
-      agentSelection = selected.selection;
+      if ('selection' in selected) agentSelection = selected.selection;
+      else executionRouting = selected.routing;
       resolvedConfig = sdk.config;
     }
     const taskPreparations = spec.mode === 'run' && cli.fromPreparationRunId
@@ -1374,6 +1402,7 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
       ? applyTaskPreparation(spec, taskPreparations, cli.fromPreparationRunId ? 'reused' : 'inline')
       : spec;
     if (executionSpec.mode === 'run' && agentSelection) executionSpec = withAgentSelection(executionSpec, agentSelection);
+    if (executionSpec.mode === 'run' && executionRouting) executionSpec = withExecutionRouting(executionSpec, executionRouting);
     warnings = collectProviderWarnings(executionSpec, resolvedConfig.model.provider);
 
     for (const warning of warnings) {
@@ -1403,7 +1432,8 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
       return 1;
     }
 
-    orchestrationSdk = cli.orchestrate && executionSpec.mode === 'run'
+    const shouldOrchestrate = cli.orchestrate || executionRouting?.decision.mode === 'orchestration';
+    orchestrationSdk = shouldOrchestrate && executionSpec.mode === 'run'
       ? await createOrchestrationSdk({
           ...sdkOptions,
           requestedAgentConfig: sdk.config.agent,
@@ -1415,7 +1445,11 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
         })
       : undefined;
     const orchestrated = orchestrationSdk && executionSpec.mode === 'run'
-      ? await orchestrationSdk.runRaw(executionSpec.goal, { ...buildRunOptions(executionSpec), sessionId })
+      ? await orchestrationSdk.runRaw(executionSpec.goal, {
+          ...buildRunOptions(executionSpec),
+          sessionId,
+          ...(executionRouting?.decision.mode === 'orchestration' ? { routingDecision: executionRouting.decision } : {}),
+        })
       : undefined;
     const result = orchestrated?.finalResult ?? (executionSpec.mode === 'chat'
       ? await sdk.chat(executionSpec.messages, { ...buildChatOptions(executionSpec), sessionId })
@@ -1469,6 +1503,115 @@ function withAgentSelection(spec: ManualRunSpec, selection: AgentSelectionResult
   };
 }
 
+function withExecutionRouting(spec: ManualRunSpec, routing: AdaptiveExecutionRoutingResult): ManualRunSpec {
+  return {
+    ...spec,
+    metadata: {
+      ...(spec.metadata ?? {}),
+      executionRouting: {
+        ...routing.decision,
+        routerId: routing.routerId,
+        ...(routing.routingRunId ? { routingRunId: routing.routingRunId } : {}),
+        ...(routing.routingModel ? { routingModel: routing.routingModel } : {}),
+      } as unknown as JsonValue,
+    },
+  };
+}
+
+async function selectInlineExecutionRouting(args: {
+  originalObjective: string;
+  cli: ManualTestCliOptions;
+  fallbackSdk: Awaited<ReturnType<typeof createAgentSdk>>;
+  sdkOptions: AgentSdkOptions;
+  resolvedCwd: string;
+  eventListener?: (event: AgentEvent) => void;
+  sessionId: string;
+  attachments?: TaskPreparationAttachmentSummary;
+}): Promise<{ sdk: Awaited<ReturnType<typeof createAgentSdk>>; routing: AdaptiveExecutionRoutingResult }> {
+  const discovery = await discoverAgentSdkAgents(args.sdkOptions);
+  const settings = args.fallbackSdk.config.settings;
+  const selectionSettings = settings.agentSelection;
+  const attachments = args.attachments ?? {
+    images: args.cli.imagePaths,
+    files: args.cli.fileAttachmentPaths,
+    audio: args.cli.audioPaths,
+  };
+  const request = {
+    originalObjective: args.originalObjective,
+    candidates: discovery.agents,
+    workspaceRoot: args.fallbackSdk.config.workspaceRoot,
+    attachments,
+    sessionId: args.sessionId,
+    maxSpecialists: settings.executionRouting?.maxSpecialists ?? 4,
+  };
+  let routing: AdaptiveExecutionRoutingResult;
+
+  try {
+    if (selectionSettings?.engine === 'typesafe') {
+      const typesafe = selectionSettings.typesafe;
+      if (!typesafe) throw new Error('Adaptive execution routing requires settings.agentSelection.typesafe.');
+      const env = {
+        ...process.env,
+        ...(args.sdkOptions.env ?? {}),
+        ...(settings.env ?? {}),
+      };
+      const apiKeyEnv = typesafe.apiKeyEnv ?? 'TYPESAFE_API_KEY';
+      const apiKey = env[apiKeyEnv];
+      if (!apiKey) throw new Error(`TypeSafe execution routing requires environment variable "${apiKeyEnv}".`);
+      const model = typesafe.model ?? 'jev-latest';
+      const policy = await loadTypeSafeAgentSelectionPolicy(
+        args.resolvedCwd,
+        typesafe.policyPath,
+        typesafe.policy,
+        env,
+      );
+      routing = await selectExecutionRoutingWithTypeSafe(
+        createTypeSafeAgentSelectionClient({
+          apiKey,
+          baseUrl: typesafe.baseUrl,
+          timeoutMs: typesafe.timeoutMs,
+        }),
+        request,
+        model,
+        policy,
+      );
+    } else {
+      const configuredAgent = selectionSettings?.agent ?? settings.taskPreparation?.agent;
+      if (!configuredAgent) {
+        throw new Error('Adaptive execution routing requires settings.agentSelection.agent or settings.taskPreparation.agent.');
+      }
+      const routerSdk = await createAgentSdk({
+        ...args.sdkOptions,
+        cwd: args.resolvedCwd,
+        agentConfigPath: configuredAgent,
+        settingsConfigPath: undefined,
+        settingsConfig: { ...settings, agent: undefined },
+        settingsOverrides: undefined,
+        model: undefined,
+        runtime: args.fallbackSdk.created.runtime,
+        eventListener: args.eventListener,
+      });
+      try {
+        routing = await selectExecutionRoutingWithAgent(routerSdk, request);
+      } finally {
+        await routerSdk.close();
+      }
+    }
+  } catch (error) {
+    if (!(error instanceof ExecutionRoutingConfidenceError) || settings.executionRouting?.lowConfidenceFallback !== 'direct') throw error;
+    const fallback = discovery.currentAgent
+      ?? discovery.agents.find((candidate) => candidate.configPath === args.fallbackSdk.agentPath);
+    if (!fallback) throw new Error('Low-confidence routing could not resolve the configured direct fallback profile.');
+    routing = {
+      decision: directRoutingFallback(fallback, attachments, error.confidence),
+      routerId: 'deterministic:low-confidence-fallback',
+    };
+  }
+
+  const sdk = await createSdkForSelectedAgent(args, discovery.agents, routing.decision.primaryAgentId);
+  return { sdk, routing };
+}
+
 async function selectInlineAgent(args: {
   originalObjective: string;
   cli: ManualTestCliOptions;
@@ -1477,13 +1620,14 @@ async function selectInlineAgent(args: {
   resolvedCwd: string;
   eventListener?: (event: AgentEvent) => void;
   sessionId: string;
+  attachments?: TaskPreparationAttachmentSummary;
 }): Promise<{ sdk: Awaited<ReturnType<typeof createAgentSdk>>; selection: AgentSelectionResult }> {
   const discovery = await discoverAgentSdkAgents(args.sdkOptions);
   const selectionRequest = {
     originalObjective: args.originalObjective,
     candidates: discovery.agents,
     workspaceRoot: args.fallbackSdk.config.workspaceRoot,
-    attachments: {
+    attachments: args.attachments ?? {
       images: args.cli.imagePaths,
       files: args.cli.fileAttachmentPaths,
       audio: args.cli.audioPaths,
@@ -1544,10 +1688,24 @@ async function selectInlineAgent(args: {
     }
   }
 
-  const selected = discovery.agents.find((candidate) => candidate.id === selection.selectedAgentId && candidate.validationState === 'valid');
-  if (!selected) throw new Error(`Selected agent profile "${selection.selectedAgentId}" is no longer available.`);
-  if (selected.configPath === args.fallbackSdk.agentPath) return { sdk: args.fallbackSdk, selection };
-  const sdk = await createAgentSdk({
+  const sdk = await createSdkForSelectedAgent(args, discovery.agents, selection.selectedAgentId);
+  return { sdk, selection };
+}
+
+async function createSdkForSelectedAgent(
+  args: {
+    fallbackSdk: Awaited<ReturnType<typeof createAgentSdk>>;
+    sdkOptions: AgentSdkOptions;
+    resolvedCwd: string;
+    eventListener?: (event: AgentEvent) => void;
+  },
+  candidates: Awaited<ReturnType<typeof discoverAgentSdkAgents>>['agents'],
+  selectedAgentId: string,
+): Promise<Awaited<ReturnType<typeof createAgentSdk>>> {
+  const selected = candidates.find((candidate) => candidate.id === selectedAgentId && candidate.validationState === 'valid');
+  if (!selected) throw new Error(`Selected agent profile "${selectedAgentId}" is no longer available.`);
+  if (selected.configPath === args.fallbackSdk.agentPath) return args.fallbackSdk;
+  return createAgentSdk({
     ...args.sdkOptions,
     cwd: args.resolvedCwd,
     agentConfigPath: selected.configPath,
@@ -1560,7 +1718,28 @@ async function selectInlineAgent(args: {
     runtime: args.fallbackSdk.created.runtime,
     eventListener: args.eventListener,
   });
-  return { sdk, selection };
+}
+
+function summarizeRunAttachments(spec: ManualRunSpec): TaskPreparationAttachmentSummary {
+  const contentParts = spec.contentParts ?? [];
+  const structuredInput = spec.input && typeof spec.input === 'object' && !Array.isArray(spec.input)
+    ? spec.input
+    : undefined;
+  return {
+    images: [
+      ...(spec.images ?? []).map((_, index) => `images.${index}`),
+      ...contentParts.flatMap((part, index) => part.type === 'image' ? [`contentParts.${index}`] : []),
+      ...(structuredInput && 'image' in structuredInput ? ['input.image'] : []),
+    ],
+    files: [
+      ...contentParts.flatMap((part, index) => part.type === 'file' ? [`contentParts.${index}`] : []),
+      ...(structuredInput && 'file' in structuredInput ? ['input.file'] : []),
+    ],
+    audio: [
+      ...contentParts.flatMap((part, index) => part.type === 'audio' ? [`contentParts.${index}`] : []),
+      ...(structuredInput && 'audio' in structuredInput ? ['input.audio'] : []),
+    ],
+  };
 }
 
 async function prepareInlineTask(args: {

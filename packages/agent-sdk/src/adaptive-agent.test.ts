@@ -1286,6 +1286,63 @@ describe('adaptive-agent TypeSafe profile selection', () => {
       log.mockRestore();
     }
   });
+
+  it('uses opt-in TypeSafe adaptive routing without changing the default selection path', async () => {
+    await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({
+      runtime: { mode: 'memory' },
+      agent: { mode: 'auto', configPath: './agent.json' },
+      agents: { dirs: ['./agents'] },
+      executionRouting: { mode: 'adaptive', maxSpecialists: 2 },
+      agentSelection: {
+        engine: 'typesafe',
+        typesafe: {
+          model: 'jev-1.13.0',
+          apiKeyEnv: 'TEST_TYPESAFE_API_KEY',
+          policy: { minimumConfidence: 0.7, minimumRelevance: 0.7 },
+        },
+      },
+    }));
+    const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as {
+        state: { candidates: Array<{ id: string }> };
+        questions: Record<string, unknown>;
+      };
+      const researcherIndex = body.state.candidates.findIndex((candidate) => candidate.id === 'researcher');
+      const answers = Object.fromEntries(Object.keys(body.questions).map((key) => {
+        if (key === 'execution_mode') return [key, { type: 'choice', choice: 'direct', confidence: 0.91, probabilities: { direct: 0.91, orchestration: 0.09 } }];
+        if (key === 'direct_primary') return [key, { type: 'choice', choice: 'researcher', confidence: 0.9, probabilities: { researcher: 0.9 } }];
+        if (key === `candidate_${researcherIndex}_text_relevant`) return [key, { type: 'noul', noul: 0.92 }];
+        return [key, { type: 'noul', noul: 0.8 }];
+      }));
+      return new Response(JSON.stringify({ model: 'jev-1.13.0', answers }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetch);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      const exitCode = await main([
+        'run', '--dry-run', '--cwd', tempDir, '--output', 'json',
+        'Research the latest browser automation APIs.',
+      ]);
+      const output = JSON.parse(String(log.mock.calls.at(-1)?.[0])) as {
+        request?: { metadata?: { executionRouting?: Record<string, unknown> } };
+      };
+
+      expect(exitCode).toBe(0);
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(output.request?.metadata?.executionRouting).toMatchObject({
+        mode: 'direct',
+        primaryAgentId: 'researcher',
+        source: 'typesafe',
+        routingModel: 'jev-1.13.0',
+      });
+    } finally {
+      log.mockRestore();
+    }
+  });
 });
 
 describe('adaptive-agent single-run recovery commands', () => {

@@ -269,19 +269,28 @@ ordering only through an opt-in mode.
 - Retain the existing durable plan, stage, retry, pause/resume, and recovery
   behavior.
 
-### Phase 2: opt-in adaptive execution routing
+### Phase 2: opt-in adaptive execution routing (implemented)
 
 - Add agent and TypeSafe/JEV adapters that propose the common decision shape.
 - Add an explicit opt-in for automatic direct-versus-orchestration selection.
-- Define confidence fallback and configurable cost/latency/stage bounds.
+- Define confidence fallback and bound specialist fan-out with
+  `maxSpecialists`.
 - Decide and version preparation-before-routing migration behavior.
 - Evaluate deterministic versus learned routing on representative multimodal
   and subject-specialist cases before changing defaults.
+
+The implemented compatibility choice preserves selection/routing before task
+preparation. `executionRouting.mode: "adaptive"` is the explicit opt-in;
+`maxSpecialists` bounds fan-out and `lowConfidenceFallback` controls safe direct
+fallback versus failure. Preparation-before-routing remains a possible future
+versioned migration rather than a Phase 2 behavior change.
 
 ### Later phases
 
 - Consider calibrated quality/cost feedback and policy tuning using persisted
   routing outcomes.
+- Consider generalized token, dollar, and deadline budgets beyond the Phase 2
+  specialist-count bound.
 - Consider making adaptive routing a default only after compatibility,
   privacy, latency, and quality gates are met.
 

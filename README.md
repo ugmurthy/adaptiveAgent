@@ -220,6 +220,69 @@ Plain `run` is unchanged: it still executes one fixed profile or, when
 modality. Automatic direct-versus-orchestrated selection is not enabled in this
 phase.
 
+### Opt-in adaptive execution routing
+
+To let the configured `agentSelection.engine` choose direct execution or a
+validated specialist orchestration, opt in explicitly:
+
+```json
+{
+  "agent": {
+    "mode": "auto",
+    "configPath": "./agents/default.json"
+  },
+  "executionRouting": {
+    "mode": "adaptive",
+    "maxSpecialists": 4,
+    "lowConfidenceFallback": "error"
+  },
+  "agentSelection": {
+    "engine": "typesafe",
+    "typesafe": {
+      "model": "jev-latest",
+      "apiKeyEnv": "TYPESAFE_API_KEY",
+      "policy": {
+        "relevance": {
+          "instructions": "Is this profile a strong match for the objective and this attachment modality?"
+        },
+        "selection": {
+          "candidateCriteria": "Prefer the narrowest capable specialist."
+        },
+        "routing": {
+          "modeInstructions": "Choose direct only when one profile should handle the complete objective; otherwise choose orchestration.",
+          "primaryInstructions": "Choose the best profile to own and synthesize the complete objective.",
+          "assignmentInstructions": "Choose the strongest capable specialist for this modality."
+        }
+      }
+    }
+  }
+}
+```
+
+Both `agent` and `typesafe` engines produce the same validated
+`ExecutionRoutingDecision`. TypeSafe evaluates candidate-by-modality relevance,
+execution mode, primary profile, and modality assignments. The agent engine
+returns the equivalent structured object from a tool-free router run. Agent SDK
+rejects unknown IDs, unsupported or duplicate assignments, missing modalities,
+and decisions exceeding `maxSpecialists` before starting execution.
+The optional TypeSafe `policy.routing` questions tune execution-shape, primary,
+and per-modality choices independently of the legacy single-agent
+`policy.selection.instructions`; `selection.candidateCriteria` remains common
+guidance for candidate choices.
+
+`lowConfidenceFallback` defaults to `error`. Setting it to `direct` uses the
+configured profile only when that profile supports every input modality;
+otherwise the request still fails. Explicit `--agent` remains fixed. Explicit
+`--orchestrate` remains a force override and preserves deterministic Phase 1
+routing. Without `executionRouting.mode: "adaptive"`, ordinary single-profile
+selection is unchanged.
+
+Adaptive routing currently preserves the compatibility ordering in which
+routing/selection occurs before task preparation. The routing decision is
+recorded under request metadata and, for orchestration, in the durable plan and
+lifecycle events. Selector inputs contain safe profile summaries and attachment
+types/counts, not config paths, credentials, instructions, or attachment paths.
+
 Delegation, orchestration, and swarms serve different scopes:
 
 | Capability | Best use |

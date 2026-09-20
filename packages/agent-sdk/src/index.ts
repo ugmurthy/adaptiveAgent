@@ -61,6 +61,7 @@ export * from './task-preparation.js';
 export * from './agent-selection.js';
 export * from './typesafe-agent-selection.js';
 export * from './execution-routing.js';
+export * from './adaptive-execution-routing.js';
 export { agentConfigurationFingerprint } from './sdk-utils.js';
 export * from './server-profiles.js';
 export { createGatewayProxyTool, type GatewayProxyToolFactoryOptions, type GatewayRemoteToolName } from './gateway-tools.js';

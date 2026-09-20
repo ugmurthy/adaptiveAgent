@@ -242,6 +242,39 @@ describe('agent-sdk config resolution', () => {
     });
   });
 
+  it('loads adaptive execution routing and TypeSafe routing policy settings', async () => {
+    await writeAgentConfig(join(tempDir, 'agent.json'));
+    await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({
+      agent: { mode: 'auto' },
+      executionRouting: { mode: 'adaptive', maxSpecialists: 3, lowConfidenceFallback: 'error' },
+      agentSelection: {
+        engine: 'typesafe',
+        typesafe: {
+          policy: {
+            routing: {
+              modeInstructions: 'Choose the execution shape.',
+              primaryInstructions: 'Choose the primary profile.',
+              assignmentInstructions: 'Choose the specialist for this modality.',
+            },
+          },
+        },
+      },
+    }));
+
+    const config = await loadAgentSdkConfig({ cwd: tempDir, env: testEnvironment() });
+
+    expect(config.settings.executionRouting).toEqual({
+      mode: 'adaptive',
+      maxSpecialists: 3,
+      lowConfidenceFallback: 'error',
+    });
+    expect(config.settings.agentSelection?.typesafe?.policy?.routing).toEqual({
+      modeInstructions: 'Choose the execution shape.',
+      primaryInstructions: 'Choose the primary profile.',
+      assignmentInstructions: 'Choose the specialist for this modality.',
+    });
+  });
+
   it('rejects conflicting inline and file-based TypeSafe selection policies', async () => {
     await writeAgentConfig(join(tempDir, 'agent.json'));
     await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({
