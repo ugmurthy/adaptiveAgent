@@ -393,6 +393,7 @@ async function runTui(sdkOptions: AgentSdkOptions, state: TuiClientState, cli: T
       ...sdkOptions,
       requestedAgentConfig: sdk.config.agent,
       agentCatalogPaths: cli.agentCatalogPaths,
+      includeDiscoveredAgents: true,
       runtime: sdk.created.runtime,
       eventListener: handleEvent,
       orchestrationListener: handleOrchestrationEvent,

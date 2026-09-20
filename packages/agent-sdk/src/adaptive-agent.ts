@@ -265,7 +265,7 @@ Run options:
   --from-preparation <runId>
                           Reuse a successful task preparation run.
   --orchestrate           Route run requests through the orchestration SDK.
-  --catalog <path>        Agent config path to add to orchestration catalog. Repeatable.
+  --catalog <path>        Add a profile to the discovered orchestration catalog. Repeatable.
 
 ${COMMON_AGENT_OPTIONS_TEXT}
 
@@ -494,7 +494,7 @@ Spec options:
   --spec <path>           Path to the JSON spec file.
   --mode <chat|run>       Override the spec mode.
   --orchestrate           Route run-mode specs through the orchestration SDK.
-  --catalog <path>        Agent config path to add to orchestration catalog. Repeatable.
+  --catalog <path>        Add a profile to the discovered orchestration catalog. Repeatable.
 
 ${COMMON_AGENT_OPTIONS_TEXT}
 
@@ -558,7 +558,7 @@ Eval options:
   --type <value>          Run only rows with a matching attachment type: audio,
                           image, video, or other. Rows without attachments do not match.
   --orchestrate           Route benchmark cases through the orchestration SDK.
-  --catalog <path>        Agent config path to add to orchestration catalog. Repeatable.
+  --catalog <path>        Add a profile to the discovered orchestration catalog. Repeatable.
 
 ${COMMON_AGENT_OPTIONS_TEXT}
 
@@ -1200,6 +1200,7 @@ async function runSpecCommand(cli: ManualTestCliOptions): Promise<number> {
           ...sdkOptions,
           requestedAgentConfig: sdk.config.agent,
           agentCatalogPaths: cli.agentCatalogPaths,
+          includeDiscoveredAgents: true,
           runtime: sdk.created.runtime,
           eventListener,
           orchestrationListener,
@@ -1407,6 +1408,7 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
           ...sdkOptions,
           requestedAgentConfig: sdk.config.agent,
           agentCatalogPaths: cli.agentCatalogPaths,
+          includeDiscoveredAgents: true,
           runtime: sdk.created.runtime,
           eventListener,
           orchestrationListener,
@@ -2462,6 +2464,7 @@ async function runEvalCommand(cli: ManualTestCliOptions): Promise<number> {
         ...sdkOptions,
         requestedAgentConfig: sdk.config.agent,
         agentCatalogPaths: cli.agentCatalogPaths,
+        includeDiscoveredAgents: true,
         runtime: sdk.created.runtime,
         eventListener,
         orchestrationListener,

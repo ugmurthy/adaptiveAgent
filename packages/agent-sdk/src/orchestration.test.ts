@@ -51,6 +51,33 @@ describe('orchestration sdk', () => {
     ]);
   });
 
+  it('builds one grouped specialist node when one agent is assigned image and audio', () => {
+    const catalog = catalogFor([
+      agent('general', ['text']),
+      agent('media-analyst', ['text', 'image', 'audio'], ['image', 'audio']),
+    ]);
+
+    const plan = buildOrchestrationPlan({
+      sessionId: 'session-1',
+      requestedAgentId: 'general',
+      goal: 'compare the image and audio',
+      options: multimodalOptions(),
+      catalog,
+      finalizeWithRequestedAgent: true,
+    });
+
+    expect(plan.executionShape).toBe('sequential');
+    expect(plan.routingDecision.assignments).toContainEqual(expect.objectContaining({
+      agentId: 'media-analyst',
+      modalities: ['image', 'audio'],
+    }));
+    expect(plan.nodes.map((node) => [node.id, node.agentId, node.dependsOn])).toEqual([
+      ['image_audio_specialist', 'media-analyst', []],
+      ['final_synthesis', 'general', ['image_audio_specialist']],
+    ]);
+    expect(plan.nodes[0]?.inputSelector?.claimIds).toEqual(['images.0', 'contentParts.0']);
+  });
+
   it('fails planning before starting a stage when no agent can consume a required modality', () => {
     const catalog = catalogFor([agent('general', ['text'])]);
 
@@ -489,6 +516,34 @@ describe('orchestration sdk', () => {
     await sdk.close();
   });
 
+  it('executes one grouped multimodal specialist run with all assigned attachments', async () => {
+    const calls: Array<{ agentId: string; goal: string; options: AgentSdkRunOptions }> = [];
+    const sdk = await createOrchestrationSdk({
+      agentCatalog: [
+        { agentId: 'general', agentConfig: agent('general', ['text']) },
+        { agentId: 'media-analyst', agentConfig: agent('media-analyst', ['text', 'image', 'audio'], ['image', 'audio']) },
+      ],
+      requestedAgentConfig: agent('general', ['text']),
+      sessionIdFactory: () => 'session-grouped',
+      agentRunnerFactory: async (agentId) => fakeRunner(agentId, calls),
+    });
+
+    const result = await sdk.run('compare the image and audio', multimodalOptions());
+
+    expect(result.stages.map((stage) => stage.agentId)).toEqual(['media-analyst', 'general']);
+    const specialistCall = calls.find((call) => call.agentId === 'media-analyst')!;
+    expect(specialistCall.options.images).toEqual([{ path: '/tmp/image.png' }]);
+    expect(specialistCall.options.contentParts).toEqual([
+      { type: 'audio', audio: { source: { kind: 'path', path: '/tmp/audio.wav' }, format: 'wav' } },
+    ]);
+    expect(specialistCall.options.metadata?.orchestration).toMatchObject({
+      selectedCatalogAgentIds: ['general', 'media-analyst'],
+      routingSource: 'deterministic',
+      catalogFingerprint: result.plan.catalogFingerprint,
+    });
+    await sdk.close();
+  });
+
   it('resolves catalog agent names from configured agent search dirs', async () => {
     const tempDir = await mkdtemp(join(tmpdir(), 'orchestration-catalog-'));
     const calls: Array<{ agentId: string; goal: string; options: AgentSdkRunOptions }> = [];
@@ -511,6 +566,40 @@ describe('orchestration sdk', () => {
 
       expect(result.stages.map((stage) => stage.agentId)).toEqual(['mesh-audio-min', 'general']);
       expect(calls[0]?.options.contentParts).toEqual([{ type: 'audio', audio: { source: { kind: 'path', path: '/tmp/audio.mp3' }, format: 'mp3' } }]);
+      await sdk.close();
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('uses valid active profiles discovered from configured agent dirs without explicit catalog entries', async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), 'orchestration-discovery-'));
+    const calls: Array<{ agentId: string; goal: string; options: AgentSdkRunOptions }> = [];
+    try {
+      const agentsDir = join(tempDir, 'agents');
+      const requested = agent('general', ['text']);
+      await mkdir(agentsDir);
+      await writeFile(join(agentsDir, 'general.json'), JSON.stringify(requested));
+      await writeFile(join(agentsDir, 'media.json'), JSON.stringify(agent('media-analyst', ['text', 'image', 'audio'], ['image', 'audio'])));
+      await writeFile(join(agentsDir, 'duplicate-a.json'), JSON.stringify(agent('aaa-duplicate', ['text', 'image', 'audio'], ['image', 'audio'])));
+      await writeFile(join(agentsDir, 'duplicate-b.json'), JSON.stringify(agent('aaa-duplicate', ['text', 'image', 'audio'], ['image', 'audio'])));
+      await writeFile(join(agentsDir, 'invalid.json'), '{invalid');
+      await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({ agents: { dirs: ['./agents'] } }));
+
+      const sdk = await createOrchestrationSdk({
+        cwd: tempDir,
+        agentConfig: requested,
+        agentConfigPath: join(agentsDir, 'general.json'),
+        requestedAgentConfig: requested,
+        includeDiscoveredAgents: true,
+        sessionIdFactory: () => 'session-discovered',
+        agentRunnerFactory: async (agentId) => fakeRunner(agentId, calls),
+      });
+
+      const result = await sdk.run('compare the image and audio', multimodalOptions());
+
+      expect(result.stages.map((stage) => stage.agentId)).toEqual(['media-analyst', 'general']);
+      expect(result.plan.routingDecision.selectedCatalogAgentIds).toEqual(['general', 'media-analyst']);
       await sdk.close();
     } finally {
       await rm(tempDir, { recursive: true, force: true });

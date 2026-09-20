@@ -670,6 +670,8 @@ export function summarizeOrchestration(result: OrchestratedRunResult): JsonValue
     detectedModalities: result.detectedModalities,
     executionShape: result.executionShape,
     routingReason: result.plan.routingReason,
+    routingDecision: result.plan.routingDecision as unknown as JsonValue,
+    catalogFingerprint: result.plan.catalogFingerprint,
     routingDiagnostics: result.plan.routingDiagnostics as unknown as JsonValue,
     finalNodeId: result.plan.finalNodeId,
     stages: result.stages.map((stage) => ({
@@ -729,6 +731,8 @@ export function summarizeOrchestrationLifecycleEvent(event: OrchestrationLifecyc
     ...('executionShape' in event ? { executionShape: event.executionShape } : {}),
     ...('detectedModalities' in event ? { detectedModalities: event.detectedModalities } : {}),
     ...('routingReason' in event ? { routingReason: event.routingReason } : {}),
+    ...('routingDecision' in event ? { routingDecision: event.routingDecision as unknown as JsonValue } : {}),
+    ...('catalogFingerprint' in event ? { catalogFingerprint: event.catalogFingerprint } : {}),
     ...('nodes' in event ? { nodes: event.nodes as unknown as JsonValue } : {}),
     ...('nodeId' in event ? { nodeId: event.nodeId, agentId: event.agentId, stage: event.stage } : {}),
     ...('runId' in event ? { runId: event.runId, rootRunId: event.rootRunId } : {}),
@@ -1472,6 +1476,8 @@ function formatInteractiveChatBlock(
 export function printOrchestration(result: OrchestratedRunResult): void {
   console.log(`orchestration: session=${result.sessionId} shape=${result.executionShape}`);
   console.log(`routing: ${result.plan.routingReason}`);
+  console.log(`assignments: ${result.plan.routingDecision.assignments.map((assignment) => `${assignment.agentId}=[${assignment.modalities.join(',')}]`).join(' ')}`);
+  console.log(`catalog: ${result.plan.catalogFingerprint}`);
   console.log(`stages: ${result.stages.map((stage) => `${stage.nodeId}:${stage.agentId}:${stage.runId}`).join(', ') || '(none)'}`);
   console.log('');
 }

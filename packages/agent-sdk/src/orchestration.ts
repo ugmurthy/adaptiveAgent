@@ -4,8 +4,17 @@ import { resolve } from 'node:path';
 import { InMemoryOrchestrationStore, type AgentRun, type JsonObject, type JsonValue, type OrchestrationExecution, type OrchestrationStage, type OrchestrationStore, type RunResult } from '@adaptive-agent/core';
 
 import { AgentSdk, type AgentConfigFile, type AgentSdkOptions, type AgentSdkRunOptions, type SupportedModality } from './index.js';
+import { resolveAgentSdkConfigWithSources } from './config-resolve.js';
+import { validateAgent } from './config-validate.js';
+import {
+  buildDeterministicExecutionRoutingDecision,
+  supportedModalities,
+  validateExecutionRoutingDecision,
+  type ExecutionRoutingDecision,
+} from './execution-routing.js';
 import { adaptiveAgentHome, expandStrings, readJson, resolveAgentConfigByName, resolveAgentDirs, resolvePath, pathExists } from './sdk-utils.js';
 import type { AgentSettingsFile } from './config-types.js';
+import { discoverCatalogAgentInventory } from './tool-registry.js';
 
 export type OrchestrationSessionStatus = 'routing' | 'running' | 'paused' | 'succeeded' | 'failed' | 'cancelled';
 export type OrchestrationStageKind = 'single' | 'modality_specialist' | 'parallel_specialist' | 'subject_specialist' | 'final_synthesis';
@@ -54,6 +63,7 @@ export interface OrchestrationRoutingDiagnostics {
 export interface OrchestrationPlan {
   sessionId: string;
   requestedAgentId: string;
+  catalogFingerprint: string;
   detectedModalities: SupportedModality[];
   detectedSubjects: string[];
   inputClaims: InputClaim[];
@@ -61,6 +71,7 @@ export interface OrchestrationPlan {
   nodes: OrchestrationPlanNode[];
   finalNodeId: string;
   routingReason: string;
+  routingDecision: ExecutionRoutingDecision;
   routingDiagnostics: OrchestrationRoutingDiagnostics;
 }
 
@@ -156,6 +167,8 @@ export type OrchestrationLifecycleEvent =
       detectedModalities: SupportedModality[];
       detectedSubjects: string[];
       routingReason: string;
+      routingDecision: ExecutionRoutingDecision;
+      catalogFingerprint: string;
       nodes: Array<Pick<OrchestrationPlanNode, 'id' | 'agentId' | 'stage' | 'dependsOn'>>;
       createdAt: string;
     }
@@ -220,6 +233,7 @@ export interface OrchestrationSdkOptions extends AgentSdkOptions {
   requestedAgentConfigPath?: string;
   agentCatalog?: AgentCatalogEntry[];
   agentCatalogPaths?: string[];
+  includeDiscoveredAgents?: boolean;
   sessionStore?: OrchestrationSessionStore;
   sessionRunLinkStore?: OrchestrationSessionRunLinkStore;
   orchestrationStore?: OrchestrationStore;
@@ -285,13 +299,13 @@ export class OrchestrationSdk {
 
   async inspectSession(sessionId: string): Promise<OrchestrationSessionInspection> {
     const durable = await this.inspectExecution(sessionId);
-    const plan = durable.execution ? parsePlan(durable.execution.plan) : this.plans.get(sessionId);
+    const plan = durable.execution ? parsePlan(durable.execution.plan, durable.execution.catalogFingerprint) : this.plans.get(sessionId);
     return { session: await this.sessionStore.get(sessionId), links: await this.linkStore.listBySession(sessionId), plan };
   }
 
   async inspectExecution(executionId: string): Promise<{ execution: OrchestrationExecution | null; stages: OrchestrationStage[]; plan?: OrchestrationPlan }> {
     const execution = await this.orchestrationStore.getExecution(executionId);
-    return { execution, stages: execution ? await this.orchestrationStore.listStages(executionId) : [], plan: execution ? parsePlan(execution.plan) : undefined };
+    return { execution, stages: execution ? await this.orchestrationStore.listStages(executionId) : [], plan: execution ? parsePlan(execution.plan, execution.catalogFingerprint) : undefined };
   }
 
   async interruptExecution(executionId: string): Promise<void> {
@@ -311,7 +325,7 @@ export class OrchestrationSdk {
     if (!execution) throw new Error(`Orchestration execution ${executionId} not found.`);
     if (execution.catalogFingerprint !== this.catalogFingerprint) throw new Error(`CATALOG_CHANGED: orchestration execution ${executionId} was created with a different catalog fingerprint.`);
     if (execution.status === 'cancelled') throw new Error(`Orchestration execution ${executionId} is cancelled.`);
-    return this.continueExecution(execution, parseRequest(execution.request), parsePlan(execution.plan));
+    return this.continueExecution(execution, parseRequest(execution.request), parsePlan(execution.plan, execution.catalogFingerprint));
   }
 
   async close(): Promise<void> {
@@ -329,7 +343,8 @@ export class OrchestrationSdk {
       const requestedRunner = await this.getRunner(requestedAgentId);
       if (requestedRunner instanceof AgentSdk) this.orchestrationStore = requestedRunner.created.runtime.orchestrationStore;
     }
-    const plan = buildOrchestrationPlan({ sessionId, requestedAgentId, goal, options, catalog: this.catalog, finalizeWithRequestedAgent: options.finalizeWithRequestedAgent ?? true });
+    const fingerprint = options.catalogFingerprint ?? this.catalogFingerprint;
+    const plan = buildOrchestrationPlan({ sessionId, requestedAgentId, goal, options, catalog: this.catalog, catalogFingerprint: fingerprint, finalizeWithRequestedAgent: options.finalizeWithRequestedAgent ?? true });
     this.plans.set(sessionId, plan);
     this.emitLifecycle({
       type: 'orchestration.plan.created',
@@ -339,12 +354,13 @@ export class OrchestrationSdk {
       detectedModalities: plan.detectedModalities,
       detectedSubjects: plan.detectedSubjects,
       routingReason: plan.routingReason,
+      routingDecision: plan.routingDecision,
+      catalogFingerprint: plan.catalogFingerprint,
       nodes: plan.nodes.map((node) => ({ id: node.id, agentId: node.agentId, stage: node.stage, dependsOn: node.dependsOn })),
       createdAt: this.now().toISOString(),
     });
 
     const request = jsonSafe({ goal, options: stripOrchestrationOptions(options) });
-    const fingerprint = options.catalogFingerprint ?? this.catalogFingerprint;
     const durable = await this.orchestrationStore.createExecution({
       id: sessionId,
       request,
@@ -574,34 +590,68 @@ export function detectInputClaims(goal: string, options: AgentSdkRunOptions): In
   return claims;
 }
 
-export function buildOrchestrationPlan(params: { sessionId: string; requestedAgentId: string; goal: string; options: AgentSdkRunOptions; catalog: Map<string, AgentCatalogEntry>; finalizeWithRequestedAgent: boolean }): OrchestrationPlan {
+export function buildOrchestrationPlan(params: { sessionId: string; requestedAgentId: string; goal: string; options: AgentSdkRunOptions; catalog: Map<string, AgentCatalogEntry>; catalogFingerprint?: string; finalizeWithRequestedAgent: boolean }): OrchestrationPlan {
   const requested = params.catalog.get(params.requestedAgentId);
   if (!requested) throw new Error(`Unknown requested agent "${params.requestedAgentId}"`);
   const inputClaims = detectInputClaims(params.goal, params.options);
   const detectedModalities = unique(inputClaims.map((claim) => claim.modality));
-  const specialistModalities = detectedModalities.filter((modality) => shouldRouteToSpecialist(params.catalog, requested, modality));
+  const baseDecision = buildDeterministicExecutionRoutingDecision({
+    requestedAgentId: params.requestedAgentId,
+    detectedModalities,
+    catalog: params.catalog,
+    forceOrchestration: true,
+    synthesize: params.finalizeWithRequestedAgent,
+  });
   const subjectRouting = chooseSubjectSpecialist(params.catalog, params.goal, params.requestedAgentId);
   const subjectSpecialist = subjectRouting.selected;
   const detectedSubjects = subjectSpecialist?.matchedSubjects ?? [];
   const routingDiagnostics = { subjectCandidates: subjectRouting.candidates };
-  if (specialistModalities.length === 0 && !subjectSpecialist) {
-    return { sessionId: params.sessionId, requestedAgentId: params.requestedAgentId, detectedModalities, detectedSubjects, inputClaims, executionShape: 'single', nodes: [{ id: 'requested', agentId: params.requestedAgentId, stage: 'single', dependsOn: [], inputSelector: { includeGoal: true, includeOriginalInput: true } }], finalNodeId: 'requested', routingReason: `Requested agent "${params.requestedAgentId}" supports detected modalities: ${detectedModalities.join(', ')}.`, routingDiagnostics };
+  const modalityAssignments = baseDecision.assignments.filter((assignment) => assignment.agentId !== params.requestedAgentId);
+  const hasSpecialists = modalityAssignments.length > 0 || Boolean(subjectSpecialist);
+  const routingReason = hasSpecialists
+    ? buildRoutingReason(params.requestedAgentId, modalityAssignments.flatMap((assignment) => assignment.modalities), detectedSubjects, params.finalizeWithRequestedAgent)
+    : baseDecision.reason;
+  const routingDecision: ExecutionRoutingDecision = {
+    ...baseDecision,
+    ...(params.finalizeWithRequestedAgent && hasSpecialists ? { synthesisAgentId: params.requestedAgentId } : {}),
+    selectedCatalogAgentIds: unique([
+      ...baseDecision.selectedCatalogAgentIds,
+      ...(subjectSpecialist ? [subjectSpecialist.entry.agentId] : []),
+    ]),
+    reason: routingReason,
+  };
+  validateExecutionRoutingDecision(routingDecision, detectedModalities, params.catalog);
+  const catalogFingerprint = params.catalogFingerprint ?? fingerprintCatalog([...params.catalog.values()]);
+  if (!hasSpecialists) {
+    return { sessionId: params.sessionId, requestedAgentId: params.requestedAgentId, catalogFingerprint, detectedModalities, detectedSubjects, inputClaims, executionShape: 'single', nodes: [{ id: 'requested', agentId: params.requestedAgentId, stage: 'single', dependsOn: [], inputSelector: { includeGoal: true, includeOriginalInput: true } }], finalNodeId: 'requested', routingReason, routingDecision, routingDiagnostics };
   }
 
-  const specialistNodes: OrchestrationPlanNode[] = specialistModalities.map((modality) => {
-    const specialist = chooseSpecialist(params.catalog, modality, params.requestedAgentId);
-    if (!specialist) throw new Error(`No agent supports required modality "${modality}".`);
-    return { id: `${modality}_specialist`, agentId: specialist.agentId, stage: specialistModalities.length === 1 ? 'modality_specialist' as const : 'parallel_specialist' as const, dependsOn: [], inputSelector: { includeGoal: true, claimIds: inputClaims.filter((claim) => claim.modality === modality).map((claim) => claim.id) }, outputRole: `${modality}_analysis` };
+  const specialistNodes: OrchestrationPlanNode[] = modalityAssignments.map((assignment) => {
+    const slug = assignment.modalities.join('_');
+    return {
+      id: `${slug}_specialist`,
+      agentId: assignment.agentId,
+      stage: modalityAssignments.length === 1 ? 'modality_specialist' as const : 'parallel_specialist' as const,
+      dependsOn: [],
+      inputSelector: { includeGoal: true, claimIds: inputClaims.filter((claim) => assignment.modalities.includes(claim.modality)).map((claim) => claim.id) },
+      outputRole: `${slug}_analysis`,
+      metadata: { assignedModalities: assignment.modalities },
+    };
   });
   if (subjectSpecialist) {
-    specialistNodes.push({ id: `subject_${slugify(subjectSpecialist.matchedSubjects[0] ?? subjectSpecialist.entry.agentId)}_specialist`, agentId: subjectSpecialist.entry.agentId, stage: 'subject_specialist', dependsOn: [], inputSelector: { includeGoal: true }, outputRole: `${subjectSpecialist.matchedSubjects.join('_') || 'subject'}_analysis`, metadata: { matchedSubjects: subjectSpecialist.matchedSubjects } });
+    const existing = specialistNodes.find((node) => node.agentId === subjectSpecialist.entry.agentId);
+    if (existing) {
+      existing.metadata = { ...(existing.metadata ?? {}), matchedSubjects: subjectSpecialist.matchedSubjects };
+    } else {
+      specialistNodes.push({ id: `subject_${slugify(subjectSpecialist.matchedSubjects[0] ?? subjectSpecialist.entry.agentId)}_specialist`, agentId: subjectSpecialist.entry.agentId, stage: 'subject_specialist', dependsOn: [], inputSelector: { includeGoal: true }, outputRole: `${subjectSpecialist.matchedSubjects.join('_') || 'subject'}_analysis`, metadata: { matchedSubjects: subjectSpecialist.matchedSubjects } });
+    }
   }
   if (!params.finalizeWithRequestedAgent) {
     const first = specialistNodes[0]!;
-    return { sessionId: params.sessionId, requestedAgentId: params.requestedAgentId, detectedModalities, detectedSubjects, inputClaims, executionShape: specialistNodes.length === 1 ? 'single' : 'parallel_fanout_then_synthesis', nodes: specialistNodes, finalNodeId: first.id, routingReason: buildRoutingReason(params.requestedAgentId, specialistModalities, detectedSubjects, false), routingDiagnostics };
+    return { sessionId: params.sessionId, requestedAgentId: params.requestedAgentId, catalogFingerprint, detectedModalities, detectedSubjects, inputClaims, executionShape: specialistNodes.length === 1 ? 'single' : 'parallel_fanout_then_synthesis', nodes: specialistNodes, finalNodeId: first.id, routingReason, routingDecision, routingDiagnostics };
   }
   const finalNode = { id: 'final_synthesis', agentId: params.requestedAgentId, stage: 'final_synthesis' as const, dependsOn: specialistNodes.map((node) => node.id), inputSelector: { includeGoal: true, includeOriginalInput: true, includePriorOutputs: specialistNodes.map((node) => node.id) } };
-  return { sessionId: params.sessionId, requestedAgentId: params.requestedAgentId, detectedModalities, detectedSubjects, inputClaims, executionShape: specialistNodes.length === 1 ? 'sequential' : 'parallel_fanout_then_synthesis', nodes: [...specialistNodes, finalNode], finalNodeId: finalNode.id, routingReason: buildRoutingReason(params.requestedAgentId, specialistModalities, detectedSubjects, true), routingDiagnostics };
+  return { sessionId: params.sessionId, requestedAgentId: params.requestedAgentId, catalogFingerprint, detectedModalities, detectedSubjects, inputClaims, executionShape: specialistNodes.length === 1 ? 'sequential' : 'parallel_fanout_then_synthesis', nodes: [...specialistNodes, finalNode], finalNodeId: finalNode.id, routingReason, routingDecision, routingDiagnostics };
 }
 
 function buildNodeOptions(options: OrchestratedRunOptions, plan: OrchestrationPlan, node: OrchestrationPlanNode, priorResults: Map<string, OrchestratedRunStageResult>, requestedModalities: SupportedModality[]): AgentSdkRunOptions {
@@ -609,7 +659,7 @@ function buildNodeOptions(options: OrchestratedRunOptions, plan: OrchestrationPl
     const result = priorResults.get(id)?.result;
     return [id, resultToJson(result)];
   }));
-  const orchestration = { kind: 'catalog', executionId: plan.sessionId, sessionId: plan.sessionId, requestedAgentId: plan.requestedAgentId, selectedAgentId: node.agentId, executionShape: plan.executionShape, stage: node.stage, nodeId: node.id, dependsOn: node.dependsOn, detectedModalities: plan.detectedModalities, routingReason: plan.routingReason } satisfies JsonObject;
+  const orchestration = { kind: 'catalog', executionId: plan.sessionId, sessionId: plan.sessionId, requestedAgentId: plan.requestedAgentId, selectedAgentId: node.agentId, selectedCatalogAgentIds: plan.routingDecision.selectedCatalogAgentIds, modalityAssignments: plan.routingDecision.assignments as unknown as JsonValue, routingSource: plan.routingDecision.source, catalogFingerprint: plan.catalogFingerprint, executionShape: plan.executionShape, stage: node.stage, nodeId: node.id, dependsOn: node.dependsOn, detectedModalities: plan.detectedModalities, routingReason: plan.routingReason } satisfies JsonObject;
   if (node.stage === 'final_synthesis') {
     const raw = selectSynthesisAttachments(options, requestedModalities);
     return { ...raw, input: { originalInput: options.input ?? null, upstreamResults: priorOutputs }, context: { ...(options.context ?? {}), sessionId: plan.sessionId, orchestration }, executionContext: options.executionContext, inferenceTier: options.inferenceTier, outputSchema: options.outputSchema, metadata: { ...(options.metadata ?? {}), orchestration } };
@@ -659,26 +709,6 @@ function resultToJson(result: RunResult | undefined): JsonValue {
 
 function buildSynthesisGoal(originalGoal: string): string {
   return ['Complete the original user request using the specialist result(s) already produced.', 'Do not assume access to raw attachments unless they are included explicitly.', '', `Original user request: ${originalGoal}`].join('\n');
-}
-
-function supportedModalities(config: AgentConfigFile): SupportedModality[] {
-  return config.capabilities?.modalitiesSupported?.length ? config.capabilities.modalitiesSupported : ['text'];
-}
-
-function shouldRouteToSpecialist(catalog: Map<string, AgentCatalogEntry>, requested: AgentCatalogEntry, modality: SupportedModality): boolean {
-  if (modality === 'text') return false;
-  const requestedSupported = supportedModalities(requested.agentConfig);
-  if (!requestedSupported.includes(modality)) return true;
-  const specialist = chooseSpecialist(catalog, modality, requested.agentId);
-  if (!specialist) return false;
-  return specialistScore(specialist, modality) > specialistScore(requested, modality);
-}
-
-function chooseSpecialist(catalog: Map<string, AgentCatalogEntry>, modality: SupportedModality, excludeAgentId?: string): AgentCatalogEntry | undefined {
-  return [...catalog.values()]
-    .filter((entry) => entry.agentId !== excludeAgentId)
-    .filter((entry) => supportedModalities(entry.agentConfig).includes(modality))
-    .sort((left, right) => specialistScore(right, modality) - specialistScore(left, modality) || supportedModalities(left.agentConfig).length - supportedModalities(right.agentConfig).length || left.agentId.localeCompare(right.agentId))[0];
 }
 
 function chooseSubjectSpecialist(catalog: Map<string, AgentCatalogEntry>, goal: string, requestedAgentId: string): { selected?: { entry: AgentCatalogEntry; matchedSubjects: string[] }; candidates: SubjectRoutingCandidateDiagnostic[] } {
@@ -736,23 +766,24 @@ function buildRoutingReason(requestedAgentId: string, modalities: SupportedModal
     : `Routed ${parts.join(' and ')} to specialist agent(s) without requested-agent synthesis.`;
 }
 
-function specialistScore(entry: AgentCatalogEntry, modality: SupportedModality): number {
-  let score = 0;
-  if (entry.agentConfig.capabilities?.modalitiesPreferred?.includes(modality)) score += 4;
-  if (entry.agentConfig.capabilities?.modalityRoles?.[modality] === 'analyze') score += 2;
-  if (entry.agentId.toLowerCase().includes(modality)) score += 1;
-  return score;
-}
-
 async function buildCatalog(options: OrchestrationSdkOptions): Promise<AgentCatalogEntry[]> {
   const entries = new Map<string, AgentCatalogEntry>();
-  for (const entry of options.agentCatalog ?? []) entries.set(entry.agentId, entry);
   const cwd = options.cwd ?? process.cwd();
   const env = { ...(options.env ?? process.env), ...(options.settingsConfig?.env ?? {}) };
   const agentDirs = await resolveCatalogAgentDirs(options, cwd, env);
+  if (options.includeDiscoveredAgents) {
+    const resolved = await resolveAgentSdkConfigWithSources(options);
+    const inventory = await discoverCatalogAgentInventory(resolved.config, resolved.agentPath, options);
+    for (const candidate of inventory.agents) {
+      if (candidate.archived || candidate.validationState !== 'valid' || !candidate.invocationModes.includes('run')) continue;
+      const agentConfig = validateAgent(expandStrings(await readJson(candidate.configPath), env), candidate.configPath);
+      entries.set(candidate.id, { agentId: candidate.id, configPath: candidate.configPath, agentConfig });
+    }
+  }
+  for (const entry of options.agentCatalog ?? []) entries.set(entry.agentId, entry);
   for (const pathOrName of options.agentCatalogPaths ?? []) {
     const configPath = await resolveAgentConfigByName(pathOrName, agentDirs) ?? resolvePath(cwd, pathOrName);
-    const agentConfig = expandStrings(await readJson(configPath), env) as AgentConfigFile;
+    const agentConfig = validateAgent(expandStrings(await readJson(configPath), env), configPath);
     entries.set(agentConfig.id, { agentId: agentConfig.id, configPath, agentConfig });
   }
   const requestedConfig = options.requestedAgentConfig ?? options.agentConfig;
@@ -786,8 +817,28 @@ async function findSettingsPath(options: OrchestrationSdkOptions, cwd: string, e
 
 interface StoredRequest { goal: string; options: OrchestratedRunOptions }
 
-function parsePlan(value: JsonValue): OrchestrationPlan {
-  return value as unknown as OrchestrationPlan;
+function parsePlan(value: JsonValue, catalogFingerprint?: string): OrchestrationPlan {
+  const plan = value as unknown as OrchestrationPlan;
+  if (plan.routingDecision && plan.catalogFingerprint) return plan;
+  const assignments = new Map<string, SupportedModality[]>();
+  for (const modality of plan.detectedModalities) {
+    const specialist = plan.nodes.find((node) => node.inputSelector?.claimIds?.some((claimId) =>
+      plan.inputClaims.find((claim) => claim.id === claimId)?.modality === modality
+    ));
+    const agentId = specialist?.agentId ?? plan.requestedAgentId;
+    assignments.set(agentId, [...(assignments.get(agentId) ?? []), modality]);
+  }
+  const synthesisAgentId = plan.nodes.find((node) => node.stage === 'final_synthesis')?.agentId;
+  const routingDecision: ExecutionRoutingDecision = {
+    mode: 'orchestration',
+    primaryAgentId: plan.requestedAgentId,
+    ...(synthesisAgentId ? { synthesisAgentId } : {}),
+    assignments: [...assignments].map(([agentId, modalities]) => ({ agentId, modalities, reason: 'Recovered from a legacy orchestration plan.' })),
+    selectedCatalogAgentIds: unique(plan.nodes.map((node) => node.agentId)),
+    reason: plan.routingReason,
+    source: 'deterministic',
+  };
+  return { ...plan, catalogFingerprint: catalogFingerprint ?? 'legacy', routingDecision };
 }
 
 function parseRequest(value: JsonValue): StoredRequest {

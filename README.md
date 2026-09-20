@@ -206,6 +206,20 @@ orchestration can run independent stages before final synthesis. Preview the
 resolved configuration and request without spending model tokens by adding
 `--dry-run`.
 
+`--orchestrate` is an explicit force override: it uses every valid, non-archived
+`run` profile discovered from configured `agents.dirs`, plus any profiles named
+with `--catalog`. The requested `--agent` remains the primary and final
+synthesis profile. Routing validates every attachment modality before starting
+a stage; missing capability metadata means text-only. When one specialist wins
+multiple modalities, it receives all of those attachments in one grouped run.
+Run output and durable plans record the selected catalog IDs, grouped modality
+assignments, routing reason, and credential-free catalog fingerprint.
+
+Plain `run` is unchanged: it still executes one fixed profile or, when
+`settings.agent.mode` is `auto`, selects one profile that supports every input
+modality. Automatic direct-versus-orchestrated selection is not enabled in this
+phase.
+
 Delegation, orchestration, and swarms serve different scopes:
 
 | Capability | Best use |
