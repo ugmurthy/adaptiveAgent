@@ -1,10 +1,12 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  buildCliAttachmentExecutionContext,
   buildInteractiveChatSpec,
   collectProviderWarnings,
   selectBenchmarkCases,
@@ -1287,6 +1289,124 @@ describe('adaptive-agent TypeSafe profile selection', () => {
     }
   });
 
+  it('keeps the invocation workspace for an auto-selected external profile without a workspace override', async () => {
+    const externalCatalog = await mkdtemp(join(tmpdir(), 'adaptive-agent-external-catalog-'));
+    await writeFile(join(tempDir, 'face.jpeg'), 'image bytes');
+    await writeFile(join(externalCatalog, 'vision.json'), JSON.stringify({
+      id: 'vision',
+      name: 'Vision',
+      description: 'Reviews images.',
+      invocationModes: ['run'],
+      defaultInvocationMode: 'run',
+      model: { provider: 'ollama', model: 'qwen3.5' },
+      tools: [],
+      capabilities: { modalitiesSupported: ['text', 'image'] },
+    }));
+    await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({
+      runtime: { mode: 'memory' },
+      agent: { mode: 'auto', configPath: './agent.json' },
+      agents: { dirs: [externalCatalog] },
+      agentSelection: {
+        engine: 'typesafe',
+        typesafe: {
+          model: 'jev-1.13.0',
+          apiKeyEnv: 'TEST_TYPESAFE_API_KEY',
+          policy: { minimumConfidence: 0.7, minimumRelevance: 0.7 },
+        },
+      },
+    }));
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { questions?: Record<string, unknown> };
+      if (body.questions) return typeSafeSelectionResponse('vision')(input, init);
+      return openAiStreamResponse('image accepted');
+    });
+    vi.stubGlobal('fetch', fetch);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      const exitCode = await main([
+        'run', '--cwd', tempDir, '--runtime', 'memory', '--output', 'json', '--image', './face.jpeg',
+        'Review this image.',
+      ]);
+      const output = JSON.parse(String(log.mock.calls.at(-1)?.[0])) as {
+        resolvedConfig: { workspaceRoot: string; agentId: string };
+        result: { status: string; output: string };
+      };
+
+      expect(exitCode).toBe(0);
+      expect(output.resolvedConfig).toMatchObject({ workspaceRoot: await realpath(tempDir), agentId: 'vision' });
+      expect(output.result).toMatchObject({ status: 'success', output: 'image accepted' });
+    } finally {
+      log.mockRestore();
+      await rm(externalCatalog, { recursive: true, force: true });
+    }
+  });
+
+  it('authorizes an invocation-relative image when the selected profile has an explicit external workspace', async () => {
+    const externalCatalog = await mkdtemp(join(tmpdir(), 'adaptive-agent-external-catalog-'));
+    const selectedWorkspace = await mkdtemp(join(tmpdir(), 'adaptive-agent-selected-workspace-'));
+    const imagePath = join(tempDir, 'face.jpeg');
+    await writeFile(imagePath, 'image bytes');
+    await writeFile(join(externalCatalog, 'vision.json'), JSON.stringify({
+      id: 'vision',
+      name: 'Vision',
+      description: 'Reviews images.',
+      invocationModes: ['run'],
+      defaultInvocationMode: 'run',
+      workspaceRoot: selectedWorkspace,
+      model: { provider: 'ollama', model: 'qwen3.5', baseUrl: 'http://ollama.test/v1' },
+      tools: [],
+      capabilities: { modalitiesSupported: ['text', 'image'] },
+    }));
+    await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({
+      runtime: { mode: 'memory' },
+      agent: { mode: 'auto', configPath: './agent.json' },
+      agents: { dirs: [externalCatalog] },
+      agentSelection: {
+        engine: 'typesafe',
+        typesafe: {
+          model: 'jev-1.13.0',
+          apiKeyEnv: 'TEST_TYPESAFE_API_KEY',
+          policy: { minimumConfidence: 0.7, minimumRelevance: 0.7 },
+        },
+      },
+    }));
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { questions?: Record<string, unknown> };
+      if (body.questions) return typeSafeSelectionResponse('vision')(input, init);
+      return openAiStreamResponse('image accepted');
+    });
+    vi.stubGlobal('fetch', fetch);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      const exitCode = await main([
+        'run', '--cwd', tempDir, '--runtime', 'memory', '--inspect', '--output', 'json',
+        '--image', './face.jpeg', 'Review this image.',
+      ]);
+      const output = JSON.parse(String(log.mock.calls.at(-1)?.[0])) as {
+        resolvedConfig: { workspaceRoot: string; agentId: string };
+        result: { status: string; output: string };
+        inspection: { run: { executionContext: { fileAccess: { workspaceRoot: string; attachmentRoots: string[]; files: Array<{ path: string }> } } } };
+      };
+
+      expect(exitCode).toBe(0);
+      expect(output.resolvedConfig).toMatchObject({ workspaceRoot: await realpath(selectedWorkspace), agentId: 'vision' });
+      expect(output.result).toMatchObject({ status: 'success', output: 'image accepted' });
+      expect(output.inspection.run.executionContext.fileAccess).toMatchObject({
+        workspaceRoot: await realpath(selectedWorkspace),
+        attachmentRoots: [await realpath(tempDir)],
+        files: [expect.objectContaining({ path: await realpath(imagePath) })],
+      });
+    } finally {
+      log.mockRestore();
+      await Promise.all([
+        rm(externalCatalog, { recursive: true, force: true }),
+        rm(selectedWorkspace, { recursive: true, force: true }),
+      ]);
+    }
+  });
+
   it('uses opt-in TypeSafe adaptive routing without changing the default selection path', async () => {
     await writeFile(join(tempDir, 'agent.settings.json'), JSON.stringify({
       runtime: { mode: 'memory' },
@@ -1341,6 +1461,67 @@ describe('adaptive-agent TypeSafe profile selection', () => {
       });
     } finally {
       log.mockRestore();
+    }
+  });
+});
+
+describe('adaptive-agent CLI attachment authority', () => {
+  it('preserves audio attachments under the invocation workspace without adding broader authority', async () => {
+    const invocationWorkspace = await mkdtemp(join(tmpdir(), 'adaptive-agent-invocation-'));
+    const selectedWorkspace = await mkdtemp(join(tmpdir(), 'adaptive-agent-selected-'));
+    try {
+      const audioPath = join(invocationWorkspace, 'sample.mp3');
+      await writeFile(audioPath, 'audio bytes');
+      const spec: Parameters<typeof buildCliAttachmentExecutionContext>[0] = {
+        mode: 'run',
+        goal: 'Transcribe this.',
+        contentParts: [{ type: 'audio', audio: { source: { kind: 'path', path: audioPath }, format: 'mp3' } }],
+      };
+
+      await expect(buildCliAttachmentExecutionContext(spec, invocationWorkspace, invocationWorkspace)).resolves.toBeUndefined();
+      await expect(buildCliAttachmentExecutionContext(spec, invocationWorkspace, selectedWorkspace)).resolves.toMatchObject({
+        fileAccess: {
+          workspaceRoot: await realpath(selectedWorkspace),
+          attachmentRoots: [await realpath(invocationWorkspace)],
+          files: [expect.objectContaining({ path: await realpath(audioPath) })],
+        },
+      });
+    } finally {
+      await Promise.all([invocationWorkspace, selectedWorkspace].map((path) => rm(path, { recursive: true, force: true })));
+    }
+  });
+
+  it('keeps explicit workspaces and rejects attachments outside the invocation workspace', async () => {
+    const invocationWorkspace = await mkdtemp(join(tmpdir(), 'adaptive-agent-invocation-'));
+    const selectedWorkspace = await mkdtemp(join(tmpdir(), 'adaptive-agent-selected-'));
+    const outsideWorkspace = await mkdtemp(join(tmpdir(), 'adaptive-agent-outside-'));
+    try {
+      const imagePath = join(invocationWorkspace, 'face.jpeg');
+      const outsidePath = join(outsideWorkspace, 'secret.jpeg');
+      await writeFile(imagePath, 'image bytes');
+      await writeFile(outsidePath, 'outside bytes');
+      const authorized = await buildCliAttachmentExecutionContext({
+        mode: 'run',
+        goal: 'Review this.',
+        images: [{ path: imagePath }],
+      }, invocationWorkspace, selectedWorkspace);
+
+      expect(authorized).toMatchObject({ fileAccess: {
+        workspaceRoot: await realpath(selectedWorkspace),
+        attachmentRoots: [await realpath(invocationWorkspace)],
+        files: [{
+          path: await realpath(imagePath),
+          sizeBytes: 11,
+          sha256: createHash('sha256').update('image bytes').digest('hex'),
+        }],
+      } });
+      await expect(buildCliAttachmentExecutionContext({
+        mode: 'run',
+        goal: 'Review this.',
+        images: [{ path: outsidePath }],
+      }, invocationWorkspace, selectedWorkspace)).rejects.toThrow('outside the invocation workspace');
+    } finally {
+      await Promise.all([invocationWorkspace, selectedWorkspace, outsideWorkspace].map((path) => rm(path, { recursive: true, force: true })));
     }
   });
 });
@@ -1688,6 +1869,41 @@ async function writeAgentConfig(path: string): Promise<void> {
       tools: ['read_file'],
     }),
   );
+}
+
+function typeSafeSelectionResponse(selectedAgentId: string) {
+  return async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const body = JSON.parse(String(init?.body)) as { questions: Record<string, unknown> };
+    const relevanceAnswers = Object.fromEntries(
+      Object.keys(body.questions)
+        .filter((key) => key.endsWith('_relevant'))
+        .map((key) => [key, { type: 'noul', noul: 0.94 }]),
+    );
+    return new Response(JSON.stringify({
+      model: 'jev-1.13.0',
+      answers: {
+        ...relevanceAnswers,
+        selection: {
+          type: 'choice',
+          choice: selectedAgentId,
+          confidence: 0.91,
+          probabilities: { [selectedAgentId]: 0.91 },
+        },
+      },
+      usage: { input_tokens: 100, output_tokens: 10 },
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+}
+
+function openAiStreamResponse(content: string): Response {
+  const chunks = [
+    { id: 'response-1', object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content }, finish_reason: null }] },
+    { id: 'response-1', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 } },
+  ];
+  return new Response(`${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join('')}data: [DONE]\n\n`, {
+    status: 200,
+    headers: { 'content-type': 'text/event-stream' },
+  });
 }
 
 describe('adaptive-agent pretty rendering', () => {

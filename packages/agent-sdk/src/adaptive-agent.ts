@@ -1,8 +1,9 @@
 #!/usr/bin/env bun
 
+import { createHash } from 'node:crypto';
 import { closeSync, createReadStream, createWriteStream, openSync } from 'node:fs';
-import { access, appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname, extname, resolve } from 'node:path';
+import { access, appendFile, mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
+import { dirname, extname, isAbsolute, relative, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 
 import { marked } from 'marked';
@@ -1432,6 +1433,9 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
       return 1;
     }
 
+    const executionContext = executionSpec.mode === 'run'
+      ? await buildCliAttachmentExecutionContext(executionSpec, resolvedCwd, sdk.config.workspaceRoot)
+      : undefined;
     const shouldOrchestrate = cli.orchestrate || executionRouting?.decision.mode === 'orchestration';
     orchestrationSdk = shouldOrchestrate && executionSpec.mode === 'run'
       ? await createOrchestrationSdk({
@@ -1446,14 +1450,14 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
       : undefined;
     const orchestrated = orchestrationSdk && executionSpec.mode === 'run'
       ? await orchestrationSdk.runRaw(executionSpec.goal, {
-          ...buildRunOptions(executionSpec),
+          ...buildRunOptions(executionSpec, executionContext),
           sessionId,
           ...(executionRouting?.decision.mode === 'orchestration' ? { routingDecision: executionRouting.decision } : {}),
         })
       : undefined;
     const result = orchestrated?.finalResult ?? (executionSpec.mode === 'chat'
       ? await sdk.chat(executionSpec.messages, { ...buildChatOptions(executionSpec), sessionId })
-      : await sdk.run(executionSpec.goal, { ...buildRunOptions(executionSpec), sessionId }));
+      : await sdk.run(executionSpec.goal, { ...buildRunOptions(executionSpec, executionContext), sessionId }));
     const runInspection = cli.inspect ? await summarizeInspection(sdk, result.runId) : undefined;
 
     if (cli.output === 'json') {
@@ -3324,7 +3328,7 @@ function buildChatOptions(spec: ManualChatSpec): AgentSdkChatOptions {
   };
 }
 
-function buildRunOptions(spec: ManualRunSpec): AgentSdkRunOptions {
+function buildRunOptions(spec: ManualRunSpec, executionContext?: JsonObject): AgentSdkRunOptions {
   return {
     input: spec.input,
     images: spec.images,
@@ -3333,6 +3337,54 @@ function buildRunOptions(spec: ManualRunSpec): AgentSdkRunOptions {
     context: spec.context,
     outputSchema: spec.outputSchema,
     metadata: spec.metadata,
+    ...(executionContext ? { executionContext } : {}),
+  };
+}
+
+export async function buildCliAttachmentExecutionContext(
+  spec: ManualRunSpec,
+  invocationCwd: string,
+  workspaceRoot: string,
+): Promise<JsonObject | undefined> {
+  const inputs = collectContentParts(spec).flatMap((part) => {
+    if (part.type === 'image' && part.image.path) return [{ path: part.image.path, setPath: (path: string) => { part.image.path = path; } }];
+    if (part.type === 'file' && part.file.source.kind === 'path') return [{ path: part.file.source.path, setPath: (path: string) => { part.file.source = { kind: 'path', path }; } }];
+    if (part.type === 'audio' && part.audio.source.kind === 'path') return [{ path: part.audio.source.path, setPath: (path: string) => { part.audio.source = { kind: 'path', path }; } }];
+    return [];
+  });
+  if (inputs.length === 0) return undefined;
+
+  const canonicalInvocationCwd = await realpath(invocationCwd);
+  const canonicalWorkspaceRoot = await realpath(workspaceRoot);
+  const entries = await Promise.all(inputs.map(async (input) => {
+    const canonicalPath = await realpath(input.path);
+    const invocationRelativePath = relative(canonicalInvocationCwd, canonicalPath);
+    const workspaceRelativePath = relative(canonicalWorkspaceRoot, canonicalPath);
+    const isInInvocationWorkspace = !invocationRelativePath.startsWith('..') && !isAbsolute(invocationRelativePath);
+    const isInSelectedWorkspace = !workspaceRelativePath.startsWith('..') && !isAbsolute(workspaceRelativePath);
+    if (!isInInvocationWorkspace && !isInSelectedWorkspace) {
+      throw new Error(`CLI attachment path ${input.path} is outside the invocation workspace ${canonicalInvocationCwd} and selected workspace ${canonicalWorkspaceRoot}.`);
+    }
+    const metadata = await stat(canonicalPath);
+    if (!metadata.isFile()) throw new Error(`CLI attachment path is not a file: ${input.path}`);
+    input.setPath(canonicalPath);
+    if (isInSelectedWorkspace) return undefined;
+    return {
+      path: canonicalPath,
+      sizeBytes: metadata.size,
+      sha256: createHash('sha256').update(await readFile(canonicalPath)).digest('hex'),
+    };
+  }));
+  const files = [...new Map(entries.flatMap((entry) => entry ? [[entry.path, entry] as const] : [])).values()];
+  if (files.length === 0) return undefined;
+
+  return {
+    fileAccess: {
+      version: 1,
+      workspaceRoot: canonicalWorkspaceRoot,
+      attachmentRoots: [canonicalInvocationCwd],
+      files,
+    },
   };
 }
 
