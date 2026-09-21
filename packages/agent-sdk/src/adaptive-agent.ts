@@ -1434,7 +1434,7 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
     }
 
     const executionContext = executionSpec.mode === 'run'
-      ? await buildCliAttachmentExecutionContext(executionSpec, resolvedCwd, sdk.config.workspaceRoot)
+      ? await buildCliAttachmentExecutionContext(executionSpec, sdk.config.workspaceRoot)
       : undefined;
     const shouldOrchestrate = cli.orchestrate || executionRouting?.decision.mode === 'orchestration';
     orchestrationSdk = shouldOrchestrate && executionSpec.mode === 'run'
@@ -3343,7 +3343,6 @@ function buildRunOptions(spec: ManualRunSpec, executionContext?: JsonObject): Ag
 
 export async function buildCliAttachmentExecutionContext(
   spec: ManualRunSpec,
-  invocationCwd: string,
   workspaceRoot: string,
 ): Promise<JsonObject | undefined> {
   const inputs = collectContentParts(spec).flatMap((part) => {
@@ -3354,22 +3353,17 @@ export async function buildCliAttachmentExecutionContext(
   });
   if (inputs.length === 0) return undefined;
 
-  const canonicalInvocationCwd = await realpath(invocationCwd);
   const canonicalWorkspaceRoot = await realpath(workspaceRoot);
   const entries = await Promise.all(inputs.map(async (input) => {
     const canonicalPath = await realpath(input.path);
-    const invocationRelativePath = relative(canonicalInvocationCwd, canonicalPath);
     const workspaceRelativePath = relative(canonicalWorkspaceRoot, canonicalPath);
-    const isInInvocationWorkspace = !invocationRelativePath.startsWith('..') && !isAbsolute(invocationRelativePath);
     const isInSelectedWorkspace = !workspaceRelativePath.startsWith('..') && !isAbsolute(workspaceRelativePath);
-    if (!isInInvocationWorkspace && !isInSelectedWorkspace) {
-      throw new Error(`CLI attachment path ${input.path} is outside the invocation workspace ${canonicalInvocationCwd} and selected workspace ${canonicalWorkspaceRoot}.`);
-    }
     const metadata = await stat(canonicalPath);
     if (!metadata.isFile()) throw new Error(`CLI attachment path is not a file: ${input.path}`);
     input.setPath(canonicalPath);
     if (isInSelectedWorkspace) return undefined;
     return {
+      root: dirname(canonicalPath),
       path: canonicalPath,
       sizeBytes: metadata.size,
       sha256: createHash('sha256').update(await readFile(canonicalPath)).digest('hex'),
@@ -3377,13 +3371,14 @@ export async function buildCliAttachmentExecutionContext(
   }));
   const files = [...new Map(entries.flatMap((entry) => entry ? [[entry.path, entry] as const] : [])).values()];
   if (files.length === 0) return undefined;
+  const attachmentRoots = [...new Set(files.map((file) => file.root))];
 
   return {
     fileAccess: {
       version: 1,
       workspaceRoot: canonicalWorkspaceRoot,
-      attachmentRoots: [canonicalInvocationCwd],
-      files,
+      attachmentRoots,
+      files: files.map(({ root: _root, ...file }) => file),
     },
   };
 }

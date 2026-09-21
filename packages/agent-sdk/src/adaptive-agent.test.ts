@@ -1342,10 +1342,11 @@ describe('adaptive-agent TypeSafe profile selection', () => {
     }
   });
 
-  it('authorizes an invocation-relative image when the selected profile has an explicit external workspace', async () => {
+  it('authorizes an explicit absolute image when the selected profile has an external workspace', async () => {
     const externalCatalog = await mkdtemp(join(tmpdir(), 'adaptive-agent-external-catalog-'));
     const selectedWorkspace = await mkdtemp(join(tmpdir(), 'adaptive-agent-selected-workspace-'));
-    const imagePath = join(tempDir, 'face.jpeg');
+    const externalAttachments = await mkdtemp(join(tmpdir(), 'adaptive-agent-external-attachments-'));
+    const imagePath = join(externalAttachments, 'face.jpeg');
     await writeFile(imagePath, 'image bytes');
     await writeFile(join(externalCatalog, 'vision.json'), JSON.stringify({
       id: 'vision',
@@ -1382,7 +1383,7 @@ describe('adaptive-agent TypeSafe profile selection', () => {
     try {
       const exitCode = await main([
         'run', '--cwd', tempDir, '--runtime', 'memory', '--inspect', '--output', 'json',
-        '--image', './face.jpeg', 'Review this image.',
+        '--image', imagePath, 'Review this image.',
       ]);
       const output = JSON.parse(String(log.mock.calls.at(-1)?.[0])) as {
         resolvedConfig: { workspaceRoot: string; agentId: string };
@@ -1395,7 +1396,7 @@ describe('adaptive-agent TypeSafe profile selection', () => {
       expect(output.result).toMatchObject({ status: 'success', output: 'image accepted' });
       expect(output.inspection.run.executionContext.fileAccess).toMatchObject({
         workspaceRoot: await realpath(selectedWorkspace),
-        attachmentRoots: [await realpath(tempDir)],
+        attachmentRoots: [await realpath(externalAttachments)],
         files: [expect.objectContaining({ path: await realpath(imagePath) })],
       });
     } finally {
@@ -1403,6 +1404,7 @@ describe('adaptive-agent TypeSafe profile selection', () => {
       await Promise.all([
         rm(externalCatalog, { recursive: true, force: true }),
         rm(selectedWorkspace, { recursive: true, force: true }),
+        rm(externalAttachments, { recursive: true, force: true }),
       ]);
     }
   });
@@ -1478,8 +1480,8 @@ describe('adaptive-agent CLI attachment authority', () => {
         contentParts: [{ type: 'audio', audio: { source: { kind: 'path', path: audioPath }, format: 'mp3' } }],
       };
 
-      await expect(buildCliAttachmentExecutionContext(spec, invocationWorkspace, invocationWorkspace)).resolves.toBeUndefined();
-      await expect(buildCliAttachmentExecutionContext(spec, invocationWorkspace, selectedWorkspace)).resolves.toMatchObject({
+      await expect(buildCliAttachmentExecutionContext(spec, invocationWorkspace)).resolves.toBeUndefined();
+      await expect(buildCliAttachmentExecutionContext(spec, selectedWorkspace)).resolves.toMatchObject({
         fileAccess: {
           workspaceRoot: await realpath(selectedWorkspace),
           attachmentRoots: [await realpath(invocationWorkspace)],
@@ -1491,37 +1493,40 @@ describe('adaptive-agent CLI attachment authority', () => {
     }
   });
 
-  it('keeps explicit workspaces and rejects attachments outside the invocation workspace', async () => {
+  it('authorizes explicitly supplied absolute attachments outside the invocation workspace', async () => {
     const invocationWorkspace = await mkdtemp(join(tmpdir(), 'adaptive-agent-invocation-'));
     const selectedWorkspace = await mkdtemp(join(tmpdir(), 'adaptive-agent-selected-'));
-    const outsideWorkspace = await mkdtemp(join(tmpdir(), 'adaptive-agent-outside-'));
+    const desktopDirectory = await mkdtemp(join(tmpdir(), 'adaptive-agent-desktop-'));
+    const downloadsDirectory = await mkdtemp(join(tmpdir(), 'adaptive-agent-downloads-'));
     try {
-      const imagePath = join(invocationWorkspace, 'face.jpeg');
-      const outsidePath = join(outsideWorkspace, 'secret.jpeg');
+      const imagePath = join(desktopDirectory, 'face.jpeg');
+      const audioPath = join(downloadsDirectory, 'sample.mp3');
+      const unlistedPath = join(downloadsDirectory, 'unlisted.txt');
       await writeFile(imagePath, 'image bytes');
-      await writeFile(outsidePath, 'outside bytes');
+      await writeFile(audioPath, 'audio bytes');
+      await writeFile(unlistedPath, 'not authorized');
       const authorized = await buildCliAttachmentExecutionContext({
         mode: 'run',
-        goal: 'Review this.',
+        goal: 'Review and transcribe these.',
         images: [{ path: imagePath }],
-      }, invocationWorkspace, selectedWorkspace);
+        contentParts: [{ type: 'audio', audio: { source: { kind: 'path', path: audioPath }, format: 'mp3' } }],
+      }, selectedWorkspace);
 
       expect(authorized).toMatchObject({ fileAccess: {
         workspaceRoot: await realpath(selectedWorkspace),
-        attachmentRoots: [await realpath(invocationWorkspace)],
-        files: [{
-          path: await realpath(imagePath),
-          sizeBytes: 11,
-          sha256: createHash('sha256').update('image bytes').digest('hex'),
-        }],
+        attachmentRoots: [await realpath(downloadsDirectory), await realpath(desktopDirectory)],
+        files: expect.arrayContaining([
+          {
+            path: await realpath(imagePath),
+            sizeBytes: 11,
+            sha256: createHash('sha256').update('image bytes').digest('hex'),
+          },
+          expect.objectContaining({ path: await realpath(audioPath) }),
+        ]),
       } });
-      await expect(buildCliAttachmentExecutionContext({
-        mode: 'run',
-        goal: 'Review this.',
-        images: [{ path: outsidePath }],
-      }, invocationWorkspace, selectedWorkspace)).rejects.toThrow('outside the invocation workspace');
+      expect(JSON.stringify(authorized)).not.toContain(await realpath(unlistedPath));
     } finally {
-      await Promise.all([invocationWorkspace, selectedWorkspace, outsideWorkspace].map((path) => rm(path, { recursive: true, force: true })));
+      await Promise.all([invocationWorkspace, selectedWorkspace, desktopDirectory, downloadsDirectory].map((path) => rm(path, { recursive: true, force: true })));
     }
   });
 });
