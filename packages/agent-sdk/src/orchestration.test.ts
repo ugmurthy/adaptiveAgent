@@ -233,6 +233,10 @@ describe('orchestration sdk', () => {
     expect(imageCall.options.contentParts).toBeUndefined();
     expect(audioCall.options.images).toBeUndefined();
     expect(audioCall.options.contentParts).toEqual([{ type: 'audio', audio: { source: { kind: 'path', path: '/tmp/audio.wav' }, format: 'wav' } }]);
+    expect(imageCall.goal).toContain('Assigned modalities: image.');
+    expect(audioCall.goal).toContain('Assigned modalities: audio.');
+    expect(imageCall.goal).toContain('Do not request inputs for other modalities; other specialists handle them.');
+    expect(audioCall.goal).toContain('Original user request: compare the image and audio');
     expect(calls.every((call) =>
       call.options.executionContext?.authorizationRef === 'permit-orchestration'
     )).toBe(true);
@@ -296,15 +300,15 @@ describe('orchestration sdk', () => {
 
   it('persists allocated stage ids before invoking runners', async () => {
     const store = new InMemoryOrchestrationStore();
-    const observed: Array<{ runId: string | undefined; status: string | undefined }> = [];
+    const observed: Array<{ goal: string; runId: string | undefined; status: string | undefined }> = [];
     const sdk = await createOrchestrationSdk({
       agentCatalog: [{ agentId: 'general', agentConfig: agent('general', ['text']) }],
       requestedAgentConfig: agent('general', ['text']),
       orchestrationStore: store,
       agentRunnerFactory: async () => ({
-        async runRaw(_goal, options = {}) {
+        async runRaw(goal, options = {}) {
           const stage = (await store.listStages('execution-1'))[0];
-          observed.push({ runId: options.runId, status: stage?.status });
+          observed.push({ goal, runId: options.runId, status: stage?.status });
           return success(options.runId!);
         },
         async inspect(runId) { return { run: { rootRunId: runId } }; },
@@ -313,7 +317,7 @@ describe('orchestration sdk', () => {
 
     const result = await sdk.run('answer', { executionId: 'execution-1' });
 
-    expect(observed).toEqual([{ runId: result.finalResult.runId, status: 'running' }]);
+    expect(observed).toEqual([{ goal: 'answer', runId: result.finalResult.runId, status: 'running' }]);
     expect((await store.getExecution('execution-1'))?.status).toBe('succeeded');
   });
 
@@ -605,6 +609,8 @@ describe('orchestration sdk', () => {
     expect(specialistCall.options.contentParts).toEqual([
       { type: 'audio', audio: { source: { kind: 'path', path: '/tmp/audio.wav' }, format: 'wav' } },
     ]);
+    expect(specialistCall.goal).toContain('Assigned modalities: image, audio.');
+    expect(specialistCall.goal).toContain('Original user request: compare the image and audio');
     expect(specialistCall.options.metadata?.orchestration).toMatchObject({
       selectedCatalogAgentIds: ['general', 'media-analyst'],
       routingSource: 'deterministic',

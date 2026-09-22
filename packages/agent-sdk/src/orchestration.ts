@@ -467,7 +467,7 @@ export class OrchestrationSdk {
     this.emitLifecycle({ type: 'orchestration.stage.starting', sessionId: plan.sessionId, requestedAgentId: plan.requestedAgentId, nodeId: node.id, agentId: node.agentId, stage: node.stage, dependsOn: node.dependsOn, createdAt: this.now().toISOString() });
     const runner = await this.getRunner(node.agentId);
     const startedAt = this.now().toISOString();
-    const runGoal = node.stage === 'final_synthesis' ? buildSynthesisGoal(goal) : goal;
+    const runGoal = buildNodeGoal(goal, node);
     const runOptions = buildNodeOptions(options, plan, node, priorResults, supportedModalities(this.catalog.get(node.agentId)!.agentConfig));
     const result = await runner.runRaw(runGoal, { ...runOptions, runId: stage.runId, sessionId: plan.sessionId });
     const rootRunId = (await runner.inspect(result.runId)).run?.rootRunId ?? result.runId;
@@ -732,6 +732,21 @@ function resultToJson(result: RunResult | undefined): JsonValue {
   if (result.status === 'success') return result.output;
   if (result.status === 'failure') return { status: result.status, runId: result.runId, error: result.error, code: result.code };
   return { status: result.status, runId: result.runId, message: result.message };
+}
+
+function buildNodeGoal(originalGoal: string, node: OrchestrationPlanNode): string {
+  if (node.stage === 'final_synthesis') return buildSynthesisGoal(originalGoal);
+  if (node.stage !== 'modality_specialist' && node.stage !== 'parallel_specialist') return originalGoal;
+  const assignedModalities = node.metadata?.assignedModalities;
+  if (!Array.isArray(assignedModalities) || assignedModalities.length === 0 || assignedModalities.some((modality) => typeof modality !== 'string')) return originalGoal;
+  return [
+    'Complete only the part of the original user request assigned to this specialist node.',
+    `Assigned modalities: ${assignedModalities.join(', ')}.`,
+    'Use the supplied inputs for those modalities now. Do not request inputs for other modalities; other specialists handle them.',
+    'Return your findings for use in the final response.',
+    '',
+    `Original user request: ${originalGoal}`,
+  ].join('\n');
 }
 
 function buildSynthesisGoal(originalGoal: string): string {
