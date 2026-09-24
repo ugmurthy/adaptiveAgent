@@ -277,6 +277,47 @@ describe('desktop runtime protocol', () => {
     }
   });
 
+  it('routes image and audio to catalog orchestration when no single run profile supports both', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'desktop-mixed-media-'));
+    const selectorPath = join(cwd, 'selector.json');
+    const agent = (id: string, modalities: string[]) => ({
+      id, name: id, invocationModes: ['run'], defaultInvocationMode: 'run',
+      model: { provider: 'ollama', model: 'test-model' }, tools: [],
+      capabilities: { modalitiesSupported: modalities },
+    });
+    await writeFile(join(cwd, 'agent.json'), JSON.stringify(agent('fallback', ['text'])));
+    await writeFile(selectorPath, JSON.stringify(agent('selector', ['text'])));
+    await writeFile(join(cwd, 'image.json'), JSON.stringify(agent('image', ['text', 'image'])));
+    await writeFile(join(cwd, 'audio.json'), JSON.stringify(agent('audio', ['text', 'audio'])));
+    await writeFile(join(cwd, 'agent.settings.json'), JSON.stringify({ agents: { dirs: [cwd] } }));
+    const runRaw = vi.fn();
+    const close = vi.fn(async () => undefined);
+    const create = vi.spyOn(AgentSdk, 'create').mockResolvedValue({
+      config: { agent: { id: 'selector', tools: [] } }, runRaw, close,
+    } as unknown as AgentSdk);
+    const { runtime } = createRuntime();
+    const fallback = {
+      config: { agent: agent('fallback', ['text']), workspaceRoot: cwd, settings: { agent: { mode: 'auto' }, taskPreparation: { agent: selectorPath } } },
+      created: { runtime: {} },
+    } as unknown as AgentSdk;
+    Object.assign(runtime as unknown as Record<string, unknown>, { sdkOptions: { cwd }, settingsCwd: cwd });
+
+    try {
+      const selected = await (runtime as unknown as { selectDesktopRunSdk: Function }).selectDesktopRunSdk(
+        fallback, 'Extract text and transcribe audio', [
+          { kind: 'image', stagedRelativePath: 'image/diagram.png' },
+          { kind: 'audio', stagedRelativePath: 'audio/recording.mp3' },
+        ], 'session-mixed',
+      );
+      expect(selected).toEqual({ sdk: fallback });
+      expect(runRaw).not.toHaveBeenCalled();
+      expect(close).toHaveBeenCalledOnce();
+    } finally {
+      create.mockRestore();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('returns a terminal preparation result when fail mode needs clarification', async () => {
     const runRaw = vi.fn();
     const preparation = {

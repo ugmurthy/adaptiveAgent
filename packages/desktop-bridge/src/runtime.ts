@@ -3,6 +3,7 @@ import {
   agentConfigurationFingerprint,
   createOrchestrationSdk,
   discoverAgentSdkAgents,
+  eligibleAgentSelectionCandidates,
   inspectAgentSdkResolution,
   prepareTask,
   restoreTaskPreparation,
@@ -804,6 +805,10 @@ export class DesktopRuntime {
     const options = this.sdkOptions;
     if (!options) throw new DesktopProtocolError('NOT_INITIALIZED', 'The runtime configuration is unavailable.', JSON_RPC_ERROR_CODES.notInitialized);
     const discovery = await discoverAgentSdkAgents(options);
+    const paths = (kind: DesktopAttachmentInput['kind']) => attachments
+      .filter((attachment) => attachment.kind === kind)
+      .map((attachment) => attachment.stagedRelativePath);
+    const attachmentSummary = { images: paths('image'), files: paths('file'), audio: paths('audio') };
     const preparationSdk = await AgentSdk.create({
       ...options,
       cwd: this.settingsCwd,
@@ -816,14 +821,17 @@ export class DesktopRuntime {
       eventListener: undefined,
     });
     try {
-      const paths = (kind: DesktopAttachmentInput['kind']) => attachments
-        .filter((attachment) => attachment.kind === kind)
-        .map((attachment) => attachment.stagedRelativePath);
+      // Media runs already use catalog orchestration. When no single profile accepts
+      // every attachment, let that path assign each modality to its specialist.
+      if (executionMode(attachments) === 'catalog'
+        && eligibleAgentSelectionCandidates({ candidates: discovery.agents, attachments: attachmentSummary }, preparationSdk.config.agent.id).length === 0) {
+        return { sdk: fallbackSdk };
+      }
       const selection = await selectAgentProfile(preparationSdk, {
         originalObjective,
         candidates: discovery.agents,
         workspaceRoot: fallbackSdk.config.workspaceRoot,
-        attachments: { images: paths('image'), files: paths('file'), audio: paths('audio') },
+        attachments: attachmentSummary,
         sessionId,
       });
       const selected = discovery.agents.find((candidate) =>
