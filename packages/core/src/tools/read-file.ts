@@ -365,6 +365,17 @@ export function createReadFileTool(config?: ReadFileToolConfig): ToolDefinition 
         return buildWorkspacePathRecovery('read_file', filePath, error);
       }
 
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+        return {
+          ok: false,
+          recoveryKind: 'file_not_found',
+          toolName: 'read_file',
+          requestedPath: filePath,
+          message: error.message,
+          correctiveAction: 'Check the path or list the containing directory, then retry with an existing file.',
+        };
+      }
+
       if (error instanceof ReadFileDirectoryError) {
         return {
           ok: false,

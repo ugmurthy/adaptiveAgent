@@ -306,6 +306,31 @@ describe('createEditFileTool', () => {
     });
   });
 
+  it('returns actionable feedback for an empty oldText in the second edit without changing the file', async () => {
+    await writeFile(join(tempDir, 'file.txt'), 'original');
+    const tool = createEditFileTool({ allowedRoot: tempDir });
+    const result = await executeRecoverableTool(tool, {
+      path: 'file.txt',
+      edits: [
+        { type: 'replace', oldText: 'original', newText: 'changed' },
+        { type: 'replace', oldText: '', newText: 'inserted' },
+      ],
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      recoveryKind: 'invalid_edit',
+      toolName: 'edit_file',
+      path: 'file.txt',
+      editIndex: 1,
+      field: 'oldText',
+      fileChanged: false,
+      message: 'edit_file replace edit 1 requires non-empty "oldText"',
+      correctiveAction: expect.stringContaining('insert_before/insert_after'),
+    });
+    await expect(readFile(join(tempDir, 'file.txt'), 'utf8')).resolves.toBe('original');
+  });
+
   it('rejects binary files without writing', async () => {
     await writeFile(join(tempDir, 'binary.txt'), new Uint8Array([0x61, 0x00, 0x62]));
 

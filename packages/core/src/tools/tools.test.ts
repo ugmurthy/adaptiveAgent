@@ -147,6 +147,23 @@ describe('createReadFileTool', () => {
     });
   });
 
+  it('returns recoverable feedback for a missing file, but not for unrelated errors', async () => {
+    const tool = createReadFileTool({ allowedRoot: tempDir });
+    const input = { path: 'missing/report.txt' };
+    const result = await tool.execute(input, stubToolContext()).catch((error: unknown) => tool.recoverError?.(error, input));
+
+    expect(result).toMatchObject({
+      ok: false,
+      recoveryKind: 'file_not_found',
+      toolName: 'read_file',
+      requestedPath: input.path,
+      message: expect.stringContaining('ENOENT'),
+      correctiveAction: expect.stringContaining('list the containing directory'),
+    });
+    expect(tool.recoverError?.(Object.assign(new Error('permission denied'), { code: 'EACCES' }), input))
+      .toBeUndefined();
+  });
+
   it('returns actionable recoverable output when the path is a directory', async () => {
     await mkdir(join(tempDir, 'documents'));
     const tool = createReadFileTool({ allowedRoot: tempDir });

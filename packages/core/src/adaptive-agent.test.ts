@@ -15,6 +15,7 @@ import { InMemoryRunStore } from './in-memory-run-store.js';
 import { InMemorySnapshotStore } from './in-memory-snapshot-store.js';
 import { InMemoryToolExecutionStore } from './in-memory-tool-execution-store.js';
 import { createCanonicalTempDirectory } from './test-utils.js';
+import { createEditFileTool } from './tools/edit-file.js';
 import { createReadFileTool } from './tools/read-file.js';
 import { createWriteFileTool } from './tools/write-file.js';
 import type { AgentEvent, ModelAdapter, ModelRequest, ModelResponse, RuntimeStores, ToolDefinition } from './types.js';
@@ -1489,7 +1490,7 @@ describe('AdaptiveAgent', () => {
     expect(model.receivedRequests[1]?.invocation?.callId).toBe(model.receivedRequests[0]?.invocation?.callId);
   });
 
-  it('retries a read_file not_found failure after the file is created', async () => {
+  it('retries a terminal read_file not_found failure after the file is created', async () => {
     const tempDir = await createCanonicalTempDirectory('adaptive-agent-read-retry-');
     try {
       const runStore = new InMemoryRunStore();
@@ -1515,7 +1516,8 @@ describe('AdaptiveAgent', () => {
 
       const agent = new AdaptiveAgent({
         model,
-        tools: [createReadFileTool({ allowedRoot: tempDir })],
+        // A legacy tool without recovery still exercises the durable terminal retry path.
+        tools: [{ ...createReadFileTool({ allowedRoot: tempDir }), recoverError: undefined }],
         runStore,
         eventStore,
         snapshotStore,
@@ -4091,6 +4093,79 @@ describe('AdaptiveAgent', () => {
         error: 'HTTP 429 fetching search results',
       },
     });
+  });
+
+  it('continues after read_file cannot find a path and retries an existing file', async () => {
+    const tempDir = await createCanonicalTempDirectory('adaptive-agent-read-missing-');
+    try {
+      await writeFile(join(tempDir, 'report.txt'), 'report content');
+      const eventStore = new InMemoryEventStore();
+      const model = new SequenceModel([
+        { finishReason: 'tool_calls', toolCalls: [{ id: 'missing-read', name: 'read_file', input: { path: 'missing/report.txt' } }] },
+        { finishReason: 'tool_calls', toolCalls: [{ id: 'retry-read', name: 'read_file', input: { path: 'report.txt' } }] },
+        { finishReason: 'stop', text: 'read' },
+      ]);
+      const agent = new AdaptiveAgent({
+        model,
+        tools: [createReadFileTool({ allowedRoot: tempDir })],
+        runStore: new InMemoryRunStore(),
+        eventStore,
+        snapshotStore: new InMemorySnapshotStore(),
+      });
+
+      const result = await agent.run({ goal: 'Read the report' });
+      expect(result).toMatchObject({ status: 'success', output: 'read' });
+      expect(model.receivedRequests[1]?.messages.filter((message) => message.role === 'tool')).toMatchObject([{
+        toolCallId: 'missing-read', content: expect.stringContaining('"recoveryKind":"file_not_found"'),
+      }]);
+      expect(model.receivedRequests[2]?.messages.filter((message) => message.role === 'tool')).toMatchObject([
+        { toolCallId: 'missing-read' },
+        { toolCallId: 'retry-read', content: expect.stringContaining('report content') },
+      ]);
+      const events = await eventStore.listByRun(result.runId);
+      expect(events.find((event) => event.type === 'tool.failed' && event.toolCallId === 'missing-read')?.payload)
+        .toMatchObject({ recoverable: true, output: { recoveryKind: 'file_not_found' } });
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('continues after edit_file receives empty oldText and retries a valid edit', async () => {
+    const tempDir = await createCanonicalTempDirectory('adaptive-agent-edit-empty-');
+    try {
+      await writeFile(join(tempDir, 'report.txt'), 'draft');
+      const eventStore = new InMemoryEventStore();
+      const model = new SequenceModel([
+        { finishReason: 'tool_calls', toolCalls: [{ id: 'empty-edit', name: 'edit_file', input: {
+          path: 'report.txt', edits: [{ type: 'replace', oldText: '', newText: 'final' }],
+        } }] },
+        { finishReason: 'tool_calls', toolCalls: [{ id: 'retry-edit', name: 'edit_file', input: {
+          path: 'report.txt', edits: [{ type: 'replace', oldText: 'draft', newText: 'final' }],
+        } }] },
+        { finishReason: 'stop', text: 'edited' },
+      ]);
+      const agent = new AdaptiveAgent({
+        model,
+        tools: [createEditFileTool({ allowedRoot: tempDir })],
+        runStore: new InMemoryRunStore(),
+        eventStore,
+        snapshotStore: new InMemorySnapshotStore(),
+        defaults: { autoApproveAll: true },
+      });
+
+      const result = await agent.run({ goal: 'Edit the report' });
+      expect(result).toMatchObject({ status: 'success', output: 'edited' });
+      expect(model.receivedRequests[1]?.messages.filter((message) => message.role === 'tool')).toMatchObject([{
+        toolCallId: 'empty-edit', content: expect.stringContaining('"recoveryKind":"invalid_edit"'),
+      }]);
+      await expect(readFile(join(tempDir, 'report.txt'), 'utf8')).resolves.toBe('final');
+      const events = await eventStore.listByRun(result.runId);
+      expect(events.find((event) => event.type === 'tool.failed' && event.toolCallId === 'empty-edit')?.payload)
+        .toMatchObject({ recoverable: true, output: { field: 'oldText', fileChanged: false } });
+      expect(events.some((event) => event.type === 'tool.completed' && event.toolCallId === 'retry-edit')).toBe(true);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
   });
 
   it('continues after a recoverable tool timeout and passes the recovered output back to the model', async () => {

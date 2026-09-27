@@ -128,6 +128,13 @@ class EditFileConstraintError extends Error {
   }
 }
 
+class EmptyOldTextError extends Error {
+  constructor(public readonly editIndex: number) {
+    super(`edit_file replace edit ${editIndex} requires non-empty "oldText"`);
+    this.name = 'EmptyOldTextError';
+  }
+}
+
 class ExpectedSha256MismatchError extends Error {
   constructor(
     public readonly filePath: string,
@@ -245,6 +252,19 @@ export function createEditFileTool(config?: EditFileToolConfig): ToolDefinition 
       const filePath = extractInputPath(input);
       if (error instanceof PathOutsideRootError) {
         return buildWorkspacePathRecovery('edit_file', filePath, error);
+      }
+      if (error instanceof EmptyOldTextError) {
+        return {
+          ok: false,
+          recoveryKind: 'invalid_edit',
+          toolName: 'edit_file',
+          path: filePath,
+          editIndex: error.editIndex,
+          field: 'oldText',
+          fileChanged: false,
+          message: error.message,
+          correctiveAction: 'Provide non-empty oldText containing the exact text to replace, or use insert_before/insert_after with a non-empty anchorText to add text.',
+        } as JsonObject;
       }
       if (error instanceof ExpectedSha256MismatchError) {
         return {
@@ -447,7 +467,7 @@ function normalizeEditOperation(value: unknown, index: number): NormalizedEditOp
   switch (editType) {
     case 'replace': {
       if (typeof edit.oldText !== 'string' || edit.oldText.length === 0) {
-        throw new Error(`edit_file replace edit ${index} requires non-empty "oldText"`);
+        throw new EmptyOldTextError(index);
       }
       if (typeof edit.newText !== 'string') {
         throw new Error(`edit_file replace edit ${index} requires "newText" to be a string`);
