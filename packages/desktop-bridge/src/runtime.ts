@@ -287,13 +287,13 @@ export class DesktopRuntime {
         };
         if (executionMode(params.attachments ?? []) === 'catalog') {
           const orchestration = await this.catalogOrchestration(executionId, sdk);
-          const { runId: _runId, sessionId: _sessionId, ...orchestrationOptions } = runOptions;
+          const { runId: _runId, ...orchestrationOptions } = runOptions;
           const orchestrated = await orchestration.runRaw(preparation?.preparedObjective ?? params.goal, {
             ...orchestrationOptions,
             executionId,
             requestedAgentId: sdk.config.agent.id,
           });
-          return executionResult(executionId, 'catalog', orchestrated.finalResult, catalogExecutionStages(orchestrated.stages));
+          return executionResult(executionId, 'catalog', orchestrated.finalResult, catalogExecutionStages(orchestrated.stages), orchestrated.sessionId);
         }
         const result = await sdk.runRaw(preparation?.preparedObjective ?? params.goal, runOptions);
         this.runSdks.set(executionId, sdk);
@@ -325,7 +325,7 @@ export class DesktopRuntime {
           const inspection = await orchestration.inspectExecution(id);
           const finalNodeId = inspection.plan?.finalNodeId;
           const finalStage = inspection.stages.find((stage) => stage.nodeId === finalNodeId);
-          return asJsonValue({ executionId: id, mode: 'catalog', status: durable.status, finalRunId: finalStage?.runId, traceTarget: { kind: 'session', sessionId: id }, stages: inspection.stages });
+          return asJsonValue({ executionId: id, mode: 'catalog', status: durable.status, finalRunId: finalStage?.runId, traceTarget: { kind: 'session', sessionId: inspection.plan?.sessionId ?? id }, stages: inspection.stages });
         }
         const run = await this.requireSdk().inspect(asRunId(id));
         return asJsonValue({ executionId: id, mode: 'direct', status: run.run?.status ?? 'not_found', finalRunId: run.run?.id, traceTarget: { kind: 'root-run', rootRunId: id } });
@@ -343,7 +343,7 @@ export class DesktopRuntime {
         const id = request.params!.executionId;
         if (await this.requireSdk().created.runtime.orchestrationStore.getExecution(asRunId(id))) {
           const resumed = await (await this.catalogOrchestration(id)).resumeExecution(id);
-          return executionResult(id, 'catalog', resumed.finalResult, catalogExecutionStages(resumed.stages));
+          return executionResult(id, 'catalog', resumed.finalResult, catalogExecutionStages(resumed.stages), resumed.sessionId);
         }
         return asJsonValue(executionResult(id, 'direct', await (await this.sdkForRun(id)).resumeRaw(asRunId(id))));
       }
@@ -1403,7 +1403,7 @@ function catalogExecutionStages(stages: OrchestratedRunStageResult[]): JsonValue
     status: stage.result.status === 'success' ? 'succeeded' : stage.result.status === 'failure' ? 'failed' : 'paused',
   }));
 }
-function executionResult(executionId: string, mode: 'direct' | 'catalog', result: any, stages?: JsonValue[]): JsonValue { return asJsonValue({ executionId, mode, status: result.status, finalRunId: result.runId, traceTarget: mode === 'direct' ? { kind: 'root-run', rootRunId: executionId } : { kind: 'session', sessionId: executionId }, ...(stages ? { stages } : {}), result }); }
+function executionResult(executionId: string, mode: 'direct' | 'catalog', result: any, stages?: JsonValue[], sessionId = executionId): JsonValue { return asJsonValue({ executionId, mode, status: result.status, finalRunId: result.runId, traceTarget: mode === 'direct' ? { kind: 'root-run', rootRunId: executionId } : { kind: 'session', sessionId }, ...(stages ? { stages } : {}), result }); }
 
 function agentSelectionMismatch(expected: RuntimeInitializeParams['agentSelection'], actual: unknown): DesktopProtocolError {
   return new DesktopProtocolError(

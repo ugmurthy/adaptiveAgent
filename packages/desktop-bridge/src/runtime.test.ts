@@ -942,7 +942,7 @@ export async function execute() { return { value }; }
     const runRaw = vi.fn(async () => ({ status: 'success', runId: 'execution-1', output: 'done', stepsUsed: 1, usage: {} }));
     const chatRaw = vi.fn(async () => ({ status: 'success', runId: 'execution-chat', output: 'done', stepsUsed: 1, usage: {} }));
     const orchestrationRun = vi.fn(async (_goal: string, options: Record<string, unknown>) => ({
-      sessionId: options.executionId,
+      sessionId: options.sessionId,
       requestedAgentId: 'file-agent',
       detectedModalities: ['text', 'image', 'audio'],
       detectedSubjects: [],
@@ -970,6 +970,11 @@ export async function execute() { return { value }; }
       managedAttachmentRoot: root,
       settingsCwd: workspace,
       sdkOptions: { cwd: workspace },
+      prepareRunTask: vi.fn(async () => ({
+        originalObjective: 'analyze them', decision: 'complete', preparedObjective: 'analyze them',
+        title: 'Analyze Media', name: 'analyze-media', assumptions: [], clarificationQuestions: [], reason: 'Ready.',
+        preparationAgentId: 'task-preparer', preparationRunId: 'preparation-1',
+      })),
       sdk: {
         agentPath: join(workspace, 'agent.json'),
         runRaw,
@@ -981,13 +986,14 @@ export async function execute() { return { value }; }
     await writeFile(join(workspace, 'agent.json'), JSON.stringify({ id: 'file-agent', name: 'File Agent', invocationModes: ['run'], defaultInvocationMode: 'run', model: { provider: 'ollama', model: 'test' }, tools: [] }));
 
     const catalogResult = await runtime.handleRpc(request({
-      id: 'run', method: 'agent/run', params: { executionId: 'execution-1', goal: 'analyze them', attachments: [file, image, audio] },
+      id: 'run', method: 'agent/run', params: { executionId: 'execution-1', sessionId: 'task-session-2', goal: 'analyze them', attachments: [file, image, audio] },
     }));
     expect(catalogResult).toMatchObject({
       executionId: 'execution-1',
       mode: 'catalog',
       finalRunId: 'final-run',
       result: { status: 'approval_requested' },
+      traceTarget: { kind: 'session', sessionId: 'task-session-2' },
     });
     expect((catalogResult as { stages: unknown }).stages).toEqual([
       { nodeId: 'image_specialist', stage: 'parallel_specialist', agentId: 'image-agent', runId: 'image-run', rootRunId: 'image-run', status: 'succeeded' },
@@ -997,6 +1003,8 @@ export async function execute() { return { value }; }
     expect(runRaw).not.toHaveBeenCalled();
     expect(orchestrationRun).toHaveBeenCalledWith('analyze them', expect.objectContaining({
       executionId: 'execution-1',
+      sessionId: 'task-session-2',
+      metadata: { taskPreparation: expect.objectContaining({ preparationRunId: 'preparation-1' }) },
       contentParts: [
         expect.objectContaining({ type: 'file', file: expect.objectContaining({ name: 'note.txt', mimeType: 'text/plain' }) }),
         expect.objectContaining({ type: 'image', image: expect.objectContaining({ name: 'photo.png', mimeType: 'image/png' }) }),
@@ -1051,12 +1059,12 @@ export async function execute() { return { value }; }
       status: 'paused',
       request: { goal: 'analyze', options: {} },
       catalogFingerprint: 'catalog',
-      plan: { sessionId: 'execution-catalog', requestedAgentId: 'general', finalNodeId: 'final_synthesis', nodes: [] },
+      plan: { sessionId: 'task-session', executionId: 'execution-catalog', requestedAgentId: 'general', finalNodeId: 'final_synthesis', nodes: [] },
       stages: [{ nodeId: 'final_synthesis', runId: 'final-run', agentId: 'general', status: 'paused' }],
     });
     const interruptExecution = vi.fn(async () => undefined);
     const resumeExecution = vi.fn(async () => ({
-      sessionId: 'execution-catalog', requestedAgentId: 'general', detectedModalities: [], detectedSubjects: [], executionShape: 'single',
+      sessionId: 'task-session', requestedAgentId: 'general', detectedModalities: [], detectedSubjects: [], executionShape: 'single',
       plan: { finalNodeId: 'final_synthesis' },
       stages: [{
         nodeId: 'final_synthesis', stage: 'final_synthesis', agentId: 'general', runId: 'final-run', rootRunId: 'final-root',
@@ -1069,7 +1077,7 @@ export async function execute() { return { value }; }
       inspectExecution: vi.fn(async () => ({
         execution: await store.getExecution('execution-catalog'),
         stages: await store.listStages('execution-catalog'),
-        plan: { finalNodeId: 'final_synthesis' } as never,
+        plan: { sessionId: 'task-session', finalNodeId: 'final_synthesis' } as never,
       })),
       interruptExecution,
       resumeExecution,
@@ -1089,12 +1097,12 @@ export async function execute() { return { value }; }
     });
 
     await expect(runtime.handleRpc(request({ id: 'inspect', method: 'execution/inspect', params: { executionId: 'execution-catalog' } }))).resolves.toMatchObject({
-      executionId: 'execution-catalog', mode: 'catalog', status: 'paused', finalRunId: 'final-run', traceTarget: { kind: 'session', sessionId: 'execution-catalog' },
+      executionId: 'execution-catalog', mode: 'catalog', status: 'paused', finalRunId: 'final-run', traceTarget: { kind: 'session', sessionId: 'task-session' },
     });
     await runtime.handleRpc(request({ id: 'interrupt', method: 'execution/interrupt', params: { executionId: 'execution-catalog' } }));
     expect(interruptExecution).toHaveBeenCalledWith('execution-catalog');
     await expect(runtime.handleRpc(request({ id: 'resume', method: 'execution/resume', params: { executionId: 'execution-catalog' } }))).resolves.toEqual({
-      executionId: 'execution-catalog', mode: 'catalog', status: 'success', finalRunId: 'final-run', traceTarget: { kind: 'session', sessionId: 'execution-catalog' },
+      executionId: 'execution-catalog', mode: 'catalog', status: 'success', finalRunId: 'final-run', traceTarget: { kind: 'session', sessionId: 'task-session' },
       stages: [{ nodeId: 'final_synthesis', stage: 'final_synthesis', agentId: 'general', runId: 'final-run', rootRunId: 'final-root', status: 'succeeded' }],
       result: { status: 'success', runId: 'final-run', output: 'done', stepsUsed: 1, usage: {} },
     });

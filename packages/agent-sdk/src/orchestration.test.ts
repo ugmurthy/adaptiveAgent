@@ -51,6 +51,31 @@ describe('orchestration sdk', () => {
     ]);
   });
 
+  it('keeps a caller session across specialist runs when its execution id differs', async () => {
+    const calls: Array<{ agentId: string; goal: string; options: AgentSdkRunOptions }> = [];
+    const sdk = await createOrchestrationSdk({
+      agentCatalog: [
+        { agentId: 'general', agentConfig: agent('general', ['text']) },
+        { agentId: 'image-analyst', agentConfig: agent('image-analyst', ['text', 'image'], ['image']) },
+        { agentId: 'audio-analyst', agentConfig: agent('audio-analyst', ['text', 'audio'], ['audio']) },
+      ],
+      requestedAgentConfig: agent('general', ['text']),
+      agentRunnerFactory: async (agentId) => fakeRunner(agentId, calls),
+    });
+
+    const result = await sdk.runRaw('compare the image and audio', {
+      ...multimodalOptions(), executionId: 'execution-1', sessionId: 'task-session-2',
+    });
+    const inspection = await sdk.inspectExecution('execution-1');
+
+    expect(inspection.execution?.id).toBe('execution-1');
+    expect(inspection.plan).toMatchObject({ sessionId: 'task-session-2', executionId: 'execution-1' });
+    expect(result.sessionId).toBe('task-session-2');
+    expect(calls).toHaveLength(3);
+    expect(calls.every(({ options }) => options.sessionId === 'task-session-2'
+      && options.metadata?.orchestration && (options.metadata.orchestration as { executionId: string }).executionId === 'execution-1')).toBe(true);
+  });
+
   it('builds one grouped specialist node when one agent is assigned image and audio', () => {
     const catalog = catalogFor([
       agent('general', ['text']),
@@ -440,15 +465,19 @@ describe('orchestration sdk', () => {
     const firstSdk = await createOrchestrationSdk(options);
     const first = await firstSdk.run('transcribe', {
       executionId: 'execution-resume',
+      sessionId: 'task-session-resume',
       contentParts: [{ type: 'audio', audio: { source: { kind: 'path', path: '/tmp/audio.wav' }, format: 'wav' } }],
     });
     expect(first.finalResult.status).toBe('clarification_requested');
+    expect(first.sessionId).toBe('task-session-resume');
     expect((await store.getExecution('execution-resume'))?.status).toBe('paused');
 
     const resumedSdk = await createOrchestrationSdk(options);
     const resumed = await resumedSdk.resumeExecution('execution-resume');
 
     expect(resumed.finalResult.status).toBe('success');
+    expect(resumed.sessionId).toBe('task-session-resume');
+    expect((await resumedSdk.inspectExecution('execution-resume')).plan?.sessionId).toBe('task-session-resume');
     expect(calls.filter((agentId) => agentId === 'audio-analyst')).toHaveLength(1);
     expect((await store.getExecution('execution-resume'))?.status).toBe('succeeded');
   });

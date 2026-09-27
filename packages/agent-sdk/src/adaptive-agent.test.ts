@@ -1289,6 +1289,45 @@ describe('adaptive-agent TypeSafe profile selection', () => {
     }
   });
 
+  it('records TypeSafe selection usage and rates on the executed run, separate from model usage', async () => {
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { questions?: Record<string, unknown> };
+      return body.questions
+        ? typeSafeSelectionResponse('researcher')(input, init)
+        : openAiStreamResponse('research complete');
+    });
+    vi.stubGlobal('fetch', fetch);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      const exitCode = await main([
+        'run', '--cwd', tempDir, '--runtime', 'memory', '--inspect', '--output', 'json',
+        'Research browser automation APIs.',
+      ]);
+      const output = JSON.parse(String(log.mock.calls.at(-1)?.[0])) as {
+        result: { status: string };
+        inspection: { run: { metadata: { agentSelection: Record<string, unknown> }; usage: Record<string, unknown> } };
+      };
+
+      expect(exitCode).toBe(0);
+      expect(output.result.status).toBe('success');
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(output.inspection.run.metadata.agentSelection).toMatchObject({
+        selectedAgentId: 'researcher',
+        selectionAgentId: 'typesafe:jev-1.13.0',
+        typesafe: {
+          usage: { inputTokens: 100, outputTokens: 10 },
+          inputRatePerMillionTokens: 0,
+          outputRatePerMillionTokens: 0,
+        },
+      });
+      expect(output.inspection.run.metadata.agentSelection).not.toHaveProperty('usage');
+      expect(output.inspection.run.usage).not.toEqual({ inputTokens: 100, outputTokens: 10 });
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   it('keeps the invocation workspace for an auto-selected external profile without a workspace override', async () => {
     const externalCatalog = await mkdtemp(join(tmpdir(), 'adaptive-agent-external-catalog-'));
     await writeFile(join(tempDir, 'face.jpeg'), 'image bytes');

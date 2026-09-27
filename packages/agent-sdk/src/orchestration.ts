@@ -62,6 +62,7 @@ export interface OrchestrationRoutingDiagnostics {
 
 export interface OrchestrationPlan {
   sessionId: string;
+  executionId?: string;
   requestedAgentId: string;
   catalogFingerprint: string;
   detectedModalities: SupportedModality[];
@@ -338,7 +339,8 @@ export class OrchestrationSdk {
     if (options.contextRefs && options.contextRefs.length > 0) {
       throw new Error('Context refs are not supported for orchestration until stage propagation semantics are defined.');
     }
-    const sessionId = options.executionId ?? options.sessionId ?? this.sessionIdFactory();
+    const executionId = options.executionId ?? options.sessionId ?? this.sessionIdFactory();
+    const sessionId = options.sessionId ?? executionId;
     const requestedAgentId = options.requestedAgentId ?? this.defaultRequestedAgentId;
     if (!this.options.orchestrationStore && !this.options.agentRunnerFactory) {
       const requestedRunner = await this.getRunner(requestedAgentId);
@@ -346,6 +348,7 @@ export class OrchestrationSdk {
     }
     const fingerprint = options.catalogFingerprint ?? this.catalogFingerprint;
     const plan = buildOrchestrationPlan({ sessionId, requestedAgentId, goal, options, catalog: this.catalog, catalogFingerprint: fingerprint, routingDecision: options.routingDecision, finalizeWithRequestedAgent: options.finalizeWithRequestedAgent ?? true });
+    if (executionId !== sessionId) plan.executionId = executionId;
     this.plans.set(sessionId, plan);
     this.emitLifecycle({
       type: 'orchestration.plan.created',
@@ -363,7 +366,7 @@ export class OrchestrationSdk {
 
     const request = jsonSafe({ goal, options: stripOrchestrationOptions(options) });
     const durable = await this.orchestrationStore.createExecution({
-      id: sessionId,
+      id: executionId,
       request,
       catalogFingerprint: fingerprint,
       plan: jsonSafe(plan),
@@ -459,7 +462,7 @@ export class OrchestrationSdk {
     const completedStatus = finalResult.status === 'success' ? 'succeeded' : 'failed';
     execution = await this.orchestrationStore.updateExecution(execution.id, { status: completedStatus }, execution.version);
     if (legacySession) await this.sessionStore.update({ ...legacySession, status: completedStatus, updatedAt: this.now().toISOString(), completedAt: this.now().toISOString() });
-    this.emitLifecycle({ type: 'orchestration.session.completed', sessionId: execution.id, requestedAgentId: plan.requestedAgentId, status: completedStatus, executionShape: plan.executionShape, finalRunId: finalResult.runId, createdAt: this.now().toISOString() });
+    this.emitLifecycle({ type: 'orchestration.session.completed', sessionId: plan.sessionId, requestedAgentId: plan.requestedAgentId, status: completedStatus, executionShape: plan.executionShape, finalRunId: finalResult.runId, createdAt: this.now().toISOString() });
     return this.result(plan, results, finalResult);
   }
 
@@ -669,7 +672,7 @@ function buildNodeOptions(options: OrchestratedRunOptions, plan: OrchestrationPl
     const result = priorResults.get(id)?.result;
     return [id, resultToJson(result)];
   }));
-  const orchestration = { kind: 'catalog', executionId: plan.sessionId, sessionId: plan.sessionId, requestedAgentId: plan.requestedAgentId, selectedAgentId: node.agentId, selectedCatalogAgentIds: plan.routingDecision.selectedCatalogAgentIds, modalityAssignments: plan.routingDecision.assignments as unknown as JsonValue, routingSource: plan.routingDecision.source, catalogFingerprint: plan.catalogFingerprint, executionShape: plan.executionShape, stage: node.stage, nodeId: node.id, dependsOn: node.dependsOn, detectedModalities: plan.detectedModalities, routingReason: plan.routingReason } satisfies JsonObject;
+  const orchestration = { kind: 'catalog', executionId: plan.executionId ?? plan.sessionId, sessionId: plan.sessionId, requestedAgentId: plan.requestedAgentId, selectedAgentId: node.agentId, selectedCatalogAgentIds: plan.routingDecision.selectedCatalogAgentIds, modalityAssignments: plan.routingDecision.assignments as unknown as JsonValue, routingSource: plan.routingDecision.source, catalogFingerprint: plan.catalogFingerprint, executionShape: plan.executionShape, stage: node.stage, nodeId: node.id, dependsOn: node.dependsOn, detectedModalities: plan.detectedModalities, routingReason: plan.routingReason } satisfies JsonObject;
   if (node.stage === 'final_synthesis') {
     const raw = selectSynthesisAttachments(options, requestedModalities);
     return { ...raw, input: { originalInput: filterInputModalities(options.input, new Set(requestedModalities)) ?? null, upstreamResults: priorOutputs }, context: { ...(options.context ?? {}), sessionId: plan.sessionId, orchestration }, executionContext: options.executionContext, inferenceTier: options.inferenceTier, outputSchema: options.outputSchema, metadata: { ...(options.metadata ?? {}), orchestration } };

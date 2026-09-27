@@ -1502,6 +1502,13 @@ function withAgentSelection(spec: ManualRunSpec, selection: AgentSelectionResult
         ...(selection.confidence === undefined ? {} : { confidence: selection.confidence }),
         ...(selection.relevance === undefined ? {} : { relevance: selection.relevance }),
         ...(selection.probabilities ? { probabilities: selection.probabilities as unknown as JsonValue } : {}),
+        ...(selection.selectionAgentId.startsWith('typesafe:') ? {
+          typesafe: {
+            ...(selection.usage ? { usage: selection.usage } : {}),
+            inputRatePerMillionTokens: 0,
+            outputRatePerMillionTokens: 0,
+          },
+        } : {}),
       },
     },
   };
