@@ -111,6 +111,8 @@ const MAX_LINE_BYTES = 4096;
 const DEFAULT_EXCLUDED_DIRECTORIES = new Set(['.git', 'node_modules']);
 const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
 
+class SearchFilesInputError extends Error {}
+
 export function createSearchFilesTool(config?: SearchFilesToolConfig): ToolDefinition {
   const allowedRoot = config?.allowedRoot ?? process.cwd();
   const resolvedAllowedRoot = resolve(allowedRoot);
@@ -213,6 +215,15 @@ export function createSearchFilesTool(config?: SearchFilesToolConfig): ToolDefin
       const filePath = extractInputPath(input);
       if (error instanceof PathOutsideRootError) {
         return buildWorkspacePathRecovery('search_files', filePath, error);
+      }
+      if (error instanceof SearchFilesInputError) {
+        return {
+          ok: false,
+          recoveryKind: 'invalid_input',
+          toolName: 'search_files',
+          message: error.message,
+          correctiveAction: 'Retry search_files with a non-empty "query" and/or "filename" and correct any invalid fields described in the message.',
+        };
       }
 
       return undefined;
@@ -326,23 +337,23 @@ function normalizeSearchInput(
   const input = parseObjectInput(rawInput, 'search_files expects a JSON object');
   const searchPath = input.path === undefined ? '.' : input.path;
   if (typeof searchPath !== 'string' || !searchPath.trim()) {
-    throw new Error('search_files requires "path" to be a non-empty string when provided');
+    throw new SearchFilesInputError('search_files requires "path" to be a non-empty string when provided');
   }
 
   const query = normalizeOptionalSearchString(input.query, 'query');
   const filename = normalizeOptionalSearchString(input.filename, 'filename');
   if (query === undefined && filename === undefined) {
-    throw new Error('search_files requires at least one of "query" or "filename"');
+    throw new SearchFilesInputError('search_files requires at least one of "query" or "filename"');
   }
 
   const mode = input.mode === undefined ? 'literal' : input.mode;
   if (mode !== 'literal' && mode !== 'regex') {
-    throw new Error('search_files "mode" must be "literal" or "regex"');
+    throw new SearchFilesInputError('search_files "mode" must be "literal" or "regex"');
   }
 
   const caseSensitive = input.caseSensitive ?? false;
   if (typeof caseSensitive !== 'boolean') {
-    throw new Error('search_files "caseSensitive" must be a boolean when provided');
+    throw new SearchFilesInputError('search_files "caseSensitive" must be a boolean when provided');
   }
 
   return {
@@ -365,14 +376,14 @@ function parseObjectInput(rawInput: unknown, message: string): Record<string, un
     try {
       input = JSON.parse(rawInput);
     } catch {
-      throw new Error(message);
+      throw new SearchFilesInputError(message);
     }
   } else {
     input = rawInput;
   }
 
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
-    throw new Error(message);
+    throw new SearchFilesInputError(message);
   }
 
   return input as Record<string, unknown>;
@@ -383,7 +394,7 @@ function normalizeOptionalSearchString(value: unknown, fieldName: 'query' | 'fil
     return undefined;
   }
   if (typeof value !== 'string' || !value.trim()) {
-    throw new Error(`search_files "${fieldName}" must be a non-empty string when provided`);
+    throw new SearchFilesInputError(`search_files "${fieldName}" must be a non-empty string when provided`);
   }
   return value;
 }
@@ -393,12 +404,12 @@ function normalizeGlobArray(value: unknown, fieldName: 'includeGlobs' | 'exclude
     return [];
   }
   if (!Array.isArray(value)) {
-    throw new Error(`search_files "${fieldName}" must be an array of strings when provided`);
+    throw new SearchFilesInputError(`search_files "${fieldName}" must be an array of strings when provided`);
   }
 
   return value.map((glob, index) => {
     if (typeof glob !== 'string' || !glob.trim()) {
-      throw new Error(`search_files "${fieldName}" entry ${index} must be a non-empty string`);
+      throw new SearchFilesInputError(`search_files "${fieldName}" entry ${index} must be a non-empty string`);
     }
     return compileGlob(glob);
   });
@@ -419,7 +430,7 @@ function normalizePositiveIntegerInput(value: unknown, fallback: number, fieldNa
     return fallback;
   }
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
-    throw new Error(`search_files "${fieldName}" must be a positive number when provided`);
+    throw new SearchFilesInputError(`search_files "${fieldName}" must be a positive number when provided`);
   }
   return Math.max(1, Math.floor(value));
 }
@@ -439,7 +450,7 @@ function normalizeContextLinesInput(value: unknown, fallback: number): number {
     return fallback;
   }
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
-    throw new Error('search_files "contextLines" must be a non-negative number when provided');
+    throw new SearchFilesInputError('search_files "contextLines" must be a non-negative number when provided');
   }
   return Math.min(MAX_CONTEXT_LINES, Math.floor(value));
 }
@@ -473,7 +484,7 @@ function createMatcher(
     };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    throw new Error(`Invalid search_files ${fieldName} regex: ${reason}`);
+    throw new SearchFilesInputError(`Invalid search_files ${fieldName} regex: ${reason}`);
   }
 }
 

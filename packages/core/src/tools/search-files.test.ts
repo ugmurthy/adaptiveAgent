@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type { ToolContext } from '../types.js';
+import type { JsonValue, ToolContext, ToolDefinition } from '../types.js';
 import { createSearchFilesTool } from './search-files.js';
 
 function stubToolContext(overrides?: Partial<ToolContext>): ToolContext {
@@ -21,14 +21,11 @@ function stubToolContext(overrides?: Partial<ToolContext>): ToolContext {
 }
 
 async function executeRecoverableTool(
-  tool: {
-    execute: (input: any, context: ToolContext) => Promise<unknown>;
-    recoverError?: (error: unknown, input: unknown) => unknown;
-  },
-  input: unknown,
+  tool: ToolDefinition,
+  input: JsonValue,
 ) {
   try {
-    return await tool.execute(input as any, stubToolContext());
+    return await tool.execute(input, stubToolContext());
   } catch (error) {
     return tool.recoverError?.(error, input);
   }
@@ -112,6 +109,23 @@ describe('createSearchFilesTool', () => {
       requestedPath: '/outside.txt',
       suggestedPath: 'outside.txt',
     });
+  });
+
+  it('returns actionable recovery for missing selectors and invalid regex, but not unexpected errors', async () => {
+    const tool = createSearchFilesTool({ allowedRoot: tempDir });
+
+    expect(await executeRecoverableTool(tool, { path: '.' })).toMatchObject({
+      ok: false,
+      recoveryKind: 'invalid_input',
+      toolName: 'search_files',
+      message: 'search_files requires at least one of "query" or "filename"',
+      correctiveAction: expect.stringContaining('non-empty "query" and/or "filename"'),
+    });
+    expect(await executeRecoverableTool(tool, { query: '[', mode: 'regex' })).toMatchObject({
+      recoveryKind: 'invalid_input',
+      message: expect.stringContaining('Invalid search_files query regex'),
+    });
+    expect(tool.recoverError?.(new Error('unexpected failure'), { query: 'needle' })).toBeUndefined();
   });
 
   it('truncates at maxMatches without pagination', async () => {

@@ -17,6 +17,7 @@ import { InMemoryToolExecutionStore } from './in-memory-tool-execution-store.js'
 import { createCanonicalTempDirectory } from './test-utils.js';
 import { createEditFileTool } from './tools/edit-file.js';
 import { createReadFileTool } from './tools/read-file.js';
+import { createSearchFilesTool } from './tools/search-files.js';
 import { createWriteFileTool } from './tools/write-file.js';
 import type { AgentEvent, ModelAdapter, ModelRequest, ModelResponse, RuntimeStores, ToolDefinition } from './types.js';
 
@@ -4125,6 +4126,42 @@ describe('AdaptiveAgent', () => {
       const events = await eventStore.listByRun(result.runId);
       expect(events.find((event) => event.type === 'tool.failed' && event.toolCallId === 'missing-read')?.payload)
         .toMatchObject({ recoverable: true, output: { recoveryKind: 'file_not_found' } });
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('feeds a missing search_files selector back to the model and accepts a corrected call', async () => {
+    const tempDir = await createCanonicalTempDirectory('adaptive-agent-search-input-');
+    try {
+      await writeFile(join(tempDir, 'report.txt'), 'needle');
+      const eventStore = new InMemoryEventStore();
+      const model = new SequenceModel([
+        { finishReason: 'tool_calls', toolCalls: [{ id: 'bad-search', name: 'search_files', input: { path: '.' } }] },
+        { finishReason: 'tool_calls', toolCalls: [{ id: 'retry-search', name: 'search_files', input: { query: 'needle' } }] },
+        { finishReason: 'stop', text: 'found' },
+      ]);
+      const agent = new AdaptiveAgent({
+        model,
+        tools: [createSearchFilesTool({ allowedRoot: tempDir })],
+        runStore: new InMemoryRunStore(),
+        eventStore,
+        snapshotStore: new InMemorySnapshotStore(),
+      });
+
+      const result = await agent.run({ goal: 'Find the report' });
+      expect(result).toMatchObject({ status: 'success', output: 'found' });
+      expect(model.receivedRequests[1]?.messages.filter((message) => message.role === 'tool')).toMatchObject([{
+        toolCallId: 'bad-search',
+        content: expect.stringContaining('search_files requires at least one of'),
+      }]);
+      expect(model.receivedRequests[2]?.messages.filter((message) => message.role === 'tool')).toMatchObject([
+        { toolCallId: 'bad-search' },
+        { toolCallId: 'retry-search', content: expect.stringContaining('report.txt') },
+      ]);
+      const events = await eventStore.listByRun(result.runId);
+      expect(events.find((event) => event.type === 'tool.failed' && event.toolCallId === 'bad-search')?.payload)
+        .toMatchObject({ recoverable: true, output: { recoveryKind: 'invalid_input' } });
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
