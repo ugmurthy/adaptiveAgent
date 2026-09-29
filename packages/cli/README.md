@@ -1,18 +1,30 @@
 # AdaptiveAgent
 
+## Highlights since v0.1.48
+
+- **JEV-based agent selection:** opt-in TypeSafe JEV routing selects a capable
+  profile from the agent catalog using the objective and attachment modalities,
+  with configurable policy and confidence thresholds.
+- **Adaptive execution:** opt-in routing chooses between a direct run and
+  specialist orchestration across text, image, file, and audio inputs. Explicit
+  `--agent` and `--orchestrate` overrides remain available.
+- **Inspectable orchestration:** specialist assignments and routing decisions
+  are recorded with durable runs; a JEV study command compares prompt or
+  persisted-session routing cases.
+
+See the [changelog](CHANGELOG.md) for the full update and the configuration
+examples below for [JEV selection](#typesafe-jev-agent-selection) and
+[adaptive execution](#opt-in-adaptive-execution-routing).
+
 ## What is AdaptiveAgent?
 
 AdaptiveAgent is the operating layer for reliable AI agents.
 
 It is a Bun + TypeScript runtime and CLI stack for running goal-oriented agents with typed tools, structured events, approvals, resumable runs, retries, child-run delegation, and multi-model support. It helps teams move from fragile agent demos to controlled, inspectable, recoverable production workflows.
 
-> **[Read the changelog](CHANGELOG.md).** Since release `v0.1.36`, the repository has
-> added decision-oriented trace reporting, an embedded SQLite runtime, and two
-> host-facing JSON-RPC 2.0 sidecars: `desktop-bridge` for agent execution and
-> `trace-session-sidecar` for read-only trace access. A Tauri desktop app uses
-> the desktop sidecar, while the capability gateway and its shared protocol/client
-> packages provide authenticated remote inference and tools. The legacy hosted
-> service stack was removed; durable runtime semantics remain in core.
+The stack includes decision-oriented trace reporting, an embedded SQLite
+runtime, host-facing desktop and trace sidecars, a Tauri desktop app, and an
+authenticated capability gateway. Durable runtime semantics remain in core.
 
 ## Getting Started in 60secs
 
@@ -101,6 +113,19 @@ This exercises default agent resolution, one-shot goal execution, local tools,
 progress updates, and persisted run inspection. Add `--events` to display the
 full lifecycle event stream.
 
+Discover available profiles before selecting one by name:
+
+```bash
+adaptive-agent agents
+adaptive-agent run --agent reviewer "Review the current changes."
+```
+
+Use `adaptive-agent agents --output json` when embedding discovery in a host.
+It returns safe metadata and the exact `id`, `configPath`, and
+`configurationFingerprint` selection descriptor used by `desktop-bridge`.
+Discovery does not load agent tools or delegate handlers and does not expose
+credentials or system instructions.
+
 ### 2. Refine an idea through chat
 
 Start an interactive conversation:
@@ -126,6 +151,30 @@ cat implementation-plan.md | adaptive-agent chat
 
 Use `chat` while shaping a goal through conversation. Use `run` when the desired
 outcome is already clear enough to execute as one objective.
+
+### TypeSafe JEV routing study
+
+The repository study script can evaluate a prompt against the current agent
+catalog or replay persisted SQLite routing cases without modifying history:
+
+```bash
+bun run jev-routing-study prompt --attachment-type image "Extract this diagram"
+bun run jev-routing-study history --session-id <session-id>
+bun run jev-routing-study history --limit 10
+```
+
+It uses `./agent.settings.json` by default, including the configured TypeSafe
+model and selection policy. If those settings do not specify a SQLite path,
+history defaults to `~/.adaptiveAgent/desktop.sqlite`. Use `--policy <path>`
+for a study-only policy, `--output json|jsonl` for machine-readable results,
+and `--show-state` or `--show-response` for diagnostics. Historical cases
+without linked selector inputs use the current catalog by default and are
+marked `approx`; pass `--no-allow-current-catalog` to require exact context. The table's
+`modalities` column uses `I`, `A`, and `F` for image, audio, and file (`-` for
+text-only). Latency, token, and cost pairs are existing/JEV; JEV latency is
+client wall-clock time and JEV cost is an input-token estimate at the
+configurable price (default `$0.042` per million input tokens). `--repeat`
+performs repeated paid calls and disables cache reuse.
 
 ### 3. Delegate focused research to a skill
 
@@ -169,6 +218,83 @@ orchestration can run independent stages before final synthesis. Preview the
 resolved configuration and request without spending model tokens by adding
 `--dry-run`.
 
+`--orchestrate` is an explicit force override: it uses every valid, non-archived
+`run` profile discovered from configured `agents.dirs`, plus any profiles named
+with `--catalog`. The requested `--agent` remains the primary and final
+synthesis profile. Routing validates every attachment modality before starting
+a stage; missing capability metadata means text-only. When one specialist wins
+multiple modalities, it receives all of those attachments in one grouped run.
+Run output and durable plans record the selected catalog IDs, grouped modality
+assignments, routing reason, and credential-free catalog fingerprint.
+
+Plain `run` is unchanged: it still executes one fixed profile or, when
+`settings.agent.mode` is `auto`, selects one profile that supports every input
+modality. Automatic direct-versus-orchestrated selection is not enabled in this
+phase.
+
+### Opt-in adaptive execution routing
+
+To let the configured `agentSelection.engine` choose direct execution or a
+validated specialist orchestration, opt in explicitly:
+
+```json
+{
+  "agent": {
+    "mode": "auto",
+    "configPath": "./agents/default.json"
+  },
+  "executionRouting": {
+    "mode": "adaptive",
+    "maxSpecialists": 4,
+    "lowConfidenceFallback": "error"
+  },
+  "agentSelection": {
+    "engine": "typesafe",
+    "typesafe": {
+      "model": "jev-latest",
+      "apiKeyEnv": "TYPESAFE_API_KEY",
+      "policy": {
+        "relevance": {
+          "instructions": "Is this profile a strong match for the objective and this attachment modality?"
+        },
+        "selection": {
+          "candidateCriteria": "Prefer the narrowest capable specialist."
+        },
+        "routing": {
+          "modeInstructions": "Choose direct only when one profile should handle the complete objective; otherwise choose orchestration.",
+          "primaryInstructions": "Choose the best profile to own and synthesize the complete objective.",
+          "assignmentInstructions": "Choose the strongest capable specialist for this modality."
+        }
+      }
+    }
+  }
+}
+```
+
+Both `agent` and `typesafe` engines produce the same validated
+`ExecutionRoutingDecision`. TypeSafe evaluates candidate-by-modality relevance,
+execution mode, primary profile, and modality assignments. The agent engine
+returns the equivalent structured object from a tool-free router run. Agent SDK
+rejects unknown IDs, unsupported or duplicate assignments, missing modalities,
+and decisions exceeding `maxSpecialists` before starting execution.
+The optional TypeSafe `policy.routing` questions tune execution-shape, primary,
+and per-modality choices independently of the legacy single-agent
+`policy.selection.instructions`; `selection.candidateCriteria` remains common
+guidance for candidate choices.
+
+`lowConfidenceFallback` defaults to `error`. Setting it to `direct` uses the
+configured profile only when that profile supports every input modality;
+otherwise the request still fails. Explicit `--agent` remains fixed. Explicit
+`--orchestrate` remains a force override and preserves deterministic Phase 1
+routing. Without `executionRouting.mode: "adaptive"`, ordinary single-profile
+selection is unchanged.
+
+Adaptive routing currently preserves the compatibility ordering in which
+routing/selection occurs before task preparation. The routing decision is
+recorded under request metadata and, for orchestration, in the durable plan and
+lifecycle events. Selector inputs contain safe profile summaries and attachment
+types/counts, not config paths, credentials, instructions, or attachment paths.
+
 Delegation, orchestration, and swarms serve different scopes:
 
 | Capability | Best use |
@@ -186,6 +312,121 @@ it from a file:
 adaptive-agent run "Summarize this repository and identify the main packages"
 adaptive-agent run --file ./prompts/release-notes.md
 ```
+
+Task preparation can assess and improve a goal before the execution agent runs
+it. Configure `taskPreparation` in `agent.settings.json`, or override its mode
+for one command with `--enhance never|auto|always`. A dry run performs task
+preparation but does not start the execution agent:
+
+```bash
+adaptive-agent run --dry-run --enhance auto \
+  "Gather last week's AI news and write a styled HTML bulletin"
+```
+
+Preparation is a real model-backed run, so this kind of dry run can have
+latency and cost. Its output includes a preparation run ID. Reuse that exact
+prepared goal later without another preparation model call:
+
+```bash
+adaptive-agent run \
+  --from-preparation 62e5b46f-18d8-49aa-ae55-e78f7980ca75 \
+  --progress
+```
+
+`--from-preparation` supplies both the original and prepared goals from the
+persisted preparation, so do not add positional goal text or `--file`. It is
+also mutually exclusive with `--enhance`. Reuse requires the same SQLite or
+Postgres runtime; an in-memory preparation is not available after its CLI
+process exits. The consuming run records the original goal, prepared goal,
+preparation decision, and preparation run ID in metadata. `trace-session`
+reports both goals and the preparation run ID while keeping the preparation
+run separate from the execution trace.
+
+Every run or chat start has a core `sessionId`. When a caller does not provide
+one, the runtime generates it. Inline task selection, task preparation,
+clarification attempts, and execution share the same session so their usage is
+accounted together. `--from-preparation` reuses the stored preparation session
+unless `--session-id` is supplied explicitly.
+
+To select the execution profile for each task, set `agent.mode` to `auto`.
+The configured `agent.id` and `agent.configPath` remain the bootstrap profile.
+By default, `agentSelection.agent` (or the legacy `taskPreparation.agent`
+fallback) performs a tool-free structured selection from the valid, active run
+profiles in `agents.dirs`:
+
+```json
+{
+  "agent": {
+    "mode": "auto",
+    "id": "byok-agent",
+    "configPath": "/Users/ugmurthy/.adaptiveAgent/agents/byok-agent.json"
+  },
+  "agents": {
+    "dirs": ["$HOME/.adaptiveAgent/agents"]
+  },
+  "agentSelection": {
+    "agent": "task-preparer"
+  },
+  "taskPreparation": {
+    "agent": "task-preparer",
+    "mode": "auto"
+  }
+}
+```
+
+Omitting `agent.mode` preserves fixed-profile behavior. An explicit CLI
+`--agent` or exact desktop runtime profile selection also remains fixed for
+that invocation.
+
+### TypeSafe JEV agent selection
+
+Auto-selection can use TypeSafe JEV as a fast typed decision layer instead of
+a generative selector agent. Set `TYPESAFE_API_KEY` (or configure another
+`apiKeyEnv`) and select the TypeSafe engine:
+
+```json
+{
+  "agent": { "mode": "auto", "configPath": "./agents/default.json" },
+  "agents": { "dirs": ["./agents"] },
+  "agentSelection": {
+    "engine": "typesafe",
+    "typesafe": {
+      "model": "jev-1.13.0",
+      "apiKeyEnv": "TYPESAFE_API_KEY",
+      "policyPath": "./agent-routing-policy.json",
+      "timeoutMs": 10000
+    }
+  }
+}
+```
+
+The policy file controls both JEV questions and the confidence gates without a
+code change:
+
+```json
+{
+  "relevance": {
+    "instructions": "Is the referenced profile a strong match for this objective and all requested attachment types?",
+    "criteria": {
+      "true": "The profile has the relevant specialization, tools, and attachment capabilities.",
+      "false": "The profile is mismatched or lacks a required capability."
+    }
+  },
+  "selection": {
+    "instructions": "Which candidate is the single best profile for this objective?",
+    "candidateCriteria": "Prefer the narrowest capable specialist."
+  },
+  "minimumRelevance": 0.65,
+  "minimumConfidence": 0.7
+}
+```
+
+The same object can be placed inline at `agentSelection.typesafe.policy`; do
+not set both `policy` and `policyPath`. Before calling JEV, the CLI removes
+profiles that do not declare support for every supplied image, file, or audio
+modality. The JEV request contains the prompt, attachment modality names and
+counts, and safe profile summaries; it does not contain attachment paths or
+contents. Selection fails closed when either configured threshold is missed.
 
 Use `chat` for an interactive conversation, or provide the first message on
 the command line:
@@ -523,7 +764,7 @@ The current workspace packages are:
 - `@adaptive-agent/trace-session` in `packages/trace-session`: decision-oriented SQLite/Postgres trace reporter with a read-only NDJSON JSON-RPC 2.0 stdio sidecar for native and desktop trace consumers.
 - `@adaptive-agent/trace-workbench` in `packages/trace-workbench`: Bun + Svelte trace workbench for choosing persisted sessions/runs, exploring timelines, resource spend, messages, diagnostics, and exporting markdown/PDF reports.
 - `@adaptive-agent/gateway-protocol`, `@adaptive-agent/gateway-client`, and `@adaptive-agent/capability-gateway`: shared JSON-RPC contracts, client integration, and the authenticated capability/inference gateway.
-- `@adaptive-agent/desktop-bridge`: the NDJSON JSON-RPC 2.0 stdio sidecar for runtime initialization, agent execution, run control, interactions, events, and safe CLI access.
+- `@adaptive-agent/desktop-bridge`: the NDJSON JSON-RPC 2.0 stdio sidecar for agent discovery and exact selection, runtime initialization, execution, run control, interactions, events, and safe CLI access.
 - `@adaptive-agent/desktop-app`: the Tauri 2 + Svelte desktop client backed by `desktop-bridge`.
 
 Useful local commands:

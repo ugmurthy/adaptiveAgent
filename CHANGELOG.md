@@ -4,13 +4,37 @@ All notable changes to this project will be documented in this file.
 
 This project follows semantic versioning for release notes.
 
-## Unreleased
+## [0.1.49] - 2026-09-27## Unreleased
+
+### Added
+
+- Added durable mixed-media orchestration: catalog specialists can handle
+  text, image, file, and audio stages before the primary agent synthesizes a
+  response, with plans and history persisted in SQLite and Postgres.
+- Added opt-in TypeSafe JEV agent selection with configurable policy and
+  confidence gates, plus a study command for prompt and persisted-session
+  routing comparisons.
+- Added opt-in adaptive execution routing that chooses direct execution or
+  validated specialist orchestration using either TypeSafe JEV or a tool-free
+  selector agent; explicit profile and orchestration overrides remain fixed.
 
 ### Changed
 
 - Made trace-session the authority for session-list `title` and `name` across
   gateway Postgres, core-only Postgres, and SQLite, and bumped the read-only
   sidecar protocol to `1.1` so consumers can require the new result contract.
+- Expanded explicit `--orchestrate` routing across the active agent catalog,
+  grouping modality assignments and recording routing decisions in run metadata
+  and durable plans.
+
+### Fixed
+
+- Preserved catalog-stage responses and scoped specialist goals to their
+  assigned work; kept CLI attachment paths authoritative during routing.
+- Allowed desktop mixed-media requests to route when no single profile
+  supports every modality.
+- Kept catalog stages in the same task session and recorded TypeSafe selector
+  usage with the task.
 
 ## [0.1.47] - 2026-09-11
 

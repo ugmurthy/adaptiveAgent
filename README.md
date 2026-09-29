@@ -1,18 +1,30 @@
 # AdaptiveAgent
 
+## Highlights since v0.1.48
+
+- **JEV-based agent selection:** opt-in TypeSafe JEV routing selects a capable
+  profile from the agent catalog using the objective and attachment modalities,
+  with configurable policy and confidence thresholds.
+- **Adaptive execution:** opt-in routing chooses between a direct run and
+  specialist orchestration across text, image, file, and audio inputs. Explicit
+  `--agent` and `--orchestrate` overrides remain available.
+- **Inspectable orchestration:** specialist assignments and routing decisions
+  are recorded with durable runs; a JEV study command compares prompt or
+  persisted-session routing cases.
+
+See the [changelog](CHANGELOG.md) for the full update and the configuration
+examples below for [JEV selection](#typesafe-jev-agent-selection) and
+[adaptive execution](#opt-in-adaptive-execution-routing).
+
 ## What is AdaptiveAgent?
 
 AdaptiveAgent is the operating layer for reliable AI agents.
 
 It is a Bun + TypeScript runtime and CLI stack for running goal-oriented agents with typed tools, structured events, approvals, resumable runs, retries, child-run delegation, and multi-model support. It helps teams move from fragile agent demos to controlled, inspectable, recoverable production workflows.
 
-> **[Read the changelog](CHANGELOG.md).** Since release `v0.1.36`, the repository has
-> added decision-oriented trace reporting, an embedded SQLite runtime, and two
-> host-facing JSON-RPC 2.0 sidecars: `desktop-bridge` for agent execution and
-> `trace-session-sidecar` for read-only trace access. A Tauri desktop app uses
-> the desktop sidecar, while the capability gateway and its shared protocol/client
-> packages provide authenticated remote inference and tools. The legacy hosted
-> service stack was removed; durable runtime semantics remain in core.
+The stack includes decision-oriented trace reporting, an embedded SQLite
+runtime, host-facing desktop and trace sidecars, a Tauri desktop app, and an
+authenticated capability gateway. Durable runtime semantics remain in core.
 
 ## Getting Started in 60secs
 
