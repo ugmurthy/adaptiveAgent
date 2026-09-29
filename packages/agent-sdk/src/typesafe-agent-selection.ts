@@ -65,6 +65,13 @@ export interface TypeSafeAgentSelectionClient {
   }): Promise<TypeSafeAgentSelectionResponse>;
 }
 
+export class AgentSelectionConfidenceError extends Error {
+  constructor(message: string, readonly confidence: number) {
+    super(message);
+    this.name = 'AgentSelectionConfidenceError';
+  }
+}
+
 export interface CreateTypeSafeAgentSelectionClientOptions {
   apiKey: string;
   baseUrl?: string;
@@ -178,10 +185,10 @@ export async function selectAgentProfileWithTypeSafe(
     throw new Error('TypeSafe agent selector returned confidence or relevance outside the range 0 to 1.');
   }
   if (confidence < policy.minimumConfidence) {
-    throw new Error(`TypeSafe agent selection confidence ${confidence.toFixed(3)} is below the configured minimum ${policy.minimumConfidence.toFixed(3)}.`);
+    throw new AgentSelectionConfidenceError(`TypeSafe agent selection confidence ${confidence.toFixed(3)} is below the configured minimum ${policy.minimumConfidence.toFixed(3)}.`, confidence);
   }
   if (relevanceAnswer.noul < policy.minimumRelevance) {
-    throw new Error(`TypeSafe relevance ${relevanceAnswer.noul.toFixed(3)} for agent "${selectedAgentId}" is below the configured minimum ${policy.minimumRelevance.toFixed(3)}.`);
+    throw new AgentSelectionConfidenceError(`TypeSafe relevance ${relevanceAnswer.noul.toFixed(3)} for agent "${selectedAgentId}" is below the configured minimum ${policy.minimumRelevance.toFixed(3)}.`, relevanceAnswer.noul);
   }
 
   return {

@@ -103,6 +103,8 @@ export interface TypeSafeAgentSelectionPolicyConfig {
 export interface AgentSelectionSettingsConfig {
   engine?: 'agent' | 'typesafe';
   agent?: string;
+  /** TypeSafe threshold failures use agent when omitted and configured; otherwise error. */
+  lowConfidenceFallback?: 'error' | 'agent';
   typesafe?: {
     model?: string;
     apiKeyEnv?: string;
@@ -116,6 +118,7 @@ export interface AgentSelectionSettingsConfig {
 export interface ExecutionRoutingSettingsConfig {
   mode?: 'single' | 'adaptive';
   maxSpecialists?: number;
+  /** Legacy fallback; use agentSelection.lowConfidenceFallback for new configurations. */
   lowConfidenceFallback?: 'direct' | 'error';
 }
 

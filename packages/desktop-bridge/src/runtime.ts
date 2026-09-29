@@ -1,15 +1,18 @@
 import {
   AgentSdk,
+  agentSelectionMetadata,
   agentConfigurationFingerprint,
   createOrchestrationSdk,
+  decideAutomaticRun,
   discoverAgentSdkAgents,
   eligibleAgentSelectionCandidates,
+  executionRoutingMetadata,
   inspectAgentSdkResolution,
   prepareTask,
   restoreTaskPreparation,
   resolveRuntimeTarget,
-  selectAgentProfile,
   type AgentSelectionResult,
+  type AdaptiveExecutionRoutingResult,
   type AgentSdkCatalogAgent,
   type AgentSdkOptions,
   type AgentSdkRunOptions,
@@ -78,6 +81,8 @@ interface PendingDesktopTaskPreparation {
   fileAccess?: FileAccessExecutionContext;
   inferenceTier?: InferenceTier;
   agentSelection?: JsonObject;
+  executionRouting?: JsonObject;
+  catalogExecution?: boolean;
   preparations: TaskPreparationResult[];
 }
 
@@ -259,6 +264,9 @@ export class DesktopRuntime {
               parts,
               fileAccess,
               selected.selection,
+              selected.routing,
+              selected.routing?.decision.mode === 'orchestration'
+                || (!selected.routing && executionMode(params.attachments ?? []) === 'catalog'),
               [preparation],
             );
             await this.persistPendingTaskPreparation(preparation.preparationRunId, pending);
@@ -281,20 +289,23 @@ export class DesktopRuntime {
           ...(parts.length ? { contentParts: parts } : {}),
           ...(fileAccess ? { executionContext: { fileAccess } } : {}),
           ...(params.inferenceTier ? { inferenceTier: params.inferenceTier } : {}),
-          ...((preparation || selected.selection) ? {
+          ...((preparation || selected.selection || selected.routing) ? {
             metadata: {
               ...(preparation ? taskPreparationMetadata(preparation) : {}),
               ...(selected.selection ? { agentSelection: agentSelectionMetadata(selected.selection) } : {}),
+              ...(selected.routing ? { executionRouting: executionRoutingMetadata(selected.routing) } : {}),
             },
           } : {}),
         };
-        if (executionMode(params.attachments ?? []) === 'catalog') {
+        if (selected.routing?.decision.mode === 'orchestration'
+          || (!selected.routing && executionMode(params.attachments ?? []) === 'catalog')) {
           const orchestration = await this.catalogOrchestration(executionId, sdk);
           const { runId: _runId, ...orchestrationOptions } = runOptions;
           const orchestrated = await orchestration.runRaw(preparation?.preparedObjective ?? params.goal, {
             ...orchestrationOptions,
             executionId,
             requestedAgentId: sdk.config.agent.id,
+            ...(selected.routing?.decision.mode === 'orchestration' ? { routingDecision: selected.routing.decision } : {}),
           });
           return executionResult(executionId, 'catalog', orchestrated.finalResult, catalogExecutionStages(orchestrated.stages), orchestrated.sessionId);
         }
@@ -804,16 +815,8 @@ export class DesktopRuntime {
     originalObjective: string,
     attachments: DesktopAttachmentInput[],
     sessionId: string,
-  ): Promise<{ sdk: AgentSdk; selection?: AgentSelectionResult }> {
+  ): Promise<{ sdk: AgentSdk; selection?: AgentSelectionResult; routing?: AdaptiveExecutionRoutingResult }> {
     if (fallbackSdk.config.settings?.agent?.mode !== 'auto') return { sdk: fallbackSdk };
-    const configuredAgent = fallbackSdk.config.settings.taskPreparation?.agent;
-    if (!configuredAgent) {
-      throw new DesktopProtocolError(
-        'INVALID_CONFIGURATION',
-        'Auto agent selection requires settings.taskPreparation.agent.',
-        JSON_RPC_ERROR_CODES.commandFailed,
-      );
-    }
     const options = this.sdkOptions;
     if (!options) throw new DesktopProtocolError('NOT_INITIALIZED', 'The runtime configuration is unavailable.', JSON_RPC_ERROR_CODES.notInitialized);
     const discovery = await discoverAgentSdkAgents(options);
@@ -821,42 +824,32 @@ export class DesktopRuntime {
       .filter((attachment) => attachment.kind === kind)
       .map((attachment) => attachment.stagedRelativePath);
     const attachmentSummary = { images: paths('image'), files: paths('file'), audio: paths('audio') };
-    const preparationSdk = await AgentSdk.create({
-      ...options,
-      cwd: this.settingsCwd,
-      agentConfigPath: configuredAgent,
-      settingsConfigPath: undefined,
-      settingsConfig: { ...fallbackSdk.config.settings, agent: undefined },
-      settingsOverrides: undefined,
-      model: undefined,
-      runtime: fallbackSdk.created.runtime,
-      eventListener: undefined,
-    });
-    try {
-      // Media runs already use catalog orchestration. When no single profile accepts
-      // every attachment, let that path assign each modality to its specialist.
-      if (executionMode(attachments) === 'catalog'
-        && eligibleAgentSelectionCandidates({ candidates: discovery.agents, attachments: attachmentSummary }, preparationSdk.config.agent.id).length === 0) {
-        return { sdk: fallbackSdk };
-      }
-      const selection = await selectAgentProfile(preparationSdk, {
-        originalObjective,
-        candidates: discovery.agents,
-        workspaceRoot: fallbackSdk.config.workspaceRoot,
-        attachments: attachmentSummary,
-        sessionId,
-      });
-      const selected = discovery.agents.find((candidate) =>
-        candidate.id === selection.selectedAgentId
-        && candidate.validationState === 'valid'
-        && !candidate.archived,
-      );
-      if (!selected) throw new Error(`Selected agent profile "${selection.selectedAgentId}" is no longer available.`);
-      if (selected.configPath === fallbackSdk.agentPath) return { sdk: fallbackSdk, selection };
-      return { sdk: await this.sdkForSelectedAgent(fallbackSdk, selected), selection };
-    } finally {
-      await preparationSdk.close();
+    // Legacy single-profile media runs need catalog orchestration when no one
+    // profile supports all attachments. Adaptive routing handles this itself.
+    if (fallbackSdk.config.settings.executionRouting?.mode !== 'adaptive'
+      && executionMode(attachments) === 'catalog'
+      && eligibleAgentSelectionCandidates({ candidates: discovery.agents, attachments: attachmentSummary }).length === 0) {
+      return { sdk: fallbackSdk };
     }
+    const decision = await decideAutomaticRun({
+      fallbackSdk,
+      sdkOptions: options,
+      cwd: this.settingsCwd,
+      originalObjective,
+      attachments: attachmentSummary,
+      sessionId,
+    });
+    const selectedId = decision.kind === 'selection' ? decision.selection.selectedAgentId : decision.routing.decision.primaryAgentId;
+    const selected = discovery.agents.find((candidate) =>
+      candidate.id === selectedId
+      && candidate.validationState === 'valid'
+      && !candidate.archived,
+    );
+    if (!selected) throw new Error(`Selected agent profile "${selectedId}" is no longer available.`);
+    const sdk = selected.configPath === fallbackSdk.agentPath ? fallbackSdk : await this.sdkForSelectedAgent(fallbackSdk, selected);
+    return decision.kind === 'selection'
+      ? { sdk, selection: decision.selection }
+      : { sdk, routing: decision.routing };
   }
 
   private async prepareRunTask(
@@ -959,6 +952,8 @@ export class DesktopRuntime {
     contentParts: ModelContentPart[],
     fileAccess: FileAccessExecutionContext | undefined,
     selection: AgentSelectionResult | undefined,
+    routing: AdaptiveExecutionRoutingResult | undefined,
+    catalogExecution: boolean,
     preparations: TaskPreparationResult[],
   ): PendingDesktopTaskPreparation {
     const paths = (kind: DesktopAttachmentInput['kind']) => (params.attachments ?? [])
@@ -980,6 +975,8 @@ export class DesktopRuntime {
       ...(fileAccess ? { fileAccess: structuredClone(fileAccess) } : {}),
       ...(params.inferenceTier ? { inferenceTier: params.inferenceTier } : {}),
       ...(selection ? { agentSelection: agentSelectionMetadata(selection) } : {}),
+      ...(routing ? { executionRouting: executionRoutingMetadata(routing) } : {}),
+      ...(catalogExecution ? { catalogExecution: true } : {}),
       preparations: structuredClone(preparations),
     };
   }
@@ -1045,7 +1042,7 @@ export class DesktopRuntime {
         taskPreparation: preparation,
       });
     }
-    const result = await targetSdk.runRaw(preparation.preparedObjective, {
+    const runOptions: AgentSdkRunOptions = {
       runId: asRunId(pending.executionId),
       sessionId: pending.sessionId,
       ...(pending.input === undefined ? {} : { input: pending.input }),
@@ -1057,8 +1054,24 @@ export class DesktopRuntime {
       metadata: {
         ...taskPreparationMetadata(preparations),
         ...(pending.agentSelection ? { agentSelection: pending.agentSelection } : {}),
+        ...(pending.executionRouting ? { executionRouting: pending.executionRouting } : {}),
       },
-    });
+    };
+    if (pending.catalogExecution) {
+      const orchestration = await this.catalogOrchestration(pending.executionId, targetSdk);
+      const { runId: _runId, ...orchestrationOptions } = runOptions;
+      const orchestrated = await orchestration.runRaw(preparation.preparedObjective, {
+        ...orchestrationOptions,
+        executionId: pending.executionId,
+        requestedAgentId: targetSdk.config.agent.id,
+        ...(pending.executionRouting && (pending.executionRouting as { mode?: string }).mode === 'orchestration'
+          ? { routingDecision: pending.executionRouting as unknown as AdaptiveExecutionRoutingResult['decision'] }
+          : {}),
+      });
+      await this.clearPendingTaskPreparation(runId).catch(() => undefined);
+      return executionResult(pending.executionId, 'catalog', orchestrated.finalResult, catalogExecutionStages(orchestrated.stages), orchestrated.sessionId);
+    }
+    const result = await targetSdk.runRaw(preparation.preparedObjective, runOptions);
     this.runSdks.set(pending.executionId, targetSdk);
     this.runSdks.set(result.runId, targetSdk);
     await this.clearPendingTaskPreparation(runId).catch(() => undefined);
@@ -1630,16 +1643,6 @@ function readPendingTaskPreparation(value: JsonValue | undefined): PendingDeskto
     throw new Error('Pending desktop task preparation metadata is invalid.');
   }
   return pending;
-}
-
-function agentSelectionMetadata(result: AgentSelectionResult): JsonObject {
-  return {
-    mode: 'auto',
-    selectedAgentId: result.selectedAgentId,
-    reason: result.reason,
-    selectionAgentId: result.selectionAgentId,
-    selectionRunId: result.selectionRunId,
-  };
 }
 
 function hasConfigurationOverrides(params: RuntimeInitializeParams): boolean {

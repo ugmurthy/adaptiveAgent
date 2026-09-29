@@ -44,14 +44,9 @@ import {
   type TaskPreparationResult,
   prepareTask,
   restoreTaskPreparation,
-  selectAgentProfile,
-  createTypeSafeAgentSelectionClient,
-  loadTypeSafeAgentSelectionPolicy,
-  selectAgentProfileWithTypeSafe,
-  directRoutingFallback,
-  ExecutionRoutingConfidenceError,
-  selectExecutionRoutingWithAgent,
-  selectExecutionRoutingWithTypeSafe,
+  decideAutomaticRun,
+  agentSelectionMetadata,
+  executionRoutingMetadata,
 } from './index.js';
 import { doctorExitCode, renderDoctorReport, runDoctor } from './install/doctor.js';
 import { renderInitReport, runInit, type InitProfile } from './install/init.js';
@@ -1194,14 +1189,21 @@ async function runSpecCommand(cli: ManualTestCliOptions): Promise<number> {
         sessionId,
         attachments: summarizeRunAttachments(spec),
       };
-      const adaptive = !cli.orchestrate && resolvedConfig.settings.executionRouting?.mode === 'adaptive';
-      const selected = adaptive
-        ? await selectInlineExecutionRouting(selectionArgs)
-        : await selectInlineAgent(selectionArgs);
-      sdk = selected.sdk;
-      selectedSdk = selected.sdk === fallbackSdk ? undefined : selected.sdk;
+      const selected = await decideAutomaticRun({
+        fallbackSdk,
+        sdkOptions,
+        cwd: resolvedCwd,
+        originalObjective: selectionArgs.originalObjective,
+        attachments: selectionArgs.attachments,
+        sessionId,
+        selectorEventListener: eventListener,
+        ...(cli.orchestrate ? { executionRoutingMode: 'single' } : {}),
+      });
+      sdk = await createSdkForSelectedAgent(selectionArgs, (await discoverAgentSdkAgents(sdkOptions)).agents,
+        selected.kind === 'selection' ? selected.selection.selectedAgentId : selected.routing.decision.primaryAgentId);
+      selectedSdk = sdk === fallbackSdk ? undefined : sdk;
       resolvedConfig = sdk.config;
-      if ('selection' in selected) executionSpec = withAgentSelection(spec, selected.selection);
+      if (selected.kind === 'selection') executionSpec = withAgentSelection(spec, selected.selection);
       else {
         executionRouting = selected.routing;
         executionSpec = withExecutionRouting(spec, selected.routing);
@@ -1369,13 +1371,20 @@ async function runInlineCommand(cli: ManualTestCliOptions, mode: 'run' | 'chat')
         sessionId,
         attachments: summarizeRunAttachments(spec),
       };
-      const adaptive = !cli.orchestrate && resolvedConfig.settings.executionRouting?.mode === 'adaptive';
-      const selected = adaptive
-        ? await selectInlineExecutionRouting(selectionArgs)
-        : await selectInlineAgent(selectionArgs);
-      sdk = selected.sdk;
-      selectedSdk = selected.sdk === fallbackSdk ? undefined : selected.sdk;
-      if ('selection' in selected) agentSelection = selected.selection;
+      const selected = await decideAutomaticRun({
+        fallbackSdk,
+        sdkOptions,
+        cwd: resolvedCwd,
+        originalObjective: selectionArgs.originalObjective,
+        attachments: selectionArgs.attachments,
+        sessionId,
+        selectorEventListener: eventListener,
+        ...(cli.orchestrate ? { executionRoutingMode: 'single' } : {}),
+      });
+      sdk = await createSdkForSelectedAgent(selectionArgs, (await discoverAgentSdkAgents(sdkOptions)).agents,
+        selected.kind === 'selection' ? selected.selection.selectedAgentId : selected.routing.decision.primaryAgentId);
+      selectedSdk = sdk === fallbackSdk ? undefined : sdk;
+      if (selected.kind === 'selection') agentSelection = selected.selection;
       else executionRouting = selected.routing;
       resolvedConfig = sdk.config;
     }
@@ -1492,24 +1501,7 @@ function withAgentSelection(spec: ManualRunSpec, selection: AgentSelectionResult
     ...spec,
     metadata: {
       ...(spec.metadata ?? {}),
-      agentSelection: {
-        mode: 'auto',
-        selectedAgentId: selection.selectedAgentId,
-        reason: selection.reason,
-        selectionAgentId: selection.selectionAgentId,
-        ...(selection.selectionRunId ? { selectionRunId: selection.selectionRunId } : {}),
-        ...(selection.selectionModel ? { selectionModel: selection.selectionModel } : {}),
-        ...(selection.confidence === undefined ? {} : { confidence: selection.confidence }),
-        ...(selection.relevance === undefined ? {} : { relevance: selection.relevance }),
-        ...(selection.probabilities ? { probabilities: selection.probabilities as unknown as JsonValue } : {}),
-        ...(selection.selectionAgentId.startsWith('typesafe:') ? {
-          typesafe: {
-            ...(selection.usage ? { usage: selection.usage } : {}),
-            inputRatePerMillionTokens: 0,
-            outputRatePerMillionTokens: 0,
-          },
-        } : {}),
-      },
+      agentSelection: agentSelectionMetadata(selection),
     },
   };
 }
@@ -1519,188 +1511,9 @@ function withExecutionRouting(spec: ManualRunSpec, routing: AdaptiveExecutionRou
     ...spec,
     metadata: {
       ...(spec.metadata ?? {}),
-      executionRouting: {
-        ...routing.decision,
-        routerId: routing.routerId,
-        ...(routing.routingRunId ? { routingRunId: routing.routingRunId } : {}),
-        ...(routing.routingModel ? { routingModel: routing.routingModel } : {}),
-      } as unknown as JsonValue,
+      executionRouting: executionRoutingMetadata(routing),
     },
   };
-}
-
-async function selectInlineExecutionRouting(args: {
-  originalObjective: string;
-  cli: ManualTestCliOptions;
-  fallbackSdk: Awaited<ReturnType<typeof createAgentSdk>>;
-  sdkOptions: AgentSdkOptions;
-  resolvedCwd: string;
-  eventListener?: (event: AgentEvent) => void;
-  sessionId: string;
-  attachments?: TaskPreparationAttachmentSummary;
-}): Promise<{ sdk: Awaited<ReturnType<typeof createAgentSdk>>; routing: AdaptiveExecutionRoutingResult }> {
-  const discovery = await discoverAgentSdkAgents(args.sdkOptions);
-  const settings = args.fallbackSdk.config.settings;
-  const selectionSettings = settings.agentSelection;
-  const attachments = args.attachments ?? {
-    images: args.cli.imagePaths,
-    files: args.cli.fileAttachmentPaths,
-    audio: args.cli.audioPaths,
-  };
-  const request = {
-    originalObjective: args.originalObjective,
-    candidates: discovery.agents,
-    workspaceRoot: args.fallbackSdk.config.workspaceRoot,
-    attachments,
-    sessionId: args.sessionId,
-    maxSpecialists: settings.executionRouting?.maxSpecialists ?? 4,
-  };
-  let routing: AdaptiveExecutionRoutingResult;
-
-  try {
-    if (selectionSettings?.engine === 'typesafe') {
-      const typesafe = selectionSettings.typesafe;
-      if (!typesafe) throw new Error('Adaptive execution routing requires settings.agentSelection.typesafe.');
-      const env = {
-        ...process.env,
-        ...(args.sdkOptions.env ?? {}),
-        ...(settings.env ?? {}),
-      };
-      const apiKeyEnv = typesafe.apiKeyEnv ?? 'TYPESAFE_API_KEY';
-      const apiKey = env[apiKeyEnv];
-      if (!apiKey) throw new Error(`TypeSafe execution routing requires environment variable "${apiKeyEnv}".`);
-      const model = typesafe.model ?? 'jev-latest';
-      const policy = await loadTypeSafeAgentSelectionPolicy(
-        args.resolvedCwd,
-        typesafe.policyPath,
-        typesafe.policy,
-        env,
-      );
-      routing = await selectExecutionRoutingWithTypeSafe(
-        createTypeSafeAgentSelectionClient({
-          apiKey,
-          baseUrl: typesafe.baseUrl,
-          timeoutMs: typesafe.timeoutMs,
-        }),
-        request,
-        model,
-        policy,
-      );
-    } else {
-      const configuredAgent = selectionSettings?.agent ?? settings.taskPreparation?.agent;
-      if (!configuredAgent) {
-        throw new Error('Adaptive execution routing requires settings.agentSelection.agent or settings.taskPreparation.agent.');
-      }
-      const routerSdk = await createAgentSdk({
-        ...args.sdkOptions,
-        cwd: args.resolvedCwd,
-        agentConfigPath: configuredAgent,
-        settingsConfigPath: undefined,
-        settingsConfig: { ...settings, agent: undefined },
-        settingsOverrides: undefined,
-        model: undefined,
-        runtime: args.fallbackSdk.created.runtime,
-        eventListener: args.eventListener,
-      });
-      try {
-        routing = await selectExecutionRoutingWithAgent(routerSdk, request);
-      } finally {
-        await routerSdk.close();
-      }
-    }
-  } catch (error) {
-    if (!(error instanceof ExecutionRoutingConfidenceError) || settings.executionRouting?.lowConfidenceFallback !== 'direct') throw error;
-    const fallback = discovery.currentAgent
-      ?? discovery.agents.find((candidate) => candidate.configPath === args.fallbackSdk.agentPath);
-    if (!fallback) throw new Error('Low-confidence routing could not resolve the configured direct fallback profile.');
-    routing = {
-      decision: directRoutingFallback(fallback, attachments, error.confidence),
-      routerId: 'deterministic:low-confidence-fallback',
-    };
-  }
-
-  const sdk = await createSdkForSelectedAgent(args, discovery.agents, routing.decision.primaryAgentId);
-  return { sdk, routing };
-}
-
-async function selectInlineAgent(args: {
-  originalObjective: string;
-  cli: ManualTestCliOptions;
-  fallbackSdk: Awaited<ReturnType<typeof createAgentSdk>>;
-  sdkOptions: AgentSdkOptions;
-  resolvedCwd: string;
-  eventListener?: (event: AgentEvent) => void;
-  sessionId: string;
-  attachments?: TaskPreparationAttachmentSummary;
-}): Promise<{ sdk: Awaited<ReturnType<typeof createAgentSdk>>; selection: AgentSelectionResult }> {
-  const discovery = await discoverAgentSdkAgents(args.sdkOptions);
-  const selectionRequest = {
-    originalObjective: args.originalObjective,
-    candidates: discovery.agents,
-    workspaceRoot: args.fallbackSdk.config.workspaceRoot,
-    attachments: args.attachments ?? {
-      images: args.cli.imagePaths,
-      files: args.cli.fileAttachmentPaths,
-      audio: args.cli.audioPaths,
-    },
-    sessionId: args.sessionId,
-  };
-  const selectionSettings = args.fallbackSdk.config.settings.agentSelection;
-  let selection: AgentSelectionResult;
-
-  if (selectionSettings?.engine === 'typesafe') {
-    const typesafe = selectionSettings.typesafe;
-    if (!typesafe) throw new Error('Auto agent selection requires settings.agentSelection.typesafe.');
-    const env = {
-      ...process.env,
-      ...(args.sdkOptions.env ?? {}),
-      ...(args.fallbackSdk.config.settings.env ?? {}),
-    };
-    const apiKeyEnv = typesafe.apiKeyEnv ?? 'TYPESAFE_API_KEY';
-    const apiKey = env[apiKeyEnv];
-    if (!apiKey) throw new Error(`TypeSafe agent selection requires environment variable "${apiKeyEnv}".`);
-    const model = typesafe.model ?? 'jev-latest';
-    const policy = await loadTypeSafeAgentSelectionPolicy(
-      args.resolvedCwd,
-      typesafe.policyPath,
-      typesafe.policy,
-      env,
-    );
-    selection = await selectAgentProfileWithTypeSafe(
-      createTypeSafeAgentSelectionClient({
-        apiKey,
-        baseUrl: typesafe.baseUrl,
-        timeoutMs: typesafe.timeoutMs,
-      }),
-      selectionRequest,
-      model,
-      policy,
-    );
-  } else {
-    const configuredAgent = selectionSettings?.agent ?? args.fallbackSdk.config.settings.taskPreparation?.agent;
-    if (!configuredAgent) {
-      throw new Error('Auto agent selection requires settings.agentSelection.agent or settings.taskPreparation.agent.');
-    }
-    const preparationSdk = await createAgentSdk({
-      ...args.sdkOptions,
-      cwd: args.resolvedCwd,
-      agentConfigPath: configuredAgent,
-      settingsConfigPath: undefined,
-      settingsConfig: { ...args.fallbackSdk.config.settings, agent: undefined },
-      settingsOverrides: undefined,
-      model: undefined,
-      runtime: args.fallbackSdk.created.runtime,
-      eventListener: args.eventListener,
-    });
-    try {
-      selection = await selectAgentProfile(preparationSdk, selectionRequest);
-    } finally {
-      await preparationSdk.close();
-    }
-  }
-
-  const sdk = await createSdkForSelectedAgent(args, discovery.agents, selection.selectedAgentId);
-  return { sdk, selection };
 }
 
 async function createSdkForSelectedAgent(

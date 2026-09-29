@@ -311,11 +311,81 @@ describe('desktop runtime protocol', () => {
       );
       expect(selected).toEqual({ sdk: fallback });
       expect(runRaw).not.toHaveBeenCalled();
-      expect(close).toHaveBeenCalledOnce();
+      expect(create).not.toHaveBeenCalled();
+      expect(close).not.toHaveBeenCalled();
     } finally {
       create.mockRestore();
       await rm(cwd, { recursive: true, force: true });
     }
+  });
+
+  it('uses the Agent SDK TypeSafe engine for an unpinned automatic desktop run', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'desktop-typesafe-selection-'));
+    const agentPath = join(cwd, 'agent.json');
+    await writeFile(agentPath, JSON.stringify({
+      id: 'bootstrap', name: 'Bootstrap', invocationModes: ['run'], defaultInvocationMode: 'run',
+      model: { provider: 'ollama', model: 'test' }, tools: [],
+    }));
+    await writeFile(join(cwd, 'agent.settings.json'), JSON.stringify({ agents: { dirs: [cwd] } }));
+    const fetch = vi.fn(async (_input: unknown, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as { questions: Record<string, unknown> };
+      const answers = Object.fromEntries(Object.keys(request.questions).map((key) => [key, { type: 'noul', noul: 0.9 }]));
+      return new Response(JSON.stringify({ model: 'jev-1.13.0', answers }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetch);
+    const { runtime } = createRuntime();
+    const fallback = {
+      agentPath,
+      config: {
+        agent: { id: 'bootstrap', name: 'Bootstrap' }, workspaceRoot: cwd,
+        settings: { agent: { mode: 'auto' }, agentSelection: { engine: 'typesafe', typesafe: { apiKeyEnv: 'TEST_TYPESAFE_API_KEY', model: 'jev-1.13.0' } } },
+      },
+      created: { runtime: {} },
+    } as unknown as AgentSdk;
+    Object.assign(runtime as unknown as Record<string, unknown>, {
+      sdkOptions: { cwd, env: { TEST_TYPESAFE_API_KEY: 'test-key' } }, settingsCwd: cwd,
+    });
+    try {
+      const selected = await (runtime as unknown as { selectDesktopRunSdk: Function })
+        .selectDesktopRunSdk(fallback, 'Review this', [], 'session-1');
+      expect(selected).toMatchObject({ sdk: fallback, selection: { selectedAgentId: 'bootstrap', selectionAgentId: 'typesafe:jev-1.13.0' } });
+      expect(fetch).toHaveBeenCalledOnce();
+    } finally {
+      vi.unstubAllGlobals();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('passes an adaptive orchestration decision to catalog execution exactly once', async () => {
+    const decision = {
+      mode: 'orchestration' as const,
+      primaryAgentId: 'primary', synthesisAgentId: 'primary',
+      assignments: [{ agentId: 'specialist', modalities: ['text' as const], reason: 'Specialized.' }],
+      selectedCatalogAgentIds: ['primary', 'specialist'], reason: 'Use a specialist.', confidence: 0.92, source: 'typesafe' as const,
+    };
+    const orchestrationRun = vi.fn(async () => ({
+      sessionId: 'session-1', stages: [], finalResult: { status: 'success', runId: 'final-1', output: 'done' },
+    }));
+    const { runtime } = createRuntime();
+    await runtime.handleRpc(request({ id: 'init', method: 'initialize', params: { protocolVersion: '1.19', clientInfo: { name: 'desktop' } } }));
+    const sdk = { runRaw: vi.fn(), config: { agent: { id: 'primary', name: 'Primary' }, workspaceRoot: '/workspace', settings: {} } };
+    Object.assign(runtime as unknown as Record<string, unknown>, {
+      sdk,
+      selectDesktopRunSdk: vi.fn(async () => ({ sdk, routing: { decision, routerId: 'typesafe:jev-1.13.0', routingModel: 'jev-1.13.0' } })),
+      prepareRunTask: vi.fn(async () => undefined),
+      catalogOrchestration: vi.fn(async () => ({ runRaw: orchestrationRun })),
+    });
+    await expect(runtime.handleRpc(request({
+      id: 'run', method: 'agent/run', params: { executionId: 'execution-1', sessionId: 'session-1', goal: 'Investigate it' },
+    }))).resolves.toMatchObject({ mode: 'catalog', status: 'success' });
+    expect(sdk.runRaw).not.toHaveBeenCalled();
+    expect(orchestrationRun).toHaveBeenCalledOnce();
+    expect(orchestrationRun).toHaveBeenCalledWith('Investigate it', expect.objectContaining({
+      requestedAgentId: 'primary', routingDecision: decision,
+      metadata: { executionRouting: expect.objectContaining({ routerId: 'typesafe:jev-1.13.0', primaryAgentId: 'primary' }) },
+    }));
   });
 
   it('returns a terminal preparation result when fail mode needs clarification', async () => {

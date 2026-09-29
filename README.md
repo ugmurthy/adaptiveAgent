@@ -245,11 +245,11 @@ validated specialist orchestration, opt in explicitly:
   },
   "executionRouting": {
     "mode": "adaptive",
-    "maxSpecialists": 4,
-    "lowConfidenceFallback": "error"
+    "maxSpecialists": 4
   },
   "agentSelection": {
     "engine": "typesafe",
+    "lowConfidenceFallback": "error",
     "typesafe": {
       "model": "jev-latest",
       "apiKeyEnv": "TYPESAFE_API_KEY",
@@ -282,9 +282,16 @@ and per-modality choices independently of the legacy single-agent
 `policy.selection.instructions`; `selection.candidateCriteria` remains common
 guidance for candidate choices.
 
-`lowConfidenceFallback` defaults to `error`. Setting it to `direct` uses the
-configured profile only when that profile supports every input modality;
-otherwise the request still fails. Explicit `--agent` remains fixed. Explicit
+On a TypeSafe selection or routing confidence/relevance threshold failure,
+Agent SDK asks `agentSelection.agent` to make the same kind of decision, or
+fails if it is absent. Set `agentSelection.lowConfidenceFallback` to `error`
+to disable this fallback explicitly, or `agent` to require a configured selector
+at settings validation time. Missing credentials, malformed answers, and invalid
+routing decisions still fail rather than silently falling back. The older
+`executionRouting.lowConfidenceFallback: "direct"` remains readable for the
+`agent` engine's adaptive routing; TypeSafe configurations using it must migrate
+to `agentSelection.agent` or explicit `lowConfidenceFallback: "error"`.
+Explicit `--agent` remains fixed. Explicit
 `--orchestrate` remains a force override and preserves deterministic Phase 1
 routing. Without `executionRouting.mode: "adaptive"`, ordinary single-profile
 selection is unchanged.
@@ -390,15 +397,26 @@ a generative selector agent. Set `TYPESAFE_API_KEY` (or configure another
   "agents": { "dirs": ["./agents"] },
   "agentSelection": {
     "engine": "typesafe",
+    "agent": "agent-selector",
+    "lowConfidenceFallback": "agent",
     "typesafe": {
       "model": "jev-1.13.0",
       "apiKeyEnv": "TYPESAFE_API_KEY",
       "policyPath": "./agent-routing-policy.json",
       "timeoutMs": 10000
     }
-  }
+  },
+  "executionRouting": { "mode": "adaptive", "maxSpecialists": 4 },
+  "taskPreparation": { "mode": "auto", "agent": "task-preparer" }
 }
 ```
+
+Here `agentSelection.agent` is a tool-free selector/router used only on a
+low-confidence TypeSafe decision; `taskPreparation.agent` separately prepares
+the task after the execution profile and shape have been chosen. The policy
+file contains `relevance`, `selection`, `routing`, `minimumConfidence`, and
+`minimumRelevance` as shown below. Alternatively place that object inline at
+`agentSelection.typesafe.policy`, but do not set both `policy` and `policyPath`.
 
 The policy file controls both JEV questions and the confidence gates without a
 code change:
