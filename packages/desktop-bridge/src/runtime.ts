@@ -208,6 +208,9 @@ export class DesktopRuntime {
       && (request.params?.id !== undefined || request.params?.provider !== undefined || request.params?.model !== undefined)) {
       throw new DesktopProtocolError('INVALID_PARAMS', 'Agent draft id, provider, and model overrides require desktop protocol 1.19.', JSON_RPC_ERROR_CODES.invalidParams);
     }
+    if (this.negotiatedProtocolVersion !== '1.19' && request.method === 'run/resume' && request.params?.allowConfigurationDrift !== undefined) {
+      throw new DesktopProtocolError('INVALID_PARAMS', 'Resume with current configuration requires desktop protocol 1.19.', JSON_RPC_ERROR_CODES.invalidParams);
+    }
     if (!['1.14', '1.15', '1.16', '1.17', '1.18', '1.19'].includes(this.negotiatedProtocolVersion) && request.method === 'runtime/initialize' && request.params?.agentSelection) {
       throw new DesktopProtocolError('INVALID_PARAMS', 'Exact agent selection requires desktop protocol 1.14.', JSON_RPC_ERROR_CODES.invalidParams);
     }
@@ -347,8 +350,15 @@ export class DesktopRuntime {
         }
         return asJsonValue(executionResult(id, 'direct', await (await this.sdkForRun(id)).resumeRaw(asRunId(id))));
       }
-      case 'run/resume':
-        return asJsonValue(await (await this.sdkForRun(request.params!.runId)).resumeRaw(asRunId(request.params!.runId)));
+      case 'run/resume': {
+        const params = request.params!;
+        const { sdk, temporary } = await this.resolveRunSdk(params.runId, params.allowConfigurationDrift === true);
+        try {
+          return asJsonValue(await sdk.resumeRaw(asRunId(params.runId)));
+        } finally {
+          if (temporary) await sdk.close();
+        }
+      }
       case 'run/retry':
         return asJsonValue(await (await this.sdkForRun(request.params!.runId)).retryRaw(asRunId(request.params!.runId)));
       case 'run/recover': {
@@ -473,12 +483,14 @@ export class DesktopRuntime {
     this.sdk = undefined;
     this.sdkOptions = undefined;
     const selectedSdks = [...this.selectedAgentSdks.values()];
+    const runSdks = [...new Set(this.runSdks.values())].filter((runSdk) => runSdk !== sdk && !selectedSdks.includes(runSdk));
     const orchestrationSdks = [...this.orchestrationSdks.values()];
     this.orchestrationSdks.clear();
     this.selectedAgentSdks.clear();
     this.runSdks.clear();
     await Promise.all(orchestrationSdks.map((orchestration) => orchestration.close()));
     await Promise.all(selectedSdks.map((selected) => selected.close()));
+    await Promise.all(runSdks.map((runSdk) => runSdk.close()));
     await sdk?.close();
     this.gatewayClient?.close();
     this.gatewayClient = undefined;
@@ -1238,38 +1250,78 @@ export class DesktopRuntime {
   }
 
   private async sdkForRun(runId: string): Promise<AgentSdk> {
+    return (await this.resolveRunSdk(runId, false, false)).sdk;
+  }
+
+  private async resolveRunSdk(runId: string, allowConfigurationDrift: boolean, requireIdentity = true): Promise<{ sdk: AgentSdk; temporary: boolean }> {
     const direct = this.runSdks.get(runId);
-    if (direct) return direct;
+    if (direct) return { sdk: direct, temporary: false };
     const fallback = this.requireSdk();
     const runStore = fallback.created?.runtime?.runStore;
-    if (!runStore) return fallback;
+    if (!runStore) return { sdk: fallback, temporary: false };
     const run = await runStore.getRun(asRunId(runId));
-    if (!run) return fallback;
+    if (!run) return { sdk: fallback, temporary: false };
     const rootSdk = this.runSdks.get(run.rootRunId);
-    if (rootSdk) return rootSdk;
+    if (rootSdk) return { sdk: rootSdk, temporary: false };
     const agentConfigPath = run.metadata?.agentConfigPath;
     const fingerprint = run.metadata?.agentConfigurationFingerprint;
-    if (typeof agentConfigPath !== 'string' || typeof fingerprint !== 'string' || agentConfigPath === fallback.agentPath) {
-      return fallback;
+    if (typeof agentConfigPath !== 'string' || !isAbsolute(agentConfigPath) || typeof fingerprint !== 'string' || !fingerprint) {
+      if (!requireIdentity) return { sdk: fallback, temporary: false };
+      throw new DesktopProtocolError('AGENT_SELECTION_MISMATCH', 'This run has no verifiable historical agent profile.', JSON_RPC_ERROR_CODES.commandRejected);
     }
     const options = this.sdkOptions;
-    if (!options) return fallback;
-    const discovery = await discoverAgentSdkAgents(options);
-    const selected = discovery.agents.find((candidate) =>
-      candidate.configPath === agentConfigPath
-      && candidate.configurationFingerprint === fingerprint
-      && candidate.validationState === 'valid',
-    );
-    if (!selected) {
+    if (!options) return { sdk: fallback, temporary: false };
+    const provider = run.modelProvider;
+    const model = run.modelName;
+    const gatewayRun = provider === 'adaptive-agent-gateway';
+    const matchesModel = (candidate: AgentSdk) => gatewayRun
+      ? candidate.config.inference.mode === 'gateway' && model === `tier:${candidate.config.inference.tier}`
+      : (!provider || candidate.config.model.provider === provider) && (!model || candidate.config.model.model === model);
+    if (agentConfigPath === fallback.agentPath
+      && matchesModel(fallback)
+      && agentConfigurationFingerprint(fallback.config) === fingerprint) {
+      return { sdk: fallback, temporary: false };
+    }
+    let sdk: AgentSdk;
+    try {
+      sdk = await AgentSdk.create({
+        ...options,
+        cwd: this.settingsCwd,
+        agentConfigPath,
+        settingsConfigPath: undefined,
+        settingsConfig: {
+          ...fallback.config.settings,
+          agent: { mode: 'fixed', configPath: agentConfigPath },
+        },
+        settingsOverrides: undefined,
+        model: {
+          ...options.model,
+          ...(!gatewayRun && provider ? { provider: provider as NonNullable<AgentSdkOptions['model']>['provider'] } : {}),
+          ...(!gatewayRun && model ? { model } : {}),
+        },
+        runtime: fallback.created.runtime,
+        eventListener: (event: AgentEvent) => this.writeAgentEvent(event),
+      });
+    } catch {
+      throw new DesktopProtocolError('AGENT_SELECTION_MISMATCH', 'The historical agent profile cannot be loaded with the current runtime settings.', JSON_RPC_ERROR_CODES.commandRejected);
+    }
+    const sameAgent = sdk.agentPath === agentConfigPath
+      && (typeof run.metadata?.agentId !== 'string' || sdk.config.agent.id === run.metadata.agentId);
+    const sameModel = matchesModel(sdk);
+    const exact = sameAgent && sameModel && agentConfigurationFingerprint(sdk.config) === fingerprint;
+    const canConfirmDrift = !gatewayRun && !!provider && !!model && typeof run.metadata?.agentId === 'string';
+    if (!sameAgent || !sameModel || (!exact && (!allowConfigurationDrift || !canConfirmDrift))) {
+      await sdk.close();
       throw new DesktopProtocolError(
-        'AGENT_SELECTION_MISMATCH',
-        'The exact agent profile used by this run is no longer available.',
+        sameAgent && sameModel && canConfirmDrift ? 'RUN_CONFIGURATION_DRIFT' : 'AGENT_SELECTION_MISMATCH',
+        !sameAgent || !sameModel ? 'The historical agent or model does not match the run.'
+          : canConfirmDrift ? 'The historical profile resolves differently under current settings. Review before resuming with the current configuration.'
+          : 'This run cannot be resumed with changed settings without a verifiable historical agent and model.',
         JSON_RPC_ERROR_CODES.commandRejected,
       );
     }
-    const sdk = await this.sdkForSelectedAgent(fallback, selected);
-    this.runSdks.set(run.rootRunId, sdk);
-    return sdk;
+    if (exact) this.runSdks.set(run.rootRunId, sdk);
+    return { sdk, temporary: !exact };
   }
 
   private async sdkForSelectedAgent(fallbackSdk: AgentSdk, selected: AgentSdkCatalogAgent): Promise<AgentSdk> {

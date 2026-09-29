@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { ADAPTIVE_AGENT_CLI_COMMANDS } from '@adaptive-agent/agent-sdk/cli';
-import { AgentSdk, type OrchestratedRunResult, type ResolvedAgentSdkConfig, type TaskPreparationResult } from '@adaptive-agent/agent-sdk';
+import { AgentSdk, agentConfigurationFingerprint, type OrchestratedRunResult, type ResolvedAgentSdkConfig, type TaskPreparationResult } from '@adaptive-agent/agent-sdk';
 import * as agentCreate from '@adaptive-agent/agent-sdk/agent-create';
 import { InMemoryOrchestrationStore } from '@adaptive-agent/core';
 
@@ -1196,6 +1196,116 @@ export async function execute() { return { value }; }
 
     expect(resumeRaw).toHaveBeenCalledWith('interrupted-run');
     expect(retryRaw).toHaveBeenCalledWith('failed-run');
+  });
+
+  it('resolves a historical profile outside current discovery with the run model and existing stores', async () => {
+    const { runtime } = createRuntime();
+    await initialize(runtime);
+    const historicalPath = '/archive/original.json';
+    const currentPath = '/workspace/current.json';
+    const baseConfig = {
+      agent: { id: 'original', name: 'Original', tools: [] },
+      model: { provider: 'ollama', model: 'historical-model' },
+      inference: { mode: 'local', tier: 'medium' },
+      interaction: { approvalMode: 'manual', clarificationMode: 'interactive' },
+      settings: { interaction: { approvalMode: 'manual' } },
+    } as unknown as ResolvedAgentSdkConfig;
+    const storedFingerprint = agentConfigurationFingerprint(baseConfig);
+    const run = {
+      id: 'old-run', rootRunId: 'old-run', modelProvider: 'ollama', modelName: 'historical-model',
+      metadata: { agentId: 'original', agentConfigPath: historicalPath, agentConfigurationFingerprint: storedFingerprint },
+    };
+    const stores = { runStore: { getRun: vi.fn(async () => run) } };
+    const fallback = { agentPath: currentPath, config: { ...baseConfig, agent: { ...baseConfig.agent, id: 'current' } }, created: { runtime: stores }, close: vi.fn() };
+    (runtime as unknown as { sdk: unknown; sdkOptions: unknown }).sdk = fallback;
+    (runtime as unknown as { sdkOptions: unknown }).sdkOptions = { cwd: '/workspace', model: { provider: 'ollama', model: 'current-model' } };
+    const resumeRaw = vi.fn(async () => ({ status: 'success', runId: 'old-run' }));
+    const close = vi.fn(async () => undefined);
+    const create = vi.spyOn(AgentSdk, 'create').mockResolvedValue({
+      agentPath: historicalPath, config: baseConfig, resumeRaw, close,
+    } as unknown as AgentSdk);
+    try {
+      await expect(runtime.handleRpc(request({ id: 'resume', method: 'run/resume', params: { runId: 'old-run' } }))).resolves.toMatchObject({ runId: 'old-run' });
+      expect(create).toHaveBeenCalledWith(expect.objectContaining({
+        agentConfigPath: historicalPath,
+        runtime: stores,
+        model: { provider: 'ollama', model: 'historical-model' },
+      }));
+      expect(resumeRaw).toHaveBeenCalledWith('old-run');
+      expect(close).not.toHaveBeenCalled();
+    } finally {
+      create.mockRestore();
+      await runtime.close();
+    }
+  });
+
+  it('blocks same-path drift until explicitly confirmed and never caches the drifted SDK', async () => {
+    const { runtime } = createRuntime();
+    await runtime.handleRpc(request({ id: 'init', method: 'initialize', params: { protocolVersion: '1.19', clientInfo: { name: 'test-client' } } }));
+    const path = '/workspace/original.json';
+    const config = {
+      agent: { id: 'original', name: 'Changed', tools: [] },
+      model: { provider: 'ollama', model: 'historical-model' },
+      inference: { mode: 'local', tier: 'medium' },
+      interaction: { approvalMode: 'manual', clarificationMode: 'interactive' },
+      settings: {},
+    } as unknown as ResolvedAgentSdkConfig;
+    const fingerprint = agentConfigurationFingerprint({ ...config, agent: { ...config.agent, name: 'Original' } });
+    const run = {
+      id: 'old-run', rootRunId: 'old-run', modelProvider: 'ollama', modelName: 'historical-model',
+      metadata: { agentId: 'original', agentConfigPath: path, agentConfigurationFingerprint: fingerprint },
+    };
+    const stores = { runStore: { getRun: vi.fn(async () => run) } };
+    const resumeRaw = vi.fn(async () => ({ status: 'success', runId: 'old-run' }));
+    (runtime as unknown as { sdk: unknown; sdkOptions: unknown }).sdk = { agentPath: path, config, created: { runtime: stores }, resumeRaw, close: vi.fn() };
+    (runtime as unknown as { sdkOptions: unknown }).sdkOptions = { cwd: '/workspace' };
+    const close = vi.fn(async () => undefined);
+    const create = vi.spyOn(AgentSdk, 'create').mockResolvedValue({ agentPath: path, config, resumeRaw, close } as unknown as AgentSdk);
+    try {
+      await expect(runtime.handleRpc(request({ id: 'resume', method: 'run/resume', params: { runId: 'old-run' } }))).rejects.toMatchObject({ code: 'RUN_CONFIGURATION_DRIFT' });
+      expect(resumeRaw).not.toHaveBeenCalled();
+      await expect(runtime.handleRpc(request({ id: 'resume-approved', method: 'run/resume', params: { runId: 'old-run', allowConfigurationDrift: true } }))).resolves.toMatchObject({ runId: 'old-run' });
+      expect(resumeRaw).toHaveBeenCalledTimes(1);
+      expect(close).toHaveBeenCalledTimes(2);
+      await expect(runtime.handleRpc(request({ id: 'resume-again', method: 'run/resume', params: { runId: 'old-run' } }))).rejects.toMatchObject({ code: 'RUN_CONFIGURATION_DRIFT' });
+      expect(create).toHaveBeenCalledTimes(3);
+    } finally {
+      create.mockRestore();
+      await runtime.close();
+    }
+  });
+
+  it('does not treat gateway adapter labels as profile model settings or permit unverified drift', async () => {
+    const { runtime } = createRuntime();
+    await runtime.handleRpc(request({ id: 'init', method: 'initialize', params: { protocolVersion: '1.19', clientInfo: { name: 'test-client' } } }));
+    const path = '/workspace/gateway-agent.json';
+    const config = {
+      agent: { id: 'gateway-agent', name: 'Changed', tools: [] },
+      model: { provider: 'openrouter', model: 'underlying-model' },
+      inference: { mode: 'gateway', tier: 'high' },
+      interaction: { approvalMode: 'manual', clarificationMode: 'interactive' },
+      settings: {},
+    } as unknown as ResolvedAgentSdkConfig;
+    let fingerprint = agentConfigurationFingerprint({ ...config, agent: { ...config.agent, name: 'Original' } });
+    const stores = { runStore: { getRun: vi.fn(async () => ({
+      id: 'old-run', rootRunId: 'old-run', modelProvider: 'adaptive-agent-gateway', modelName: 'tier:high',
+      metadata: { agentId: 'gateway-agent', agentConfigPath: path, agentConfigurationFingerprint: fingerprint },
+    })) } };
+    const resumeRaw = vi.fn(async () => ({ status: 'success', runId: 'old-run' }));
+    (runtime as unknown as { sdk: unknown; sdkOptions: unknown }).sdk = { agentPath: path, config, created: { runtime: stores }, resumeRaw, close: vi.fn() };
+    (runtime as unknown as { sdkOptions: unknown }).sdkOptions = { cwd: '/workspace' };
+    const create = vi.spyOn(AgentSdk, 'create').mockResolvedValue({ agentPath: path, config, close: vi.fn() } as unknown as AgentSdk);
+    try {
+      await expect(runtime.handleRpc(request({ id: 'resume', method: 'run/resume', params: { runId: 'old-run', allowConfigurationDrift: true } }))).rejects.toMatchObject({ code: 'AGENT_SELECTION_MISMATCH' });
+      expect(create).toHaveBeenCalledWith(expect.objectContaining({ model: {} }));
+      expect(resumeRaw).not.toHaveBeenCalled();
+      fingerprint = agentConfigurationFingerprint(config);
+      await expect(runtime.handleRpc(request({ id: 'exact', method: 'run/resume', params: { runId: 'old-run' } }))).resolves.toMatchObject({ runId: 'old-run' });
+      expect(resumeRaw).toHaveBeenCalledTimes(1);
+    } finally {
+      create.mockRestore();
+      await runtime.close();
+    }
   });
 
   it('dispatches constrained same-run recovery to core', async () => {

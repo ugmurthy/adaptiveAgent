@@ -205,6 +205,10 @@ export interface RunIdParams {
   runId: string;
 }
 
+export interface ResumeParams extends RunIdParams {
+  allowConfigurationDrift?: boolean;
+}
+
 export interface DeleteRunResult {
   deleted: true;
   rootRunId: string;
@@ -252,7 +256,7 @@ export type DesktopRpcRequest =
   | RpcRequest<'auth/updateAccessToken', UpdateAccessTokenParams>
   | RpcRequest<'agent/run', RunParams>
   | RpcRequest<'agent/chat', ChatParams>
-  | RpcRequest<'run/resume', RunIdParams>
+  | RpcRequest<'run/resume', ResumeParams>
   | RpcRequest<'run/retry', RunIdParams>
   | RpcRequest<'run/recover', RecoverParams>
   | RpcRequest<'run/continue', ContinueParams>
@@ -511,7 +515,12 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
     case 'execution/resume':
       requiredString(requiredParams(method, params), 'executionId');
       return;
-    case 'run/resume':
+    case 'run/resume': {
+      const value = requiredParams(method, params);
+      requiredString(value, 'runId');
+      optionalBoolean(value, 'allowConfigurationDrift');
+      return;
+    }
     case 'run/retry':
     case 'run/interrupt':
     case 'run/delete':

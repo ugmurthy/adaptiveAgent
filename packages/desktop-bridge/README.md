@@ -147,7 +147,7 @@ steering, and in-memory run state.
 | `auth/updateAccessToken` | `accessToken` | - |
 | `agent/run` | `goal` | `sessionId`, `input`, `inferenceMode`, `inferenceTier`, `profileRef` |
 | `agent/chat` | `message` | `sessionId`, `inferenceMode`, `inferenceTier`, `profileRef` |
-| `run/resume` | `runId` | - |
+| `run/resume` | `runId` | `allowConfigurationDrift` (protocol 1.19 only; explicit confirmation for non-gateway runs with a changed resolved profile) |
 | `run/retry` | `runId` | - |
 | `run/recover` | `runId` | `strategy` (`auto`, `resume`, `retry`, `continue`), `dryRun` |
 | `run/continue` | `runId` | - |

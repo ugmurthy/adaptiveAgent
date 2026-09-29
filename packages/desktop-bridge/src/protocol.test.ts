@@ -59,6 +59,15 @@ describe('desktop bridge protocol', () => {
     }
   });
 
+  it('requires an explicit boolean to allow configuration drift on resume', () => {
+    const envelope = (allowConfigurationDrift: unknown) => JSON.stringify({
+      jsonrpc: '2.0', id: 'resume', method: 'run/resume',
+      params: { runId: 'old-run', allowConfigurationDrift },
+    });
+    expect(parseDesktopRpcRequest(envelope(true))).toMatchObject({ params: { allowConfigurationDrift: true } });
+    expect(() => parseDesktopRpcRequest(envelope('true'))).toThrowError(expect.objectContaining({ code: 'INVALID_PARAMS' }));
+  });
+
   it('validates agent builder requests', () => {
     expect(parseDesktopRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'agent/createDraft', params: { brief: 'Build a reviewer' } }))).toMatchObject({ method: 'agent/createDraft' });
     expect(parseDesktopRpcRequest(JSON.stringify({
