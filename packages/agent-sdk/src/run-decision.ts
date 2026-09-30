@@ -44,6 +44,10 @@ export function agentSelectionMetadata(selection: AgentSelectionResult): JsonObj
     ...(selection.confidence === undefined ? {} : { confidence: selection.confidence }),
     ...(selection.relevance === undefined ? {} : { relevance: selection.relevance }),
     ...(selection.probabilities ? { probabilities: selection.probabilities as unknown as JsonValue } : {}),
+    ...(selection.rejectedTypeSafe ? { rejectedTypeSafe: {
+      ...selection.rejectedTypeSafe,
+      decision: agentSelectionMetadata(selection.rejectedTypeSafe.decision),
+    } } : {}),
     ...(selection.selectionAgentId.startsWith('typesafe:') ? {
       typesafe: {
         ...(selection.usage ? { usage: selection.usage } : {}),
@@ -60,6 +64,8 @@ export function executionRoutingMetadata(routing: AdaptiveExecutionRoutingResult
     routerId: routing.routerId,
     ...(routing.routingRunId ? { routingRunId: routing.routingRunId } : {}),
     ...(routing.routingModel ? { routingModel: routing.routingModel } : {}),
+    ...(routing.usage ? { typesafe: { usage: routing.usage } } : {}),
+    ...(routing.rejectedTypeSafe ? { rejectedTypeSafe: routing.rejectedTypeSafe } : {}),
   } as unknown as JsonObject;
 }
 
@@ -146,7 +152,16 @@ export async function decideAutomaticRun(request: AutomaticRunDecisionRequest): 
       : { kind: 'selection', selection: await selectAgentProfileWithTypeSafe(client, selectionRequest, model, policy) };
   } catch (error) {
     if (!(error instanceof AgentSelectionConfidenceError || error instanceof ExecutionRoutingConfidenceError)) throw error;
-    if (selectionSettings.lowConfidenceFallback !== 'error' && selectionSettings.agent) return runWithSelectorAgent();
+    if (selectionSettings.lowConfidenceFallback !== 'error' && selectionSettings.agent) {
+      const fallback = await runWithSelectorAgent();
+      if (fallback.kind === 'selection' && error instanceof AgentSelectionConfidenceError) {
+        return { kind: 'selection', selection: { ...fallback.selection, rejectedTypeSafe: error.rejectedTypeSafe } };
+      }
+      if (fallback.kind === 'routing' && error instanceof ExecutionRoutingConfidenceError) {
+        return { kind: 'routing', routing: { ...fallback.routing, rejectedTypeSafe: error.rejectedTypeSafe } };
+      }
+      return fallback;
+    }
     throw error;
   }
 }

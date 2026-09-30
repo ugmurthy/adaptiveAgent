@@ -1326,6 +1326,9 @@ function renderHtmlWorkflow(report: TraceReport): string {
     'Root runs, child-run shape, snapshots, and tool timeline for studying how the agent executed the objective.',
     [
       htmlSubsection('Root runs', rootRows.length === 0 ? '<p class="empty">No root runs were found.</p>' : htmlTable(['Root', 'Linked run', 'Status', 'Duration', 'Model', 'Original goal', 'Prepared goal/error'], rootRows)),
+      renderRunDecisions(report.rootRuns).length
+        ? htmlSubsection('Agent selection and execution routing', `<pre>${escapeHtml(renderRunDecisions(report.rootRuns).map((line) => stripAnsi(line)).join('\n'))}</pre>`)
+        : '',
       runTree,
       snapshots,
       htmlSubsection(formatTimelineTitle(report.timeline, report.session), timeline),
@@ -1661,6 +1664,7 @@ function renderDecisionSummary(report: TraceReport, diagnostics: TraceDiagnostic
     `${chalk.cyan('tool-provider cost')} ${formatCost(toolCost)}`,
     `${chalk.cyan('total cost')} ${formatCost(modelCost + toolCost)}`,
     `${chalk.cyan('usage')} ${formatUsageSummary(report.usage.total)}`,
+    ...renderRunDecisions(report.rootRuns),
     '', markdownBlock('# Findings'), findings,
     '', markdownBlock('# Goal / Final Output'), renderGoal(report.rootRuns), '', renderFinalOutput(report.rootRuns),
   ];
@@ -1911,6 +1915,7 @@ function renderTraceSummary(report: TraceReport): string {
   }
   lines.push(`${chalk.cyan('total steps')} ${report.totalSteps ?? 'unknown'}`);
   lines.push(renderUsage(report.usage, report.rootRuns));
+  lines.push(...renderRunDecisions(report.rootRuns));
 
   const rootRunsWithoutUsage = rootRunsNotCoveredByUsage(report.rootRuns, report.usage);
   if (rootRunsWithoutUsage.length > 0 || report.usage.byRootRun.length === 0) {
@@ -1924,6 +1929,35 @@ function renderTraceSummary(report: TraceReport): string {
     }
   }
   return lines.join('\n');
+}
+
+function renderRunDecisions(rootRuns: RootRun[]): string[] {
+  return rootRuns.flatMap((run) => {
+    const lines: string[] = [];
+    const selection = run.agentSelection;
+    const routing = run.executionRouting;
+    const prefix = rootRuns.length > 1 ? `${run.rootRunId} ` : '';
+    if (selection) lines.push(`${chalk.cyan(`${prefix}agent selection`)} ${String(selection.selectedAgentId ?? 'unknown')} by ${String(selection.selectionAgentId ?? 'unknown')}${selection.confidence === undefined ? '' : ` confidence=${selection.confidence}`}${decisionUsage(selection)}`);
+    if (routing) lines.push(`${chalk.cyan(`${prefix}execution routing`)} ${String(routing.mode ?? 'unknown')} primary=${String(routing.primaryAgentId ?? 'unknown')} by ${String(routing.routerId ?? 'unknown')}${routing.confidence === undefined ? '' : ` confidence=${routing.confidence}`}${decisionUsage(routing)}`);
+    for (const [label, decision] of [['agent selection', selection], ['execution routing', routing]] as const) {
+      const rejected = decision?.rejectedTypeSafe;
+      if (!rejected || typeof rejected !== 'object' || Array.isArray(rejected)) continue;
+      const attempt = rejected as Record<string, unknown>;
+      const candidate = attempt.decision && typeof attempt.decision === 'object' ? attempt.decision as Record<string, unknown> : {};
+      const usage = label === 'agent selection' && candidate.typesafe && typeof candidate.typesafe === 'object'
+        ? (candidate.typesafe as Record<string, unknown>).usage : attempt.usage;
+      lines.push(`${chalk.cyan(`${prefix}rejected TypeSafe ${label}`)} ${label === 'agent selection' ? `candidate=${String(candidate.selectedAgentId ?? 'unknown')}` : `mode=${String(candidate.mode ?? 'unknown')} primary=${String(candidate.primaryAgentId ?? 'unknown')}`} ${String(attempt.threshold)}=${label === 'agent selection' ? String(candidate[attempt.threshold as string] ?? 'unknown') : String(attempt[attempt.threshold === 'confidence' ? 'choiceConfidence' : 'relevance'] ?? 'unknown')} minimum=${String(attempt.minimum)} model=${String(label === 'agent selection' ? candidate.selectionModel ?? 'unknown' : attempt.model ?? 'unknown')}${decisionUsage({ typesafe: { usage } })}`);
+    }
+    return lines;
+  });
+}
+
+function decisionUsage(decision: Record<string, unknown>): string {
+  const typesafe = decision.typesafe;
+  const usage = typesafe && typeof typesafe === 'object' ? (typesafe as Record<string, unknown>).usage : undefined;
+  if (!usage || typeof usage !== 'object') return '';
+  const tokens = usage as Record<string, unknown>;
+  return `\n  TypeSafe tokens=${String(tokens.inputTokens ?? 'unknown')}+${String(tokens.outputTokens ?? 'unknown')} (cost not included in run totals)`;
 }
 
 function rootRunsNotCoveredByUsage(rootRuns: RootRun[], usage: SessionUsageSummary): RootRun[] {

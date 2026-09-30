@@ -6,7 +6,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 
 import { AgentSdk } from './index.js';
 import { validateSettings } from './config-validate.js';
-import { decideAutomaticRun } from './run-decision.js';
+import { agentSelectionMetadata, decideAutomaticRun, executionRoutingMetadata } from './run-decision.js';
 
 const directories: string[] = [];
 
@@ -93,6 +93,22 @@ it.each([[false, undefined], [true, undefined], [false, 'agent'], [true, 'agent'
   expect(decision).toMatchObject(adaptive
     ? { kind: 'routing', routing: { routerId: 'selector', decision: { primaryAgentId: 'researcher', source: 'agent' } } }
     : { kind: 'selection', selection: { selectedAgentId: 'researcher', selectionAgentId: 'selector' } });
+  if (decision.kind === 'selection') {
+    expect(agentSelectionMetadata(decision.selection)).toMatchObject({
+      selectedAgentId: 'researcher', selectionAgentId: 'selector',
+      rejectedTypeSafe: { threshold: 'confidence', minimum: 0.7, decision: {
+        selectedAgentId: 'researcher', confidence: 0.2, relevance: 0.9,
+        probabilities: { researcher: 0.2 }, selectionModel: 'jev-1.13.0',
+      } },
+    });
+  } else {
+    expect(executionRoutingMetadata(decision.routing)).toMatchObject({
+      source: 'agent', rejectedTypeSafe: { threshold: 'confidence', minimum: 0.7,
+        choiceConfidence: 0.2, relevance: 0.9, model: 'jev-1.13.0',
+        decision: { mode: 'direct', primaryAgentId: 'researcher', source: 'typesafe' },
+      },
+    });
+  }
   },
 );
 

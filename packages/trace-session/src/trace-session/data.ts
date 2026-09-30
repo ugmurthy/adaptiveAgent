@@ -1379,6 +1379,8 @@ function rootRunRowsToRootRuns(rows: Array<{
     completedAt: row.completed_at,
     status: row.status,
     goal: row.goal,
+    agentSelection: runDecisionFromMetadata(row.metadata, 'agentSelection'),
+    executionRouting: runDecisionFromMetadata(row.metadata, 'executionRouting'),
     taskPreparation: taskPreparationFromMetadata(row.metadata),
     result: row.result,
     errorCode: row.error_code,
@@ -1389,6 +1391,12 @@ function rootRunRowsToRootRuns(rows: Array<{
     leaseExpiresAt: row.lease_expires_at,
     heartbeatAt: row.heartbeat_at,
   }));
+}
+
+export function runDecisionFromMetadata(metadata: unknown, key: 'agentSelection' | 'executionRouting'): Record<string, unknown> | undefined {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return undefined;
+  const value = (metadata as Record<string, unknown>)[key];
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
 
 export function taskPreparationFromMetadata(metadata: unknown): RootRun['taskPreparation'] {

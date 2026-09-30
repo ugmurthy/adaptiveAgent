@@ -7,6 +7,11 @@ export interface AgentSelectionResult {
   selectedAgentId: string;
   reason: string;
   selectionAgentId: string;
+  rejectedTypeSafe?: {
+    decision: Omit<AgentSelectionResult, 'rejectedTypeSafe'>;
+    threshold: 'confidence' | 'relevance';
+    minimum: number;
+  };
   selectionRunId?: string;
   selectionModel?: string;
   confidence?: number;

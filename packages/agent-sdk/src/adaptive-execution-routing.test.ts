@@ -49,6 +49,7 @@ describe('adaptive execution routing', () => {
   it('builds a validated candidate-by-modality orchestration decision from TypeSafe answers', async () => {
     const evaluate = vi.fn(async (_request: Parameters<TypeSafeAgentSelectionClient['evaluate']>[0]) => ({
       model: 'jev-test',
+      usage: { input_tokens: 71, output_tokens: 9 },
       answers: {
         orchestration_primary: choice('general', 0.94),
         assignment_text: choice('general', 0.93),
@@ -87,6 +88,7 @@ describe('adaptive execution routing', () => {
   it('allows TypeSafe to choose direct execution when one profile covers every modality', async () => {
     const evaluate = vi.fn(async (_request: Parameters<TypeSafeAgentSelectionClient['evaluate']>[0]) => ({
       model: 'jev-test',
+      usage: { input_tokens: 71, output_tokens: 9 },
       answers: {
         execution_mode: choice('direct', 0.9),
         candidate_0_text_relevant: noul(0.95),
@@ -107,6 +109,7 @@ describe('adaptive execution routing', () => {
       },
     });
 
+    expect(result.usage).toEqual({ inputTokens: 71, outputTokens: 9 });
     expect(result.decision).toMatchObject({
       mode: 'direct',
       primaryAgentId: 'multimodal',

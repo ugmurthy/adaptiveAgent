@@ -6685,6 +6685,8 @@ function runMetadataEventPayload(metadata: Record<string, JsonValue> | undefined
   return removeUndefinedJsonFields({
     agentId: typeof metadata.agentId === 'string' ? metadata.agentId : undefined,
     orchestration: isJsonObject(metadata.orchestration) ? metadata.orchestration : undefined,
+    agentSelection: isJsonObject(metadata.agentSelection) ? metadata.agentSelection : undefined,
+    executionRouting: isJsonObject(metadata.executionRouting) ? metadata.executionRouting : undefined,
   });
 }
 

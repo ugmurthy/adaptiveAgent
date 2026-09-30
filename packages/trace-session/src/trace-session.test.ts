@@ -10,10 +10,19 @@ import { cacheKey, databaseIdentity, effectiveCacheTtl, parseCacheDuration, read
 import { usageForArgs } from './trace-session/constants.js';
 import type { EventType, MilestoneEntry, TraceAggregateObservation, TraceReport, TraceRow } from './trace-session.js';
 import { SQLITE_TRACE_DATABASE_OPTIONS } from './trace-session/reader.js';
-import { filterSessions, sessionPresentationFromRuns } from './trace-session/data.js';
+import { filterSessions, runDecisionFromMetadata, sessionPresentationFromRuns } from './trace-session/data.js';
 import type { SessionListItem } from './trace-session/types.js';
 
 describe('session presentation projection', () => {
+  it('projects only decision metadata from core runs without gateway tables', () => {
+    const selection = { selectedAgentId: 'fallback', rejectedTypeSafe: { threshold: 'confidence', minimum: 0.7 } };
+    const routing = { mode: 'direct', rejectedTypeSafe: { threshold: 'relevance', minimum: 0.6 } };
+    const metadata = { agentSelection: selection, executionRouting: routing, secret: 'not in report' };
+    expect(runDecisionFromMetadata(metadata, 'agentSelection')).toEqual(selection);
+    expect(runDecisionFromMetadata(metadata, 'executionRouting')).toEqual(routing);
+    expect(runDecisionFromMetadata({ agentSelection: [] }, 'agentSelection')).toBeUndefined();
+  });
+
   it('uses persisted task-preparation title and name from the earliest non-internal root', () => {
     const runs = [
       { rootRunId: 'selector', startedAt: '2026-01-01T00:00:00Z', goal: 'Select an agent', metadata: { command: 'agent-selection' } },
@@ -2201,6 +2210,28 @@ describe('trace-session CLI helpers', () => {
     });
   });
 
+  it('reports effective and rejected decisions beside usage without adding selection tokens to run totals', () => {
+    const base = reliabilityReport();
+    const report = reliabilityReport({ rootRuns: [{
+      ...base.rootRuns[0]!,
+      agentSelection: { selectedAgentId: 'fallback', selectionAgentId: 'selector', rejectedTypeSafe: {
+        threshold: 'confidence', minimum: 0.7,
+        decision: { selectedAgentId: 'researcher', confidence: 0.2, relevance: 0.9, selectionModel: 'jev-1.13.0', typesafe: { usage: { inputTokens: 113, outputTokens: 7 } } },
+      } },
+      executionRouting: { mode: 'direct', primaryAgentId: 'fallback', routerId: 'selector', rejectedTypeSafe: {
+        threshold: 'relevance', minimum: 0.6, model: 'jev-1.13.0', choiceConfidence: 0.8, relevance: 0.3,
+        decision: { mode: 'orchestration', primaryAgentId: 'researcher' }, usage: { inputTokens: 51, outputTokens: 4 },
+      } },
+    }] });
+    const text = stripAnsi(renderTraceReport(report, { json: false, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false, view: 'summary' }));
+    expect(text).toContain('agent selection fallback by selector');
+    expect(text).toContain('rejected TypeSafe agent selection candidate=researcher confidence=0.2 minimum=0.7 model=jev-1.13.0\n  TypeSafe tokens=113+7 (cost not included in run totals)');
+    expect(text).toContain('rejected TypeSafe execution routing mode=orchestration primary=researcher relevance=0.3 minimum=0.6 model=jev-1.13.0\n  TypeSafe tokens=51+4 (cost not included in run totals)');
+    const json = JSON.parse(renderTraceReport(report, { json: true, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false })) as TraceReport;
+    expect(json.rootRuns[0]?.executionRouting?.rejectedTypeSafe).toEqual(report.rootRuns[0]?.executionRouting?.rejectedTypeSafe);
+    expect(json.usage.total).toEqual(base.usage.total);
+  });
+
   it('prints JSON as machine-readable report output', () => {
     const output = renderTraceReport(
       {
@@ -2991,6 +3022,14 @@ describe('trace-session CLI helpers', () => {
         errorMessage: 'Exploded <b>bad</b>',
         modelProvider: 'openai',
         modelName: 'gpt-test',
+        agentSelection: { selectedAgentId: 'fallback', selectionAgentId: 'selector', rejectedTypeSafe: {
+          threshold: 'confidence', minimum: 0.7,
+          decision: { selectedAgentId: 'researcher', confidence: 0.2, selectionModel: 'jev-test', typesafe: { usage: { inputTokens: 113, outputTokens: 7 } } },
+        } },
+        executionRouting: { mode: 'direct', primaryAgentId: 'fallback', routerId: 'selector', rejectedTypeSafe: {
+          threshold: 'relevance', minimum: 0.6, model: 'jev-test', choiceConfidence: 0.8, relevance: 0.3,
+          decision: { mode: 'orchestration', primaryAgentId: 'researcher' }, usage: { inputTokens: 51, outputTokens: 4 },
+        } },
       }],
       usage: usage({
         total: {
@@ -3060,6 +3099,7 @@ describe('trace-session CLI helpers', () => {
     });
 
     expect(html).toContain('<!doctype html>');
+    expect(html).toContain('rejected TypeSafe agent selection');
     expect(html).toContain('Adaptive Agent Trace Report');
     expect(html).toContain('Trace Brief');
     expect(html).toContain('Findings');
@@ -4057,6 +4097,10 @@ describe('trace-session CLI helpers', () => {
                 completed_at: '2026-04-16T10:00:02.000Z',
                 status: 'succeeded',
                 goal: 'Swarm branch A',
+                metadata: {
+                  agentSelection: { selectedAgentId: 'fallback', rejectedTypeSafe: { threshold: 'confidence', minimum: 0.7 } },
+                  executionRouting: { mode: 'direct', rejectedTypeSafe: { threshold: 'relevance', minimum: 0.6 } },
+                },
                 result: 'A done',
               },
               {
@@ -4139,6 +4183,10 @@ describe('trace-session CLI helpers', () => {
 
     expect(report.session).toBeNull();
     expect(report.rootRuns.map((run) => run.rootRunId)).toEqual(['root-swarm-a', 'root-swarm-b']);
+    expect(report.rootRuns[0]).toMatchObject({
+      agentSelection: { selectedAgentId: 'fallback', rejectedTypeSafe: { threshold: 'confidence' } },
+      executionRouting: { mode: 'direct', rejectedTypeSafe: { threshold: 'relevance' } },
+    });
     expect(report.warnings).toEqual([
       'Gateway session "swarm-session-1" was not found; tracing matching agent_runs rows instead.',
     ]);

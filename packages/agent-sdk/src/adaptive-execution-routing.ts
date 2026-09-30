@@ -31,12 +31,23 @@ export interface AdaptiveExecutionRoutingResult {
   routerId: string;
   routingRunId?: string;
   routingModel?: string;
+  usage?: { inputTokens: number; outputTokens: number };
+  rejectedTypeSafe?: {
+    decision: ExecutionRoutingDecision;
+    model: string;
+    choiceConfidence: number;
+    relevance: number;
+    threshold: 'confidence' | 'relevance';
+    minimum: number;
+    usage?: { inputTokens: number; outputTokens: number };
+  };
 }
 
 export class ExecutionRoutingConfidenceError extends Error {
   constructor(
     message: string,
     readonly confidence: number,
+    readonly rejectedTypeSafe?: NonNullable<AdaptiveExecutionRoutingResult['rejectedTypeSafe']>,
   ) {
     super(message);
     this.name = 'ExecutionRoutingConfidenceError';
@@ -217,14 +228,25 @@ export async function selectExecutionRoutingWithTypeSafe(
   validateRouting(decision, candidates, modalities, request.maxSpecialists);
   const minimumConfidence = policy.minimumConfidence ?? 0.5;
   const minimumRelevance = policy.minimumRelevance ?? 0.5;
-  enforceConfidence(Math.min(...choiceConfidences), minimumConfidence);
-  if (Math.min(...relevance) < minimumRelevance) {
+  const attempt = {
+    decision,
+    model: response.model,
+    choiceConfidence: Math.min(...choiceConfidences),
+    relevance: Math.min(...relevance),
+    ...(response.usage ? { usage: { inputTokens: response.usage.input_tokens, outputTokens: response.usage.output_tokens } } : {}),
+  };
+  if (attempt.choiceConfidence < minimumConfidence) {
     throw new ExecutionRoutingConfidenceError(
-      `Execution routing relevance ${Math.min(...relevance).toFixed(3)} is below the configured minimum ${minimumRelevance.toFixed(3)}.`,
-      Math.min(...relevance),
+      `Execution routing confidence ${attempt.choiceConfidence.toFixed(3)} is below the configured minimum ${minimumConfidence.toFixed(3)}.`,
+      attempt.choiceConfidence, { ...attempt, threshold: 'confidence', minimum: minimumConfidence });
+  }
+  if (attempt.relevance < minimumRelevance) {
+    throw new ExecutionRoutingConfidenceError(
+      `Execution routing relevance ${attempt.relevance.toFixed(3)} is below the configured minimum ${minimumRelevance.toFixed(3)}.`,
+      attempt.relevance, { ...attempt, threshold: 'relevance', minimum: minimumRelevance },
     );
   }
-  return { decision, routerId: `typesafe:${response.model}`, routingModel: response.model };
+  return { decision, routerId: `typesafe:${response.model}`, routingModel: response.model, ...(attempt.usage ? { usage: attempt.usage } : {}) };
 }
 
 export function directRoutingFallback(

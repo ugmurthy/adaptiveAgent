@@ -118,6 +118,8 @@ export interface RootRun {
   completedAt?: string | null;
   status: string | null;
   goal: string | null;
+  agentSelection?: Record<string, unknown>;
+  executionRouting?: Record<string, unknown>;
   taskPreparation?: {
     originalGoal: string;
     preparedGoal: string;

@@ -115,7 +115,12 @@ describe('TypeSafe agent selection', () => {
 
     await expect(selectAgentProfileWithTypeSafe(client, request(), 'jev-1.13.0', {
       minimumConfidence: 0.7,
-    })).rejects.toThrow('confidence 0.690 is below the configured minimum 0.700');
+    })).rejects.toMatchObject({
+      message: 'TypeSafe agent selection confidence 0.690 is below the configured minimum 0.700.',
+      rejectedTypeSafe: { threshold: 'confidence', minimum: 0.7,
+        decision: { selectedAgentId: 'researcher', confidence: 0.69, probabilities: { researcher: 0.51, coder: 0.49 } },
+      },
+    });
   });
 
   it('still checks relevance when attachment filtering leaves one candidate', async () => {
@@ -130,9 +135,11 @@ describe('TypeSafe agent selection', () => {
       workspaceRoot: '/workspace',
       attachments: { images: [], files: [], audio: ['recording.mp3'] },
       sessionId: 'session-1',
-    }, 'jev-1.13.0', { minimumRelevance: 0.7 })).rejects.toThrow(
-      'relevance 0.400 for agent "audio" is below the configured minimum 0.700',
-    );
+    }, 'jev-1.13.0', { minimumRelevance: 0.7 })).rejects.toMatchObject({
+      rejectedTypeSafe: { threshold: 'relevance', minimum: 0.7,
+        decision: { selectedAgentId: 'audio', confidence: 1, relevance: 0.4 },
+      },
+    });
     expect(evaluate).toHaveBeenCalledWith(expect.objectContaining({
       questions: {
         candidate_0_relevant: expect.objectContaining({ type: 'noul' }),

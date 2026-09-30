@@ -66,7 +66,7 @@ export interface TypeSafeAgentSelectionClient {
 }
 
 export class AgentSelectionConfidenceError extends Error {
-  constructor(message: string, readonly confidence: number) {
+  constructor(message: string, readonly confidence: number, readonly rejectedTypeSafe?: NonNullable<AgentSelectionResult['rejectedTypeSafe']>) {
     super(message);
     this.name = 'AgentSelectionConfidenceError';
   }
@@ -184,14 +184,7 @@ export async function selectAgentProfileWithTypeSafe(
   if (!isProbability(confidence) || !isProbability(relevanceAnswer.noul)) {
     throw new Error('TypeSafe agent selector returned confidence or relevance outside the range 0 to 1.');
   }
-  if (confidence < policy.minimumConfidence) {
-    throw new AgentSelectionConfidenceError(`TypeSafe agent selection confidence ${confidence.toFixed(3)} is below the configured minimum ${policy.minimumConfidence.toFixed(3)}.`, confidence);
-  }
-  if (relevanceAnswer.noul < policy.minimumRelevance) {
-    throw new AgentSelectionConfidenceError(`TypeSafe relevance ${relevanceAnswer.noul.toFixed(3)} for agent "${selectedAgentId}" is below the configured minimum ${policy.minimumRelevance.toFixed(3)}.`, relevanceAnswer.noul);
-  }
-
-  return {
+  const result: AgentSelectionResult = {
     selectedAgentId,
     reason: `TypeSafe selected "${selectedAgentId}" with confidence ${confidence.toFixed(3)} and relevance ${relevanceAnswer.noul.toFixed(3)}.`,
     selectionAgentId: `typesafe:${response.model}`,
@@ -206,6 +199,15 @@ export async function selectAgentProfileWithTypeSafe(
       },
     } : {}),
   };
+  if (confidence < policy.minimumConfidence) {
+    throw new AgentSelectionConfidenceError(`TypeSafe agent selection confidence ${confidence.toFixed(3)} is below the configured minimum ${policy.minimumConfidence.toFixed(3)}.`, confidence,
+      { decision: result, threshold: 'confidence', minimum: policy.minimumConfidence });
+  }
+  if (relevanceAnswer.noul < policy.minimumRelevance) {
+    throw new AgentSelectionConfidenceError(`TypeSafe relevance ${relevanceAnswer.noul.toFixed(3)} for agent "${selectedAgentId}" is below the configured minimum ${policy.minimumRelevance.toFixed(3)}.`, relevanceAnswer.noul,
+      { decision: result, threshold: 'relevance', minimum: policy.minimumRelevance });
+  }
+  return result;
 }
 
 function normalizePolicy(input: unknown): Required<TypeSafeAgentSelectionPolicyConfig> {

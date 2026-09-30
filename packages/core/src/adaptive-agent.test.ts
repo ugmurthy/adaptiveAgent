@@ -3450,12 +3450,15 @@ describe('AdaptiveAgent', () => {
       },
     });
 
-    const result = await agent.run({ goal: 'Persist the initial state transactionally' });
+    const agentSelection = { selectedAgentId: 'researcher', rejectedTypeSafe: { threshold: 'confidence', minimum: 0.7 } };
+    const executionRouting = { mode: 'direct', rejectedTypeSafe: { threshold: 'relevance', minimum: 0.6 } };
+    const result = await agent.run({ goal: 'Persist the initial state transactionally', metadata: { agentSelection, executionRouting } });
 
     expect(result.status).toBe('success');
     expect(runInTransaction).toHaveBeenCalledTimes(2);
     const events = await eventStore.listByRun(result.runId);
     expect(events[0]?.type).toBe('run.created');
+    expect(events[0]?.payload).toMatchObject({ agentSelection, executionRouting });
     expect(events[1]?.type).toBe('snapshot.created');
     const latestSnapshot = await snapshotStore.getLatest(result.runId);
     expect(latestSnapshot?.state).toMatchObject({
