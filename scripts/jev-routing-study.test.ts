@@ -118,7 +118,7 @@ describe('JEV routing study', () => {
     expect(modalityMarker({ images: [], audio: ['a', 'b'], files: ['f'] })).toBe('AF');
   });
 
-  it('limits history by the latest distinct non-null sessions', async () => {
+  it('limits history by the latest distinct non-null sessions, not the latest routed sessions', async () => {
     const fixture = await createFixture();
     const database = new Database(fixture.databasePath, { strict: true });
     insertRun(database, 'execution-approx-2', 'session-approx', {
@@ -129,18 +129,170 @@ describe('JEV routing study', () => {
       goal: 'Newer routed run without a session',
       metadata: { agentSelection: { selectedAgentId: 'current-a' } },
     }, '2026-01-05T00:00:00.000Z', '2026-01-05T00:00:00.001Z');
+    insertRun(database, 'execution-unrouted', 'session-new', {
+      goal: 'A newer session without agent selection',
+    }, '2026-01-06T00:00:00.000Z', '2026-01-06T00:00:00.001Z');
+    insertRun(database, 'execution-exact-followup', 'session-exact', {
+      goal: 'Recent activity in an older routed session',
+    }, '2026-01-07T00:00:00.000Z', '2026-01-07T00:00:00.001Z');
+    insertRun(database, 'selector-new', 'session-new', {
+      goal: 'Select agent', metadata: { command: 'agent-selection', agentSelection: { role: 'selector' } },
+    }, '2026-01-06T00:00:01.000Z');
     database.close();
 
     const latest = extractHistoricalCases(fixture.databasePath, { limit: 1 });
+    const latestTwo = extractHistoricalCases(fixture.databasePath, { limit: 2 });
+    const latestThree = extractHistoricalCases(fixture.databasePath, { limit: 3 });
     const exact = extractHistoricalCases(fixture.databasePath, { sessionIds: ['session-exact'] });
 
     expect(latest.map((item) => [item.sessionId, item.runId])).toEqual([
+      ['session-exact', 'execution-exact-followup'],
+      ['session-exact', 'execution-exact'],
+    ]);
+    expect(latestTwo.map((item) => item.runId)).toEqual(['execution-exact-followup', 'execution-exact', 'execution-unrouted']);
+    expect(latestThree.map((item) => [item.sessionId, item.runId])).toEqual([
+      ['session-exact', 'execution-exact-followup'],
+      ['session-exact', 'execution-exact'],
+      ['session-new', 'execution-unrouted'],
       ['session-approx', 'execution-approx-2'],
       ['session-approx', 'execution-approx'],
     ]);
     expect(exact.map((item) => [item.sessionId, item.runId])).toEqual([
+      ['session-exact', 'execution-exact-followup'],
       ['session-exact', 'execution-exact'],
     ]);
+  });
+
+  it('reports accepted and rejected persisted JEV decisions without evaluating, even with --refresh', async () => {
+    const fixture = await createFixture();
+    const database = new Database(fixture.databasePath, { strict: true });
+    insertRun(database, 'accepted-jev', 'session-accepted', {
+      goal: 'Accepted objective', metadata: { agentSelection: {
+        selectedAgentId: 'current-a', selectionModel: 'jev-test', confidence: 0.9, relevance: 0.8,
+        probabilities: { 'current-a': 0.9, 'current-b': 0.1 },
+        typesafe: { usage: { inputTokens: 100, outputTokens: 7 } },
+      } },
+    });
+    insertRun(database, 'rejected-jev', 'session-rejected', {
+      goal: 'Rejected objective', metadata: { agentSelection: {
+        selectedAgentId: 'current-b', selectionRunId: 'selector-1',
+        rejectedTypeSafe: { threshold: 'confidence', minimum: 0.7, decision: {
+          selectedAgentId: 'current-a', selectionModel: 'jev-test', confidence: 0.4, relevance: 0.85,
+          probabilities: { 'current-a': 0.4, 'current-b': 0.6 },
+        } },
+      } },
+    });
+    database.close();
+    const evaluator: TypeSafeAgentSelectionClient = { evaluate: () => { throw new Error('must not evaluate'); } };
+    const common = { mode: 'history' as const, settingsPath: fixture.settingsPath, databasePath: fixture.databasePath,
+      allowCurrentCatalog: false, sessionIds: ['session-accepted', 'session-rejected'], repeat: 1,
+      inputPricePerMillion: 0.042, cachePath: fixture.cachePath, showState: false, showResponse: false, evaluator };
+    const results = await runStudy({ ...common, refresh: true });
+    expect(results).toHaveLength(2);
+    expect(results[0]).toMatchObject({ runId: 'accepted-jev', objective: 'Accepted objective', jevSelection: 'current-a',
+      existingSelection: 'current-a', agreement: true, confidence: 0.9, relevance: 0.8, margin: 0.8,
+      inputTokens: 100, outputTokens: 7, accepted: true, reportedOnly: true, cached: false });
+    expect(results[1]).toMatchObject({ runId: 'rejected-jev', objective: 'Rejected objective', jevSelection: 'current-a',
+      existingSelection: 'current-b', agreement: false, confidence: 0.4, relevance: 0.85,
+      accepted: false, reportedOnly: true, cached: false });
+    expect(results[0]!.estimatedCostUSD).toBeCloseTo(0.0000042);
+    const process = Bun.spawn(['bun', 'scripts/jev-routing-study.ts', 'history', '--session-id', 'session-accepted',
+      '--database', fixture.databasePath, '--settings', fixture.settingsPath, '--refresh'],
+    { cwd: join(import.meta.dir, '..'), stdout: 'pipe', stderr: 'pipe' });
+    expect(await process.exited).toBe(0);
+    expect(await new Response(process.stdout).text()).toContain('│ approx  │ *      │');
+    expect(await new Response(process.stderr).text()).toContain('reported only');
+    const forced = Bun.spawn(['bun', 'scripts/jev-routing-study.ts', 'history', '--session-id', 'session-accepted',
+      '--database', fixture.databasePath, '--settings', fixture.settingsPath,
+      '--force-jev', '--no-allow-current-catalog'],
+    { cwd: join(import.meta.dir, '..'), stdout: 'pipe', stderr: 'pipe' });
+    expect(await forced.exited).toBe(1);
+    expect(await new Response(forced.stderr).text()).toContain('no exact linked selector context');
+  });
+
+  it('forces a fresh evaluation instead of persisted JEV or study cache reuse', async () => {
+    const fixture = await createFixture();
+    const database = new Database(fixture.databasePath, { strict: true });
+    insertRun(database, 'accepted-jev', 'session-accepted', { goal: 'Accepted objective', metadata: { agentSelection: {
+      selectedAgentId: 'current-a', selectionModel: 'jev-test', confidence: 0.9, relevance: 0.8,
+    } } });
+    database.close();
+    let calls = 0;
+    const evaluator = fakeEvaluator(() => { calls += 1; return { selected: 'current-b', confidence: 0.8, relevance: 0.9 }; });
+    const options = { mode: 'history' as const, settingsPath: fixture.settingsPath, databasePath: fixture.databasePath,
+      allowCurrentCatalog: true, sessionIds: ['session-accepted'], repeat: 1, inputPricePerMillion: 0.042,
+      cachePath: fixture.cachePath, refresh: false, showState: false, showResponse: false, evaluator };
+    const first = await runStudy({ ...options, forceJev: true });
+    const second = await runStudy({ ...options, forceJev: true });
+    expect(calls).toBe(2);
+    expect(first[0]).toMatchObject({ jevSelection: 'current-b', cached: false, accepted: true });
+    expect(first[0]!.reportedOnly).toBeUndefined();
+    expect(second[0]!.cached).toBe(false);
+    const reported = await runStudy(options);
+    expect(reported[0]).toMatchObject({ jevSelection: 'current-a', reportedOnly: true });
+    expect(calls).toBe(2);
+  });
+
+  it('evaluates the original objective for recent sessions with no selection and agent-only selection', async () => {
+    const fixture = await createFixture();
+    const database = new Database(fixture.databasePath, { strict: true });
+    insertRun(database, 'agent-only', 'session-agent-only', {
+      goal: 'Prepared goal', metadata: {
+        taskPreparation: { originalObjective: 'Original agent-only objective' },
+        agentSelection: { selectedAgentId: 'current-a' },
+      },
+    }, '2026-01-06T00:00:00.000Z');
+    insertRun(database, 'no-selection', 'session-no-selection', {
+      goal: 'Original no-selection objective',
+    }, '2026-01-07T00:00:00.000Z');
+    insertRun(database, 'child', 'session-no-selection', { goal: 'Child goal' }, '2026-01-08T00:00:00.000Z');
+    database.query("UPDATE agent_runs SET parent_run_id = 'no-selection' WHERE id = 'child'").run();
+    database.close();
+    const objectives: string[] = [];
+    const evaluator = fakeEvaluator((objective) => {
+      objectives.push(objective);
+      return { selected: 'current-b', confidence: 0.8, relevance: 0.9 };
+    });
+    const results = await runStudy({ mode: 'history', settingsPath: fixture.settingsPath,
+      databasePath: fixture.databasePath, allowCurrentCatalog: true, limit: 2, repeat: 1,
+      inputPricePerMillion: 0.042, cachePath: fixture.cachePath, refresh: true,
+      showState: false, showResponse: false, evaluator });
+    expect(objectives).toEqual(['Original no-selection objective', 'Original agent-only objective']);
+    expect(results.map((result) => [result.runId, result.existingSelection, result.jevSelection])).toEqual([
+      ['no-selection', undefined, 'current-b'],
+      ['agent-only', 'current-a', 'current-b'],
+    ]);
+  });
+
+  it('uses a preparer original objective when execution is absent and reports sessions with no usable objective', async () => {
+    const fixture = await createFixture();
+    const database = new Database(fixture.databasePath, { strict: true });
+    insertRun(database, 'selector-only', 'session-setup', {
+      goal: 'Synthetic selector goal', metadata: { command: 'agent-selection',
+        agentSelection: { originalObjective: 'Original setup objective' } },
+    }, '2026-01-06T00:00:00.000Z');
+    insertRun(database, 'preparer-only', 'session-setup', {
+      goal: 'Synthetic preparer goal', metadata: { command: 'task-preparation',
+        taskPreparation: { originalObjective: 'Original setup objective' } },
+    }, '2026-01-06T00:00:01.000Z');
+    insertRun(database, 'no-objective', 'session-empty', {
+      goal: 'Synthetic selector goal', metadata: { command: 'agent-selection' },
+    }, '2026-01-07T00:00:00.000Z');
+    database.close();
+    const objectives: string[] = [];
+    const evaluator = fakeEvaluator((objective) => {
+      objectives.push(objective);
+      return { selected: 'current-b', confidence: 0.8, relevance: 0.9 };
+    });
+    const results = await runStudy({ mode: 'history', settingsPath: fixture.settingsPath,
+      databasePath: fixture.databasePath, allowCurrentCatalog: true, limit: 2, repeat: 1,
+      inputPricePerMillion: 0.042, cachePath: fixture.cachePath, refresh: true,
+      showState: false, showResponse: false, evaluator });
+    expect(objectives).toEqual(['Original setup objective']);
+    expect(results[0]).toMatchObject({ runId: 'no-objective', sessionId: 'session-empty',
+      error: 'Skipped: session has no usable original objective.' });
+    expect(results[1]).toMatchObject({ runId: 'preparer-only', sessionId: 'session-setup',
+      objective: 'Original setup objective', jevSelection: 'current-b' });
   });
 });
 
@@ -170,6 +322,7 @@ async function createFixture(): Promise<{ settingsPath: string; databasePath: st
     CREATE TABLE agent_runs (
       id TEXT PRIMARY KEY,
       session_id TEXT,
+      parent_run_id TEXT,
       record_json TEXT NOT NULL,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
@@ -254,7 +407,7 @@ function insertRun(
   createdAt = '2026-01-02T00:00:00.000Z',
   updatedAt = '2026-01-02T00:00:00.001Z',
 ): void {
-  database.query('INSERT INTO agent_runs VALUES (?, ?, ?, ?, ?)').run(id, sessionId, JSON.stringify(record), createdAt, updatedAt);
+  database.query('INSERT INTO agent_runs VALUES (?, ?, NULL, ?, ?, ?)').run(id, sessionId, JSON.stringify(record), createdAt, updatedAt);
 }
 
 function fakeEvaluator(

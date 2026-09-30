@@ -42,11 +42,21 @@ interface HistoricalCase {
   runId: string;
   sessionId: string;
   objective: string;
+  skipReason?: string;
   existingSelection?: string;
   selectionRunId?: string;
   candidates?: AgentSdkCatalogAgent[];
   attachments?: AttachmentSummary;
   contextQuality: ContextQuality;
+  persistedJev?: {
+    selectedAgentId: string;
+    confidence: number;
+    relevance: number;
+    probabilities: Record<string, number>;
+    accepted: boolean;
+    inputTokens?: number;
+    outputTokens?: number;
+  };
   existingModelLatencyMs?: number;
   existingElapsedMs?: number;
   existingInputTokens?: number;
@@ -86,6 +96,7 @@ export interface StudyResult {
     estimatedCostUSD?: number;
   };
   cached: boolean;
+  reportedOnly?: boolean;
   error?: string;
   state?: unknown;
   response?: unknown;
@@ -105,6 +116,7 @@ export interface RunStudyOptions {
   inputPricePerMillion: number;
   cachePath?: string;
   refresh: boolean;
+  forceJev?: boolean;
   showState: boolean;
   showResponse: boolean;
   evaluator?: TypeSafeAgentSelectionClient;
@@ -170,6 +182,8 @@ export async function runStudy(options: RunStudyOptions): Promise<StudyResult[]>
       limit: options.limit,
     });
     cases = cases.map((item) => {
+      if (item.skipReason) return item;
+      if (item.persistedJev && !options.forceJev) return item;
       if (item.candidates && item.attachments) return item;
       if (!options.allowCurrentCatalog) {
         throw new Error(`Run ${item.runId} has no exact linked selector context; rerun with --allow-current-catalog to permit an approximate replay.`);
@@ -191,8 +205,47 @@ export async function runStudy(options: RunStudyOptions): Promise<StudyResult[]>
   const results: StudyResult[] = [];
 
   for (const item of cases) {
-    const candidates = item.candidates!;
-    const attachments = item.attachments!;
+    if (item.skipReason) {
+      results.push({
+        runId: item.runId,
+        sessionId: item.sessionId,
+        repetition: 1,
+        objective: item.objective,
+        modalities: '-',
+        contextQuality: item.contextQuality,
+        cached: false,
+        error: item.skipReason,
+      });
+      continue;
+    }
+    const candidates = item.candidates ?? currentCandidates;
+    const attachments = item.attachments ?? emptyAttachments();
+    if (item.persistedJev && !options.forceJev) {
+      const jev = item.persistedJev;
+      results.push({
+        runId: item.runId,
+        sessionId: item.sessionId,
+        repetition: 1,
+        objective: item.objective,
+        modalities: modalityMarker(attachments),
+        existingSelection: item.existingSelection,
+        jevSelection: jev.selectedAgentId,
+        ...(item.existingSelection ? { agreement: item.existingSelection === jev.selectedAgentId } : {}),
+        confidence: jev.confidence,
+        relevance: jev.relevance,
+        margin: probabilityMargin(jev.probabilities),
+        accepted: jev.accepted,
+        inputTokens: jev.inputTokens,
+        outputTokens: jev.outputTokens,
+        estimatedCostUSD: jev.inputTokens === undefined ? undefined : jev.inputTokens * options.inputPricePerMillion / 1_000_000,
+        contextQuality: item.contextQuality,
+        existing: existingMetrics(item),
+        cached: false,
+        reportedOnly: true,
+        ...(options.showState ? { state: safeStudyState(item.objective, attachments, candidates) } : {}),
+      });
+      continue;
+    }
     const catalogHash = hashJson(candidates.map(safeCandidateForHash));
     const state = safeStudyState(item.objective, attachments, candidates);
     const keyBase = hashJson({
@@ -202,7 +255,7 @@ export async function runStudy(options: RunStudyOptions): Promise<StudyResult[]>
       catalogHash,
     });
     for (let repetition = 1; repetition <= options.repeat; repetition += 1) {
-      const cached = !options.refresh ? cache.get(keyBase) : undefined;
+      const cached = !options.refresh && !options.forceJev ? cache.get(keyBase) : undefined;
       try {
         const evaluation = cached ?? await evaluateCase(client ??= createLiveClient(configured, env), {
           objective: item.objective,
@@ -279,16 +332,13 @@ export function extractHistoricalCases(
     if (selection.sessionIds?.length) {
       rows = selection.sessionIds.flatMap((sessionId) => {
         const matches = database.query(`
-          SELECT id, session_id, record_json
+          SELECT id, session_id, parent_run_id, record_json
           FROM agent_runs
           WHERE session_id = ?
-            AND (${ROUTED_RUN_PREDICATE})
           ORDER BY created_at DESC
         `).all(sessionId) as RunRow[];
         if (matches.length > 0) return matches;
-        const exists = database.query('SELECT 1 FROM agent_runs WHERE session_id = ? LIMIT 1').get(sessionId);
-        if (!exists) throw new Error(`Session ${sessionId} was not found in the SQLite runtime.`);
-        throw new Error(`Session ${sessionId} has no persisted agent-selection runs.`);
+        throw new Error(`Session ${sessionId} was not found in the SQLite runtime.`);
       });
     } else if (selection.limit !== undefined) {
       rows = database.query(`
@@ -297,28 +347,48 @@ export function extractHistoricalCases(
           FROM agent_runs
           WHERE session_id IS NOT NULL
             AND session_id <> ''
-            AND (${ROUTED_RUN_PREDICATE})
           GROUP BY session_id
           ORDER BY latest_created_at DESC
           LIMIT ?
         )
-        SELECT runs.id, runs.session_id, runs.record_json
+        SELECT runs.id, runs.session_id, runs.parent_run_id, runs.record_json
         FROM agent_runs AS runs
         JOIN recent_sessions ON recent_sessions.session_id = runs.session_id
-        WHERE ${ROUTED_RUN_PREDICATE.replaceAll('record_json', 'runs.record_json')}
         ORDER BY recent_sessions.latest_created_at DESC, runs.created_at DESC
       `).all(selection.limit) as RunRow[];
     } else {
       rows = database.query(`
-        SELECT id, session_id, record_json
+        SELECT id, session_id, parent_run_id, record_json
         FROM agent_runs
         WHERE session_id IS NOT NULL
           AND session_id <> ''
-          AND (${ROUTED_RUN_PREDICATE})
         ORDER BY created_at DESC
       `).all() as RunRow[];
     }
-    return rows.map((row) => extractHistoricalCase(database, row));
+    const sessions = new Map<string, RunRow[]>();
+    for (const row of rows) {
+      const session = sessions.get(row.session_id) ?? [];
+      session.push(row);
+      sessions.set(row.session_id, session);
+    }
+    return [...sessions.values()].flatMap((session) => {
+      const executions = session.filter((row) => row.parent_run_id === null
+        && !['agent-selection', 'task-preparation', 'execution-routing'].includes(
+          stringValue(objectValue(parseObject(row.record_json, `agent_runs.record_json for ${row.id}`).metadata).command) ?? '',
+        ));
+      if (executions.length) return executions.map((row) => extractHistoricalCase(database, row));
+      const preparation = session.find((row) => {
+        const record = parseObject(row.record_json, `agent_runs.record_json for ${row.id}`);
+        const metadata = objectValue(record.metadata);
+        return metadata.command === 'task-preparation' && Boolean(stringValue(objectValue(metadata.taskPreparation).originalObjective)
+          ?? stringValue(objectValue(record.input).originalObjective));
+      });
+      const selector = session.find((row) => {
+        const metadata = objectValue(parseObject(row.record_json, `agent_runs.record_json for ${row.id}`).metadata);
+        return metadata.command === 'agent-selection' && Boolean(stringValue(objectValue(metadata.agentSelection).originalObjective));
+      });
+      return [extractHistoricalCase(database, preparation ?? selector ?? session[0]!, true)];
+    });
   } finally {
     database.close();
   }
@@ -358,13 +428,29 @@ async function evaluateCase(
   return evaluationFromSelection(selection, latencyMs, response);
 }
 
-function extractHistoricalCase(database: Database, row: RunRow): HistoricalCase {
+function extractHistoricalCase(database: Database, row: RunRow, setupOnly = false): HistoricalCase {
   const record = parseObject(row.record_json, `agent_runs.record_json for ${row.id}`);
   const metadata = objectValue(record.metadata);
   const taskPreparation = objectValue(metadata.taskPreparation);
   const selection = objectValue(metadata.agentSelection);
-  const objective = stringValue(taskPreparation.originalObjective) ?? stringValue(record.goal);
-  if (!objective) throw new Error(`Run ${row.id} has no metadata.taskPreparation.originalObjective or goal.`);
+  const rejected = objectValue(selection.rejectedTypeSafe);
+  const jev = Object.keys(rejected).length ? objectValue(rejected.decision) : selection;
+  const probabilities = objectValue(jev.probabilities);
+  const persistedJev = stringValue(jev.selectionModel) && stringValue(jev.selectedAgentId)
+    && numberValue(jev.confidence) !== undefined && numberValue(jev.relevance) !== undefined
+    ? {
+      selectedAgentId: stringValue(jev.selectedAgentId)!,
+      confidence: numberValue(jev.confidence)!,
+      relevance: numberValue(jev.relevance)!,
+      probabilities: Object.fromEntries(Object.entries(probabilities).filter((entry): entry is [string, number] => typeof entry[1] === 'number' && Number.isFinite(entry[1]))),
+      accepted: Object.keys(rejected).length === 0,
+      inputTokens: numberValue(objectValue(objectValue(jev.typesafe).usage).inputTokens),
+      outputTokens: numberValue(objectValue(objectValue(jev.typesafe).usage).outputTokens),
+    } : undefined;
+  const objective = setupOnly
+    ? stringValue(taskPreparation.originalObjective) ?? stringValue(objectValue(record.input).originalObjective)
+      ?? stringValue(selection.originalObjective)
+    : stringValue(taskPreparation.originalObjective) ?? stringValue(record.goal);
   const selectionRunId = stringValue(selection.selectionRunId);
   let existingSelection = stringValue(selection.selectedAgentId);
   let candidates: AgentSdkCatalogAgent[] | undefined;
@@ -405,12 +491,14 @@ function extractHistoricalCase(database: Database, row: RunRow): HistoricalCase 
   return {
     runId: row.id,
     sessionId: row.session_id,
-    objective,
+    objective: objective ?? '',
+    ...(objective ? {} : { skipReason: 'Skipped: session has no usable original objective.' }),
     existingSelection,
     selectionRunId,
     candidates,
     attachments,
     contextQuality,
+    persistedJev,
     existingModelLatencyMs,
     existingElapsedMs,
     existingInputTokens,
@@ -634,12 +722,7 @@ function stringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
 }
 
-const ROUTED_RUN_PREDICATE = `
-  json_extract(record_json, '$.metadata.agentSelection.selectedAgentId') IS NOT NULL
-  OR json_extract(record_json, '$.metadata.agentSelection.selectionRunId') IS NOT NULL
-`;
-
-interface RunRow { id: string; session_id: string; record_json: string }
+interface RunRow { id: string; session_id: string; parent_run_id: string | null; record_json: string }
 interface SelectorRunRow { record_json: string; created_at: string; updated_at: string }
 
 interface CliOptions extends Omit<RunStudyOptions, 'mode' | 'settingsPath' | 'repeat' | 'inputPricePerMillion' | 'allowCurrentCatalog' | 'refresh' | 'showState' | 'showResponse'> {
@@ -649,6 +732,7 @@ interface CliOptions extends Omit<RunStudyOptions, 'mode' | 'settingsPath' | 're
   inputPricePerMillion: number;
   allowCurrentCatalog: boolean;
   refresh: boolean;
+  forceJev: boolean;
   showState: boolean;
   showResponse: boolean;
   output: OutputFormat;
@@ -668,6 +752,7 @@ function parseCli(argv: string[]): CliOptions {
     repeat: 1,
     inputPricePerMillion: DEFAULT_INPUT_PRICE_PER_MILLION,
     refresh: false,
+    forceJev: false,
     showState: false,
     showResponse: false,
     output: 'table',
@@ -707,6 +792,7 @@ function parseCli(argv: string[]): CliOptions {
       case '--allow-current-catalog': options.allowCurrentCatalog = true; break;
       case '--no-allow-current-catalog': options.allowCurrentCatalog = false; break;
       case '--refresh': options.refresh = true; break;
+      case '--force-jev': options.forceJev = true; break;
       case '--show-state': options.showState = true; break;
       case '--show-response': options.showResponse = true; break;
       case '--help': printHelp(); process.exit(0);
@@ -753,13 +839,14 @@ Options:
   --database <path>                 Override the resolved SQLite runtime path
   --policy <path>                   Override the configured TypeSafe policy
   --attachment-type <type>          image, file, or audio; repeatable
-  --session-id <id>                 Replay routed runs in one session; repeatable
-  --limit <n>                       Replay the latest n routed non-null sessions
+  --session-id <id>                 Study one session; repeatable
+  --limit <n>                       Study the latest n non-null sessions
   --[no-]allow-current-catalog      Permit approximate history replay (default: enabled)
   --input-price-per-million <usd>   Estimated JEV input price (default: 0.042)
-  --repeat <count>                  Repeat each evaluation (paid calls; cache disabled)
+  --repeat <count>                  Repeat new evaluations (paid calls; persisted decisions reported once)
   --cache <path>                    JSONL cache path
-  --refresh                         Bypass cached evaluations
+  --refresh                         Bypass study JSONL cache (not persisted JEV decisions)
+  --force-jev                       Reevaluate even when a JEV decision is persisted; bypass cache
   --show-state                      Include the path-free JEV state
   --show-response                   Include the API response (not monetary cost or latency)
   --output <table|json|jsonl>       Output format (default: table)`);
@@ -791,10 +878,10 @@ function render(results: StudyResult[], output: OutputFormat): void {
     tokens: `${formatTokens(result.existing?.inputTokens, result.existing?.outputTokens)}/${formatTokens(result.inputTokens, result.outputTokens)}`,
     estCost: `${formatCost(result.existing?.estimatedCostUSD)}/${formatCost(result.estimatedCostUSD)}`,
     context: result.contextQuality === 'approximate-current-catalog' ? 'approx' : result.contextQuality,
-    status: result.error ? short(result.error, 28) : result.accepted ? (result.cached ? 'cached' : 'accepted') : 'LOW',
+    status: result.error ? short(result.error, 28) : result.reportedOnly ? '*' : result.accepted ? (result.cached ? 'cached' : 'accepted') : 'LOW',
   }));
   console.table(rows);
-  console.error('JEV latency is client wall-clock time; JEV cost is estimated from input tokens only. API responses do not provide monetary cost or server latency.');
+  console.error('* = persisted JEV decision (reported only, including rejected decisions). JEV latency is client wall-clock time; JEV cost is estimated from input tokens only. API responses do not provide monetary cost or server latency.');
 }
 
 function short(value: string, length: number): string {

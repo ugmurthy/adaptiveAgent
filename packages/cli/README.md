@@ -167,9 +167,16 @@ It uses `./agent.settings.json` by default, including the configured TypeSafe
 model and selection policy. If those settings do not specify a SQLite path,
 history defaults to `~/.adaptiveAgent/desktop.sqlite`. Use `--policy <path>`
 for a study-only policy, `--output json|jsonl` for machine-readable results,
-and `--show-state` or `--show-response` for diagnostics. Historical cases
-without linked selector inputs use the current catalog by default and are
-marked `approx`; pass `--no-allow-current-catalog` to require exact context. The table's
+and `--show-state` or `--show-response` for diagnostics. `--limit` searches the
+newest sessions, including those without agent selection. It studies execution
+runs, or uses a persisted original objective from setup when execution never
+started; sessions with no usable objective appear as skipped errors rather than
+disappearing. Persisted JEV decisions (accepted or rejected) are reported without
+another evaluation, with `*` in the table status column. Use `--force-jev` to
+reevaluate and bypass the study cache; `--refresh` bypasses only the JSONL study
+cache, not persisted decisions. Runs without linked selector inputs use the
+current catalog by default and are marked `approx`; pass
+`--no-allow-current-catalog` to require exact context for reevaluation. The table's
 `modalities` column uses `I`, `A`, and `F` for image, audio, and file (`-` for
 text-only). Latency, token, and cost pairs are existing/JEV; JEV latency is
 client wall-clock time and JEV cost is an input-token estimate at the
