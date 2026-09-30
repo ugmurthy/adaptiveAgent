@@ -1,4 +1,5 @@
 import { TypeSafeClient } from '@typesafe-ai/sdk';
+import { createHash } from 'node:crypto';
 import type { JsonValue } from '@adaptive-agent/core';
 
 import {
@@ -103,6 +104,19 @@ export async function loadTypeSafeAgentSelectionPolicy(
     ? await readJson(resolvePath(cwd, policyPath, env))
     : inline;
   return normalizePolicy(supplied);
+}
+
+/** Fingerprint the effective policy without persisting its instructions or criteria. */
+export function typeSafePolicyHash(policy: TypeSafeAgentSelectionPolicyConfig): string {
+  const stableJson = (value: unknown): string => {
+    if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+    if (value && typeof value === 'object') {
+      const record = value as Record<string, unknown>;
+      return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(',')}}`;
+    }
+    return JSON.stringify(value) ?? 'null';
+  };
+  return createHash('sha256').update(stableJson(policy)).digest('hex');
 }
 
 export async function selectAgentProfileWithTypeSafe(

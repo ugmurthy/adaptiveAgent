@@ -1,12 +1,13 @@
 import type { JsonSchema, JsonValue, RunResult } from '@adaptive-agent/core';
 
-import type { AgentSdkCatalogAgent, SupportedModality } from './config-types.js';
+import type { AgentSdkCatalogAgent, SupportedModality, TypeSafePolicyProvenance } from './config-types.js';
 import type { TaskPreparationAttachmentSummary, TaskPreparationRunner } from './task-preparation.js';
 
 export interface AgentSelectionResult {
   selectedAgentId: string;
   reason: string;
   selectionAgentId: string;
+  policy?: TypeSafePolicyProvenance;
   rejectedTypeSafe?: {
     decision: Omit<AgentSelectionResult, 'rejectedTypeSafe'>;
     threshold: 'confidence' | 'relevance';

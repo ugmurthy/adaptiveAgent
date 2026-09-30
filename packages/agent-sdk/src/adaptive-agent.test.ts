@@ -1227,7 +1227,12 @@ describe('adaptive-agent TypeSafe profile selection', () => {
         typesafe: {
           model: 'jev-1.13.0',
           apiKeyEnv: 'TEST_TYPESAFE_API_KEY',
-          policy: { minimumConfidence: 0.7, minimumRelevance: 0.7 },
+          policy: {
+            minimumConfidence: 0.7,
+            minimumRelevance: 0.7,
+            relevance: { instructions: 'Settings-only relevance question.' },
+            selection: { instructions: 'Settings-only selection question.' },
+          },
         },
       },
     }));
@@ -1244,9 +1249,9 @@ describe('adaptive-agent TypeSafe profile selection', () => {
     const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as { questions: Record<string, unknown> };
       expect(body.questions.candidate_0_relevant).toMatchObject({
-        instructions: { question: null }, criteria: null,
+        instructions: { question: 'Settings-only relevance question.' }, criteria: null,
       });
-      expect(body.questions.selection).toMatchObject({ instructions: null });
+      expect(body.questions.selection).toMatchObject({ instructions: 'Settings-only selection question.' });
       const relevanceAnswers = Object.fromEntries(
         Object.keys(body.questions)
           .filter((key) => key.endsWith('_relevant'))
@@ -1287,6 +1292,9 @@ describe('adaptive-agent TypeSafe profile selection', () => {
         selectionModel: 'jev-1.13.0',
         confidence: 0.91,
         relevance: 0.94,
+        policy: { source: 'inline', hash: createHash('sha256').update(
+          '{"minimumConfidence":0.7,"minimumRelevance":0.7,"relevance":{"instructions":"Settings-only relevance question."},"selection":{"instructions":"Settings-only selection question."}}',
+        ).digest('hex') },
       });
     } finally {
       log.mockRestore();

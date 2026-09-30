@@ -100,6 +100,11 @@ export interface TypeSafeAgentSelectionPolicyConfig {
   minimumConfidence?: number;
 }
 
+export interface TypeSafePolicyProvenance {
+  source: 'default' | 'inline' | 'file';
+  hash: string;
+}
+
 export interface AgentSelectionSettingsConfig {
   engine?: 'agent' | 'typesafe';
   agent?: string;

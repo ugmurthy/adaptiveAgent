@@ -65,6 +65,7 @@ describe('JEV routing study', () => {
       },
     });
     expect(results[0]!.margin).toBeCloseTo(0.2);
+    expect(results[0]!.policy).toMatchObject({ source: 'inline', hash: expect.stringMatching(/^[a-f0-9]{64}$/) });
     expect(results[1]).toMatchObject({
       runId: 'execution-approx',
       sessionId: 'session-approx',

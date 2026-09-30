@@ -12,11 +12,13 @@ import {
   discoverAgentSdkAgents,
   loadTypeSafeAgentSelectionPolicy,
   selectAgentProfileWithTypeSafe,
+  typeSafePolicyHash,
   type AgentSdkCatalogAgent,
   type AgentSelectionResult,
   type TypeSafeAgentSelectionClient,
   type TypeSafeAgentSelectionPolicyConfig,
   type TypeSafeAgentSelectionResponse,
+  type TypeSafePolicyProvenance,
 } from '../packages/agent-sdk/src/index.js';
 
 type OutputFormat = 'table' | 'json' | 'jsonl';
@@ -54,6 +56,7 @@ interface HistoricalCase {
     relevance: number;
     probabilities: Record<string, number>;
     accepted: boolean;
+    policy?: TypeSafePolicyProvenance;
     inputTokens?: number;
     outputTokens?: number;
   };
@@ -81,6 +84,7 @@ export interface StudyResult {
   agreement?: boolean;
   confidence?: number;
   relevance?: number;
+  policy?: TypeSafePolicyProvenance;
   margin?: number;
   accepted?: boolean;
   latencyMs?: number;
@@ -158,6 +162,10 @@ export async function runStudy(options: RunStudyOptions): Promise<StudyResult[]>
     options.policyPath ? undefined : configured.policy,
     env,
   );
+  const policyProvenance: TypeSafePolicyProvenance = {
+    source: options.policyPath || configured.policyPath ? 'file' : configured.policy ? 'inline' : 'default',
+    hash: typeSafePolicyHash(policy),
+  };
   const currentCatalog = await discoverAgentSdkAgents({
     cwd: process.cwd(),
     settingsConfigPath: settingsPath,
@@ -197,7 +205,7 @@ export async function runStudy(options: RunStudyOptions): Promise<StudyResult[]>
     });
   }
 
-  const policyHash = hashJson(policy);
+  const policyHash = policyProvenance.hash;
   const cachePath = options.cachePath ?? DEFAULT_CACHE_PATH;
   const cache = options.repeat === 1 ? await readCache(cachePath) : new Map<string, CachedEvaluation>();
   let client = options.evaluator;
@@ -233,6 +241,7 @@ export async function runStudy(options: RunStudyOptions): Promise<StudyResult[]>
         ...(item.existingSelection ? { agreement: item.existingSelection === jev.selectedAgentId } : {}),
         confidence: jev.confidence,
         relevance: jev.relevance,
+        ...(jev.policy ? { policy: jev.policy } : {}),
         margin: probabilityMargin(jev.probabilities),
         accepted: jev.accepted,
         inputTokens: jev.inputTokens,
@@ -283,6 +292,7 @@ export async function runStudy(options: RunStudyOptions): Promise<StudyResult[]>
           ...(item.existingSelection ? { agreement: item.existingSelection === evaluation.selectedAgentId } : {}),
           confidence: evaluation.confidence,
           relevance: evaluation.relevance,
+          policy: policyProvenance,
           margin,
           accepted,
           latencyMs: evaluation.latencyMs,
@@ -436,6 +446,7 @@ function extractHistoricalCase(database: Database, row: RunRow, setupOnly = fals
   const rejected = objectValue(selection.rejectedTypeSafe);
   const jev = Object.keys(rejected).length ? objectValue(rejected.decision) : selection;
   const probabilities = objectValue(jev.probabilities);
+  const recordedPolicy = objectValue(jev.policy);
   const persistedJev = stringValue(jev.selectionModel) && stringValue(jev.selectedAgentId)
     && numberValue(jev.confidence) !== undefined && numberValue(jev.relevance) !== undefined
     ? {
@@ -444,6 +455,8 @@ function extractHistoricalCase(database: Database, row: RunRow, setupOnly = fals
       relevance: numberValue(jev.relevance)!,
       probabilities: Object.fromEntries(Object.entries(probabilities).filter((entry): entry is [string, number] => typeof entry[1] === 'number' && Number.isFinite(entry[1]))),
       accepted: Object.keys(rejected).length === 0,
+      ...(typeof recordedPolicy.hash === 'string' && ['default', 'inline', 'file'].includes(String(recordedPolicy.source))
+        ? { policy: { source: recordedPolicy.source as TypeSafePolicyProvenance['source'], hash: recordedPolicy.hash } } : {}),
       inputTokens: numberValue(objectValue(objectValue(jev.typesafe).usage).inputTokens),
       outputTokens: numberValue(objectValue(objectValue(jev.typesafe).usage).outputTokens),
     } : undefined;
@@ -881,6 +894,9 @@ function render(results: StudyResult[], output: OutputFormat): void {
     status: result.error ? short(result.error, 28) : result.reportedOnly ? '*' : result.accepted ? (result.cached ? 'cached' : 'accepted') : 'LOW',
   }));
   console.table(rows);
+  for (const policy of new Map(results.flatMap((result) => result.policy ? [[`${result.policy.source}:${result.policy.hash}`, result.policy] as const] : [])).values()) {
+    console.error(`TypeSafe policy: ${policy.source} sha256=${policy.hash}`);
+  }
   console.error('* = persisted JEV decision (reported only, including rejected decisions). JEV latency is client wall-clock time; JEV cost is estimated from input tokens only. API responses do not provide monetary cost or server latency.');
 }
 

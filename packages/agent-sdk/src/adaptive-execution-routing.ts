@@ -5,6 +5,7 @@ import type {
   AgentSdkCatalogAgent,
   SupportedModality,
   TypeSafeAgentSelectionPolicyConfig,
+  TypeSafePolicyProvenance,
 } from './config-types.js';
 import {
   validateExecutionRoutingDecision,
@@ -29,12 +30,15 @@ export interface AdaptiveExecutionRoutingRequest {
 export interface AdaptiveExecutionRoutingResult {
   decision: ExecutionRoutingDecision;
   routerId: string;
+  policy?: TypeSafePolicyProvenance;
   routingRunId?: string;
   routingModel?: string;
+  relevance?: number;
   usage?: { inputTokens: number; outputTokens: number };
   rejectedTypeSafe?: {
     decision: ExecutionRoutingDecision;
     model: string;
+    policy?: TypeSafePolicyProvenance;
     choiceConfidence: number;
     relevance: number;
     threshold: 'confidence' | 'relevance';
@@ -241,7 +245,8 @@ export async function selectExecutionRoutingWithTypeSafe(
       attempt.relevance, { ...attempt, threshold: 'relevance', minimum: policy.minimumRelevance },
     );
   }
-  return { decision, routerId: `typesafe:${response.model}`, routingModel: response.model, ...(attempt.usage ? { usage: attempt.usage } : {}) };
+  return { decision, routerId: `typesafe:${response.model}`, routingModel: response.model, relevance: attempt.relevance,
+    ...(attempt.usage ? { usage: attempt.usage } : {}) };
 }
 
 export function directRoutingFallback(

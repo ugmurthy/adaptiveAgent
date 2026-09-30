@@ -16,6 +16,7 @@ import {
   createTypeSafeAgentSelectionClient,
   loadTypeSafeAgentSelectionPolicy,
   selectAgentProfileWithTypeSafe,
+  typeSafePolicyHash,
 } from './typesafe-agent-selection.js';
 
 export interface AutomaticRunDecisionRequest {
@@ -43,6 +44,7 @@ export function agentSelectionMetadata(selection: AgentSelectionResult): JsonObj
     ...(selection.selectionModel ? { selectionModel: selection.selectionModel } : {}),
     ...(selection.confidence === undefined ? {} : { confidence: selection.confidence }),
     ...(selection.relevance === undefined ? {} : { relevance: selection.relevance }),
+    ...(selection.policy ? { policy: { source: selection.policy.source, hash: selection.policy.hash } } : {}),
     ...(selection.probabilities ? { probabilities: selection.probabilities as unknown as JsonValue } : {}),
     ...(selection.rejectedTypeSafe ? { rejectedTypeSafe: {
       ...selection.rejectedTypeSafe,
@@ -64,6 +66,8 @@ export function executionRoutingMetadata(routing: AdaptiveExecutionRoutingResult
     routerId: routing.routerId,
     ...(routing.routingRunId ? { routingRunId: routing.routingRunId } : {}),
     ...(routing.routingModel ? { routingModel: routing.routingModel } : {}),
+    ...(routing.relevance === undefined ? {} : { relevance: routing.relevance }),
+    ...(routing.policy ? { policy: routing.policy } : {}),
     ...(routing.usage ? { typesafe: { usage: routing.usage } } : {}),
     ...(routing.rejectedTypeSafe ? { rejectedTypeSafe: routing.rejectedTypeSafe } : {}),
   } as unknown as JsonObject;
@@ -140,6 +144,10 @@ export async function decideAutomaticRun(request: AutomaticRunDecisionRequest): 
   const apiKey = env[apiKeyEnv];
   if (!apiKey) throw new Error(`TypeSafe run selection requires environment variable "${apiKeyEnv}".`);
   const policy = await loadTypeSafeAgentSelectionPolicy(cwd, typesafe.policyPath, typesafe.policy, env);
+  const policyProvenance = {
+    source: typesafe.policyPath ? 'file' as const : typesafe.policy ? 'inline' as const : 'default' as const,
+    hash: typeSafePolicyHash(policy),
+  };
   const client = createTypeSafeAgentSelectionClient({
     apiKey,
     baseUrl: typesafe.baseUrl,
@@ -148,10 +156,16 @@ export async function decideAutomaticRun(request: AutomaticRunDecisionRequest): 
   const model = typesafe.model ?? 'jev-latest';
   try {
     return adaptive
-      ? { kind: 'routing', routing: await selectExecutionRoutingWithTypeSafe(client, routingRequest, model, policy) }
-      : { kind: 'selection', selection: await selectAgentProfileWithTypeSafe(client, selectionRequest, model, policy) };
+      ? { kind: 'routing', routing: { ...await selectExecutionRoutingWithTypeSafe(client, routingRequest, model, policy), policy: policyProvenance } }
+      : { kind: 'selection', selection: { ...await selectAgentProfileWithTypeSafe(client, selectionRequest, model, policy), policy: policyProvenance } };
   } catch (error) {
     if (!(error instanceof AgentSelectionConfidenceError || error instanceof ExecutionRoutingConfidenceError)) throw error;
+    if (error instanceof AgentSelectionConfidenceError && error.rejectedTypeSafe) {
+      error.rejectedTypeSafe.decision.policy = policyProvenance;
+    }
+    if (error instanceof ExecutionRoutingConfidenceError && error.rejectedTypeSafe) {
+      error.rejectedTypeSafe.policy = policyProvenance;
+    }
     if (selectionSettings.lowConfidenceFallback !== 'error' && selectionSettings.agent) {
       const fallback = await runWithSelectorAgent();
       if (fallback.kind === 'selection' && error instanceof AgentSelectionConfidenceError) {

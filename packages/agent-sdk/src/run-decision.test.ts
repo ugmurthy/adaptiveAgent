@@ -1,4 +1,5 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -98,6 +99,7 @@ it.each([[false, undefined], [true, undefined], [false, 'agent'], [true, 'agent'
       selectedAgentId: 'researcher', selectionAgentId: 'selector',
       rejectedTypeSafe: { threshold: 'confidence', minimum: 0.7, decision: {
         selectedAgentId: 'researcher', confidence: 0.2, relevance: 0.9,
+        policy: { source: 'inline', hash: createHash('sha256').update('{"minimumConfidence":0.7}').digest('hex') },
         probabilities: { researcher: 0.2 }, selectionModel: 'jev-1.13.0',
       } },
     });
@@ -105,6 +107,7 @@ it.each([[false, undefined], [true, undefined], [false, 'agent'], [true, 'agent'
     expect(executionRoutingMetadata(decision.routing)).toMatchObject({
       source: 'agent', rejectedTypeSafe: { threshold: 'confidence', minimum: 0.7,
         choiceConfidence: 0.2, relevance: 0.9, model: 'jev-1.13.0',
+        policy: { source: 'inline', hash: createHash('sha256').update('{"minimumConfidence":0.7}').digest('hex') },
         decision: { mode: 'direct', primaryAgentId: 'researcher', source: 'typesafe' },
       },
     });
@@ -130,4 +133,30 @@ it.each([true, false])('errors on low TypeSafe confidence when selector is unava
     originalObjective: 'Research this', attachments: { images: [], files: [], audio: [] }, sessionId: 'same-session',
   })).rejects.toThrow(/confidence 0.200 is below/);
   expect(create).not.toHaveBeenCalled();
+});
+
+it('records the default policy when TypeSafe has no policy or policyPath', async () => {
+  const { cwd, fallbackSdk } = await fixture(false, 'error');
+  fallbackSdk.config.settings.agentSelection!.typesafe!.policy = undefined;
+  vi.stubGlobal('fetch', async (_input: unknown, init?: RequestInit) => {
+    const request = JSON.parse(String(init?.body)) as { questions: Record<string, unknown> };
+    expect(request.questions.candidate_0_relevant).toMatchObject({
+      instructions: { question: 'Is the referenced candidate agent a strong match for the objective and every requested attachment modality?' },
+    });
+    return new Response(JSON.stringify({ model: 'jev-1.13.0', answers: {
+      ...Object.fromEntries(Object.keys(request.questions).filter((key) => key.endsWith('_relevant'))
+        .map((key) => [key, { type: 'noul', noul: 0.85 }])),
+      selection: { type: 'choice', choice: 'researcher', confidence: 0.9, probabilities: { researcher: 0.9 } },
+    } }), { status: 200, headers: { 'content-type': 'application/json' } });
+  });
+  const decision = await decideAutomaticRun({
+    fallbackSdk, sdkOptions: { cwd, env: { TEST_TYPESAFE_API_KEY: 'test-key' } }, cwd,
+    originalObjective: 'Research this', attachments: { images: [], files: [], audio: [] }, sessionId: 'session',
+  });
+  expect(decision.kind).toBe('selection');
+  if (decision.kind === 'selection') {
+    expect(agentSelectionMetadata(decision.selection)).toMatchObject({
+      policy: { source: 'default', hash: expect.stringMatching(/^[a-f0-9]{64}$/) },
+    });
+  }
 });

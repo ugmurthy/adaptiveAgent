@@ -354,7 +354,12 @@ describe('desktop runtime protocol', () => {
     try {
       const selected = await (runtime as unknown as { selectDesktopRunSdk: Function })
         .selectDesktopRunSdk(fallback, 'Review this', [], 'session-1');
-      expect(selected).toMatchObject({ sdk: fallback, selection: { selectedAgentId: 'bootstrap', selectionAgentId: 'typesafe:jev-1.13.0', relevance: 0.4 } });
+      expect(selected).toMatchObject({ sdk: fallback, selection: {
+        selectedAgentId: 'bootstrap', selectionAgentId: 'typesafe:jev-1.13.0', relevance: 0.4,
+        policy: { source: 'file', hash: createHash('sha256').update(
+          '{"minimumRelevance":0.2,"relevance":{"instructions":"Desktop policy only."}}',
+        ).digest('hex') },
+      } });
       expect(fetch).toHaveBeenCalledOnce();
     } finally {
       vi.unstubAllGlobals();

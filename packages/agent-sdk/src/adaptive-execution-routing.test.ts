@@ -8,6 +8,7 @@ import {
   selectExecutionRoutingWithAgent,
   selectExecutionRoutingWithTypeSafe,
 } from './adaptive-execution-routing.js';
+import { executionRoutingMetadata } from './run-decision.js';
 import type { TaskPreparationRunner } from './task-preparation.js';
 import type { TypeSafeAgentSelectionClient } from './typesafe-agent-selection.js';
 
@@ -41,6 +42,7 @@ describe('adaptive execution routing', () => {
       source: 'agent',
       confidence: 0.91,
     });
+    expect(executionRoutingMetadata(result)).not.toHaveProperty('relevance');
     const input = runRaw.mock.calls[0]?.[1]?.input;
     expect(JSON.stringify(input)).not.toContain('/private/image.png');
     expect(JSON.stringify(input)).not.toContain('/private/audio.wav');
@@ -78,6 +80,12 @@ describe('adaptive execution routing', () => {
       source: 'typesafe',
       confidence: 0.91,
     });
+    expect(executionRoutingMetadata(result)).toMatchObject({
+      relevance: 0.91,
+      confidence: 0.91,
+      routingModel: 'jev-test',
+      typesafe: { usage: { inputTokens: 71, outputTokens: 9 } },
+    });
     const evaluation = evaluate.mock.calls[0]![0];
     expect(evaluation.questions).toHaveProperty('candidate_1_image_relevant');
     expect(evaluation.questions).toHaveProperty('candidate_2_audio_relevant');
@@ -110,6 +118,7 @@ describe('adaptive execution routing', () => {
     });
 
     expect(result.usage).toEqual({ inputTokens: 71, outputTokens: 9 });
+    expect(executionRoutingMetadata(result)).toMatchObject({ confidence: 0.9, relevance: 0.93 });
     expect(result.decision).toMatchObject({
       mode: 'direct',
       primaryAgentId: 'multimodal',
