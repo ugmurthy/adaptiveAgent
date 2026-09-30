@@ -444,7 +444,12 @@ not set both `policy` and `policyPath`. Before calling JEV, the CLI removes
 profiles that do not declare support for every supplied image, file, or audio
 modality. The JEV request contains the prompt, attachment modality names and
 counts, and safe profile summaries; it does not contain attachment paths or
-contents. Selection fails closed when either configured threshold is missed.
+contents. An explicit policy replaces the built-in policy rather than merging
+with it: omitted question guidance is not inherited, and only thresholds
+specified in the policy are enforced. With no policy, the built-in guidance
+and 0.5 confidence/relevance thresholds apply. The desktop bridge uses the
+same policy for automatic runs; an exact desktop profile selection remains fixed.
+Selection fails closed when either configured threshold is missed.
 
 Use `chat` for an interactive conversation, or provide the first message on
 the command line:

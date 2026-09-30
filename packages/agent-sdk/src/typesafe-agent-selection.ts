@@ -124,23 +124,23 @@ export async function selectAgentProfileWithTypeSafe(
     questions[`candidate_${index}_relevant`] = {
       type: 'noul',
       instructions: {
-        question: policy.relevance.instructions ?? null,
+        question: policy.relevance?.instructions ?? null,
         objective: '`objective`',
         attachmentTypes: '`attachments.types`',
         candidate: `\`candidates[${index}]\``,
       },
-      criteria: policy.relevance.criteria ?? null,
+      criteria: policy.relevance?.criteria ?? null,
     };
   });
   if (candidates.length > 1) {
     questions.selection = {
       type: 'choice',
-      instructions: policy.selection.instructions ?? null,
+      instructions: policy.selection?.instructions ?? null,
       criteria: Object.fromEntries(candidates.map((candidate, index) => [
         candidate.id,
         {
           profile: candidateSummaries[index],
-          ...(policy.selection.candidateCriteria === undefined
+          ...(policy.selection?.candidateCriteria === undefined
             ? {}
             : { guidance: policy.selection.candidateCriteria }),
         },
@@ -199,18 +199,18 @@ export async function selectAgentProfileWithTypeSafe(
       },
     } : {}),
   };
-  if (confidence < policy.minimumConfidence) {
+  if (policy.minimumConfidence !== undefined && confidence < policy.minimumConfidence) {
     throw new AgentSelectionConfidenceError(`TypeSafe agent selection confidence ${confidence.toFixed(3)} is below the configured minimum ${policy.minimumConfidence.toFixed(3)}.`, confidence,
       { decision: result, threshold: 'confidence', minimum: policy.minimumConfidence });
   }
-  if (relevanceAnswer.noul < policy.minimumRelevance) {
+  if (policy.minimumRelevance !== undefined && relevanceAnswer.noul < policy.minimumRelevance) {
     throw new AgentSelectionConfidenceError(`TypeSafe relevance ${relevanceAnswer.noul.toFixed(3)} for agent "${selectedAgentId}" is below the configured minimum ${policy.minimumRelevance.toFixed(3)}.`, relevanceAnswer.noul,
       { decision: result, threshold: 'relevance', minimum: policy.minimumRelevance });
   }
   return result;
 }
 
-function normalizePolicy(input: unknown): Required<TypeSafeAgentSelectionPolicyConfig> {
+function normalizePolicy(input: unknown): TypeSafeAgentSelectionPolicyConfig {
   if (input !== undefined && !isRecord(input)) {
     throw new Error('TypeSafe agent selection policy must be a JSON object.');
   }
@@ -227,30 +227,11 @@ function normalizePolicy(input: unknown): Required<TypeSafeAgentSelectionPolicyC
   if (supplied?.routing !== undefined && !isRecord(supplied.routing)) {
     throw new Error('TypeSafe agent selection policy routing must be an object.');
   }
-  const policy = {
-    relevance: {
-      ...DEFAULT_POLICY.relevance,
-      ...(supplied?.relevance ?? {}),
-      criteria: {
-        ...DEFAULT_POLICY.relevance.criteria,
-        ...(supplied?.relevance?.criteria ?? {}),
-      },
-    },
-    selection: {
-      ...DEFAULT_POLICY.selection,
-      ...(supplied?.selection ?? {}),
-    },
-    routing: {
-      ...DEFAULT_POLICY.routing,
-      ...(supplied?.routing ?? {}),
-    },
-    minimumRelevance: supplied?.minimumRelevance ?? DEFAULT_POLICY.minimumRelevance,
-    minimumConfidence: supplied?.minimumConfidence ?? DEFAULT_POLICY.minimumConfidence,
-  };
-  if (!isProbability(policy.minimumRelevance) || !isProbability(policy.minimumConfidence)) {
+  if ((supplied?.minimumRelevance !== undefined && !isProbability(supplied.minimumRelevance))
+    || (supplied?.minimumConfidence !== undefined && !isProbability(supplied.minimumConfidence))) {
     throw new Error('TypeSafe agent selection thresholds must be numbers between 0 and 1.');
   }
-  return policy;
+  return supplied ?? DEFAULT_POLICY;
 }
 
 function isProbability(value: number): boolean {

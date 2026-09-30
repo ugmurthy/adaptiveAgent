@@ -124,7 +124,7 @@ describe('TypeSafe agent selection', () => {
   });
 
   it('still checks relevance when attachment filtering leaves one candidate', async () => {
-    const evaluate = vi.fn(async () => ({
+    const evaluate = vi.fn(async (_request: Parameters<TypeSafeAgentSelectionClient['evaluate']>[0]) => ({
       model: 'jev-1.13.0',
       answers: { candidate_0_relevant: { type: 'noul' as const, noul: 0.4 } },
     }));
@@ -151,18 +151,36 @@ describe('TypeSafe agent selection', () => {
     tempDir = await mkdtemp(join(tmpdir(), 'typesafe-selection-policy-'));
     await writeFile(join(tempDir, 'routing-policy.json'), JSON.stringify({
       relevance: { instructions: 'Does this profile fit?' },
-      selection: { instructions: 'Choose the best profile.' },
-      routing: { assignmentInstructions: 'Choose the best modality specialist.' },
-      minimumConfidence: 0.73,
-      minimumRelevance: 0.66,
+      minimumConfidence: 0.3,
     }));
 
-    await expect(loadTypeSafeAgentSelectionPolicy(tempDir, './routing-policy.json', undefined)).resolves.toMatchObject({
+    await expect(loadTypeSafeAgentSelectionPolicy(tempDir, './routing-policy.json', undefined)).resolves.toEqual({
       relevance: { instructions: 'Does this profile fit?' },
-      selection: { instructions: 'Choose the best profile.' },
-      routing: { assignmentInstructions: 'Choose the best modality specialist.' },
-      minimumConfidence: 0.73,
-      minimumRelevance: 0.66,
+      minimumConfidence: 0.3,
+    });
+  });
+
+  it('uses an inline policy without inheriting default questions or thresholds', async () => {
+    const evaluate = vi.fn(async (_request: Parameters<TypeSafeAgentSelectionClient['evaluate']>[0]) => ({
+      model: 'jev-test',
+      answers: {
+        candidate_0_relevant: { type: 'noul' as const, noul: 0.2 },
+        candidate_1_relevant: { type: 'noul' as const, noul: 0.2 },
+        selection: { type: 'choice' as const, choice: 'coder', confidence: 0.4, probabilities: { coder: 0.4 } },
+      },
+    }));
+    const result = await selectAgentProfileWithTypeSafe({ evaluate }, request(), 'jev-test', {
+      relevance: { instructions: 'Use only this instruction.' },
+      minimumConfidence: 0.3,
+    });
+
+    expect(result.selectedAgentId).toBe('coder');
+    expect(evaluate.mock.calls[0]![0].questions).toMatchObject({
+      candidate_0_relevant: { instructions: { question: 'Use only this instruction.' }, criteria: null },
+      selection: { instructions: null, criteria: { coder: { profile: expect.any(Object) } } },
+    });
+    await expect(selectAgentProfileWithTypeSafe({ evaluate }, request(), 'jev-test')).rejects.toMatchObject({
+      rejectedTypeSafe: { threshold: 'confidence', minimum: 0.5 },
     });
   });
 });

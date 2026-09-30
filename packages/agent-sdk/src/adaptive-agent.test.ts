@@ -1243,6 +1243,10 @@ describe('adaptive-agent TypeSafe profile selection', () => {
   it('routes a dry-run through JEV and records confidence metadata', async () => {
     const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as { questions: Record<string, unknown> };
+      expect(body.questions.candidate_0_relevant).toMatchObject({
+        instructions: { question: null }, criteria: null,
+      });
+      expect(body.questions.selection).toMatchObject({ instructions: null });
       const relevanceAnswers = Object.fromEntries(
         Object.keys(body.questions)
           .filter((key) => key.endsWith('_relevant'))

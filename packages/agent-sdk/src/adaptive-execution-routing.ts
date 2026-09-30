@@ -132,15 +132,12 @@ export async function selectExecutionRoutingWithTypeSafe(
       questions[relevanceKey(index, modality)] = {
         type: 'noul',
         instructions: {
-          question: policy.relevance?.instructions ?? 'Is this candidate a strong match for the objective and assigned modality?',
+          question: policy.relevance?.instructions ?? null,
           objective: '`objective`',
           modality,
           candidate: `\`candidates[${index}]\``,
         },
-        criteria: policy.relevance?.criteria ?? {
-          true: 'The candidate is capable and well suited to this modality and objective.',
-          false: 'The candidate is weakly matched or unsuitable for this modality or objective.',
-        },
+        criteria: policy.relevance?.criteria ?? null,
       };
     }
   });
@@ -151,13 +148,13 @@ export async function selectExecutionRoutingWithTypeSafe(
   const modes = directCandidates.length > 0 && candidates.length > 1
     ? ['direct', 'orchestration']
     : directCandidates.length > 0 ? ['direct'] : ['orchestration'];
-  addChoiceQuestion(questions, 'execution_mode', modes, policy.routing?.modeInstructions ?? 'Choose direct execution or specialist orchestration.', {
+  addChoiceQuestion(questions, 'execution_mode', modes, policy.routing?.modeInstructions ?? null, {
     direct: 'One profile should complete the objective and consume every modality.',
     orchestration: 'Different profiles should handle modalities or specialization before synthesis.',
   });
-  addCandidateChoice(questions, 'direct_primary', directCandidates, candidateSummaries, policy, policy.routing?.primaryInstructions ?? 'Choose the direct execution profile.');
+  addCandidateChoice(questions, 'direct_primary', directCandidates, candidateSummaries, policy, policy.routing?.primaryInstructions ?? null);
   const primaryCandidates = candidates.filter((candidate) => supportedCandidateModalities(candidate).includes('text'));
-  addCandidateChoice(questions, 'orchestration_primary', primaryCandidates, candidateSummaries, policy, policy.routing?.primaryInstructions ?? 'Choose the primary synthesis profile.');
+  addCandidateChoice(questions, 'orchestration_primary', primaryCandidates, candidateSummaries, policy, policy.routing?.primaryInstructions ?? null);
   for (const modality of modalities) {
     addCandidateChoice(
       questions,
@@ -165,7 +162,7 @@ export async function selectExecutionRoutingWithTypeSafe(
       candidates.filter((candidate) => supportedCandidateModalities(candidate).includes(modality)),
       candidateSummaries,
       policy,
-      policy.routing?.assignmentInstructions ?? `Choose the best profile for the ${modality} input claims.`,
+      policy.routing?.assignmentInstructions ?? null,
     );
   }
 
@@ -226,8 +223,6 @@ export async function selectExecutionRoutingWithTypeSafe(
     source: 'typesafe',
   };
   validateRouting(decision, candidates, modalities, request.maxSpecialists);
-  const minimumConfidence = policy.minimumConfidence ?? 0.5;
-  const minimumRelevance = policy.minimumRelevance ?? 0.5;
   const attempt = {
     decision,
     model: response.model,
@@ -235,15 +230,15 @@ export async function selectExecutionRoutingWithTypeSafe(
     relevance: Math.min(...relevance),
     ...(response.usage ? { usage: { inputTokens: response.usage.input_tokens, outputTokens: response.usage.output_tokens } } : {}),
   };
-  if (attempt.choiceConfidence < minimumConfidence) {
+  if (policy.minimumConfidence !== undefined && attempt.choiceConfidence < policy.minimumConfidence) {
     throw new ExecutionRoutingConfidenceError(
-      `Execution routing confidence ${attempt.choiceConfidence.toFixed(3)} is below the configured minimum ${minimumConfidence.toFixed(3)}.`,
-      attempt.choiceConfidence, { ...attempt, threshold: 'confidence', minimum: minimumConfidence });
+      `Execution routing confidence ${attempt.choiceConfidence.toFixed(3)} is below the configured minimum ${policy.minimumConfidence.toFixed(3)}.`,
+      attempt.choiceConfidence, { ...attempt, threshold: 'confidence', minimum: policy.minimumConfidence });
   }
-  if (attempt.relevance < minimumRelevance) {
+  if (policy.minimumRelevance !== undefined && attempt.relevance < policy.minimumRelevance) {
     throw new ExecutionRoutingConfidenceError(
-      `Execution routing relevance ${attempt.relevance.toFixed(3)} is below the configured minimum ${minimumRelevance.toFixed(3)}.`,
-      attempt.relevance, { ...attempt, threshold: 'relevance', minimum: minimumRelevance },
+      `Execution routing relevance ${attempt.relevance.toFixed(3)} is below the configured minimum ${policy.minimumRelevance.toFixed(3)}.`,
+      attempt.relevance, { ...attempt, threshold: 'relevance', minimum: policy.minimumRelevance },
     );
   }
   return { decision, routerId: `typesafe:${response.model}`, routingModel: response.model, ...(attempt.usage ? { usage: attempt.usage } : {}) };

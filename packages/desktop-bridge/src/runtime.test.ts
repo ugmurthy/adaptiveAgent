@@ -327,9 +327,13 @@ describe('desktop runtime protocol', () => {
       model: { provider: 'ollama', model: 'test' }, tools: [],
     }));
     await writeFile(join(cwd, 'agent.settings.json'), JSON.stringify({ agents: { dirs: [cwd] } }));
+    await writeFile(join(cwd, 'policy.json'), JSON.stringify({ relevance: { instructions: 'Desktop policy only.' }, minimumRelevance: 0.2 }));
     const fetch = vi.fn(async (_input: unknown, init?: RequestInit) => {
       const request = JSON.parse(String(init?.body)) as { questions: Record<string, unknown> };
-      const answers = Object.fromEntries(Object.keys(request.questions).map((key) => [key, { type: 'noul', noul: 0.9 }]));
+      expect(request.questions.candidate_0_relevant).toMatchObject({
+        instructions: { question: 'Desktop policy only.' }, criteria: null,
+      });
+      const answers = Object.fromEntries(Object.keys(request.questions).map((key) => [key, { type: 'noul', noul: 0.4 }]));
       return new Response(JSON.stringify({ model: 'jev-1.13.0', answers }), {
         status: 200, headers: { 'content-type': 'application/json' },
       });
@@ -340,7 +344,7 @@ describe('desktop runtime protocol', () => {
       agentPath,
       config: {
         agent: { id: 'bootstrap', name: 'Bootstrap' }, workspaceRoot: cwd,
-        settings: { agent: { mode: 'auto' }, agentSelection: { engine: 'typesafe', typesafe: { apiKeyEnv: 'TEST_TYPESAFE_API_KEY', model: 'jev-1.13.0' } } },
+        settings: { agent: { mode: 'auto' }, agentSelection: { engine: 'typesafe', typesafe: { apiKeyEnv: 'TEST_TYPESAFE_API_KEY', model: 'jev-1.13.0', policyPath: './policy.json' } } },
       },
       created: { runtime: {} },
     } as unknown as AgentSdk;
@@ -350,7 +354,7 @@ describe('desktop runtime protocol', () => {
     try {
       const selected = await (runtime as unknown as { selectDesktopRunSdk: Function })
         .selectDesktopRunSdk(fallback, 'Review this', [], 'session-1');
-      expect(selected).toMatchObject({ sdk: fallback, selection: { selectedAgentId: 'bootstrap', selectionAgentId: 'typesafe:jev-1.13.0' } });
+      expect(selected).toMatchObject({ sdk: fallback, selection: { selectedAgentId: 'bootstrap', selectionAgentId: 'typesafe:jev-1.13.0', relevance: 0.4 } });
       expect(fetch).toHaveBeenCalledOnce();
     } finally {
       vi.unstubAllGlobals();
