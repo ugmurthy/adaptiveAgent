@@ -1,6 +1,7 @@
 import type { JsonSchema, JsonValue, RunResult } from '@adaptive-agent/core';
 
 import { safeCandidateSummary } from './agent-selection.js';
+import { selectAgentProfileWithTypeSafe } from './typesafe-agent-selection.js';
 import type {
   AgentSdkCatalogAgent,
   SupportedModality,
@@ -30,6 +31,8 @@ export interface AdaptiveExecutionRoutingRequest {
 export interface AdaptiveExecutionRoutingResult {
   decision: ExecutionRoutingDecision;
   routerId: string;
+  /** Set by staged TypeSafe orchestration for reporting choice confidence independently of relevance. */
+  choiceConfidence?: number;
   policy?: TypeSafePolicyProvenance;
   routingRunId?: string;
   routingModel?: string;
@@ -56,6 +59,97 @@ export class ExecutionRoutingConfidenceError extends Error {
     super(message);
     this.name = 'ExecutionRoutingConfidenceError';
   }
+}
+
+/** Opt-in mode-first routing for evaluation; existing automatic runs retain the combined request. */
+export async function selectStagedExecutionRoutingWithTypeSafe(
+  client: TypeSafeAgentSelectionClient,
+  request: AdaptiveExecutionRoutingRequest,
+  model: string,
+  policy: TypeSafeAgentSelectionPolicyConfig = {},
+): Promise<AdaptiveExecutionRoutingResult & {
+  stages: Array<{ name: 'mode' | 'selection' | 'assignments'; confidence: number; relevance?: number; usage?: { inputTokens: number; outputTokens: number } }>;
+}> {
+  const candidates = eligibleRoutingCandidates(request.candidates);
+  const modalities = routingModalities(request.attachments);
+  assertModalityCoverage(candidates, modalities);
+  const directCandidates = candidates.filter((candidate) =>
+    modalities.every((modality) => supportedCandidateModalities(candidate).includes(modality))
+  );
+  const modes = directCandidates.length === 0 ? ['orchestration']
+    : candidates.length === 1 ? ['direct'] : ['direct', 'orchestration'];
+  let modeConfidence = 1;
+  let modeUsage: { inputTokens: number; outputTokens: number } | undefined;
+  let mode = modes[0]!;
+  if (modes.length > 1) {
+    const response = await client.evaluate({
+      model,
+      state: {
+        objective: request.originalObjective,
+        attachments: attachmentInventory(request.attachments),
+        candidates: candidates.map((candidate) => ({
+          id: candidate.id, name: candidate.name, description: candidate.description ?? '',
+          modalities: supportedCandidateModalities(candidate), tools: candidate.tools,
+        })),
+        limits: { maxSpecialists: request.maxSpecialists },
+      },
+      questions: {
+        execution_mode: {
+          type: 'choice',
+          instructions: policy.routing?.modeInstructions ?? null,
+          criteria: {
+            direct: 'One eligible profile can own and complete the entire objective.',
+            orchestration: 'A distinct specialist contribution is useful and can be represented by the supplied modalities.',
+          },
+        },
+      },
+    });
+    mode = readChoice(response, 'execution_mode', modes);
+    modeConfidence = readChoiceConfidence(response, 'execution_mode', modes);
+    if (response.usage) modeUsage = { inputTokens: response.usage.input_tokens, outputTokens: response.usage.output_tokens };
+  }
+  const stages: Array<{ name: 'mode' | 'selection' | 'assignments'; confidence: number; relevance?: number; usage?: { inputTokens: number; outputTokens: number } }> = [
+    { name: 'mode', confidence: modeConfidence, ...(modeUsage ? { usage: modeUsage } : {}) },
+  ];
+  if (policy.minimumConfidence !== undefined && modeConfidence < policy.minimumConfidence) {
+    throw new ExecutionRoutingConfidenceError(
+      `Execution mode confidence ${modeConfidence.toFixed(3)} is below the configured minimum ${policy.minimumConfidence.toFixed(3)}.`,
+      modeConfidence,
+    );
+  }
+
+  if (mode === 'direct') {
+    const selection = await selectAgentProfileWithTypeSafe(client, { ...request, candidates: directCandidates }, model, policy);
+    stages.push({ name: 'selection', confidence: selection.confidence!, relevance: selection.relevance, ...(selection.usage ? { usage: selection.usage } : {}) });
+    const usage = combinedUsage(modeUsage, selection.usage);
+    const decision: ExecutionRoutingDecision = {
+      mode: 'direct', primaryAgentId: selection.selectedAgentId,
+      assignments: [{ agentId: selection.selectedAgentId, modalities, reason: selection.reason }],
+      selectedCatalogAgentIds: [selection.selectedAgentId], reason: selection.reason,
+      confidence: Math.min(modeConfidence, selection.confidence!, selection.relevance!), source: 'typesafe',
+    };
+    validateRouting(decision, candidates, modalities, request.maxSpecialists);
+    return { decision, routerId: `typesafe:${selection.selectionModel}`, routingModel: selection.selectionModel,
+      relevance: selection.relevance, ...(usage ? { usage } : {}), stages };
+  }
+
+  const result = await selectExecutionRoutingWithTypeSafe(client, request, model, policy, 'orchestration');
+  if (result.decision.assignments.every((assignment) => assignment.agentId === result.decision.primaryAgentId)) {
+    throw new Error('Staged orchestration requires a specialist distinct from the primary agent.');
+  }
+  stages.push({ name: 'assignments', confidence: result.choiceConfidence!, relevance: result.relevance,
+    ...(result.usage ? { usage: result.usage } : {}) });
+  const usage = combinedUsage(modeUsage, result.usage);
+  return { ...result, decision: { ...result.decision, confidence: Math.min(modeConfidence, result.decision.confidence!) },
+    ...(usage ? { usage } : {}), stages };
+}
+
+function combinedUsage(...parts: Array<{ inputTokens: number; outputTokens: number } | undefined>) {
+  const present = parts.filter((part): part is { inputTokens: number; outputTokens: number } => Boolean(part));
+  return present.length ? {
+    inputTokens: present.reduce((sum, part) => sum + part.inputTokens, 0),
+    outputTokens: present.reduce((sum, part) => sum + part.outputTokens, 0),
+  } : undefined;
 }
 
 export async function selectExecutionRoutingWithAgent(
@@ -125,6 +219,7 @@ export async function selectExecutionRoutingWithTypeSafe(
   request: AdaptiveExecutionRoutingRequest,
   model: string,
   policy: TypeSafeAgentSelectionPolicyConfig = {},
+  branch?: 'orchestration',
 ): Promise<AdaptiveExecutionRoutingResult> {
   const candidates = eligibleRoutingCandidates(request.candidates);
   const modalities = routingModalities(request.attachments);
@@ -149,16 +244,27 @@ export async function selectExecutionRoutingWithTypeSafe(
   const directCandidates = candidates.filter((candidate) =>
     modalities.every((modality) => supportedCandidateModalities(candidate).includes(modality))
   );
-  const modes = directCandidates.length > 0 && candidates.length > 1
+  const modes = branch ? ['orchestration'] : directCandidates.length > 0 && candidates.length > 1
     ? ['direct', 'orchestration']
     : directCandidates.length > 0 ? ['direct'] : ['orchestration'];
   addChoiceQuestion(questions, 'execution_mode', modes, policy.routing?.modeInstructions ?? null, {
     direct: 'One profile should complete the objective and consume every modality.',
     orchestration: 'Different profiles should handle modalities or specialization before synthesis.',
   });
-  addCandidateChoice(questions, 'direct_primary', directCandidates, candidateSummaries, policy, policy.routing?.primaryInstructions ?? null);
+  if (!branch) addCandidateChoice(questions, 'direct_primary', directCandidates, candidateSummaries, policy, policy.routing?.primaryInstructions ?? null);
   const primaryCandidates = candidates.filter((candidate) => supportedCandidateModalities(candidate).includes('text'));
-  addCandidateChoice(questions, 'orchestration_primary', primaryCandidates, candidateSummaries, policy, policy.routing?.primaryInstructions ?? null);
+  addCandidateChoice(questions, 'orchestration_primary', primaryCandidates, candidateSummaries, policy, policy.routing?.primaryInstructions ?? null, Boolean(branch));
+  if (branch) {
+    for (const candidate of primaryCandidates) {
+      const index = candidates.indexOf(candidate);
+      questions[`candidate_${index}_primary_relevant`] = {
+        type: 'noul',
+        instructions: { question: 'Can this primary own the objective and synthesize specialist results?',
+          objective: '`objective`', candidate: `\`candidates[${index}]\`` },
+        criteria: policy.relevance?.criteria ?? null,
+      };
+    }
+  }
   for (const modality of modalities) {
     addCandidateChoice(
       questions,
@@ -167,6 +273,7 @@ export async function selectExecutionRoutingWithTypeSafe(
       candidateSummaries,
       policy,
       policy.routing?.assignmentInstructions ?? null,
+      Boolean(branch),
     );
   }
 
@@ -185,19 +292,28 @@ export async function selectExecutionRoutingWithTypeSafe(
   const mode = modeChoice;
   const primaryPool = mode === 'direct' ? directCandidates : primaryCandidates;
   const primaryAgentId = readChoice(response, mode === 'direct' ? 'direct_primary' : 'orchestration_primary', primaryPool.map((candidate) => candidate.id));
-  const assigned = mode === 'direct'
+  let assigned = mode === 'direct'
     ? modalities.map((modality) => ({ modality, agentId: primaryAgentId }))
     : modalities.map((modality) => {
         const eligible = candidates.filter((candidate) => supportedCandidateModalities(candidate).includes(modality));
         return { modality, agentId: readChoice(response, `assignment_${modality}`, eligible.map((candidate) => candidate.id)) };
       });
+  if (branch && unique(assigned.map(({ agentId }) => agentId).filter((id) => id !== primaryAgentId)).length > request.maxSpecialists) {
+    assigned = boundedAssignments(response, candidates, modalities, primaryAgentId, request.maxSpecialists);
+  }
   const assignments = groupAssignments(assigned);
   const choiceConfidences = [
     readChoiceConfidence(response, 'execution_mode', modes),
     readChoiceConfidence(response, mode === 'direct' ? 'direct_primary' : 'orchestration_primary', primaryPool.map((candidate) => candidate.id)),
     ...(mode === 'orchestration' ? modalities.map((modality) => {
       const eligible = candidates.filter((candidate) => supportedCandidateModalities(candidate).includes(modality));
-      return readChoiceConfidence(response, `assignment_${modality}`, eligible.map((candidate) => candidate.id));
+      const key = `assignment_${modality}`;
+      const confidence = readChoiceConfidence(response, key, eligible.map((candidate) => candidate.id));
+      const answer = response.answers[key];
+      const chosen = assigned.find((assignment) => assignment.modality === modality)!.agentId;
+      return branch && answer?.type === 'choice' && chosen !== answer.choice
+        ? answer.probabilities[chosen]!
+        : confidence;
     }) : []),
   ];
   const relevance = assigned.map(({ modality, agentId }) => {
@@ -208,6 +324,13 @@ export async function selectExecutionRoutingWithTypeSafe(
     }
     return answer.noul;
   });
+  if (branch) {
+    const answer = response.answers[`candidate_${candidates.findIndex((candidate) => candidate.id === primaryAgentId)}_primary_relevant`];
+    if (!answer || answer.type !== 'noul' || !isProbability(answer.noul)) {
+      throw new Error('TypeSafe execution router returned invalid primary synthesis relevance.');
+    }
+    relevance.push(answer.noul);
+  }
   const confidence = Math.min(...choiceConfidences, ...relevance);
   const decision: ExecutionRoutingDecision = {
     mode,
@@ -246,6 +369,7 @@ export async function selectExecutionRoutingWithTypeSafe(
     );
   }
   return { decision, routerId: `typesafe:${response.model}`, routingModel: response.model, relevance: attempt.relevance,
+    ...(branch ? { choiceConfidence: attempt.choiceConfidence } : {}),
     ...(attempt.usage ? { usage: attempt.usage } : {}) };
 }
 
@@ -398,15 +522,18 @@ function addCandidateChoice(
   summaries: Array<Record<string, JsonValue>>,
   policy: TypeSafeAgentSelectionPolicyConfig,
   instructions: JsonValue,
+  compact = false,
 ): void {
   if (eligible.length <= 1) return;
-  const byId = new Map(summaries.map((summary) => [summary.id, summary]));
+  const byId = new Map(summaries.map((summary, index) => [summary.id, compact ? `\`candidates[${index}]\`` : summary]));
   questions[key] = {
     type: 'choice',
-    instructions,
+    instructions: compact && policy.selection?.candidateCriteria !== undefined
+      ? { question: instructions, candidateCriteria: policy.selection.candidateCriteria }
+      : instructions,
     criteria: Object.fromEntries(eligible.map((candidate) => [candidate.id, {
       profile: byId.get(candidate.id) ?? null,
-      ...(policy.selection?.candidateCriteria === undefined ? {} : { guidance: policy.selection.candidateCriteria }),
+      ...(compact || policy.selection?.candidateCriteria === undefined ? {} : { guidance: policy.selection.candidateCriteria }),
     }])),
   };
 }
@@ -438,6 +565,38 @@ function readChoiceConfidence(response: TypeSafeAgentSelectionResponse, key: str
     throw new Error(`TypeSafe execution router returned invalid confidence for ${key}.`);
   }
   return answer.confidence;
+}
+
+function boundedAssignments(
+  response: TypeSafeAgentSelectionResponse,
+  candidates: AgentSdkCatalogAgent[],
+  modalities: SupportedModality[],
+  primaryAgentId: string,
+  maxSpecialists: number,
+): Array<{ modality: SupportedModality; agentId: string }> {
+  let best: Array<{ modality: SupportedModality; agentId: string }> | undefined;
+  let bestScore = -Infinity;
+  const visit = (index: number, assigned: Array<{ modality: SupportedModality; agentId: string }>, specialists: Set<string>, score: number) => {
+    if (index === modalities.length) {
+      if (specialists.size > 0 && score > bestScore) { best = [...assigned]; bestScore = score; }
+      return;
+    }
+    const modality = modalities[index]!;
+    const eligible = candidates.filter((candidate) => supportedCandidateModalities(candidate).includes(modality));
+    const answer = response.answers[`assignment_${modality}`];
+    for (const candidate of eligible) {
+      const probability = eligible.length === 1 ? 1
+        : answer?.type === 'choice' ? answer.probabilities[candidate.id] : undefined;
+      if (probability === undefined || !isProbability(probability) || probability === 0) continue;
+      const next = new Set(specialists);
+      if (candidate.id !== primaryAgentId) next.add(candidate.id);
+      if (next.size > maxSpecialists) continue;
+      visit(index + 1, [...assigned, { modality, agentId: candidate.id }], next, score + Math.log(probability));
+    }
+  };
+  visit(0, [], new Set(), 0);
+  if (!best) throw new Error(`TypeSafe assignments cannot satisfy the maximum of ${maxSpecialists} specialists.`);
+  return best;
 }
 
 function groupAssignments(assignments: Array<{ modality: SupportedModality; agentId: string }>) {

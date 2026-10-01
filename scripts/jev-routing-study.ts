@@ -12,6 +12,7 @@ import {
   discoverAgentSdkAgents,
   loadTypeSafeAgentSelectionPolicy,
   selectAgentProfileWithTypeSafe,
+  selectStagedExecutionRoutingWithTypeSafe,
   typeSafePolicyHash,
   type AgentSdkCatalogAgent,
   type AgentSelectionResult,
@@ -28,6 +29,7 @@ type ContextQuality = 'exact' | 'current-catalog' | 'approximate-current-catalog
 interface StudySettings {
   env?: Record<string, string>;
   runtime?: { mode?: string; sqlitePath?: string };
+  executionRouting?: { mode?: 'single' | 'adaptive'; maxSpecialists?: number };
   agentSelection?: {
     typesafe?: {
       model?: string;
@@ -46,6 +48,7 @@ interface HistoricalCase {
   objective: string;
   skipReason?: string;
   existingSelection?: string;
+  existingRoutingMode?: 'direct' | 'orchestration';
   selectionRunId?: string;
   candidates?: AgentSdkCatalogAgent[];
   attachments?: AttachmentSummary;
@@ -80,7 +83,11 @@ export interface StudyResult {
   objective: string;
   modalities: string;
   existingSelection?: string;
+  existingRoutingMode?: 'direct' | 'orchestration';
   jevSelection?: string;
+  routingMode?: 'direct' | 'orchestration';
+  assignments?: Array<{ agentId: string; modalities: string[] }>;
+  stages?: Array<{ name: string; confidence: number; relevance?: number; usage?: { inputTokens: number; outputTokens: number } }>;
   agreement?: boolean;
   confidence?: number;
   relevance?: number;
@@ -129,14 +136,18 @@ export interface RunStudyOptions {
 
 interface CachedEvaluation {
   selectedAgentId: string;
+  routingMode?: 'direct' | 'orchestration';
+  assignments?: Array<{ agentId: string; modalities: string[] }>;
+  stages?: StudyResult['stages'];
   confidence: number;
   relevance: number;
-  probabilities: Record<string, number>;
+  probabilities?: Record<string, number>;
   model: string;
   inputTokens?: number;
   outputTokens?: number;
   latencyMs: number;
-  response?: TypeSafeAgentSelectionResponse;
+  response?: TypeSafeAgentSelectionResponse | TypeSafeAgentSelectionResponse[];
+  states?: unknown[];
 }
 
 interface CacheEntry {
@@ -156,6 +167,8 @@ export async function runStudy(options: RunStudyOptions): Promise<StudyResult[]>
   const configured = settings.agentSelection?.typesafe ?? {};
   const env = { ...process.env, ...(settings.env ?? {}) };
   const model = configured.model ?? 'jev-latest';
+  const adaptive = settings.executionRouting?.mode === 'adaptive';
+  const maxSpecialists = settings.executionRouting?.maxSpecialists ?? 4;
   const policy = await loadTypeSafeAgentSelectionPolicy(
     process.cwd(),
     options.policyPath ?? configured.policyPath,
@@ -191,7 +204,7 @@ export async function runStudy(options: RunStudyOptions): Promise<StudyResult[]>
     });
     cases = cases.map((item) => {
       if (item.skipReason) return item;
-      if (item.persistedJev && !options.forceJev) return item;
+      if (item.persistedJev && !options.forceJev && !adaptive) return item;
       if (item.candidates && item.attachments) return item;
       if (!options.allowCurrentCatalog) {
         throw new Error(`Run ${item.runId} has no exact linked selector context; rerun with --allow-current-catalog to permit an approximate replay.`);
@@ -228,7 +241,7 @@ export async function runStudy(options: RunStudyOptions): Promise<StudyResult[]>
     }
     const candidates = item.candidates ?? currentCandidates;
     const attachments = item.attachments ?? emptyAttachments();
-    if (item.persistedJev && !options.forceJev) {
+    if (item.persistedJev && !options.forceJev && !adaptive) {
       const jev = item.persistedJev;
       results.push({
         runId: item.runId,
@@ -237,6 +250,7 @@ export async function runStudy(options: RunStudyOptions): Promise<StudyResult[]>
         objective: item.objective,
         modalities: modalityMarker(attachments),
         existingSelection: item.existingSelection,
+        ...(item.existingRoutingMode ? { existingRoutingMode: item.existingRoutingMode } : {}),
         jevSelection: jev.selectedAgentId,
         ...(item.existingSelection ? { agreement: item.existingSelection === jev.selectedAgentId } : {}),
         confidence: jev.confidence,
@@ -262,6 +276,8 @@ export async function runStudy(options: RunStudyOptions): Promise<StudyResult[]>
       model,
       policyHash,
       catalogHash,
+      strategy: adaptive ? 'staged-adaptive-v1' : 'single-selection',
+      ...(adaptive ? { maxSpecialists } : {}),
     });
     for (let repetition = 1; repetition <= options.repeat; repetition += 1) {
       const cached = !options.refresh && !options.forceJev ? cache.get(keyBase) : undefined;
@@ -273,12 +289,15 @@ export async function runStudy(options: RunStudyOptions): Promise<StudyResult[]>
           model,
           policy,
           clock,
+          adaptive,
+          maxSpecialists,
         });
         if (!cached && options.repeat === 1) {
-          await appendCache(cachePath, { key: keyBase, value: evaluation });
-          cache.set(keyBase, evaluation);
+          const { states: _states, ...cacheValue } = evaluation;
+          await appendCache(cachePath, { key: keyBase, value: cacheValue });
+          cache.set(keyBase, cacheValue);
         }
-        const margin = probabilityMargin(evaluation.probabilities);
+        const margin = evaluation.probabilities ? probabilityMargin(evaluation.probabilities) : undefined;
         const accepted = evaluation.confidence >= (policy.minimumConfidence ?? 0.5)
           && evaluation.relevance >= (policy.minimumRelevance ?? 0.5);
         results.push({
@@ -288,8 +307,11 @@ export async function runStudy(options: RunStudyOptions): Promise<StudyResult[]>
           objective: item.objective,
           modalities: modalityMarker(attachments),
           existingSelection: item.existingSelection,
+          ...(item.existingRoutingMode ? { existingRoutingMode: item.existingRoutingMode } : {}),
           jevSelection: evaluation.selectedAgentId,
-          ...(item.existingSelection ? { agreement: item.existingSelection === evaluation.selectedAgentId } : {}),
+          ...(evaluation.routingMode ? { routingMode: evaluation.routingMode, assignments: evaluation.assignments, stages: evaluation.stages } : {}),
+          ...(item.existingSelection ? { agreement: item.existingSelection === evaluation.selectedAgentId
+            && (!item.existingRoutingMode || item.existingRoutingMode === evaluation.routingMode) } : {}),
           confidence: evaluation.confidence,
           relevance: evaluation.relevance,
           policy: policyProvenance,
@@ -304,7 +326,7 @@ export async function runStudy(options: RunStudyOptions): Promise<StudyResult[]>
           contextQuality: item.contextQuality,
           existing: existingMetrics(item),
           cached: Boolean(cached),
-          ...(options.showState ? { state } : {}),
+          ...(options.showState ? { state: evaluation.states ?? state } : {}),
           ...(options.showResponse && evaluation.response ? { response: evaluation.response } : {}),
         });
       } catch (error) {
@@ -413,29 +435,50 @@ async function evaluateCase(
     model: string;
     policy: TypeSafeAgentSelectionPolicyConfig;
     clock: () => number;
+    adaptive: boolean;
+    maxSpecialists: number;
   },
 ): Promise<CachedEvaluation> {
-  let response: TypeSafeAgentSelectionResponse | undefined;
+  const responses: TypeSafeAgentSelectionResponse[] = [];
+  const states: unknown[] = [];
   const capturingClient: TypeSafeAgentSelectionClient = {
     async evaluate(request) {
-      response = await client.evaluate(request);
+      states.push({ state: request.state, questions: Object.keys(request.questions) });
+      const response = await client.evaluate(request);
+      responses.push(response);
       return response;
     },
   };
   const started = args.clock();
-  const selection = await selectAgentProfileWithTypeSafe(capturingClient, {
+  const request = {
     originalObjective: args.objective,
     candidates: args.candidates,
     workspaceRoot: '<redacted>',
     attachments: args.attachments,
     sessionId: 'jev-routing-study',
-  }, args.model, {
+  };
+  const studyPolicy = {
     ...args.policy,
     minimumConfidence: 0,
     minimumRelevance: 0,
-  });
+  };
+  if (args.adaptive) {
+    const routing = await selectStagedExecutionRoutingWithTypeSafe(capturingClient, {
+      ...request, maxSpecialists: args.maxSpecialists,
+    }, args.model, studyPolicy);
+    return {
+      selectedAgentId: routing.decision.primaryAgentId,
+      routingMode: routing.decision.mode,
+      assignments: routing.decision.assignments.map(({ agentId, modalities }) => ({ agentId, modalities })),
+      stages: routing.stages,
+      confidence: Math.min(...routing.stages.map((stage) => stage.confidence)), relevance: routing.relevance!,
+      model: routing.routingModel!, inputTokens: routing.usage?.inputTokens, outputTokens: routing.usage?.outputTokens,
+      latencyMs: args.clock() - started, response: responses, states,
+    };
+  }
+  const selection = await selectAgentProfileWithTypeSafe(capturingClient, request, args.model, studyPolicy);
   const latencyMs = args.clock() - started;
-  return evaluationFromSelection(selection, latencyMs, response);
+  return { ...evaluationFromSelection(selection, latencyMs, responses[0]), states };
 }
 
 function extractHistoricalCase(database: Database, row: RunRow, setupOnly = false): HistoricalCase {
@@ -443,6 +486,7 @@ function extractHistoricalCase(database: Database, row: RunRow, setupOnly = fals
   const metadata = objectValue(record.metadata);
   const taskPreparation = objectValue(metadata.taskPreparation);
   const selection = objectValue(metadata.agentSelection);
+  const routing = objectValue(metadata.executionRouting);
   const rejected = objectValue(selection.rejectedTypeSafe);
   const jev = Object.keys(rejected).length ? objectValue(rejected.decision) : selection;
   const probabilities = objectValue(jev.probabilities);
@@ -465,7 +509,8 @@ function extractHistoricalCase(database: Database, row: RunRow, setupOnly = fals
       ?? stringValue(selection.originalObjective)
     : stringValue(taskPreparation.originalObjective) ?? stringValue(record.goal);
   const selectionRunId = stringValue(selection.selectionRunId);
-  let existingSelection = stringValue(selection.selectedAgentId);
+  let existingSelection = stringValue(selection.selectedAgentId) ?? stringValue(routing.primaryAgentId);
+  const existingRoutingMode = routing.mode === 'direct' || routing.mode === 'orchestration' ? routing.mode : undefined;
   let candidates: AgentSdkCatalogAgent[] | undefined;
   let attachments: AttachmentSummary | undefined;
   let contextQuality: ContextQuality = 'approximate-current-catalog';
@@ -507,6 +552,7 @@ function extractHistoricalCase(database: Database, row: RunRow, setupOnly = fals
     objective: objective ?? '',
     ...(objective ? {} : { skipReason: 'Skipped: session has no usable original objective.' }),
     existingSelection,
+    existingRoutingMode,
     selectionRunId,
     candidates,
     attachments,
@@ -880,8 +926,10 @@ function render(results: StudyResult[], output: OutputFormat): void {
       : short(result.sessionId ?? '-', 12),
     objective: short(result.objective.replace(/\s+/g, ' '), 42),
     modalities: result.modalities,
+    mode: `${result.existingRoutingMode ?? '-'}/${result.routingMode ?? '-'}`,
     existing: result.existingSelection ?? '-',
     jev: result.jevSelection ?? 'ERROR',
+    assignments: result.assignments?.map((assignment) => `${assignment.agentId}:${assignment.modalities.join('+')}`).join(', ') ?? '-',
     agree: result.agreement === undefined ? '-' : result.agreement ? 'yes' : 'NO',
     conf: decimal(result.confidence),
     rel: decimal(result.relevance),

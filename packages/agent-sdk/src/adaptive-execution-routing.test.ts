@@ -7,10 +7,11 @@ import {
   ExecutionRoutingConfidenceError,
   selectExecutionRoutingWithAgent,
   selectExecutionRoutingWithTypeSafe,
+  selectStagedExecutionRoutingWithTypeSafe,
 } from './adaptive-execution-routing.js';
 import { executionRoutingMetadata } from './run-decision.js';
 import type { TaskPreparationRunner } from './task-preparation.js';
-import type { TypeSafeAgentSelectionClient } from './typesafe-agent-selection.js';
+import type { TypeSafeAgentSelectionClient, TypeSafeAgentSelectionResponse } from './typesafe-agent-selection.js';
 
 describe('adaptive execution routing', () => {
   it('accepts a grouped multimodal decision from the agent engine without exposing paths', async () => {
@@ -164,6 +165,83 @@ describe('adaptive execution routing', () => {
       candidate('image', ['text', 'image']),
       candidate('audio', ['text', 'audio']),
     ], 1))).rejects.toThrow('exceeding the configured maximum 1');
+  });
+
+  it('asks for mode before direct whole-task selection and never asks assignment questions', async () => {
+    const requests: Array<Parameters<TypeSafeAgentSelectionClient['evaluate']>[0]> = [];
+    const client: TypeSafeAgentSelectionClient = { async evaluate(input): Promise<TypeSafeAgentSelectionResponse> {
+      requests.push(input);
+      return requests.length === 1
+        ? { model: 'jev-test', usage: { input_tokens: 20, output_tokens: 2 }, answers: { execution_mode: choice('direct', 0.85) } }
+        : { model: 'jev-test', usage: { input_tokens: 30, output_tokens: 3 }, answers: {
+          candidate_0_relevant: noul(0.92), selection: choice('general', 0.9),
+        } };
+    } };
+    const result = await selectStagedExecutionRoutingWithTypeSafe(client, request([
+      candidate('general', ['text', 'image', 'audio']),
+      candidate('image', ['text', 'image']),
+    ]), 'jev-test');
+    expect(requests.map((input) => Object.keys(input.questions))).toEqual([
+      ['execution_mode'], ['candidate_0_relevant'],
+    ]);
+    expect(result.decision).toMatchObject({ mode: 'direct', primaryAgentId: 'general', confidence: 0.85 });
+    expect(result.usage).toEqual({ inputTokens: 50, outputTokens: 5 });
+    expect(result.stages.map((stage) => stage.name)).toEqual(['mode', 'selection']);
+  });
+
+  it('asks only orchestration branch questions and assigns a distinct specialist', async () => {
+    const requests: Array<Parameters<TypeSafeAgentSelectionClient['evaluate']>[0]> = [];
+    const client: TypeSafeAgentSelectionClient = { async evaluate(input): Promise<TypeSafeAgentSelectionResponse> {
+      requests.push(input);
+      return requests.length === 1
+        ? { model: 'jev-test', answers: { execution_mode: choice('orchestration', 0.88) } }
+        : { model: 'jev-test', answers: {
+          orchestration_primary: choice('general', 0.91),
+          assignment_text: choice('general', 0.93),
+          assignment_image: choice('image', 0.94),
+          assignment_audio: choice('audio', 0.92),
+          candidate_0_text_relevant: noul(0.95),
+          candidate_0_primary_relevant: noul(0.96),
+          candidate_1_image_relevant: noul(0.94),
+          candidate_2_audio_relevant: noul(0.92),
+        } };
+    } };
+    const result = await selectStagedExecutionRoutingWithTypeSafe(client, request([
+      candidate('general', ['text', 'image', 'audio']),
+      candidate('image', ['image']), candidate('audio', ['audio']),
+    ]), 'jev-test');
+    expect(Object.keys(requests[0]!.questions)).toEqual(['execution_mode']);
+    expect(requests[1]!.questions).not.toHaveProperty('direct_primary');
+    expect(requests[1]!.questions).not.toHaveProperty('execution_mode');
+    expect(requests[1]!.questions).toHaveProperty('assignment_image');
+    expect(requests[1]!.questions.assignment_image).toMatchObject({ criteria: { image: { profile: '`candidates[1]`' } } });
+    expect(JSON.stringify(requests[1]!.questions)).not.toContain('image description');
+    expect(result.decision).toMatchObject({ mode: 'orchestration', primaryAgentId: 'general', confidence: 0.88,
+      assignments: [{ agentId: 'general', modalities: ['text'] }, { agentId: 'image', modalities: ['image'] }, { agentId: 'audio', modalities: ['audio'] }] });
+  });
+
+  it('uses lower-ranked probabilities to respect the specialist budget', async () => {
+    const client: TypeSafeAgentSelectionClient = { async evaluate(): Promise<TypeSafeAgentSelectionResponse> {
+      return { model: 'jev-test', answers: {
+        assignment_text: choice('general', 0.95),
+        assignment_image: { type: 'choice', choice: 'image', confidence: 0.6,
+          probabilities: { image: 0.6, media: 0.4 } },
+        assignment_audio: { type: 'choice', choice: 'audio', confidence: 0.6,
+          probabilities: { audio: 0.6, media: 0.4 } },
+        candidate_0_text_relevant: noul(0.95), candidate_0_primary_relevant: noul(0.96),
+        candidate_1_image_relevant: noul(0.9), candidate_2_audio_relevant: noul(0.9),
+        candidate_3_image_relevant: noul(0.88), candidate_3_audio_relevant: noul(0.87),
+      } };
+    } };
+    const result = await selectStagedExecutionRoutingWithTypeSafe(client, request([
+      candidate('general', ['text']), candidate('image', ['image']),
+      candidate('audio', ['audio']), candidate('media', ['image', 'audio']),
+    ], 1), 'jev-test');
+    expect(result.decision.assignments).toEqual([
+      expect.objectContaining({ agentId: 'general', modalities: ['text'] }),
+      expect.objectContaining({ agentId: 'media', modalities: ['image', 'audio'] }),
+    ]);
+    expect(result.decision.confidence).toBe(0.4);
   });
 });
 

@@ -119,6 +119,66 @@ describe('JEV routing study', () => {
     expect(modalityMarker({ images: [], audio: ['a', 'b'], files: ['f'] })).toBe('AF');
   });
 
+  it('uses the Agent SDK staged adaptive path when configured without changing production routing', async () => {
+    const fixture = await createFixture();
+    const settings = JSON.parse(await readFile(fixture.settingsPath, 'utf8')) as Record<string, unknown>;
+    settings.executionRouting = { mode: 'adaptive', maxSpecialists: 2 };
+    await writeFile(fixture.settingsPath, JSON.stringify(settings));
+    const requests: Array<Parameters<TypeSafeAgentSelectionClient['evaluate']>[0]> = [];
+    const evaluator: TypeSafeAgentSelectionClient = { async evaluate(request) {
+      requests.push(request);
+      return requests.length === 1
+        ? { model: request.model, answers: { execution_mode: { type: 'choice', choice: 'direct', confidence: 0.82, probabilities: { direct: 0.82, orchestration: 0.18 } } },
+          usage: { input_tokens: 40, output_tokens: 4 } }
+        : { model: request.model, answers: {
+          candidate_0_relevant: { type: 'noul', noul: 0.91 },
+          candidate_1_relevant: { type: 'noul', noul: 0.86 },
+          selection: { type: 'choice', choice: 'current-a', confidence: 0.89, probabilities: { 'current-a': 0.89, 'current-b': 0.11 } },
+        }, usage: { input_tokens: 80, output_tokens: 8 } };
+    } };
+    const results = await runStudy({ mode: 'prompt', prompt: 'Implement a code change',
+      settingsPath: fixture.settingsPath, allowCurrentCatalog: true, repeat: 1,
+      inputPricePerMillion: 0.042, cachePath: fixture.cachePath, refresh: true,
+      showState: true, showResponse: true, evaluator });
+    expect(requests.map((request) => Object.keys(request.questions))).toEqual([
+      ['execution_mode'], ['candidate_0_relevant', 'candidate_1_relevant', 'selection'],
+    ]);
+    expect(results[0]).toMatchObject({ routingMode: 'direct', jevSelection: 'current-a', confidence: 0.82,
+      relevance: 0.91, inputTokens: 120, outputTokens: 12, accepted: true,
+      assignments: [{ agentId: 'current-a', modalities: ['text'] }],
+      stages: [{ name: 'mode', confidence: 0.82 }, { name: 'selection', confidence: 0.89 }] });
+    expect((results[0]!.state as unknown[])).toHaveLength(2);
+    expect((results[0]!.response as unknown[])).toHaveLength(2);
+    expect(await readFile(fixture.cachePath, 'utf8')).not.toContain('Implement a code change');
+  });
+
+  it('compares both primary profile and mode for historical adaptive runs', async () => {
+    const fixture = await createFixture();
+    const settings = JSON.parse(await readFile(fixture.settingsPath, 'utf8')) as Record<string, unknown>;
+    settings.executionRouting = { mode: 'adaptive', maxSpecialists: 2 };
+    await writeFile(fixture.settingsPath, JSON.stringify(settings));
+    const database = new Database(fixture.databasePath, { strict: true });
+    insertRun(database, 'routed', 'session-routed', {
+      goal: 'Implement a change', metadata: { executionRouting: { mode: 'orchestration', primaryAgentId: 'current-a' } },
+    });
+    database.close();
+    const evaluator: TypeSafeAgentSelectionClient = { async evaluate(request) {
+      return Object.hasOwn(request.questions, 'execution_mode')
+        ? { model: request.model, answers: { execution_mode: { type: 'choice', choice: 'direct', confidence: 0.9,
+          probabilities: { direct: 0.9, orchestration: 0.1 } } } }
+        : { model: request.model, answers: { candidate_0_relevant: { type: 'noul', noul: 0.9 },
+          candidate_1_relevant: { type: 'noul', noul: 0.8 },
+          selection: { type: 'choice', choice: 'current-a', confidence: 0.9,
+            probabilities: { 'current-a': 0.9, 'current-b': 0.1 } } } };
+    } };
+    const results = await runStudy({ mode: 'history', settingsPath: fixture.settingsPath,
+      databasePath: fixture.databasePath, sessionIds: ['session-routed'], allowCurrentCatalog: true,
+      repeat: 1, inputPricePerMillion: 0.042, cachePath: fixture.cachePath, refresh: true,
+      showState: false, showResponse: false, evaluator });
+    expect(results[0]).toMatchObject({ existingSelection: 'current-a', existingRoutingMode: 'orchestration',
+      jevSelection: 'current-a', routingMode: 'direct', agreement: false, contextQuality: 'approximate-current-catalog' });
+  });
+
   it('limits history by the latest distinct non-null sessions, not the latest routed sessions', async () => {
     const fixture = await createFixture();
     const database = new Database(fixture.databasePath, { strict: true });
