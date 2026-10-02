@@ -112,6 +112,8 @@ export interface AgentSelectionSettingsConfig {
   lowConfidenceFallback?: 'error' | 'agent';
   typesafe?: {
     model?: string;
+    /** Defaults to combined; staged applies only to adaptive TypeSafe routing. */
+    routingStrategy?: 'combined' | 'staged';
     apiKeyEnv?: string;
     baseUrl?: string;
     timeoutMs?: number;

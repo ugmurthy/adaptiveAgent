@@ -293,6 +293,15 @@ and per-modality choices independently of the legacy single-agent
 `policy.selection.instructions`; `selection.candidateCriteria` remains common
 guidance for candidate choices.
 
+CLI and desktop-bridge can opt into mode-first TypeSafe routing by adding
+`"routingStrategy": "staged"` to `agentSelection.typesafe` while keeping
+`agent.mode: "auto"` and `executionRouting.mode: "adaptive"`. The shared Agent SDK
+decision path then asks for execution mode first, followed by single-profile
+selection or modality-based orchestration assignments. Omission or `"combined"`
+preserves the existing request. Update/rebuild the SDK and restart the client
+after changing settings. See [Staged TypeSafe Routing Requests](JEV-STAGED-ROUTING-REQUESTS.md)
+for full request examples, rollout, rollback, and per-stage diagnostics.
+
 On a TypeSafe selection or routing confidence/relevance threshold failure,
 Agent SDK asks `agentSelection.agent` to make the same kind of decision, or
 fails if it is absent. Set `agentSelection.lowConfidenceFallback` to `error`

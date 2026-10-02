@@ -8,6 +8,7 @@ import {
   ExecutionRoutingConfidenceError,
   selectExecutionRoutingWithAgent,
   selectExecutionRoutingWithTypeSafe,
+  selectStagedExecutionRoutingWithTypeSafe,
   type AdaptiveExecutionRoutingResult,
 } from './adaptive-execution-routing.js';
 import type { TaskPreparationAttachmentSummary } from './task-preparation.js';
@@ -67,9 +68,12 @@ export function executionRoutingMetadata(routing: AdaptiveExecutionRoutingResult
     ...(routing.routingRunId ? { routingRunId: routing.routingRunId } : {}),
     ...(routing.routingModel ? { routingModel: routing.routingModel } : {}),
     ...(routing.relevance === undefined ? {} : { relevance: routing.relevance }),
+    ...(routing.choiceConfidence === undefined ? {} : { choiceConfidence: routing.choiceConfidence }),
+    ...(routing.stages ? { stages: routing.stages } : {}),
     ...(routing.policy ? { policy: routing.policy } : {}),
     ...(routing.usage ? { typesafe: { usage: routing.usage } } : {}),
     ...(routing.rejectedTypeSafe ? { rejectedTypeSafe: routing.rejectedTypeSafe } : {}),
+    ...(routing.rejectedStagedTypeSafe ? { rejectedStagedTypeSafe: routing.rejectedStagedTypeSafe } : {}),
   } as unknown as JsonObject;
 }
 
@@ -154,9 +158,11 @@ export async function decideAutomaticRun(request: AutomaticRunDecisionRequest): 
     timeoutMs: typesafe.timeoutMs,
   });
   const model = typesafe.model ?? 'jev-latest';
+  const route = typesafe.routingStrategy === 'staged'
+    ? selectStagedExecutionRoutingWithTypeSafe : selectExecutionRoutingWithTypeSafe;
   try {
     return adaptive
-      ? { kind: 'routing', routing: { ...await selectExecutionRoutingWithTypeSafe(client, routingRequest, model, policy), policy: policyProvenance } }
+      ? { kind: 'routing', routing: { ...await route(client, routingRequest, model, policy), policy: policyProvenance } }
       : { kind: 'selection', selection: { ...await selectAgentProfileWithTypeSafe(client, selectionRequest, model, policy), policy: policyProvenance } };
   } catch (error) {
     if (!(error instanceof AgentSelectionConfidenceError || error instanceof ExecutionRoutingConfidenceError)) throw error;
@@ -166,13 +172,19 @@ export async function decideAutomaticRun(request: AutomaticRunDecisionRequest): 
     if (error instanceof ExecutionRoutingConfidenceError && error.rejectedTypeSafe) {
       error.rejectedTypeSafe.policy = policyProvenance;
     }
+    if (error instanceof ExecutionRoutingConfidenceError && error.stagedAttempt) {
+      error.stagedAttempt.policy = policyProvenance;
+    }
     if (selectionSettings.lowConfidenceFallback !== 'error' && selectionSettings.agent) {
       const fallback = await runWithSelectorAgent();
       if (fallback.kind === 'selection' && error instanceof AgentSelectionConfidenceError) {
         return { kind: 'selection', selection: { ...fallback.selection, rejectedTypeSafe: error.rejectedTypeSafe } };
       }
       if (fallback.kind === 'routing' && error instanceof ExecutionRoutingConfidenceError) {
-        return { kind: 'routing', routing: { ...fallback.routing, rejectedTypeSafe: error.rejectedTypeSafe } };
+        return { kind: 'routing', routing: { ...fallback.routing,
+          ...(error.rejectedTypeSafe ? { rejectedTypeSafe: error.rejectedTypeSafe } : {}),
+          ...(error.stagedAttempt ? { rejectedStagedTypeSafe: error.stagedAttempt } : {}),
+        } };
       }
       return fallback;
     }

@@ -4,10 +4,43 @@
 
 This documents the opt-in `selectStagedExecutionRoutingWithTypeSafe` API in
 `packages/agent-sdk/src/adaptive-execution-routing.ts`. The JEV routing study
-uses it when `executionRouting.mode` is `adaptive`. CLI and desktop-bridge still
-use the existing combined TypeSafe request through `decideAutomaticRun`; the
-examples below do not describe their current wire requests. No agent executes
+uses it when `executionRouting.mode` is `adaptive`. CLI and desktop-bridge opt in
+through the shared `decideAutomaticRun` path by setting
+`agentSelection.typesafe.routingStrategy` to `staged`. They retain the existing
+combined request when the setting is omitted or `combined`. No agent executes
 during a study evaluation.
+
+## Production rollout
+
+Merge these fields into the effective settings used by the CLI or desktop bridge;
+keep the existing model, policy, credentials, catalog, and fallback configuration:
+
+```json
+{
+  "agent": { "mode": "auto" },
+  "agentSelection": {
+    "engine": "typesafe",
+    "typesafe": { "routingStrategy": "staged" }
+  },
+  "executionRouting": { "mode": "adaptive", "maxSpecialists": 4 }
+}
+```
+
+Rebuild/update the Agent SDK and restart the client so it loads the new code and
+settings. Roll back by removing `routingStrategy` or setting it to `combined`.
+The switch does not affect fixed-profile runs, forced orchestration, the agent
+engine, or nonadaptive single-profile selection. The study uses staged routing
+for adaptive evaluations regardless of this production rollout switch.
+
+Production enforces the effective policy's `minimumConfidence` against choice
+confidence independently of `minimumRelevance`. A low mode score stops before
+the branch call. A low branch score retains the completed decision before using
+the configured selector-agent fallback (or throwing when fallback is disabled).
+Successful execution-routing metadata includes `choiceConfidence`, `stages`,
+policy provenance, and summed TypeSafe usage. Fallback metadata includes
+`rejectedStagedTypeSafe` with the rejected scores, stages, policy, and usage;
+a rejected mode-only attempt has no completed `decision`. Malformed responses
+and invalid routes still fail rather than invoking threshold fallback.
 
 Each stage calls `client.evaluate({ model, state, questions })`. The SDK first
 filters out archived, invalid, and non-`run` profiles. Absent or empty

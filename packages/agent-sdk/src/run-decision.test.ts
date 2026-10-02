@@ -117,6 +117,90 @@ it.each([[false, undefined], [true, undefined], [false, 'agent'], [true, 'agent'
 
 function profileForRunner() { return { id: 'selector', name: 'selector', tools: [], delegates: [] }; }
 
+it('validates the adaptive TypeSafe routing strategy', () => {
+  for (const routingStrategy of ['combined', 'staged']) {
+    expect(validateSettings({ agentSelection: { typesafe: { routingStrategy } } }, 'settings.json')
+      .agentSelection?.typesafe?.routingStrategy).toBe(routingStrategy);
+  }
+  expect(() => validateSettings({ agentSelection: { typesafe: { routingStrategy: 'other' } } }, 'settings.json'))
+    .toThrow(/must be equal to one of the allowed values/);
+});
+
+it.each([
+  ['direct', 'success'], ['orchestration', 'success'],
+  ['direct', 'mode'], ['direct', 'confidence'], ['direct', 'relevance'],
+  ['orchestration', 'confidence'], ['orchestration', 'relevance'],
+  ['direct', 'disabled'],
+] as const)('staged production routing preserves %s / %s scores and usage', async (mode, outcome) => {
+  const { cwd, fallbackSdk } = await fixture(true, outcome === 'disabled' ? 'error' : 'agent');
+  const config = fallbackSdk.config.settings.agentSelection!.typesafe!;
+  config.routingStrategy = 'staged';
+  config.policy = { minimumConfidence: 0.7, minimumRelevance: 0.3 };
+  const calls: Array<Record<string, unknown>> = [];
+  vi.stubGlobal('fetch', async (_input: unknown, init?: RequestInit) => {
+    const request = JSON.parse(String(init?.body));
+    calls.push(request.questions);
+    const modeStage = Object.keys(request.questions).length === 1;
+    const confidence = modeStage ? (outcome === 'mode' ? 0.6 : 0.91)
+      : outcome === 'confidence' || outcome === 'disabled' ? 0.65 : 0.83;
+    const answers = Object.fromEntries(Object.keys(request.questions).map((key) => {
+      const choice = key === 'execution_mode' ? mode : key === 'orchestration_primary' ? 'bootstrap' : 'researcher';
+      return [key, request.questions[key].type === 'choice'
+        ? { type: 'choice', choice, confidence, probabilities: { [choice]: confidence } }
+        : { type: 'noul', noul: outcome === 'relevance' ? 0.25 : 0.42 }];
+    }));
+    return new Response(JSON.stringify({ model: 'jev-1.13.0', answers,
+      usage: { input_tokens: modeStage ? 101 : 233, output_tokens: modeStage ? 7 : 19 },
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  });
+  const runRaw = vi.fn(async () => ({ status: 'success', runId: 'fallback-run', output: {
+    mode: 'direct', primaryAgentId: 'researcher', assignments: [{ agentId: 'researcher', modalities: ['text'], reason: 'Fallback.' }],
+    reason: 'Fallback.', confidence: 0.95,
+  } }));
+  const create = vi.spyOn(AgentSdk, 'create').mockResolvedValue({
+    config: { agent: profileForRunner() }, runRaw, close: vi.fn(),
+  } as unknown as AgentSdk);
+  const promise = decideAutomaticRun({ fallbackSdk, sdkOptions: { cwd, env: { TEST_TYPESAFE_API_KEY: 'test-key' } }, cwd,
+    originalObjective: 'Research this', attachments: { images: [], files: [], audio: [] }, sessionId: 'session',
+  });
+  if (outcome === 'disabled') {
+    await expect(promise).rejects.toMatchObject({ stagedAttempt: {
+      threshold: 'confidence', choiceConfidence: 0.65, usage: { inputTokens: 334, outputTokens: 26 },
+    } });
+    expect(create).not.toHaveBeenCalled();
+    return;
+  }
+  const decision = await promise;
+  expect(calls[0]).toHaveProperty('execution_mode');
+  expect(Object.keys(calls[0]!)).toEqual(['execution_mode']);
+  expect(calls).toHaveLength(outcome === 'mode' ? 1 : 2);
+  if (calls[1]) {
+    expect(calls[1]).not.toHaveProperty('execution_mode');
+    expect(calls[1]).toHaveProperty(mode === 'direct' ? 'selection' : 'assignment_text');
+  }
+  expect(decision.kind).toBe('routing');
+  if (decision.kind !== 'routing') throw new Error('Expected routing');
+  const metadata = executionRoutingMetadata(decision.routing);
+  if (outcome === 'success') {
+    expect(create).not.toHaveBeenCalled();
+    expect(metadata).toMatchObject({ mode, source: 'typesafe', confidence: 0.42, choiceConfidence: 0.83,
+      relevance: 0.42, typesafe: { usage: { inputTokens: 334, outputTokens: 26 } },
+      stages: [{ name: 'mode', confidence: 0.91, usage: { inputTokens: 101, outputTokens: 7 } },
+        { name: mode === 'direct' ? 'selection' : 'assignments', confidence: 0.83, relevance: 0.42 }],
+    });
+  } else {
+    expect(create).toHaveBeenCalledOnce();
+    expect(metadata).toMatchObject({ source: 'agent', rejectedStagedTypeSafe: {
+      mode, threshold: outcome === 'relevance' ? 'relevance' : 'confidence',
+      minimum: outcome === 'relevance' ? 0.3 : 0.7,
+      policy: { source: 'inline', hash: createHash('sha256').update(JSON.stringify(config.policy)).digest('hex') },
+      usage: { inputTokens: outcome === 'mode' ? 101 : 334, outputTokens: outcome === 'mode' ? 7 : 26 },
+      ...(outcome === 'mode' ? {} : { decision: { mode, source: 'typesafe' }, relevance: outcome === 'relevance' ? 0.25 : 0.42 }),
+    } });
+    if (outcome === 'mode') expect(decision.routing.rejectedStagedTypeSafe).not.toHaveProperty('decision');
+  }
+});
+
 it.each([true, false])('errors on low TypeSafe confidence when selector is unavailable or disabled (configured=%s)', async (selectorConfigured) => {
   const { cwd, fallbackSdk } = await fixture(false, selectorConfigured ? 'error' : undefined, selectorConfigured);
   vi.stubGlobal('fetch', async () => new Response(JSON.stringify({
@@ -138,8 +222,11 @@ it.each([true, false])('errors on low TypeSafe confidence when selector is unava
 it('records the default policy when TypeSafe has no policy or policyPath', async () => {
   const { cwd, fallbackSdk } = await fixture(false, 'error');
   fallbackSdk.config.settings.agentSelection!.typesafe!.policy = undefined;
+  // The staged opt-in must not turn a nonadaptive run into mode-first routing.
+  fallbackSdk.config.settings.agentSelection!.typesafe!.routingStrategy = 'staged';
   vi.stubGlobal('fetch', async (_input: unknown, init?: RequestInit) => {
     const request = JSON.parse(String(init?.body)) as { questions: Record<string, unknown> };
+    expect(request.questions).not.toHaveProperty('execution_mode');
     expect(request.questions.candidate_0_relevant).toMatchObject({
       instructions: { question: 'Is the referenced candidate agent a strong match for the objective and every requested attachment modality?' },
     });

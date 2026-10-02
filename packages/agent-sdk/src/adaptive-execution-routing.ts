@@ -28,16 +28,38 @@ export interface AdaptiveExecutionRoutingRequest {
   maxSpecialists: number;
 }
 
+export interface TypeSafeRoutingStage {
+  name: 'mode' | 'selection' | 'assignments';
+  confidence: number;
+  relevance?: number;
+  usage?: { inputTokens: number; outputTokens: number };
+}
+
+export interface StagedTypeSafeRoutingAttempt {
+  mode: 'direct' | 'orchestration';
+  model: string;
+  policy?: TypeSafePolicyProvenance;
+  stages: TypeSafeRoutingStage[];
+  choiceConfidence: number;
+  relevance?: number;
+  decision?: ExecutionRoutingDecision;
+  usage?: { inputTokens: number; outputTokens: number };
+  threshold: 'confidence' | 'relevance';
+  minimum: number;
+}
+
 export interface AdaptiveExecutionRoutingResult {
   decision: ExecutionRoutingDecision;
   routerId: string;
-  /** Set by staged TypeSafe orchestration for reporting choice confidence independently of relevance. */
+  /** Set by staged TypeSafe routing for reporting choice confidence independently of relevance. */
   choiceConfidence?: number;
   policy?: TypeSafePolicyProvenance;
   routingRunId?: string;
   routingModel?: string;
   relevance?: number;
   usage?: { inputTokens: number; outputTokens: number };
+  stages?: TypeSafeRoutingStage[];
+  rejectedStagedTypeSafe?: StagedTypeSafeRoutingAttempt;
   rejectedTypeSafe?: {
     decision: ExecutionRoutingDecision;
     model: string;
@@ -55,20 +77,21 @@ export class ExecutionRoutingConfidenceError extends Error {
     message: string,
     readonly confidence: number,
     readonly rejectedTypeSafe?: NonNullable<AdaptiveExecutionRoutingResult['rejectedTypeSafe']>,
+    readonly stagedAttempt?: StagedTypeSafeRoutingAttempt,
   ) {
     super(message);
     this.name = 'ExecutionRoutingConfidenceError';
   }
 }
 
-/** Opt-in mode-first routing for evaluation; existing automatic runs retain the combined request. */
+/** Mode-first routing; automatic runs opt in with typesafe.routingStrategy. */
 export async function selectStagedExecutionRoutingWithTypeSafe(
   client: TypeSafeAgentSelectionClient,
   request: AdaptiveExecutionRoutingRequest,
   model: string,
   policy: TypeSafeAgentSelectionPolicyConfig = {},
 ): Promise<AdaptiveExecutionRoutingResult & {
-  stages: Array<{ name: 'mode' | 'selection' | 'assignments'; confidence: number; relevance?: number; usage?: { inputTokens: number; outputTokens: number } }>;
+  stages: TypeSafeRoutingStage[];
 }> {
   const candidates = eligibleRoutingCandidates(request.candidates);
   const modalities = routingModalities(request.attachments);
@@ -80,7 +103,7 @@ export async function selectStagedExecutionRoutingWithTypeSafe(
     : candidates.length === 1 ? ['direct'] : ['direct', 'orchestration'];
   let modeConfidence = 1;
   let modeUsage: { inputTokens: number; outputTokens: number } | undefined;
-  let mode = modes[0]!;
+  let mode = modes[0]! as 'direct' | 'orchestration';
   if (modes.length > 1) {
     const response = await client.evaluate({
       model,
@@ -104,22 +127,28 @@ export async function selectStagedExecutionRoutingWithTypeSafe(
         },
       },
     });
-    mode = readChoice(response, 'execution_mode', modes);
+    mode = readChoice(response, 'execution_mode', modes) as 'direct' | 'orchestration';
     modeConfidence = readChoiceConfidence(response, 'execution_mode', modes);
     if (response.usage) modeUsage = { inputTokens: response.usage.input_tokens, outputTokens: response.usage.output_tokens };
   }
-  const stages: Array<{ name: 'mode' | 'selection' | 'assignments'; confidence: number; relevance?: number; usage?: { inputTokens: number; outputTokens: number } }> = [
+  const stages: TypeSafeRoutingStage[] = [
     { name: 'mode', confidence: modeConfidence, ...(modeUsage ? { usage: modeUsage } : {}) },
   ];
   if (policy.minimumConfidence !== undefined && modeConfidence < policy.minimumConfidence) {
     throw new ExecutionRoutingConfidenceError(
       `Execution mode confidence ${modeConfidence.toFixed(3)} is below the configured minimum ${policy.minimumConfidence.toFixed(3)}.`,
       modeConfidence,
+      undefined,
+      { mode, model, stages, choiceConfidence: modeConfidence, threshold: 'confidence', minimum: policy.minimumConfidence,
+        ...(modeUsage ? { usage: modeUsage } : {}) },
     );
   }
 
+  // Collect a complete branch attempt before applying gates so rejected scores
+  // and both calls' usage survive production fallback.
+  const branchPolicy = { ...policy, minimumConfidence: 0, minimumRelevance: 0 };
   if (mode === 'direct') {
-    const selection = await selectAgentProfileWithTypeSafe(client, { ...request, candidates: directCandidates }, model, policy);
+    const selection = await selectAgentProfileWithTypeSafe(client, { ...request, candidates: directCandidates }, model, branchPolicy);
     stages.push({ name: 'selection', confidence: selection.confidence!, relevance: selection.relevance, ...(selection.usage ? { usage: selection.usage } : {}) });
     const usage = combinedUsage(modeUsage, selection.usage);
     const decision: ExecutionRoutingDecision = {
@@ -129,19 +158,41 @@ export async function selectStagedExecutionRoutingWithTypeSafe(
       confidence: Math.min(modeConfidence, selection.confidence!, selection.relevance!), source: 'typesafe',
     };
     validateRouting(decision, candidates, modalities, request.maxSpecialists);
-    return { decision, routerId: `typesafe:${selection.selectionModel}`, routingModel: selection.selectionModel,
+    const result = { decision, routerId: `typesafe:${selection.selectionModel}`, routingModel: selection.selectionModel,
+      choiceConfidence: Math.min(modeConfidence, selection.confidence!),
       relevance: selection.relevance, ...(usage ? { usage } : {}), stages };
+    enforceStagedThresholds(result, policy);
+    return result;
   }
 
-  const result = await selectExecutionRoutingWithTypeSafe(client, request, model, policy, 'orchestration');
+  const result = await selectExecutionRoutingWithTypeSafe(client, request, model, branchPolicy, 'orchestration');
   if (result.decision.assignments.every((assignment) => assignment.agentId === result.decision.primaryAgentId)) {
     throw new Error('Staged orchestration requires a specialist distinct from the primary agent.');
   }
   stages.push({ name: 'assignments', confidence: result.choiceConfidence!, relevance: result.relevance,
     ...(result.usage ? { usage: result.usage } : {}) });
   const usage = combinedUsage(modeUsage, result.usage);
-  return { ...result, decision: { ...result.decision, confidence: Math.min(modeConfidence, result.decision.confidence!) },
+  const staged = { ...result, choiceConfidence: Math.min(modeConfidence, result.choiceConfidence!),
+    decision: { ...result.decision, confidence: Math.min(modeConfidence, result.decision.confidence!) },
     ...(usage ? { usage } : {}), stages };
+  enforceStagedThresholds(staged, policy);
+  return staged;
+}
+
+function enforceStagedThresholds(result: AdaptiveExecutionRoutingResult & { stages: TypeSafeRoutingStage[] }, policy: TypeSafeAgentSelectionPolicyConfig): void {
+  const threshold = policy.minimumConfidence !== undefined && result.choiceConfidence! < policy.minimumConfidence
+    ? 'confidence' : policy.minimumRelevance !== undefined && result.relevance! < policy.minimumRelevance ? 'relevance' : undefined;
+  if (!threshold) return;
+  const minimum = (threshold === 'confidence' ? policy.minimumConfidence : policy.minimumRelevance)!;
+  const score = (threshold === 'confidence' ? result.choiceConfidence : result.relevance)!;
+  throw new ExecutionRoutingConfidenceError(
+    `Staged execution routing ${threshold} ${score.toFixed(3)} is below the configured minimum ${minimum.toFixed(3)}.`,
+    score, undefined, {
+      mode: result.decision.mode, model: result.routingModel!, stages: result.stages,
+      choiceConfidence: result.choiceConfidence!, relevance: result.relevance!, decision: result.decision,
+      threshold, minimum, ...(result.usage ? { usage: result.usage } : {}),
+    },
+  );
 }
 
 function combinedUsage(...parts: Array<{ inputTokens: number; outputTokens: number } | undefined>) {
