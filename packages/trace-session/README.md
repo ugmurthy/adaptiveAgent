@@ -218,6 +218,29 @@ Use `--messages` when the HTML or JSON report should include snapshot-backed
 model context. Assistant reasoning is excluded unless `--reasoning` is
 explicitly supplied.
 
+### Staged TypeSafe routing
+
+Terminal decision summaries and the HTML Workflow section report the effective
+execution mode, primary profile, choice confidence, and relevance separately.
+For staged routing they also show:
+
+- `mode`, then `selection` or `assignments`, with each stage's confidence,
+  relevance when present, and input/output token usage;
+- agent-to-modality assignments, reasons, and the synthesis profile;
+- policy source and hash;
+- rejected staged attempts with the failed threshold, score, minimum, model,
+  stages, assignments when evaluated, and the effective selector-agent fallback.
+
+A rejection at the mode stage is labeled `branch not evaluated`; no selected
+profile or assignment is invented. Legacy combined routing and selection
+rejections remain supported. Missing stage details in older traces are not
+zero-filled. JSON retains the original decision metadata.
+
+`TypeSafe tokens=input+output` on the routing/rejection line is aggregate usage;
+the stage lines are its breakdown, not additional usage. These routing tokens
+and their cost remain separate from execution run totals. Both SQLite and core
+Postgres metadata work without gateway tables.
+
 ### Copy-friendly discovery
 
 `list traces` produces cards with full session, run, and root IDs on dedicated

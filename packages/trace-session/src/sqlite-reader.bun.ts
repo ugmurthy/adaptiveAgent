@@ -46,7 +46,9 @@ async function fixture(): Promise<string> {
     metadata: {
       taskPreparation: { title: 'Modernize Trace Session', name: 'modernize-trace-session' },
       agentSelection: { selectedAgentId: 'researcher', rejectedTypeSafe: { threshold: 'confidence', minimum: 0.7 } },
-      executionRouting: { mode: 'direct', rejectedTypeSafe: { threshold: 'relevance', minimum: 0.6 } },
+      executionRouting: { mode: 'direct', rejectedStagedTypeSafe: { mode: 'orchestration', threshold: 'confidence', minimum: 0.7,
+        stages: [{ name: 'mode', confidence: 0.2, usage: { inputTokens: 101, outputTokens: 7 } }],
+        usage: { inputTokens: 101, outputTokens: 7 } } },
     },
     status: 'succeeded', modelProvider: 'openrouter', modelName: 'test-model',
     usage: { promptTokens: 100, completionTokens: 40, reasoningTokens: 10, totalTokens: 150, estimatedCostUSD: 0.15 },
@@ -134,7 +136,9 @@ describe('SqliteTraceReader', () => {
       expect(byRoot.target).toMatchObject({ kind: 'root-run', resolvedRootRunId: 'root-1' });
       expect(byRoot.rootRuns[0]).toMatchObject({
         agentSelection: { selectedAgentId: 'researcher', rejectedTypeSafe: { threshold: 'confidence' } },
-        executionRouting: { mode: 'direct', rejectedTypeSafe: { threshold: 'relevance' } },
+        executionRouting: { mode: 'direct', rejectedStagedTypeSafe: { mode: 'orchestration', threshold: 'confidence',
+          stages: [{ name: 'mode', confidence: 0.2, usage: { inputTokens: 101, outputTokens: 7 } }],
+          usage: { inputTokens: 101, outputTokens: 7 } } },
       });
       const byChild = await service.trace(options({ runId: 'child-1' }));
       expect(byChild.target).toMatchObject({ kind: 'run', requestedId: 'child-1', resolvedRootRunId: 'root-1' });

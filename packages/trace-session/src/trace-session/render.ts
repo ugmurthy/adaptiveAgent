@@ -1938,7 +1938,19 @@ function renderRunDecisions(rootRuns: RootRun[]): string[] {
     const routing = run.executionRouting;
     const prefix = rootRuns.length > 1 ? `${run.rootRunId} ` : '';
     if (selection) lines.push(`${chalk.cyan(`${prefix}agent selection`)} ${String(selection.selectedAgentId ?? 'unknown')} by ${String(selection.selectionAgentId ?? 'unknown')}${selection.confidence === undefined ? '' : ` confidence=${selection.confidence}`}${decisionUsage(selection)}`);
-    if (routing) lines.push(`${chalk.cyan(`${prefix}execution routing`)} ${String(routing.mode ?? 'unknown')} primary=${String(routing.primaryAgentId ?? 'unknown')} by ${String(routing.routerId ?? 'unknown')}${routing.confidence === undefined ? '' : ` confidence=${routing.confidence}`}${decisionUsage(routing)}`);
+    if (routing) {
+      lines.push(`${chalk.cyan(`${prefix}execution routing`)} ${String(routing.mode ?? 'unknown')} primary=${String(routing.primaryAgentId ?? 'unknown')} by ${String(routing.routerId ?? 'unknown')}${routing.confidence === undefined ? '' : ` confidence=${routing.confidence}`}${routing.choiceConfidence === undefined ? '' : ` choiceConfidence=${routing.choiceConfidence}`}${routing.relevance === undefined ? '' : ` relevance=${routing.relevance}`}${decisionUsage(routing)}`);
+      lines.push(...renderRoutingDetails(routing));
+      const rejected = routing.rejectedStagedTypeSafe;
+      if (rejected && typeof rejected === 'object' && !Array.isArray(rejected)) {
+        const attempt = rejected as Record<string, unknown>;
+        const candidate = attempt.decision && typeof attempt.decision === 'object' && !Array.isArray(attempt.decision)
+          ? attempt.decision as Record<string, unknown> : undefined;
+        lines.push(`${chalk.cyan(`${prefix}rejected staged TypeSafe execution routing`)} mode=${String(attempt.mode ?? 'unknown')}${candidate ? ` primary=${String(candidate.primaryAgentId ?? 'unknown')}` : ' (branch not evaluated)'} ${String(attempt.threshold)}=${String(attempt[attempt.threshold === 'confidence' ? 'choiceConfidence' : 'relevance'] ?? 'unknown')} minimum=${String(attempt.minimum)} model=${String(attempt.model ?? 'unknown')}${decisionUsage({ typesafe: { usage: attempt.usage } })}`);
+        lines.push(...renderRoutingDetails({ ...candidate, stages: attempt.stages, policy: attempt.policy }));
+        lines.push(`  fallback: ${String(routing.mode ?? 'unknown')} primary=${String(routing.primaryAgentId ?? 'unknown')} by ${String(routing.routerId ?? 'unknown')}`);
+      }
+    }
     for (const [label, decision] of [['agent selection', selection], ['execution routing', routing]] as const) {
       const rejected = decision?.rejectedTypeSafe;
       if (!rejected || typeof rejected !== 'object' || Array.isArray(rejected)) continue;
@@ -1950,6 +1962,30 @@ function renderRunDecisions(rootRuns: RootRun[]): string[] {
     }
     return lines;
   });
+}
+
+function renderRoutingDetails(routing: Record<string, unknown>): string[] {
+  const lines: string[] = [];
+  if (Array.isArray(routing.stages)) {
+    for (const value of routing.stages) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+      const stage = value as Record<string, unknown>;
+      lines.push(`  stage ${String(stage.name ?? 'unknown')}: confidence=${String(stage.confidence ?? 'unknown')}${stage.relevance === undefined ? '' : ` relevance=${stage.relevance}`}${decisionUsage({ typesafe: { usage: stage.usage } })}`);
+    }
+  }
+  if (routing.synthesisAgentId !== undefined) lines.push(`  synthesis: ${String(routing.synthesisAgentId)}`);
+  if (Array.isArray(routing.assignments)) {
+    for (const value of routing.assignments) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+      const assignment = value as Record<string, unknown>;
+      lines.push(`  assignment: ${String(assignment.agentId ?? 'unknown')} modalities=${Array.isArray(assignment.modalities) ? assignment.modalities.join(', ') : 'unknown'}${assignment.reason === undefined ? '' : ` reason=${String(assignment.reason)}`}`);
+    }
+  }
+  if (routing.policy && typeof routing.policy === 'object' && !Array.isArray(routing.policy)) {
+    const policy = routing.policy as Record<string, unknown>;
+    lines.push(`  policy: ${String(policy.source ?? 'unknown')} hash=${String(policy.hash ?? 'unknown')}`);
+  }
+  return lines;
 }
 
 function decisionUsage(decision: Record<string, unknown>): string {

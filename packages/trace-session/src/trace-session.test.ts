@@ -16,7 +16,9 @@ import type { SessionListItem } from './trace-session/types.js';
 describe('session presentation projection', () => {
   it('projects only decision metadata from core runs without gateway tables', () => {
     const selection = { selectedAgentId: 'fallback', rejectedTypeSafe: { threshold: 'confidence', minimum: 0.7 } };
-    const routing = { mode: 'direct', rejectedTypeSafe: { threshold: 'relevance', minimum: 0.6 } };
+    const routing = { mode: 'direct', stages: [{ name: 'mode', confidence: 0.9 }],
+      rejectedStagedTypeSafe: { mode: 'direct', threshold: 'confidence', minimum: 0.7,
+        stages: [{ name: 'mode', confidence: 0.2 }], usage: { inputTokens: 101, outputTokens: 7 } } };
     const metadata = { agentSelection: selection, executionRouting: routing, secret: 'not in report' };
     expect(runDecisionFromMetadata(metadata, 'agentSelection')).toEqual(selection);
     expect(runDecisionFromMetadata(metadata, 'executionRouting')).toEqual(routing);
@@ -2229,6 +2231,70 @@ describe('trace-session CLI helpers', () => {
     expect(text).toContain('rejected TypeSafe execution routing mode=orchestration primary=researcher relevance=0.3 minimum=0.6 model=jev-1.13.0\n  TypeSafe tokens=51+4 (cost not included in run totals)');
     const json = JSON.parse(renderTraceReport(report, { json: true, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false })) as TraceReport;
     expect(json.rootRuns[0]?.executionRouting?.rejectedTypeSafe).toEqual(report.rootRuns[0]?.executionRouting?.rejectedTypeSafe);
+    expect(json.usage.total).toEqual(base.usage.total);
+  });
+
+  it.each(['selection', 'assignments'] as const)('reports accepted staged %s scores, assignments and policy', (branch) => {
+    const base = reliabilityReport();
+    const routing = {
+      mode: branch === 'selection' ? 'direct' : 'orchestration', primaryAgentId: 'owner', routerId: 'typesafe:jev-test',
+      confidence: 0.42, choiceConfidence: 0.83, relevance: 0.42,
+      typesafe: { usage: { inputTokens: 334, outputTokens: 26 } }, policy: { source: 'inline', hash: 'policy-hash' },
+      stages: [{ name: 'mode', confidence: 0.91, usage: { inputTokens: 101, outputTokens: 7 } },
+        { name: branch, confidence: 0.83, relevance: 0.42, usage: { inputTokens: 233, outputTokens: 19 } }],
+      ...(branch === 'assignments' ? { synthesisAgentId: 'owner' } : {}),
+      assignments: [{ agentId: branch === 'selection' ? 'owner' : 'image-expert', modalities: ['text', 'image'], reason: 'Inspect <images>.' }],
+    };
+    const report = reliabilityReport({ rootRuns: [{ ...base.rootRuns[0]!, executionRouting: routing }] });
+    for (const view of ['summary', 'timeline', 'usage'] as const) {
+      const text = stripAnsi(renderTraceReport(report, { json: false, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false, view }));
+      expect(text).toContain('confidence=0.42 choiceConfidence=0.83 relevance=0.42');
+      expect(text).toContain('stage mode: confidence=0.91\n  TypeSafe tokens=101+7');
+      expect(text).toContain(`stage ${branch}: confidence=0.83 relevance=0.42\n  TypeSafe tokens=233+19`);
+      expect(text).toContain('TypeSafe tokens=334+26');
+      expect(text).toContain(`assignment: ${branch === 'selection' ? 'owner' : 'image-expert'} modalities=text, image reason=Inspect <images>.`);
+      expect(text).toContain('policy: inline hash=policy-hash');
+      if (branch === 'assignments') expect(text).toContain('synthesis: owner');
+    }
+    const html = renderTraceHtml(report, { includePlans: false, messages: false });
+    expect(html).toContain(`stage ${branch}: confidence=0.83 relevance=0.42`);
+    expect(html).toContain('Inspect &lt;images&gt;.');
+    expect(html).not.toContain('Inspect <images>.');
+    const json = JSON.parse(renderTraceReport(report, { json: true, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false })) as TraceReport;
+    expect(json.rootRuns[0]?.executionRouting).toEqual(routing);
+    expect(json.usage.total).toEqual(base.usage.total);
+  });
+
+  it.each(['mode', 'selection', 'assignments'] as const)('distinguishes rejected %s attempt from effective fallback', (branch) => {
+    const base = reliabilityReport();
+    const mode = branch === 'selection' ? 'direct' : 'orchestration';
+    const attempt = {
+      mode, model: 'jev-test', threshold: branch === 'assignments' ? 'relevance' : 'confidence',
+      minimum: branch === 'assignments' ? 0.3 : 0.7, choiceConfidence: branch === 'assignments' ? 0.83 : 0.2,
+      ...(branch === 'mode' ? {} : { relevance: 0.25, decision: {
+        mode, primaryAgentId: 'rejected-owner',
+        ...(branch === 'assignments' ? { synthesisAgentId: 'rejected-owner' } : {}),
+        assignments: [{ agentId: 'rejected-specialist', modalities: ['image'], reason: 'Analyze.' }],
+      } }),
+      stages: [{ name: 'mode', confidence: branch === 'mode' ? 0.2 : 0.91 },
+        ...(branch === 'mode' ? [] : [{ name: branch, confidence: branch === 'assignments' ? 0.83 : 0.2, relevance: 0.25 }])],
+      usage: { inputTokens: branch === 'mode' ? 101 : 334, outputTokens: branch === 'mode' ? 7 : 26 },
+      policy: { source: 'file', hash: 'rejected-policy' },
+    };
+    const routing = { mode: 'direct', primaryAgentId: 'fallback', routerId: 'selector', source: 'agent',
+      assignments: [{ agentId: 'fallback', modalities: ['text', 'image'], reason: 'Fallback.' }], rejectedStagedTypeSafe: attempt };
+    const report = reliabilityReport({ rootRuns: [{ ...base.rootRuns[0]!, executionRouting: routing }] });
+    const text = stripAnsi(renderTraceReport(report, { json: false, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false, view: 'summary' }));
+    expect(text).toContain('execution routing direct primary=fallback by selector');
+    expect(text).toContain(`rejected staged TypeSafe execution routing mode=${mode}${branch === 'mode' ? ' (branch not evaluated) confidence=0.2 minimum=0.7' : ` primary=rejected-owner ${branch === 'assignments' ? 'relevance=0.25 minimum=0.3' : 'confidence=0.2 minimum=0.7'}`} model=jev-test`);
+    expect(text).toContain(`TypeSafe tokens=${branch === 'mode' ? '101+7' : '334+26'}`);
+    expect(text).toContain('fallback: direct primary=fallback by selector');
+    expect(text).toContain('policy: file hash=rejected-policy');
+    if (branch === 'mode') expect(text).not.toContain('primary=unknown');
+    else expect(text).toContain('assignment: rejected-specialist modalities=image reason=Analyze.');
+    expect(renderTraceHtml(report, { includePlans: false, messages: false })).toContain('fallback: direct primary=fallback by selector');
+    const json = JSON.parse(renderTraceReport(report, { json: true, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false })) as TraceReport;
+    expect(json.rootRuns[0]?.executionRouting?.rejectedStagedTypeSafe).toEqual(attempt);
     expect(json.usage.total).toEqual(base.usage.total);
   });
 
