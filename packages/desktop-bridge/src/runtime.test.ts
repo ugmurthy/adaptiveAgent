@@ -756,6 +756,7 @@ describe('desktop runtime protocol', () => {
         settingsPath: join(cwd, 'agent.settings.json'),
         diagnostics: [],
       });
+      expect(discovery.agents).toHaveLength(1);
       expect(discovery.currentAgent.configurationFingerprint).toMatch(/^[a-f0-9]{64}$/);
       expect(JSON.stringify(discovery)).not.toContain('must-not-leak');
       expect(JSON.stringify(discovery)).not.toContain('private prompt');
@@ -862,6 +863,7 @@ describe('desktop runtime protocol', () => {
       expect(initialized.capabilities.methods).toContain('catalog/inspect');
       const catalog = await runtime.handleRpc(request({ id: 'catalog', method: 'catalog/inspect', params: { cwd } })) as any;
       expect(catalog).toMatchObject({ currentAgent: { id: 'desktop-agent', configPath: agentPath }, settingsPath: join(cwd, 'agent.settings.json'), diagnostics: [] });
+      expect(catalog.agents).toHaveLength(1);
       expect(catalog).not.toHaveProperty('config');
       expect(catalog).not.toHaveProperty('tools');
       const descriptor = catalog.currentAgent;
