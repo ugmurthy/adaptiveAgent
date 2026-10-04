@@ -1,5 +1,8 @@
 # @adaptive-agent/agent-sdk
 
+For the programmatic API and profile/settings file formats, see the
+[Agent SDK API reference](API.md).
+
 `@adaptive-agent/agent-sdk` is the CLI-facing package for running configured agents from the shell. It resolves `agent.json` and `agent.settings.json`, wires built-in tools, chooses a runtime store, and calls `@adaptive-agent/core` with CLI-friendly defaults.
 
 Use this package when you want an executable command such as `adaptive-agent run`, `adaptive-agent chat`, `adaptive-agent swarm-run`, `adaptive-agent retry`, or `adaptive-agent eval`. Use `@adaptive-agent/core` directly when you are embedding the runtime in an application and want to provide stores, tools, model adapters, and event handling yourself.
