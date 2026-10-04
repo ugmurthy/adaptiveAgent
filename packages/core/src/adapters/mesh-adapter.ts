@@ -101,6 +101,7 @@ export class MeshAdapter extends BaseOpenAIChatAdapter {
       let completion: Record<string, unknown> | undefined;
       let adapterAttemptCount = 0;
       let reasoningFallbackTriggered = false;
+      let reasoningEffortFallbackTriggered = false;
 
       for (let attempt = 1; attempt <= 2; attempt += 1) {
         adapterAttemptCount = attempt;
@@ -128,6 +129,7 @@ export class MeshAdapter extends BaseOpenAIChatAdapter {
           const body = {
             ...baseBody,
             ...meshReasoningRequest(this.reasoning, fallbackAttempt),
+            ...(reasoningEffortFallbackTriggered ? { reasoning_effort: 'none' } : {}),
             stream: true,
           };
           const stream = this.client.chat.completions.create(
@@ -165,6 +167,28 @@ export class MeshAdapter extends BaseOpenAIChatAdapter {
           completion = accumulator.toCompletion();
           break;
         } catch (error) {
+          const providerError = enrichMeshError(error);
+          if (
+            !fallbackAttempt
+            && !request.signal?.aborted
+            && allChunks.length === 0
+            && Array.isArray(baseBody.tools) && baseBody.tools.length > 0
+            && error instanceof MeshAPIApiError
+            && /function tools with reasoning_effort are not supported/i.test(providerError.message)
+          ) {
+            reasoningEffortFallbackTriggered = true;
+            await request.onRetry?.({
+              attempt,
+              nextAttempt: attempt + 1,
+              statusCode: error.status,
+              retryDelayMs: 0,
+              reason: 'provider_error',
+              phase: 'http_status',
+              message: `${providerError.message}; auto-recovery: retrying with reasoning_effort='none' and reasoning disabled`,
+              performance: { reasoningEffortFallbackTriggered: true, recoveryReasoningEffort: 'none' },
+            });
+            continue;
+          }
           const shouldRetryWithoutReasoning = reasoningFallbackTriggered
             && !fallbackAttempt
             && !request.signal?.aborted;
@@ -192,6 +216,8 @@ export class MeshAdapter extends BaseOpenAIChatAdapter {
           ...(priced.performance ?? {}),
           adapterAttemptCount,
           reasoningFallbackTriggered: reasoningFallbackTriggered || undefined,
+          reasoningEffortFallbackTriggered: reasoningEffortFallbackTriggered || undefined,
+          recoveryReasoningEffort: reasoningEffortFallbackTriggered ? 'none' : undefined,
           abortedAdapterAttemptCount: reasoningFallbackTriggered ? 1 : undefined,
           usageMayExcludeAbortedAttempt: reasoningFallbackTriggered || undefined,
           adapterResponseLatencyMs: Date.now() - startedAt,

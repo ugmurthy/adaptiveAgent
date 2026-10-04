@@ -1834,6 +1834,77 @@ describe('MistralAdapter', () => {
 });
 
 describe('MeshAdapter', () => {
+  const reasoningToolsError = "Function tools with reasoning_effort are not supported for gpt-6-luna in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.";
+
+  it.each([400, 500])('recovers Mesh reasoning/tool incompatibility at HTTP %s and reports the recovery', async (status) => {
+    const adapter = new MeshAdapter({
+      model: 'openai/gpt-6-luna',
+      apiKey: 'mesh-key',
+      reasoning: { enabled: true, maxTokens: 4096 },
+    });
+    const onRetry = vi.fn();
+    mockFetchResponse({
+      error: status === 400
+        ? { code: 'invalid_request', message: reasoningToolsError }
+        : { code: 'upstream_error', message: 'Upstream error', provider_error: { message: reasoningToolsError } },
+      request_id: 'req_reasoning_tools',
+    }, status);
+    mockFetchSseResponse(meshTextChunks('Recovered'));
+
+    const response = await adapter.generate({ ...requestWithTools(), onRetry });
+
+    expect(response.text).toBe('Recovered');
+    const chatCalls = fetchSpy.mock.calls.filter((call) => call[0] === 'https://api.meshapi.ai/v1/chat/completions');
+    expect(chatCalls).toHaveLength(2);
+    const firstBody = JSON.parse(chatCalls[0][1].body);
+    const secondBody = JSON.parse(chatCalls[1][1].body);
+    expect(firstBody.reasoning_effort).toBeUndefined();
+    expect(firstBody.reasoning).toEqual({ enabled: true, max_tokens: 4096 });
+    expect(secondBody).toEqual({ ...firstBody, reasoning_effort: 'none', reasoning: { enabled: false } });
+    expect(onRetry).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      attempt: 1,
+      nextAttempt: 2,
+      statusCode: status,
+      retryDelayMs: 0,
+      message: expect.stringContaining(reasoningToolsError),
+      performance: { reasoningEffortFallbackTriggered: true, recoveryReasoningEffort: 'none' },
+    }));
+    expect(onRetry.mock.calls[0][0].message).toContain("auto-recovery: retrying with reasoning_effort='none'");
+    expect(response.performance).toMatchObject({
+      adapterAttemptCount: 2,
+      reasoningEffortFallbackTriggered: true,
+      recoveryReasoningEffort: 'none',
+    });
+    expect(response.performance?.abortedAdapterAttemptCount).toBeUndefined();
+  });
+
+  it('does not retry a rejected reasoning-effort recovery again', async () => {
+    const adapter = new MeshAdapter({ model: 'openai/gpt-6-luna', apiKey: 'mesh-key' });
+    const onRetry = vi.fn();
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      mockFetchResponse({ error: { code: 'invalid_request', message: reasoningToolsError } }, 400);
+    }
+
+    await expect(adapter.generate({ ...requestWithTools(), onRetry })).rejects.toThrow(reasoningToolsError);
+
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(onRetry).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['unrelated error', requestWithTools(), 'reasoning_effort is invalid'],
+    ['request without tools', simpleRequest(), reasoningToolsError],
+  ])('does not apply reasoning-effort recovery to %s', async (_name, request, message) => {
+    const adapter = new MeshAdapter({ model: 'openai/gpt-6-luna', apiKey: 'mesh-key' });
+    const onRetry = vi.fn();
+    mockFetchResponse({ error: { code: 'invalid_request', message } }, 400);
+
+    await expect(adapter.generate({ ...request, onRetry })).rejects.toThrow(message);
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(onRetry).not.toHaveBeenCalled();
+  });
+
   it('uses Mesh base URL and auth', async () => {
     const adapter = new MeshAdapter({ model: 'openai/gpt-4o', apiKey: 'mesh-key' });
     const chunks = meshTextChunks('Hello world');
@@ -2293,12 +2364,13 @@ describe('MeshAdapter', () => {
     expect(result.usage).toBeUndefined();
   });
 
-  it('fails Mesh mid-stream errors without retrying', async () => {
+  it.each(['upstream stream failed', reasoningToolsError])('fails Mesh mid-stream errors without retrying: %s', async (message) => {
     const adapter = new MeshAdapter({ model: 'auto', apiKey: 'mesh-key' });
+    const onRetry = vi.fn();
     fetchSpy.mockResolvedValueOnce(
       new Response(
         'data: {"id":"chatcmpl-mesh-stream","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}\n\n' +
-          'data: {"error":{"code":"upstream_error","message":"upstream stream failed"},"request_id":"req_stream_123"}\n\n',
+          `data: ${JSON.stringify({ error: { code: 'upstream_error', message }, request_id: 'req_stream_123' })}\n\n`,
         {
           status: 200,
           headers: { 'Content-Type': 'text/event-stream' },
@@ -2306,8 +2378,9 @@ describe('MeshAdapter', () => {
       ),
     );
 
-    await expect(adapter.generate(simpleRequest())).rejects.toThrow('upstream stream failed');
+    await expect(adapter.generate({ ...requestWithTools(), onRetry })).rejects.toThrow(message);
     expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(onRetry).not.toHaveBeenCalled();
   });
 
   it('cancels Mesh stream consumption when the request signal aborts', async () => {
