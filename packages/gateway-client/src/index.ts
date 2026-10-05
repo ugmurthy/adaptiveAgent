@@ -3,6 +3,7 @@ import type {
   ModelAdapter,
   ModelRequest,
   ModelResponse,
+  ModelStreamEvent as CoreModelStreamEvent,
 } from '@adaptive-agent/core/src/types.js';
 import {
   PROTOCOL_VERSION,
@@ -85,7 +86,12 @@ export class GatewayResponseError extends GatewayClientError {
 }
 
 interface Pending { method: GatewayRequestMethod; resolve(value: unknown): void; reject(error: unknown): void; timer: ReturnType<typeof setTimeout>; }
-interface StreamState { validator: StreamSequenceValidator; reject(error: unknown): void; }
+interface StreamState { validator: StreamSequenceValidator; reject(error: unknown): void; accept(envelope: ModelStreamEnvelope): void; }
+export interface GenerateModelOptions {
+  signal?: AbortSignal;
+  onEvent?: (event: ModelStreamEnvelope['event']) => Promise<void> | void;
+}
+interface StreamDelivery { queue: Promise<void>; delivered: number; error?: unknown; failed: boolean; }
 
 const bounded = (value: number | undefined, fallback: number, min: number, max: number): number => Math.min(max, Math.max(min, value ?? fallback));
 
@@ -201,12 +207,14 @@ export class GatewayClient {
     throw last;
   }
 
-  async generateModel(params: ModelGenerateParams, options: { signal?: AbortSignal } = {}): Promise<ModelGenerateResult> {
+  async generateModel(params: ModelGenerateParams, options: GenerateModelOptions = {}): Promise<ModelGenerateResult> {
     let last: unknown;
+    const delivery: StreamDelivery = { queue: Promise.resolve(), delivered: -1, failed: false };
     for (let attempt = 0; attempt <= this.reconnectAttempts; attempt++) {
       if (options.signal?.aborted) throw abortError();
-      try { return await this.generateOnce(params, options.signal); }
+      try { return await this.generateOnce(params, options, delivery); }
       catch (error) {
+        if (delivery.failed) throw delivery.error;
         last = error;
         if (error instanceof GatewayTimeoutError) {
           this.ignoreCancelledStream(params.invocation.callId);
@@ -228,36 +236,64 @@ export class GatewayClient {
     throw last;
   }
 
-  private async generateOnce(params: ModelGenerateParams, signal?: AbortSignal): Promise<ModelGenerateResult> {
+  private async generateOnce(params: ModelGenerateParams, options: GenerateModelOptions, delivery: StreamDelivery): Promise<ModelGenerateResult> {
+    const { signal } = options;
     await waitForConnection(this.connect(), signal);
     if (this.streams.has(params.invocation.callId)) {
       throw new GatewayClientError(`Gateway model call ${params.invocation.callId} is already active`);
     }
     let rejectStream!: (error: unknown) => void;
     const failed = new Promise<never>((_, reject) => { rejectStream = reject; });
-    let rejectAborted!: (error: unknown) => void;
-    const abortFailure = new Promise<never>((_, reject) => { rejectAborted = reject; });
+    const controller = new AbortController();
+    const fail = (error: unknown) => {
+      rejectStream(error);
+      controller.abort();
+    };
+    const timer = setTimeout(() => fail(new GatewayTimeoutError()), this.requestTimeoutMs);
     this.streams.set(params.invocation.callId, {
       validator: new StreamSequenceValidator(params.invocation.callId),
-      reject: rejectStream,
+      reject: fail,
+      accept: (envelope) => {
+        delivery.queue = delivery.queue.then(async () => {
+          if (controller.signal.aborted || delivery.failed || envelope.seq <= delivery.delivered) return;
+          // Reserve delivery before awaiting user code, including across reconnects.
+          delivery.delivered = envelope.seq;
+          await options.onEvent?.(envelope.event);
+          if (envelope.event.type === 'error') fail(fromPublicError(envelope.event.error));
+        }).catch((error) => {
+          delivery.failed = true;
+          delivery.error = error;
+          this.ignoreCancelledStream(params.invocation.callId);
+          void this.requestRaw('request/cancel', { callId: params.invocation.callId }).catch(() => undefined);
+          this.streams.get(params.invocation.callId)?.reject(error);
+          fail(error);
+        });
+      },
     });
     const abort = () => {
       this.streams.delete(params.invocation.callId);
       this.ignoreCancelledStream(params.invocation.callId);
       void this.requestRaw('request/cancel', { callId: params.invocation.callId }).catch(() => undefined);
-      rejectAborted(abortError());
+      fail(abortError());
     };
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) abort();
     try {
-      if (signal?.aborted) await abortFailure;
-      const result = await Promise.race([this.requestRaw('model/generate', params), failed, abortFailure]);
+      if (signal?.aborted) throw abortError();
+      const result = await Promise.race([this.requestRawWithSignal('model/generate', params, controller.signal), failed]);
       const state = this.streams.get(params.invocation.callId);
       if (!state) throw abortError();
       try { state.validator.assertTerminal(); } catch (error) { throw new GatewayProtocolError('incomplete model stream', error); }
       if (result.callId !== params.invocation.callId) throw new GatewayProtocolError('terminal response callId changed');
+      await Promise.race([delivery.queue, failed]);
+      if (delivery.failed) throw delivery.error;
       return result;
+    } catch (error) {
+      if (error instanceof GatewayResponseError) await Promise.race([delivery.queue, failed]);
+      throw error;
     } finally {
+      clearTimeout(timer);
+      controller.abort();
       signal?.removeEventListener('abort', abort);
       this.streams.delete(params.invocation.callId);
       this.applyCredentialRefreshIfIdle();
@@ -377,7 +413,7 @@ export class GatewayClient {
       }
       try {
         state.validator.accept(notification.params);
-        if (notification.params.event.type === 'error') state.reject(fromPublicError(notification.params.event.error));
+        state.accept(notification.params);
       } catch (error) {
         state.reject(error instanceof GatewayClientError ? error : new GatewayProtocolError((error as Error).message, error));
       }
@@ -429,6 +465,12 @@ export class GatewayModelAdapter implements ModelAdapter {
   private readonly permits = new Map<string, Promise<RunAuthorizeResult>>();
   constructor(private readonly options: GatewayModelAdapterOptions) { this.model = `tier:${options.defaultTier}`; }
   async generate(request: ModelRequest): Promise<ModelResponse> {
+    return this.generateWithEvents(request);
+  }
+  async stream(request: ModelRequest, onEvent: (event: CoreModelStreamEvent) => Promise<void> | void): Promise<ModelResponse> {
+    return this.generateWithEvents(request, onEvent);
+  }
+  private async generateWithEvents(request: ModelRequest, onEvent?: (event: CoreModelStreamEvent) => Promise<void> | void): Promise<ModelResponse> {
     if (!request.invocation) throw new GatewayClientError('Gateway model requests require invocation context');
     const context = (request.executionContext ?? {}) as GatewayExecutionContext;
     if (context.inferenceMode !== undefined && context.inferenceMode !== 'gateway') throw new GatewayClientError('Gateway adapter requires gateway inference mode');
@@ -456,14 +498,28 @@ export class GatewayModelAdapter implements ModelAdapter {
       maxOutputTokens: request.maxOutputTokens,
     };
     let result: ModelGenerateResult;
+    let emitted = false;
+    const options: GenerateModelOptions = {
+      signal: request.signal,
+      onEvent: onEvent ? (event) => {
+        emitted = true;
+        if (event.type === 'start') return onEvent({ type: 'start', provider: this.provider, model: this.model });
+        if (event.type === 'usage') return onEvent({ type: 'usage', usage: { promptTokens: event.usage.inputTokens, completionTokens: event.usage.outputTokens, totalTokens: event.usage.totalTokens, estimatedCostUSD: event.usage.cost ?? 0, provider: event.usage.provider, model: event.usage.model } });
+        if (event.type === 'error') {
+          const error = fromPublicError(event.error);
+          return onEvent({ type: 'error', error: { message: error.message, name: error.name } });
+        }
+        return onEvent(event);
+      } : undefined,
+    };
     try {
-      result = await this.options.client.generateModel(params, { signal: request.signal });
+      result = await this.options.client.generateModel(params, options);
     } catch (error) {
-      if (!(error instanceof GatewayResponseError) || error.gatewayCode !== 'forbidden') throw error;
+      if (emitted || !(error instanceof GatewayResponseError) || error.gatewayCode !== 'forbidden') throw error;
       this.invalidateAuthorization(authorization.key, authorization.promise);
       authorization = this.authorizeRoot(rootRunId, tier, context.profileRefs ?? []);
       permit = await authorization.promise;
-      result = await this.options.client.generateModel({ ...params, permitId: permit.permitId }, { signal: request.signal });
+      result = await this.options.client.generateModel({ ...params, permitId: permit.permitId }, options);
     }
     return {
       text: result.text, structuredOutput: result.structuredOutput, toolCalls: result.toolCalls,

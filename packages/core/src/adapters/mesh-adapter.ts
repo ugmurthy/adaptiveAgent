@@ -7,10 +7,7 @@ import type { JsonValue, ModelRequest, ModelResponse, ModelStreamEvent, Structur
 import {
   BaseOpenAIChatAdapter,
   MAX_LOCAL_AUDIO_BYTES,
-  createModelStreamEmitter,
-  emitModelStreamError,
   emitModelStreamEvents,
-  emitTerminalModelStreamEvents,
   fromProviderToolName,
   type BaseOpenAIChatAdapterConfig,
 } from './base-openai-chat-adapter.js';
@@ -88,16 +85,14 @@ export class MeshAdapter extends BaseOpenAIChatAdapter {
     });
   }
 
-  override async stream(
+  protected override async generateFromProvider(
     request: ModelRequest,
     onEvent: (event: ModelStreamEvent) => Promise<void> | void,
   ): Promise<ModelResponse> {
-    const emitter = createModelStreamEmitter(onEvent);
-    await emitter.emit({ type: 'start', provider: this.provider, model: this.model });
     try {
       const baseBody = await this.buildRequestBody(request);
-      const allChunks: unknown[] = [];
-      const startedAt = Date.now();
+      let responseBytes = 2;
+      let chunkCount = 0;
       let completion: Record<string, unknown> | undefined;
       let adapterAttemptCount = 0;
       let reasoningFallbackTriggered = false;
@@ -138,7 +133,7 @@ export class MeshAdapter extends BaseOpenAIChatAdapter {
           );
           const accumulator = new MeshStreamAccumulator();
           for await (const chunk of stream as unknown as AsyncIterable<unknown>) {
-            allChunks.push(chunk);
+            responseBytes += approximateSerializedByteLength(chunk) + (chunkCount++ > 0 ? 1 : 0);
             const events = accumulator.add(chunk);
             for (const event of events) {
               if (event.type === 'reasoning_delta' && event.delta.length > 0) {
@@ -162,7 +157,7 @@ export class MeshAdapter extends BaseOpenAIChatAdapter {
                 sawActionableOutput = true;
               }
             }
-            await emitModelStreamEvents(emitter.emit, events);
+            await emitModelStreamEvents(onEvent, events);
           }
           completion = accumulator.toCompletion();
           break;
@@ -171,7 +166,7 @@ export class MeshAdapter extends BaseOpenAIChatAdapter {
           if (
             !fallbackAttempt
             && !request.signal?.aborted
-            && allChunks.length === 0
+            && chunkCount === 0
             && Array.isArray(baseBody.tools) && baseBody.tools.length > 0
             && error instanceof MeshAPIApiError
             && /function tools with reasoning_effort are not supported/i.test(providerError.message)
@@ -211,7 +206,6 @@ export class MeshAdapter extends BaseOpenAIChatAdapter {
       const response = {
         ...priced,
         providerResponseId: priced.providerResponseId || undefined,
-        rawProviderResponse: allChunks,
         performance: compactJsonObject({
           ...(priced.performance ?? {}),
           adapterAttemptCount,
@@ -220,17 +214,13 @@ export class MeshAdapter extends BaseOpenAIChatAdapter {
           recoveryReasoningEffort: reasoningEffortFallbackTriggered ? 'none' : undefined,
           abortedAdapterAttemptCount: reasoningFallbackTriggered ? 1 : undefined,
           usageMayExcludeAbortedAttempt: reasoningFallbackTriggered || undefined,
-          adapterResponseLatencyMs: Date.now() - startedAt,
           adapterRequestBytes: approximateSerializedByteLength(baseBody),
-          adapterResponseBytes: approximateSerializedByteLength(allChunks),
+          adapterResponseBytes: responseBytes,
         }),
       };
-      await emitTerminalModelStreamEvents(emitter.emit, response, emitter.startedToolCallIds);
       return response;
     } catch (error) {
-      const enriched = enrichMeshError(error);
-      await emitModelStreamError(emitter.emit, enriched);
-      throw enriched;
+      throw enrichMeshError(error);
     }
   }
 

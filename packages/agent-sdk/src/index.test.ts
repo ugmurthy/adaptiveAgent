@@ -743,7 +743,14 @@ describe('agent-sdk gateway integration', () => {
         inferenceTier: 'medium',
         routePolicyRef: 'policy-e2e',
       });
-      expect(inspection.events.filter((event) => event.type === 'model.completed')).toHaveLength(2);
+      const completions = inspection.events.filter((event) => event.type === 'model.completed');
+      expect(completions).toHaveLength(2);
+      expect(completions[0]?.payload).toMatchObject({
+        performance: { streamProgressed: true, streamDeltaEventCount: 0 },
+      });
+      expect(completions[1]?.payload).toMatchObject({
+        performance: { streamProgressed: true, streamDeltaEventCount: 1, streamProgressBytes: 16 },
+      });
       expect(JSON.stringify(inspection)).not.toContain(token);
       expect(JSON.stringify([...billing.records.values()])).not.toContain('Use the local uppercase tool');
       expect(JSON.stringify([...billing.records.values()])).not.toContain('CLIENT-SIDE');

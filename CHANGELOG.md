@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 This project follows semantic versioning for release notes.
 
+## Unreleased
+
+### Changed
+
+- Removed raw stream-chunk retention from built-in model adapters. HTTP
+  response-byte telemetry counts bytes read; SDK telemetry incrementally
+  estimates serialized chunk bytes without retaining the chunks.
+- Applied shared provider/model admission, cooldown, and bounded transient
+  HTTP retries to all built-in adapters. Each adapter call permits two retries,
+  including HTTP 524; runtime retry policy remains a separate outer budget.
+  Partial text, reasoning, or tool output suppresses generic retries. Mesh's
+  explicit reasoning recovery remains provider-specific.
+- Unified normal generation and output repair under runtime streaming,
+  timeouts, retry policy, usage accounting, and persisted model lifecycle
+  events. Repair events carry `purpose: output_repair`.
+- Added incremental gateway adapter streaming with ordered async callbacks,
+  reconnect replay deduplication, and cancellation of failed consumers.
+- Standardized `adapterResponseLatencyMs` as the successful provider-hook
+  duration, including preparation and stream consumption but excluding gate
+  wait and earlier failed attempts. Retry events no longer include request-byte
+  telemetry; successful response events still do.
+
+### Compatibility
+
+- Mesh no longer populates the optional `rawProviderResponse` with raw chunks.
+  Consume normalized stream events and the final response instead.
+- HTTP 524 no longer bypasses the adapter retry limit. SDK adapters now honor
+  the same admission and HTTP retry policy as the base HTTP adapter.
+- Gateway streaming exposes the existing protocol's events; it does not add
+  reasoning deltas or change the wire protocol or durable replay contracts.
+
 ## [0.1.49] - 2026-09-27## Unreleased
 
 ### Added
