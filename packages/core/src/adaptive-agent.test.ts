@@ -2131,6 +2131,83 @@ describe('AdaptiveAgent', () => {
     });
   });
 
+  it.each([true, false])('uses the runtime repair retry budget (recovery=%s) and accounts usage once', async (recover) => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const timeout = () => new DOMException('timed out', 'TimeoutError');
+    const model = new SequenceModel([
+      { finishReason: 'stop', text: 'plain report', usage: { promptTokens: 2, completionTokens: 3, totalTokens: 5, estimatedCostUSD: 0.1 } },
+      timeout(),
+      recover
+        ? { finishReason: 'stop', structuredOutput: { answer: 'done' }, usage: { promptTokens: 7, completionTokens: 11, totalTokens: 18, estimatedCostUSD: 0.2 } }
+        : timeout(),
+    ]);
+    const agent = new AdaptiveAgent({
+      model, tools: [], runStore, eventStore, snapshotStore: new InMemorySnapshotStore(),
+      defaults: { modelRetryPolicy: { maxRetries: 1, baseDelayMs: 0, maxDelayMs: 0, jitter: false } },
+    });
+    const result = await agent.run({ goal: 'Repair report', outputSchema: { type: 'object' } });
+    expect(result.status).toBe(recover ? 'success' : 'failure');
+    expect(model.receivedRequests.map((request) => request.invocation?.purpose)).toEqual([
+      'agent_turn', 'output_repair', 'output_repair',
+    ]);
+    expect(model.receivedRequests.map((request) => request.invocation?.attempt)).toEqual([1, 1, 2]);
+    const events = await eventStore.listByRun(result.runId);
+    const repairEvents = events.filter((event) => event.payload !== null
+      && typeof event.payload === 'object' && !Array.isArray(event.payload)
+      && event.payload.purpose === 'output_repair');
+    expect(repairEvents.map((event) => event.type)).toEqual(recover
+      ? ['model.started', 'model.failed', 'model.retry', 'model.started', 'model.completed']
+      : ['model.started', 'model.failed', 'model.retry', 'model.started', 'model.failed']);
+    expect(events.filter((event) => event.type === 'usage.updated')).toHaveLength(recover ? 2 : 1);
+    expect(await runStore.getRun(result.runId)).toMatchObject({
+      usage: { promptTokens: recover ? 9 : 2, completionTokens: recover ? 14 : 3, totalTokens: recover ? 23 : 5 },
+    });
+  });
+
+  it.each(['none', 'text', 'tool'] as const)('applies repair stream inactivity and suppresses retries after %s progress', async (kind) => {
+    const progress = kind !== 'none';
+    const eventStore = new InMemoryEventStore();
+    const requests: ModelRequest[] = [];
+    const model: ModelAdapter = {
+      provider: 'test', model: 'repair-stream',
+      capabilities: { toolCalling: true, jsonOutput: true, streaming: true, usage: false },
+      async generate() { throw new Error('stream must be used'); },
+      async stream(request, onEvent) {
+        requests.push(request);
+        if (request.invocation?.purpose === 'agent_turn') return { finishReason: 'stop', text: 'plain report' };
+        if (kind === 'text') await onEvent({ type: 'text_delta', delta: '{' });
+        if (kind === 'tool') await onEvent({ type: 'tool_call_start', toolCallId: 'partial', name: 'lookup' });
+        return new Promise((_resolve, reject) => {
+          request.signal?.addEventListener('abort', () => reject(request.signal?.reason), { once: true });
+        });
+      },
+    };
+    const agent = new AdaptiveAgent({
+      model, tools: [], eventStore, runStore: new InMemoryRunStore(), snapshotStore: new InMemorySnapshotStore(),
+      defaults: {
+        modelTimeoutMs: 1000, modelInactivityTimeoutMs: 5,
+        modelRetryPolicy: { maxRetries: 1, baseDelayMs: 0, maxDelayMs: 0, jitter: false },
+      },
+    });
+    const result = await agent.run({ goal: 'Repair stalled report', outputSchema: { type: 'object' } });
+    expect(result).toMatchObject({ status: 'failure', code: 'MODEL_ERROR' });
+    expect(requests).toHaveLength(progress ? 2 : 3);
+    const events = await eventStore.listByRun(result.runId);
+    const failures = events.filter((event) => event.type === 'model.failed');
+    expect(failures).toHaveLength(progress ? 1 : 2);
+    expect(failures[0].payload).toMatchObject({
+      purpose: 'output_repair', timeoutSource: 'agent_model_inactivity_timeout', timedOut: true,
+      retryable: !progress,
+      ...(progress ? { retrySuppressedReason: 'stream_progress' } : {}),
+      performance: expect.objectContaining({ streamProgressed: progress }),
+    });
+    expect(events.filter((event) => event.type === 'model.retry')).toHaveLength(progress ? 0 : 1);
+    expect(events.find((event) => event.type === 'run.failed')?.payload).toMatchObject({
+      diagnostics: expect.objectContaining({ repair: expect.objectContaining({ failureReason: 'repair_model_error' }) }),
+    });
+  });
+
   it('normalizes fenced JSON text for outputSchema before repair', async () => {
     const runStore = new InMemoryRunStore();
     const eventStore = new InMemoryEventStore();

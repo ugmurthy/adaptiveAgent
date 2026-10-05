@@ -463,6 +463,32 @@ describe('BaseOpenAIChatAdapter', () => {
     ]);
   });
 
+  it('counts wire bytes for long UTF-8 streams and cancels the reader at DONE', async () => {
+    const frame = `data: ${JSON.stringify(openAIStreamDelta({ content: 'é' }))}\n\n`;
+    const wire = ': keepalive\n\n' + frame.repeat(1024)
+      + `data: ${JSON.stringify(openAIStreamDelta({}, { finishReason: 'stop' }))}\n\n`
+      + 'data: [DONE]\n\n';
+    const bytes = new TextEncoder().encode(wire);
+    const split = wire.indexOf('é') + 1;
+    const cancel = vi.fn();
+    fetchSpy.mockResolvedValueOnce(new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(bytes.subarray(0, split));
+        controller.enqueue(bytes.subarray(split));
+      },
+      cancel,
+    }), { headers: { 'Content-Type': 'text/event-stream' } }));
+    let deltas = 0;
+    const result = await createAdapter().stream(simpleRequest(), (event) => {
+      if (event.type === 'text_delta') deltas += 1;
+    });
+    expect(result.text).toBe('é'.repeat(1024));
+    expect(deltas).toBe(1024);
+    expect(result.performance?.adapterResponseBytes).toBe(Buffer.byteLength(wire, 'utf8'));
+    expect(result.rawProviderResponse).toBeUndefined();
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
   it('emits reasoning deltas as observable stream progress', async () => {
     const adapter = createAdapter();
     const events: ModelStreamEvent[] = [];
@@ -970,7 +996,6 @@ describe('BaseOpenAIChatAdapter', () => {
         reason: 'rate_limit',
         phase: 'http_status',
         performance: expect.objectContaining({
-          adapterRequestBytes: expect.any(Number),
           adapterRetryDelayMs: 250,
           adapterStatusCode: 429,
         }),
@@ -1011,7 +1036,7 @@ describe('BaseOpenAIChatAdapter', () => {
     expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
 
-  it('retries Cloudflare 524 responses without the default attempt cap', async () => {
+  it('bounds Cloudflare 524 retries like other retryable HTTP statuses', async () => {
     const adapter = createAdapter();
 
     fetchSpy
@@ -1025,10 +1050,11 @@ describe('BaseOpenAIChatAdapter', () => {
         }),
       );
 
-    const result = await adapter.generate(simpleRequest());
-
-    expect(fetchSpy).toHaveBeenCalledTimes(4);
-    expect(result.text).toBe('Hello world');
+    await expect(adapter.generate(simpleRequest())).rejects.toMatchObject({
+      statusCode: 524,
+      modelInvocationAttempt: 3,
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
   });
 
   it('shares provider/model cooldown across adapter instances', async () => {
@@ -1346,7 +1372,10 @@ describe('OpenRouterAdapter', () => {
       model: 'anthropic/claude-sonnet-4',
       apiKey: 'or-key',
     });
-    mockFetchResponse({ error: { message: 'edge timeout detail' } }, 524);
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      mockFetchResponse({ error: { message: 'edge timeout detail' } }, 524);
+    }
 
     let error: unknown;
     try {
@@ -1358,7 +1387,7 @@ describe('OpenRouterAdapter', () => {
     expect(error).toBeInstanceOf(Error);
     expect(error).toMatchObject({
       modelInvocationPhase: 'http_status',
-      modelInvocationAttempt: 1,
+      modelInvocationAttempt: 3,
       modelInvocationStatusCode: 524,
     });
     expect((error as Error).message).toContain('edge timeout detail');
@@ -1917,7 +1946,8 @@ describe('MeshAdapter', () => {
     expect(fetchSpy.mock.calls[0][1].headers['X-Mesh-Version']).toBe('2026-09');
     expect(adapter.provider).toBe('mesh');
     expect(adapter.capabilities.usage).toBe(true);
-    expect(response.rawProviderResponse).toEqual(chunks);
+    expect(response.rawProviderResponse).toBeUndefined();
+    expect(response.performance?.adapterResponseBytes).toBe(Buffer.byteLength(JSON.stringify(chunks), 'utf8'));
   });
 
   it('passes the runtime model timeout to the Mesh SDK HTTP timeout', async () => {
@@ -2413,24 +2443,108 @@ describe('MeshAdapter', () => {
 
   it('surfaces upstream provider detail from Mesh SDK errors', async () => {
     const adapter = new MeshAdapter({ model: 'auto', apiKey: 'mesh-key' });
-    mockFetchResponse(
-      {
-        error: {
-          code: 'upstream_error',
-          message: 'Upstream provider returned an error.',
-          provider_error: {
-            message:
-              'The GenerateContentRequest proto is invalid: contents[2].parts[0].function_response.name: [REQUIRED_FIELD_MISSING]',
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      mockFetchResponse(
+        {
+          error: {
+            code: 'upstream_error',
+            message: 'Upstream provider returned an error.',
+            provider_error: {
+              message:
+                'The GenerateContentRequest proto is invalid: contents[2].parts[0].function_response.name: [REQUIRED_FIELD_MISSING]',
+            },
           },
+          request_id: 'req_mesh_123',
         },
-        request_id: 'req_mesh_123',
-      },
-      500,
-    );
+        500,
+      );
+    }
 
     await expect(adapter.generate(simpleRequest())).rejects.toThrow(
       'Upstream provider returned an error.: The GenerateContentRequest proto is invalid: contents[2].parts[0].function_response.name: [REQUIRED_FIELD_MISSING] [requestId=req_mesh_123]',
     );
+  });
+});
+
+describe.each(['openrouter', 'mistral', 'mesh'] as const)('%s shared execution policy', (provider) => {
+  function adapter(model: string) {
+    const Adapter = { openrouter: OpenRouterAdapter, mistral: MistralAdapter, mesh: MeshAdapter }[provider];
+    return new Adapter({ model: `${provider}-${model}`, apiKey: 'test-key', maxConcurrentRequests: 1 });
+  }
+
+  function response() {
+    const chunks = [
+      openAIStreamDelta({ content: 'Answer ✓' }),
+      openAIStreamDelta({}, { finishReason: 'stop', usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, cost: 0.001 } }),
+    ];
+    return new Response(chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join('') + 'data: [DONE]\n\n', {
+      headers: { 'Content-Type': 'text/event-stream' },
+    });
+  }
+
+  it('holds shared admission until consumption ends and removes aborted queued requests', async () => {
+    const firstAdapter = adapter('admission');
+    const secondAdapter = adapter('admission');
+    const progress = deferred<void>();
+    const encoder = new TextEncoder();
+    let source!: ReadableStreamDefaultController<Uint8Array>;
+    fetchSpy.mockResolvedValueOnce(new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        source = controller;
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(openAIStreamDelta({ content: 'Answer ' }))}\n\n`));
+      },
+    }), { headers: { 'Content-Type': 'text/event-stream' } })).mockResolvedValueOnce(response());
+    const first = firstAdapter.stream(simpleRequest(), (event) => {
+      if (event.type === 'text_delta') progress.resolve();
+    });
+    await progress.promise;
+    const controller = new AbortController();
+    const queued = secondAdapter.generate(simpleRequest({ signal: controller.signal }));
+    await Promise.resolve();
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    controller.abort();
+    await expect(queued).rejects.toMatchObject({ modelInvocationPhase: 'gate_wait' });
+    source.enqueue(encoder.encode(`data: ${JSON.stringify(openAIStreamDelta({ content: '✓' }, {
+      finishReason: 'stop', usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, cost: 0.001 },
+    }))}\n\ndata: [DONE]\n\n`));
+    source.close();
+    await expect(first).resolves.toMatchObject({ text: 'Answer ✓' });
+    await expect(secondAdapter.generate(simpleRequest())).resolves.toMatchObject({
+      text: 'Answer ✓', performance: { adapterAttemptCount: 1, adapterGateWaitMs: expect.any(Number) },
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('honors provider retry delays and emits one lifecycle across recovery', async () => {
+    vi.useFakeTimers();
+    fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({
+      error: { code: 'rate_limit_exceeded', message: 'slow down', retry_after_seconds: 1 }, request_id: 'retry-policy',
+    }), { status: 429, headers: { 'Content-Type': 'application/json', 'Retry-After': '1' } }))
+      .mockResolvedValueOnce(response());
+    const events: ModelStreamEvent[] = [];
+    const onRetry = vi.fn();
+    const pending = adapter('retry').stream(simpleRequest({ onRetry }), (event) => { events.push(event); });
+    await vi.advanceTimersByTimeAsync(999);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(pending).resolves.toMatchObject({ text: 'Answer ✓', performance: { adapterAttemptCount: 2, adapterRetryDelayMs: 1000 } });
+    expect(onRetry).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 429, retryDelayMs: 1000 }));
+    expect(events.filter((event) => event.type === 'start')).toHaveLength(1);
+    expect(events.filter((event) => event.type === 'done')).toHaveLength(1);
+    expect(events.filter((event) => event.type === 'error')).toHaveLength(0);
+  });
+
+  it('does not retry after visible progress and releases admission on failure', async () => {
+    const model = adapter('partial');
+    fetchSpy.mockResolvedValueOnce(response()).mockResolvedValueOnce(response());
+    const failure = new ModelRequestError('consumer failed', 503);
+    await expect(model.stream(simpleRequest(), (event) => {
+      if (event.type === 'text_delta') throw failure;
+    })).rejects.toBe(failure);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    await expect(model.generate(simpleRequest())).resolves.toMatchObject({ text: 'Answer ✓' });
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
 });
 

@@ -19,6 +19,126 @@ import {
 } from './index.js';
 
 describe('gateway client transport', () => {
+  test('exposes text progress while the server has not sent its result', async () => {
+    const progress = deferred<void>();
+    let entry!: { request: JsonRpcRequest<'model/generate'>; socket: FakeSocket };
+    const { client } = fakeClient((request, socket) => {
+      if (respondToSetup(request, socket)) return;
+      if (request.method !== 'model/generate') return;
+      entry = { request, socket };
+      stream(entry, 0, { type: 'start' });
+      stream(entry, 1, { type: 'text_delta', delta: 'partial' });
+    });
+    const pending = client.generateModel(modelParams('incremental'), { onEvent: event => { if (event.type === 'text_delta') progress.resolve(); } });
+    await progress.promise;
+    stream(entry, 2, { type: 'done' });
+    respond(entry, resultFor(entry.request.params, 'partial'));
+    await expect(pending).resolves.toMatchObject({ text: 'partial' });
+    client.close();
+  });
+
+  test('timeout still cancels when a result arrived but a callback is stalled', async () => {
+    const gate = deferred<void>();
+    const cancellations: unknown[] = [];
+    const { client } = fakeClient((request, socket) => {
+      if (respondToSetup(request, socket)) return;
+      if (request.method === 'request/cancel') cancellations.push(request.params);
+      if (request.method !== 'model/generate') return;
+      const entry = { request, socket };
+      stream(entry, 0, { type: 'start' });
+      stream(entry, 1, { type: 'done' });
+      respond(entry, resultFor(request.params, 'complete'));
+    }, { requestTimeoutMs: 100 });
+    await expect(client.generateModel(modelParams('callback-timeout'), { onEvent: () => gate.promise })).rejects.toBeInstanceOf(GatewayTimeoutError);
+    expect(cancellations).toEqual([{ callId: 'callback-timeout' }]);
+    gate.resolve();
+    client.close();
+  });
+
+  test('reconnect replay validates all frames but does not redeliver progress', async () => {
+    const seen: string[] = [];
+    let count = 0;
+    let firstSocket: FakeSocket;
+    const { client } = fakeClient((request, socket) => {
+      if (respondToSetup(request, socket)) return;
+      if (request.method !== 'model/generate') return;
+      const entry = { request, socket };
+      stream(entry, 0, { type: 'start' });
+      stream(entry, 1, { type: 'text_delta', delta: 'same' });
+      if (++count === 1) { firstSocket = socket; return; }
+      stream(entry, 2, { type: 'done' });
+      respond(entry, resultFor(request.params, 'same'));
+    });
+    await client.generateModel(modelParams('replay'), { onEvent: async event => {
+      seen.push(event.type);
+      if (event.type === 'text_delta' && count === 1) firstSocket.disconnect();
+    } });
+    expect(count).toBe(2);
+    expect(seen).toEqual(['start', 'text_delta', 'done']);
+    client.close();
+  });
+
+  test('delivers progress in async order before result without blocking other RPCs', async () => {
+    const gate = deferred<void>();
+    const started = deferred<void>();
+    const events: string[] = [];
+    const { client } = fakeClient((request, socket) => {
+      if (respondToSetup(request, socket)) return;
+      if (request.method !== 'model/generate') return;
+      const entry = { request, socket };
+      stream(entry, 0, { type: 'start' });
+      stream(entry, 1, { type: 'text_delta', delta: 'progress' });
+      stream(entry, 2, { type: 'done' });
+      respond(entry, resultFor(request.params, 'result'));
+    });
+    let finished = false;
+    const pending = client.generateModel(modelParams('ordered'), { onEvent: async event => {
+      events.push(event.type);
+      if (event.type === 'start') { started.resolve(); await gate.promise; }
+    } }).then(result => { finished = true; return result; });
+    await started.promise;
+    await expect(client.authorizeRun({ runId: 'other', inferenceMode: 'gateway', requestedTier: 'high', profileRefs: [] })).resolves.toMatchObject({ permitId: 'permit-1' });
+    expect(events).toEqual(['start']);
+    expect(finished).toBe(false);
+    gate.resolve();
+    await expect(pending).resolves.toMatchObject({ text: 'result' });
+    expect(events).toEqual(['start', 'text_delta', 'done']);
+    client.close();
+  });
+
+  test('callback failure cancels and removes the pending model RPC immediately', async () => {
+    const cancellations: unknown[] = [];
+    const failure = new Error('consumer failed');
+    const { client } = fakeClient((request, socket) => {
+      if (respondToSetup(request, socket)) return;
+      if (request.method === 'request/cancel') {
+        cancellations.push(request.params);
+        socket.serverMessage({ jsonrpc: '2.0', id: request.id, result: { cancelled: true } });
+      }
+      if (request.method === 'model/generate') stream({ request, socket }, 0, { type: 'start' });
+    });
+    await expect(client.generateModel(modelParams('failure'), { onEvent: async () => { throw failure; } })).rejects.toBe(failure);
+    expect(cancellations).toEqual([{ callId: 'failure' }]);
+    expect([...((client as unknown as { pending: Map<unknown, { method: string }> }).pending).values()].filter(item => item.method === 'model/generate')).toHaveLength(0);
+    client.close();
+  });
+
+  test('abort does not wait for a stalled callback', async () => {
+    const started = deferred<void>();
+    const gate = deferred<void>();
+    const controller = new AbortController();
+    const { client } = fakeClient((request, socket) => {
+      if (respondToSetup(request, socket)) return;
+      if (request.method === 'model/generate') stream({ request, socket }, 0, { type: 'start' });
+    });
+    const pending = client.generateModel(modelParams('stalled'), { signal: controller.signal, onEvent: async () => { started.resolve(); await gate.promise; } });
+    await started.promise;
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    gate.resolve();
+    client.close();
+  });
+
   test('requires TLS except for loopback development gateways', () => {
     const options = {
       accessToken: () => 'token',
@@ -49,13 +169,17 @@ describe('gateway client transport', () => {
       respond(second!, resultFor(second!.request.params, 'second'));
     });
 
+    const firstEvents: string[] = [];
+    const secondEvents: string[] = [];
     const [first, second] = await Promise.all([
-      client.generateModel(modelParams('call-first')),
-      client.generateModel(modelParams('call-second')),
+      client.generateModel(modelParams('call-first'), { onEvent: event => { if (event.type === 'text_delta') firstEvents.push(event.delta); } }),
+      client.generateModel(modelParams('call-second'), { onEvent: event => { if (event.type === 'text_delta') secondEvents.push(event.delta); } }),
     ]);
 
     expect(first.text).toBe('first');
     expect(second.text).toBe('second');
+    expect(firstEvents).toEqual(['first']);
+    expect(secondEvents).toEqual(['second']);
     client.close();
   });
 
@@ -433,6 +557,36 @@ describe('gateway client transport', () => {
 });
 
 describe('gateway model adapter', () => {
+  test('converts neutral usage, tool and public error events into core events', async () => {
+    const { client } = fakeClient((request, socket) => {
+      if (respondToSetup(request, socket)) return;
+      if (request.method !== 'model/generate') return;
+      const entry = { request, socket };
+      const events = [
+        { type: 'start' },
+        { type: 'tool_call_start', toolCallId: 'tool-1', name: 'search' },
+        { type: 'tool_call_delta', toolCallId: 'tool-1', argumentsDelta: '{}' },
+        { type: 'tool_call_end', toolCall: { id: 'tool-1', name: 'search', input: {} } },
+        { type: 'usage', usage: resultFor(request.params, '').usage },
+        { type: 'error', error: { gatewayCode: 'provider_timeout', retryable: true, traceId: 'trace-1' } },
+      ];
+      events.forEach((event, seq) => stream(entry, seq, event));
+      socket.serverMessage({ jsonrpc: '2.0', id: request.id, error: { code: -32000, message: 'failed', data: events[5]!.error } });
+    });
+    const adapter = new GatewayModelAdapter({ client, defaultTier: 'high' });
+    const seen: unknown[] = [];
+    await expect(adapter.stream({ messages: [], invocation: modelParams('conversion').invocation, executionContext: { authorizationRef: 'permit-1' } }, event => { seen.push(event); })).rejects.toMatchObject({ gatewayCode: 'provider_timeout', modelInvocationStatusCode: 524 });
+    expect(seen).toEqual([
+      { type: 'start', provider: adapter.provider, model: 'tier:high' },
+      { type: 'tool_call_start', toolCallId: 'tool-1', name: 'search' },
+      { type: 'tool_call_delta', toolCallId: 'tool-1', argumentsDelta: '{}' },
+      { type: 'tool_call_end', toolCall: { id: 'tool-1', name: 'search', input: {} } },
+      { type: 'usage', usage: { promptTokens: 3, completionTokens: 2, totalTokens: 5, estimatedCostUSD: 0.001, provider: 'ollama', model: 'actual-high' } },
+      { type: 'error', error: { message: 'Gateway provider timed out', name: 'GatewayResponseError' } },
+    ]);
+    client.close();
+  });
+
   test('returns actual route usage and safe route, timing, and trace diagnostics', async () => {
     const generateModel = vi.fn(async (params: ModelGenerateParams) => resultFor(params, 'adapter-result'));
     const adapter = new GatewayModelAdapter({

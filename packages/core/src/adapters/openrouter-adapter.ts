@@ -10,10 +10,7 @@ import {
   MAX_LOCAL_AUDIO_BYTES,
   MAX_LOCAL_FILE_BYTES,
   OpenAIChatStreamAccumulator,
-  createModelStreamEmitter,
-  emitModelStreamError,
   emitModelStreamEvents,
-  emitTerminalModelStreamEvents,
   type BaseOpenAIChatAdapterConfig,
   withModelInvocationDiagnostics,
 } from './base-openai-chat-adapter.js';
@@ -94,18 +91,16 @@ export class OpenRouterAdapter extends BaseOpenAIChatAdapter {
     });
   }
 
-  override async stream(
+  protected override async generateFromProvider(
     request: ModelRequest,
     onEvent: (event: ModelStreamEvent) => Promise<void> | void,
   ): Promise<ModelResponse> {
-    const emitter = createModelStreamEmitter(onEvent);
-    await emitter.emit({ type: 'start', provider: this.provider, model: this.model });
     let completion: unknown;
     try {
       const normalizedRequest = await normalizeOpenRouterRequest(request);
       const body = this.buildStreamingRequestBody(await this.buildRequestBody(normalizedRequest));
-      const startedAt = Date.now();
-      const chunks: unknown[] = [];
+      let responseBytes = 0;
+      let chunkCount = 0;
       const sdkResult = await this.client.chat.send(
         {
           chatRequest: toSdkRequest(body),
@@ -115,8 +110,8 @@ export class OpenRouterAdapter extends BaseOpenAIChatAdapter {
       if (isAsyncIterable(sdkResult)) {
         const accumulator = new OpenAIChatStreamAccumulator();
         for await (const chunk of sdkResult as AsyncIterable<unknown>) {
-          chunks.push(chunk);
-          await emitModelStreamEvents(emitter.emit, accumulator.add(chunk));
+          responseBytes += approximateSerializedByteLength(chunk) + (chunkCount++ > 0 ? 1 : 0);
+          await emitModelStreamEvents(onEvent, accumulator.add(chunk));
         }
         completion = accumulator.toCompletion();
       } else {
@@ -127,18 +122,13 @@ export class OpenRouterAdapter extends BaseOpenAIChatAdapter {
         ...parsed,
         performance: compactJsonObject({
           ...(parsed.performance ?? {}),
-          adapterAttemptCount: 1,
-          adapterResponseLatencyMs: Date.now() - startedAt,
           adapterRequestBytes: approximateSerializedByteLength(body),
-          adapterResponseBytes: approximateSerializedByteLength(chunks.length > 0 ? chunks : completion),
+          adapterResponseBytes: chunkCount > 0 ? responseBytes + 2 : approximateSerializedByteLength(completion),
         }),
       };
-      await emitTerminalModelStreamEvents(emitter.emit, response, emitter.startedToolCallIds);
       return response;
     } catch (error) {
-      const enriched = enrichOpenRouterSdkError(error);
-      await emitModelStreamError(emitter.emit, enriched);
-      throw enriched;
+      throw enrichOpenRouterSdkError(error);
     }
   }
 }

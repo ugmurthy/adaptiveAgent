@@ -10,10 +10,7 @@ import {
   MAX_LOCAL_AUDIO_BYTES,
   MAX_LOCAL_FILE_BYTES,
   OpenAIChatStreamAccumulator,
-  createModelStreamEmitter,
-  emitModelStreamError,
   emitModelStreamEvents,
-  emitTerminalModelStreamEvents,
   type BaseOpenAIChatAdapterConfig,
 } from './base-openai-chat-adapter.js';
 import { toProviderSdkResponseFormat } from './provider-sdk-request.js';
@@ -77,47 +74,36 @@ export class MistralAdapter extends BaseOpenAIChatAdapter {
     });
   }
 
-  override async stream(
+  protected override async generateFromProvider(
     request: ModelRequest,
     onEvent: (event: ModelStreamEvent) => Promise<void> | void,
   ): Promise<ModelResponse> {
-    const emitter = createModelStreamEmitter(onEvent);
-    await emitter.emit({ type: 'start', provider: this.provider, model: this.model });
-    try {
-      const normalizedRequest = await normalizeMistralRequest(request);
-      const body = {
-        ...await this.buildRequestBody(normalizedRequest),
-        stream: true,
-      };
-      const startedAt = Date.now();
-      const chunks: unknown[] = [];
-      const stream = await this.client.chat.stream(toSdkRequest(body) as never, {
-        signal: request.signal,
-      } as never);
-      const accumulator = new OpenAIChatStreamAccumulator();
-      for await (const event of stream as AsyncIterable<unknown>) {
-        chunks.push(event);
-        await emitModelStreamEvents(emitter.emit, accumulator.add(fromMistralStreamEvent(event)));
-      }
-
-      const completion = accumulator.toCompletion();
-      const parsed = this.parseResponse(completion as never);
-      const response = {
-        ...parsed,
-        performance: compactJsonObject({
-          ...(parsed.performance ?? {}),
-          adapterAttemptCount: 1,
-          adapterResponseLatencyMs: Date.now() - startedAt,
-          adapterRequestBytes: approximateSerializedByteLength(body),
-          adapterResponseBytes: approximateSerializedByteLength(chunks),
-        }),
-      };
-      await emitTerminalModelStreamEvents(emitter.emit, response, emitter.startedToolCallIds);
-      return response;
-    } catch (error) {
-      await emitModelStreamError(emitter.emit, error);
-      throw error;
+    const normalizedRequest = await normalizeMistralRequest(request);
+    const body = {
+      ...await this.buildRequestBody(normalizedRequest),
+      stream: true,
+    };
+    let responseBytes = 2;
+    let chunkCount = 0;
+    const stream = await this.client.chat.stream(toSdkRequest(body) as never, {
+      signal: request.signal,
+    } as never);
+    const accumulator = new OpenAIChatStreamAccumulator();
+    for await (const event of stream as AsyncIterable<unknown>) {
+      responseBytes += approximateSerializedByteLength(event) + (chunkCount++ > 0 ? 1 : 0);
+      await emitModelStreamEvents(onEvent, accumulator.add(fromMistralStreamEvent(event)));
     }
+
+    const completion = accumulator.toCompletion();
+    const parsed = this.parseResponse(completion as never);
+    return {
+      ...parsed,
+      performance: compactJsonObject({
+        ...(parsed.performance ?? {}),
+        adapterRequestBytes: approximateSerializedByteLength(body),
+        adapterResponseBytes: responseBytes,
+      }),
+    };
   }
 }
 

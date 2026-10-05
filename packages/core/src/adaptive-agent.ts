@@ -143,7 +143,6 @@ interface RunFailureEventOptions {
 
 interface OutputSchemaRepairResult {
   output?: JsonObject;
-  usage?: UsageSummary;
   diagnostics?: JsonObject;
 }
 
@@ -2073,9 +2072,7 @@ export class AdaptiveAgent {
             repairText,
             state.outputSchema,
           );
-          if (repairResult.usage) {
-            currentRun = await this.applyUsage(currentRun, repairResult.usage);
-          }
+          currentRun = await this.refreshRun(currentRun.id);
           structuredOutput = repairResult.output;
           repairDiagnostics = repairResult.diagnostics;
         }
@@ -4161,6 +4158,15 @@ export class AdaptiveAgent {
       metadata: run.metadata,
       executionContext: run.executionContext,
     };
+    return this.executeModelRequest(run, modelRequest, 'agent_turn');
+  }
+
+  private async executeModelRequest(
+    run: AgentRun,
+    modelRequest: ModelRequest,
+    purpose: ModelInvocationContext['purpose'],
+    onInvocation?: (invocation: ModelInvocationContext) => void,
+  ): Promise<ModelResponse> {
     const modelTimeoutMs = this.defaults.modelTimeoutMs;
     const modelProvider = this.options.model.provider;
     const modelName = this.options.model.model;
@@ -4169,13 +4175,15 @@ export class AdaptiveAgent {
     const maxAttempts = retryPolicy.maxRetries + 1;
 
     for (let attempt = 1; ; attempt += 1) {
-      const invocation = createModelInvocationContext(run, 'agent_turn', attempt, modelRequest);
+      const invocation = createModelInvocationContext(run, purpose, attempt, modelRequest);
+      onInvocation?.(invocation);
       const startedAt = Date.now();
       const timeoutContext = createAbortTimeoutContext(
         modelTimeoutMs,
         this.options.model.stream ? this.defaults.modelInactivityTimeoutMs : undefined,
       );
       const streamProgress = {
+        progressed: false,
         deltaEventCount: 0,
         bytes: 0,
         firstAt: undefined as number | undefined,
@@ -4189,16 +4197,19 @@ export class AdaptiveAgent {
             : event.type === 'tool_call_delta'
               ? event.argumentsDelta
               : undefined;
-        if (!delta) return;
+        if (!delta && event.type !== 'tool_call_start' && event.type !== 'tool_call_end') return;
         const now = Date.now();
-        streamProgress.deltaEventCount += 1;
-        streamProgress.bytes += Buffer.byteLength(delta, 'utf8');
+        streamProgress.progressed = true;
+        if (delta) {
+          streamProgress.deltaEventCount += 1;
+          streamProgress.bytes += Buffer.byteLength(delta, 'utf8');
+        }
         streamProgress.firstAt ??= now;
         streamProgress.lastAt = now;
         timeoutContext.recordProgress();
       };
       const streamProgressMetrics = (): JsonObject => compactJsonObject({
-        streamProgressed: streamProgress.deltaEventCount > 0,
+        streamProgressed: streamProgress.progressed,
         streamDeltaEventCount: streamProgress.deltaEventCount,
         streamProgressBytes: streamProgress.bytes,
         firstStreamProgressMs: streamProgress.firstAt === undefined ? undefined : streamProgress.firstAt - startedAt,
@@ -4257,6 +4268,7 @@ export class AdaptiveAgent {
               ...runLogBindings(run),
               stepId: invocation.stepId,
               callId: invocation.callId,
+              purpose: invocation.purpose,
               provider: modelProvider,
               model: modelName,
               durationMs,
@@ -4278,6 +4290,7 @@ export class AdaptiveAgent {
               payload: compactJsonObject({
                 stepId: invocation.stepId,
                 callId: invocation.callId,
+                purpose: invocation.purpose,
                 provider: modelProvider,
                 model: modelName,
                 durationMs,
@@ -4313,7 +4326,7 @@ export class AdaptiveAgent {
             ? createModelInactivityTimeoutError(this.defaults.modelInactivityTimeoutMs!, caughtError)
             : caughtError;
         const failureKind = classifyModelErrorKind(modelError, timedOut);
-        const streamProgressed = streamProgress.deltaEventCount > 0;
+        const streamProgressed = streamProgress.progressed;
         const policyRetryDelayMs = resolveModelRetryDelayMs(retryPolicy, attempt, failureKind);
         const retrySuppressed = streamProgressed && policyRetryDelayMs !== undefined;
         const retryDelayMs = streamProgressed
@@ -4342,6 +4355,7 @@ export class AdaptiveAgent {
           callId: invocation.callId,
           durationMs,
           performance: failurePerformance,
+          purpose: invocation.purpose,
           ...summarizeModelFailureForLog(modelError, {
             modelTimeoutMs,
             modelInactivityTimeoutMs: this.defaults.modelInactivityTimeoutMs,
@@ -4363,6 +4377,7 @@ export class AdaptiveAgent {
               stepId: invocation.stepId,
               callId: invocation.callId,
               durationMs,
+              purpose: invocation.purpose,
               timedOut,
               timeoutSource,
               modelTimeoutMs,
@@ -4404,6 +4419,7 @@ export class AdaptiveAgent {
           model: modelName,
           durationMs,
           performance: retryPerformance,
+          purpose: invocation.purpose,
           attempt,
           nextAttempt: attempt + 1,
           retryDelayMs,
@@ -4423,6 +4439,7 @@ export class AdaptiveAgent {
             model: modelName,
             durationMs,
             performance: retryPerformance,
+            purpose: invocation.purpose,
             attempt,
             nextAttempt: attempt + 1,
             retryDelayMs,
@@ -4512,38 +4529,33 @@ export class AdaptiveAgent {
         },
       ),
     };
-    const invocation = createModelInvocationContext(run, 'output_repair', 1, repairRequest);
+    let invocation: ModelInvocationContext | undefined;
     const requestPerformance = modelRequestPerformanceMetrics(repairRequest);
     const startedAt = Date.now();
-    const timeoutContext = createAbortTimeoutContext(this.defaults.modelTimeoutMs);
-
-    this.logLifecycle('debug', 'model.output_schema_repair.request', {
-      ...runLogBindings(run),
-      stepId: invocation.stepId,
-      callId: invocation.callId,
-      purpose: invocation.purpose,
-      ...summarizeModelRequestForLog(repairRequest),
-    });
 
     let response: ModelResponse;
     try {
-      response = await this.options.model.generate({
-        ...repairRequest,
-        invocation,
-        signal: timeoutContext.signal,
-        modelTimeoutMs: this.defaults.modelTimeoutMs,
+      response = await this.executeModelRequest(run, repairRequest, 'output_repair', (context) => {
+        invocation = context;
+        this.logLifecycle('debug', 'model.output_schema_repair.request', {
+          ...runLogBindings(run),
+          stepId: context.stepId,
+          callId: context.callId,
+          purpose: context.purpose,
+          ...summarizeModelRequestForLog(repairRequest),
+        });
       });
     } catch (error) {
       const durationMs = Date.now() - startedAt;
       this.logLifecycle('warn', 'model.output_schema_repair.failed', {
         ...runLogBindings(run),
-        stepId: invocation.stepId,
-        callId: invocation.callId,
+        stepId: invocation?.stepId,
+        callId: invocation?.callId,
         durationMs,
         performance: compactJsonObject({
           ...requestPerformance,
           durationMs,
-          timedOut: timeoutContext.didTimeout(),
+          timedOut: classifyModelErrorKind(error, false) === 'timeout',
           modelTimeoutMs: this.defaults.modelTimeoutMs,
         }),
         error: errorForLog(error),
@@ -4557,8 +4569,6 @@ export class AdaptiveAgent {
           durationMs,
         }),
       };
-    } finally {
-      timeoutContext.dispose();
     }
 
     const durationMs = Date.now() - startedAt;
@@ -4566,8 +4576,8 @@ export class AdaptiveAgent {
     const output = isJsonObject(structuredOutput) ? structuredOutput : undefined;
     this.logLifecycle(output ? 'debug' : 'warn', 'model.output_schema_repair.response', {
       ...runLogBindings(run),
-      stepId: invocation.stepId,
-      callId: invocation.callId,
+      stepId: invocation?.stepId,
+      callId: invocation?.callId,
       durationMs,
       ...summarizeModelResponseForLog(response),
       repaired: Boolean(output),
@@ -4579,7 +4589,6 @@ export class AdaptiveAgent {
 
     return {
       ...(output ? { output } : {}),
-      ...(response.usage ? { usage: response.usage } : {}),
       diagnostics: buildOutputSchemaRepairDiagnostics(response, Boolean(output), durationMs),
     };
   }
