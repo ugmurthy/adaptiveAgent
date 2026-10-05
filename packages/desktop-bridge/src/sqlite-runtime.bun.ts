@@ -72,7 +72,7 @@ it('defaults the desktop runtime to SQLite and points CLI children at the initia
   }
 });
 
-it('runs remote inference in SQLite while writing artifacts locally', async () => {
+it.each(['auto', 'manual'] as const)('runs remote inference in SQLite while writing artifacts locally with %s approval', async (approvalMode) => {
   const cwd = await mkdtemp(join(tmpdir(), 'desktop-gateway-'));
   const artifactPath = join(cwd, 'gateway-artifact.txt');
   const provider: ProviderAdapter = {
@@ -166,7 +166,7 @@ it('runs remote inference in SQLite while writing artifacts locally', async () =
         inferenceMode: 'gateway',
         inferenceTier: 'medium',
         gatewayUrl: server.url,
-        approvalMode: 'auto',
+        approvalMode,
       },
     }));
     expect(initialized).toMatchObject({
@@ -175,11 +175,29 @@ it('runs remote inference in SQLite while writing artifacts locally', async () =
       connections: { sqlite: 'connected', gateway: 'disconnected' },
     });
 
-    const result = await runtime.handleRpc(request({
+    let result = await runtime.handleRpc(request({
       id: 'run',
       method: 'agent/run',
       params: { runId: crypto.randomUUID(), goal: 'Write the requested artifact', inferenceMode: 'gateway', inferenceTier: 'medium' },
     }));
+    if (approvalMode === 'manual') {
+      expect(result).toMatchObject({ status: 'approval_requested' });
+      expect(existsSync(artifactPath)).toBe(false);
+      const { runId, approvalId } = result as { runId: string; approvalId: string };
+      const approvalRequest = request({
+        id: 'approve', method: 'interaction/resolveApproval', params: { runId, approvalId, approved: true },
+      });
+      const [approval, duplicate] = await Promise.all([
+        runtime.handleRpc(approvalRequest), runtime.handleRpc({ ...approvalRequest, id: 'duplicate' }),
+      ]);
+      expect(approval).toEqual(duplicate);
+      expect(approval).toMatchObject({ runId, approvalId, approved: true, resolved: true });
+      result = (approval as { result: typeof result }).result;
+      await expect(runtime.handleRpc(approvalRequest)).resolves.toEqual({ runId, approvalId, approved: true, resolved: true });
+      await expect(runtime.handleRpc(request({
+        id: 'conflicting', method: 'interaction/resolveApproval', params: { runId, approvalId, approved: false },
+      }))).rejects.toThrow('conflicting decision');
+    }
     expect(result).toMatchObject({ status: 'success', output: 'artifact written' });
     expect(await readFile(artifactPath, 'utf8')).toBe('written by the local desktop runtime\n');
     const info = await runtime.handleRpc(request({ id: 'info', method: 'runtime/info' }));

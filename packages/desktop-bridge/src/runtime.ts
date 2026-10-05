@@ -155,6 +155,8 @@ export class DesktopRuntime {
   private settingsCwd = process.cwd();
   private settingsUpdateInProgress = false;
   private agentBuilderInProgress = false;
+  private readonly runOperations = new Map<string, Promise<unknown>>();
+  private readonly approvalOperations = new Map<string, { approved: boolean; operation: Promise<JsonValue> }>();
 
   constructor(
     private readonly write: DesktopMessageWriter,
@@ -175,6 +177,53 @@ export class DesktopRuntime {
   }
 
   async handleRpc(request: DesktopRpcRequest): Promise<JsonValue> {
+    // Interaction events can arrive before the execution RPC has unwound and
+    // released core's lease. Queue continuation behind that same-run operation.
+    switch (request.method) {
+      case 'agent/run':
+      case 'agent/chat': {
+        const id = request.params!.executionId ?? request.params!.runId;
+        if (id) return this.withRunOperation(id, () => this.handleRequest(request));
+        break;
+      }
+      case 'run/resume':
+      case 'run/retry':
+      case 'run/recover':
+      case 'run/continue':
+      case 'interaction/resolveClarification':
+        return this.withRunOperation(request.params!.runId, () => this.handleRequest(request));
+      case 'execution/resume':
+        return this.withRunOperation(request.params!.executionId, () => this.handleRequest(request));
+    }
+    return this.handleRequest(request);
+  }
+
+  private async withRunOperation(runId: string, operation: () => Promise<JsonValue>): Promise<JsonValue> {
+    const runStore = this.sdk?.created?.runtime?.runStore;
+    const run = await runStore?.getRun(asRunId(runId));
+    if (run) {
+      runId = run.rootRunId;
+      const root = run.id === runId ? run : await runStore?.getRun(asRunId(runId));
+      const sourceId = root?.metadata?.continuationOfRunId;
+      // Recovery can create a new root before its originating RPC has returned.
+      // Its approval must wait for that RPC too, not only for same-run retries.
+      if (typeof sourceId === 'string') {
+        const source = await runStore?.getRun(asRunId(sourceId));
+        const sourceRootId = source?.rootRunId ?? sourceId;
+        if (this.runOperations.has(sourceRootId)) runId = sourceRootId;
+      }
+    }
+    const previous = this.runOperations.get(runId);
+    const current = (previous ? previous.catch(() => undefined) : Promise.resolve()).then(operation);
+    this.runOperations.set(runId, current);
+    const cleanup = () => {
+      if (this.runOperations.get(runId) === current) this.runOperations.delete(runId);
+    };
+    void current.then(cleanup, cleanup);
+    return current;
+  }
+
+  private async handleRequest(request: DesktopRpcRequest): Promise<JsonValue> {
     if (request.method === 'initialize') return this.initializeProtocol(request.params!);
     if (!this.rpcInitialized) {
       throw new DesktopProtocolError(
@@ -938,10 +987,34 @@ export class DesktopRuntime {
     });
   }
 
-  private async resolveApproval(runId: string, approvalId: string, approved: boolean): Promise<JsonValue> {
-    const sdk = await this.sdkForRun(runId);
-    await sdk.agent.resolveApproval(asRunId(runId), approvalId, approved);
-    return { runId, approvalId, approved, resolved: true };
+  private resolveApproval(runId: string, approvalId: string, approved: boolean): Promise<JsonValue> {
+    const key = JSON.stringify([runId, approvalId]);
+    const existing = this.approvalOperations.get(key);
+    if (existing) {
+      if (existing.approved !== approved) {
+        return Promise.reject(new Error(`Approval ${approvalId} was already resolved with a conflicting decision`));
+      }
+      return existing.operation;
+    }
+    const operation = this.withRunOperation(runId, async () => {
+      const sdk = await this.sdkForRun(runId);
+      const events = await sdk.created.runtime.eventStore.listByRun(asRunId(runId));
+      const alreadyResolved = events.some((event) => event.type === 'approval.resolved'
+        && event.payload !== null && typeof event.payload === 'object' && !Array.isArray(event.payload)
+        && event.payload.approvalId === approvalId);
+      // Always ask core to validate the decision, including conflicting repeats.
+      await sdk.agent.resolveApproval(asRunId(runId), approvalId, approved);
+      const acknowledgement = { runId, approvalId, approved, resolved: true };
+      if (!approved || alreadyResolved) return acknowledgement;
+      const result = await sdk.resumeRaw(asRunId(runId));
+      return asJsonValue({ ...acknowledgement, result });
+    });
+    this.approvalOperations.set(key, { approved, operation });
+    // Retain only in-flight operations; persisted approval events prevent replay
+    // after completion or restart, including after a failed continuation.
+    const cleanup = () => this.approvalOperations.delete(key);
+    void operation.then(cleanup, cleanup);
+    return operation;
   }
 
   private pendingTaskPreparation(

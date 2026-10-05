@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { ADAPTIVE_AGENT_CLI_COMMANDS } from '@adaptive-agent/agent-sdk/cli';
 import { AgentSdk, agentConfigurationFingerprint, type OrchestratedRunResult, type ResolvedAgentSdkConfig, type TaskPreparationResult } from '@adaptive-agent/agent-sdk';
 import * as agentCreate from '@adaptive-agent/agent-sdk/agent-create';
-import { InMemoryOrchestrationStore } from '@adaptive-agent/core';
+import { AdaptiveAgent, InMemoryEventStore, InMemoryOrchestrationStore, InMemoryRunStore, InMemorySnapshotStore, InMemoryToolExecutionStore, type ModelAdapter, type ModelResponse, type UUID } from '@adaptive-agent/core';
 
 import { JSON_RPC_ERROR_CODES, type DesktopMessage, type DesktopRpcRequest } from './protocol.js';
 import { DesktopRuntime, safeResolvedConfiguration, updateDesktopSettings, validateRestrictedDesktopConfiguration, type CliExecutor, type DesktopOrchestrationFactory } from './runtime.js';
@@ -91,6 +91,188 @@ function desktopPreparationTarget(runStore: unknown, runRaw: ReturnType<typeof v
     },
   } as unknown as AgentSdk;
 }
+
+describe('desktop approval continuation', () => {
+  async function fixture() {
+    const { runtime } = createRuntime();
+    await initialize(runtime);
+    const decisions = new Map<string, boolean>();
+    const resolveApproval = vi.fn(async (_runId: string, approvalId: string, approved: boolean) => {
+      if (decisions.has(approvalId) && decisions.get(approvalId) !== approved) {
+        throw new Error(`Approval ${approvalId} was already resolved with a conflicting decision`);
+      }
+      decisions.set(approvalId, approved);
+    });
+    const resumeRaw = vi.fn(async (_runId: string): Promise<unknown> => ({ status: 'success', runId: 'run-1', output: 'written' }));
+    const sdk = {
+      agent: { resolveApproval }, resumeRaw,
+      created: { runtime: { eventStore: { listByRun: async () => [...decisions].map(([approvalId, approved]) => ({ type: 'approval.resolved', payload: { approvalId, approved } })) } } },
+    };
+    Object.assign(runtime, { sdk });
+    const approve = (approvalId = 'approval-1', approved = true) => runtime.handleRpc(request({
+      id: approvalId, method: 'interaction/resolveApproval', params: { runId: 'run-1', approvalId, approved },
+    }));
+    return { runtime, sdk, decisions, resolveApproval, resumeRaw, approve };
+  }
+
+  it('continues once for concurrent and completed duplicate approvals and rejects conflicting decisions', async () => {
+    const { runtime, approve, resolveApproval, resumeRaw } = await fixture();
+    let finish!: (value: unknown) => void;
+    resumeRaw.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const first = approve();
+    const duplicate = approve();
+    await vi.waitFor(() => expect(resumeRaw).toHaveBeenCalledTimes(1));
+    await expect(approve('approval-1', false)).rejects.toThrow('conflicting decision');
+    finish({ status: 'success', runId: 'run-1', output: 'written' });
+    const expected = { runId: 'run-1', approvalId: 'approval-1', approved: true, resolved: true, result: { status: 'success', runId: 'run-1', output: 'written' } };
+    await expect(first).resolves.toEqual(expected);
+    await expect(duplicate).resolves.toEqual(expected);
+    await expect(approve()).resolves.toEqual({ runId: 'run-1', approvalId: 'approval-1', approved: true, resolved: true });
+    await expect(approve('approval-1', false)).rejects.toThrow('conflicting decision');
+    expect(resolveApproval).toHaveBeenCalledTimes(3);
+    expect(resumeRaw).toHaveBeenCalledExactlyOnceWith('run-1');
+    expect((runtime as unknown as { approvalOperations: Map<string, unknown> }).approvalOperations.size).toBe(0);
+  });
+
+  it('queues immediately subsequent approval behind the prior continuation and preserves both approval identities', async () => {
+    const { approve, resolveApproval, resumeRaw } = await fixture();
+    let finish!: (value: unknown) => void;
+    resumeRaw.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const first = approve();
+    await vi.waitFor(() => expect(resumeRaw).toHaveBeenCalledTimes(1));
+    // A new approval event can reach the client before resumeRaw releases its lease.
+    const next = approve('approval-2');
+    await Promise.resolve();
+    expect(resolveApproval).toHaveBeenCalledTimes(1);
+    const nextInteraction = { status: 'approval_requested', runId: 'run-1', approvalId: 'approval-2', toolName: 'write_file' };
+    finish(nextInteraction);
+    await expect(first).resolves.toEqual({ runId: 'run-1', approvalId: 'approval-1', approved: true, resolved: true, result: nextInteraction });
+    await expect(next).resolves.toMatchObject({ approvalId: 'approval-2', result: { status: 'success', output: 'written' } });
+    expect(resumeRaw).toHaveBeenCalledTimes(2);
+  });
+
+  it('waits for an existing same-run execution before resolving and continuing approval', async () => {
+    const { runtime, approve, resolveApproval, resumeRaw } = await fixture();
+    let finish!: (value: unknown) => void;
+    resumeRaw.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const running = runtime.handleRpc(request({ id: 'resume', method: 'run/resume', params: { runId: 'run-1' } }));
+    await vi.waitFor(() => expect(resumeRaw).toHaveBeenCalledTimes(1));
+    const approval = approve();
+    await Promise.resolve();
+    expect(resolveApproval).not.toHaveBeenCalled();
+    finish({ status: 'approval_requested', runId: 'run-1', approvalId: 'approval-1' });
+    await running;
+    await expect(approval).resolves.toMatchObject({ result: { status: 'success' } });
+    expect(resumeRaw).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns clarification_requested intact without an extra clarification resume', async () => {
+    const { approve, resumeRaw } = await fixture();
+    const result = { status: 'clarification_requested', runId: 'run-1', question: 'Which file?', clarificationId: 'clarification-1' };
+    resumeRaw.mockResolvedValueOnce(result);
+    await expect(approve()).resolves.toEqual({ runId: 'run-1', approvalId: 'approval-1', approved: true, resolved: true, result });
+    expect(resumeRaw).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['run/retry', 'run/recover', 'run/continue'] as const)('queues approval behind an active %s RPC', async (method) => {
+    const { runtime, sdk, approve, resolveApproval, resumeRaw } = await fixture();
+    let finish!: (value: unknown) => void;
+    const executing = vi.fn(() => new Promise((resolve) => { finish = resolve; }));
+    Object.assign(sdk, {
+      retryRaw: executing, recoverRaw: executing, continueRunRaw: executing,
+    });
+    // Recovery/continuation may create a new root from an older source run.
+    Object.assign(sdk.created.runtime, { runStore: { getRun: async (id: string) => ({
+      id, rootRunId: id, ...(id === 'run-1' && method !== 'run/retry' ? { metadata: { continuationOfRunId: 'source-run' } } : {}),
+    }) } });
+    const sourceId = method === 'run/retry' ? 'run-1' : 'source-run';
+    const running = runtime.handleRpc(request({ id: 'execute', method, params: { runId: sourceId } }));
+    await vi.waitFor(() => expect(executing).toHaveBeenCalledTimes(1));
+    const approval = approve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(resolveApproval).not.toHaveBeenCalled();
+    finish({ status: 'approval_requested', runId: 'run-1', approvalId: 'approval-1' });
+    await running;
+    await expect(approval).resolves.toMatchObject({ result: { status: 'success' } });
+    expect(resumeRaw).toHaveBeenCalledExactlyOnceWith('run-1');
+  });
+
+  it('does not continue rejected or previously persisted approvals, including after restart', async () => {
+    const { approve, decisions, resumeRaw } = await fixture();
+    await expect(approve('rejected', false)).resolves.toEqual({ runId: 'run-1', approvalId: 'rejected', approved: false, resolved: true });
+    decisions.set('historical', true);
+    await expect(approve('historical')).resolves.toEqual({ runId: 'run-1', approvalId: 'historical', approved: true, resolved: true });
+    expect(resumeRaw).not.toHaveBeenCalled();
+  });
+
+  it('propagates continuation failures without replaying execution on duplicate approval', async () => {
+    const { approve, resumeRaw } = await fixture();
+    resumeRaw.mockRejectedValueOnce(new Error('lease unavailable'));
+    await expect(approve()).rejects.toThrow('lease unavailable');
+    await expect(approve()).resolves.toMatchObject({ resolved: true });
+    expect(resumeRaw).toHaveBeenCalledTimes(1);
+  });
+
+  it('queues a child approval answered from its event before the original root RPC releases leases', async () => {
+    const { runtime } = createRuntime();
+    await initialize(runtime);
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const toolExecutionStore = new InMemoryToolExecutionStore();
+    const model = (responses: ModelResponse[]): ModelAdapter => ({
+      provider: 'test', model: 'test',
+      capabilities: { toolCalling: true, jsonOutput: true, streaming: false, usage: false },
+      async generate() { return responses.shift()!; },
+    });
+    let releaseEvent!: () => void;
+    const eventGate = new Promise<void>((resolve) => { releaseEvent = resolve; });
+    let approval: Promise<unknown> | undefined;
+    let childRunId: UUID | undefined;
+    const execute = vi.fn(async () => ({ finding: 'approved' }));
+    const agent = new AdaptiveAgent({
+      model: model([
+        { finishReason: 'tool_calls', toolCalls: [{ id: 'delegate', name: 'delegate.researcher', input: { goal: 'Gated lookup' } }] },
+        { finishReason: 'stop', structuredOutput: { report: 'root consumed child' } },
+      ]),
+      tools: [{ name: 'secure.lookup', description: 'Gated lookup', inputSchema: { type: 'object' }, requiresApproval: true, execute }],
+      delegates: [{ name: 'researcher', description: 'Researcher', allowedTools: ['secure.lookup'], model: model([
+        { finishReason: 'tool_calls', toolCalls: [{ id: 'secure', name: 'secure.lookup', input: {} }] },
+        { finishReason: 'stop', structuredOutput: { finding: 'approved' } },
+      ]) }],
+      delegation: { childRunsMayRequestApproval: true },
+      runStore, eventStore, snapshotStore, toolExecutionStore,
+      eventSink: { async emit(event) {
+        if (event.type !== 'approval.requested') return;
+        childRunId = event.runId;
+        const approvalId = (event.payload as { approvalId: string }).approvalId;
+        approval = runtime.handleRpc(request({ id: 'approve-child', method: 'interaction/resolveApproval', params: { runId: event.runId, approvalId, approved: true } }));
+        await eventGate;
+      } },
+    });
+    const resolveApproval = vi.spyOn(agent, 'resolveApproval');
+    const resumeRaw = vi.fn((runId: UUID) => agent.resume(runId));
+    const sdk = {
+      agent, resumeRaw,
+      runRaw: (goal: string, options: { runId: UUID }) => agent.run({ goal, runId: options.runId }),
+      created: { runtime: { runStore, eventStore, snapshotStore, toolExecutionStore } },
+    };
+    Object.assign(runtime, { sdk, selectDesktopRunSdk: async () => ({ sdk }), prepareRunTask: async () => undefined, fileAccessContext: async () => undefined });
+    const rootRunId = 'root-run' as UUID;
+    const original = runtime.handleRpc(request({ id: 'root', method: 'agent/run', params: { runId: rootRunId, goal: 'Delegate gated work' } }));
+    await vi.waitFor(() => expect(approval).toBeDefined());
+    expect(resolveApproval).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    releaseEvent();
+    await expect(original).resolves.toMatchObject({ status: 'approval_requested', rootRunId });
+    await expect(approval).resolves.toMatchObject({ runId: childRunId, result: { status: 'success', runId: rootRunId, output: { report: 'root consumed child' } } });
+    expect(resumeRaw).toHaveBeenCalledExactlyOnceWith(childRunId);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(await runStore.getRun(rootRunId)).toMatchObject({ status: 'succeeded' });
+    expect(await runStore.listChildren(rootRunId)).toHaveLength(1);
+  });
+});
 
 describe('desktop runtime protocol', () => {
   it('updates editable settings without dropping advanced configuration', () => {

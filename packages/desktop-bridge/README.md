@@ -156,10 +156,41 @@ steering, and in-memory run state.
 | `run/inspect` | `runId` | - |
 | `run/replay` | `runId` | - |
 | `run/steer` | `runId`, `message` | `role`, `metadata` |
-| `interaction/resolveApproval` | `runId`, `approved` | - |
+| `interaction/resolveApproval` | `runId`, `approvalId`, `approved` | - |
 | `interaction/resolveClarification` | `runId`, `answer` | - |
 | `cli/commands` | - | - |
 | `cli/execute` | `argv` | `stdin`, `timeoutMs` (maximum 24 hours) |
+
+### Approval continuation
+
+`interaction/resolveApproval` persists the decision through core. A newly
+approved interaction also awaits same-run `resumeRaw` in the bridge; the desktop
+must not issue a second resume. The response preserves the acknowledgement and
+adds the continuation's unmodified `RunResult` as `result`:
+
+```json
+{"runId":"run-1","approvalId":"approval-1","approved":true,"resolved":true,"result":{"status":"approval_requested","runId":"run-1","approvalId":"approval-2","toolName":"write_file"}}
+```
+
+The outer `approvalId` identifies the resolved interaction; any nested
+`result.approvalId` identifies a new interaction. Clients settle the original
+request and consume `result`, including `success`, `approval_requested`, or
+`clarification_requested`. Events can arrive before the response:
+`approval.resolved` precedes continued execution and subsequent interaction
+events. Do not overwrite a newer interaction with an older response.
+
+Rejection and completed duplicate decisions return only
+`{runId, approvalId, approved, resolved: true}`. Concurrent identical decisions
+share one operation; conflicting decisions fail. Same-run execution operations
+are serialized by durable `rootRunId`, including child approvals, retries,
+recovery, and continuation source linkage. An immediately subsequent approval
+waits for the previous operation to release core's lease. Duplicate tracking is in-flight only;
+persisted `approval.resolved` events prevent continuation replay after completion
+or restart. Continuation failures propagate as RPC errors; a duplicate approval
+does not retry execution. Recovery uses explicit `run/resume` when appropriate.
+Core still validates decisions and enforces leases. Child continuation and parent
+cascading remain core-owned. Ordinary clarification already executes in core and
+receives no additional bridge resume.
 
 ### Task-preparation clarification
 
