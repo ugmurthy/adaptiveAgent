@@ -9,7 +9,7 @@ import { createTracePostgresPool as createPostgresPool, resolveTraceRuntimeTarge
 
 import { USAGE, usageForArgs } from './constants.js';
 import { cacheKey, isTerminalReport, parseCacheDuration, readCache, writeCache, type TraceCacheTarget } from './cache.js';
-import { aggregateSessionPerformance, listSessionlessRuns, listSessionPerformance, listSessions, loadUsageForTraceTargetWithTerminalState, traceSession } from './data.js';
+import { aggregateSessionPerformance, inspectSessionSettings, listSessionlessRuns, listSessionPerformance, listSessions, loadUsageForTraceTargetWithTerminalState, traceSession } from './data.js';
 import { buildTraceComparison } from './report.js';
 import { SqliteTraceReader, TraceService } from './reader.js';
 import {
@@ -57,6 +57,14 @@ export function parseArgs(args: string[]): CliOptions {
   }
 
   switch (command) {
+    case 'settings': {
+      options.inspectSettings = true;
+      if (helpRequested && normalizedArgs[0]?.startsWith('-')) break;
+      const target = requireCommandArgument('settings target', normalizedArgs.shift());
+      if (target !== 'session') throw new Error('Settings inspection expects session <session-id>.');
+      options.sessionId = requireCommandArgument('session id', normalizedArgs.shift());
+      break;
+    }
     case 'view': {
       if (helpRequested && normalizedArgs[0]?.startsWith('-')) break;
       const target = requireCommandArgument('view target', normalizedArgs.shift());
@@ -264,6 +272,22 @@ export async function main(): Promise<void> {
     }
     const postgresConfig = runtimeTarget.config;
 
+    if (options.inspectSettings) {
+      let pool = await createTraceSessionPostgresPool(postgresConfig);
+      try {
+        let report;
+        try { report = await inspectSessionSettings(pool, options); }
+        catch (error) {
+          if (!isPostgresPasswordAuthFailure(error)) throw error;
+          await pool.end();
+          pool = createPostgresPool(postgresConfig, { password: await promptHidden('Postgres password: ') });
+          report = await inspectSessionSettings(pool, options);
+        }
+        console.log(options.json ? JSON.stringify(report, null, 2) : inspect(report, { depth: null, colors: process.stdout.isTTY, maxArrayLength: null, maxStringLength: null }));
+      } finally { await pool.end(); }
+      return;
+    }
+
     if (options.compareRunIds) {
       const [baselineId, candidateId] = options.compareRunIds;
       const [baseline, candidate] = await runTraceComparisonWithPasswordRetry(postgresConfig,
@@ -338,6 +362,11 @@ export async function main(): Promise<void> {
 }
 
 async function runWithService(service: TraceService, options: CliOptions, cacheTarget: TraceCacheTarget): Promise<void> {
+  if (options.inspectSettings) {
+    const report = await service.settings(options);
+    console.log(options.json ? JSON.stringify(report, null, 2) : inspect(report, { depth: null, colors: process.stdout.isTTY, maxArrayLength: null, maxStringLength: null }));
+    return;
+  }
   if (options.compareRunIds) {
     const [baselineId, candidateId] = options.compareRunIds;
     const [baseline, candidate] = await Promise.all([
@@ -688,6 +717,7 @@ async function promptHidden(prompt: string): Promise<string> {
 function assertOptionApplies(command: string, option: string, options: CliOptions): void {
   const globalOptions = ['--database-url', '--database-url-env', '--config', '--settings', '--pgssl', '--help', '-h'];
   const optionsByCommand: Record<string, string[]> = {
+    settings: ['--json'],
     view: ['--root-run', '--report', '--focus-run', '--messages', '--reasoning', '--messages-view', '--system-only', '--include-plans', '--only-delegates', '--preview-chars', '--json', '--html', '--fresh', '--no-cache', '--cache-ttl'],
     compare: ['--json', '--html', '--fresh', '--no-cache', '--cache-ttl'],
     list: options.listSessionless

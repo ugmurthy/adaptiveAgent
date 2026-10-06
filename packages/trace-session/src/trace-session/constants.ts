@@ -15,6 +15,7 @@ Usage:
 
 Commands:
   view         Inspect one persisted session or run tree.
+  settings     Reconstruct partial historical settings and profile evidence.
   compare      Compare two focused runs.
   list         Discover persisted sessions and runs.
   aggregate    Aggregate performance across root traces.
@@ -47,6 +48,16 @@ View options:
   --fresh                Bypass cached data and replace it.
   --no-cache             Disable persistent cache reads and writes.
   --cache-ttl <duration> Override cache TTL (0 or a duration with ms/s/m/h/d).
+
+${GLOBAL_OPTIONS}`;
+
+const SETTINGS_USAGE = `Usage:
+  trace-session settings session <session-id> [--json] [database options]
+
+Read persisted settings/profile evidence for every run, including children.
+Always reads the database directly. Does not load current agent profiles.
+Reconstruction is partial, not a runnable settings or profile export.
+System messages and execution context may contain sensitive data.
 
 ${GLOBAL_OPTIONS}`;
 
@@ -121,6 +132,7 @@ ${GLOBAL_OPTIONS}`;
 export function usageForArgs(args: string[]): string {
   const normalized = args[0] === 'trace-session' ? args.slice(1) : args;
   switch (normalized[0]) {
+    case 'settings': return SETTINGS_USAGE;
     case 'view': return VIEW_USAGE;
     case 'compare': return COMPARE_USAGE;
     case 'list': return LIST_USAGE;

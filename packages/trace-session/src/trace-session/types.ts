@@ -49,6 +49,7 @@ export type ReportView =
 export type MessageView = 'compact' | 'delta' | 'full';
 
 export interface CliOptions {
+  inspectSettings?: boolean;
   compareRunIds?: [string, string];
   sessionId?: string;
   rootRunId?: string;

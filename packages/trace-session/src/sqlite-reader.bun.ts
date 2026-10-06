@@ -86,6 +86,33 @@ async function fixture(): Promise<string> {
 }
 
 describe('SqliteTraceReader', () => {
+  it('inspects legacy session settings including children and distinct snapshot evidence', async () => {
+    const path = await fixture();
+    const database = new Database(path, { strict: true });
+    const root = JSON.parse((database.query('select record_json from agent_runs where id=?').get('root-1') as { record_json: string }).record_json);
+    root.metadata.agentId = 'historical-agent';
+    root.metadata.agentConfigPath = '/missing/historical-agent.json';
+    root.modelParameters = { temperature: 0.25 };
+    database.run('update agent_runs set record_json=? where id=?', [JSON.stringify(root), 'root-1']);
+    const latest = { id: 'snapshot-latest', runId: 'root-1', snapshotSeq: 5, status: 'succeeded', state: { messages: [{ role: 'system', content: 'Later instructions' }], visibleToolNames: ['final-tool'] }, createdAt: '2026-07-01T10:00:06.000Z' };
+    database.run('insert into run_snapshots (id,run_id,snapshot_seq,status,created_at,record_json) values (?,?,?,?,?,?)', [latest.id, latest.runId, latest.snapshotSeq, latest.status, latest.createdAt, JSON.stringify(latest)]);
+    database.close();
+    const service = new TraceService(new SqliteTraceReader(path));
+    try {
+      const report = await service.settings(options({ sessionId: 'session-1' }));
+      expect(report.completeness).toBe('partial');
+      expect(report.runs.map(run => run.runId)).toEqual(['root-1', 'child-1']);
+      expect(report.runs[0].agent.agentId).toBe('historical-agent');
+      expect(report.runs[0].model.parameters).toEqual({ temperature: 0.25 });
+      expect(report.runs[0].initialSnapshot).toEqual({ seq: 1, systemMessages: [{ role: 'system', content: 'You are an agent.' }], outputSchema: null });
+      expect(report.runs[0].latestSnapshot).toEqual({ seq: 5, visibleToolNames: ['final-tool'] });
+      expect(report.runs[1]).toMatchObject({ parentRunId: 'root-1', delegateName: 'researcher', initialSnapshot: null, latestSnapshot: null });
+      const missing = await service.settings(options({ sessionId: 'unrelated-session' }));
+      expect(missing.runs).toEqual([]);
+      expect(missing.warnings[0]).toContain('was not found');
+    } finally { await service.close(); }
+  });
+
   it('does not create a missing database and rejects an unsupported schema', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'trace-session-sqlite-invalid-'));
     temporaryDirectories.push(directory);
@@ -308,6 +335,19 @@ describe('SqliteTraceReader', () => {
     expect(JSON.parse(stdout)).toMatchObject({
       target: { kind: 'session', requestedId: 'session-1' },
       rootRuns: [{ rootRunId: 'root-1' }],
+    });
+    const settingsProcess = Bun.spawn([
+      processExecPath(), 'run', join(import.meta.dir, 'trace-session.ts'),
+      'settings', 'session', 'session-1', '--settings', settingsPath, '--json',
+    ], { cwd: join(import.meta.dir, '..'), stdout: 'pipe', stderr: 'pipe' });
+    const [settingsExit, settingsOutput, settingsError] = await Promise.all([
+      settingsProcess.exited, new Response(settingsProcess.stdout).text(), new Response(settingsProcess.stderr).text(),
+    ]);
+    expect(settingsExit).toBe(0);
+    expect(settingsError).toBe('');
+    expect(JSON.parse(settingsOutput)).toMatchObject({
+      sessionId: 'session-1', completeness: 'partial',
+      runs: [{ runId: 'root-1', initialSnapshot: { systemMessages: [{ role: 'system', content: 'You are an agent.' }] } }, { runId: 'child-1', delegateName: 'researcher' }],
     });
   });
 });

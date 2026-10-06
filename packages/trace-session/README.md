@@ -11,6 +11,30 @@ optional, so reports continue to work for core-only runs.
 Reporting is read-only. `maintenance empty-goal-sql` prints reviewable SQL for
 empty-goal gateway sessions; it does not execute that SQL.
 
+## Historical settings and agent profiles
+
+```bash
+bun run trace-session settings session "$SESSION_ID"
+bun run trace-session settings session "$SESSION_ID" --json
+# SQLite: add --settings /path/to/agent.settings.json to select the database.
+```
+
+This read-only inspection works with Postgres and SQLite, including core-only
+sessions and legacy session IDs stored in context/metadata. It reads fresh
+persisted evidence for every root and child run in the session: model fields,
+agent identity/configuration path/fingerprint, execution context, initial
+snapshot system messages/output schema, and latest snapshot tool visibility.
+Programmatic callers can use `TraceService.settings(options)`.
+
+Reconstruction is explicitly **partial**. Full settings and agent/delegate
+definitions were not archived: limits, retry policies, tool definitions and
+configured allowed tools cannot be recovered reliably. Null means unavailable,
+not a default. Effective system messages are not the original profile text;
+runtime tool visibility is not a configured tool allowlist. Current profile
+files are never read, so changed or deleted files cannot misrepresent history.
+The output is not a runnable configuration. Review system messages and
+execution context for sensitive data before sharing the report.
+
 ## Principle: decision-oriented trace reporting
 
 A trace should not begin as an event dump. It should answer four questions in a

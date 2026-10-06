@@ -1,4 +1,5 @@
 import { inspect } from 'node:util';
+import { historicalSettingsReport, reconstructRunSettings } from './settings.js';
 
 import {
   buildMilestones,
@@ -65,6 +66,24 @@ export interface PostgresQueryResult<T> {
 
 export interface PostgresClient {
   query<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<PostgresQueryResult<T>>;
+}
+
+export async function inspectSessionSettings(client: PostgresClient, options: CliOptions) {
+  if (!options.sessionId) throw new Error('Settings inspection requires a session ID.');
+  const support = await detectTraceSupport(client);
+  const { rootRunIds } = await resolveTraceTarget(client, options, support.hasGatewaySessionTables);
+  const result = await client.query<{ run: Record<string, unknown>; initial: Record<string, unknown> | null; latest: Record<string, unknown> | null }>(`
+    select to_jsonb(r) as run,
+      (select to_jsonb(s) from run_snapshots s where s.run_id = r.id order by s.snapshot_seq asc limit 1) as initial,
+      (select to_jsonb(s) from run_snapshots s where s.run_id = r.id order by s.snapshot_seq desc limit 1) as latest
+    from agent_runs r where r.root_run_id::text = any($1::text[])
+    order by r.created_at, r.id
+  `, [rootRunIds]);
+  const camelCase = (record: Record<string, unknown>) => Object.fromEntries(Object.entries(record)
+    .map(([key, value]) => [key.replace(/_([a-z])/g, (_, letter: string) => letter.toUpperCase()), value]));
+  return historicalSettingsReport(options.sessionId, result.rows.map(row => reconstructRunSettings(
+    camelCase(row.run), row.initial ? camelCase(row.initial) : undefined, row.latest ? camelCase(row.latest) : undefined,
+  )));
 }
 
 export async function traceSession(client: PostgresClient, options: CliOptions): Promise<TraceReport> {

@@ -1,7 +1,9 @@
 import { existsSync } from 'node:fs';
 import type { Database } from 'bun:sqlite';
+import { historicalSettingsReport, reconstructRunSettings, type HistoricalSettingsReport } from './settings.js';
 
 import {
+  inspectSessionSettings,
   aggregateSessionPerformance, buildAggregateObservation, filterSessions, listSessionlessRuns,
   listSessionPerformance, listSessions, loadUsageForTraceTarget, runMessageTraceFromRow, traceSession,
   sessionPresentationFromRuns,
@@ -21,6 +23,7 @@ import type {
 } from './types.js';
 
 export interface TraceReader {
+  settings(options: CliOptions): Promise<HistoricalSettingsReport>;
   trace(options: CliOptions): Promise<TraceReport>;
   usage(options: CliOptions): Promise<SessionUsageSummary>;
   listSessions(options?: ListFilterOptions & { recoverAgentRunSessionIds?: boolean }): Promise<SessionListItem[]>;
@@ -32,6 +35,7 @@ export interface TraceReader {
 
 export class TraceService {
   constructor(readonly reader: TraceReader) {}
+  settings(options: CliOptions) { return this.reader.settings(options); }
   trace(options: CliOptions) { return this.reader.trace(options); }
   usage(options: CliOptions) { return this.reader.usage(options); }
   listSessions(options?: ListFilterOptions & { recoverAgentRunSessionIds?: boolean }) { return this.reader.listSessions(options); }
@@ -43,6 +47,7 @@ export class TraceService {
 
 export class PostgresTraceReader implements TraceReader {
   constructor(private readonly client: PostgresClient, private readonly end?: () => Promise<void>) {}
+  settings(options: CliOptions) { return inspectSessionSettings(this.client, options); }
   trace(options: CliOptions) { return traceSession(this.client, options); }
   usage(options: CliOptions) { return loadUsageForTraceTarget(this.client, options); }
   listSessions(options = {}) { return listSessions(this.client, options); }
@@ -94,6 +99,19 @@ export class SqliteTraceReader implements TraceReader {
   }
   private tx<T>(fn: () => T): T { this.db.exec('BEGIN'); try { const out = fn(); this.db.exec('COMMIT'); return out; } catch (e) { if (this.db.inTransaction) this.db.exec('ROLLBACK'); throw e; } }
   private allRuns(): Array<DbRun & { record: Json }> { return (this.db.query('select id, session_id, root_run_id, record_json from agent_runs').all() as DbRun[]).map(r => ({...r, record: parse(r.record_json,'agent_runs',r.id,'record_json')})); }
+  async settings(options: CliOptions): Promise<HistoricalSettingsReport> {
+    if (!options.sessionId) throw new Error('Settings inspection requires a session ID.');
+    return this.tx(() => {
+      const runs = this.allRuns(), roots = this.roots(options, runs);
+      const selected = runs.filter(run => roots.includes(run.root_run_id))
+        .sort((a, b) => String(a.record.createdAt).localeCompare(String(b.record.createdAt)) || a.id.localeCompare(b.id));
+      return historicalSettingsReport(options.sessionId!, selected.map(run => {
+        const snapshots = this.db.query('select id,record_json from run_snapshots where run_id=? order by snapshot_seq').all(run.id) as Array<{ id: string; record_json: string }>;
+        const read = (snapshot: typeof snapshots[number] | undefined) => snapshot ? parse(snapshot.record_json, 'run_snapshots', snapshot.id, 'record_json') : undefined;
+        return reconstructRunSettings(run.record, read(snapshots[0]), read(snapshots.at(-1)));
+      }));
+    });
+  }
   private roots(options: CliOptions, runs: ReturnType<SqliteTraceReader['allRuns']>) {
     if (options.sessionId) {
       if (options.rootRunId) return runs.some(r => effectiveSessionId(r) === options.sessionId && r.root_run_id === options.rootRunId) ? [options.rootRunId] : [];
