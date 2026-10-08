@@ -349,8 +349,29 @@ Use this shape when you need durable execution semantics: events, snapshots, lea
 | `resume(runId)` | Continue the same run from persisted state. |
 | `retry(runId)` | Retry the same failed run when policy allows. |
 | `getRecoveryOptions(runId)` | Analyze whether a failed run can continue safely. |
+| `getRecoveryPlan(runId)` | Recommend resume, retry, continuation, or an explicit user/reconciliation action. |
+| `recover({ runId, ... })` | Apply the safe automatic recommendation, or an explicitly selected strategy. |
 | `continueRun(options)` | Create and execute a new linked continuation run. |
 | `createContinuationRun(options)` | Create the continuation run record without executing it. |
+
+`getSessionRecoveryTargets(stores, sessionId)` groups durable runs into ordinary
+run lineage, swarm coordinator executions, and catalog orchestration executions.
+It excludes delegate children and superseded attempts, and can find saved
+orchestration plans before their stage runs exist. The SDK's unified
+`recover({ sessionId })` loads the historical profiles and delegates recovery to
+these owners; core does not discover agent JSON files or depend on Agent SDK.
+
+`SwarmCoordinator.recoverSession({ sessionId, coordinatorRunId?, dryRun?,
+requireApproval? })` owns swarm recovery. It preserves successful workers,
+recovers unfinished roles, and updates finalizers when inputs change. Automatic
+run recovery reuses persisted continuation links rather than creating another
+branch. User action, exhausted budgets, and uncertain tool outcomes are not
+bypassed with a fresh continuation.
+
+Custom orchestration stores must implement `listBySession(sessionId)` against
+saved plan identity and support `runId` patches in `updateStage` so continuation
+identity remains durable. The built-in memory, SQLite, and Postgres stores do so;
+this interface extension requires no database migration.
 
 ## Result handling pattern
 

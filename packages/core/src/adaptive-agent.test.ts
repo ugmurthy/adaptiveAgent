@@ -1188,6 +1188,38 @@ describe('AdaptiveAgent', () => {
     );
   });
 
+  it('reuses a persisted continuation after a recovery restart instead of creating another one', async () => {
+    const runStore = new InMemoryRunStore();
+    const eventStore = new InMemoryEventStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const continuationStore = new InMemoryContinuationStore();
+    const model = new SequenceModel([new Error('Invalid model output'), { finishReason: 'stop', text: 'Continued once' }]);
+    const options = { model, tools: [], runStore, eventStore, snapshotStore, continuationStore };
+    const agent = new AdaptiveAgent(options);
+    const failed = await agent.run({ goal: 'Recover after a restart', sessionId: 'continuation-restart' });
+    const created = await agent.createContinuationRun({ fromRunId: failed.runId });
+    const restarted = new AdaptiveAgent(options);
+    expect(await restarted.recover({ runId: failed.runId })).toMatchObject({ action: 'continue_new_run', result: { status: 'success', runId: created.continuationRunId, output: 'Continued once' } });
+    expect(await restarted.recover({ runId: failed.runId })).toMatchObject({ result: { status: 'success', runId: created.continuationRunId } });
+    expect(await continuationStore.listBySourceRun(failed.runId)).toHaveLength(1);
+    expect(model.receivedRequests).toHaveLength(2);
+    expect((await runStore.getRun(failed.runId))?.status).toBe('failed');
+  });
+
+  it('does not bypass rejected approvals or exhausted budgets with a continuation', async () => {
+    const runStore = new InMemoryRunStore();
+    const snapshotStore = new InMemorySnapshotStore();
+    const agent = new AdaptiveAgent({ model: new SequenceModel([]), tools: [], runStore, snapshotStore, continuationStore: new InMemoryContinuationStore() });
+    for (const code of ['APPROVAL_REJECTED', 'MAX_STEPS'] as const) {
+      const run = await runStore.createRun({ goal: code, status: 'failed' });
+      await runStore.updateRun(run.id, { errorCode: code, errorMessage: code });
+      await snapshotStore.save({ runId: run.id, snapshotSeq: 1, status: 'failed', summary: {}, state: { schemaVersion: 1, messages: [], stepsUsed: 1000 } });
+      expect(await agent.getRecoveryPlan(run.id)).toMatchObject({ action: 'requires_user_action', executable: false });
+      await expect(agent.recover({ runId: run.id })).rejects.toThrow();
+      await expect(agent.continueRun({ fromRunId: run.id })).rejects.toThrow();
+    }
+  });
+
   it('uses provider-facing delegate names in the runtime tool manifest when the adapter rewrites them', async () => {
     const runStore = new InMemoryRunStore();
     const model = new AliasingSequenceModel([

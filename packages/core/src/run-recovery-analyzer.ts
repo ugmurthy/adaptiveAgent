@@ -102,6 +102,15 @@ export class RunRecoveryAnalyzer {
       };
     }
 
+    if (classification.failureClass === 'user_action_required' || classification.failureClass === 'policy_blocked' || run.errorCode === 'MAX_STEPS') {
+      return {
+        runId, continuable: false, decision: 'requires_user_action',
+        failureClass: classification.failureClass, reason: run.errorCode === 'MAX_STEPS'
+          ? 'Run exhausted its step budget; increase maxSteps before recovery'
+          : classification.reason,
+      };
+    }
+
     return {
       runId,
       continuable: this.options.recovery?.continuation?.enabled !== false,

@@ -1,7 +1,20 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 
-import { InMemoryOrchestrationStore, type AgentRun, type JsonObject, type JsonValue, type OrchestrationExecution, type OrchestrationStage, type OrchestrationStore, type RunResult } from '@adaptive-agent/core';
+import {
+  InMemoryOrchestrationStore,
+  OrchestrationOptimisticConcurrencyError,
+  type AgentRun,
+  type JsonObject,
+  type JsonValue,
+  type OrchestrationExecution,
+  type OrchestrationStage,
+  type OrchestrationStore,
+  type RecoverRunOptions,
+  type RecoverRunResult,
+  type RunRecoveryPlan,
+  type RunResult,
+} from '@adaptive-agent/core';
 
 import { AgentSdk, type AgentConfigFile, type AgentSdkOptions, type AgentSdkRunOptions, type SupportedModality } from './index.js';
 import { resolveAgentSdkConfigWithSources } from './config-resolve.js';
@@ -245,15 +258,61 @@ export interface OrchestrationSdkOptions extends AgentSdkOptions {
   concurrency?: OrchestrationConcurrencyPolicy;
   agentRunnerFactory?: (agentId: string, agentConfig: AgentConfigFile, options: AgentSdkOptions) => Promise<OrchestrationAgentRunner>;
   orchestrationListener?: (event: OrchestrationLifecycleEvent) => void;
+  /**
+   * While an execution is `routing`/`running`, stage activity newer than this is treated as owned by a
+   * live scheduler and `recoverExecution` reports `busy`. Defaults to 60 seconds.
+   */
+  recoveryStaleAfterMs?: number;
 }
 
 export interface OrchestrationAgentRunner {
   runRaw(goal: string, options?: AgentSdkRunOptions): Promise<RunResult>;
   resumeRaw?(runId: string): Promise<RunResult>;
+  /** Run-level recovery plan; must not call a model. Required for `recoverExecution` to recover a stage. */
+  getRecoveryPlan?(runId: string): Promise<RunRecoveryPlan>;
+  /** Executes one run-level recovery (resume, retry, or continuation). Required for `recoverExecution` to recover a stage. */
+  recoverRaw?(options: RecoverRunOptions): Promise<RecoverRunResult>;
   interrupt?(runId: string): Promise<void>;
-  inspect(runId: string): Promise<{ run: (Pick<AgentRun, 'rootRunId'> & Partial<Pick<AgentRun, 'id' | 'status' | 'result' | 'errorCode' | 'errorMessage' | 'usage'>>) | null }>;
+  inspect(runId: string): Promise<{ run: (Pick<AgentRun, 'rootRunId'> & Partial<Pick<AgentRun, 'id' | 'status' | 'result' | 'errorCode' | 'errorMessage' | 'usage' | 'leaseOwner' | 'leaseExpiresAt'>>) | null }>;
   close?(): Promise<void>;
 }
+
+export interface OrchestrationRecoveryOptions {
+  /** Compute run recovery plans without mutating stores or invoking any model. */
+  dryRun?: boolean;
+  /** Forwarded to run-level recovery; continuation recovery may require it. */
+  requireApproval?: boolean;
+}
+
+export type OrchestrationRecoveryOutcome = 'planned' | 'completed' | 'failed' | 'blocked' | 'busy';
+
+export interface OrchestrationRecoveryResult {
+  executionId: string;
+  sessionId: string;
+  outcome: OrchestrationRecoveryOutcome;
+  plans: RunRecoveryPlan[];
+  actions: RecoverRunResult[];
+  reason?: string;
+  result?: OrchestratedRunResult;
+}
+
+interface StageRecoveryItem { stage: OrchestrationStage; plan: RunRecoveryPlan; revertStatus: OrchestrationStage['status'] }
+interface StageRestartItem { stage: OrchestrationStage; freshRunId: boolean }
+interface ExecutionRecoveryAssessment {
+  plans: RunRecoveryPlan[];
+  busy?: string;
+  blocked?: string;
+  reconcile: Array<{ stage: OrchestrationStage; result: RunResult }>;
+  recover: StageRecoveryItem[];
+  restart: StageRestartItem[];
+  preserved: string[];
+  stageVersions: Map<string, number>;
+}
+
+type OrchestrationStageRunPatch = Partial<Pick<OrchestrationStage, 'status' | 'upstreamRunIds' | 'runId'>>;
+
+const DEFAULT_RECOVERY_STALE_AFTER_MS = 60_000;
+const RECOVERABLE_RUN_ACTIONS = new Set<RunRecoveryPlan['action']>(['resume_same_run', 'retry_same_run', 'continue_new_run']);
 
 export class OrchestrationSdk {
   private readonly catalog = new Map<string, AgentCatalogEntry>();
@@ -267,6 +326,7 @@ export class OrchestrationSdk {
   private readonly defaultRequestedAgentId: string;
   private orchestrationStore: OrchestrationStore;
   private readonly catalogFingerprint: string;
+  private readonly recoveringExecutions = new Set<string>();
 
   private constructor(private readonly options: OrchestrationSdkOptions, entries: AgentCatalogEntry[]) {
     for (const entry of entries) {
@@ -330,9 +390,335 @@ export class OrchestrationSdk {
     return this.continueExecution(execution, parseRequest(execution.request), parsePlan(execution.plan, execution.catalogFingerprint));
   }
 
+  /**
+   * Recovers an unfinished orchestration execution from its saved plan without redecomposing.
+   *
+   * Successful independent stages are preserved. Each failed, paused, or stale stage is recovered at most
+   * once through its own agent runner (`getRecoveryPlan` + `recoverRaw`); continuation run IDs are persisted
+   * on the stage and as session run links. Downstream stages whose upstream results change are restarted
+   * with fresh run IDs and recomputed input, then the saved plan continues. Cancellation, catalog drift,
+   * live leases, user action, and reconciliation requirements return `blocked` or `busy` instead.
+   */
+  async recoverExecution(executionId: string, options: OrchestrationRecoveryOptions = {}): Promise<OrchestrationRecoveryResult> {
+    // Claim the in-process guard synchronously so concurrent callers cannot both pass it.
+    const alreadyRecovering = this.recoveringExecutions.has(executionId);
+    const ownsGuard = !options.dryRun && !alreadyRecovering;
+    if (ownsGuard) this.recoveringExecutions.add(executionId);
+    try {
+      await this.adoptRequestedRuntimeStore();
+      const execution = await this.orchestrationStore.getExecution(executionId);
+      if (!execution) throw new Error(`Orchestration execution ${executionId} not found.`);
+      const plan = parsePlan(execution.plan, execution.catalogFingerprint);
+      if (alreadyRecovering) {
+        return { executionId, sessionId: plan.sessionId, outcome: 'busy', plans: [], actions: [], reason: `Recovery is already in progress for orchestration execution ${executionId}.` };
+      }
+      return await this.recoverExecutionWithGuard(execution, plan, options);
+    } finally {
+      if (ownsGuard) this.recoveringExecutions.delete(executionId);
+    }
+  }
+
   async close(): Promise<void> {
     await Promise.all([...this.runners.values()].map((runner) => runner.close?.()));
     this.runners.clear();
+  }
+
+  private async adoptRequestedRuntimeStore(): Promise<void> {
+    if (this.options.orchestrationStore || this.options.agentRunnerFactory) return;
+    const requestedRunner = await this.getRunner(this.defaultRequestedAgentId);
+    if (requestedRunner instanceof AgentSdk) this.orchestrationStore = requestedRunner.created.runtime.orchestrationStore;
+  }
+
+  private async recoverExecutionWithGuard(execution: OrchestrationExecution, plan: OrchestrationPlan, options: OrchestrationRecoveryOptions): Promise<OrchestrationRecoveryResult> {
+    const executionId = execution.id;
+    const report = (outcome: OrchestrationRecoveryOutcome, fields: Partial<Omit<OrchestrationRecoveryResult, 'executionId' | 'sessionId' | 'outcome'>> = {}): OrchestrationRecoveryResult =>
+      ({ executionId, sessionId: plan.sessionId, outcome, plans: [], actions: [], ...fields });
+
+    if (execution.status === 'cancelled') return report('blocked', { reason: `Orchestration execution ${executionId} is cancelled.` });
+    if (execution.catalogFingerprint !== this.catalogFingerprint) {
+      return report('blocked', { reason: `CATALOG_CHANGED: orchestration execution ${executionId} was created with a different catalog fingerprint.` });
+    }
+    const missingAgent = plan.nodes.find((node) => !this.catalog.has(node.agentId));
+    if (missingAgent) return report('blocked', { reason: `CATALOG_CHANGED: agent "${missingAgent.agentId}" for stage ${missingAgent.id} is not in the catalog.` });
+    if (execution.status === 'succeeded') {
+      return report('completed', { reason: `Orchestration execution ${executionId} already succeeded; nothing to recover.`, result: await this.completedResult(execution.id, plan) });
+    }
+
+    const assessment = await this.assessRecovery(execution, plan, await this.orchestrationStore.listStages(executionId));
+    if (assessment.busy) return report('busy', { plans: assessment.plans, reason: assessment.busy });
+    if (assessment.blocked) return report('blocked', { plans: assessment.plans, reason: assessment.blocked });
+    const summary = describeRecovery(assessment);
+    if (options.dryRun) return report('planned', { plans: assessment.plans, reason: summary });
+
+    // Optimistic execution claim: only one recoverer/scheduler can move this version forward.
+    let claimed: OrchestrationExecution;
+    try {
+      claimed = await this.orchestrationStore.updateExecution(executionId, { status: 'running' }, execution.version);
+    } catch (error) {
+      if (isOptimisticConflict(error)) return report('busy', { plans: assessment.plans, reason: `Orchestration execution ${executionId} was claimed concurrently.` });
+      throw error;
+    }
+    // Revalidate: stages must still match what was assessed, otherwise another writer is active.
+    const revalidated = await this.orchestrationStore.listStages(executionId);
+    if (revalidated.length !== assessment.stageVersions.size || revalidated.some((stage) => assessment.stageVersions.get(stage.nodeId) !== stage.version)) {
+      await this.releaseRecoveryClaim(executionId, execution.status, claimed.version);
+      return report('busy', { plans: assessment.plans, reason: `Orchestration execution ${executionId} changed while recovery was being planned.` });
+    }
+
+    const actions: RecoverRunResult[] = [];
+    try {
+      const session = await this.sessionStore.get(plan.sessionId);
+      const runningSession = session && session.status !== 'running'
+        ? await this.sessionStore.update({ ...session, status: 'running', updatedAt: this.now().toISOString(), completedAt: undefined })
+        : session;
+
+      for (const { stage, result } of assessment.reconcile) {
+        await this.finishStage(await this.requireStage(executionId, stage.nodeId), result);
+      }
+
+      const recovered: Array<{ stage: OrchestrationStage; result: RunResult }> = [];
+      for (const item of assessment.recover) {
+        // Stage-level CAS claim against the assessed version (bumps it even when already `running`) prevents duplicate recovery.
+        const stageClaim = await this.orchestrationStore.updateStage(executionId, item.stage.nodeId, { status: 'running' }, item.stage.version);
+        const runner = await this.getRunner(stageClaim.agentId);
+        const node = plan.nodes.find((candidate) => candidate.id === stageClaim.nodeId)!;
+        let action: RecoverRunResult;
+        try {
+          action = await runner.recoverRaw!({
+            runId: stageClaim.runId,
+            strategy: 'auto',
+            ...(options.requireApproval !== undefined ? { requireApproval: options.requireApproval } : {}),
+            metadata: { orchestration: { kind: 'catalog', executionId, sessionId: plan.sessionId, nodeId: node.id, stage: node.stage, recoveryOfRunId: stageClaim.runId } },
+          });
+        } catch (error) {
+          await this.revertStageClaim(stageClaim, item.revertStatus);
+          await this.releaseRecoveryClaim(executionId, execution.status);
+          return report('blocked', { plans: assessment.plans, actions, reason: `Recovery of stage ${node.id} (run ${stageClaim.runId}) failed: ${errorMessage(error)}` });
+        }
+        actions.push(action);
+        if (!action.result) {
+          await this.revertStageClaim(stageClaim, item.revertStatus);
+          await this.releaseRecoveryClaim(executionId, execution.status);
+          return report('blocked', { plans: assessment.plans, actions, reason: `Recovery of stage ${node.id} (run ${stageClaim.runId}) returned no run result.` });
+        }
+        const finished = await this.persistRecoveredStage(plan, node, stageClaim, action.result);
+        recovered.push({ stage: finished, result: action.result });
+        if (isPaused(action.result) || (action.result.status === 'failure' && this.concurrency.failurePolicy === 'fail_fast')) break;
+      }
+
+      const paused = recovered.find(({ result }) => isPaused(result));
+      if (paused) {
+        await this.pauseExecution((await this.orchestrationStore.getExecution(executionId))!);
+        if (runningSession) await this.sessionStore.update({ ...runningSession, status: 'paused', updatedAt: this.now().toISOString() });
+        return report('blocked', {
+          plans: assessment.plans,
+          actions,
+          reason: `Stage ${paused.stage.nodeId} (run ${paused.stage.runId}) requires user action after recovery.`,
+          result: this.pausedResult(plan, await this.loadCompletedResults(executionId, plan), paused.stage.runId, paused.result),
+        });
+      }
+
+      const failFastFailure = this.concurrency.failurePolicy === 'fail_fast' && recovered.some(({ result }) => result.status === 'failure');
+      if (!failFastFailure) {
+        for (const item of assessment.restart) {
+          await this.patchStageRun(item.stage, { status: 'queued', upstreamRunIds: [], ...(item.freshRunId ? { runId: randomSessionId() } : {}) }, item.stage.version);
+        }
+      }
+
+      const latest = (await this.orchestrationStore.getExecution(executionId))!;
+      const result = await this.continueExecution(latest, parseRequest(latest.request), plan, runningSession);
+      const outcome: OrchestrationRecoveryOutcome = result.finalResult.status === 'success' ? 'completed' : result.finalResult.status === 'failure' ? 'failed' : 'blocked';
+      return report(outcome, { plans: assessment.plans, actions, reason: outcome === 'blocked' ? 'Orchestration execution paused for user action.' : summary, result });
+    } catch (error) {
+      const latest = await this.orchestrationStore.getExecution(executionId);
+      if (latest?.status === 'cancelled') return report('blocked', { plans: assessment.plans, actions, reason: `Orchestration execution ${executionId} was cancelled during recovery.` });
+      if (isOptimisticConflict(error)) return report('busy', { plans: assessment.plans, actions, reason: `Orchestration execution ${executionId} was modified concurrently during recovery: ${errorMessage(error)}` });
+      throw error;
+    }
+  }
+
+  /** Read-only classification of every stage. Never calls a model or mutates stores. */
+  private async assessRecovery(execution: OrchestrationExecution, plan: OrchestrationPlan, stages: OrchestrationStage[]): Promise<ExecutionRecoveryAssessment> {
+    const assessment: ExecutionRecoveryAssessment = { plans: [], reconcile: [], recover: [], restart: [], preserved: [], stageVersions: new Map(stages.map((stage) => [stage.nodeId, stage.version])) };
+    const byNode = new Map(stages.map((stage) => [stage.nodeId, stage]));
+    const nowMs = this.now().getTime();
+    const staleAfterMs = this.options.recoveryStaleAfterMs ?? DEFAULT_RECOVERY_STALE_AFTER_MS;
+    const executionActive = execution.status === 'routing' || execution.status === 'running';
+    const isRecent = (timestamp: string): boolean => executionActive && nowMs - Date.parse(timestamp) < staleAfterMs;
+    const changed = new Set<string>();
+
+    const planRecovery = async (stage: OrchestrationStage, revertStatus: OrchestrationStage['status']): Promise<string | undefined> => {
+      const runner = await this.getRunner(stage.agentId);
+      if (!runner.getRecoveryPlan || !runner.recoverRaw) return `Stage ${stage.nodeId} (agent "${stage.agentId}") runner does not support run recovery.`;
+      let runPlan: RunRecoveryPlan;
+      try {
+        runPlan = await runner.getRecoveryPlan(stage.runId);
+      } catch (error) {
+        return `Stage ${stage.nodeId} (run ${stage.runId}) has no recovery plan: ${errorMessage(error)}`;
+      }
+      assessment.plans.push(runPlan);
+      if (!runPlan.executable || !RECOVERABLE_RUN_ACTIONS.has(runPlan.action)) {
+        return `Stage ${stage.nodeId} (run ${stage.runId}) cannot be recovered automatically (${runPlan.action}): ${runPlan.reason}`;
+      }
+      assessment.recover.push({ stage, plan: runPlan, revertStatus });
+      return undefined;
+    };
+
+    for (const node of topologicalNodes(plan)) {
+      const stage = byNode.get(node.id);
+      if (!stage) {
+        assessment.blocked ??= `Orchestration execution ${execution.id} has no durable stage for plan node ${node.id}.`;
+        continue;
+      }
+      const upstreamChanged = node.dependsOn.some((dependency) => changed.has(dependency));
+      let blocked: string | undefined;
+      switch (stage.status) {
+        case 'queued':
+          changed.add(node.id);
+          break;
+        case 'succeeded':
+          if (upstreamChanged) {
+            assessment.restart.push({ stage, freshRunId: true });
+            changed.add(node.id);
+          } else {
+            assessment.preserved.push(node.id);
+          }
+          break;
+        case 'skipped':
+        case 'cancelled':
+          assessment.restart.push({ stage, freshRunId: true });
+          changed.add(node.id);
+          break;
+        case 'failed':
+        case 'paused': {
+          changed.add(node.id);
+          const runner = await this.getRunner(stage.agentId);
+          const run = (await runner.inspect(stage.runId)).run;
+          if (run && hasLiveLease(run, nowMs)) {
+            assessment.busy ??= `Stage ${node.id} run ${stage.runId} holds a live lease.`;
+            break;
+          }
+          if (stage.status === 'failed' && upstreamChanged) {
+            // Input changes do not grant permission to bypass user action or uncertain side effects.
+            if (!runner.getRecoveryPlan) {
+              blocked = `Stage ${node.id} runner does not support run recovery.`;
+              break;
+            }
+            const prior = await runner.getRecoveryPlan(stage.runId);
+            if (prior.action === 'requires_user_action' || prior.action === 'requires_reconciliation') {
+              assessment.plans.push(prior);
+              blocked = `Stage ${node.id} (run ${stage.runId}) cannot restart automatically (${prior.action}): ${prior.reason}`;
+              break;
+            }
+            // Its input is stale: restart with a fresh run instead of recovering the old one.
+            assessment.restart.push({ stage, freshRunId: true });
+            break;
+          }
+          blocked = await planRecovery(stage, stage.status);
+          break;
+        }
+        case 'running': {
+          const run = (await (await this.getRunner(stage.agentId)).inspect(stage.runId)).run;
+          if (run && hasLiveLease(run, nowMs)) {
+            assessment.busy ??= `Stage ${node.id} run ${stage.runId} holds a live lease.`;
+            break;
+          }
+          if (isRecent(stage.updatedAt)) {
+            assessment.busy ??= `Stage ${node.id} run ${stage.runId} is owned by an active scheduler.`;
+            break;
+          }
+          changed.add(node.id);
+          if (!run) {
+            // The stage was claimed but its run never started: restart it with its allocated run ID.
+            assessment.restart.push({ stage, freshRunId: false });
+          } else if (run.status === 'succeeded') {
+            assessment.reconcile.push({ stage, result: resultFromStoredRun(stage.runId, run)! });
+            changed.delete(node.id);
+          } else if (run.status === 'awaiting_approval' || run.status === 'clarification_requested') {
+            blocked = `Stage ${node.id} run ${stage.runId} is ${run.status}; user action is required.`;
+          } else {
+            blocked = await planRecovery(stage, run.status === 'failed' || run.status === 'cancelled' ? 'failed' : 'running');
+          }
+          break;
+        }
+      }
+      if (blocked) assessment.blocked ??= blocked;
+    }
+    if (!assessment.busy && executionActive) {
+      // A routing/running execution with recent activity is owned by a live scheduler or another recovery
+      // (recovery claims bump the execution), so do not plan duplicate continuation or finalizer work.
+      const lastActivity = Math.max(Date.parse(execution.updatedAt), ...stages.map((stage) => Date.parse(stage.updatedAt)));
+      if (nowMs - lastActivity < staleAfterMs) assessment.busy = `Orchestration execution ${execution.id} is ${execution.status} and recently active.`;
+    }
+    return assessment;
+  }
+
+  /** Persists a recovered run on its stage (including a continuation run ID) and in session run links. */
+  private async persistRecoveredStage(plan: OrchestrationPlan, node: OrchestrationPlanNode, claimed: OrchestrationStage, result: RunResult): Promise<OrchestrationStage> {
+    const status: OrchestrationStage['status'] = result.status === 'success' ? 'succeeded' : result.status === 'failure' ? 'failed' : 'paused';
+    const runId = result.runId;
+    const current = await this.requireStage(claimed.executionId, claimed.nodeId);
+    const execution = await this.orchestrationStore.getExecution(claimed.executionId);
+    if (execution?.status === 'cancelled' || current.status === 'cancelled') throw new Error(`Orchestration execution ${claimed.executionId} is cancelled.`);
+    const finished = await this.patchStageRun(current, { status, ...(runId !== current.runId ? { runId } : {}) }, current.version);
+    const runner = await this.getRunner(claimed.agentId);
+    const rootRunId = (await runner.inspect(runId)).run?.rootRunId ?? runId;
+    const now = this.now().toISOString();
+    const existing = await this.linkStore.getByRunId(runId);
+    if (existing && existing.sessionId === plan.sessionId && existing.nodeId === node.id) {
+      await this.linkStore.update({ ...existing, rootRunId, status, completedAt: status === 'paused' ? existing.completedAt : now });
+    } else {
+      const upstreamRunIds = finished.upstreamRunIds;
+      const metadata: JsonObject = { ...(node.metadata ?? {}), ...(runId !== claimed.runId ? { recoveredFromRunId: claimed.runId } : {}) };
+      await this.linkStore.append({ sessionId: plan.sessionId, nodeId: node.id, runId, rootRunId, stage: node.stage, agentId: claimed.agentId, requestedAgentId: plan.requestedAgentId, status, dependsOn: node.dependsOn, upstreamRunIds, metadata, createdAt: now, startedAt: now, ...(status === 'paused' ? {} : { completedAt: now }) });
+    }
+    this.emitLifecycle({ type: 'orchestration.stage.linked', sessionId: plan.sessionId, requestedAgentId: plan.requestedAgentId, nodeId: node.id, agentId: claimed.agentId, stage: node.stage, runId, rootRunId, status, createdAt: now });
+    return finished;
+  }
+
+  /** Updates a stage, including its run ID. Verifies stores that predate run ID patches did not drop it. */
+  private async patchStageRun(stage: OrchestrationStage, patch: OrchestrationStageRunPatch, expectedVersion: number): Promise<OrchestrationStage> {
+    const updated = await this.orchestrationStore.updateStage(stage.executionId, stage.nodeId, patch as Parameters<OrchestrationStore['updateStage']>[2], expectedVersion);
+    if (patch.runId && updated.runId !== patch.runId) {
+      throw new Error(`ORCHESTRATION_STORE_UNSUPPORTED: orchestration store did not persist run ID ${patch.runId} for stage ${stage.nodeId}.`);
+    }
+    return updated;
+  }
+
+  private async requireStage(executionId: string, nodeId: string): Promise<OrchestrationStage> {
+    const stage = (await this.orchestrationStore.listStages(executionId)).find((item) => item.nodeId === nodeId);
+    if (!stage) throw new Error(`Orchestration stage ${nodeId} not found.`);
+    return stage;
+  }
+
+  private async revertStageClaim(claimed: OrchestrationStage, status: OrchestrationStage['status']): Promise<void> {
+    try {
+      const current = await this.requireStage(claimed.executionId, claimed.nodeId);
+      if (current.version === claimed.version && current.status !== status) await this.orchestrationStore.updateStage(claimed.executionId, claimed.nodeId, { status }, current.version);
+    } catch (error) {
+      if (!isOptimisticConflict(error)) throw error;
+    }
+  }
+
+  private async releaseRecoveryClaim(executionId: string, status: OrchestrationExecution['status'], expectedVersion?: number): Promise<void> {
+    try {
+      const current = await this.orchestrationStore.getExecution(executionId);
+      if (!current || current.status === 'cancelled' || current.status === status) return;
+      if (expectedVersion !== undefined && current.version !== expectedVersion) return;
+      await this.orchestrationStore.updateExecution(executionId, { status }, current.version);
+    } catch (error) {
+      if (!isOptimisticConflict(error)) throw error;
+    }
+  }
+
+  private async completedResult(executionId: string, plan: OrchestrationPlan): Promise<OrchestratedRunResult | undefined> {
+    try {
+      const results = await this.loadCompletedResults(executionId, plan);
+      const finalResult = results.get(plan.finalNodeId)?.result ?? [...results.values()].at(-1)?.result;
+      return finalResult ? this.result(plan, results, finalResult) : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   private async execute(goal: string, options: OrchestratedRunOptions): Promise<OrchestratedRunResult> {
@@ -928,6 +1314,47 @@ function isPaused(result: RunResult): boolean {
   return result.status === 'approval_requested' || result.status === 'clarification_requested';
 }
 
+const TERMINAL_STAGE_RUN_STATUSES = new Set<string>(['succeeded', 'failed', 'cancelled', 'clarification_requested', 'replan_required']);
+
+function hasLiveLease(run: Partial<Pick<AgentRun, 'status' | 'leaseOwner' | 'leaseExpiresAt'>>, nowMs: number): boolean {
+  if (run.status && TERMINAL_STAGE_RUN_STATUSES.has(run.status)) return false;
+  if (run.leaseExpiresAt) return Date.parse(run.leaseExpiresAt) > nowMs;
+  return Boolean(run.leaseOwner);
+}
+
+function isOptimisticConflict(error: unknown): boolean {
+  return error instanceof OrchestrationOptimisticConcurrencyError
+    || (error instanceof Error && error.name === 'OrchestrationOptimisticConcurrencyError');
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function topologicalNodes(plan: OrchestrationPlan): OrchestrationPlanNode[] {
+  const ordered: OrchestrationPlanNode[] = [];
+  const placed = new Set<string>();
+  while (ordered.length < plan.nodes.length) {
+    const next = plan.nodes.filter((node) => !placed.has(node.id) && node.dependsOn.every((dependency) => placed.has(dependency)));
+    if (next.length === 0) throw new Error(`Orchestration plan ${plan.executionId ?? plan.sessionId} has a dependency cycle or unknown dependency.`);
+    for (const node of next) {
+      ordered.push(node);
+      placed.add(node.id);
+    }
+  }
+  return ordered;
+}
+
+function describeRecovery(assessment: ExecutionRecoveryAssessment): string {
+  const parts = [
+    assessment.recover.length > 0 ? `recover ${assessment.recover.map((item) => `${item.stage.nodeId} (${item.plan.action})`).join(', ')}` : undefined,
+    assessment.reconcile.length > 0 ? `reconcile ${assessment.reconcile.map((item) => item.stage.nodeId).join(', ')}` : undefined,
+    assessment.restart.length > 0 ? `restart ${assessment.restart.map((item) => item.stage.nodeId).join(', ')}` : undefined,
+    assessment.preserved.length > 0 ? `preserve ${assessment.preserved.join(', ')}` : undefined,
+  ].filter((part): part is string => Boolean(part));
+  return parts.length > 0 ? `Recovery plan: ${parts.join('; ')}.` : 'No stage requires recovery; the saved plan will be continued.';
+}
+
 function emptyUsage(): Extract<RunResult, { status: 'success' }>['usage'] {
   return { promptTokens: 0, completionTokens: 0, estimatedCostUSD: 0 };
 }
@@ -959,7 +1386,12 @@ class InMemoryOrchestrationSessionStore implements OrchestrationSessionStore {
 class InMemoryOrchestrationSessionRunLinkStore implements OrchestrationSessionRunLinkStore {
   private readonly links: OrchestrationSessionRunLinkRecord[] = [];
   async append(link: OrchestrationSessionRunLinkRecord): Promise<OrchestrationSessionRunLinkRecord> { this.links.push(link); return link; }
-  async update(link: OrchestrationSessionRunLinkRecord): Promise<OrchestrationSessionRunLinkRecord> { const index = this.links.findIndex((entry) => entry.sessionId === link.sessionId && entry.nodeId === link.nodeId); if (index >= 0) this.links[index] = link; return link; }
+  async update(link: OrchestrationSessionRunLinkRecord): Promise<OrchestrationSessionRunLinkRecord> {
+    const byRun = this.links.findIndex((entry) => entry.runId === link.runId);
+    const index = byRun >= 0 ? byRun : this.links.findIndex((entry) => entry.sessionId === link.sessionId && entry.nodeId === link.nodeId);
+    if (index >= 0) this.links[index] = link;
+    return link;
+  }
   async listBySession(sessionId: string): Promise<OrchestrationSessionRunLinkRecord[]> { return this.links.filter((link) => link.sessionId === sessionId); }
   async getByRunId(runId: string): Promise<OrchestrationSessionRunLinkRecord | undefined> { return this.links.find((link) => link.runId === runId); }
 }

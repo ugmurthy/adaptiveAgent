@@ -3,10 +3,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
-import { InMemoryOrchestrationStore, type RunResult } from '@adaptive-agent/core';
+import { InMemoryOrchestrationStore, type AgentRun, type JsonValue, type OrchestrationStage, type RunRecoveryPlan, type RunResult } from '@adaptive-agent/core';
 
 import type { AgentConfigFile, AgentSdkRunOptions, SupportedModality } from './index.js';
-import { buildOrchestrationPlan, createOrchestrationSdk, type AgentCatalogEntry, type OrchestrationAgentRunner, type OrchestrationLifecycleEvent } from './orchestration.js';
+import { buildOrchestrationPlan, createOrchestrationSdk, type AgentCatalogEntry, type OrchestrationAgentRunner, type OrchestrationLifecycleEvent, type OrchestrationSdkOptions } from './orchestration.js';
 
 describe('orchestration sdk', () => {
   it('builds a single-node plan when requested agent supports all modalities', () => {
@@ -710,6 +710,280 @@ describe('orchestration sdk', () => {
     }
   });
 });
+
+describe('orchestration execution recovery', () => {
+  it('recovers a failed stage, preserves successful siblings, and restarts skipped synthesis with fresh input', async () => {
+    const harness = recoveryHarness({ failFirstRunFor: ['image-analyst'] });
+    const sdk = await harness.sdk();
+    const failed = await sdk.run('compare the image and audio', { ...multimodalOptions(), executionId: 'exec-recover', sessionId: 'session-recover' });
+    expect(failed.finalResult.status).toBe('failure');
+    const before = stagesByNode(await harness.store.listStages('exec-recover'));
+    expect([before.image_specialist.status, before.audio_specialist.status, before.final_synthesis.status]).toEqual(['failed', 'succeeded', 'skipped']);
+
+    const recovered = await sdk.recoverExecution('exec-recover');
+
+    expect(recovered).toMatchObject({ executionId: 'exec-recover', sessionId: 'session-recover', outcome: 'completed' });
+    expect(recovered.plans).toEqual([expect.objectContaining({ runId: before.image_specialist.runId, action: 'continue_new_run' })]);
+    expect(recovered.actions).toHaveLength(1);
+    expect(recovered.result?.finalResult.status).toBe('success');
+    const after = stagesByNode(await harness.store.listStages('exec-recover'));
+    const continuationRunId = `${before.image_specialist.runId}-continuation`;
+    expect(after.image_specialist).toMatchObject({ status: 'succeeded', runId: continuationRunId });
+    expect(after.audio_specialist).toMatchObject({ status: 'succeeded', runId: before.audio_specialist.runId, version: before.audio_specialist.version });
+    expect(after.final_synthesis.status).toBe('succeeded');
+    expect(after.final_synthesis.runId).not.toBe(before.final_synthesis.runId);
+    expect(after.final_synthesis.upstreamRunIds.sort()).toEqual([before.audio_specialist.runId, continuationRunId].sort());
+    expect(harness.calls.filter((call) => call.agentId === 'audio-analyst' && call.kind === 'run')).toHaveLength(1);
+    expect(harness.calls.filter((call) => call.kind === 'recover')).toEqual([{ agentId: 'image-analyst', kind: 'recover', runId: before.image_specialist.runId }]);
+    const synthesisCall = harness.runCalls.find((call) => call.agentId === 'general')!;
+    expect(synthesisCall.options.runId).toBe(after.final_synthesis.runId);
+    expect((synthesisCall.options.input as { upstreamResults: Record<string, unknown> }).upstreamResults.image_specialist).toEqual({ agentId: 'image-analyst', runId: continuationRunId });
+    expect((await harness.store.getExecution('exec-recover'))?.status).toBe('succeeded');
+    const links = (await sdk.inspectSession('session-recover')).links;
+    expect(links).toContainEqual(expect.objectContaining({ nodeId: 'image_specialist', runId: continuationRunId, status: 'succeeded', metadata: expect.objectContaining({ recoveredFromRunId: before.image_specialist.runId }) }));
+    expect(links).toContainEqual(expect.objectContaining({ nodeId: 'final_synthesis', runId: after.final_synthesis.runId, status: 'succeeded' }));
+
+    const noOp = await sdk.recoverExecution('exec-recover');
+    expect(noOp).toMatchObject({ outcome: 'completed', plans: [], actions: [] });
+    expect(noOp.result?.finalResult).toMatchObject({ status: 'success', runId: after.final_synthesis.runId });
+    expect(harness.calls.filter((call) => call.kind === 'recover')).toHaveLength(1);
+  });
+
+  it('keeps continuation stage identity across SDK restarts without recovering twice', async () => {
+    const harness = recoveryHarness({ failFirstRunFor: ['image-analyst'] });
+    await (await harness.sdk()).run('analyze image', { images: [{ path: '/tmp/image.png' }], executionId: 'exec-restart' });
+    const original = stagesByNode(await harness.store.listStages('exec-restart'));
+
+    expect((await (await harness.sdk()).recoverExecution('exec-restart')).outcome).toBe('completed');
+    const restarted = await harness.sdk();
+    const inspection = await restarted.inspectExecution('exec-restart');
+    const stages = stagesByNode(inspection.stages);
+    expect(stages.image_specialist.runId).toBe(`${original.image_specialist.runId}-continuation`);
+
+    const again = await restarted.recoverExecution('exec-restart');
+    expect(again).toMatchObject({ outcome: 'completed', actions: [] });
+    expect(again.result?.stages.find((stage) => stage.nodeId === 'image_specialist')).toMatchObject({ runId: stages.image_specialist.runId, result: { status: 'success' } });
+    expect(stagesByNode(await harness.store.listStages('exec-restart'))).toEqual(stages);
+    expect(harness.calls.filter((call) => call.kind === 'recover')).toHaveLength(1);
+  });
+
+  it('restarts a downstream synthesis that already consumed a failed upstream result instead of recovering it', async () => {
+    const harness = recoveryHarness({ failFirstRunFor: ['image-analyst', 'general'], failurePolicy: 'wait_for_all' });
+    const sdk = await harness.sdk();
+    const failed = await sdk.run('compare the image and audio', { ...multimodalOptions(), executionId: 'exec-downstream' });
+    expect(failed.finalResult.status).toBe('failure');
+    const before = stagesByNode(await harness.store.listStages('exec-downstream'));
+    expect([before.image_specialist.status, before.audio_specialist.status, before.final_synthesis.status]).toEqual(['failed', 'succeeded', 'failed']);
+
+    const recovered = await sdk.recoverExecution('exec-downstream');
+
+    expect(recovered.outcome).toBe('completed');
+    expect(recovered.plans.map((plan) => plan.runId)).toEqual([before.image_specialist.runId]);
+    expect(harness.calls.filter((call) => call.kind === 'recover').map((call) => call.agentId)).toEqual(['image-analyst']);
+    const after = stagesByNode(await harness.store.listStages('exec-downstream'));
+    expect(after.final_synthesis.status).toBe('succeeded');
+    expect(after.final_synthesis.runId).not.toBe(before.final_synthesis.runId);
+    expect(after.audio_specialist.runId).toBe(before.audio_specialist.runId);
+    expect(harness.runCalls.filter((call) => call.agentId === 'general').map((call) => call.options.runId)).toEqual([before.final_synthesis.runId, after.final_synthesis.runId]);
+    expect(recovered.result?.finalResult.runId).toBe(after.final_synthesis.runId);
+  });
+
+  it('plans without model calls or store mutations in dry run', async () => {
+    const harness = recoveryHarness({ failFirstRunFor: ['image-analyst'] });
+    const sdk = await harness.sdk();
+    await sdk.run('compare the image and audio', { ...multimodalOptions(), executionId: 'exec-dry' });
+    const execution = await harness.store.getExecution('exec-dry');
+    const stages = await harness.store.listStages('exec-dry');
+    const callsBefore = harness.calls.length;
+
+    const planned = await sdk.recoverExecution('exec-dry', { dryRun: true });
+
+    expect(planned).toMatchObject({ outcome: 'planned', actions: [] });
+    expect(planned.plans).toEqual([expect.objectContaining({ action: 'continue_new_run', executable: true })]);
+    expect(planned.reason).toContain('restart final_synthesis');
+    expect(planned.reason).toContain('preserve audio_specialist');
+    expect(harness.calls.slice(callsBefore).every((call) => call.kind === 'plan')).toBe(true);
+    expect(await harness.store.getExecution('exec-dry')).toEqual(execution);
+    expect(await harness.store.listStages('exec-dry')).toEqual(stages);
+  });
+
+  it.each(['requires_user_action', 'requires_reconciliation'] as const)('does not bypass %s when a failed downstream input would change', async (action) => {
+    const harness = recoveryHarness({ failFirstRunFor: ['image-analyst', 'general'], failurePolicy: 'wait_for_all' });
+    const sdk = await harness.sdk();
+    await sdk.run('compare the image and audio', { ...multimodalOptions(), executionId: 'exec-protected-downstream' });
+    const stages = await harness.store.listStages('exec-protected-downstream');
+    const synthesis = stagesByNode(stages).final_synthesis;
+    harness.planOverrides.set(synthesis.runId, { action, executable: false, reason: 'explicit resolution required' });
+    expect(await sdk.recoverExecution('exec-protected-downstream')).toMatchObject({ outcome: 'blocked', reason: expect.stringContaining(action), actions: [] });
+    expect(await harness.store.listStages('exec-protected-downstream')).toEqual(stages);
+    expect(harness.calls.filter((call) => call.kind === 'recover')).toHaveLength(0);
+    expect(harness.runCalls.filter((call) => call.agentId === 'general')).toHaveLength(1);
+  });
+
+  it('reports a recovered stage that fails again without looping into another recovery', async () => {
+    const harness = recoveryHarness({ failFirstRunFor: ['image-analyst'], recoveryFails: true });
+    const sdk = await harness.sdk();
+    await sdk.run('analyze image', { images: [{ path: '/tmp/image.png' }], executionId: 'exec-fails-again' });
+
+    const recovered = await sdk.recoverExecution('exec-fails-again');
+
+    expect(recovered.outcome).toBe('failed');
+    expect(recovered.actions).toHaveLength(1);
+    expect(harness.calls.filter((call) => call.kind === 'recover')).toHaveLength(1);
+    expect(harness.runCalls.filter((call) => call.agentId === 'general')).toHaveLength(0);
+    expect((await harness.store.getExecution('exec-fails-again'))?.status).toBe('failed');
+    expect(stagesByNode(await harness.store.listStages('exec-fails-again')).final_synthesis.status).toBe('skipped');
+  });
+
+  it('blocks cancelled executions, catalog drift, user action, reconciliation, and runners without recovery', async () => {
+    const harness = recoveryHarness({ failFirstRunFor: ['image-analyst'] });
+    const sdk = await harness.sdk();
+    await sdk.run('analyze image', { images: [{ path: '/tmp/image.png' }], executionId: 'exec-blocked' });
+    const imageRunId = stagesByNode(await harness.store.listStages('exec-blocked')).image_specialist.runId;
+
+    harness.planOverrides.set(imageRunId, { action: 'requires_reconciliation', executable: false, reason: 'tool side effect is uncertain' });
+    expect(await sdk.recoverExecution('exec-blocked')).toMatchObject({ outcome: 'blocked', reason: expect.stringContaining('requires_reconciliation') });
+    harness.planOverrides.set(imageRunId, { action: 'requires_user_action', executable: false, reason: 'approval required' });
+    expect(await sdk.recoverExecution('exec-blocked')).toMatchObject({ outcome: 'blocked', reason: expect.stringContaining('approval required') });
+    harness.planOverrides.delete(imageRunId);
+
+    const drifted = await createOrchestrationSdk({ ...harness.options, agentCatalog: [...harness.options.agentCatalog, { agentId: 'extra', agentConfig: agent('extra', ['text']) }] });
+    expect(await drifted.recoverExecution('exec-blocked')).toMatchObject({ outcome: 'blocked', reason: expect.stringContaining('CATALOG_CHANGED') });
+
+    const legacy = await createOrchestrationSdk({ ...harness.options, agentRunnerFactory: async (agentId: string) => ({ ...harness.runner(agentId), getRecoveryPlan: undefined, recoverRaw: undefined }) });
+    expect(await legacy.recoverExecution('exec-blocked')).toMatchObject({ outcome: 'blocked', reason: expect.stringContaining('does not support run recovery') });
+
+    const failedExecution = (await harness.store.getExecution('exec-blocked'))!;
+    await harness.store.updateExecution('exec-blocked', { status: 'cancelled' }, failedExecution.version);
+    expect(await sdk.recoverExecution('exec-blocked')).toMatchObject({ outcome: 'blocked', reason: expect.stringContaining('cancelled') });
+    expect(harness.calls.filter((call) => call.kind === 'recover')).toHaveLength(0);
+  });
+
+  it('reports busy for live leases and recently active schedulers', async () => {
+    const harness = recoveryHarness({});
+    const store = harness.store;
+    const stageRunId = crypto.randomUUID();
+    const fingerprint = await catalogFingerprintForHarness();
+    await store.createExecution({ id: 'exec-busy', status: 'running', request: { goal: 'answer', options: {} }, catalogFingerprint: fingerprint, plan: singlePlan('session-busy', fingerprint), stages: [{ runId: stageRunId, nodeId: 'requested', agentId: 'general' }] });
+    const claimed = await store.claimReadyStage('exec-busy');
+    expect(claimed?.runId).toBe(stageRunId);
+    harness.runs.set(stageRunId, { status: 'running', leaseOwner: 'other-process', leaseExpiresAt: new Date(Date.now() + 60_000).toISOString() });
+
+    const sdk = await harness.sdk();
+    expect(await sdk.recoverExecution('exec-busy')).toMatchObject({ outcome: 'busy', reason: expect.stringContaining('live lease') });
+    harness.runs.set(stageRunId, { status: 'running', leaseOwner: 'other-process', leaseExpiresAt: new Date(Date.now() - 1_000).toISOString() });
+    const recent = await harness.sdk();
+    expect(await recent.recoverExecution('exec-busy')).toMatchObject({ outcome: 'busy', reason: expect.stringContaining('active scheduler') });
+    expect(harness.calls.filter((call) => call.kind === 'recover' || call.kind === 'run')).toHaveLength(0);
+    expect((await store.listStages('exec-busy'))[0]).toMatchObject({ status: 'running', version: claimed!.version });
+
+    // Once stale, the expired-lease run is resumed through run-level recovery exactly once.
+    const stale = await harness.sdk({ recoveryStaleAfterMs: 0 });
+    const recovered = await stale.recoverExecution('exec-busy');
+    expect(recovered).toMatchObject({ outcome: 'completed', plans: [expect.objectContaining({ action: 'resume_same_run' })] });
+    expect((await store.listStages('exec-busy'))[0]).toMatchObject({ status: 'succeeded', runId: stageRunId });
+  });
+
+  it('lets only one of two overlapping recoveries run continuation and synthesis work', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const harness = recoveryHarness({ failFirstRunFor: ['image-analyst'], recoveryGate: gate });
+    await (await harness.sdk()).run('analyze image', { images: [{ path: '/tmp/image.png' }], executionId: 'exec-overlap' });
+    const first = await harness.sdk();
+    const second = await harness.sdk();
+
+    const inFlight = first.recoverExecution('exec-overlap');
+    const sameProcess = first.recoverExecution('exec-overlap');
+    const otherProcess = second.recoverExecution('exec-overlap');
+    expect(await sameProcess).toMatchObject({ outcome: 'busy' });
+    expect(await otherProcess).toMatchObject({ outcome: 'busy' });
+    release();
+    expect((await inFlight).outcome).toBe('completed');
+    expect(harness.calls.filter((call) => call.kind === 'recover')).toHaveLength(1);
+    expect(harness.runCalls.filter((call) => call.agentId === 'general')).toHaveLength(1);
+  });
+});
+
+type HarnessRun = { status: AgentRun['status']; result?: JsonValue; errorMessage?: string; leaseOwner?: string; leaseExpiresAt?: string };
+
+function recoveryHarness(config: { failFirstRunFor?: string[]; failurePolicy?: 'fail_fast' | 'wait_for_all'; recoveryFails?: boolean; recoveryGate?: Promise<void> }) {
+  const store = new InMemoryOrchestrationStore();
+  const runs = new Map<string, HarnessRun>();
+  const calls: Array<{ agentId: string; kind: 'run' | 'plan' | 'recover'; runId: string }> = [];
+  const runCalls: Array<{ agentId: string; options: AgentSdkRunOptions }> = [];
+  const planOverrides = new Map<string, Pick<RunRecoveryPlan, 'action' | 'executable' | 'reason'>>();
+  const failed = new Set<string>();
+  const usage = success('usage').usage;
+  const runner = (agentId: string): OrchestrationAgentRunner => ({
+    async runRaw(_goal, options = {}) {
+      const runId = options.runId!;
+      calls.push({ agentId, kind: 'run', runId });
+      runCalls.push({ agentId, options });
+      if (config.failFirstRunFor?.includes(agentId) && !failed.has(agentId)) {
+        failed.add(agentId);
+        runs.set(runId, { status: 'failed', errorMessage: `${agentId} provider outage` });
+        return { status: 'failure', runId, error: `${agentId} provider outage`, code: 'MODEL_ERROR', stepsUsed: 0, usage };
+      }
+      const output = { agentId, runId };
+      runs.set(runId, { status: 'succeeded', result: output });
+      return { ...success(runId), output };
+    },
+    async getRecoveryPlan(runId) {
+      calls.push({ agentId, kind: 'plan', runId });
+      const run = runs.get(runId);
+      if (!run) throw new Error(`Run ${runId} does not exist`);
+      const override = planOverrides.get(runId);
+      if (override) return { runId, status: run.status, ...override };
+      if (run.status === 'failed') return { runId, status: run.status, action: 'continue_new_run', executable: true, reason: 'continuable after provider outage' };
+      if (run.status === 'running' || run.status === 'interrupted') return { runId, status: run.status, action: 'resume_same_run', executable: true, reason: 'resume from snapshot' };
+      return { runId, status: run.status, action: 'not_recoverable', executable: false, reason: `run is ${run.status}` };
+    },
+    async recoverRaw(options) {
+      calls.push({ agentId, kind: 'recover', runId: options.runId });
+      const plan = await this.getRecoveryPlan!(options.runId);
+      await config.recoveryGate;
+      const runId = plan.action === 'continue_new_run' ? `${options.runId}-continuation` : options.runId;
+      if (config.recoveryFails) {
+        runs.set(runId, { status: 'failed', errorMessage: 'still failing' });
+        return { runId: options.runId, action: plan.action, plan, result: { status: 'failure', runId, error: 'still failing', code: 'MODEL_ERROR', stepsUsed: 0, usage } };
+      }
+      const output = { agentId, runId };
+      runs.set(runId, { status: 'succeeded', result: output });
+      return { runId: options.runId, action: plan.action, plan, result: { ...success(runId), output } };
+    },
+    async interrupt() {},
+    async inspect(runId) {
+      const run = runs.get(runId);
+      return { run: run ? { rootRunId: runId, id: runId, status: run.status, result: run.result, errorMessage: run.errorMessage, usage, leaseOwner: run.leaseOwner, leaseExpiresAt: run.leaseExpiresAt } : null };
+    },
+  });
+  const options = {
+    agentCatalog: [
+      { agentId: 'general', agentConfig: agent('general', ['text']) },
+      { agentId: 'image-analyst', agentConfig: agent('image-analyst', ['text', 'image'], ['image']) },
+      { agentId: 'audio-analyst', agentConfig: agent('audio-analyst', ['text', 'audio'], ['audio']) },
+    ],
+    requestedAgentConfig: agent('general', ['text']),
+    orchestrationStore: store,
+    concurrency: { failurePolicy: config.failurePolicy ?? 'fail_fast' },
+    agentRunnerFactory: async (agentId: string) => runner(agentId),
+  };
+  return { store, runs, calls, runCalls, planOverrides, options, runner, sdk: (overrides: Partial<OrchestrationSdkOptions> = {}) => createOrchestrationSdk({ ...options, ...overrides }) };
+}
+
+async function catalogFingerprintForHarness(): Promise<string> {
+  const probe = recoveryHarness({});
+  return (await (await probe.sdk()).run('probe', { executionId: 'probe' })).plan.catalogFingerprint;
+}
+
+function singlePlan(sessionId: string, catalogFingerprint: string): JsonValue {
+  const catalog = catalogFor([agent('general', ['text']), agent('image-analyst', ['text', 'image'], ['image']), agent('audio-analyst', ['text', 'audio'], ['audio'])]);
+  return JSON.parse(JSON.stringify(buildOrchestrationPlan({ sessionId, requestedAgentId: 'general', goal: 'answer', options: {}, catalog, catalogFingerprint, finalizeWithRequestedAgent: true }))) as JsonValue;
+}
+
+function stagesByNode(stages: OrchestrationStage[]): Record<string, OrchestrationStage> {
+  return Object.fromEntries(stages.map((stage) => [stage.nodeId, stage]));
+}
 
 function agent(id: string, modalitiesSupported: SupportedModality[], modalitiesPreferred: SupportedModality[] = [], subjectsPreferred: string[] = [], keywords: string[] = []): AgentConfigFile {
   return {

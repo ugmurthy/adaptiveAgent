@@ -3,6 +3,8 @@ import type {
   AgentRun,
   JsonValue,
   OrchestrationMetadata,
+  RecoverRunResult,
+  RunRecoveryPlan,
   RunResult,
   RunStatus,
   RunStore,
@@ -30,6 +32,56 @@ export interface SwarmCoordinatorOptions {
   synthesizerAgentId?: string;
   defaultMaxWorkers?: number;
 }
+
+export interface SwarmRecoveryRequest {
+  sessionId: string;
+  /** Select a swarm when the session contains several coordinator executions. */
+  coordinatorRunId?: UUID;
+  /** Inspect and plan only. No run, lease, or metadata is mutated. */
+  dryRun?: boolean;
+  /** Explicit approval forwarded to core run recovery (for example continuation approval). Never approves pending tool calls. */
+  requireApproval?: boolean;
+}
+
+export type SwarmRecoveryOutcome = 'planned' | 'completed' | 'failed' | 'blocked' | 'busy';
+
+export interface SwarmRecoveryResult {
+  sessionId: string;
+  coordinatorRunId: UUID;
+  outcome: SwarmRecoveryOutcome;
+  /** Core recovery plans inspected for the current head run of each unfinished logical role. */
+  plans: RunRecoveryPlan[];
+  /** Core recovery actions executed (at most one per logical worker or finalizer). */
+  actions: RecoverRunResult[];
+  reason?: string;
+  result?: SwarmRunResult;
+  /** Fresh runs started during recovery: missing worker runs from the persisted descriptor, regenerated quality/synthesizer runs. */
+  startedRunIds?: UUID[];
+  /** Subtasks from the persisted descriptor that have no worker run yet. */
+  missingWorkerSubtaskIds?: string[];
+}
+
+interface SwarmRecoveryContext {
+  sessionId: string;
+  coordinatorRunId: UUID;
+  dryRun: boolean;
+  requireApproval?: boolean;
+  owner?: string;
+  leaseHeld: boolean;
+  plans: RunRecoveryPlan[];
+  actions: RecoverRunResult[];
+  startedRunIds: UUID[];
+  missingWorkerSubtaskIds: string[];
+}
+
+interface SwarmRoleHeads {
+  coordinator: AgentRun[];
+  workers: Map<string, AgentRun>;
+  quality?: AgentRun;
+  synthesizer?: AgentRun;
+}
+
+const COORDINATOR_LEASE_TTL_MS = 10 * 60 * 1000;
 
 export class SwarmCoordinator {
   constructor(private readonly options: SwarmCoordinatorOptions) {}
@@ -337,6 +389,644 @@ export class SwarmCoordinator {
     }
   }
 
+  /**
+   * General swarm session recovery.
+   *
+   * Selects the current head run of each unfinished logical role (following continuation and
+   * supersession lineage), asks the owning agent for its core recovery plan, and executes at most
+   * one core recovery per logical worker. Completed workers are preserved. Quality and synthesis
+   * are recovered in place when their inputs are unchanged and regenerated when upstream worker
+   * outputs changed. Never approves pending tool calls or clarifications.
+   */
+  async recoverSession(request: SwarmRecoveryRequest): Promise<SwarmRecoveryResult> {
+    if (!this.options.runStore.listBySession) {
+      throw new Error('Run store does not support session lookup; cannot recover a swarm session');
+    }
+
+    const sessionRuns = await this.options.runStore.listBySession(request.sessionId);
+    if (sessionRuns.length === 0) {
+      throw new Error(`Session ${request.sessionId} has no runs`);
+    }
+    const swarmRuns = sessionRuns.filter((run) => readOrchestrationMetadata(run) !== undefined);
+    if (swarmRuns.length === 0) {
+      throw new Error(`Session ${request.sessionId} is not a swarm session`);
+    }
+    const coordinatorRunIds = unique(swarmRuns.map((run) => logicalCoordinatorRunId(run, swarmRuns)).filter(isNonEmptyString))
+      .filter((id) => !request.coordinatorRunId || id === request.coordinatorRunId);
+    if (coordinatorRunIds.length !== 1) {
+      throw new Error(`Session ${request.sessionId} contains ${coordinatorRunIds.length} swarm coordinator runs; recovery requires exactly one`);
+    }
+
+    const ctx: SwarmRecoveryContext = {
+      sessionId: request.sessionId,
+      coordinatorRunId: coordinatorRunIds[0],
+      dryRun: request.dryRun === true,
+      requireApproval: request.requireApproval,
+      leaseHeld: false,
+      plans: [],
+      actions: [],
+      startedRunIds: [],
+      missingWorkerSubtaskIds: [],
+    };
+
+    const coordinatorRun = await this.options.runStore.getRun(ctx.coordinatorRunId);
+    if (!coordinatorRun) {
+      return this.recoveryResult(ctx, 'blocked', { reason: `Swarm coordinator run ${ctx.coordinatorRunId} does not exist` });
+    }
+
+    if (ctx.dryRun) {
+      if (hasLiveLease(coordinatorRun, new Date())) {
+        return this.recoveryResult(ctx, 'busy', { reason: leaseReason(coordinatorRun) });
+      }
+      return this.recoverSessionInternal(ctx);
+    }
+
+    ctx.owner = `swarm-recovery:${ctx.coordinatorRunId}:${crypto.randomUUID()}`;
+    if (!(await this.acquireRecoveryLease(ctx))) {
+      const current = await this.options.runStore.getRun(ctx.coordinatorRunId);
+      return this.recoveryResult(ctx, 'busy', { reason: current ? leaseReason(current) : `Swarm coordinator run ${ctx.coordinatorRunId} is already leased` });
+    }
+    try {
+      return await this.recoverSessionInternal(ctx);
+    } finally {
+      await this.releaseRecoveryLease(ctx);
+    }
+  }
+
+  private async recoverSessionInternal(ctx: SwarmRecoveryContext): Promise<SwarmRecoveryResult> {
+    const coordinatorRun = await this.options.runStore.getRun(ctx.coordinatorRunId);
+    if (!coordinatorRun) {
+      return this.recoveryResult(ctx, 'blocked', { reason: `Swarm coordinator run ${ctx.coordinatorRunId} does not exist` });
+    }
+
+    const descriptor = readSwarmExecutionDescriptor(coordinatorRun);
+    if (!descriptor) {
+      if (coordinatorRun.metadata?.swarmExecution !== undefined) {
+        return this.recoveryResult(ctx, 'blocked', {
+          reason: `Swarm coordinator run ${ctx.coordinatorRunId} has an unsupported or incompatible swarmExecution descriptor`,
+        });
+      }
+      return this.recoverDecomposition(ctx, coordinatorRun);
+    }
+    if (descriptor.coordinatorRunId !== ctx.coordinatorRunId || descriptor.sessionId !== ctx.sessionId) {
+      return this.recoveryResult(ctx, 'blocked', {
+        reason: `Swarm execution descriptor identity (${descriptor.sessionId}/${descriptor.coordinatorRunId}) does not match session ${ctx.sessionId} coordinator ${ctx.coordinatorRunId}`,
+      });
+    }
+    return this.recoverExecution(ctx, coordinatorRun, descriptor);
+  }
+
+  private async recoverDecomposition(ctx: SwarmRecoveryContext, coordinatorRun: AgentRun): Promise<SwarmRecoveryResult> {
+    if (coordinatorRun.context?.phase === 'swarm.execute') {
+      return this.recoveryResult(ctx, 'blocked', {
+        reason: `Swarm coordinator run ${ctx.coordinatorRunId} was created for prepared execution but has no persisted descriptor; subtasks cannot be reconstructed`,
+      });
+    }
+
+    const heads = await this.loadRoleHeads(ctx);
+    const head = selectLineageHead(heads.coordinator) ?? coordinatorRun;
+    const busy = await this.liveLeaseReason(head, new Date(), ctx.owner);
+    if (busy) return this.recoveryResult(ctx, 'busy', { reason: busy });
+
+    if (head.errorCode === 'INVALID_DECOMPOSITION') {
+      return this.recoveryResult(ctx, 'blocked', {
+        reason: `Swarm decomposition run ${head.id} produced an invalid decomposition; regeneration is required: ${head.errorMessage ?? 'invalid subtasks'}`,
+        result: readStoredSwarmResult(coordinatorRun),
+      });
+    }
+
+    if (head.status === 'succeeded') {
+      return this.executeRecoveredDecomposition(ctx, coordinatorRun, head, head.result);
+    }
+
+    let plan: RunRecoveryPlan;
+    try {
+      plan = await this.options.coordinatorAgent.getRecoveryPlan(head.id);
+    } catch (error) {
+      return this.recoveryResult(ctx, 'blocked', { reason: `Cannot plan recovery for decomposition run ${head.id}: ${errorMessage(error)}` });
+    }
+    ctx.plans.push(plan);
+
+    if (head.status === 'cancelled' || head.status === 'replan_required') {
+      return this.recoveryResult(ctx, 'blocked', { reason: `Swarm decomposition run ${head.id} is ${head.status}; automatic recovery will not override it` });
+    }
+    if (!plan.executable) {
+      const terminalFailure = head.status === 'failed' && plan.action === 'not_recoverable';
+      return this.recoveryResult(ctx, terminalFailure ? 'failed' : 'blocked', {
+        reason: plan.reason,
+        result: readStoredSwarmResult(coordinatorRun),
+      });
+    }
+    if (ctx.dryRun) {
+      return this.recoveryResult(ctx, 'planned', {
+        reason: `Decomposition run ${head.id} would be recovered with ${plan.action}; swarm execution would follow from its output`,
+      });
+    }
+
+    // The coordinator agent acquires its own lease on the decomposition run. Never hold the
+    // swarm recovery lease on that same run while it executes.
+    await this.releaseRecoveryLease(ctx);
+    let action: RecoverRunResult;
+    try {
+      action = await this.options.coordinatorAgent.recover({ runId: head.id, requireApproval: ctx.requireApproval });
+    } catch (error) {
+      return this.recoveryResult(ctx, 'failed', { reason: `Decomposition recovery for run ${head.id} failed: ${errorMessage(error)}` });
+    }
+    ctx.actions.push(action);
+    if (!(await this.acquireRecoveryLease(ctx))) {
+      return this.recoveryResult(ctx, 'busy', { reason: `Swarm coordinator run ${ctx.coordinatorRunId} was leased by another owner after decomposition recovery` });
+    }
+
+    const recovered = action.result;
+    if (!recovered) {
+      return this.recoveryResult(ctx, 'failed', { reason: `Decomposition recovery for run ${head.id} produced no result` });
+    }
+    if (recovered.status === 'approval_requested' || recovered.status === 'clarification_requested') {
+      return this.recoveryResult(ctx, 'blocked', { reason: `Decomposition run ${recovered.runId} is waiting for user action: ${recovered.message}` });
+    }
+    if (recovered.status === 'failure') {
+      const result = await this.finalizeCoordinator({
+        sessionId: ctx.sessionId,
+        coordinatorRunId: ctx.coordinatorRunId,
+        subtaskResults: [],
+        status: 'failed',
+        errorCode: recovered.code,
+        errorMessage: recovered.error,
+      });
+      return this.recoveryResult(ctx, 'failed', { reason: recovered.error, result });
+    }
+
+    const recoveredRun = await this.options.runStore.getRun(recovered.runId);
+    if (recoveredRun && recoveredRun.id !== ctx.coordinatorRunId) {
+      // A continuation copies the source orchestration metadata; bind it to the logical coordinator.
+      await this.patchRunMetadata(recoveredRun.id, {
+        orchestration: {
+          ...(readOrchestrationMetadata(recoveredRun) ?? {}),
+          ...orchestrationMetadata(ctx.coordinatorRunId, 'coordinator', undefined, this.options.coordinatorAgentId, undefined, head.id),
+        } as unknown as JsonValue,
+      });
+    }
+    const latestCoordinator = await this.options.runStore.getRun(ctx.coordinatorRunId) ?? coordinatorRun;
+    return this.executeRecoveredDecomposition(ctx, latestCoordinator, recoveredRun ?? head, recovered.output);
+  }
+
+  private async executeRecoveredDecomposition(
+    ctx: SwarmRecoveryContext,
+    coordinatorRun: AgentRun,
+    decompositionRun: AgentRun,
+    output: JsonValue | undefined,
+  ): Promise<SwarmRecoveryResult> {
+    if (isFinalizedSwarmResult(output)) {
+      return this.recoveryResult(ctx, 'blocked', {
+        reason: `Swarm coordinator run ${ctx.coordinatorRunId} has a finalized result but no execution descriptor; persisted data is incompatible`,
+      });
+    }
+    let subtasks: SwarmSubtask[];
+    try {
+      subtasks = normalizeSubtasks(output ?? null);
+    } catch (error) {
+      if (ctx.dryRun || ctx.actions.length === 0) {
+        return this.recoveryResult(ctx, 'blocked', { reason: `Decomposition run ${decompositionRun.id} output is invalid; regeneration is required: ${errorMessage(error)}` });
+      }
+      const result = await this.finalizeCoordinator({
+        sessionId: ctx.sessionId,
+        coordinatorRunId: ctx.coordinatorRunId,
+        subtaskResults: [],
+        status: 'failed',
+        errorCode: 'INVALID_DECOMPOSITION',
+        errorMessage: errorMessage(error),
+      });
+      return this.recoveryResult(ctx, 'failed', { reason: errorMessage(error), result });
+    }
+    const validation = validateSubtasks(subtasks, Object.keys(this.options.workerAgents), this.options.defaultWorkerAgentId);
+    if (!validation.valid) {
+      return this.recoveryResult(ctx, 'blocked', { reason: `Decomposition run ${decompositionRun.id} cannot execute with configured workers: ${validation.message}` });
+    }
+    if (ctx.dryRun) {
+      return this.recoveryResult(ctx, 'planned', {
+        reason: `Decomposition run ${decompositionRun.id} completed; swarm execution of ${subtasks.length} subtask(s) would start`,
+      });
+    }
+
+    const result = await this.execute({
+      sessionId: ctx.sessionId,
+      coordinatorRunId: ctx.coordinatorRunId,
+      topLevelObjective: readTopLevelObjective(coordinatorRun),
+      input: readDecompositionInput(coordinatorRun),
+      executionContext: coordinatorRun.executionContext,
+      subtasks,
+    });
+    return this.recoveryResult(ctx, outcomeForSwarmResult(result), { result, reason: result.errorMessage });
+  }
+
+  private async recoverExecution(
+    ctx: SwarmRecoveryContext,
+    coordinatorRun: AgentRun,
+    descriptor: SwarmExecutionDescriptor,
+  ): Promise<SwarmRecoveryResult> {
+    let heads = await this.loadRoleHeads(ctx);
+    const now = new Date();
+    for (const run of [...heads.workers.values(), heads.quality, heads.synthesizer]) {
+      if (!run) continue;
+      const busy = await this.liveLeaseReason(run, now, ctx.owner);
+      if (busy) return this.recoveryResult(ctx, 'busy', { reason: busy });
+    }
+    for (const run of [coordinatorRun, heads.quality, heads.synthesizer]) {
+      if (run && ['cancelled', 'replan_required', 'awaiting_approval', 'clarification_requested'].includes(run.status)) {
+        return this.recoveryResult(ctx, 'blocked', { reason: `Run ${run.id} is ${run.status}; automatic recovery will not override it` });
+      }
+    }
+    for (const [run, agent] of [[heads.quality, this.options.qualityAgent], [heads.synthesizer, this.options.synthesizerAgent]] as const) {
+      if (run?.status === 'failed' && agent) {
+        const plan = await agent.getRecoveryPlan(run.id);
+        if (plan.action === 'requires_user_action' || plan.action === 'requires_reconciliation') {
+          ctx.plans.push(plan);
+          return this.recoveryResult(ctx, 'blocked', { reason: plan.reason });
+        }
+      }
+    }
+
+    const blockers: string[] = [];
+    const workItems: Array<{ subtask: SwarmSubtask; agent: AdaptiveAgent; run: AgentRun; plan: RunRecoveryPlan }> = [];
+    const missing: Array<{ subtask: SwarmSubtask }> = [];
+    for (const subtask of descriptor.subtasks) {
+      const head = heads.workers.get(subtask.id);
+      if (head?.status === 'succeeded') continue;
+      const agent = this.resolveWorkerAgent(subtask);
+      if (!agent) {
+        blockers.push(`No configured worker agent "${subtask.targetAgentId ?? this.options.defaultWorkerAgentId ?? ''}" for subtask ${subtask.id}`);
+        continue;
+      }
+      if (!head) {
+        missing.push({ subtask });
+        continue;
+      }
+      let plan: RunRecoveryPlan;
+      try {
+        plan = await agent.getRecoveryPlan(head.id);
+      } catch (error) {
+        blockers.push(`Cannot plan recovery for worker run ${head.id} (subtask ${subtask.id}): ${errorMessage(error)}`);
+        continue;
+      }
+      ctx.plans.push(plan);
+      if (head.status === 'cancelled' || head.status === 'replan_required') {
+        blockers.push(`Worker run ${head.id} for subtask ${subtask.id} is ${head.status}; automatic recovery will not override it`);
+      } else if (plan.executable) {
+        workItems.push({ subtask, agent, run: head, plan });
+      } else if (!(head.status === 'failed' && plan.action === 'not_recoverable')) {
+        // Terminal non-recoverable failures feed finalizers as failed inputs; everything else needs a human.
+        blockers.push(`Worker run ${head.id} for subtask ${subtask.id}: ${plan.reason}`);
+      }
+    }
+    ctx.missingWorkerSubtaskIds = missing.map(({ subtask }) => subtask.id);
+
+    if (blockers.length > 0) {
+      return this.recoveryResult(ctx, 'blocked', { reason: blockers.join('; ') });
+    }
+
+    const storedResult = readStoredSwarmResult(coordinatorRun);
+    if (workItems.length === 0 && missing.length === 0 && storedResult?.status === 'succeeded' && coordinatorRun.status === 'succeeded') {
+      const currentResults = buildSubtaskResultsFromRuns(descriptor.subtasks, heads.workers);
+      if (
+        subtaskResultsFingerprint(storedResult.subtaskResults) === subtaskResultsFingerprint(currentResults)
+        && storedResult.synthesizerRunId === heads.synthesizer?.id
+      ) {
+        return this.recoveryResult(ctx, 'completed', { reason: 'Swarm session is already completed', result: storedResult });
+      }
+    }
+
+    if (workItems.length > 0 || missing.length > 0) {
+      if (ctx.dryRun) {
+        const parts = [
+          ...workItems.map(({ subtask, run, plan }) => `worker ${subtask.id} run ${run.id}: ${plan.action}`),
+          ...missing.map(({ subtask }) => `worker ${subtask.id}: start missing run`),
+        ];
+        return this.recoveryResult(ctx, 'planned', {
+          reason: `Would recover ${parts.join('; ')}; quality and synthesis would then finish with current worker outputs`,
+        });
+      }
+
+      const errors: string[] = [];
+      const items: Array<{ subtask: SwarmSubtask; agent?: AdaptiveAgent; run?: AgentRun; plan?: RunRecoveryPlan }> = [...workItems, ...missing];
+      await runWithConcurrency(items, Math.max(1, descriptor.maxWorkers), async (item) => {
+        try {
+          if (item.run && item.agent && item.plan) {
+            const metadata = item.plan.action === 'continue_new_run'
+              ? {
+                  orchestration: orchestrationMetadata(
+                    ctx.coordinatorRunId,
+                    'worker',
+                    item.subtask.id,
+                    readOrchestrationMetadata(item.run)?.agentId ?? item.subtask.targetAgentId ?? this.options.defaultWorkerAgentId,
+                    (readOrchestrationMetadata(item.run)?.attempt ?? 1) + 1,
+                    item.run.id,
+                  ) as unknown as JsonValue,
+                }
+              : undefined;
+            ctx.actions.push(await item.agent.recover({ runId: item.run.id, requireApproval: ctx.requireApproval, metadata }));
+          } else {
+            const started = await this.runWorker({
+              sessionId: ctx.sessionId,
+              coordinatorRunId: ctx.coordinatorRunId,
+              topLevelObjective: descriptor.topLevelObjective,
+              executionContext: coordinatorRun.executionContext,
+              subtask: item.subtask,
+            });
+            ctx.startedRunIds.push(started.runId);
+          }
+        } catch (error) {
+          errors.push(`subtask ${item.subtask.id}${item.run ? ` run ${item.run.id}` : ''}: ${errorMessage(error)}`);
+        }
+      });
+
+      if (!(await this.acquireRecoveryLease(ctx))) {
+        return this.recoveryResult(ctx, 'busy', { reason: `Swarm coordinator lease for ${ctx.coordinatorRunId} was lost during worker recovery` });
+      }
+      if (errors.length > 0) {
+        return this.recoveryResult(ctx, 'failed', { reason: `Worker recovery failed: ${errors.join('; ')}` });
+      }
+      heads = await this.loadRoleHeads(ctx);
+    }
+
+    const waiting: string[] = [];
+    for (const subtask of descriptor.subtasks) {
+      const head = heads.workers.get(subtask.id);
+      if (!head) {
+        waiting.push(`subtask ${subtask.id} has no worker run`);
+      } else if (head.status !== 'succeeded' && head.status !== 'failed') {
+        waiting.push(`worker run ${head.id} for subtask ${subtask.id} is ${head.status}`);
+      }
+    }
+    if (waiting.length > 0) {
+      return this.recoveryResult(ctx, 'blocked', { reason: `Workers are not finished: ${waiting.join('; ')}` });
+    }
+
+    const subtaskResults = buildSubtaskResultsFromRuns(descriptor.subtasks, heads.workers);
+    return this.recoverFinalizers(ctx, coordinatorRun, descriptor, heads, subtaskResults);
+  }
+
+  private async recoverFinalizers(
+    ctx: SwarmRecoveryContext,
+    coordinatorRun: AgentRun,
+    descriptor: SwarmExecutionDescriptor,
+    heads: SwarmRoleHeads,
+    subtaskResults: SwarmSubtaskResult[],
+  ): Promise<SwarmRecoveryResult> {
+    const executionContext = coordinatorRun.executionContext;
+    const resultsFingerprint = subtaskResultsFingerprint(subtaskResults);
+    let changed = false;
+
+    // Quality: reuse or recover in place only when it assessed the current worker outputs.
+    let qualityRunId: UUID | undefined;
+    let qualityAssessments: SwarmQualityAssessment[] | undefined;
+    let qualityError: string | undefined;
+    const qualityHead = heads.quality;
+    const qualityInputsMatch = qualityHead !== undefined
+      && subtaskResultsFingerprint(readRecordField(qualityHead.input, 'subtaskResults')) === resultsFingerprint;
+    let qualityResult: RunResult | undefined;
+    if (qualityHead && qualityInputsMatch) {
+      qualityRunId = qualityHead.id;
+      if (qualityHead.status === 'succeeded') {
+        qualityAssessments = normalizeQualityAssessments(qualityHead.result ?? null, qualityHead.id);
+      } else {
+        const plan = await this.planFinalizer(ctx, this.options.qualityAgent, qualityHead);
+        if (typeof plan === 'string') return this.recoveryResult(ctx, 'blocked', { reason: plan });
+        if (plan.executable) {
+          if (ctx.dryRun) {
+            return this.recoveryResult(ctx, 'planned', { reason: `Quality run ${qualityHead.id} would be recovered with ${plan.action}; synthesis would follow` });
+          }
+          const recovered = await this.recoverFinalizerRun(ctx, this.options.qualityAgent, qualityHead.id);
+          if (typeof recovered === 'string') return this.recoveryResult(ctx, 'failed', { reason: recovered });
+          qualityResult = recovered;
+          changed = true;
+        } else if (qualityHead.status === 'failed' && plan.action === 'not_recoverable') {
+          qualityError = qualityHead.errorMessage ?? `Quality run ${qualityHead.id} failed`;
+        } else {
+          return this.recoveryResult(ctx, 'blocked', { reason: `Quality run ${qualityHead.id}: ${plan.reason}` });
+        }
+      }
+    } else {
+      if (ctx.dryRun) {
+        return this.recoveryResult(ctx, 'planned', {
+          reason: qualityHead
+            ? `Quality run ${qualityHead.id} assessed outdated worker outputs; quality and synthesis would be regenerated`
+            : 'Quality and synthesis would run with current worker outputs',
+        });
+      }
+      qualityResult = await this.runQualityRun({
+        sessionId: ctx.sessionId,
+        coordinatorRunId: ctx.coordinatorRunId,
+        topLevelObjective: descriptor.topLevelObjective,
+        executionContext,
+        subtasks: descriptor.subtasks,
+        subtaskResults,
+        ...(qualityHead ? { attempt: nextAttempt(qualityHead), supersedesRunId: qualityHead.id } : {}),
+      });
+      ctx.startedRunIds.push(qualityResult.runId);
+      changed = true;
+    }
+    if (qualityResult) {
+      qualityRunId = qualityResult.runId;
+      if (qualityResult.status === 'approval_requested' || qualityResult.status === 'clarification_requested') {
+        return this.recoveryResult(ctx, 'blocked', { reason: `Quality run ${qualityResult.runId} is waiting for user action: ${qualityResult.message}` });
+      }
+      if (qualityResult.status === 'success') {
+        qualityAssessments = normalizeQualityAssessments(qualityResult.output, qualityResult.runId);
+      } else {
+        qualityError = qualityResult.error;
+      }
+    }
+
+    // Synthesis: reuse or recover in place only when its inputs equal the current inputs.
+    const synthesizerInput = buildSynthesizerInput(descriptor.topLevelObjective, descriptor.subtasks, subtaskResults, qualityAssessments, qualityError);
+    const synthesizerHead = heads.synthesizer;
+    const synthesizerInputsMatch = synthesizerHead !== undefined
+      && synthesizerInputFingerprint(synthesizerHead.input) === synthesizerInputFingerprint(synthesizerInput);
+    let synthesizerRunId: UUID | undefined;
+    let synthesizerOutcome: { status: 'succeeded'; output?: JsonValue } | { status: 'failed'; errorCode?: string; errorMessage?: string };
+    if (synthesizerHead && synthesizerInputsMatch) {
+      synthesizerRunId = synthesizerHead.id;
+      if (synthesizerHead.status === 'succeeded') {
+        synthesizerOutcome = { status: 'succeeded', output: synthesizerHead.result };
+      } else {
+        const plan = await this.planFinalizer(ctx, this.options.synthesizerAgent, synthesizerHead);
+        if (typeof plan === 'string') return this.recoveryResult(ctx, 'blocked', { reason: plan });
+        if (plan.executable) {
+          if (ctx.dryRun) {
+            return this.recoveryResult(ctx, 'planned', { reason: `Synthesizer run ${synthesizerHead.id} would be recovered with ${plan.action}` });
+          }
+          const recovered = await this.recoverFinalizerRun(ctx, this.options.synthesizerAgent, synthesizerHead.id);
+          if (typeof recovered === 'string') return this.recoveryResult(ctx, 'failed', { reason: recovered });
+          if (recovered.status === 'approval_requested' || recovered.status === 'clarification_requested') {
+            return this.recoveryResult(ctx, 'blocked', { reason: `Synthesizer run ${recovered.runId} is waiting for user action: ${recovered.message}` });
+          }
+          synthesizerRunId = recovered.runId;
+          synthesizerOutcome = recovered.status === 'success'
+            ? { status: 'succeeded', output: recovered.output }
+            : { status: 'failed', errorCode: recovered.code, errorMessage: recovered.error };
+          changed = true;
+        } else if (synthesizerHead.status === 'failed' && plan.action === 'not_recoverable') {
+          synthesizerOutcome = { status: 'failed', errorCode: synthesizerHead.errorCode, errorMessage: synthesizerHead.errorMessage };
+        } else {
+          return this.recoveryResult(ctx, 'blocked', { reason: `Synthesizer run ${synthesizerHead.id}: ${plan.reason}` });
+        }
+      }
+    } else {
+      if (ctx.dryRun) {
+        return this.recoveryResult(ctx, 'planned', {
+          reason: synthesizerHead
+            ? `Synthesizer run ${synthesizerHead.id} used outdated inputs; synthesis would be regenerated`
+            : 'Synthesis would run with current worker outputs and quality assessments',
+        });
+      }
+      const regenerated = await this.runSynthesizerRun({
+        sessionId: ctx.sessionId,
+        coordinatorRunId: ctx.coordinatorRunId,
+        executionContext,
+        input: synthesizerInput,
+        ...(synthesizerHead ? { attempt: nextAttempt(synthesizerHead), supersedesRunId: synthesizerHead.id } : {}),
+      });
+      ctx.startedRunIds.push(regenerated.runId);
+      changed = true;
+      if (regenerated.status === 'approval_requested' || regenerated.status === 'clarification_requested') {
+        return this.recoveryResult(ctx, 'blocked', { reason: `Synthesizer run ${regenerated.runId} is waiting for user action: ${regenerated.message}` });
+      }
+      synthesizerRunId = regenerated.runId;
+      synthesizerOutcome = regenerated.status === 'success'
+        ? { status: 'succeeded', output: regenerated.output }
+        : { status: 'failed', errorCode: regenerated.code, errorMessage: regenerated.error };
+    }
+
+    const finalResult: SwarmRunResult = {
+      sessionId: ctx.sessionId,
+      coordinatorRunId: ctx.coordinatorRunId,
+      subtaskResults,
+      qualityRunId,
+      synthesizerRunId,
+      qualityAssessments,
+      ...synthesizerOutcome,
+    };
+    const storedResult = readStoredSwarmResult(coordinatorRun);
+    const storedMatches = !changed
+      && ctx.actions.length === 0
+      && ctx.startedRunIds.length === 0
+      && storedResult !== undefined
+      && coordinatorRun.status === storedResult.status
+      && storedResult.status === finalResult.status
+      && storedResult.qualityRunId === finalResult.qualityRunId
+      && storedResult.synthesizerRunId === finalResult.synthesizerRunId
+      && subtaskResultsFingerprint(storedResult.subtaskResults) === resultsFingerprint;
+    if (storedMatches) {
+      return this.recoveryResult(ctx, outcomeForSwarmResult(storedResult), {
+        reason: storedResult.status === 'succeeded' ? 'Swarm session is already completed' : storedResult.errorMessage ?? 'Swarm session failed and has no recoverable runs',
+        result: storedResult,
+      });
+    }
+    if (ctx.dryRun) {
+      return this.recoveryResult(ctx, 'planned', { reason: 'Swarm coordinator result would be finalized from current worker and finalizer runs' });
+    }
+    const result = await this.finalizeCoordinator(finalResult);
+    return this.recoveryResult(ctx, outcomeForSwarmResult(result), { result, reason: result.errorMessage });
+  }
+
+  private async planFinalizer(ctx: SwarmRecoveryContext, agent: AdaptiveAgent, run: AgentRun): Promise<RunRecoveryPlan | string> {
+    if (run.status === 'cancelled' || run.status === 'replan_required') {
+      return `${readOrchestrationMetadata(run)?.role ?? 'Finalizer'} run ${run.id} is ${run.status}; automatic recovery will not override it`;
+    }
+    try {
+      const plan = await agent.getRecoveryPlan(run.id);
+      ctx.plans.push(plan);
+      return plan;
+    } catch (error) {
+      return `Cannot plan recovery for run ${run.id}: ${errorMessage(error)}`;
+    }
+  }
+
+  private async recoverFinalizerRun(ctx: SwarmRecoveryContext, agent: AdaptiveAgent, runId: UUID): Promise<RunResult | string> {
+    try {
+      const action = await agent.recover({ runId, requireApproval: ctx.requireApproval });
+      ctx.actions.push(action);
+      if (!action.result) return `Recovery for run ${runId} produced no result`;
+      if (!(await this.acquireRecoveryLease(ctx))) return `Swarm coordinator lease for ${ctx.coordinatorRunId} was lost during finalizer recovery`;
+      return action.result;
+    } catch (error) {
+      return `Recovery for run ${runId} failed: ${errorMessage(error)}`;
+    }
+  }
+
+  private async loadRoleHeads(ctx: SwarmRecoveryContext): Promise<SwarmRoleHeads> {
+    const sessionRuns = await this.options.runStore.listBySession!(ctx.sessionId);
+    const swarmRuns = sessionRuns.filter((run) => readOrchestrationMetadata(run) !== undefined);
+    const owned = swarmRuns.filter((run) => !run.parentRunId && logicalCoordinatorRunId(run, swarmRuns) === ctx.coordinatorRunId);
+    const byRole = (role: OrchestrationMetadata['role']) => owned.filter((run) => readOrchestrationMetadata(run)?.role === role);
+    const workersBySubtask = new Map<string, AgentRun[]>();
+    for (const run of byRole('worker')) {
+      const subtaskId = readOrchestrationMetadata(run)?.subtaskId;
+      if (!subtaskId) continue;
+      workersBySubtask.set(subtaskId, [...(workersBySubtask.get(subtaskId) ?? []), run]);
+    }
+    const workers = new Map<string, AgentRun>();
+    for (const [subtaskId, runs] of workersBySubtask) {
+      const head = selectLineageHead(runs);
+      if (head) workers.set(subtaskId, head);
+    }
+    return {
+      coordinator: byRole('coordinator'),
+      workers,
+      quality: selectLineageHead(byRole('quality')),
+      synthesizer: selectLineageHead(byRole('synthesizer')),
+    };
+  }
+
+  private async liveLeaseReason(run: AgentRun, now: Date, ownOwner: string | undefined): Promise<string | undefined> {
+    if (hasLiveLease(run, now) && run.leaseOwner !== ownOwner) return leaseReason(run);
+    if (run.status === 'awaiting_subagent' && run.currentChildRunId) {
+      const child = await this.options.runStore.getRun(run.currentChildRunId);
+      if (child && hasLiveLease(child, now)) return leaseReason(child);
+    }
+    return undefined;
+  }
+
+  private async acquireRecoveryLease(ctx: SwarmRecoveryContext): Promise<boolean> {
+    if (ctx.dryRun || !ctx.owner) return true;
+    const acquired = await this.options.runStore.tryAcquireLease({
+      runId: ctx.coordinatorRunId,
+      owner: ctx.owner,
+      ttlMs: COORDINATOR_LEASE_TTL_MS,
+      now: new Date(),
+    });
+    ctx.leaseHeld = acquired;
+    return acquired;
+  }
+
+  private async releaseRecoveryLease(ctx: SwarmRecoveryContext): Promise<void> {
+    if (!ctx.leaseHeld || !ctx.owner) return;
+    ctx.leaseHeld = false;
+    try {
+      await this.options.runStore.releaseLease(ctx.coordinatorRunId, ctx.owner);
+    } catch {
+      // Lease release is best effort; the lease expires on its own.
+    }
+  }
+
+  private recoveryResult(
+    ctx: SwarmRecoveryContext,
+    outcome: SwarmRecoveryOutcome,
+    extra: { reason?: string; result?: SwarmRunResult } = {},
+  ): SwarmRecoveryResult {
+    return {
+      sessionId: ctx.sessionId,
+      coordinatorRunId: ctx.coordinatorRunId,
+      outcome,
+      plans: [...ctx.plans],
+      actions: [...ctx.actions],
+      ...(extra.reason ? { reason: extra.reason } : {}),
+      ...(extra.result ? { result: extra.result } : {}),
+      ...(ctx.startedRunIds.length > 0 ? { startedRunIds: [...ctx.startedRunIds] } : {}),
+      ...(ctx.missingWorkerSubtaskIds.length > 0 ? { missingWorkerSubtaskIds: [...ctx.missingWorkerSubtaskIds] } : {}),
+    };
+  }
+
   private async runFinalizers(params: {
     sessionId: string;
     coordinatorRunId: UUID;
@@ -349,43 +1039,38 @@ export class SwarmCoordinator {
   }): Promise<SwarmRunResult> {
     const qualityAttempt = params.previousQualityRunId ? 2 : undefined;
 
-    const qualityResult = await this.options.qualityAgent.run({
+    const qualityResult = await this.runQualityRun({
       sessionId: params.sessionId,
-      goal: 'Assess swarm worker outputs against the top-level objective and subtask objectives.',
-      input: {
-        topLevelObjective: params.topLevelObjective,
-        subtasks: params.subtasks as unknown as JsonValue,
-        subtaskResults: params.subtaskResults as unknown as JsonValue,
-      },
+      coordinatorRunId: params.coordinatorRunId,
+      topLevelObjective: params.topLevelObjective,
       executionContext: params.executionContext,
-      outputSchema: qualityOutputSchema,
-      metadata: {
-        orchestration: orchestrationMetadata(params.coordinatorRunId, 'quality', undefined, this.options.qualityAgentId, qualityAttempt, params.previousQualityRunId) as unknown as JsonValue,
-      },
+      subtasks: params.subtasks,
+      subtaskResults: params.subtaskResults,
+      attempt: qualityAttempt,
+      supersedesRunId: params.previousQualityRunId,
     });
     const qualityRunId = qualityResult.runId;
     const qualityAssessments = qualityResult.status === 'success'
       ? normalizeQualityAssessments(qualityResult.output, qualityRunId)
       : undefined;
 
-    const synthesizerInput = {
-      topLevelObjective: params.topLevelObjective,
-      subtasks: params.subtasks as unknown as JsonValue,
-      subtaskResults: params.subtaskResults as unknown as JsonValue,
-      qualityAssessments: (qualityAssessments ?? []) as unknown as JsonValue,
-      ...(qualityResult.status === 'failure' ? { qualityError: qualityResult.error } : {}),
-    } satisfies Record<string, JsonValue>;
+    const synthesizerInput = buildSynthesizerInput(
+      params.topLevelObjective,
+      params.subtasks,
+      params.subtaskResults,
+      qualityAssessments,
+      qualityResult.status === 'failure' ? qualityResult.error : undefined,
+    );
 
     const synthesizerAttempt = params.previousSynthesizerRunId ? 2 : undefined;
 
-    const synthesizerResult = await this.options.synthesizerAgent.run({
+    const synthesizerResult = await this.runSynthesizerRun({
       sessionId: params.sessionId,
-      goal: 'Synthesize the final response for the top-level objective from worker results and quality assessments.',
-      input: synthesizerInput,
+      coordinatorRunId: params.coordinatorRunId,
       executionContext: params.executionContext,
-      metadata: {
-        orchestration: orchestrationMetadata(params.coordinatorRunId, 'synthesizer', undefined, this.options.synthesizerAgentId, synthesizerAttempt, params.previousSynthesizerRunId) as unknown as JsonValue,
-      },
+      input: synthesizerInput,
+      attempt: synthesizerAttempt,
+      supersedesRunId: params.previousSynthesizerRunId,
     });
 
     if (synthesizerResult.status === 'success') {
@@ -411,6 +1096,51 @@ export class SwarmCoordinator {
       status: 'failed',
       errorCode: resultErrorCode(synthesizerResult),
       errorMessage: resultErrorMessage(synthesizerResult),
+    });
+  }
+
+  private runQualityRun(params: {
+    sessionId: string;
+    coordinatorRunId: UUID;
+    topLevelObjective: string;
+    executionContext?: AgentRun['executionContext'];
+    subtasks: SwarmSubtask[];
+    subtaskResults: SwarmSubtaskResult[];
+    attempt?: number;
+    supersedesRunId?: UUID;
+  }): Promise<RunResult> {
+    return this.options.qualityAgent.run({
+      sessionId: params.sessionId,
+      goal: 'Assess swarm worker outputs against the top-level objective and subtask objectives.',
+      input: {
+        topLevelObjective: params.topLevelObjective,
+        subtasks: params.subtasks as unknown as JsonValue,
+        subtaskResults: params.subtaskResults as unknown as JsonValue,
+      },
+      executionContext: params.executionContext,
+      outputSchema: qualityOutputSchema,
+      metadata: {
+        orchestration: orchestrationMetadata(params.coordinatorRunId, 'quality', undefined, this.options.qualityAgentId, params.attempt, params.supersedesRunId) as unknown as JsonValue,
+      },
+    });
+  }
+
+  private runSynthesizerRun(params: {
+    sessionId: string;
+    coordinatorRunId: UUID;
+    executionContext?: AgentRun['executionContext'];
+    input: Record<string, JsonValue>;
+    attempt?: number;
+    supersedesRunId?: UUID;
+  }): Promise<RunResult> {
+    return this.options.synthesizerAgent.run({
+      sessionId: params.sessionId,
+      goal: 'Synthesize the final response for the top-level objective from worker results and quality assessments.',
+      input: params.input,
+      executionContext: params.executionContext,
+      metadata: {
+        orchestration: orchestrationMetadata(params.coordinatorRunId, 'synthesizer', undefined, this.options.synthesizerAgentId, params.attempt, params.supersedesRunId) as unknown as JsonValue,
+      },
     });
   }
 
@@ -665,6 +1395,144 @@ function runToSubtaskResult(subtaskId: string, run: AgentRun): SwarmSubtaskResul
     errorCode: run.errorCode,
     errorMessage: run.errorMessage,
   };
+}
+
+/**
+ * Resolves the logical swarm coordinator id for a run. Decomposition runs keep
+ * `coordinatorRunId: 'pending'` until execution starts, so coordinator-role runs fall back to the
+ * root of their continuation/supersession lineage.
+ */
+function logicalCoordinatorRunId(run: AgentRun, runs: AgentRun[]): UUID | undefined {
+  const metadata = readOrchestrationMetadata(run);
+  if (!metadata) return undefined;
+  if (metadata.coordinatorRunId !== 'pending') return metadata.coordinatorRunId;
+  if (metadata.role !== 'coordinator') return undefined;
+  const byId = new Map(runs.map((candidate) => [candidate.id, candidate]));
+  const visited = new Set<UUID>();
+  let current = run;
+  while (!visited.has(current.id)) {
+    visited.add(current.id);
+    const sourceId = lineageSourceRunIds(current)[0];
+    const source = sourceId ? byId.get(sourceId) : undefined;
+    if (!source) break;
+    const sourceMetadata = readOrchestrationMetadata(source);
+    if (sourceMetadata && sourceMetadata.coordinatorRunId !== 'pending') return sourceMetadata.coordinatorRunId;
+    current = source;
+  }
+  return current.id;
+}
+
+/** Runs that this run continues or supersedes. */
+function lineageSourceRunIds(run: AgentRun): UUID[] {
+  const ids: UUID[] = [];
+  const continuationOf = run.metadata?.continuationOfRunId;
+  if (isNonEmptyString(continuationOf)) ids.push(continuationOf);
+  const supersedes = readOrchestrationMetadata(run)?.supersedesRunId;
+  if (supersedes && !ids.includes(supersedes)) ids.push(supersedes);
+  return ids;
+}
+
+/**
+ * Picks the unique unsuperseded head of one logical role. Branching or cyclic histories must
+ * be reconciled explicitly; recency alone does not identify the authoritative attempt.
+ */
+function selectLineageHead(runs: AgentRun[]): AgentRun | undefined {
+  if (runs.length === 0) return undefined;
+  const superseded = new Set(runs.flatMap(lineageSourceRunIds));
+  const candidates = runs.filter((run) => !superseded.has(run.id));
+  if (candidates.length !== 1) throw new Error('Swarm role has ambiguous continuation or supersession lineage; choose the intended execution explicitly');
+  return candidates[0];
+}
+
+function hasLiveLease(run: AgentRun, now: Date): boolean {
+  return Boolean(run.leaseOwner && run.leaseExpiresAt && new Date(run.leaseExpiresAt).getTime() > now.getTime());
+}
+
+function leaseReason(run: AgentRun): string {
+  const role = readOrchestrationMetadata(run)?.role;
+  return `Run ${run.id}${role ? ` (${role})` : ''} holds a live lease${run.leaseOwner ? ` owned by ${run.leaseOwner}` : ''}${run.leaseExpiresAt ? ` until ${run.leaseExpiresAt}` : ''}`;
+}
+
+function readStoredSwarmResult(run: AgentRun): SwarmRunResult | undefined {
+  const raw = run.result;
+  if (!isRecord(raw) || !isFinalizedSwarmResult(raw) || !Array.isArray(raw.subtaskResults)) return undefined;
+  return raw as unknown as SwarmRunResult;
+}
+
+function outcomeForSwarmResult(result: SwarmRunResult): SwarmRecoveryOutcome {
+  if (result.status === 'succeeded') return 'completed';
+  if (result.status === 'failed') return 'failed';
+  return 'blocked';
+}
+
+function nextAttempt(run: AgentRun): number {
+  return (readOrchestrationMetadata(run)?.attempt ?? 1) + 1;
+}
+
+function readTopLevelObjective(run: AgentRun): string {
+  const fromContext = run.context?.topLevelObjective;
+  return isNonEmptyString(fromContext) ? fromContext : run.goal;
+}
+
+function readDecompositionInput(run: AgentRun): JsonValue | undefined {
+  const input = run.input;
+  // Agent SDK decomposition wraps the caller input with the worker catalog.
+  if (isRecord(input) && Object.hasOwn(input, 'originalInput') && Object.hasOwn(input, 'workerCatalog')) {
+    const original = input.originalInput as JsonValue;
+    return original === null ? undefined : original;
+  }
+  return input;
+}
+
+function readRecordField(value: unknown, key: string): unknown {
+  return isRecord(value) ? value[key] : undefined;
+}
+
+function buildSynthesizerInput(
+  topLevelObjective: string,
+  subtasks: SwarmSubtask[],
+  subtaskResults: SwarmSubtaskResult[],
+  qualityAssessments: SwarmQualityAssessment[] | undefined,
+  qualityError: string | undefined,
+): Record<string, JsonValue> {
+  return {
+    topLevelObjective,
+    subtasks: subtasks as unknown as JsonValue,
+    subtaskResults: subtaskResults as unknown as JsonValue,
+    qualityAssessments: (qualityAssessments ?? []) as unknown as JsonValue,
+    ...(qualityError !== undefined ? { qualityError } : {}),
+  };
+}
+
+/** Compares worker outputs by identity, status, and output only, so representation noise does not force regeneration. */
+function subtaskResultsFingerprint(value: unknown): string {
+  if (!Array.isArray(value)) return 'invalid';
+  return stableStringify(value.map((item) => isRecord(item)
+    ? { subtaskId: item.subtaskId ?? null, runId: item.runId ?? null, status: item.status ?? null, output: item.output ?? null }
+    : null));
+}
+
+function synthesizerInputFingerprint(value: unknown): string {
+  if (!isRecord(value)) return 'invalid';
+  return stableStringify({
+    subtaskResults: subtaskResultsFingerprint(value.subtaskResults),
+    qualityAssessments: value.qualityAssessments ?? [],
+    qualityError: value.qualityError !== undefined,
+  });
+}
+
+function stableStringify(value: unknown): string {
+  if (value === undefined) return 'null';
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, entry]) => entry !== undefined)
+    .sort(([left], [right]) => left.localeCompare(right));
+  return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${stableStringify(entry)}`).join(',')}}`;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function coordinatorLeaseOwner(coordinatorRunId: UUID): string {

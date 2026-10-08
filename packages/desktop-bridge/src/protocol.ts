@@ -1,5 +1,5 @@
 import type { ChatMessage, JsonValue, RuntimeDeletionTarget } from '@adaptive-agent/core';
-import type { AgentSdkAgentDiscovery, AgentSdkCatalogAgent } from '@adaptive-agent/agent-sdk';
+import type { AgentSdkAgentDiscovery, AgentSdkCatalogAgent, RecoverSessionOptions } from '@adaptive-agent/agent-sdk';
 import type { InferenceMode, InferenceTier, ProfileRef } from '@adaptive-agent/gateway-client';
 
 export {
@@ -8,8 +8,8 @@ export {
 } from '@adaptive-agent/agent-sdk/cli';
 
 /** Keep versions as strings: JSON numbers cannot distinguish 1.10 from 1.1. */
-export const DESKTOP_PROTOCOL_VERSION = '1.19' as const;
-export const SUPPORTED_DESKTOP_PROTOCOL_VERSIONS = ['1.10', '1.11', '1.12', '1.13', '1.14', '1.15', '1.16', '1.17', '1.18', DESKTOP_PROTOCOL_VERSION] as const;
+export const DESKTOP_PROTOCOL_VERSION = '1.20' as const;
+export const SUPPORTED_DESKTOP_PROTOCOL_VERSIONS = ['1.10', '1.11', '1.12', '1.13', '1.14', '1.15', '1.16', '1.17', '1.18', '1.19', DESKTOP_PROTOCOL_VERSION] as const;
 export const DESKTOP_BRIDGE_VERSION = '0.1.0';
 
 export type DesktopProtocolVersion = (typeof SUPPORTED_DESKTOP_PROTOCOL_VERSIONS)[number];
@@ -223,6 +223,8 @@ export interface RecoverParams extends RunIdParams {
   dryRun?: boolean;
 }
 
+export type AgentRecoverParams = RecoverSessionOptions | (RecoverParams & { sessionId?: never; requireApproval?: boolean });
+
 export interface SteerParams extends RunIdParams {
   message: string;
   role?: 'user' | 'system';
@@ -256,6 +258,7 @@ export type DesktopRpcRequest =
   | RpcRequest<'auth/updateAccessToken', UpdateAccessTokenParams>
   | RpcRequest<'agent/run', RunParams>
   | RpcRequest<'agent/chat', ChatParams>
+  | RpcRequest<'agent/recover', AgentRecoverParams>
   | RpcRequest<'run/resume', ResumeParams>
   | RpcRequest<'run/retry', RunIdParams>
   | RpcRequest<'run/recover', RecoverParams>
@@ -288,6 +291,7 @@ export const DESKTOP_RPC_METHODS = [
   'auth/updateAccessToken',
   'agent/run',
   'agent/chat',
+  'agent/recover',
   'run/resume',
   'run/retry',
   'run/recover',
@@ -532,6 +536,24 @@ function validateRpcParams(method: DesktopRpcRequest['method'], params: Record<s
       const value = requiredParams(method, params);
       requiredString(value, 'runId');
       optionalString(value, 'continuationRunId');
+      return;
+    }
+    case 'agent/recover': {
+      const value = requiredParams(method, params);
+      if ((value.runId === undefined) === (value.sessionId === undefined)) invalidParams('Exactly one runId or sessionId is required.');
+      if (value.sessionId !== undefined) {
+        requiredString(value, 'sessionId');
+        optionalString(value, 'executionId');
+        optionalString(value, 'coordinatorRunId');
+        if (value.executionId !== undefined && value.coordinatorRunId !== undefined) invalidParams('executionId and coordinatorRunId are mutually exclusive.');
+        if (value.strategy !== undefined) invalidParams('Session recovery selects its strategy automatically.');
+      } else {
+        requiredString(value, 'runId');
+        if (value.executionId !== undefined || value.coordinatorRunId !== undefined) invalidParams('Execution selectors require sessionId.');
+        optionalEnum(value, 'strategy', ['auto', 'same_run', 'resume', 'retry', 'continue']);
+      }
+      optionalBoolean(value, 'dryRun');
+      optionalBoolean(value, 'requireApproval');
       return;
     }
     case 'run/recover': {

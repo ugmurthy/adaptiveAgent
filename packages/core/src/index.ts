@@ -17,6 +17,7 @@ export * from './sqlite-orchestration-store.js';
 export * from './swarm-coordinator.js';
 export * from './delegation-executor.js';
 export * from './run-recovery-analyzer.js';
+export * from './session-recovery.js';
 export * from './adapters/index.js';
 export * from './logger.js';
 export * from './tool-budget-policy.js';

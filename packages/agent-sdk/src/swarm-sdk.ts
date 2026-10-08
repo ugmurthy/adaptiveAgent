@@ -4,6 +4,8 @@ import type {
   JsonValue,
   ModelContentPart,
   RunResult,
+  SwarmRecoveryRequest,
+  SwarmRecoveryResult,
   SwarmRetryResult,
   SwarmRunResult,
   SwarmSubtask,
@@ -20,7 +22,7 @@ import {
 import { createSwarmRoleAgentConfig } from './swarm-role-config.js';
 import { buildSwarmCoordinator, parseSwarmSubtasks, runSwarmDecomposition, validateSdkDecomposition } from './swarm-runner.js';
 
-export type SwarmLifecyclePhase = 'initialization' | 'decomposition' | 'execution' | 'retry';
+export type SwarmLifecyclePhase = 'initialization' | 'decomposition' | 'execution' | 'retry' | 'recovery';
 export type SwarmLifecycleState = 'started' | 'completed' | 'waiting' | 'failed';
 export interface SwarmLifecycleEvent {
   phase: SwarmLifecyclePhase;
@@ -240,6 +242,28 @@ export class SwarmSdk {
     catch (error) { this.emit('retry', 'failed', sessionId, undefined, error); throw error; }
   }
 
+  /**
+   * General swarm session recovery. Forwards to core `SwarmCoordinator.recoverSession`, which
+   * owns lineage selection, leasing, and finalizer regeneration semantics.
+   */
+  async recover(request: SwarmRecoveryRequest): Promise<SwarmRecoveryResult> {
+    this.emit('recovery', 'started', request.sessionId);
+    try {
+      const result = await this.coordinator().recoverSession({
+        sessionId: request.sessionId,
+        ...(request.coordinatorRunId === undefined ? {} : { coordinatorRunId: request.coordinatorRunId }),
+        ...(request.dryRun === undefined ? {} : { dryRun: request.dryRun }),
+        ...(request.requireApproval === undefined ? {} : { requireApproval: request.requireApproval }),
+      });
+      this.emit('recovery', recoveryLifecycleState(result), request.sessionId, result.coordinatorRunId);
+      return result;
+    } catch (error) {
+      this.emit('recovery', 'failed', request.sessionId, undefined, error);
+      throw error;
+    }
+  }
+
+  /** Legacy stale-run recovery. Use `recover` for complete logical swarm recovery. */
   async recoverSession(sessionId: string, now = new Date()): Promise<SwarmSessionInspection> {
     const inspection = await this.inspectSession(sessionId);
     for (const run of inspection.runs.filter((candidate) => isActiveRun(candidate) && !hasLiveLease(candidate, now))) {
@@ -293,4 +317,9 @@ function latestLogicalRuns(runs: AgentRun[]): AgentRun[] {
 }
 function isActiveRun(run: AgentRun): boolean { return ['queued', 'planning', 'awaiting_subagent', 'running'].includes(run.status); }
 function hasLiveLease(run: AgentRun, now: Date): boolean { return Boolean(run.leaseExpiresAt && new Date(run.leaseExpiresAt).getTime() > now.getTime()); }
+function recoveryLifecycleState(result: SwarmRecoveryResult): SwarmLifecycleState {
+  if (result.outcome === 'completed' || result.outcome === 'planned') return 'completed';
+  if (result.outcome === 'blocked' || result.outcome === 'busy') return 'waiting';
+  return 'failed';
+}
 function inferPhase(runs: AgentRun[]): SwarmSessionInspection['phase'] { return runs.some((r) => readRole(r) === 'synthesizer') ? 'synthesis' : runs.some((r) => readRole(r) === 'quality') ? 'quality' : runs.some((r) => readRole(r) === 'worker') ? 'workers' : 'decomposition'; }

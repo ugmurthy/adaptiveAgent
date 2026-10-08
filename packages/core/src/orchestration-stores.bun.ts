@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { InMemoryOrchestrationStore, OrchestrationOptimisticConcurrencyError } from './in-memory-orchestration-store.js';
 import { openSqliteRuntimeStores } from './sqlite-runtime-stores.js';
-import type { OrchestrationStore } from './types.js';
+import type { OrchestrationExecution, OrchestrationStage, OrchestrationStore } from './types.js';
 
 const firstRun = '00000000-0000-4000-8000-000000000001';
 const secondRun = '00000000-0000-4000-8000-000000000002';
@@ -36,7 +36,47 @@ async function expectFailedDependencyToBeTerminal(store: OrchestrationStore) {
   expect((await store.claimReadyStage(execution.id))?.nodeId).toBe('synthesis');
 }
 
+type SessionListingStore = OrchestrationStore & { listBySession(sessionId: string): Promise<OrchestrationExecution[]> };
+type RunIdPatchStore = OrchestrationStore & { updateStage(executionId: string, nodeId: string, patch: { status?: OrchestrationStage['status']; runId?: string }, expectedVersion: number): Promise<OrchestrationStage> };
+
+/** Creates executions for two sessions (one without any started stage) and patches a stage run ID. */
+async function exerciseSessionListingAndRunIdPatch(store: SessionListingStore & RunIdPatchStore) {
+  const ids = ['00000000-0000-4000-8000-0000000000b2', '00000000-0000-4000-8000-0000000000b1', '00000000-0000-4000-8000-0000000000c1'];
+  const create = (id: string, sessionId: string) => store.createExecution({ id, request: { objective: id }, catalogFingerprint: 'sha256:session', plan: { sessionId, nodes: ['a'] }, stages: [{ nodeId: 'a', runId: crypto.randomUUID(), agentId: 'worker' }] });
+  await create(ids[0]!, 'session-listing');
+  await create(ids[1]!, 'session-listing');
+  await create(ids[2]!, 'session-listing-other');
+  await store.createExecution({ id: crypto.randomUUID(), request: {}, catalogFingerprint: 'sha256:session', plan: { nodes: [] }, stages: [] });
+  const listed = await store.listBySession('session-listing');
+  expect(listed.map((execution) => execution.id).sort()).toEqual([ids[0], ids[1]].sort());
+  const deterministic = [...listed].sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
+  expect(listed.map((execution) => execution.id)).toEqual(deterministic.map((execution) => execution.id));
+  expect(await store.listBySession('session-listing')).toEqual(listed);
+  expect(await store.listBySession('session-')).toEqual([]);
+  expect((await store.listBySession('session-listing-other')).map((execution) => execution.id)).toEqual([ids[2]]);
+
+  const stage = (await store.listStages(ids[0]!))[0]!;
+  const continuationRunId = crypto.randomUUID();
+  const patched = await store.updateStage(ids[0]!, 'a', { status: 'succeeded', runId: continuationRunId }, stage.version);
+  expect(patched).toMatchObject({ runId: continuationRunId, status: 'succeeded', version: stage.version + 1 });
+  expect((await store.listStages(ids[0]!))[0]?.runId).toBe(continuationRunId);
+  return { executionId: ids[0]!, continuationRunId };
+}
+
 describe('durable orchestration stores',()=>{
   test('in-memory optimistic versions, ready claims, and cancellation',async()=>{const store=new InMemoryOrchestrationStore();await exercise(store);await expectFailedDependencyToBeTerminal(store);});
   test('SQLite persists across reopen',async()=>{const dir=await mkdtemp(join(tmpdir(),'orchestration-'));const path=join(dir,'runtime.db');try{const first=openSqliteRuntimeStores({path});const id=await exercise(first.orchestrationStore);await expectFailedDependencyToBeTerminal(first.orchestrationStore);await first.close();const reopened=openSqliteRuntimeStores({path});expect((await reopened.orchestrationStore.getExecution(id))?.status).toBe('cancelled');expect(await reopened.orchestrationStore.listStages(id)).toHaveLength(2);await reopened.close();}finally{await rm(dir,{recursive:true,force:true});}});
+  test('in-memory lists executions by plan session and accepts stage run ID patches',async()=>{await exerciseSessionListingAndRunIdPatch(new InMemoryOrchestrationStore());});
+  test('SQLite lists executions by plan session and persists patched stage run IDs across reopen',async()=>{
+    const dir=await mkdtemp(join(tmpdir(),'orchestration-session-'));const path=join(dir,'runtime.db');
+    try{
+      const first=openSqliteRuntimeStores({path});
+      const { executionId, continuationRunId }=await exerciseSessionListingAndRunIdPatch(first.orchestrationStore);
+      await first.close();
+      const reopened=openSqliteRuntimeStores({path});
+      expect((await reopened.orchestrationStore.listStages(executionId))[0]?.runId).toBe(continuationRunId);
+      expect((await reopened.orchestrationStore.listBySession('session-listing')).map((execution)=>execution.id)).toContain(executionId);
+      await reopened.close();
+    }finally{await rm(dir,{recursive:true,force:true});}
+  });
 });

@@ -1032,9 +1032,11 @@ export interface OrchestrationStore {
       Partial<Pick<OrchestrationStage, 'status' | 'dependencies' | 'upstreamRunIds'>>>;
   }): Promise<OrchestrationExecution>;
   getExecution(id: UUID): Promise<OrchestrationExecution | null>;
+  /** Executions whose persisted plan belongs to this session, ordered by creation then id. */
+  listBySession(sessionId: string): Promise<OrchestrationExecution[]>;
   updateExecution(id: UUID, patch: Partial<Pick<OrchestrationExecution, 'status'>>, expectedVersion: number): Promise<OrchestrationExecution>;
   listStages(executionId: UUID): Promise<OrchestrationStage[]>;
-  updateStage(executionId: UUID, nodeId: string, patch: Partial<Pick<OrchestrationStage, 'status' | 'upstreamRunIds'>>, expectedVersion: number): Promise<OrchestrationStage>;
+  updateStage(executionId: UUID, nodeId: string, patch: Partial<Pick<OrchestrationStage, 'status' | 'upstreamRunIds' | 'runId'>>, expectedVersion: number): Promise<OrchestrationStage>;
   /** Atomically changes one queued stage whose dependencies are terminal to running. */
   claimReadyStage(executionId: UUID): Promise<OrchestrationStage | null>;
 }

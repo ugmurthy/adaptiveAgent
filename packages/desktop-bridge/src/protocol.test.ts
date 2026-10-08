@@ -34,8 +34,17 @@ describe('desktop bridge protocol', () => {
     );
   });
 
-  it('uses a string for protocol 1.19', () => {
-    expect(DESKTOP_PROTOCOL_VERSION).toBe('1.19');
+  it('uses a string for protocol 1.20', () => {
+    expect(DESKTOP_PROTOCOL_VERSION).toBe('1.20');
+  });
+
+  it('validates unified recovery targets and explicit consent', () => {
+    const parse = (params: unknown) => parseDesktopRpcRequest(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'agent/recover', params }));
+    expect(parse({ sessionId: 'session', executionId: 'execution', dryRun: true })).toMatchObject({ method: 'agent/recover', params: { sessionId: 'session', executionId: 'execution' } });
+    expect(parse({ runId: 'run', requireApproval: true })).toMatchObject({ params: { runId: 'run', requireApproval: true } });
+    for (const params of [{}, { runId: 'run', sessionId: 'session' }, { sessionId: '' }, { sessionId: 's', executionId: 'e', coordinatorRunId: 'c' }, { sessionId: 's', strategy: 'retry' }, { runId: 'r', executionId: 'e' }, { sessionId: 's', dryRun: 'true' }, { sessionId: 's', requireApproval: 'true' }]) {
+      expect(() => parse(params)).toThrowError(expect.objectContaining({ code: 'INVALID_PARAMS' }));
+    }
   });
 
   it('validates agent discovery requests', () => {

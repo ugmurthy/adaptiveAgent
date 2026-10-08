@@ -80,7 +80,8 @@ These are methods on `sdk`.
 | `retry(runId)` / `retryRaw(runId)` | `RunResult`; retry through core recovery semantics. |
 | `getRecoveryOptions(runId)` | `RunRecoveryOptions`; available recovery choices. |
 | `getRecoveryPlan(runId)` | `RunRecoveryPlan`; recommended recovery action and constraints. |
-| `recover(options)` / `recoverRaw(options)` | `RecoverRunResult`; apply a recovery strategy. Options: `runId`, `strategy?`, `requireApproval?`, `metadata?`. |
+| `recover({ runId, ... })` / `recoverRaw({ runId, ... })` | `RecoverRunResult`; apply a run recovery strategy. Options: `strategy?`, `requireApproval?`, `metadata?`. Use `getRecoveryPlan` for a run preview. |
+| `recover({ sessionId, ... })` / `recoverRaw({ sessionId, ... })` | `RecoverSessionResult`; automatically recover an ordinary run, swarm, or catalog orchestration. Options: `executionId?`, `coordinatorRunId?`, `dryRun?`, `requireApproval?`. |
 | `createContinuationRun(options)` | `ContinueRunResult`; create a continuation without executing it. |
 | `continueRun(options)` / `continueRunRaw(options)` | `RunResult`; create and execute a continuation. |
 | `interrupt(runId)` | `void`; request interruption. |
@@ -89,10 +90,55 @@ These are methods on `sdk`.
 | `subscribe(listener)` | Unsubscribe function; receive live core events. No-op if the store lacks subscription support. |
 | `close()` | `void`; unsubscribe and close SDK-owned runtime/gateway resources. |
 
-The non-raw recovery methods also apply interaction handling. `chat` does not
+The non-raw run recovery methods also apply interaction handling. Session
+recovery never prompts or automatically resolves approvals/clarifications; it
+returns `blocked` so the host can handle them explicitly. `chat` does not
 retain a transcript: pass the complete `ChatMessage[]` for multi-turn chat.
 Messages have `role: "system" | "user" | "assistant"`, `content`, and optional
 `images`. There is no separate `ask()` or `createChat()` helper.
+
+### Unified session recovery
+
+```ts
+const preview = await sdk.recover({ sessionId, dryRun: true });
+const recovery = await sdk.recover({ sessionId });
+
+if (recovery.outcome === 'completed') console.log(recovery.result);
+else console.log(recovery.outcome, recovery.reason, recovery.plans);
+```
+
+`recover` is the decision-making entry point, not a fourth execution strategy.
+Core chooses resume of persisted non-terminal work, same-run retry when eligible,
+or a linked continuation when safe. The session facade routes the logical work
+to its owning runtime/coordinator; it does not recover every historical run ID.
+
+- Ordinary work follows continuation lineage and excludes delegate child runs.
+- Swarms preserve successful workers, recover unfinished roles, start missing
+  workers from the saved descriptor, and regenerate finalizers when inputs change.
+- Catalog orchestration reuses the saved plan, preserves independent successful
+  stages, and persists continuation run IDs and updated downstream inputs.
+- Repeated recovery of completed work does not start another execution. Previously
+  persisted continuations are reused instead of creating another branch.
+- `dryRun` reads and plans without invoking models or changing durable execution
+  state. Profile/tool initialization can still occur to reconstruct owners.
+- Missing profiles, incompatible configuration/catalogs, cancellation, pending
+  user action, exhausted budgets, and uncertain tool effects block automatic work.
+  `requireApproval: true` grants continuation consent, not pending tool approval.
+
+`RecoverSessionResult` includes `sessionId`, `outcome`, `target`, `plans`,
+`actions`, and optional `result`, `reason`, `candidates`, and `startedRunIds`.
+Outcomes are `planned`, `completed`, `failed`, `blocked`, `busy`, `ambiguous`,
+or `not_found`. `completed` describes the owning execution's completion policy;
+inspect its result for partial worker/stage failures allowed by that policy.
+
+A session may contain several independent objectives. If more than one needs
+recovery, or a continuation history branches, the API returns `ambiguous` rather
+than choosing by recency. Select an ordinary `runId` instead of `sessionId`, or
+provide `executionId` or `coordinatorRunId` alongside `sessionId`. Selectors must
+belong to the session; the two session selectors are mutually exclusive.
+Recover only against the original runtime stores; use SQLite or Postgres to
+recover after process restarts. Referenced profiles must remain available through
+their saved paths or the configured catalog.
 
 ### Execution options and results
 
@@ -152,7 +198,8 @@ and inputs, not duplicate agent definitions.
 | `swarm.executeDecomposition(request)` | Execute prepared decomposition using `sessionId`, `coordinatorRunId`, `topLevelObjective`, and `decompositionOutput`. |
 | `swarm.inspectSession(sessionId)` | Session state, phase, runs, result, and retryability. |
 | `swarm.retrySession(sessionId, options?)` | Retry eligible session work; options: `dryRun`, `maxWorkers`, `allowPartial`. |
-| `swarm.recoverSession(sessionId, now?)` | Recover stale child runs and return session inspection. |
+| `swarm.recover({ sessionId, ... })` | General swarm recovery; returns `SwarmRecoveryResult`. Options: `coordinatorRunId?`, `dryRun?`, `requireApproval?`. |
+| `swarm.recoverSession(sessionId, now?)` | Legacy stale active-run recovery and refreshed session inspection; retained unchanged. Use `recover` for logical swarm completion. |
 | `swarm.close()` | Release owned resources. |
 
 `SwarmSdkOptions` extends SDK options with `coordinatorSdk`, role-specific
@@ -181,6 +228,7 @@ performs final synthesis. See [orchestration types](src/orchestration.ts).
 | `orchestration.inspectExecution(executionId)` | Durable execution, stages, and optional plan. |
 | `orchestration.interruptExecution(executionId)` | Interrupt active stage runs. |
 | `orchestration.resumeExecution(executionId)` | Resume paused execution. |
+| `orchestration.recoverExecution(executionId, options?)` | Recover the saved execution using core run recovery; returns `OrchestrationRecoveryResult`. Options: `dryRun`, `requireApproval`. |
 | `orchestration.close()` | Close cached agent runners. |
 
 Creation options extend SDK options with `requestedAgentConfig` or
@@ -188,7 +236,10 @@ Creation options extend SDK options with `requestedAgentConfig` or
 `includeDiscoveredAgents`, store injections (`sessionStore`,
 `sessionRunLinkStore`, `orchestrationStore`), `catalogFingerprint`,
 `sessionIdFactory`, `now`, `concurrency`, `agentRunnerFactory`, and
-`orchestrationListener`. Concurrency has `maxConcurrentRunsPerSession` and
+`orchestrationListener`. `recoveryStaleAfterMs` defaults to 60000; recent scheduler
+activity and live leases return `busy`. Custom runners must expose
+`getRecoveryPlan` and `recoverRaw` to recover existing stage runs. Concurrency has
+`maxConcurrentRunsPerSession` and
 `failurePolicy`; built-in orchestration stores default to in-memory.
 
 Run options extend normal run options with `executionId`, `requestedAgentId`,

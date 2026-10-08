@@ -136,6 +136,81 @@ describe('SwarmSdk', () => {
   });
 });
 
+describe('SwarmSdk.recover', () => {
+  it('forwards general recovery to the core coordinator and keeps recoverSession returning an inspection', async () => {
+    const runtime = createAdaptiveAgentRuntime();
+    const coordinator = await AgentSdk.create({ agentConfig: agentConfig('coordinator'), runtime, env: testEnvironment() });
+    openSdks.push(coordinator);
+    const runStore = coordinator.created.runtime.runStore;
+    const lifecycle: string[] = [];
+    const swarm = await SwarmSdk.create({
+      coordinatorSdk: coordinator,
+      workerConfigs: [await resolvedConfig('worker')],
+      qualityConfig: await resolvedConfig('quality'),
+      synthesizerConfig: await resolvedConfig('synthesizer'),
+      lifecycleListener: (event) => lifecycle.push(`${event.phase}:${event.state}`),
+    });
+
+    const sessionId = 'session-sdk-recover';
+    const coordinatorRun = await runStore.createRun({
+      sessionId,
+      goal: 'finish the swarm',
+      status: 'running',
+      metadata: { orchestration: { kind: 'swarm', coordinatorRunId: 'pending', role: 'coordinator' } },
+    });
+    let worker = await runStore.createRun({
+      sessionId,
+      goal: 'work',
+      status: 'succeeded',
+      metadata: { orchestration: { kind: 'swarm', coordinatorRunId: coordinatorRun.id, role: 'worker', subtaskId: 'one', agentId: 'worker' } },
+    });
+    worker = await runStore.updateRun(worker.id, { result: 'done' }, worker.version);
+    const storedResult = {
+      sessionId,
+      coordinatorRunId: coordinatorRun.id,
+      status: 'succeeded',
+      output: 'final',
+      subtaskResults: [{ subtaskId: 'one', runId: worker.id, rootRunId: worker.rootRunId, status: 'succeeded', output: 'done' }],
+    };
+    const latestCoordinator = (await runStore.getRun(coordinatorRun.id))!;
+    await runStore.updateRun(coordinatorRun.id, {
+      status: 'succeeded',
+      result: storedResult,
+      metadata: {
+        orchestration: { kind: 'swarm', coordinatorRunId: coordinatorRun.id, role: 'coordinator' },
+        swarmExecution: {
+          schemaVersion: 1,
+          sessionId,
+          coordinatorRunId: coordinatorRun.id,
+          topLevelObjective: 'finish the swarm',
+          maxWorkers: 1,
+          subtasks: [{ id: 'one', subObjective: 'work', targetAgentId: 'worker' }],
+          agents: { workerAgentIds: { one: 'worker' } },
+        },
+      },
+    }, latestCoordinator.version);
+
+    await expect(swarm.recover({ sessionId, dryRun: true })).resolves.toEqual({
+      sessionId,
+      coordinatorRunId: coordinatorRun.id,
+      outcome: 'completed',
+      plans: [],
+      actions: [],
+      reason: 'Swarm session is already completed',
+      result: storedResult,
+    });
+    await expect(swarm.recover({ sessionId, requireApproval: false })).resolves.toMatchObject({ outcome: 'completed', actions: [], result: storedResult });
+    await expect(swarm.recoverSession(sessionId)).resolves.toMatchObject({ sessionId, state: 'completed', coordinatorRunId: coordinatorRun.id });
+    await expect(swarm.recover({ sessionId: 'missing-session' })).rejects.toThrow('has no runs');
+    expect(lifecycle.filter((entry) => entry.startsWith('recovery:'))).toEqual([
+      'recovery:started', 'recovery:completed',
+      'recovery:started', 'recovery:completed',
+      'recovery:started', 'recovery:failed',
+    ]);
+    await swarm.close();
+  });
+});
+
 async function resolvedConfig(id: string): Promise<ResolvedAgentSdkConfig> {
   return loadAgentSdkConfig({
     agentConfig: agentConfig(id),

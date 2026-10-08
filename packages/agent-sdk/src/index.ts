@@ -50,9 +50,11 @@ import { resolveRuntimeBundle } from './postgres-runtime.js';
 import { discoverCatalogAgentInventory, discoverCatalogDelegates, resolveToolsAndDelegates } from './tool-registry.js';
 import { agentConfigurationFingerprint, mergeMetadata, normalizeRecovery, promptText, promptYesNo } from './sdk-utils.js';
 import { resolveServerProfile } from './server-profiles.js';
+import { recoverSession, type RecoverSessionOptions, type RecoverSessionResult } from './session-recovery.js';
 
 export * from './config-types.js';
 export * from './errors.js';
+export type { RecoverSessionOptions, RecoverSessionResult } from './session-recovery.js';
 export * from './ambient.js';
 export * from './swarm-sdk.js';
 export * from './context-bundles.js';
@@ -109,6 +111,7 @@ export class AgentSdk {
   };
   private readonly clock?: () => Date;
   private unsubscribe?: () => void;
+  private recoveryOptions: AgentSdkOptions = {};
 
   private constructor(args: { created: CreatedAdaptiveAgent<RunStore, EventStore, SnapshotStore, PlanStore | undefined, ContinuationStore>; config: ResolvedAgentSdkConfig; agentPath: string; metadata: JsonObject; registeredToolNames: string[]; closeRuntime?: () => Promise<void>; authorization?: { client: GatewayClient; inferenceMode: InferenceMode; defaultTier: InferenceTier; profileRefs: ProfileRef[]; owned: boolean }; unsubscribe?: () => void; clock?: () => Date }) {
     this.created = args.created;
@@ -178,7 +181,9 @@ export class AgentSdk {
       logger,
     });
     const unsubscribe = config.events.subscribe && created.runtime.eventStore.subscribe ? created.runtime.eventStore.subscribe((event) => options.eventListener?.(event)) : undefined;
-    return new AgentSdk({ created, config, agentPath: resolved.agentPath, metadata, registeredToolNames: modules.registeredToolNames, closeRuntime: runtime.close, authorization, unsubscribe, clock: options.clock });
+    const sdk = new AgentSdk({ created, config, agentPath: resolved.agentPath, metadata, registeredToolNames: modules.registeredToolNames, closeRuntime: runtime.close, authorization, unsubscribe, clock: options.clock });
+    sdk.recoveryOptions = options;
+    return sdk;
   }
 
   async run(goal: string, options: AgentSdkRunOptions = {}): Promise<RunResult> {
@@ -205,11 +210,19 @@ export class AgentSdk {
   async retryRaw(runId: UUID): Promise<RunResult> { return this.agent.retry(runId); }
   async getRecoveryOptions(runId: UUID): Promise<RunRecoveryOptions> { return this.agent.getRecoveryOptions(runId); }
   async getRecoveryPlan(runId: UUID): Promise<RunRecoveryPlan> { return this.agent.getRecoveryPlan(runId); }
-  async recover(options: RecoverRunOptions): Promise<RecoverRunResult> {
+  async recover(options: RecoverRunOptions & { sessionId?: never }): Promise<RecoverRunResult>;
+  async recover(options: RecoverSessionOptions): Promise<RecoverSessionResult>;
+  async recover(options: RecoverRunOptions | RecoverSessionOptions): Promise<RecoverRunResult | RecoverSessionResult> {
+    if ('sessionId' in options) return recoverSession(this, options, this.recoveryOptions);
     const recovered = await this.agent.recover(options);
     return recovered.result ? { ...recovered, result: await this.resolveInteractions(recovered.result) } : recovered;
   }
-  async recoverRaw(options: RecoverRunOptions): Promise<RecoverRunResult> { return this.agent.recover(options); }
+  async recoverRaw(options: RecoverRunOptions & { sessionId?: never }): Promise<RecoverRunResult>;
+  async recoverRaw(options: RecoverSessionOptions): Promise<RecoverSessionResult>;
+  async recoverRaw(options: RecoverRunOptions | RecoverSessionOptions): Promise<RecoverRunResult | RecoverSessionResult> {
+    if ('sessionId' in options) return recoverSession(this, options, this.recoveryOptions);
+    return this.agent.recover(options);
+  }
   async createContinuationRun(options: ContinueRunOptions): Promise<ContinueRunResult> { return this.agent.createContinuationRun(options); }
   async continueRun(options: ContinueRunOptions): Promise<RunResult> { return this.resolveInteractions(await this.agent.continueRun(options)); }
   async continueRunRaw(options: ContinueRunOptions): Promise<RunResult> { return this.agent.continueRun(options); }

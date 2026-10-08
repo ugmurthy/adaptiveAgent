@@ -36,7 +36,15 @@ export class InMemoryOrchestrationStore implements OrchestrationStore {
     this.executions.set(id, next); return structuredClone(next);
   }
   async listStages(id: string): Promise<OrchestrationStage[]> { return [...(this.stages.get(id)?.values() ?? [])].sort((a,b) => a.nodeId.localeCompare(b.nodeId)).map((stage) => structuredClone(stage)); }
-  async updateStage(id: string, nodeId: string, patch: Partial<Pick<OrchestrationStage, 'status' | 'upstreamRunIds'>>, expectedVersion: number) {
+  /** Lists executions whose saved plan belongs to `sessionId`, oldest first (ties by id). */
+  async listBySession(sessionId: string): Promise<OrchestrationExecution[]> {
+    return [...this.executions.values()]
+      .filter((execution) => planSessionId(execution) === sessionId)
+      .sort(compareExecutions)
+      .map((execution) => structuredClone(execution));
+  }
+  /** `runId` may be patched when recovery moves a stage to a continuation or fresh run. */
+  async updateStage(id: string, nodeId: string, patch: OrchestrationStagePatch, expectedVersion: number) {
     const current = this.requireStage(id, nodeId);
     if (current.version !== expectedVersion) throw new OrchestrationOptimisticConcurrencyError(`Orchestration stage ${nodeId} version mismatch`);
     const now = new Date().toISOString(); const status = patch.status ?? current.status;
@@ -54,5 +62,15 @@ export class InMemoryOrchestrationStore implements OrchestrationStore {
   }
   private requireExecution(id: string) { const value = this.executions.get(id); if (!value) throw new Error(`Orchestration execution ${id} not found`); return value; }
   private requireStage(id: string, nodeId: string) { const value = this.stages.get(id)?.get(nodeId); if (!value) throw new Error(`Orchestration stage ${nodeId} not found`); return value; }
+}
+export type OrchestrationStagePatch = Partial<Pick<OrchestrationStage, 'status' | 'upstreamRunIds' | 'runId'>>;
+function planSessionId(execution: OrchestrationExecution): string | undefined {
+  const plan = execution.plan;
+  if (!plan || typeof plan !== 'object' || Array.isArray(plan)) return undefined;
+  const sessionId = (plan as Record<string, unknown>).sessionId;
+  return typeof sessionId === 'string' ? sessionId : undefined;
+}
+function compareExecutions(left: OrchestrationExecution, right: OrchestrationExecution): number {
+  return left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id);
 }
 function cloneNullable<T>(value: T | null): T | null { return value === null ? null : structuredClone(value); }

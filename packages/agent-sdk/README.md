@@ -70,6 +70,22 @@ and the allowlisted remote `web_search` and `read_web_page` tools. Agent SDK
 loads profiles and prepares requests, while core still validates and owns their
 execution semantics.
 
+## Unified programmatic recovery
+
+```ts
+const preview = await sdk.recover({ sessionId, dryRun: true });
+const recovered = await sdk.recover({ sessionId });
+```
+
+The same entry point handles ordinary runs, swarm executions, and saved catalog
+orchestration. It selects resume, retry, or a safe linked continuation through
+core, preserves completed work, and reports blocked/busy/ambiguous cases rather
+than forcing execution. Existing `sdk.recover({ runId })` remains available.
+See the [session recovery contract](API.md#unified-session-recovery) for results,
+explicit selectors, profile requirements, and approval handling. Desktop hosts
+can use the same API through bridge protocol `1.20`'s `agent/recover` RPC.
+The existing CLI `recover` command remains run-ID based.
+
 ## Init install options
 
 `adaptive-agent init` creates `~/.adaptiveAgent`, writes the default agent, and installs the built-in `core` bundle unless `--minimal` is used. Bundled assets are regular agent JSON files and skill directories copied into the configured home folders:

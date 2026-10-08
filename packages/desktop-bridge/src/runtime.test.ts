@@ -93,9 +93,9 @@ function desktopPreparationTarget(runStore: unknown, runRaw: ReturnType<typeof v
 }
 
 describe('desktop approval continuation', () => {
-  async function fixture() {
+  async function fixture(protocolVersion = '1.10') {
     const { runtime } = createRuntime();
-    await initialize(runtime);
+    await runtime.handleRpc(request({ id: 'init', method: 'initialize', params: { protocolVersion, clientInfo: { name: 'test-client' } } }));
     const decisions = new Map<string, boolean>();
     const resolveApproval = vi.fn(async (_runId: string, approvalId: string, approved: boolean) => {
       if (decisions.has(approvalId) && decisions.get(approvalId) !== approved) {
@@ -204,6 +204,26 @@ describe('desktop approval continuation', () => {
     decisions.set('historical', true);
     await expect(approve('historical')).resolves.toEqual({ runId: 'run-1', approvalId: 'historical', approved: true, resolved: true });
     expect(resumeRaw).not.toHaveBeenCalled();
+  });
+
+  it('queues approval for a recovered continuation until session recovery releases its leases', async () => {
+    const { runtime, sdk, approve, resolveApproval, resumeRaw } = await fixture('1.20');
+    let finish!: (value: unknown) => void;
+    const recoverRaw = vi.fn(() => new Promise((resolve) => { finish = resolve; }));
+    Object.assign(sdk, { recoverRaw });
+    Object.assign(sdk.created.runtime, { runStore: { getRun: async (id: string) => ({
+      id, rootRunId: id, sessionId: 'recovering-session', metadata: id === 'run-1' ? { continuationOfRunId: 'source' } : {},
+    }) } });
+    const recovery = runtime.handleRpc(request({ id: 'recover-session', method: 'agent/recover', params: { sessionId: 'recovering-session' } }));
+    await vi.waitFor(() => expect(recoverRaw).toHaveBeenCalledTimes(1));
+    const approval = approve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(resolveApproval).not.toHaveBeenCalled();
+    expect(resumeRaw).not.toHaveBeenCalled();
+    finish({ sessionId: 'recovering-session', outcome: 'blocked', plans: [], actions: [] });
+    await recovery;
+    await expect(approval).resolves.toMatchObject({ result: { status: 'success', runId: 'run-1' } });
+    expect(resumeRaw).toHaveBeenCalledExactlyOnceWith('run-1');
   });
 
   it('propagates continuation failures without replaying execution on duplicate approval', async () => {
@@ -906,7 +926,7 @@ describe('desktop runtime protocol', () => {
       params: { protocolVersion: '2.0', clientInfo: { name: 'desktop' } },
     }))).rejects.toMatchObject({
       code: 'UNSUPPORTED_PROTOCOL_VERSION',
-      data: { supportedProtocolVersions: ['1.10', '1.11', '1.12', '1.13', '1.14', '1.15', '1.16', '1.17', '1.18', '1.19'] },
+      data: { supportedProtocolVersions: ['1.10', '1.11', '1.12', '1.13', '1.14', '1.15', '1.16', '1.17', '1.18', '1.19', '1.20'] },
     });
   });
 
@@ -1581,6 +1601,49 @@ export async function execute() { return { value }; }
       id: 'recover', method: 'run/recover', params: { runId: 'failed-run', strategy: 'same_run' },
     }))).resolves.toMatchObject({ runId: 'failed-run', action: 'retry_same_run' });
     expect(recoverRaw).toHaveBeenCalledWith({ runId: 'failed-run', strategy: 'same_run' });
+  });
+
+  it('advertises unified recovery only in 1.20 and forwards session selectors, dry-run, and consent intact', async () => {
+    const old = createRuntime().runtime;
+    const oldHandshake = await old.handleRpc(request({ id: 'old', method: 'initialize', params: { protocolVersion: '1.19', clientInfo: { name: 'old' } } }));
+    expect(oldHandshake).toMatchObject({ capabilities: { methods: expect.not.arrayContaining(['agent/recover']) } });
+    await expect(old.handleRpc(request({ id: 'old-recover', method: 'agent/recover', params: { sessionId: 's' } }))).rejects.toMatchObject({ code: 'METHOD_NOT_FOUND' });
+    const { runtime } = createRuntime();
+    const handshake = await runtime.handleRpc(request({ id: 'init', method: 'initialize', params: { protocolVersion: '1.20', clientInfo: { name: 'new' } } }));
+    expect(handshake).toMatchObject({ capabilities: { methods: expect.arrayContaining(['agent/recover', 'execution/resume', 'agents/list']) } });
+    const recoverRaw = vi.fn(async () => ({ sessionId: 's', outcome: 'planned', plans: [], actions: [] }));
+    Object.assign(runtime, { sdk: { recoverRaw } });
+    const params = { sessionId: 's', executionId: 'execution', dryRun: true, requireApproval: true };
+    expect(await runtime.handleRpc(request({ id: 'recover', method: 'agent/recover', params }))).toEqual({ sessionId: 's', outcome: 'planned', plans: [], actions: [] });
+    expect(recoverRaw).toHaveBeenCalledExactlyOnceWith(params);
+  });
+
+  it('uses the unified SDK recovery API for a real failed ordinary session', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'desktop-session-recovery-'));
+    let calls = 0;
+    const model: ModelAdapter = {
+      provider: 'ollama', model: 'test', capabilities: { toolCalling: true, jsonOutput: true, streaming: false, usage: false },
+      generate: async () => { if (++calls === 1) throw new Error('Model timed out'); return { finishReason: 'stop', text: 'Recovered through the bridge' }; },
+    };
+    const sdk = await AgentSdk.create({
+      cwd, runtimeMode: 'memory', modelAdapter: model,
+      env: { ...process.env, DATABASE_URL: undefined, ADAPTIVE_AGENT_HOME: join(cwd, 'home') },
+      agentConfig: { id: 'bridge-agent', name: 'Bridge agent', invocationModes: ['run'], defaultInvocationMode: 'run', model: { provider: 'ollama', model: 'test' }, tools: [] },
+      settingsConfig: { logging: { enabled: false } },
+    });
+    const { runtime } = createRuntime();
+    try {
+      await runtime.handleRpc(request({ id: 'init', method: 'initialize', params: { protocolVersion: '1.20', clientInfo: { name: 'test' } } }));
+      Object.assign(runtime, { sdk });
+      const failed = await sdk.runRaw('Recover me', { sessionId: 'bridge-session' });
+      expect(await runtime.handleRpc(request({ id: 'plan', method: 'agent/recover', params: { sessionId: 'bridge-session', dryRun: true } }))).toMatchObject({ outcome: 'planned', plans: [{ action: 'retry_same_run' }] });
+      expect(calls).toBe(1);
+      expect(await runtime.handleRpc(request({ id: 'recover', method: 'agent/recover', params: { sessionId: 'bridge-session' } }))).toMatchObject({ outcome: 'completed', result: { runId: failed.runId, output: 'Recovered through the bridge' } });
+      expect(calls).toBe(2);
+    } finally {
+      await runtime.close();
+      await rm(cwd, { recursive: true, force: true });
+    }
   });
 
   it('exposes typed history maintenance only in protocol 1.12 with SQLite support', async () => {

@@ -13,8 +13,8 @@ object per line to stdout and reserves stderr for diagnostics. Requests may run
 concurrently, so clients must correlate responses by `id` and process
 notifications independently.
 
-The bridge currently exposes protocol `1.19` over JSON-RPC 2.0 and continues
-to accept protocols `1.10` through `1.18`. Attachment descriptors and the
+The bridge currently exposes protocol `1.20` over JSON-RPC 2.0 and continues
+to accept protocols `1.10` through `1.19`. Attachment descriptors and the
 `execution/*` envelope require explicit `1.13` or later negotiation. There is no
 legacy custom-envelope compatibility: every request must use JSON-RPC,
 including before initialization.
@@ -25,7 +25,7 @@ Protocol versions are intentionally strings. In JSON, numeric values such as
 At startup the bridge emits this JSON-RPC notification:
 
 ```json
-{"jsonrpc":"2.0","method":"runtime/ready","params":{"protocolVersion":"1.19","bridgeVersion":"0.1.0","pid":1234}}
+{"jsonrpc":"2.0","method":"runtime/ready","params":{"protocolVersion":"1.20","bridgeVersion":"0.1.0","pid":1234}}
 ```
 
 ## Versioned protocol capabilities
@@ -37,6 +37,7 @@ saving. Protocol `1.16` adds reading, archiving, and restoring agent profiles.
 Protocol `1.17` adds managed image and audio attachments. Protocol `1.18` adds
 metadata-only agent discovery through `agents/list`. Protocol `1.19` adds
 generator-agent, ID, provider, and model controls to `agent/createDraft`.
+Protocol `1.20` adds unified run/session recovery through `agent/recover`.
 
 ### Agent discovery and selection
 
@@ -77,13 +78,13 @@ The first JSON-RPC request must negotiate the protocol. Once successful, the
 connection is sticky: subsequent input and agent events use JSON-RPC only.
 
 ```json
-{"jsonrpc":"2.0","id":"initialize","method":"initialize","params":{"protocolVersion":"1.19","clientInfo":{"name":"adaptive-agent-desktop","version":"1.0.0"},"capabilities":{}}}
+{"jsonrpc":"2.0","id":"initialize","method":"initialize","params":{"protocolVersion":"1.20","clientInfo":{"name":"adaptive-agent-desktop","version":"1.0.0"},"capabilities":{}}}
 ```
 
 The result advertises supported methods, notifications, and CLI commands:
 
 ```json
-{"jsonrpc":"2.0","id":"initialize","result":{"protocolVersion":"1.19","bridgeVersion":"0.1.0","serverInfo":{"name":"@adaptive-agent/desktop-bridge","version":"0.1.0"},"capabilities":{"methods":["initialize","agents/list","catalog/inspect","runtime/initialize","runtime/info","runtime/shutdown","settings/update","auth/updateAccessToken","agent/run","agent/chat","run/resume","run/retry","run/recover","run/continue","run/interrupt","run/delete","run/inspect","run/replay","run/steer","execution/inspect","execution/interrupt","execution/resume","interaction/resolveApproval","interaction/resolveClarification","history/previewDeletion","history/delete","agent/createDraft","agent/validateConfig","agent/saveConfig","agent/readConfig","agent/archiveConfig","agent/restoreConfig","cli/commands","cli/execute"],"notifications":["runtime/ready","agent/event","cli/output"]}}}
+{"jsonrpc":"2.0","id":"initialize","result":{"protocolVersion":"1.20","bridgeVersion":"0.1.0","serverInfo":{"name":"@adaptive-agent/desktop-bridge","version":"0.1.0"},"capabilities":{"methods":["initialize","agents/list","catalog/inspect","runtime/initialize","runtime/info","runtime/shutdown","settings/update","auth/updateAccessToken","agent/run","agent/chat","agent/recover","run/resume","run/retry","run/recover","run/continue","run/interrupt","run/delete","run/inspect","run/replay","run/steer","execution/inspect","execution/interrupt","execution/resume","interaction/resolveApproval","interaction/resolveClarification","history/previewDeletion","history/delete","agent/createDraft","agent/validateConfig","agent/saveConfig","agent/readConfig","agent/archiveConfig","agent/restoreConfig","cli/commands","cli/execute"],"notifications":["runtime/ready","agent/event","cli/output"]}}}
 ```
 
 Initialize the persistent agent runtime separately. This allows setup,
@@ -147,7 +148,8 @@ steering, and in-memory run state.
 | `auth/updateAccessToken` | `accessToken` | - |
 | `agent/run` | `goal` | `sessionId`, `input`, `inferenceMode`, `inferenceTier`, `profileRef` |
 | `agent/chat` | `message` | `sessionId`, `inferenceMode`, `inferenceTier`, `profileRef` |
-| `run/resume` | `runId` | `allowConfigurationDrift` (protocol 1.19 only; explicit confirmation for non-gateway runs with a changed resolved profile) |
+| `agent/recover` | Exactly one of `sessionId`, `runId` | `dryRun`, `requireApproval`; session-only `executionId` or `coordinatorRunId`; run-only `strategy` (protocol 1.20+) |
+| `run/resume` | `runId` | `allowConfigurationDrift` (protocol 1.19+; explicit confirmation for non-gateway runs with a changed resolved profile) |
 | `run/retry` | `runId` | - |
 | `run/recover` | `runId` | `strategy` (`auto`, `resume`, `retry`, `continue`), `dryRun` |
 | `run/continue` | `runId` | - |
@@ -160,6 +162,38 @@ steering, and in-memory run state.
 | `interaction/resolveClarification` | `runId`, `answer` | - |
 | `cli/commands` | - | - |
 | `cli/execute` | `argv` | `stdin`, `timeoutMs` (maximum 24 hours) |
+
+### Unified recovery
+
+Negotiate `1.20` and call `agent/recover` after runtime initialization:
+
+```json
+{"jsonrpc":"2.0","id":"recover-preview","method":"agent/recover","params":{"sessionId":"session-1","dryRun":true}}
+{"jsonrpc":"2.0","id":"recover","method":"agent/recover","params":{"sessionId":"session-1"}}
+```
+
+The session form forwards to `AgentSdk.recoverRaw({ sessionId })` for ordinary
+runs, swarm executions, and catalog orchestration. It returns `sessionId`,
+`outcome`, `plans`, `actions`, and optional `target`, `result`, `reason`, and
+`candidates`. Outcomes are `planned`, `completed`, `failed`, `blocked`, `busy`,
+`ambiguous`, or `not_found`. Completed work is not re-executed; successful
+independent workers/stages are retained. Ambiguous unfinished objectives require
+an explicit `runId` (instead of `sessionId`), or a session-scoped `executionId`
+or `coordinatorRunId`. Session recovery always chooses strategies automatically.
+
+Pending approvals, clarification, configuration drift, cancellation, exhausted
+budgets, and uncertain tool effects are not overridden. `requireApproval` grants
+continuation consent only; resolve tool approvals through the interaction RPCs.
+Same-session recovery requests serialize; approvals for recovered workers/stages
+and new continuation runs wait for the recovery RPC to unwind and release leases.
+Dry runs invoke no models and mutate no durable execution state.
+
+The `runId` form retains `RecoverRunResult` behavior (`getRecoveryPlan` on dry
+run) and resolves the historical run's profile. Existing `run/recover` and other
+low-level methods remain available, including to clients on older protocols.
+See the [SDK session recovery contract](../agent-sdk/API.md#unified-session-recovery)
+for profile availability and persistence requirements. This RPC does not add a
+desktop UI control; hosts must negotiate the capability and wire their own action.
 
 ### Approval continuation
 
@@ -353,7 +387,7 @@ ids may be strings or finite numbers and are echoed without coercion.
 ```sh
 bun run compile
 printf '%s\n' \
-  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1.19","clientInfo":{"name":"smoke"}}}' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1.20","clientInfo":{"name":"smoke"}}}' \
   '{"jsonrpc":"2.0","id":2,"method":"cli/execute","params":{"argv":["--version"]}}' \
   | dist/agent-runtime
 ```

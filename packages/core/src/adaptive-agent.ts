@@ -1523,6 +1523,19 @@ export class AdaptiveAgent {
       };
     }
 
+    const continuations = await this.options.continuationStore?.listBySourceRun(runId) ?? [];
+    if (continuations.length > 0) {
+      if (continuations.length !== 1) {
+        return { runId, status: run.status, action: 'requires_user_action', executable: false, reason: `Run ${runId} has multiple continuations; choose the intended run explicitly` };
+      }
+      const continuation = await this.refreshRun(continuations[0]!.continuationRunId);
+      const next = continuation.status === 'succeeded' ? undefined : await this.getRecoveryPlan(continuation.id);
+      return {
+        runId, status: run.status, action: 'continue_new_run', executable: next?.executable ?? true,
+        reason: next?.reason ?? `Continuation ${continuation.id} already succeeded; reuse its stored result`,
+      };
+    }
+
     const retryability = await this.getRetryability(runId);
     if (retryability.retryable) {
       return {
@@ -1620,16 +1633,25 @@ export class AdaptiveAgent {
     }
 
     if (action === 'continue_new_run') {
-      return {
-        runId: options.runId,
-        action,
-        plan,
-        result: await this.continueRun({
-          fromRunId: options.runId,
-          requireApproval: options.requireApproval,
-          metadata: options.metadata,
-        }),
-      };
+      // Serialize creation at the source boundary and reuse persisted lineage after a restart.
+      await this.acquireLeaseOrThrow(options.runId);
+      try {
+        const continuations = await this.options.continuationStore?.listBySourceRun(options.runId) ?? [];
+        if (continuations.length > 1) throw new Error(`Run ${options.runId} has multiple continuations; choose a run explicitly`);
+        const continuation = continuations[0];
+        let result: RunResult;
+        if (continuation) {
+          const existing = await this.refreshRun(continuation.continuationRunId);
+          result = existing.status === 'succeeded'
+            ? await this.resume(existing.id)
+            : (await this.recover({ ...options, runId: existing.id, strategy: 'auto' })).result!;
+        } else {
+          result = await this.continueRun({ fromRunId: options.runId, requireApproval: options.requireApproval, metadata: options.metadata });
+        }
+        return { runId: options.runId, action, plan, result };
+      } finally {
+        await this.releaseLeaseQuietly(options.runId);
+      }
     }
 
     throw new Error(plan.reason);
