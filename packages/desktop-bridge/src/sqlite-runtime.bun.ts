@@ -7,6 +7,7 @@ import { join, resolve } from 'node:path';
 import { Database } from 'bun:sqlite';
 import { expect, it } from 'bun:test';
 import { SignJWT } from 'jose';
+import { openSqliteRuntimeStores } from '@adaptive-agent/core';
 import {
   GatewayService,
   InMemoryBillingStore,
@@ -66,6 +67,75 @@ it('defaults the desktop runtime to SQLite and points CLI children at the initia
       argv: ['inspect', 'run-1', '--output', 'json', '--runtime', 'sqlite'],
       environment: { ADAPTIVE_AGENT_SQLITE_PATH: sqlitePath },
     });
+  } finally {
+    await runtime.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+it.each(['run/interrupt', 'execution/interrupt'] as const)('allows deletion after failed historical recovery through %s despite profile drift', async (method) => {
+  const directory = await mkdtemp(join(tmpdir(), 'desktop-history-delete-'));
+  const agentPath = join(directory, 'agent.json');
+  const settingsPath = join(directory, 'agent.settings.json');
+  const sqlitePath = join(directory, 'desktop.sqlite');
+  const runId = crypto.randomUUID();
+  const unrelatedRunId = crypto.randomUUID();
+  const runtime = new DesktopRuntime(() => undefined);
+
+  try {
+    await writeFile(agentPath, JSON.stringify({
+      id: 'historical-agent', name: 'Changed Historical Agent',
+      invocationModes: ['run'], defaultInvocationMode: 'run',
+      model: { provider: 'ollama', model: 'historical-model' }, tools: [],
+    }));
+    await writeFile(settingsPath, '{}');
+    const stores = await openSqliteRuntimeStores({ path: sqlitePath });
+    try {
+      await stores.runStore.createRun({
+        id: runId, goal: 'Historical run awaiting approval', status: 'awaiting_approval',
+        modelProvider: 'ollama', modelName: 'historical-model',
+        metadata: {
+          agentId: 'historical-agent', agentConfigPath: agentPath,
+          agentConfigurationFingerprint: 'previous-profile-fingerprint',
+        },
+      });
+      await stores.runStore.createRun({ id: unrelatedRunId, goal: 'Keep this run', status: 'succeeded' });
+    } finally {
+      await stores.close();
+    }
+
+    await runtime.handleRpc(request({
+      id: 'initialize', method: 'initialize',
+      params: { protocolVersion: '1.20', clientInfo: { name: 'history-delete-test' } },
+    }));
+    await runtime.handleRpc(request({
+      id: 'runtime', method: 'runtime/initialize',
+      params: { cwd: directory, agentConfigPath: agentPath, settingsConfigPath: settingsPath, runtimeMode: 'sqlite', sqlitePath, inferenceMode: 'byok' },
+    }));
+
+    await expect(runtime.handleRpc(request({
+      id: 'recover', method: 'run/recover', params: { runId },
+    }))).rejects.toMatchObject({ code: 'RUN_CONFIGURATION_DRIFT' });
+    await expect(runtime.handleRpc(request({
+      id: 'delete-blocked', method: 'run/delete', params: { runId },
+    }))).rejects.toMatchObject({ code: 'RUN_NOT_TERMINAL' });
+
+    const interrupt = method === 'run/interrupt'
+      ? request({ id: 'interrupt', method, params: { runId } })
+      : request({ id: 'interrupt', method, params: { executionId: runId } });
+    await expect(runtime.handleRpc(interrupt)).resolves.toMatchObject({ interrupted: true });
+    await expect(runtime.handleRpc(request({
+      id: 'inspect-interrupted', method: 'run/inspect', params: { runId },
+    }))).resolves.toMatchObject({ run: { id: runId, status: 'interrupted' } });
+    await expect(runtime.handleRpc(request({
+      id: 'delete', method: 'run/delete', params: { runId },
+    }))).resolves.toEqual({ deleted: true, rootRunId: runId });
+    await expect(runtime.handleRpc(request({
+      id: 'inspect-deleted', method: 'run/inspect', params: { runId },
+    }))).resolves.toMatchObject({ run: null, events: [] });
+    await expect(runtime.handleRpc(request({
+      id: 'inspect-unrelated', method: 'run/inspect', params: { runId: unrelatedRunId },
+    }))).resolves.toMatchObject({ run: { id: unrelatedRunId, status: 'succeeded' } });
   } finally {
     await runtime.close();
     await rm(directory, { recursive: true, force: true });

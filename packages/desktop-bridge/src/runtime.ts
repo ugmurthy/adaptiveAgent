@@ -420,7 +420,7 @@ export class DesktopRuntime {
           await (await this.catalogOrchestration(id)).interruptExecution(id);
           return { executionId: id, interrupted: true };
         }
-        await (await this.sdkForRun(id)).interrupt(asRunId(id));
+        await this.requireSdk().interrupt(asRunId(id));
         return { executionId: id, interrupted: true };
       }
       case 'execution/resume': {
@@ -463,7 +463,8 @@ export class DesktopRuntime {
         }));
       }
       case 'run/interrupt':
-        await (await this.sdkForRun(request.params!.runId)).interrupt(asRunId(request.params!.runId));
+        // Interruption uses shared runtime stores, not historical profile execution.
+        await this.requireSdk().interrupt(asRunId(request.params!.runId));
         return { runId: request.params!.runId, interrupted: true };
       case 'run/delete':
         return this.deleteRun(request.params!.runId);
