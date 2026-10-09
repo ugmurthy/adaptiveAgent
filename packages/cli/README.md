@@ -11,6 +11,14 @@
 - **Inspectable orchestration:** specialist assignments and routing decisions
   are recorded with durable runs; a JEV study command compares prompt or
   persisted-session routing cases.
+- **Unified session recovery:** SDK and desktop bridge hosts can recover
+  ordinary runs, swarms, and saved orchestration through one entry point,
+  preserving completed work and surfacing cases that need user action.
+- **Historical configuration evidence:** inspect persisted session model,
+  profile, and snapshot settings with `trace-session settings session`,
+  without confusing current profile files with historical configuration.
+- **Lower-memory model streaming:** built-in adapters no longer retain raw
+  stream chunks; generation and output repair share runtime execution policy.
 
 See the [changelog](CHANGELOG.md) for the full update and the configuration
 examples below for [JEV selection](#typesafe-jev-agent-selection) and
@@ -164,19 +172,24 @@ bun run jev-routing-study history --limit 10
 ```
 
 It uses `./agent.settings.json` by default, including the configured TypeSafe
-model and selection policy. If those settings do not specify a SQLite path,
-history defaults to `~/.adaptiveAgent/desktop.sqlite`. Use `--policy <path>`
+model and selection policy. With `executionRouting.mode: "adaptive"`, the study
+uses the Agent SDK's opt-in staged TypeSafe path: decide execution mode first,
+then evaluate only direct profile selection or orchestration assignments. The
+exact state and question shapes, with direct and orchestration examples, are
+documented in [Staged TypeSafe Routing Requests](JEV-STAGED-ROUTING-REQUESTS.md).
+CLI and desktop bridge default to combined routing and can opt into staged
+routing with `agentSelection.typesafe.routingStrategy: "staged"`. JSON
+results include the mode, primary profile, assignments, per-stage scores and
+usage; table mode shows the existing/studied mode pair. Each staged evaluation
+can make two paid calls; `--repeat` multiplies both. If those settings do not
+specify a SQLite path, history defaults to `~/.adaptiveAgent/desktop.sqlite`.
+Use `--policy <path>`
 for a study-only policy, `--output json|jsonl` for machine-readable results,
-and `--show-state` or `--show-response` for diagnostics. `--limit` searches the
-newest sessions, including those without agent selection. It studies execution
-runs, or uses a persisted original objective from setup when execution never
-started; sessions with no usable objective appear as skipped errors rather than
-disappearing. Persisted JEV decisions (accepted or rejected) are reported without
-another evaluation, with `*` in the table status column. Use `--force-jev` to
-reevaluate and bypass the study cache; `--refresh` bypasses only the JSONL study
-cache, not persisted decisions. Runs without linked selector inputs use the
-current catalog by default and are marked `approx`; pass
-`--no-allow-current-catalog` to require exact context for reevaluation. The table's
+and `--show-state` or `--show-response` for diagnostics. Historical cases
+without linked selector inputs use the current catalog by default and are
+marked `approx`; pass `--no-allow-current-catalog` to require exact context.
+Adaptive history re-evaluates even persisted single-profile JEV decisions,
+because those are not staged-routing results. The table's
 `modalities` column uses `I`, `A`, and `F` for image, audio, and file (`-` for
 text-only). Latency, token, and cost pairs are existing/JEV; JEV latency is
 client wall-clock time and JEV cost is an input-token estimate at the
@@ -252,11 +265,11 @@ validated specialist orchestration, opt in explicitly:
   },
   "executionRouting": {
     "mode": "adaptive",
-    "maxSpecialists": 4,
-    "lowConfidenceFallback": "error"
+    "maxSpecialists": 4
   },
   "agentSelection": {
     "engine": "typesafe",
+    "lowConfidenceFallback": "error",
     "typesafe": {
       "model": "jev-latest",
       "apiKeyEnv": "TYPESAFE_API_KEY",
@@ -289,9 +302,25 @@ and per-modality choices independently of the legacy single-agent
 `policy.selection.instructions`; `selection.candidateCriteria` remains common
 guidance for candidate choices.
 
-`lowConfidenceFallback` defaults to `error`. Setting it to `direct` uses the
-configured profile only when that profile supports every input modality;
-otherwise the request still fails. Explicit `--agent` remains fixed. Explicit
+CLI and desktop-bridge can opt into mode-first TypeSafe routing by adding
+`"routingStrategy": "staged"` to `agentSelection.typesafe` while keeping
+`agent.mode: "auto"` and `executionRouting.mode: "adaptive"`. The shared Agent SDK
+decision path then asks for execution mode first, followed by single-profile
+selection or modality-based orchestration assignments. Omission or `"combined"`
+preserves the existing request. Update/rebuild the SDK and restart the client
+after changing settings. See [Staged TypeSafe Routing Requests](JEV-STAGED-ROUTING-REQUESTS.md)
+for full request examples, rollout, rollback, and per-stage diagnostics.
+
+On a TypeSafe selection or routing confidence/relevance threshold failure,
+Agent SDK asks `agentSelection.agent` to make the same kind of decision, or
+fails if it is absent. Set `agentSelection.lowConfidenceFallback` to `error`
+to disable this fallback explicitly, or `agent` to require a configured selector
+at settings validation time. Missing credentials, malformed answers, and invalid
+routing decisions still fail rather than silently falling back. The older
+`executionRouting.lowConfidenceFallback: "direct"` remains readable for the
+`agent` engine's adaptive routing; TypeSafe configurations using it must migrate
+to `agentSelection.agent` or explicit `lowConfidenceFallback: "error"`.
+Explicit `--agent` remains fixed. Explicit
 `--orchestrate` remains a force override and preserves deterministic Phase 1
 routing. Without `executionRouting.mode: "adaptive"`, ordinary single-profile
 selection is unchanged.
@@ -397,15 +426,26 @@ a generative selector agent. Set `TYPESAFE_API_KEY` (or configure another
   "agents": { "dirs": ["./agents"] },
   "agentSelection": {
     "engine": "typesafe",
+    "agent": "agent-selector",
+    "lowConfidenceFallback": "agent",
     "typesafe": {
       "model": "jev-1.13.0",
       "apiKeyEnv": "TYPESAFE_API_KEY",
       "policyPath": "./agent-routing-policy.json",
       "timeoutMs": 10000
     }
-  }
+  },
+  "executionRouting": { "mode": "adaptive", "maxSpecialists": 4 },
+  "taskPreparation": { "mode": "auto", "agent": "task-preparer" }
 }
 ```
+
+Here `agentSelection.agent` is a tool-free selector/router used only on a
+low-confidence TypeSafe decision; `taskPreparation.agent` separately prepares
+the task after the execution profile and shape have been chosen. The policy
+file contains `relevance`, `selection`, `routing`, `minimumConfidence`, and
+`minimumRelevance` as shown below. Alternatively place that object inline at
+`agentSelection.typesafe.policy`, but do not set both `policy` and `policyPath`.
 
 The policy file controls both JEV questions and the confidence gates without a
 code change:
@@ -433,7 +473,13 @@ not set both `policy` and `policyPath`. Before calling JEV, the CLI removes
 profiles that do not declare support for every supplied image, file, or audio
 modality. The JEV request contains the prompt, attachment modality names and
 counts, and safe profile summaries; it does not contain attachment paths or
-contents. Selection fails closed when either configured threshold is missed.
+contents. An explicit policy replaces the built-in policy rather than merging
+with it: omitted question guidance is not inherited, and only thresholds
+specified in the policy are enforced. With no policy, the built-in guidance
+and 0.5 confidence/relevance thresholds apply. The desktop bridge uses the
+same policy for automatic runs; an exact desktop profile selection remains fixed.
+When either configured threshold is missed, the configured selector agent can
+make the decision; without that fallback, selection fails closed.
 
 Use `chat` for an interactive conversation, or provide the first message on
 the command line:
@@ -633,6 +679,34 @@ adaptive-agent recover <runId> --dry-run
 adaptive-agent recover <runId>
 ```
 
+### Recover a session from an SDK or desktop host
+
+Programmatic hosts can recover ordinary runs, swarms, and saved catalog
+orchestration with the same SDK entry point:
+
+```ts
+const preview = await sdk.recover({ sessionId, dryRun: true });
+const recovery = await sdk.recover({ sessionId });
+
+if (recovery.outcome === 'completed') console.log(recovery.result);
+else console.log(recovery.outcome, recovery.reason);
+```
+
+Recovery preserves successful independent workers/stages and reuses persisted
+continuations. It reports blocked, busy, or ambiguous cases rather than
+bypassing pending approvals, clarification, changed configurations, or uncertain
+tool effects. Dry runs invoke no models and change no durable execution state.
+Use the original runtime stores and keep the referenced profiles available;
+SQLite or Postgres is required across process restarts.
+
+Desktop hosts can negotiate bridge protocol `1.20` and call `agent/recover`
+after runtime initialization. This is a host API, not a new desktop UI control;
+the CLI `recover` command still takes a run ID. See the
+[SDK recovery contract](packages/agent-sdk/API.md#unified-session-recovery) for
+explicit selectors and approval handling, and the
+[bridge protocol](packages/desktop-bridge/README.md#unified-recovery) for RPC
+examples.
+
 Use `agent-create` to generate an agent profile from a description. It previews
 the generated profile and asks for confirmation before writing it:
 
@@ -781,6 +855,7 @@ bun run core:test
 bun run agent:build
 bun run trace-session list traces --limit 20
 bun run trace-session view run <run-id>
+bun run trace-session settings session <session-id> --json
 bun run trace-session compare <baseline-run-id> <candidate-run-id>
 bun run trace-session aggregate model --since 7d
 bun run trace-workbench:dev
@@ -793,3 +868,12 @@ keeps model/tool output cost separate from external tool-provider cost. See
 [`packages/trace-session/README.md`](packages/trace-session/README.md) for the
 report model, investigation workflow, cache controls, and complete command
 examples.
+
+`trace-session settings session <session-id>` reads persisted model fields,
+profile identity/path/fingerprint, execution context, initial snapshot system
+messages/output schema, and latest snapshot tool visibility for root and child
+runs. It never reads current profile files. Reconstruction is partial, not a
+runnable configuration export: limits, retry policies, and full tool/profile
+definitions were not archived, and null means unavailable rather than a
+default. Review system messages and execution context for sensitive data before
+sharing the report.

@@ -11,6 +11,14 @@
 - **Inspectable orchestration:** specialist assignments and routing decisions
   are recorded with durable runs; a JEV study command compares prompt or
   persisted-session routing cases.
+- **Unified session recovery:** SDK and desktop bridge hosts can recover
+  ordinary runs, swarms, and saved orchestration through one entry point,
+  preserving completed work and surfacing cases that need user action.
+- **Historical configuration evidence:** inspect persisted session model,
+  profile, and snapshot settings with `trace-session settings session`,
+  without confusing current profile files with historical configuration.
+- **Lower-memory model streaming:** built-in adapters no longer retain raw
+  stream chunks; generation and output repair share runtime execution policy.
 
 See the [changelog](CHANGELOG.md) for the full update and the configuration
 examples below for [JEV selection](#typesafe-jev-agent-selection) and
@@ -169,7 +177,8 @@ uses the Agent SDK's opt-in staged TypeSafe path: decide execution mode first,
 then evaluate only direct profile selection or orchestration assignments. The
 exact state and question shapes, with direct and orchestration examples, are
 documented in [Staged TypeSafe Routing Requests](JEV-STAGED-ROUTING-REQUESTS.md).
-CLI and desktop bridge still use their existing combined routing path. JSON
+CLI and desktop bridge default to combined routing and can opt into staged
+routing with `agentSelection.typesafe.routingStrategy: "staged"`. JSON
 results include the mode, primary profile, assignments, per-stage scores and
 usage; table mode shows the existing/studied mode pair. Each staged evaluation
 can make two paid calls; `--repeat` multiplies both. If those settings do not
@@ -469,7 +478,8 @@ with it: omitted question guidance is not inherited, and only thresholds
 specified in the policy are enforced. With no policy, the built-in guidance
 and 0.5 confidence/relevance thresholds apply. The desktop bridge uses the
 same policy for automatic runs; an exact desktop profile selection remains fixed.
-Selection fails closed when either configured threshold is missed.
+When either configured threshold is missed, the configured selector agent can
+make the decision; without that fallback, selection fails closed.
 
 Use `chat` for an interactive conversation, or provide the first message on
 the command line:
@@ -669,6 +679,34 @@ adaptive-agent recover <runId> --dry-run
 adaptive-agent recover <runId>
 ```
 
+### Recover a session from an SDK or desktop host
+
+Programmatic hosts can recover ordinary runs, swarms, and saved catalog
+orchestration with the same SDK entry point:
+
+```ts
+const preview = await sdk.recover({ sessionId, dryRun: true });
+const recovery = await sdk.recover({ sessionId });
+
+if (recovery.outcome === 'completed') console.log(recovery.result);
+else console.log(recovery.outcome, recovery.reason);
+```
+
+Recovery preserves successful independent workers/stages and reuses persisted
+continuations. It reports blocked, busy, or ambiguous cases rather than
+bypassing pending approvals, clarification, changed configurations, or uncertain
+tool effects. Dry runs invoke no models and change no durable execution state.
+Use the original runtime stores and keep the referenced profiles available;
+SQLite or Postgres is required across process restarts.
+
+Desktop hosts can negotiate bridge protocol `1.20` and call `agent/recover`
+after runtime initialization. This is a host API, not a new desktop UI control;
+the CLI `recover` command still takes a run ID. See the
+[SDK recovery contract](packages/agent-sdk/API.md#unified-session-recovery) for
+explicit selectors and approval handling, and the
+[bridge protocol](packages/desktop-bridge/README.md#unified-recovery) for RPC
+examples.
+
 Use `agent-create` to generate an agent profile from a description. It previews
 the generated profile and asks for confirmation before writing it:
 
@@ -817,6 +855,7 @@ bun run core:test
 bun run agent:build
 bun run trace-session list traces --limit 20
 bun run trace-session view run <run-id>
+bun run trace-session settings session <session-id> --json
 bun run trace-session compare <baseline-run-id> <candidate-run-id>
 bun run trace-session aggregate model --since 7d
 bun run trace-workbench:dev
@@ -829,3 +868,12 @@ keeps model/tool output cost separate from external tool-provider cost. See
 [`packages/trace-session/README.md`](packages/trace-session/README.md) for the
 report model, investigation workflow, cache controls, and complete command
 examples.
+
+`trace-session settings session <session-id>` reads persisted model fields,
+profile identity/path/fingerprint, execution context, initial snapshot system
+messages/output schema, and latest snapshot tool visibility for root and child
+runs. It never reads current profile files. Reconstruction is partial, not a
+runnable configuration export: limits, retry policies, and full tool/profile
+definitions were not archived, and null means unavailable rather than a
+default. Review system messages and execution context for sensitive data before
+sharing the report.

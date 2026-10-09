@@ -4,7 +4,19 @@ All notable changes to this project will be documented in this file.
 
 This project follows semantic versioning for release notes.
 
-## Unreleased
+## [0.1.50] - 2026-10-09
+
+### Added
+
+- Added read-only `trace-session settings session <sessionId>` inspection for
+  SQLite and Postgres, exposing persisted model, profile, execution-context,
+  and snapshot evidence without reading current profile files. Reports are
+  explicitly partial, not runnable configuration exports.
+- Added unified programmatic session recovery through Agent SDK
+  `recover({ sessionId })` and desktop bridge protocol `1.20`'s `agent/recover`.
+  Recovery routes ordinary runs, swarms, and saved catalog orchestration to
+  their owners, preserves completed work, supports dry-run planning, and
+  reports blocked, busy, or ambiguous work instead of forcing execution.
 
 ### Changed
 
@@ -26,6 +38,17 @@ This project follows semantic versioning for release notes.
   wait and earlier failed attempts. Retry events no longer include request-byte
   telemetry; successful response events still do.
 
+### Fixed
+
+- Fixed desktop bridge approval handling to await same-run continuation and
+  return its result with the acknowledgement. Root/child execution operations
+  are serialized, and durable approval events prevent duplicate continuation.
+- Reused persisted continuation links during automatic recovery rather than
+  creating another branch; saved orchestration records retain continuation run
+  IDs and updated downstream inputs.
+- Allowed desktop bridge run interruption despite historical profile drift,
+  so blocked non-terminal runs can be interrupted and then deleted.
+
 ### Compatibility
 
 - Mesh no longer populates the optional `rawProviderResponse` with raw chunks.
@@ -34,8 +57,12 @@ This project follows semantic versioning for release notes.
   the same admission and HTTP retry policy as the base HTTP adapter.
 - Gateway streaming exposes the existing protocol's events; it does not add
   reasoning deltas or change the wire protocol or durable replay contracts.
+- Custom orchestration stores must implement `listBySession(sessionId)` and
+  support stage `runId` updates for session recovery. Built-in stores require
+  no database migration. The CLI `recover` command remains run-ID based;
+  desktop hosts must negotiate protocol `1.20` to use `agent/recover`.
 
-## [0.1.49] - 2026-09-27## Unreleased
+## [0.1.49] - 2026-09-27
 
 ### Added
 
