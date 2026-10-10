@@ -48,7 +48,7 @@ import { resolveAgentSdkConfig, resolveAgentSdkConfigWithSources } from './confi
 import { groundTruthSystemInstructions, mergeGroundTruthContext } from './ground-truth-context.js';
 import { resolveRuntimeBundle } from './postgres-runtime.js';
 import { discoverCatalogAgentInventory, discoverCatalogDelegates, resolveToolsAndDelegates } from './tool-registry.js';
-import { agentConfigurationFingerprint, mergeMetadata, normalizeRecovery, promptText, promptYesNo } from './sdk-utils.js';
+import { agentConfigurationFingerprint, mergeMetadata, normalizeRecovery } from './sdk-utils.js';
 import { resolveServerProfile } from './server-profiles.js';
 import { recoverSession, type RecoverSessionOptions, type RecoverSessionResult } from './session-recovery.js';
 
@@ -112,7 +112,7 @@ export class AgentSdk {
   };
   private readonly clock?: () => Date;
   private unsubscribe?: () => void;
-  private recoveryOptions: AgentSdkOptions = {};
+  private options: AgentSdkOptions = {};
 
   private constructor(args: { created: CreatedAdaptiveAgent<RunStore, EventStore, SnapshotStore, PlanStore | undefined, ContinuationStore>; config: ResolvedAgentSdkConfig; agentPath: string; metadata: JsonObject; registeredToolNames: string[]; closeRuntime?: () => Promise<void>; authorization?: { client: GatewayClient; inferenceMode: InferenceMode; defaultTier: InferenceTier; profileRefs: ProfileRef[]; owned: boolean }; unsubscribe?: () => void; clock?: () => Date }) {
     this.created = args.created;
@@ -183,7 +183,7 @@ export class AgentSdk {
     });
     const unsubscribe = config.events.subscribe && created.runtime.eventStore.subscribe ? created.runtime.eventStore.subscribe((event) => options.eventListener?.(event)) : undefined;
     const sdk = new AgentSdk({ created, config, agentPath: resolved.agentPath, metadata, registeredToolNames: modules.registeredToolNames, closeRuntime: runtime.close, authorization, unsubscribe, clock: options.clock });
-    sdk.recoveryOptions = options;
+    sdk.options = options;
     return sdk;
   }
 
@@ -214,14 +214,14 @@ export class AgentSdk {
   async recover(options: RecoverRunOptions & { sessionId?: never }): Promise<RecoverRunResult>;
   async recover(options: RecoverSessionOptions): Promise<RecoverSessionResult>;
   async recover(options: RecoverRunOptions | RecoverSessionOptions): Promise<RecoverRunResult | RecoverSessionResult> {
-    if ('sessionId' in options) return recoverSession(this, options, this.recoveryOptions);
+    if ('sessionId' in options) return recoverSession(this, options, this.options);
     const recovered = await this.agent.recover(options);
     return recovered.result ? { ...recovered, result: await this.resolveInteractions(recovered.result) } : recovered;
   }
   async recoverRaw(options: RecoverRunOptions & { sessionId?: never }): Promise<RecoverRunResult>;
   async recoverRaw(options: RecoverSessionOptions): Promise<RecoverSessionResult>;
   async recoverRaw(options: RecoverRunOptions | RecoverSessionOptions): Promise<RecoverRunResult | RecoverSessionResult> {
-    if ('sessionId' in options) return recoverSession(this, options, this.recoveryOptions);
+    if ('sessionId' in options) return recoverSession(this, options, this.options);
     return this.agent.recover(options);
   }
   async createContinuationRun(options: ContinueRunOptions): Promise<ContinueRunResult> { return this.agent.createContinuationRun(options); }
@@ -336,14 +336,16 @@ export class AgentSdk {
           await this.agent.resolveApproval(result.runId, result.approvalId, true);
           result = await this.agent.resume(result.runId);
         } else {
-          const approved = await promptYesNo(`Approve tool "${result.toolName}"? [y/N] `);
+          if (!this.options.onApproval) return result as T;
+          const approved = await this.options.onApproval(result);
           await this.agent.resolveApproval(result.runId, result.approvalId, approved);
           result = await this.agent.resume(result.runId);
         }
         continue;
       }
       if (this.config.interaction.clarificationMode === 'fail') throw new Error(`Run ${result.runId} requested clarification: ${result.message}`);
-      const answer = await promptText(`${result.message}\nClarification answer: `);
+      if (!this.options.onClarification) return result as T;
+      const answer = await this.options.onClarification(result);
       result = await this.agent.resolveClarification(result.runId, answer);
     }
     return result as T;

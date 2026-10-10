@@ -129,3 +129,61 @@ declares that prerequisite. Setup itself was syntax-checked, not rerun, to avoid
 restarting or migrating the existing database. Release scripts restore generated
 source metadata after building. Non-Linux binaries were built but not executed;
 the packaged Tauri GUI was not manually exercised.
+
+## Phase 2 result
+
+Branch: `reorg/phase-2-host-neutral-sdk`, stacked on `reorg/phase-1-cli`.
+Core source, migrations, existing databases, desktop native/frontend source,
+runtime schemas, and RPC versions are unchanged.
+
+- SDK ordinary run/chat and run-level control methods no longer open terminal
+  prompts. Optional typed `onApproval` and `onClarification` callbacks receive
+  the complete pending request and support synchronous or asynchronous answers.
+  Without a callback, manual/interactive requests return pending. Existing
+  auto/reject approval and fail clarification policies remain unchanged.
+- Raw calls remain host-managed; session recovery, catalog orchestration,
+  swarms, desktop, and ambient processing retain their pending/blocked contracts.
+- CLI supplies the original prompts explicitly, including selected-profile,
+  resume, recovery, and continuation SDK construction paths.
+- SDK profile generation, validation, and persistence remain in SDK. Preview
+  rendering, report formatting, and terminal confirmation move to the public
+  `@adaptive-agent/cli/agent-create` entrypoint. SDK `runAgentCreate` requires
+  explicit `confirm` or ordinary `yes: true`, never implicit stdin consent.
+- SDK ambient processing is silent unless a host injects `AmbientLogger`.
+  `AmbientStartOptions.output` is removed; CLI supplies its existing pretty
+  logger. Explicit core logging configuration remains available.
+
+This is a source API migration for embedded SDK users, not a CLI command or RPC
+change. Existing profile-create `dryRun` behavior is deliberately preserved:
+it always confirms, and accepting writes even with `--dry-run --yes`. Use
+`prepareAgentCreate` for a strictly non-writing preview. Host-neutral means no
+implicit terminal interaction/presentation, not browser portability.
+
+### Verification
+
+| Command (package-local unless shown) | Result |
+| --- | --- |
+| Root `bun run agent:test` | 184 Vitest passed, 1 skipped; 3 Bun passed |
+| Root `bun run cli:test` | 107 passed, 1 Bun-only gateway case skipped under Node |
+| CLI `bunx --bun vitest run src/command-integration.test.ts` | All 3 passed, including gateway execution and profile presentation |
+| SDK `bunx --bun vitest run src/index.test.ts` | All 33 passed, including callback/pending contracts and gateway execution |
+| Root `bun run core:test` | 461 Vitest + 23 Bun passed |
+| Desktop bridge `bun run test` | 80 Vitest + 6 Bun passed, including manual approval with SQLite |
+| Root `bun run trace-session:test` | 116 Vitest + 8 Bun passed |
+| SDK / CLI / trace builds; compiled desktop bridge | Passed |
+| Compiled Linux CLI with local model stub and real pseudo-terminal | Approval/rejection, resumed clarification, profile create/cancel, dry-run confirmation, and non-TTY refusal passed |
+| Compiled Linux desktop bridge | v1.20 initialize + CLI child `--version`; JSON-RPC-only stdout and clean stderr |
+| Source ownership inspection / `git diff --check` | Passed |
+
+SDK and CLI typechecks still fail with exactly the same normalized Phase 1
+diagnostic sets: 36 SDK errors and 32 inherited core errors for CLI. No new
+diagnostics are suppressed. Interactive checks use isolated homes/workspaces,
+a local OpenAI-compatible stub, and one disposable SQLite database for resumed
+clarification. No existing database is migrated or written. The initial stub
+incorrectly assumed profile generation used provider `response_format`; matching
+the actual generation prompt corrected the fixture without production changes.
+Temporary smoke scripts and the standalone CLI binary are removed afterward.
+
+The packaged Tauri GUI and non-Linux terminal behavior were not manually tested
+in this phase. Durable scheduling/recovery relocation remains Phase 3; Phase 2
+does not claim the full monorepo reorganization is finished.
