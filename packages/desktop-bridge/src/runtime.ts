@@ -36,7 +36,7 @@ import {
   parseCliArgs,
   type AdaptiveAgentCliCommand,
   type ManualTestCliOptions,
-} from '@adaptive-agent/agent-sdk/cli';
+} from '@adaptive-agent/cli';
 import { RuntimeDeletionError, type AgentEvent, type ChatMessage, type FileAccessExecutionContext, type JsonObject, type JsonValue, type ModelContentPart, type UUID } from '@adaptive-agent/core';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';

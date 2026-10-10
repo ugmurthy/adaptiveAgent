@@ -3,11 +3,11 @@ set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 OUT_DIR="${ADAPTIVE_AGENT_RELEASE_DIR:-$ROOT_DIR/dist/release}"
-ADAPTIVE_AGENT_ENTRYPOINT="$ROOT_DIR/packages/agent-sdk/src/adaptive-agent.ts"
+ADAPTIVE_AGENT_ENTRYPOINT="$ROOT_DIR/packages/cli/src/adaptive-agent.ts"
 TRACE_SESSION_ENTRYPOINT="$ROOT_DIR/packages/trace-session/src/trace-session.ts"
 DESKTOP_BRIDGE_ENTRYPOINT="$ROOT_DIR/packages/desktop-bridge/src/main.ts"
-BUILD_INFO="$ROOT_DIR/packages/agent-sdk/src/install/build-info.generated.ts"
-BUNDLED_ASSETS="$ROOT_DIR/packages/agent-sdk/src/install/bundled-assets.generated.ts"
+BUILD_INFO="$ROOT_DIR/packages/cli/src/install/build-info.generated.ts"
+BUNDLED_ASSETS="$ROOT_DIR/packages/cli/src/install/bundled-assets.generated.ts"
 REPOSITORY="${ADAPTIVE_AGENT_REPOSITORY:-https://github.com/ugmurthy/adaptiveAgent}"
 # Optional build-time assets to compile into the init `core` bundle.
 # - Agent dir: top-level *.json files. The release build injects the current
@@ -15,8 +15,8 @@ REPOSITORY="${ADAPTIVE_AGENT_REPOSITORY:-https://github.com/ugmurthy/adaptiveAge
 #   ignored when embedded.
 # - Skill dir: immediate child directories containing SKILL.md. Files under
 #   each skill directory are embedded as UTF-8 text.
-CORE_BUNDLE_AGENTS_DIR="${ADAPTIVE_AGENT_CORE_BUNDLE_AGENTS_DIR:-$ROOT_DIR/packages/agent-sdk/bundled/agents}"
-CORE_BUNDLE_SKILLS_DIR="${ADAPTIVE_AGENT_CORE_BUNDLE_SKILLS_DIR:-$ROOT_DIR/packages/agent-sdk/bundled/skills}"
+CORE_BUNDLE_AGENTS_DIR="${ADAPTIVE_AGENT_CORE_BUNDLE_AGENTS_DIR:-$ROOT_DIR/packages/cli/bundled/agents}"
+CORE_BUNDLE_SKILLS_DIR="${ADAPTIVE_AGENT_CORE_BUNDLE_SKILLS_DIR:-$ROOT_DIR/packages/cli/bundled/skills}"
 
 fail() {
   printf 'build-release-assets: %s\n' "$1" >&2

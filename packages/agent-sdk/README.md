@@ -3,11 +3,11 @@
 For the programmatic API and profile/settings file formats, see the
 [Agent SDK API reference](API.md).
 
-`@adaptive-agent/agent-sdk` is the CLI-facing package for running configured agents from the shell. It resolves `agent.json` and `agent.settings.json`, wires built-in tools, chooses a runtime store, and calls `@adaptive-agent/core` with CLI-friendly defaults.
+`@adaptive-agent/agent-sdk` resolves `agent.json` and `agent.settings.json`, wires built-in tools, chooses a runtime store, and assembles configured agents on top of `@adaptive-agent/core`. It owns profile discovery, selection, routing, and decomposition policy.
 
-Use this package when you want an executable command such as `adaptive-agent run`, `adaptive-agent chat`, `adaptive-agent swarm-run`, `adaptive-agent retry`, or `adaptive-agent eval`. Use `@adaptive-agent/core` directly when you are embedding the runtime in an application and want to provide stores, tools, model adapters, and event handling yourself.
+Use this package to embed configured agents. Executable commands, terminal presentation, installation, and evaluation now belong to [`@adaptive-agent/cli`](../cli/README.md). Use `@adaptive-agent/core` directly when you want to provide stores, tools, model adapters, and event handling yourself. Remaining terminal defaults and durable orchestration are tracked in [the phased reorganization](../../REORGANIZATION.md).
 
-## CLI API at a glance
+## CLI usage of the SDK at a glance
 
 ```bash
 adaptive-agent init [options]
@@ -447,4 +447,4 @@ What this exercises:
 - `doctor` validates installation, local config, runtime settings, and optional provider reachability.
 - `update` checks for or applies GitHub Release updates.
 
-The package also exports `createAgentSdk()`, `loadAgentSdkConfig()`, and `inspectAgentSdkResolution()` for hosts that want the same config resolution behavior without spawning the CLI, but the command line remains the primary API documented here.
+The SDK exports `createAgentSdk()`, `loadAgentSdkConfig()`, and `inspectAgentSdkResolution()` for hosts that want config resolution without spawning the CLI. Import command execution from `@adaptive-agent/cli` and command metadata from `@adaptive-agent/cli/commands`; the former SDK `/cli` export has been removed to keep dependencies pointing from CLI to SDK.

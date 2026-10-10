@@ -27,7 +27,7 @@ import {
   type TuiMessageType,
   type TuiSettingsConfig,
   type TuiTextStyleName,
-} from './index.js';
+} from '@adaptive-agent/agent-sdk';
 import type {
   InspectionSummary,
   ManualTestCliOptions,
@@ -36,8 +36,8 @@ import type {
 } from './cli-types.js';
 import { agentEventColorKey, agentEventProgressPrefix, formatAgentEventSummary, summarizeAgentEvent } from './agent-event-rendering.js';
 import { formatSwarmExecutionPlan, formatSwarmRunStatuses } from './swarm-format.js';
-import { resolveReadWebPageProvider, resolveWebSearchProvider } from './tool-registry.js';
-import { applyNamedStyle, applyStyle, formatStyledMessageBlock, resolveMessageStyle } from './tui/message-styles.js';
+import { resolveReadWebPageProvider, resolveWebSearchProvider } from '@adaptive-agent/agent-sdk';
+import { applyNamedStyle, applyStyle, formatStyledMessageBlock, resolveMessageStyle } from './message-styles.js';
 
 export const passthroughMarkdownStyle = (value: string): string => value;
 

@@ -6,7 +6,6 @@ import { pathToFileURL } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AgentSdk } from './index.js';
-import { main } from './adaptive-agent.js';
 import { prepareSkillDirectory } from './skill-handler-preparation.js';
 import { testEnvironment } from './test-environment.js';
 
@@ -130,16 +129,6 @@ describe('skill handler preparation', () => {
     });
 
     await sdk.close();
-  });
-
-  it('exposes explicit preparation through the binary CLI command', async () => {
-    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
-
-    await expect(main(['skill', 'prepare', skillDir, '--output', 'json'])).resolves.toBe(0);
-
-    const report = JSON.parse(String(log.mock.calls.at(-1)?.[0])) as { skillName: string; modulePath: string };
-    expect(report.skillName).toBe('custom-handler');
-    expect(report.modulePath).toContain('skill-handlers');
   });
 });
 

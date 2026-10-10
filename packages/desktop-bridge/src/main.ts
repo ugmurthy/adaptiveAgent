@@ -1,6 +1,6 @@
 import { createInterface } from 'node:readline';
 
-import { main as runAdaptiveAgentCli } from '@adaptive-agent/agent-sdk/cli';
+import { main as runAdaptiveAgentCli } from '@adaptive-agent/cli';
 
 import { CLI_CHILD_MODE, ProcessCliExecutor } from './cli-executor.js';
 import {
