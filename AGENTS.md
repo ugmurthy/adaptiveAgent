@@ -46,6 +46,7 @@ These rules protect the package boundary established by `CORE-SESSION-SWARM-SPEC
 - Agent SDK owns agent assembly, coordinator/decomposer prompt construction, safe catalog summaries, default agent selection, and routing policy.
 - Agent SDK owns translating prepared user intent into strict core execution requests.
 - Agent SDK may prevalidate inputs for usability, but core must still validate before execution.
+- Agent SDK must not open terminal prompts or render terminal reports. Hosts supply interaction callbacks or handle pending results; profile writes require explicit consent. Ambient logging is host-injected.
 
 ### `@adaptive-agent/cli` owns terminal workflows and distribution
 

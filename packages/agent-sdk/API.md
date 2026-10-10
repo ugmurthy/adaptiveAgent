@@ -27,9 +27,16 @@ try {
 }
 ```
 
-Use raw calls in a UI or service so the host can handle approvals and
-clarifications. Normal calls can prompt on the terminal. The default approval
-policy is `auto`; choose `manual` when tool execution needs host consent.
+The SDK never opens terminal prompts. Non-raw calls apply `auto`/`reject` approval
+policy and the clarification `fail` policy; manual/interactive requests are
+returned pending unless the host supplies callbacks. Raw calls always return
+interactions without applying callbacks. The default approval policy remains
+`auto`; choose `manual` when tool execution needs host consent.
+
+Callbacks apply to ordinary run/chat and run-level control calls. Session
+recovery, catalog orchestration, swarms, and ambient processing retain their
+explicit raw/blocked interaction contracts; callbacks do not silently approve
+their pending work.
 
 ## Creating and inspecting an SDK
 
@@ -58,6 +65,7 @@ core execution types are defined in [core types](../core/src/types.ts).
 | `runtimeMode`, `sqlitePath`, `runtime` | Storage override or injected core runtime stores. |
 | `tools`, `delegates` | Custom core tool and delegate definitions. |
 | `logger`, `eventListener`, `clock` | Inject logging, receive core events, or control the time used for ground-truth context. |
+| `onApproval`, `onClarification` | Optional sync/async host callbacks receiving the complete core interaction request. Return `boolean` consent or a `string` answer. Used only by non-raw calls in manual/interactive modes. |
 | `inferenceMode`, `inferenceTier` | `local`, `byok`, or `gateway`; tier is `low`, `medium`, `high`, or `xtra-high`. |
 | `serverProfile`, `profileCachePath`, `profileRefs` | Select a server profile, change its cache directory, or supply authorization profile references. |
 | `gatewayClient`, `gateway`, `accessToken` | Inject a gateway client or configure connection and authorization. |
@@ -75,7 +83,7 @@ These are methods on `sdk`.
 | `run(goal, options?)` | `RunResult`; execute a top-level objective and handle interactions according to settings. |
 | `runRaw(goal, options?)` | `RunResult`; same preparation, but return approval/clarification states to the host. |
 | `chat(messageOrMessages, options?)` | `ChatResult`; accept a string or `ChatMessage[]`, then handle interactions. |
-| `chatRaw(messageOrMessages, options?)` | `ChatResult`; return interactions without prompting. |
+| `chatRaw(messageOrMessages, options?)` | `ChatResult`; return interactions without invoking host callbacks. |
 | `resume(runId)` / `resumeRaw(runId)` | `RunResult`; resume an existing run. |
 | `retry(runId)` / `retryRaw(runId)` | `RunResult`; retry through core recovery semantics. |
 | `getRecoveryOptions(runId)` | `RunRecoveryOptions`; available recovery choices. |
@@ -321,6 +329,11 @@ Exact signatures: [preparation](src/task-preparation.ts),
 | `buildAmbientSdkOptions(config, options?)` | Translate ambient configuration and start overrides into SDK options. |
 | `runAmbientStart(options)` | Start trigger processing. Requires `configPath`; supports `dryRun`, `runOnce`, `signal`, model/runtime/interaction overrides, and injected `createSdk`, `clock`, `logger`. |
 
+Ambient processing is silent without an injected `logger`. The former SDK
+`AmbientStartOptions.output` field is removed; output formats and the pretty
+terminal logger belong to CLI. Explicit runtime logging settings and injected
+core loggers remain supported.
+
 ## Profile editing and CLI entry points
 
 Import editing calls from `@adaptive-agent/agent-sdk/agent-create`.
@@ -334,12 +347,20 @@ Import editing calls from `@adaptive-agent/agent-sdk/agent-create`.
 | `readAgentProfile(options)` | Read exact profile content by `agentId` and `configPath`. |
 | `archiveAgentProfile(options)` | Move the exact profile into the archive. |
 | `restoreAgentProfile(options)` | Restore an archived profile. |
-| `renderAgentCreateReport(report, output?)` | Render `pretty`, `json`, or `jsonl`. |
-| `renderAgentCreatePreview(prepared)` | Render a human-readable preview. |
-| `confirmAgentCreateInTerminal(prepared)` | Prompt for confirmation and return a boolean. |
 
 Editing options also support `cwd`, `env`, `settingsConfigPath`, and
 `generatorAgent`; save options include `targetPath`. See [editing types](src/agent-create.ts).
+
+`runAgentCreate` requires a `confirm(prepared)` callback whenever confirmation is
+needed, or explicit `yes: true` for an ordinary write. It never falls back to
+stdin. Existing `dryRun` preview-confirm semantics are preserved: confirmation
+is always required and accepting the preview writes the file even with `dryRun`.
+Use `prepareAgentCreate` for a strictly non-writing preview.
+
+**Source API migration:** `renderAgentCreateReport`, `renderAgentCreatePreview`,
+`confirmAgentCreateInTerminal`, and `AgentCreateOutputFormat` now come from
+`@adaptive-agent/cli/agent-create`, not the SDK. Editing and persistence stay in
+the SDK; terminal confirmation and presentation stay in CLI.
 
 Import `main(argv?)` and `parseCliArgs(argv)` from
 `@adaptive-agent/cli`. `main` executes CLI arguments and returns an
