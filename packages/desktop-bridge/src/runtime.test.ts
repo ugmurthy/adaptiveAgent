@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, readdir, realpath, rm, symlink, writeFile } from 'node:
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { ADAPTIVE_AGENT_CLI_COMMANDS } from '@adaptive-agent/agent-sdk/cli';
+import { ADAPTIVE_AGENT_CLI_COMMANDS } from '@adaptive-agent/cli/commands';
 import { AgentSdk, agentConfigurationFingerprint, type OrchestratedRunResult, type ResolvedAgentSdkConfig, type TaskPreparationResult } from '@adaptive-agent/agent-sdk';
 import * as agentCreate from '@adaptive-agent/agent-sdk/agent-create';
 import { AdaptiveAgent, InMemoryEventStore, InMemoryOrchestrationStore, InMemoryRunStore, InMemorySnapshotStore, InMemoryToolExecutionStore, type ModelAdapter, type ModelResponse, type UUID } from '@adaptive-agent/core';

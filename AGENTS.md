@@ -6,10 +6,12 @@
 - Primary packages currently include:
   - `@adaptive-agent/core` in `packages/core`
   - `@adaptive-agent/agent-sdk` in `packages/agent-sdk`
+  - `@adaptive-agent/cli` in `packages/cli`
   - `@adaptive-agent/trace-session` in `packages/trace-session`
 - Versioned specs and contract Markdown remain important architecture references. Preserve terminology and behavioral contracts when changing implementation code.
 - Treat `agen-spec-v1.5.md` and `agen-contracts-v1.5.md` as the newest versioned spec/contract sources unless a task explicitly targets v1.4 or earlier.
 - Treat `CORE-SESSION-SWARM-SPEC.md` as the reference for the core/session/swarm responsibility boundary between `@adaptive-agent/core` and `@adaptive-agent/agent-sdk`.
+- Follow `REORGANIZATION.md` for the phased CLI/SDK/core separation; do not change database schemas during these phases.
 
 ## Runtime and verification
 
@@ -38,13 +40,19 @@ These rules protect the package boundary established by `CORE-SESSION-SWARM-SPEC
 - Core may expose strict programmatic APIs for already-prepared execution requests.
 - Core must remain usable without importing `@adaptive-agent/agent-sdk`.
 
-### `@adaptive-agent/agent-sdk` owns agent-profile and CLI setup
+### `@adaptive-agent/agent-sdk` owns agent-profile setup and policy
 
-- Agent SDK owns CLI-facing workflows and user-facing command behavior.
 - Agent SDK owns loading, resolving, and validating existing agent JSON specs.
-- Agent SDK owns coordinator/decomposer prompt construction, safe catalog summaries, default agent selection, and CLI-friendly error messages.
-- Agent SDK owns translating CLI/user intent into strict core execution requests.
+- Agent SDK owns agent assembly, coordinator/decomposer prompt construction, safe catalog summaries, default agent selection, and routing policy.
+- Agent SDK owns translating prepared user intent into strict core execution requests.
 - Agent SDK may prevalidate inputs for usability, but core must still validate before execution.
+
+### `@adaptive-agent/cli` owns terminal workflows and distribution
+
+- CLI owns argument parsing, command dispatch, terminal rendering/interactions, evaluation commands, install/update flows, and executable packaging.
+- CLI depends on SDK and core public APIs; SDK and core must not import CLI.
+- Desktop bridge may use CLI for its explicit CLI child integration, not as its runtime authority.
+- Do not restore the removed fullscreen TUI or its dependency.
 
 ### Do not blur this boundary
 

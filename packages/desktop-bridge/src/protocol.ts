@@ -5,7 +5,7 @@ import type { InferenceMode, InferenceTier, ProfileRef } from '@adaptive-agent/g
 export {
   ADAPTIVE_AGENT_CLI_COMMANDS,
   type AdaptiveAgentCliCommand,
-} from '@adaptive-agent/agent-sdk/cli';
+} from '@adaptive-agent/cli/commands';
 
 /** Keep versions as strings: JSON numbers cannot distinguish 1.10 from 1.1. */
 export const DESKTOP_PROTOCOL_VERSION = '1.20' as const;

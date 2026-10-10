@@ -79,3 +79,53 @@ resolved package-entry failures without source changes.
 
 Tests use isolated homes, mocks/local gateway servers and disposable SQLite
 files. No existing runtime database or migration needs to change.
+
+## Phase 1 result
+
+Branch: `reorg/phase-1-cli`, in a separate worktree. Core source, migrations,
+desktop native/frontend source, runtime schemas, and RPC versions are unchanged.
+
+- CLI entrypoints, terminal rendering, installer/update code, evaluation, and
+  bundled install assets now live in `packages/cli`.
+- SDK no longer exports `/cli` or owns executable bins. Consumers must import
+  `@adaptive-agent/cli` or its lightweight `/commands` metadata entrypoint.
+  This is a source import migration, not a CLI command or RPC protocol change.
+- Desktop bridge and release builds use the new CLI entrypoints.
+- Fullscreen TUI code and `pi-tui` are removed. Plain CLI message styles and
+  legacy settings remain compatible. Five fullscreen TUI tests were removed;
+  existing CLI tests were relocated and the combined SDK/CLI gateway case split.
+- SDK terminal interaction defaults, profile-editing presentation, and durable
+  orchestration remain for phases 2 and 3. Phase 1 is not the full separation.
+
+### Verification
+
+| Command (package-local unless shown) | Result |
+| --- | --- |
+| Root `bun run core:test` | 461 Vitest + 23 Bun passed |
+| Root `bun run agent:test` | 173 Vitest passed, 1 skipped; 3 Bun passed |
+| Root `bun run cli:test` | 106 passed, 1 Bun-only gateway case skipped under Node |
+| CLI `bunx --bun vitest run src/command-integration.test.ts` | Both integration cases passed, including gateway model/tool/model execution |
+| SDK `bunx --bun vitest run src/index.test.ts` | All 23 passed, including the retained SDK gateway case |
+| Desktop bridge `bun run test` | 80 Vitest + 6 Bun passed |
+| Root `bun run trace-session:test` | 116 Vitest + 8 Bun passed |
+| Desktop app `bun run test` / `bun run typecheck` / `bun run web:build` | 7 Vitest + 37 Bun passed; typecheck and build passed |
+| Root `bun run jev-routing-study:test` | 9 passed |
+| SDK / CLI / bridge / trace builds | Passed |
+| Trace workbench build | Passed |
+| Local `build-release-assets.sh` | All five platform archives built with CLI, trace, and agent-runtime binaries |
+| Local `smoke-release-assets.sh` | Linux x64 passed, including compiled runtime-only CLI child execution and isolated init |
+| Local `build-npm-packages.sh` / `smoke-npm-packages.sh` | Packaging passed; Linux x64 wrapper execution passed; nothing published |
+| Shell syntax / `git diff --check` | Passed |
+
+SDK typecheck still reports the same 36 baseline diagnostics, after normalizing
+source locations. CLI typecheck reports 32 inherited core diagnostics, with no
+CLI-local errors. Trace workbench typecheck still reports 33 errors; its full
+diagnostic output matches the original checkout after normalizing worktree paths.
+These pre-existing failures were not suppressed or fixed as part of relocation.
+
+The orb initially lacked `zip`, blocking Windows archive packaging after a
+successful compile. Installing it resolved the packaging failure; setup now
+declares that prerequisite. Setup itself was syntax-checked, not rerun, to avoid
+restarting or migrating the existing database. Release scripts restore generated
+source metadata after building. Non-Linux binaries were built but not executed;
+the packaged Tauri GUI was not manually exercised.

@@ -1,6 +1,6 @@
 import chalk from 'chalk';
 
-import type { TuiMessageStyleConfig, TuiMessageType, TuiSettingsConfig, TuiTextStyleName } from '../index.js';
+import type { TuiMessageStyleConfig, TuiMessageType, TuiSettingsConfig, TuiTextStyleName } from '@adaptive-agent/agent-sdk';
 
 export type ResolvedTuiMessageStyle = Required<Pick<TuiMessageStyleConfig, 'showPrefix'>> & Pick<TuiMessageStyleConfig, 'prefix' | 'body'>;
 export const PREFIX_PLACEHOLDER = '\u29bf';

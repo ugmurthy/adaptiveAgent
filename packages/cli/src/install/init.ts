@@ -2,7 +2,7 @@ import { access, copyFile, mkdir, readFile, readdir, stat, writeFile } from 'nod
 import { homedir } from 'node:os';
 import { basename, dirname, extname, resolve } from 'node:path';
 
-import { loadAgentSdkConfig, type AgentConfigFile, type AgentSettingsFile } from '../index.js';
+import { loadAgentSdkConfig, type AgentConfigFile, type AgentSettingsFile } from '@adaptive-agent/agent-sdk';
 import { BUNDLED_INSTALL_CATALOG, materializeBundledAgent, type BundledSkillAsset } from './bundled-assets.js';
 
 export type InitProvider = 'openrouter' | 'ollama' | 'mistral' | 'mesh';

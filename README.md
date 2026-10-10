@@ -803,7 +803,8 @@ Don't:
 The current workspace packages are:
 
 - `@adaptive-agent/core` in `packages/core`: runtime semantics, durable stores, events, snapshots, tools, delegation, retry, and continuation.
-- `@adaptive-agent/agent-sdk` in `packages/agent-sdk`: user-facing `adaptive-agent` CLI, config loading, built-in tool registration, install/update flows, and evaluation helpers.
+- `@adaptive-agent/agent-sdk` in `packages/agent-sdk`: profile/settings loading, agent assembly, built-in tool registration, selection, routing, and decomposition policy.
+- `@adaptive-agent/cli` in `packages/cli`: user-facing `adaptive-agent` commands, terminal presentation, install/update flows, evaluation helpers, and executable packaging.
 - `@adaptive-agent/trace-session` in `packages/trace-session`: decision-oriented SQLite/Postgres trace reporter with a read-only NDJSON JSON-RPC 2.0 stdio sidecar for native and desktop trace consumers.
 - `@adaptive-agent/trace-workbench` in `packages/trace-workbench`: Bun + Svelte trace workbench for choosing persisted sessions/runs, exploring timelines, resource spend, messages, diagnostics, and exporting markdown/PDF reports.
 - `@adaptive-agent/gateway-protocol`, `@adaptive-agent/gateway-client`, and `@adaptive-agent/capability-gateway`: shared JSON-RPC contracts, client integration, and the authenticated capability/inference gateway.
@@ -815,6 +816,9 @@ Useful local commands:
 ```bash
 bun run core:test
 bun run agent:build
+bun run cli:build
+bun run cli:test
+bun run cli --help
 bun run trace-session list traces --limit 20
 bun run trace-session view run <run-id>
 bun run trace-session compare <baseline-run-id> <candidate-run-id>

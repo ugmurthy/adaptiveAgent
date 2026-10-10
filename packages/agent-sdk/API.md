@@ -342,12 +342,15 @@ Editing options also support `cwd`, `env`, `settingsConfigPath`, and
 `generatorAgent`; save options include `targetPath`. See [editing types](src/agent-create.ts).
 
 Import `main(argv?)` and `parseCliArgs(argv)` from
-`@adaptive-agent/agent-sdk/cli`. `main` executes CLI arguments and returns an
+`@adaptive-agent/cli`. `main` executes CLI arguments and returns an
 exit code; parsing returns `ManualTestCliOptions`. That entry point also exports
 `ADAPTIVE_AGENT_CLI_COMMANDS`, `ADAPTIVE_AGENT_CLI_SUBCOMMANDS`, and
-`ADAPTIVE_AGENT_POSITIONAL_COMMANDS`. The `/runtime-settings` entry point exports
-the same `resolveRuntimeTarget` helper available at the package root.
-For shell commands, see [the CLI guide](../../AGENT-SDK-CLI.md).
+`ADAPTIVE_AGENT_POSITIONAL_COMMANDS`; metadata-only consumers can use
+`@adaptive-agent/cli/commands`. The former SDK `/cli` entry point has been
+removed, rather than re-exported, to avoid an SDK-to-CLI dependency.
+The SDK `/runtime-settings` entry point exports the same `resolveRuntimeTarget`
+helper available at the SDK package root.
+For shell commands, see [the CLI guide](../cli/README.md).
 
 ## Profile and settings files
 

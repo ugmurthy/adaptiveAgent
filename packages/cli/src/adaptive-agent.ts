@@ -47,13 +47,13 @@ import {
   decideAutomaticRun,
   agentSelectionMetadata,
   executionRoutingMetadata,
-} from './index.js';
+} from '@adaptive-agent/agent-sdk';
 import { doctorExitCode, renderDoctorReport, runDoctor } from './install/doctor.js';
 import { renderInitReport, runInit, type InitProfile } from './install/init.js';
 import { renderUninstallReport, runUninstall, uninstallExitCode } from './install/uninstall.js';
 import { renderUpdateReport, runUpdate, updateExitCode } from './install/update.js';
 import { getVersionInfo, renderVersion } from './install/version.js';
-import { renderAgentCreateReport, runAgentCreate } from './agent-create.js';
+import { renderAgentCreateReport, runAgentCreate } from '@adaptive-agent/agent-sdk/agent-create';
 import { AgentEventLabelRegistry, formatAgentEventSummary, summarizeAgentEvent } from './agent-event-rendering.js';
 import {
   createProjectContextBundle,
@@ -66,9 +66,9 @@ import {
   parseContextRefFlag,
   projectContextBundleDirectory,
   type ProjectContextBundle,
-} from './context-bundles.js';
+} from '@adaptive-agent/agent-sdk';
 import { formatSwarmExecutionPlan, formatSwarmRunStatuses, formatSwarmSubtasks } from './swarm-format.js';
-import { resolveReadWebPageProvider, resolveWebSearchProvider } from './tool-registry.js';
+import { resolveReadWebPageProvider, resolveWebSearchProvider } from '@adaptive-agent/agent-sdk';
 import type {
   BenchmarkAttachmentType,
   BenchmarkCase,
@@ -490,7 +490,7 @@ Run the existing JSON spec format.
 Usage:
   adaptive-agent spec <path> [options]
   adaptive-agent --spec <path> [options]
-  bun run ./packages/agent-sdk/dist/adaptive-agent.js --spec <path> [options]
+  bun run ./packages/cli/dist/adaptive-agent.js --spec <path> [options]
 
 Spec options:
   --spec <path>           Path to the JSON spec file.

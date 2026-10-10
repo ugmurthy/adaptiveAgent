@@ -1,0 +1,41 @@
+{
+  "name": "@adaptive-agent/cli",
+  "version": "0.1.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "src/cli-api.ts",
+  "exports": {
+    ".": "./src/cli-api.ts",
+    "./commands": "./src/cli-command-metadata.ts"
+  },
+  "bin": {
+    "adaptive-agent": "./dist/adaptive-agent.js",
+    "adaptive-agent-gaia-eval": "./dist/evaluate-gaia-jsonl.js"
+  },
+  "scripts": {
+    "build": "bun build ./src/cli-api.ts ./src/cli-command-metadata.ts ./src/adaptive-agent.ts ./src/evaluate-gaia-jsonl.ts --outdir dist --target bun",
+    "adaptive-agent": "bun run ./dist/adaptive-agent.js",
+    "link:global": "bun run ./scripts/link-global.ts",
+    "test": "bunx vitest run",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "dependencies": {
+    "@adaptive-agent/agent-sdk": "workspace:*",
+    "@adaptive-agent/core": "workspace:*",
+    "chalk": "^5.5.0",
+    "marked": "^15.0.12",
+    "marked-terminal": "^7.3.0",
+    "pg": "^8.20.0"
+  },
+  "devDependencies": {
+    "@adaptive-agent/capability-gateway": "workspace:*",
+    "@types/marked-terminal": "^6.1.1",
+    "@types/node": "^25.5.2",
+    "@types/pg": "^8.20.0",
+    "bun-types": "^1.3.5",
+    "jose": "^6.2.3",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.1"
+  }
+}

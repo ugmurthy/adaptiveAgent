@@ -14,7 +14,6 @@ import {
   type ProviderAdapter,
 } from '@adaptive-agent/capability-gateway';
 
-import { main as runCli } from './adaptive-agent.js';
 import { AgentSettingsValidationError, createAgentSdk, inspectAgentSdkResolution, loadAgentSdkConfig } from './index.js';
 import { testEnvironment } from './test-environment.js';
 
@@ -606,10 +605,7 @@ describe('agent-sdk gateway integration', () => {
     }
   });
 
-  bunIt('completes memory-runtime SDK and CLI WSS runs with local tools between model turns', async () => {
-    const cliDir = await mkdtemp(join(tmpdir(), 'agent-sdk-gateway-cli-'));
-    const cliInputPath = join(cliDir, 'gateway-input.txt');
-    await writeFile(cliInputPath, 'CLI-GATEWAY-CONTENT');
+  bunIt('completes memory-runtime SDK WSS runs with local tools between model turns', async () => {
     const billing = new InMemoryBillingStore();
     const providerRequests: Parameters<ProviderAdapter['generate']>[0][] = [];
     const provider: ProviderAdapter = {
@@ -639,16 +635,8 @@ describe('agent-sdk gateway integration', () => {
           onEvent({ type: 'text_delta', delta: 'gateway complete' });
           return { text: 'gateway complete', finishReason: 'stop', usage };
         }
-        const useSdkTool = request.tools?.some((tool) => tool.name === 'local_uppercase');
-        if (useSdkTool) {
-          return {
-            toolCalls: [{ id: 'local-tool-call', name: 'local_uppercase', input: { text: 'client-side' } }],
-            finishReason: 'tool_calls',
-            usage,
-          };
-        }
         return {
-          toolCalls: [{ id: 'local-tool-call', name: 'read_file', input: { path: cliInputPath } }],
+          toolCalls: [{ id: 'local-tool-call', name: 'local_uppercase', input: { text: 'client-side' } }],
           finishReason: 'tool_calls',
           usage,
         };
@@ -754,49 +742,9 @@ describe('agent-sdk gateway integration', () => {
       expect(JSON.stringify(inspection)).not.toContain(token);
       expect(JSON.stringify([...billing.records.values()])).not.toContain('Use the local uppercase tool');
       expect(JSON.stringify([...billing.records.values()])).not.toContain('CLIENT-SIDE');
-
-      await writeAgentConfig(join(cliDir, 'agent.json'), 'gateway-cli-agent');
-      await writeFile(join(cliDir, 'agent.settings.json'), JSON.stringify({
-        runtime: { mode: 'memory' },
-        gateway: { url: server.url, accessTokenEnv: 'PHASE_3_GATEWAY_CLI_TOKEN' },
-      }));
-      const previousToken = process.env.PHASE_3_GATEWAY_CLI_TOKEN;
-      process.env.PHASE_3_GATEWAY_CLI_TOKEN = token;
-      const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
-      try {
-        const exitCode = await runCli([
-          'run',
-          'Read the local gateway input file',
-          '--cwd', cliDir,
-          '--runtime', 'memory',
-          '--inference-mode', 'gateway',
-          '--tier', 'medium',
-          '--inspect',
-          '--output', 'json',
-        ]);
-        const cliOutput = JSON.parse(String(log.mock.calls.at(-1)?.[0])) as {
-          resolvedConfig: { inferenceMode: string; inferenceTier: string; runtimeMode: string };
-          result: { status: string; output: string };
-          inspection: { run: { executionContext: Record<string, unknown> }; eventTypes: Record<string, number> };
-        };
-
-        expect(exitCode).toBe(0);
-        expect(cliOutput.resolvedConfig).toMatchObject({ inferenceMode: 'gateway', inferenceTier: 'medium', runtimeMode: 'memory' });
-        expect(cliOutput.result).toMatchObject({ status: 'success', output: 'gateway complete' });
-        expect(cliOutput.inspection.run.executionContext).toMatchObject({ inferenceMode: 'gateway', inferenceTier: 'medium', routePolicyRef: 'policy-e2e' });
-        expect(cliOutput.inspection.eventTypes).toMatchObject({ 'tool.completed': 1, 'model.completed': 2 });
-        expect(providerRequests).toHaveLength(4);
-        expect(providerRequests[3]?.messages.some((message) => message.role === 'tool' && message.content.includes('CLI-GATEWAY-CONTENT'))).toBe(true);
-        expect(JSON.stringify(cliOutput)).not.toContain(token);
-      } finally {
-        log.mockRestore();
-        if (previousToken === undefined) delete process.env.PHASE_3_GATEWAY_CLI_TOKEN;
-        else process.env.PHASE_3_GATEWAY_CLI_TOKEN = previousToken;
-      }
     } finally {
       await sdk.close();
       await server.stop({ gracePeriodMs: 100 });
-      await rm(cliDir, { recursive: true, force: true });
     }
   });
 });

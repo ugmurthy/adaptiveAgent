@@ -1,4 +1,4 @@
-import type { AgentConfigFile } from '../config-types.js';
+import type { AgentConfigFile } from '@adaptive-agent/agent-sdk';
 import type { InitProvider } from './init.js';
 import { GENERATED_BUNDLED_INSTALL_CATALOG } from './bundled-assets.generated.js';
 
