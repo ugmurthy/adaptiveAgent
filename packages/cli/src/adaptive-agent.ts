@@ -53,7 +53,9 @@ import { renderInitReport, runInit, type InitProfile } from './install/init.js';
 import { renderUninstallReport, runUninstall, uninstallExitCode } from './install/uninstall.js';
 import { renderUpdateReport, runUpdate, updateExitCode } from './install/update.js';
 import { getVersionInfo, renderVersion } from './install/version.js';
-import { renderAgentCreateReport, runAgentCreate } from '@adaptive-agent/agent-sdk/agent-create';
+import { runAgentCreate } from '@adaptive-agent/agent-sdk/agent-create';
+import { confirmAgentCreateInTerminal, renderAgentCreateReport } from './agent-create.js';
+import { promptText, promptYesNo } from './terminal-interactions.js';
 import { AgentEventLabelRegistry, formatAgentEventSummary, summarizeAgentEvent } from './agent-event-rendering.js';
 import {
   createProjectContextBundle,
@@ -948,6 +950,7 @@ async function runAgentCreateCommand(cli: ManualTestCliOptions): Promise<number>
     yes: cli.yes,
     force: cli.force,
     dryRun: cli.dryRun,
+    confirm: confirmAgentCreateInTerminal,
   });
   console.log(renderAgentCreateReport(report, cli.output));
   return report.status === 'created' || report.status === 'overwritten' ? 0 : 1;

@@ -13,6 +13,8 @@ import {
   type ProviderAdapter,
 } from '@adaptive-agent/capability-gateway';
 
+import { runAgentCreate } from '@adaptive-agent/agent-sdk/agent-create';
+import { renderAgentCreatePreview, renderAgentCreateReport } from './agent-create.js';
 import { main } from './adaptive-agent.js';
 
 const bunIt = typeof Bun === 'undefined' ? it.skip : it;
@@ -27,6 +29,35 @@ describe('CLI command integration', () => {
   afterEach(async () => {
     vi.restoreAllMocks();
     await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it('preserves generated profile preview and JSON report presentation', async () => {
+    await mkdir(join(tempDir, 'agents'));
+    await writeFile(join(tempDir, 'agents', 'default-agent.json'), JSON.stringify({
+      id: 'default-agent', name: 'Generator',
+      invocationModes: ['run'], defaultInvocationMode: 'run',
+      model: { provider: 'ollama', model: 'test' }, tools: ['read_file'],
+    }));
+    const report = await runAgentCreate({
+      cwd: tempDir, brief: 'Create a docs reviewer.', confirm: async () => false,
+      generateDraft: async () => ({
+        agent: { id: 'docs-reviewer', name: 'Docs Reviewer', systemInstructions: 'Review documentation.' },
+        notes: ['Keep reviews concise.'],
+        recommendations: ['Add write access only if necessary.'],
+      }),
+    });
+    const preview = renderAgentCreatePreview(report.prepared);
+    expect(preview).toContain('Notes:\n  - Keep reviews concise.');
+    expect(preview).toContain('Recommendations:\n  - Add write access only if necessary.');
+    expect(renderAgentCreateReport(report)).toBe(`Cancelled; no file written.\npath: ${join(tempDir, 'agents', 'docs-reviewer.json')}`);
+    const json = JSON.parse(renderAgentCreateReport(report, 'json'));
+    expect(json).toMatchObject({
+      command: 'agent-create', status: 'cancelled', prompted: true,
+      path: join(tempDir, 'agents', 'docs-reviewer.json'),
+      agent: { id: 'docs-reviewer', systemInstructions: 'Review documentation.' },
+      notes: ['Keep reviews concise.'], recommendations: ['Add write access only if necessary.'],
+    });
+    expect(JSON.parse(renderAgentCreateReport(report, 'jsonl'))).toEqual(json);
   });
 
   it('exposes explicit skill preparation through the binary CLI command', async () => {
