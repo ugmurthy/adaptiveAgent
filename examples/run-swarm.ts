@@ -7,7 +7,7 @@ import {
   InMemoryRunStore,
   InMemorySnapshotStore,
   SwarmCoordinator,
-} from '../packages/core/src/index.js';
+} from '@adaptive-agent/core';
 
 const prompt = process.argv.slice(2).join(' ') || `
 Create an India market entry strategy for a premium electric two-wheeler startup launching in 2027.

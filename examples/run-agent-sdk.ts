@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { createAgentSdk } from '../packages/agent-sdk/src/index.js';
+import { createAgentSdk } from '@adaptive-agent/agent-sdk';
 
 const agent = await createAgentSdk({
   runtimeMode: 'memory',

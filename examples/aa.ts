@@ -31,17 +31,12 @@ import { marked } from 'marked';
 import { markedTerminal } from 'marked-terminal';
 
 import { resolveAaConfig } from './aa-config.js';
-import { createAdaptiveAgent } from '../packages/core/src/create-adaptive-agent.js';
-import { createAdaptiveAgentLogger } from '../packages/core/src/logger.js';
-import { loadSkillFromDirectory } from '../packages/core/src/skills/load-skill.js';
-import { skillToDelegate } from '../packages/core/src/skills/skill-to-delegate.js';
-import { createListDirectoryTool } from '../packages/core/src/tools/list-directory.js';
-import { createReadFileTool } from '../packages/core/src/tools/read-file.js';
-import { createReadWebPageTool } from '../packages/core/src/tools/read-web-page.js';
-import { createShellExecTool } from '../packages/core/src/tools/shell-exec.js';
-import { createWebSearchTool } from '../packages/core/src/tools/web-search.js';
-import { createWriteFileTool } from '../packages/core/src/tools/write-file.js';
-import type { DelegateDefinition, RunResult, ToolDefinition } from '../packages/core/src/types.js';
+import {
+  createAdaptiveAgent, createAdaptiveAgentLogger, loadSkillFromDirectory,
+  skillToDelegate, createListDirectoryTool, createReadFileTool,
+  createReadWebPageTool, createShellExecTool, createWebSearchTool, createWriteFileTool,
+  type DelegateDefinition, type RunResult, type ToolDefinition,
+} from '@adaptive-agent/core';
 
 marked.use(markedTerminal());
 

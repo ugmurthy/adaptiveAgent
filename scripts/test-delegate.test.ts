@@ -2,7 +2,7 @@ import { afterEach, expect, test } from 'bun:test';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import type { ModelAdapter, ModelRequest } from '../packages/core/src/index.js';
+import type { ModelAdapter, ModelRequest } from '@adaptive-agent/core/types';
 import { main, testDelegate } from './test-delegate.js';
 
 const roots: string[] = [];

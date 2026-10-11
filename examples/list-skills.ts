@@ -9,7 +9,7 @@
 import { readdir } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
-import { loadSkillFromDirectory } from '../packages/core/src/skills/load-skill.js';
+import { loadSkillFromDirectory } from '@adaptive-agent/core';
 
 const SKILLS_DIR = resolve(import.meta.dir, 'skills');
 

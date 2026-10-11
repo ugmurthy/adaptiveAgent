@@ -11,6 +11,11 @@
         "marked-terminal": "^7.3.0",
         "meshapi-node-sdk": "^0.1.0",
       },
+      "devDependencies": {
+        "@adaptive-agent/agent-sdk": "workspace:*",
+        "@adaptive-agent/core": "workspace:*",
+        "typescript": "^5.8.3",
+      },
     },
     "packages/agent-sdk": {
       "name": "@adaptive-agent/agent-sdk",

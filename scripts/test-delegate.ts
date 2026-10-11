@@ -4,9 +4,8 @@ import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
-import { createModelAdapter, loadSkillFromDirectory, skillToDelegate, type ModelAdapter, type ModelRequest, type ModelResponse } from '../packages/core/src/index.js';
-import { AgentSdk, loadAgentSdkConfig, prepareSkillHandlerModule, type AgentSdkOptions } from '../packages/agent-sdk/src/index.js';
-import { discoverCatalogDelegates } from '../packages/agent-sdk/src/tool-registry.js';
+import { createModelAdapter, loadSkillFromDirectory, skillToDelegate, type ModelAdapter, type ModelRequest, type ModelResponse } from '@adaptive-agent/core';
+import { AgentSdk, discoverCatalogDelegates, loadAgentSdkConfig, prepareSkillHandlerModule, type AgentSdkOptions } from '@adaptive-agent/agent-sdk';
 
 const HELP = `Manually test a SKILL.md delegate using ./agent.settings.json.
 
