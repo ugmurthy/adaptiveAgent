@@ -37,6 +37,7 @@ These rules protect the package boundary established by `CORE-SESSION-SWARM-SPEC
 - Core owns durable execution semantics: runs, sessions, child runs, retries, continuation, persistence, eventing, snapshots, and runtime metadata.
 - Core owns execution-time validation for data it is asked to run. It must not trust model output, CLI input, or SDK-prevalidated data.
 - Core owns generic orchestration primitives that are independent of a specific CLI UX or agent-spec loading flow.
+- `PreparedOrchestrationExecutor` owns prepared-plan scheduling and recovery; `recoverPreparedSession` owns logical session recovery selection and dispatch. Hosts supply configured runners, not profile-loading policy.
 - Core may expose strict programmatic APIs for already-prepared execution requests.
 - Core must remain usable without importing `@adaptive-agent/agent-sdk`.
 
@@ -45,6 +46,7 @@ These rules protect the package boundary established by `CORE-SESSION-SWARM-SPEC
 - Agent SDK owns loading, resolving, and validating existing agent JSON specs.
 - Agent SDK owns agent assembly, coordinator/decomposer prompt construction, safe catalog summaries, default agent selection, and routing policy.
 - Agent SDK owns translating prepared user intent into strict core execution requests.
+- For catalog orchestration, SDK owns plan preparation, stage prompts/input filtering, and runner creation/cleanup; it delegates durable execution to core. Historical profile/model compatibility checks also remain SDK-owned.
 - Agent SDK may prevalidate inputs for usability, but core must still validate before execution.
 - Agent SDK must not open terminal prompts or render terminal reports. Hosts supply interaction callbacks or handle pending results; profile writes require explicit consent. Ambient logging is host-injected.
 

@@ -5,7 +5,15 @@ For the programmatic API and profile/settings file formats, see the
 
 `@adaptive-agent/agent-sdk` resolves `agent.json` and `agent.settings.json`, wires built-in tools, chooses a runtime store, and assembles configured agents on top of `@adaptive-agent/core`. It owns profile discovery, selection, routing, and decomposition policy.
 
-Use this package to embed configured agents. Executable commands, terminal presentation, installation, and evaluation now belong to [`@adaptive-agent/cli`](../cli/README.md). The SDK does not prompt on stdin: supply `onApproval`/`onClarification` callbacks or handle returned pending results, and supply explicit consent for profile creation. Use `@adaptive-agent/core` directly when you want to provide stores, tools, model adapters, and event handling yourself. Durable orchestration relocation remains tracked in [the phased reorganization](../../REORGANIZATION.md).
+Use this package to embed configured agents. Executable commands, terminal presentation, installation, and evaluation now belong to [`@adaptive-agent/cli`](../cli/README.md). The SDK does not prompt on stdin: supply `onApproval`/`onClarification` callbacks or handle returned pending results, and supply explicit consent for profile creation. Use `@adaptive-agent/core` directly when you want to provide stores, tools, model adapters, and event handling yourself.
+
+`OrchestrationSdk` prepares plans, stage prompts/inputs, and profile runners; core's
+[`PreparedOrchestrationExecutor`](../core/README.md#prepared-orchestration-boundary)
+owns durable scheduling and recovery. SDK public methods and persisted payloads
+are preserved, including re-exports of the shared core artifact types. Unified
+session recovery likewise supplies profile assembly and historical compatibility
+checks to core's `recoverPreparedSession`. See [the phased reorganization](../../REORGANIZATION.md)
+for remaining workspace boundaries.
 
 ## CLI usage of the SDK at a glance
 
