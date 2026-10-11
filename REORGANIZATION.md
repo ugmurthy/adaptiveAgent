@@ -450,3 +450,49 @@ auth/URLs/streaming, PDF extraction, file conversion and durable recovery.
 This resolves typecheck acceptance debt only. Desktop trace negotiation repair
 is separate; concurrent test ordering remains deferred. Nothing is merged,
 published, deployed, or written to the existing databases.
+
+## Follow-up: desktop trace protocol 1.1
+
+Branch: `reorg/followup-trace-protocol`, stacked on the typecheck follow-up.
+The native desktop client now sends and requires `1.1`, matching the bundled
+trace sidecar. One shared native constant drives the request, response check
+and version error. Existing fail-closed read-only and privacy-capability checks
+are unchanged; there is no downgrade to `1.0`. Report shapes, schemas,
+migrations, dependencies and concurrent test ordering are unchanged.
+
+Verification:
+
+- All ten workspace typechecks pass, including Svelte zero errors/warnings.
+  Trace tests pass (117 Vitest + 8 Bun); desktop tests pass (7 Vitest + 37 Bun)
+  and the production web build passes. Boundary checks and four boundary
+  tests pass. Both follow-up PRs' read-only CI jobs pass.
+- Source and compiled Linux x64 trace-sidecar processes pass all eight privacy
+  policies (16 real processes). `1.0` is rejected, `1.1` is accepted, persisted
+  trace and authoritative session labels are correct, and messages, reasoning
+  and raw tools are included or denied exactly by policy. The disposable
+  runtime SQLite SHA-256 remains unchanged; all processes exit cleanly.
+- On the Mac runner, the unchanged parent client fails the real native
+  handshake with `Unsupported protocol version. This sidecar supports 1.1.`
+  The same temporary native harness passes against the repaired client and
+  packaged arm64 sidecar: eight privacy policies accepted, three deliberate
+  capability mismatches rejected, one root/two runs/34 tokens returned, and
+  clean transport shutdown. The fixture SQLite SHA-256 remains unchanged.
+- Final native code ([verified commit](https://github.com/ugmurthy/adaptiveAgent/commit/55712ae4c38a1765b7b77324ed0d0dfa81b88df8))
+  passes Rust formatting, `cargo check`, all 75 native library tests, and the
+  native transport harness. Both arm64
+  sidecars and an isolated `.app` are built. The harness and fixture paths
+  are validation-specific, so no production injection seam, Cargo manifest
+  edit or environment-dependent permanent test is added.
+- Three packaged launches initialize the synthetic profile. Open-file
+  inspection confirms isolated workbench and runtime database paths. Native
+  Accessibility Quit exits cleanly; the app and known child PIDs are gone.
+
+Mac validation uses a detached disposable worktree, synthetic profiles,
+workspace and databases, and a distinct test bundle identifier/app-data path.
+Existing user data and the runner's local main are not used or changed.
+Screen Recording permission is unavailable and is not modified. Independent
+Python and Swift Accessibility reads return the application root instead of
+an inspectable window/control tree. Packaged Inspector selection/privacy UI
+acceptance and the full release matrix are therefore not claimed;
+Mac x64 and Linux native desktop remain unverified, and Windows is excluded
+at the user's request. Existing Postgres and migration definitions are untouched.
