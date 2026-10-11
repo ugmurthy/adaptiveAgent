@@ -811,9 +811,25 @@ The current workspace packages are:
 - `@adaptive-agent/desktop-bridge`: the NDJSON JSON-RPC 2.0 stdio sidecar for agent discovery and exact selection, runtime initialization, execution, run control, interactions, events, and safe CLI access.
 - `@adaptive-agent/desktop-app`: the Tauri 2 + Svelte desktop client backed by `desktop-bridge`.
 
+Cross-workspace consumers use declared public package exports, never another
+package's implementation paths. Core owns prepared durable scheduling/recovery;
+SDK owns profile preparation and routing policy; CLI owns terminal interactions.
+SDK hosts supply interaction callbacks or handle pending results explicitly.
+Trace-session's root is headless (`/cli` and `/sidecar` are explicit hosts), and
+workbench owns HTTP/presentation rather than runtime SQL. Gateway-client consumes
+the narrow `@adaptive-agent/core/types` contract. Fullscreen TUI is removed;
+plain CLI behavior is retained.
+
+See [AGENTS.md](AGENTS.md) for all workspace ownership/import rules and
+[REORGANIZATION.md](REORGANIZATION.md) for phase results, source API migration
+notes, verification evidence and outstanding integration limitations. Older
+design/proposal documents describe historical layouts, not current entrypoints.
+
 Useful local commands:
 
 ```bash
+bun run boundaries:test
+bun run boundaries:check
 bun run core:test
 bun run agent:build
 bun run cli:build

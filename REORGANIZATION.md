@@ -21,7 +21,7 @@
 | desktop-bridge | Desktop RPC adaptation, runtime lifecycle, event delivery, explicit CLI child integration | agent-sdk, core, gateway-client, cli for CLI integration only |
 | desktop-app | Native process/window lifecycle, attachment ownership, workbench records, submission tracking, product presentation | Versioned agent and trace sidecar protocols |
 | gateway-protocol | Transport-neutral wire contracts and input validation | None |
-| gateway-client | Transport and gateway-to-core model adaptation | gateway-protocol, core public contracts |
+| gateway-client | Transport and gateway-to-core model adaptation | gateway-protocol, core/types public contracts |
 | capability-gateway | Authentication, authorization, permits, quotas, billing, provider routing and server profile distribution | gateway-protocol, core integrations |
 | trace-session | Runtime-schema readers, trace projections, reports and trace sidecar | Narrow SDK runtime-settings resolution; runtime schema contracts |
 | trace-workbench | Trace HTTP adaptation and web presentation | trace-session public reporting API |
@@ -319,3 +319,94 @@ compiled sidecar was tested through its supported protocol, not the packaged
 Tauri GUI; fixing that pre-existing mismatch is outside this relocation. Other
 non-Linux/native workflows were not manually exercised. Phase 5 still owns
 whole-repo dependency enforcement and final integration/release smoke checks.
+
+## Phase 5 result
+
+Branch: `reorg/phase-5-boundary-enforcement`, stacked on
+`reorg/phase-4-trace-boundary`. Runtime algorithms, schemas/migrations, existing
+databases, desktop native/frontend source, and RPC versions are unchanged.
+
+- Core now declares its root and narrow `/types` exports. Gateway-client moves
+  from private `core/src/types.js` to `/types`, preserving its contract-only
+  dependency without pulling runtime implementation into declaration builds.
+  Other private core subpaths are no longer supported public imports.
+- Active examples and developer scripts use public workspace imports. SDK
+  exposes the existing metadata-only `discoverCatalogDelegates` operation at
+  its root for the manual delegate runner; no discovery algorithm changes.
+- Root tooling declares SDK/core workspace devDependencies and TypeScript.
+  Lockfile changes only add those root declarations; package versions do not
+  change. Executable compilation inputs remain explicit source paths.
+- `bun run boundaries:check` checks all ten workspace manifests and literal
+  TS/JS imports/re-exports, import types, dynamic imports, `require`, and Svelte
+  script blocks in `packages`, `scripts`, and `examples`. It rejects forbidden
+  production/test edges, undeclared dependencies, private package subpaths,
+  cross-boundary relative paths, production imports of test modules, and broad
+  imports across the gateway/trace headless boundaries. New workspaces require
+  an explicit policy. Four fixture cases exercise allowed and rejected edges.
+- `workspace-boundaries` runs the checker and its tests on PRs and reorg branch
+  pushes with read-only repository permissions. It does not publish or deploy.
+  Existing release workflow and release triggers are unchanged.
+- `AGENTS.md` now records ownership and dependency directions for all ten
+  workspaces, public entrypoints, headless host rules, test-only exceptions and
+  verification commands. README points current consumers to these boundaries
+  rather than treating older design proposals as current package layouts.
+
+The checker is an architectural guard, not a security sandbox or protocol
+compatibility test. Computed plugin imports, native RPC representations,
+executable build-input paths, root scratch scripts and historical documents
+still require appropriate review. Build/native outputs are excluded.
+
+### Verification
+
+| Command/check | Result |
+| --- | --- |
+| `bun run boundaries:test` / `bun run boundaries:check` | 4 passed; all active workspace boundaries passed |
+| Checker/test focused TypeScript check | Passed using core's installed Bun types |
+| Core tests | 474 Vitest + 24 Bun passed |
+| SDK tests | 184 Vitest passed, 1 skipped; 3 Bun passed on rerun; initial order-sensitive failure recorded below |
+| CLI tests / Bun integration tests | 107 passed, 1 Node-skipped case; all 3 Bun integration cases passed |
+| Desktop bridge tests | 80 Vitest + 6 Bun passed |
+| Trace-session tests | 117 Vitest + 8 Bun passed |
+| Gateway protocol/client/host tests | 47 / 25 / 32 passed |
+| Desktop frontend tests / typecheck / web build | 7 Vitest + 37 Bun passed; zero typecheck errors/warnings; build passed |
+| Developer script tests | 15 passed across delegate runner, routing study and bridge script |
+| All nine packages with `build` scripts | Passed, including gateway declaration builds and workbench web/server build |
+| Seven runnable example bundle entrypoints | Passed without executing paid models/tools |
+| Public root import / private core path probe | Public APIs resolve; private core `src` import rejected |
+| Local release build / Linux x64 smoke | All five platform archives built; Linux CLI, trace and runtime-only embedded CLI execution passed |
+| Local npm package build / Linux x64 smoke | Passed; nothing published |
+| Schema/native/frontend diff / `git diff --check` | No changes / passed |
+
+Typecheck diagnostics match the prior phase exactly after normalizing source
+locations: core 76, SDK 36, CLI/bridge 32 each, trace 33. Workbench's full
+typecheck output remains identical at 32 errors. Gateway protocol/client/host
+typechecks pass. Existing failures are not suppressed.
+
+The first SDK suite run failed its unchanged concurrent gateway assertion:
+two successful runs executed local tools in `[high, low]` order while the test
+expected `[low, high]`. The focused case and complete SDK rerun passed unchanged.
+The original main case passed five focused runs; the baseline failure was not
+reproduced there. This is a recorded order-sensitive test failure, not a claim
+that all verification attempts were green or a bundled unrelated fix.
+
+Release smoke used synthetic version `v0.0.0-reorg.phase5`, without creating a
+Git tag, triggering a release, or publishing anything. Generated build metadata
+was restored. Tests used isolated fixtures and disposable SQLite databases;
+the existing Postgres cluster and migrations were not touched. No packaged
+Tauri GUI or non-Linux binaries were executed. Desktop trace negotiation still
+has the previously recorded 1.0/1.1 mismatch, unchanged in this phase.
+
+### Acceptance and delivery
+
+All five planned separation phases are implemented on stacked review branches.
+They are not merged or deployed, and `origin/main` remains unchanged. Phase 5
+provides enforceable imports and documentation, not a claim of a completely
+green native/full-repo acceptance gate. Before accepting the whole stack:
+
+- Review the five phase PRs in order and evaluate their source API migrations.
+- Resolve or explicitly accept inherited typecheck failures and the recorded
+  concurrent test ordering issue in separately scoped work.
+- Resolve the desktop trace protocol mismatch in separately authorized work,
+  then exercise the packaged desktop workflow and required target platforms.
+- Decide on integration/merge only after those acceptance choices. No schema
+  migration is required by this reorganization.
