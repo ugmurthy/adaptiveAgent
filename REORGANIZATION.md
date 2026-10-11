@@ -410,3 +410,43 @@ green native/full-repo acceptance gate. Before accepting the whole stack:
   then exercise the packaged desktop workflow and required target platforms.
 - Decide on integration/merge only after those acceptance choices. No schema
   migration is required by this reorganization.
+
+## Follow-up: inherited typechecks
+
+Branch: `reorg/followup-typechecks`, stacked on Phase 5. The concurrent gateway
+ordering test is deliberately unchanged at the user's request. No schemas,
+migrations, persisted layouts, protocol versions or dependency versions change.
+
+- Fix test fixture generics, adapter callbacks, discriminated-union narrowing,
+  and invalid fixture values (`wait_for_all`, report view `performance`).
+- Keep Mesh/base adapter URL/key storage shared as before, but accurately
+  declare the inherited protected fields rather than incompatible private
+  declarations. Streaming uses the reader's actual return type.
+- Make tool output/formatter types accurately JSON-compatible. Absent optional
+  cursor/byte-count summary fields are omitted instead of set to `undefined`;
+  serialized JSON is unchanged. PDF extraction copies exactly the file bytes
+  into an owned ArrayBuffer as before.
+- Declare the PDF worker entrypoint and global worker binding; connect the
+  declaration to consuming packages. Account for PDF marked-content entries
+  without changing extraction. Preserve the existing affine DOMMatrix shim,
+  explicitly documenting its limited boundary assertion.
+- Add root `bun run typecheck`, core's local typecheck script, and a read-only
+  CI typecheck job with gateway declaration prerequisites. Strict compiler
+  settings are unchanged; no errors are suppressed.
+
+Verification: all ten workspace typechecks pass, including Svelte checks with
+zero errors/warnings. Previous core 76, SDK 36, CLI/bridge 32, trace 33 and
+workbench 32 diagnostics are eliminated at their owning source (counts overlap
+because consumers check core). All package tests and nine package builds pass;
+desktop web build passes. Counts remain core 474 Vitest + 24 Bun, SDK 184 Vitest
+and 3 Bun (1 skipped), CLI 107 (1 Node-skipped) plus all 3 Bun integration cases,
+bridge 80 Vitest + 6 Bun, trace 117 Vitest + 8 Bun, gateways 47/25/32, desktop
+7 Vitest + 37 Bun. Boundary tests/check and diff checks pass. Fifteen asymmetric
+before/after summary/model-view comparisons against unchanged original source
+produce identical serialized JSON, including pagination zero/nonzero/missing,
+multibyte truncation, and web excerpt selection. Existing tests cover adapter
+auth/URLs/streaming, PDF extraction, file conversion and durable recovery.
+
+This resolves typecheck acceptance debt only. Desktop trace negotiation repair
+is separate; concurrent test ordering remains deferred. Nothing is merged,
+published, deployed, or written to the existing databases.

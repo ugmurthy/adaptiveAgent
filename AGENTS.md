@@ -24,6 +24,7 @@
   - `bunx vitest run -t "<name>"`
   - `bun run typecheck` when the package defines it
 - Root useful commands:
+  - `bun run typecheck` checks all ten workspaces; build gateway protocol/client/host declarations first on a fresh checkout.
   - `rg --files -uu` to inspect files
   - `rg -n "pattern" *.md` to trace terminology and contracts
 - Keep edits scoped. Do not rewrite historical docs unless the task is about migration, comparison, or historical context.

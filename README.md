@@ -830,6 +830,7 @@ Useful local commands:
 ```bash
 bun run boundaries:test
 bun run boundaries:check
+bun run typecheck
 bun run core:test
 bun run agent:build
 bun run cli:build
