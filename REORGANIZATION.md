@@ -476,7 +476,8 @@ Verification:
   The same temporary native harness passes against the repaired client and
   packaged arm64 sidecar: eight privacy policies accepted, three deliberate
   capability mismatches rejected, one root/two runs/34 tokens returned, and
-  clean transport shutdown. The fixture SQLite SHA-256 remains unchanged.
+  clean transport shutdown. The fixture SQLite SHA-256 remains unchanged
+  during this read-only matrix, not the later writable SDK startup.
 - Final native code ([verified commit](https://github.com/ugmurthy/adaptiveAgent/commit/55712ae4c38a1765b7b77324ed0d0dfa81b88df8))
   passes Rust formatting, `cargo check`, all 75 native library tests, and the
   native transport harness. Both arm64
