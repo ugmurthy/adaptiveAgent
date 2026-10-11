@@ -1951,7 +1951,8 @@ impl TraceBridge {
         if initialized.get("protocolVersion").and_then(Value::as_str)
             != Some(TRACE_PROTOCOL_VERSION)
         {
-            let error = format!("Trace sidecar did not negotiate protocol {TRACE_PROTOCOL_VERSION}.");
+            let error =
+                format!("Trace sidecar did not negotiate protocol {TRACE_PROTOCOL_VERSION}.");
             self.fail(&error);
             return Err(error);
         }
