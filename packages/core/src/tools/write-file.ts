@@ -138,7 +138,7 @@ export function createWriteFileTool(config?: WriteFileToolConfig): ToolDefinitio
           resolvedOutputPath: resolved,
           content,
           inputFormat: normalizeInputFormat(inputFormat),
-          outputFormat: normalizeOutputFormat(outputFormat),
+          outputFormat: normalizeOutputFormat(normalizedOutputFormat),
           keepIntermediate: keepIntermediate ?? true,
           createDirectories,
           convertWithPandoc,

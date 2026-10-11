@@ -19,7 +19,7 @@ import { createEditFileTool } from './tools/edit-file.js';
 import { createReadFileTool } from './tools/read-file.js';
 import { createSearchFilesTool } from './tools/search-files.js';
 import { createWriteFileTool } from './tools/write-file.js';
-import type { AgentEvent, ModelAdapter, ModelRequest, ModelResponse, RuntimeStores, ToolDefinition } from './types.js';
+import type { AgentEvent, ModelAdapter, ModelRequest, ModelResponse, RuntimeTransactionStore, ToolDefinition } from './types.js';
 
 class SequenceModel implements ModelAdapter {
   readonly provider: string;
@@ -138,6 +138,17 @@ function createBudgetedReadWebPageTool(onExecute?: () => void): ToolDefinition {
       };
     },
   };
+}
+
+function isRuntimeModelRetryEvent(event: AgentEvent): boolean {
+  const { payload } = event;
+  return (
+    event.type === 'model.retry' &&
+    typeof payload === 'object' &&
+    payload !== null &&
+    !Array.isArray(payload) &&
+    payload.phase === 'runtime'
+  );
 }
 
 describe('AdaptiveAgent', () => {
@@ -1273,7 +1284,9 @@ describe('AdaptiveAgent', () => {
     expect(result.status).toBe('success');
     expect(model.receivedRequests[0]?.messages).toHaveLength(2);
     expect(
-      model.receivedRequests[0]?.messages.some((message) => message.content.includes('## Available Tools and Delegates')),
+      model.receivedRequests[0]?.messages.some(
+        (message) => typeof message.content === 'string' && message.content.includes('## Available Tools and Delegates'),
+      ),
     ).toBe(false);
   });
 
@@ -1622,6 +1635,9 @@ describe('AdaptiveAgent', () => {
       code: 'MAX_STEPS',
       stepsUsed: 1,
     });
+    if (failed.status !== 'failure') {
+      throw new Error(`Expected failure result, received ${failed.status}`);
+    }
 
     await expect(agent.retry(failed.runId)).rejects.toThrowError(
       `increase maxSteps above ${failed.stepsUsed} before retrying`,
@@ -3532,13 +3548,18 @@ describe('AdaptiveAgent', () => {
     const eventStore = new InMemoryEventStore();
     const snapshotStore = new InMemorySnapshotStore();
     const downstreamEvents: AgentEvent[] = [];
-    const runInTransaction = vi.fn(async (operation: (stores: RuntimeStores) => Promise<unknown>) =>
-      operation({
-        runStore,
-        eventStore,
-        snapshotStore,
-      }),
-    );
+    const transactionStore: RuntimeTransactionStore = {
+      runStore,
+      eventStore,
+      snapshotStore,
+      runInTransaction: async (operation) =>
+        operation({
+          runStore,
+          eventStore,
+          snapshotStore,
+        }),
+    };
+    const runInTransaction = vi.spyOn(transactionStore, 'runInTransaction');
     const agent = new AdaptiveAgent({
       model: new SequenceModel([
         {
@@ -3551,12 +3572,7 @@ describe('AdaptiveAgent', () => {
       eventStore,
       snapshotStore,
       eventSink: { emit: async (event) => { downstreamEvents.push(event as AgentEvent); } },
-      transactionStore: {
-        runStore,
-        eventStore,
-        snapshotStore,
-        runInTransaction,
-      },
+      transactionStore,
     });
 
     const agentSelection = { selectedAgentId: 'researcher', rejectedTypeSafe: { threshold: 'confidence', minimum: 0.7 } };
@@ -3585,25 +3601,25 @@ describe('AdaptiveAgent', () => {
     const runStore = new InMemoryRunStore();
     const eventStore = new InMemoryEventStore();
     const snapshotStore = new InMemorySnapshotStore();
-    const runInTransaction = vi.fn(async (operation: (stores: RuntimeStores) => Promise<unknown>) =>
-      operation({
-        runStore,
-        eventStore,
-        snapshotStore,
-      }),
-    );
+    const transactionStore: RuntimeTransactionStore = {
+      runStore,
+      eventStore,
+      snapshotStore,
+      runInTransaction: async (operation) =>
+        operation({
+          runStore,
+          eventStore,
+          snapshotStore,
+        }),
+    };
+    const runInTransaction = vi.spyOn(transactionStore, 'runInTransaction');
     const agent = new AdaptiveAgent({
       model: new SequenceModel([]),
       tools: [],
       runStore,
       eventStore,
       snapshotStore,
-      transactionStore: {
-        runStore,
-        eventStore,
-        snapshotStore,
-        runInTransaction,
-      },
+      transactionStore,
     });
 
     const result = await agent.run({ goal: 'Fail transactionally' });
@@ -3622,13 +3638,18 @@ describe('AdaptiveAgent', () => {
     const runStore = new InMemoryRunStore();
     const eventStore = new InMemoryEventStore();
     const snapshotStore = new InMemorySnapshotStore();
-    const runInTransaction = vi.fn(async (operation: (stores: RuntimeStores) => Promise<unknown>) =>
-      operation({
-        runStore,
-        eventStore,
-        snapshotStore,
-      }),
-    );
+    const transactionStore: RuntimeTransactionStore = {
+      runStore,
+      eventStore,
+      snapshotStore,
+      runInTransaction: async (operation) =>
+        operation({
+          runStore,
+          eventStore,
+          snapshotStore,
+        }),
+    };
+    const runInTransaction = vi.spyOn(transactionStore, 'runInTransaction');
     const agent = new AdaptiveAgent({
       model: new SequenceModel([
         {
@@ -3650,12 +3671,7 @@ describe('AdaptiveAgent', () => {
       runStore,
       eventStore,
       snapshotStore,
-      transactionStore: {
-        runStore,
-        eventStore,
-        snapshotStore,
-        runInTransaction,
-      },
+      transactionStore,
     });
 
     const result = await agent.run({ goal: 'Queue a tool call transactionally' });
@@ -3680,14 +3696,20 @@ describe('AdaptiveAgent', () => {
     const eventStore = new InMemoryEventStore();
     const snapshotStore = new InMemorySnapshotStore();
     const toolExecutionStore = new InMemoryToolExecutionStore();
-    const runInTransaction = vi.fn(async (operation: (stores: RuntimeStores) => Promise<unknown>) =>
-      operation({
-        runStore,
-        eventStore,
-        snapshotStore,
-        toolExecutionStore,
-      }),
-    );
+    const transactionStore: RuntimeTransactionStore = {
+      runStore,
+      eventStore,
+      snapshotStore,
+      toolExecutionStore,
+      runInTransaction: async (operation) =>
+        operation({
+          runStore,
+          eventStore,
+          snapshotStore,
+          toolExecutionStore,
+        }),
+    };
+    const runInTransaction = vi.spyOn(transactionStore, 'runInTransaction');
     const agent = new AdaptiveAgent({
       model: new SequenceModel([
         {
@@ -3710,13 +3732,7 @@ describe('AdaptiveAgent', () => {
       eventStore,
       snapshotStore,
       toolExecutionStore,
-      transactionStore: {
-        runStore,
-        eventStore,
-        snapshotStore,
-        toolExecutionStore,
-        runInTransaction,
-      },
+      transactionStore,
     });
 
     const result = await agent.run({ goal: 'Complete a tool call transactionally' });
@@ -3738,25 +3754,30 @@ describe('AdaptiveAgent', () => {
     const snapshotStore = new InMemorySnapshotStore();
     const transactionEventGroups: string[][] = [];
     const downstreamEvents: AgentEvent[] = [];
-    const runInTransaction = vi.fn(async (operation: (stores: RuntimeStores) => Promise<unknown>) => {
-      const eventTypes: string[] = [];
-      try {
-        return await operation({
-          runStore,
-          eventStore: {
-            append: async (event) => {
-              eventTypes.push(event.type);
-              return eventStore.append(event);
+    const transactionStore: RuntimeTransactionStore = {
+      runStore,
+      eventStore,
+      snapshotStore,
+      runInTransaction: async (operation) => {
+        const eventTypes: string[] = [];
+        try {
+          return await operation({
+            runStore,
+            eventStore: {
+              append: async (event) => {
+                eventTypes.push(event.type);
+                return eventStore.append(event);
+              },
+              listByRun: (runId, afterSeq) => eventStore.listByRun(runId, afterSeq),
+              subscribe: (listener) => eventStore.subscribe(listener),
             },
-            listByRun: (runId, afterSeq) => eventStore.listByRun(runId, afterSeq),
-            subscribe: (listener) => eventStore.subscribe(listener),
-          },
-          snapshotStore,
-        });
-      } finally {
-        transactionEventGroups.push(eventTypes);
-      }
-    });
+            snapshotStore,
+          });
+        } finally {
+          transactionEventGroups.push(eventTypes);
+        }
+      },
+    };
     const agent = new AdaptiveAgent({
       model: new SequenceModel([
         {
@@ -3797,12 +3818,7 @@ describe('AdaptiveAgent', () => {
       eventStore,
       snapshotStore,
       eventSink: { emit: async (event) => { downstreamEvents.push(event as AgentEvent); } },
-      transactionStore: {
-        runStore,
-        eventStore,
-        snapshotStore,
-        runInTransaction,
-      },
+      transactionStore,
     });
 
     const result = await agent.run({ goal: 'Delegate transactionally' });
@@ -4582,7 +4598,7 @@ describe('AdaptiveAgent', () => {
     expect(attempts).toBe(2);
 
     const events = await eventStore.listByRun(result.runId);
-    const retryEvent = events.find((event) => event.type === 'model.retry' && event.payload.phase === 'runtime');
+    const retryEvent = events.find(isRuntimeModelRetryEvent);
     expect(retryEvent).toMatchObject({
       stepId: 'step-1',
       payload: expect.objectContaining({
@@ -4792,7 +4808,7 @@ describe('AdaptiveAgent', () => {
     expect(model.receivedRequests[0]?.invocation?.callId).not.toBe(model.receivedRequests[1]?.invocation?.callId);
 
     const events = await eventStore.listByRun(result.runId);
-    expect(events.find((event) => event.type === 'model.retry' && event.payload.phase === 'runtime')).toMatchObject({
+    expect(events.find(isRuntimeModelRetryEvent)).toMatchObject({
       payload: expect.objectContaining({
         reason: 'provider_error',
         attempt: 1,
@@ -4834,7 +4850,7 @@ describe('AdaptiveAgent', () => {
     expect(model.receivedRequests).toHaveLength(2);
 
     const events = await eventStore.listByRun(result.runId);
-    expect(events.filter((event) => event.type === 'model.retry' && event.payload.phase === 'runtime')).toHaveLength(1);
+    expect(events.filter(isRuntimeModelRetryEvent)).toHaveLength(1);
     expect(events.filter((event) => event.type === 'model.failed')).toHaveLength(2);
     expect(events.filter((event) => event.type === 'model.failed')[1]).toMatchObject({
       payload: expect.objectContaining({
@@ -4875,7 +4891,7 @@ describe('AdaptiveAgent', () => {
     expect(model.receivedRequests).toHaveLength(1);
 
     const events = await eventStore.listByRun(result.runId);
-    expect(events.find((event) => event.type === 'model.retry' && event.payload.phase === 'runtime')).toBeUndefined();
+    expect(events.find(isRuntimeModelRetryEvent)).toBeUndefined();
   });
 
   it('emits model.retry when the adapter reports an internal retry', async () => {

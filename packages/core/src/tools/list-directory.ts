@@ -15,14 +15,14 @@ interface ListDirectoryInput {
   filter?: string;
 }
 
-interface ListDirectoryOutput {
+type ListDirectoryOutput = {
   path: string;
   entries: Array<{ name: string; type: 'file' | 'directory' | 'other' }>;
   totalEntries?: number;
   cursor?: number;
   nextCursor?: number;
   truncated?: boolean;
-}
+};
 
 const DEFAULT_MAX_ENTRIES = 200;
 const DEFAULT_MODEL_RESULT_MAX_BYTES = 32 * 1024;
@@ -66,7 +66,7 @@ export function createListDirectoryTool(config?: ListDirectoryToolConfig): ToolD
         entryCount: result.entries.length,
         totalEntries: result.totalEntries ?? result.entries.length,
         truncated: result.truncated ?? false,
-        nextCursor: result.nextCursor,
+        ...(result.nextCursor === undefined ? {} : { nextCursor: result.nextCursor }),
       };
     },
     recoverError(error, input) {

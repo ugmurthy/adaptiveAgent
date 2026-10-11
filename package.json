@@ -9,6 +9,7 @@
   "scripts": {
     "boundaries:check": "bun run ./scripts/check-boundaries.ts",
     "boundaries:test": "bun test ./scripts/check-boundaries.test.ts",
+    "typecheck": "for package in packages/*/; do bun run --cwd \"$package\" typecheck || exit $?; done",
     "core:build": "bun run --cwd ./packages/core build",
     "core:test": "bun run --cwd ./packages/core test",
     "agent:build": "bun run --cwd ./packages/agent-sdk build",

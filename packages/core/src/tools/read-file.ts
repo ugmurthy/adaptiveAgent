@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { basename, extname, join } from 'node:path';
 import JSZip from 'jszip';
 
-import type { ToolContext, ToolDefinition } from '../types.js';
+import type { JsonValue, ToolContext, ToolDefinition } from '../types.js';
 import { buildWorkspacePathRecovery, isPathWithinRoot, PathOutsideRootError, resolvePathWithinRoots } from './path-utils.js';
 import { extractPdfTextWithPdfJs } from './pdf-text.js';
 
@@ -32,15 +32,15 @@ export interface ReadFileToolConfig {
   extractParquet?: (filePath: string, options: ParquetExtractionOptions, signal?: AbortSignal) => Promise<string>;
 }
 
-interface ReadFileInput {
+type ReadFileInput = {
   path: string;
   lineStart?: number;
   lineEnd?: number;
   offsetBytes?: number;
   maxBytes?: number;
-}
+};
 
-interface ReadFileOutput {
+type ReadFileOutput = {
   path: string;
   content: string;
   sizeBytes: number;
@@ -51,7 +51,7 @@ interface ReadFileOutput {
   lineEnd?: number;
   totalLines?: number;
   next?: Partial<ReadFileInput>;
-}
+};
 
 class ReadFileDirectoryError extends Error {
   constructor(public readonly requestedPath: string) {
@@ -78,7 +78,7 @@ export interface ZipExtractionOptions {
   maxEntrySizeBytes: number;
 }
 
-function summarizeReadFileOutput(output: ReadFileOutput): unknown {
+function summarizeReadFileOutput(output: ReadFileOutput): JsonValue {
   if (typeof output.content !== 'string') {
     return output;
   }
@@ -97,7 +97,7 @@ function summarizeReadFileOutput(output: ReadFileOutput): unknown {
   };
 }
 
-function formatReadFileOutputForModel(output: ReadFileOutput, maxBytes: number): unknown {
+function formatReadFileOutputForModel(output: ReadFileOutput, maxBytes: number): JsonValue {
   if (typeof output.content !== 'string') {
     return output;
   }
@@ -467,10 +467,7 @@ async function readContentAsText(
 
   if (extension === '.pdf') {
     signal?.throwIfAborted();
-    const extracted = await extractPdfText(contentBuffer.buffer.slice(
-      contentBuffer.byteOffset,
-      contentBuffer.byteOffset + contentBuffer.byteLength,
-    ));
+    const extracted = await extractPdfText(Uint8Array.from(contentBuffer).buffer);
     signal?.throwIfAborted();
     return extracted.text;
   }

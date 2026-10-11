@@ -122,6 +122,9 @@ describe('skill handler preparation', () => {
         delegates: ['custom-handler'],
       },
       modelAdapter: {
+        provider: 'ollama',
+        model: 'test',
+        capabilities: { toolCalling: true, jsonOutput: true, streaming: false, usage: false },
         async generate() {
           return { finishReason: 'stop', text: 'done' };
         },
