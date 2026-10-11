@@ -36,6 +36,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_NDJSON_FRAME_SIZE: usize = 1024 * 1024;
 const TRACE_MAX_NDJSON_FRAME_SIZE: usize = 8 * 1024 * 1024;
+const TRACE_PROTOCOL_VERSION: &str = "1.1";
 const TRACE_PRIVACY_SETTING: &str = "trace_privacy";
 const RECENT_WORK_LIMIT: usize = 10;
 const DEFAULT_MAX_AGENT_WINDOWS: usize = 3;
@@ -1933,9 +1934,25 @@ impl TraceBridge {
     }
 
     fn initialize(&self, privacy: TracePrivacy) -> Result<(), String> {
-        let initialized=match self.request_wait("initialize",Some(json!({"protocolVersion":"1.0","clientInfo":{"name":"adaptive-agent-desktop","version":"0.1.0"}})),REQUEST_TIMEOUT){Ok(value)=>value,Err(error)=>{self.fail(&error);return Err(error)}};
-        if initialized.get("protocolVersion").and_then(Value::as_str) != Some("1.0") {
-            let error = "Trace sidecar did not negotiate protocol 1.0.".to_string();
+        let initialized = match self.request_wait(
+            "initialize",
+            Some(json!({
+                "protocolVersion": TRACE_PROTOCOL_VERSION,
+                "clientInfo": {"name": "adaptive-agent-desktop", "version": "0.1.0"}
+            })),
+            REQUEST_TIMEOUT,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                self.fail(&error);
+                return Err(error);
+            }
+        };
+        if initialized.get("protocolVersion").and_then(Value::as_str)
+            != Some(TRACE_PROTOCOL_VERSION)
+        {
+            let error =
+                format!("Trace sidecar did not negotiate protocol {TRACE_PROTOCOL_VERSION}.");
             self.fail(&error);
             return Err(error);
         }
