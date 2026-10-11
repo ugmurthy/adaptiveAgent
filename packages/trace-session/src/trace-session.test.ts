@@ -12,8 +12,32 @@ import type { EventType, MilestoneEntry, TraceAggregateObservation, TraceReport,
 import { SQLITE_TRACE_DATABASE_OPTIONS } from './trace-session/reader.js';
 import { filterSessions, runDecisionFromMetadata, sessionPresentationFromRuns } from './trace-session/data.js';
 import type { SessionListItem } from './trace-session/types.js';
+import { listRecentSessions, type PostgresClient } from './index.js';
 
 describe('session presentation projection', () => {
+  it('preserves recent-root grouping, active status precedence, ties, and separate sessionless runs', async () => {
+    const row = (id: string, sessionId: string | null, status: string | null, startedAt: string | null, linkedAt: string, goal: unknown) => ({
+      root_run_id: id, run_id: id, session_id: sessionId, status, started_at: startedAt, linked_at: linkedAt, completed_at: null, goal,
+    });
+    const rows = [
+      row('root-b', 'b', 'succeeded', '2026-07-05', '2026-07-10', 'B'),
+      row('root-a', 'a', 'failed', '2026-07-01', '2026-07-10', 'A'),
+      row('root-a2', 'a', 'blocked', '2026-07-06', '2026-07-09', { followup: 'A2' }),
+      row('solo-1', null, null, null, '2026-07-08', null),
+      row('solo-2', null, 'succeeded', '2026-07-07', '2026-07-07', 'Separate'),
+    ];
+    const client: PostgresClient = { async query<T>() { return { rows: rows as T[], rowCount: rows.length }; } };
+    expect(await listRecentSessions(client, 5)).toEqual([
+      { sessionId: 'b', startedAt: '2026-07-05', status: 'succeeded', goals: [{ rootRunId: 'root-b', runId: 'root-b', status: 'succeeded', startedAt: '2026-07-05', completedAt: null, goal: 'B', linkedAt: '2026-07-10' }] },
+      { sessionId: 'a', startedAt: '2026-07-01', status: 'running', goals: [
+        { rootRunId: 'root-a', runId: 'root-a', status: 'failed', startedAt: '2026-07-01', completedAt: null, goal: 'A', linkedAt: '2026-07-10' },
+        { rootRunId: 'root-a2', runId: 'root-a2', status: 'blocked', startedAt: '2026-07-06', completedAt: null, goal: '{"followup":"A2"}', linkedAt: '2026-07-09' },
+      ] },
+      { sessionId: null, startedAt: '2026-07-08', status: 'unknown', goals: [{ rootRunId: 'solo-1', runId: 'solo-1', status: null, startedAt: '2026-07-08', completedAt: null, goal: null, linkedAt: '2026-07-08' }] },
+      { sessionId: null, startedAt: '2026-07-07', status: 'succeeded', goals: [{ rootRunId: 'solo-2', runId: 'solo-2', status: 'succeeded', startedAt: '2026-07-07', completedAt: null, goal: 'Separate', linkedAt: '2026-07-07' }] },
+    ]);
+  });
+
   it('projects only decision metadata from core runs without gateway tables', () => {
     const selection = { selectedAgentId: 'fallback', rejectedTypeSafe: { threshold: 'confidence', minimum: 0.7 } };
     const routing = { mode: 'direct', stages: [{ name: 'mode', confidence: 0.9 }],

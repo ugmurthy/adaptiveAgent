@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { Database } from 'bun:sqlite';
 import { afterEach, describe, expect, it } from 'bun:test';
 
-import { SqliteTraceReader, TraceService } from './trace-session/reader.js';
+import { SqliteTraceReader, TraceService } from './index.js';
 import type { CliOptions, SessionListItem, SessionUsageSummary, ToolAccountingSummary, TraceReport } from './trace-session/types.js';
 import { TraceSidecarRuntime } from './sidecar/runtime.js';
 import { parseTraceSidecarRpcRequest } from './sidecar/protocol.js';
