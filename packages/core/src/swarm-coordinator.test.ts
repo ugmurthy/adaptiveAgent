@@ -172,7 +172,9 @@ describe('SwarmCoordinator', () => {
     ))).toBe(true);
     const runsByRole = new Map(
       sessionRuns.map((run) => [
-        typeof run.metadata?.orchestration === 'object' && run.metadata.orchestration !== null
+        typeof run.metadata?.orchestration === 'object' &&
+        run.metadata.orchestration !== null &&
+        !Array.isArray(run.metadata.orchestration)
           ? String(run.metadata.orchestration.role)
           : run.id,
         run,

@@ -2270,7 +2270,7 @@ describe('trace-session CLI helpers', () => {
       assignments: [{ agentId: branch === 'selection' ? 'owner' : 'image-expert', modalities: ['text', 'image'], reason: 'Inspect <images>.' }],
     };
     const report = reliabilityReport({ rootRuns: [{ ...base.rootRuns[0]!, executionRouting: routing }] });
-    for (const view of ['summary', 'timeline', 'usage'] as const) {
+    for (const view of ['summary', 'timeline', 'performance'] as const) {
       const text = stripAnsi(renderTraceReport(report, { json: false, includePlans: false, onlyDelegates: false, messages: false, systemOnly: false, view }));
       expect(text).toContain('confidence=0.42 choiceConfidence=0.83 relevance=0.42');
       expect(text).toContain('stage mode: confidence=0.91\n  TypeSafe tokens=101+7');

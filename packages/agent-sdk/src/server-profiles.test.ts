@@ -7,6 +7,7 @@ import type {
   GatewayClient,
   ModelGenerateParams,
   ProfileRef,
+  ProfileSummary,
   RunAuthorizeParams,
 } from '@adaptive-agent/gateway-client';
 import { createAgentSdk } from './index.js';
@@ -151,7 +152,7 @@ function profileClient(value: DeclarativeProfileBundle): Pick<GatewayClient, 'li
   getProfile: ReturnType<typeof vi.fn>;
 } {
   return {
-    listProfiles: vi.fn(async () => [{
+    listProfiles: vi.fn(async (): Promise<ProfileSummary[]> => [{
       ref: value.ref,
       name: value.name,
       allowedTiers: ['medium'],

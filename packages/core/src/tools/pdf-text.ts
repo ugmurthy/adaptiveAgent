@@ -1,3 +1,5 @@
+/// <reference path="../pdfjs-worker.d.ts" />
+
 export interface ExtractedPdfText {
   title: string;
   text: string;
@@ -13,7 +15,7 @@ interface PdfJsModule {
       numPages: number;
       getMetadata(): Promise<{ info?: { Title?: string } } | null>;
       getPage(pageNumber: number): Promise<{
-        getTextContent(): Promise<{ items: Array<{ str?: string }> }>;
+        getTextContent(): Promise<{ items: Array<{ str?: string } | { type: string }> }>;
       }>;
       destroy(): Promise<void>;
     }>;
@@ -22,6 +24,10 @@ interface PdfJsModule {
 
 interface PdfJsWorkerModule {
   WorkerMessageHandler?: object;
+}
+
+declare global {
+  var pdfjsWorker: PdfJsWorkerModule | undefined;
 }
 
 interface ExtractPdfTextOptions {
@@ -83,7 +89,8 @@ async function loadPdfJsWorkerModule(): Promise<PdfJsWorkerModule> {
 
 async function ensurePdfJsNodeRuntime(options?: ExtractPdfTextOptions): Promise<void> {
   if (typeof globalThis.DOMMatrix === 'undefined') {
-    globalThis.DOMMatrix = MinimalDOMMatrix as typeof DOMMatrix;
+    // PDF.js uses this affine subset; it is not a complete DOMMatrix implementation.
+    globalThis.DOMMatrix = MinimalDOMMatrix as unknown as typeof DOMMatrix;
   }
 
   if (globalThis.pdfjsWorker?.WorkerMessageHandler) {
@@ -120,12 +127,13 @@ class MinimalDOMMatrix {
       return;
     }
 
-    this.a = init.a ?? this.a;
-    this.b = init.b ?? this.b;
-    this.c = init.c ?? this.c;
-    this.d = init.d ?? this.d;
-    this.e = init.e ?? this.e;
-    this.f = init.f ?? this.f;
+    const matrix = init as Partial<Pick<MinimalDOMMatrix, 'a' | 'b' | 'c' | 'd' | 'e' | 'f'>>;
+    this.a = matrix.a ?? this.a;
+    this.b = matrix.b ?? this.b;
+    this.c = matrix.c ?? this.c;
+    this.d = matrix.d ?? this.d;
+    this.e = matrix.e ?? this.e;
+    this.f = matrix.f ?? this.f;
   }
 
   multiplySelf(other: MinimalDOMMatrix): this {

@@ -1,4 +1,4 @@
-import type { ToolAccounting, ToolDefinition } from '../types.js';
+import type { JsonValue, ToolAccounting, ToolDefinition } from '../types.js';
 import { extractPdfTextWithPdfJs } from './pdf-text.js';
 
 export type ReadWebPageProvider = 'direct' | 'parallel';
@@ -297,7 +297,7 @@ function getReadWebPageAccounting(
   };
 }
 
-function summarizeReadWebPageOutput(output: ReadWebPageOutput): unknown {
+function summarizeReadWebPageOutput(output: ReadWebPageOutput): JsonValue {
   if (typeof output.text !== 'string') {
     return output;
   }
@@ -323,7 +323,7 @@ function summarizeReadWebPageOutput(output: ReadWebPageOutput): unknown {
   };
 }
 
-function formatReadWebPageOutputForModel(output: ReadWebPageOutput, maxBytes: number): unknown {
+function formatReadWebPageOutputForModel(output: ReadWebPageOutput, maxBytes: number): JsonValue {
   if (typeof output.text !== 'string') {
     return output;
   }
