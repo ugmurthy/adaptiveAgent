@@ -57,6 +57,37 @@ These rules protect the package boundary established by `CORE-SESSION-SWARM-SPEC
 - Desktop bridge may use CLI for its explicit CLI child integration, not as its runtime authority.
 - Do not restore the removed fullscreen TUI or its dependency.
 
+### Whole-workspace ownership
+
+| Workspace | Responsibility | Production workspace dependencies |
+| --- | --- | --- |
+| core | Durable execution, prepared orchestration, validation, runtime stores and recovery | None |
+| agent-sdk | Profiles/settings, assembly, discovery, selection/routing policy and plan preparation | core, gateway-client |
+| cli | Terminal workflows, evaluation, installation and executable distribution | agent-sdk, core |
+| desktop-bridge | Versioned RPC host, runtime lifecycle/events and explicit CLI child integration | agent-sdk, core, gateway-client, cli |
+| desktop-app | Native windows/processes, attachments, workbench records and product presentation | Agent and trace sidecar protocols, not TS runtime packages |
+| gateway-protocol | Transport-neutral wire contracts and validation | None |
+| gateway-client | Transport and gateway model adaptation | gateway-protocol, core/types |
+| capability-gateway | Authentication/authorization, permits, quotas, billing, provider routing and profile distribution | gateway-protocol, core |
+| trace-session | Read-only runtime readers/projections, reports and trace RPC host | agent-sdk/runtime-settings only |
+| trace-workbench | Trace HTTP/static adaptation and web presentation | trace-session headless root only |
+
+- Durable product records are not all core execution state: desktop workbench data and gateway billing remain host-owned.
+- Keep native and TypeScript sidecar protocol versions/payloads compatible; the desktop renderer must not import runtime implementations.
+- Provider adapters and built-in tools remain core-owned in this reorganization. Extracting them is a separate design decision.
+
+### Enforced public imports
+
+- Use package names and explicit `package.json` exports across workspaces, including in tests, scripts and examples. Do not reach into another package's `src`, `dist`, or internal files through relative paths or aliases.
+- Core exports its runtime API at `@adaptive-agent/core` and its narrow contracts at `@adaptive-agent/core/types`. Gateway-client consumes only the latter.
+- SDK has no `/cli` compatibility re-export. Use `@adaptive-agent/cli`, `/agent-create`, or `/commands` for the relevant CLI surface.
+- Trace-session's root is headless; `/cli` and `/sidecar` are explicit host entrypoints. Workbench imports only the root; trace-session imports only SDK `/runtime-settings`.
+- Production imports must be declared in `dependencies`, `peerDependencies`, or `optionalDependencies`, not just `devDependencies`. Only SDK, CLI and desktop-bridge tests may depend on the capability-gateway host.
+- Do not import test modules from production code. Keep test-only host dependencies out of helper modules used by production.
+- Build/release scripts may name executable source files as build inputs; that does not authorize cross-package implementation imports.
+- Run `bun run boundaries:test` and `bun run boundaries:check` after changing exports, dependencies or cross-package imports. The same checks run in the `workspace-boundaries` PR workflow; a new workspace needs an explicit checker policy.
+- The checker inspects literal TS/JS imports/re-exports, dynamic imports, `require`, import types and Svelte script blocks in `packages`, `scripts`, and `examples`. Generated build/native outputs, historical documents and root scratch scripts are not checked. Computed plugin imports and native protocol compatibility still require review and integration tests.
+
 ### Do not blur this boundary
 
 - Do not move CLI-specific parsing, command naming, or agent-spec discovery into core.

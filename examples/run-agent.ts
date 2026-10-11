@@ -52,22 +52,18 @@ import { isAbsolute, resolve } from 'node:path';
 import { stdin as input, stdout as output } from 'node:process';
 import { createInterface } from 'node:readline/promises';
 
-import { createAdaptiveAgent } from '../packages/core/src/create-adaptive-agent.js';
-import { createReadFileTool } from '../packages/core/src/tools/read-file.js';
-import { createListDirectoryTool } from '../packages/core/src/tools/list-directory.js';
-import { createWriteFileTool } from '../packages/core/src/tools/write-file.js';
-import { createShellExecTool } from '../packages/core/src/tools/shell-exec.js';
-import { createWebSearchTool } from '../packages/core/src/tools/web-search.js';
-import { createReadWebPageTool } from '../packages/core/src/tools/read-web-page.js';
-import { loadSkillFromDirectory } from '../packages/core/src/skills/load-skill.js';
-import { skillToDelegate } from '../packages/core/src/skills/skill-to-delegate.js';
+import {
+  createAdaptiveAgent, createReadFileTool, createListDirectoryTool, createWriteFileTool,
+  createShellExecTool, createWebSearchTool, createReadWebPageTool,
+  loadSkillFromDirectory, skillToDelegate,
+} from '@adaptive-agent/core';
 import {
   createAdaptiveAgentLogger,
   DEFAULT_LOG_DESTINATION,
   DEFAULT_LOG_LEVEL,
   type AdaptiveAgentLogDestination,
-} from '../packages/core/src/logger.js';
-import type { AgentEvent, DelegateDefinition, RunResult, ToolDefinition } from '../packages/core/src/types.js';
+} from '@adaptive-agent/core';
+import type { AgentEvent, DelegateDefinition, RunResult, ToolDefinition } from '@adaptive-agent/core/types';
 //-markdown//
 import { marked } from 'marked';
 import { markedTerminal } from 'marked-terminal';

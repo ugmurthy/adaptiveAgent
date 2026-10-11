@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { Database } from 'bun:sqlite';
 import { afterEach, describe, expect, it } from 'bun:test';
 
-import type { TypeSafeAgentSelectionClient, TypeSafeAgentSelectionResponse } from '../packages/agent-sdk/src/index.js';
+import type { TypeSafeAgentSelectionClient, TypeSafeAgentSelectionResponse } from '@adaptive-agent/agent-sdk';
 import { extractHistoricalCases, modalityMarker, runStudy } from './jev-routing-study.js';
 
 let directory: string | undefined;

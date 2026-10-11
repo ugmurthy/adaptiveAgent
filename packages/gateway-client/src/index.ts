@@ -4,7 +4,7 @@ import type {
   ModelRequest,
   ModelResponse,
   ModelStreamEvent as CoreModelStreamEvent,
-} from '@adaptive-agent/core/src/types.js';
+} from '@adaptive-agent/core/types';
 import {
   PROTOCOL_VERSION,
   StreamSequenceValidator,
