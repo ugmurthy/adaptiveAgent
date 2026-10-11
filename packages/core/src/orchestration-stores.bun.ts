@@ -3,8 +3,9 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { InMemoryOrchestrationStore, OrchestrationOptimisticConcurrencyError } from './in-memory-orchestration-store.js';
-import { openSqliteRuntimeStores } from './sqlite-runtime-stores.js';
-import type { OrchestrationExecution, OrchestrationStage, OrchestrationStore } from './types.js';
+import { openSqliteRuntimeStores, type SqliteRuntimeStoreBundle } from './sqlite-runtime-stores.js';
+import { createAdaptiveAgent, PreparedOrchestrationExecutor, type OrchestrationPlan } from './index.js';
+import type { ModelAdapter, ModelResponse, OrchestrationExecution, OrchestrationStage, OrchestrationStore } from './types.js';
 
 const firstRun = '00000000-0000-4000-8000-000000000001';
 const secondRun = '00000000-0000-4000-8000-000000000002';
@@ -78,5 +79,110 @@ describe('durable orchestration stores',()=>{
       expect((await reopened.orchestrationStore.listBySession('session-listing')).map((execution)=>execution.id)).toContain(executionId);
       await reopened.close();
     }finally{await rm(dir,{recursive:true,force:true});}
+  });
+
+  test('executes and recovers a prepared plan after SQLite reopen without duplicate continuation or sibling work', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'prepared-orchestration-'));
+    const path = join(dir, 'runtime.db');
+    const bundles: SqliteRuntimeStoreBundle[] = [];
+    let recovering = false;
+    let lookupEffects = 0;
+    const modelCalls: Record<string, number> = { analysis: 0, sibling: 0, synthesis: 0 };
+    let enterRecovery!: () => void;
+    let releaseRecovery!: () => void;
+    const entered = new Promise<void>((resolve) => { enterRecovery = resolve; });
+    const gate = new Promise<void>((resolve) => { releaseRecovery = resolve; });
+    const executorFor = (bundle: SqliteRuntimeStoreBundle) => {
+      const runners = Object.fromEntries(['analysis', 'sibling', 'synthesis'].map((id) => {
+        const model: ModelAdapter = {
+          provider: 'test', model: id,
+          capabilities: { toolCalling: true, jsonOutput: true, streaming: false, usage: false },
+          async generate(request): Promise<ModelResponse> {
+            modelCalls[id]++;
+            if (id === 'analysis' && !recovering) {
+              if (modelCalls.analysis === 1) return { finishReason: 'tool_calls', toolCalls: [{ id: 'lookup-1', name: 'lookup', input: {} }] };
+              throw new Error('Invalid model output after completed lookup');
+            }
+            if (id === 'analysis') {
+              enterRecovery();
+              await gate;
+            }
+            if (id === 'synthesis') {
+              const message = request.messages.find((item) => item.role === 'user');
+              const input = JSON.parse(message!.content as string).input;
+              return { finishReason: 'stop', structuredOutput: { sum: input.analysis.value + input.sibling.value } };
+            }
+            return { finishReason: 'stop', structuredOutput: { value: id === 'analysis' ? 17 : 31 } };
+          },
+        };
+        const { agent } = createAdaptiveAgent({ model, runtime: bundle, tools: [{ name: 'lookup', description: 'Read a finding', inputSchema: { type: 'object' }, async execute() { lookupEffects++; return { finding: 11 }; } }] });
+        return [id, {
+          agent, inspect: async (runId: string) => ({ run: await bundle.runStore.getRun(runId) }),
+          resumeRaw: agent.resume.bind(agent), getRecoveryPlan: agent.getRecoveryPlan.bind(agent), recoverRaw: agent.recover.bind(agent),
+        }];
+      }));
+      return new PreparedOrchestrationExecutor({
+        getStore: () => bundle.orchestrationStore, catalogFingerprint: 'catalog-v1', hasAgent: (id) => id in runners,
+        getRunner: async (id) => runners[id],
+        runNode: ({ runner, goal, options, node, runId, sessionId, priorResults }) => runner.agent.run({
+          ...options, goal, runId, sessionId,
+          input: node.id === 'synthesis' ? Object.fromEntries([...priorResults].map(([id, stage]) => [id, stage.result.status === 'success' ? stage.result.output : null])) : undefined,
+        }),
+      });
+    };
+    try {
+      const first = openSqliteRuntimeStores({ path });
+      bundles.push(first);
+      const plan: OrchestrationPlan = {
+        executionId: 'prepared-execution', sessionId: 'conversation', requestedAgentId: 'synthesis', catalogFingerprint: 'catalog-v1',
+        detectedModalities: ['text'], detectedSubjects: [], inputClaims: [{ id: 'goal', modality: 'text', source: 'goal' }],
+        executionShape: 'parallel_fanout_then_synthesis', finalNodeId: 'synthesis', routingReason: 'Prepared by host',
+        routingDecision: { mode: 'orchestration', primaryAgentId: 'synthesis', selectedCatalogAgentIds: ['analysis', 'sibling', 'synthesis'], assignments: [{ agentId: 'analysis', modalities: ['text'], reason: 'Prepared' }], reason: 'Prepared', source: 'deterministic' },
+        routingDiagnostics: { subjectCandidates: [] },
+        nodes: [
+          { id: 'analysis', agentId: 'analysis', stage: 'parallel_specialist', dependsOn: [] },
+          { id: 'sibling', agentId: 'sibling', stage: 'parallel_specialist', dependsOn: [] },
+          { id: 'synthesis', agentId: 'synthesis', stage: 'final_synthesis', dependsOn: ['analysis', 'sibling'] },
+        ],
+      };
+      const request = { goal: 'Combine both findings', options: {} };
+      const initial = await executorFor(first).start({ executionId: 'prepared-execution', plan, request, persistedRequest: request, catalogFingerprint: 'catalog-v1' });
+      expect(initial.finalResult.status).toBe('failure');
+      const before = await first.orchestrationStore.listStages('prepared-execution');
+      const failedStage = before.find((stage) => stage.nodeId === 'analysis')!;
+      const siblingStage = before.find((stage) => stage.nodeId === 'sibling')!;
+      await first.close();
+      bundles.pop();
+      recovering = true;
+      const reopened = openSqliteRuntimeStores({ path });
+      const competing = openSqliteRuntimeStores({ path });
+      bundles.push(reopened, competing);
+      const executor = executorFor(reopened);
+      const planned = await executor.recoverExecution('prepared-execution', { dryRun: true });
+      expect(planned).toMatchObject({ outcome: 'planned', actions: [], plans: [{ action: 'continue_new_run' }] });
+      expect(await reopened.orchestrationStore.listStages('prepared-execution')).toEqual(before);
+      const inFlight = executor.recoverExecution('prepared-execution');
+      await entered;
+      expect(await executor.recoverExecution('prepared-execution')).toMatchObject({ outcome: 'busy' });
+      expect(await executorFor(competing).recoverExecution('prepared-execution')).toMatchObject({ outcome: 'busy' });
+      releaseRecovery();
+      const recovered = await inFlight;
+      expect(recovered).toMatchObject({ outcome: 'completed', result: { sessionId: 'conversation', finalResult: { status: 'success', output: { sum: 48 } } } });
+      const after = await reopened.orchestrationStore.listStages('prepared-execution');
+      expect(after.find((stage) => stage.nodeId === 'sibling')).toEqual(siblingStage);
+      const continuationId = after.find((stage) => stage.nodeId === 'analysis')!.runId;
+      expect(continuationId).not.toBe(failedStage.runId);
+      expect((await reopened.continuationStore.listBySourceRun(failedStage.runId)).map((item) => item.continuationRunId)).toEqual([continuationId]);
+      expect([...after.find((stage) => stage.nodeId === 'synthesis')!.upstreamRunIds].sort()).toEqual([continuationId, siblingStage.runId].sort());
+      expect((await reopened.runStore.getRun(failedStage.runId))?.status).toBe('failed');
+      expect(await executorFor(competing).recoverExecution('prepared-execution')).toMatchObject({ outcome: 'completed', actions: [] });
+      expect(lookupEffects).toBe(1);
+      expect(modelCalls).toEqual({ analysis: 3, sibling: 1, synthesis: 1 });
+      expect(await competing.orchestrationStore.listStages('prepared-execution')).toEqual(after);
+    } finally {
+      releaseRecovery();
+      await Promise.all(bundles.map((bundle) => bundle.close()));
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

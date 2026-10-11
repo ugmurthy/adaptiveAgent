@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
+import { assertValidExecutionContext } from './adaptive-agent.js';
 import { OrchestrationOptimisticConcurrencyError } from './in-memory-orchestration-store.js';
 import type {
   AgentRun,
@@ -30,7 +31,7 @@ export type OrchestrationModality = 'text' | 'image' | 'file' | 'audio';
 export type OrchestrationRoutingMode = 'direct' | 'orchestration';
 export type OrchestrationRoutingSource = 'deterministic' | 'agent' | 'typesafe';
 
-/** Serialized routing decision data contract. Routing algorithms and validation are host-owned. */
+/** Serialized routing decision data contract. Routing policy and profile capability checks are host-owned. */
 export interface OrchestrationRoutingAssignment {
   agentId: string;
   modalities: OrchestrationModality[];
@@ -384,6 +385,15 @@ export class PreparedOrchestrationExecutor<TOptions = PreparedOrchestrationReque
   /** Persists a prepared plan as a new execution, projects its session, and runs it. */
   async start(input: PreparedOrchestrationStartInput<TOptions>): Promise<OrchestratedRunResult> {
     const { executionId, plan, request } = input;
+    validatePreparedPlan(plan);
+    validatePreparedRequest(request);
+    validatePreparedRequest(input.persistedRequest);
+    if (!nonemptyString(executionId) || executionId !== (plan.executionId ?? plan.sessionId)) invalidPreparedExecution('execution identity does not match the plan');
+    if (!nonemptyString(input.catalogFingerprint) || input.catalogFingerprint !== plan.catalogFingerprint) invalidPreparedExecution('catalog fingerprint does not match the plan');
+    if (request.goal !== input.persistedRequest.goal) invalidPreparedExecution('live and persisted request goals differ');
+    for (const node of plan.nodes) {
+      if (!this.options.hasAgent(node.agentId)) invalidPreparedExecution(`agent "${node.agentId}" for stage ${node.id} is unavailable`);
+    }
     const sessionId = plan.sessionId;
     const requestedAgentId = plan.requestedAgentId;
     this.plans.set(sessionId, plan);
@@ -487,6 +497,8 @@ export class PreparedOrchestrationExecutor<TOptions = PreparedOrchestrationReque
     }
     const missingAgent = plan.nodes.find((node) => !this.options.hasAgent(node.agentId));
     if (missingAgent) return report('blocked', { reason: `CATALOG_CHANGED: agent "${missingAgent.agentId}" for stage ${missingAgent.id} is not in the catalog.` });
+    parseRequest<TOptions>(execution.request);
+    await this.validateExecutionStages(execution, plan);
     if (execution.status === 'succeeded') {
       return report('completed', { reason: `Orchestration execution ${executionId} already succeeded; nothing to recover.`, result: await this.completedResult(execution.id, plan) });
     }
@@ -769,6 +781,8 @@ export class PreparedOrchestrationExecutor<TOptions = PreparedOrchestrationReque
   }
 
   private async continueExecution(durable: OrchestrationExecution, request: PreparedOrchestrationRequest<TOptions>, plan: OrchestrationPlan, legacySession?: OrchestrationSessionRecord): Promise<OrchestratedRunResult> {
+    validatePreparedRequest(request);
+    await this.validateExecutionStages(durable, plan);
     let execution = durable.status === 'routing' || durable.status === 'paused'
       ? await this.orchestrationStore.updateExecution(durable.id, { status: 'running' }, durable.version)
       : durable;
@@ -945,6 +959,22 @@ export class PreparedOrchestrationExecutor<TOptions = PreparedOrchestrationReque
     this.options.onLifecycleEvent?.(event);
   }
 
+  private async validateExecutionStages(execution: OrchestrationExecution, plan: OrchestrationPlan): Promise<void> {
+    if (plan.executionId !== undefined && plan.executionId !== execution.id) invalidPreparedExecution('stored execution identity does not match the plan');
+    if (plan.catalogFingerprint !== execution.catalogFingerprint) invalidPreparedExecution('stored catalog fingerprint does not match the plan');
+    const stages = await this.orchestrationStore.listStages(execution.id);
+    if (stages.length !== plan.nodes.length) invalidPreparedExecution('stored stages do not match the plan');
+    const nodeIds = new Set<string>();
+    for (const stage of stages) {
+      const node = plan.nodes.find((candidate) => candidate.id === stage.nodeId);
+      if (!node || nodeIds.has(stage.nodeId) || stage.executionId !== execution.id || stage.agentId !== node.agentId || !nonemptyString(stage.runId)
+        || stage.dependencies.length !== node.dependsOn.length || !node.dependsOn.every((id) => stage.dependencies.includes(id))) {
+        invalidPreparedExecution(`stored stage ${stage.nodeId} does not match the plan`);
+      }
+      nodeIds.add(stage.nodeId);
+    }
+  }
+
   private getRunner(agentId: string): Promise<TRunner> {
     return this.options.getRunner(agentId);
   }
@@ -953,6 +983,7 @@ export class PreparedOrchestrationExecutor<TOptions = PreparedOrchestrationReque
 /** Parses a persisted plan, upgrading legacy plans that predate stored routing decisions/fingerprints. */
 function parsePlan(value: JsonValue, catalogFingerprint?: string): OrchestrationPlan {
   const plan = value as unknown as OrchestrationPlan;
+  validatePreparedPlan(plan);
   if (plan.routingDecision && plan.catalogFingerprint) return plan;
   const assignments = new Map<string, OrchestrationModality[]>();
   for (const modality of plan.detectedModalities) {
@@ -976,7 +1007,59 @@ function parsePlan(value: JsonValue, catalogFingerprint?: string): Orchestration
 }
 
 function parseRequest<TOptions>(value: JsonValue): PreparedOrchestrationRequest<TOptions> {
+  validatePreparedRequest(value as unknown as PreparedOrchestrationRequest<TOptions>);
   return value as unknown as PreparedOrchestrationRequest<TOptions>;
+}
+
+function validatePreparedRequest(request: PreparedOrchestrationRequest<unknown>): void {
+  if (!request || typeof request.goal !== 'string' || !request.options || typeof request.options !== 'object' || Array.isArray(request.options)) {
+    invalidPreparedExecution('request must contain a string goal and an options object');
+  }
+  assertValidExecutionContext((request.options as Record<string, unknown>).executionContext);
+}
+
+/** Structural execution checks only; selecting profiles and judging routing policy remain host-owned. */
+function validatePreparedPlan(plan: OrchestrationPlan): void {
+  if (!plan || !nonemptyString(plan.sessionId) || !nonemptyString(plan.requestedAgentId)
+    || (plan.executionId !== undefined && !nonemptyString(plan.executionId))
+    || !Array.isArray(plan.nodes) || plan.nodes.length === 0 || !Array.isArray(plan.inputClaims)
+    || !Array.isArray(plan.detectedModalities) || plan.detectedModalities.some((modality) => !['text', 'image', 'file', 'audio'].includes(modality))
+    || !Array.isArray(plan.detectedSubjects) || plan.detectedSubjects.some((subject) => typeof subject !== 'string')) {
+    invalidPreparedExecution('plan identity, nodes, input claims and detected inputs are required');
+  }
+  const claimIds = new Set<string>();
+  for (const claim of plan.inputClaims) {
+    if (!claim || !nonemptyString(claim.id) || claimIds.has(claim.id) || !['text', 'image', 'file', 'audio'].includes(claim.modality)
+      || !['goal', 'images', 'contentParts', 'input'].includes(claim.source)
+      || (claim.index !== undefined && (!Number.isInteger(claim.index) || claim.index < 0))) invalidPreparedExecution('input claims are invalid');
+    claimIds.add(claim.id);
+  }
+  const nodeIds = new Set<string>();
+  for (const node of plan.nodes) {
+    if (!node || !nonemptyString(node.id) || nodeIds.has(node.id) || !nonemptyString(node.agentId)
+      || !['single', 'modality_specialist', 'parallel_specialist', 'subject_specialist', 'final_synthesis'].includes(node.stage)
+      || !Array.isArray(node.dependsOn) || node.dependsOn.some((id) => !nonemptyString(id)) || new Set(node.dependsOn).size !== node.dependsOn.length) {
+      invalidPreparedExecution('plan nodes require unique IDs, agents, valid stages and dependency lists');
+    }
+    nodeIds.add(node.id);
+  }
+  if (!nodeIds.has(plan.finalNodeId)) invalidPreparedExecution('final node is not in the plan');
+  for (const node of plan.nodes) {
+    if (node.dependsOn.some((id) => !nodeIds.has(id))) invalidPreparedExecution(`stage ${node.id} has an unknown dependency`);
+    const selector = node.inputSelector;
+    if (selector?.claimIds !== undefined && (!Array.isArray(selector.claimIds) || selector.claimIds.some((id) => !claimIds.has(id)))) invalidPreparedExecution(`stage ${node.id} selects an unknown input claim`);
+    if (selector?.includePriorOutputs !== undefined && (!Array.isArray(selector.includePriorOutputs) || selector.includePriorOutputs.some((id) => !node.dependsOn.includes(id)))) invalidPreparedExecution(`stage ${node.id} selects a non-dependency output`);
+  }
+  // Validate the existing dependency graph before any durable claim or run launch.
+  topologicalNodes(plan);
+}
+
+function nonemptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function invalidPreparedExecution(reason: string): never {
+  throw new Error(`INVALID_PREPARED_ORCHESTRATION: ${reason}.`);
 }
 
 function jsonSafe(value: unknown): JsonValue {
