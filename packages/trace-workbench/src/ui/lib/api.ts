@@ -1,7 +1,7 @@
-import type { SessionListItem, SessionPerformanceListItem, TraceReport } from '@adaptive-agent/trace-session';
+import type { RecentSessionListItem, SessionPerformanceListItem, TraceReport } from '@adaptive-agent/trace-session';
 
 export interface SessionListResponse {
-  sessions: SessionListItem[];
+  sessions: RecentSessionListItem[];
   performance: SessionPerformanceListItem[];
 }
 

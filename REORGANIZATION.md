@@ -253,3 +253,69 @@ files. No existing Postgres/SQLite database is migrated or written. The packaged
 Tauri GUI, Postgres restart/concurrency integration, and non-Linux executables
 were not manually exercised in this phase. Trace/workbench projection relocation
 remains Phase 4, and whole-repo dependency enforcement remains Phase 5.
+
+## Phase 4 result
+
+Branch: `reorg/phase-4-trace-boundary`, stacked on
+`reorg/phase-3-core-orchestration`. Core/SDK runtime source, schema/migration
+files, existing databases, desktop native source, and RPC versions are unchanged.
+
+- Trace-session's public root now exposes a headless API. CLI argument parsing,
+  rendering, and explicit startup live at `/cli`; the existing sidecar API is
+  exposed at `/sidecar`. CLI helpers/renderers formerly imported from the root
+  must migrate to `/cli`. Executable names, source/build CLI paths, and command
+  behavior are preserved.
+- Workbench runtime SQL and session navigation projection move into
+  trace-session's `listRecentSessions`. Workbench retains HTTP/static adaptation,
+  display models, and Markdown formatting, with no runtime queries of its own.
+- Recent navigation deliberately remains distinct from canonical `listSessions`:
+  updated-root ordering and root-limit-before-grouping are preserved, including
+  independent sessionless roots and the existing status precedence. HTTP payloads
+  do not acquire canonical labels or cursors. `RecentSessionListItem` accurately
+  types the existing payload instead of incorrectly promising `title`/`name`.
+- Existing SQLite tests now exercise the public headless entrypoint. One public
+  projection contract case covers asymmetric statuses/timestamp ties, multiple
+  sessionless roots, and persisted goal conversion.
+
+### Verification
+
+| Command/check | Result |
+| --- | --- |
+| Root `bun run trace-session:test` | 117 Vitest + 8 Bun passed |
+| Root `bun run core:test` | 474 Vitest + 24 Bun passed |
+| Root `bun run agent:test` | 184 Vitest passed, 1 skipped; 3 Bun passed |
+| Root `bun run cli:test` | 107 passed, 1 Bun-only gateway case skipped under Node |
+| CLI `bunx --bun vitest run src/command-integration.test.ts` | All 3 passed, including gateway integration |
+| Desktop bridge `bun run test` | 80 Vitest + 6 Bun passed |
+| Trace build / compiled Linux trace sidecar / workbench build | Passed |
+| Disposable Postgres, read-only connections | Exact Phase 3 projection parity at limits 0, 1, 2, 3, 5, 100; child exclusion, updated-root ordering, limit-before-grouping, status aggregation, and separate sessionless roots passed |
+| HTTP consumer | Health, session list/performance, session/run detail, and Markdown export passed against core-only fixture tables |
+| Compiled trace sidecar | Protocol 1.1 initialize/list/get/shutdown, canonical labels, redaction, and sensitive-data denial passed; JSON-RPC-only stdout and empty stderr |
+| Built trace CLI / sidecar | Both `--help` paths passed |
+| Headless bundle inspection | No CLI exports, argument parsing, terminal rendering, `readline`, `marked-terminal`, or `cli-table3` |
+| Browser consumer | Blocked default, multi-root session, successful run drill-down, empty search, and back-to-session navigation checked; 137 session tokens / 117 run tokens and persisted output rendered; no renderer errors |
+| Source ownership / `git diff --check` | Passed |
+
+The workbench server build falls from 406 modules / 2.93 MB in Phase 3 to
+124 modules / 0.61 MB without its terminal reporting dependency tree. Frontend
+JS/CSS filenames and sizes are unchanged (`index-CbTU1iwG.js`,
+`index-CEuFj1dE.css`); Svelte edits are type-only. Inspected 2x screenshots of
+default, multi-root session, and run views are retained as review artifacts.
+
+Typechecks remain failing on inherited errors. Trace-session retains the same
+33 normalized diagnostics. Workbench decreases from 33 to 32: its incorrect
+`SessionListItem` payload annotation is replaced with the accurate recent-list
+contract; all other normalized TypeScript diagnostics are unchanged. No errors
+are suppressed and no unrelated typing cleanup is included.
+
+Postgres verification used a separate disposable cluster on port 5544 with the
+existing core migrations and six synthetic runs, never the existing runtime
+database. Consumer connections enforced `default_transaction_read_only=on`.
+The test server/browser were stopped and the disposable cluster was removed.
+
+An existing desktop integration gap remains: native code requests trace protocol
+1.0, while the sidecar accepts 1.1. Both values are unchanged by Phase 4. The
+compiled sidecar was tested through its supported protocol, not the packaged
+Tauri GUI; fixing that pre-existing mismatch is outside this relocation. Other
+non-Linux/native workflows were not manually exercised. Phase 5 still owns
+whole-repo dependency enforcement and final integration/release smoke checks.

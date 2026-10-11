@@ -5,7 +5,7 @@
   import type {
     ProviderModelUsageSummary,
     RootRun,
-    SessionListItem,
+    RecentSessionListItem,
     SessionPerformanceListItem,
     TimelineEntry,
     TraceReport,
@@ -60,7 +60,7 @@
     estimatedCostUSD: 0,
   };
 
-  let sessions = $state<SessionListItem[]>([]);
+  let sessions = $state<RecentSessionListItem[]>([]);
   let performance = $state<SessionPerformanceListItem[]>([]);
   let selectedSessionKey = $state<string | null>(null);
   let selectedRootRunId = $state<string | null>(null);
@@ -220,7 +220,7 @@
     window.print();
   }
 
-  function buildSessionViews(items: SessionListItem[], perf: Map<string, SessionPerformanceListItem>): SessionViewModel[] {
+  function buildSessionViews(items: RecentSessionListItem[], perf: Map<string, SessionPerformanceListItem>): SessionViewModel[] {
     return items.map((session) => {
       const key = sessionKey(session);
       const runs = session.goals.map((goal) => {
@@ -265,7 +265,7 @@
     return matchesQuery && matchesStatus;
   }
 
-  function sessionKey(session: SessionListItem): string {
+  function sessionKey(session: RecentSessionListItem): string {
     return session.sessionId ?? `sessionless:${session.goals[0]?.rootRunId ?? session.startedAt}`;
   }
 

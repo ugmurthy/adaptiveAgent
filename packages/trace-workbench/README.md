@@ -19,6 +19,19 @@ It does not derive a second set of analytics in the browser or API server:
 session/run endpoints return the canonical `TraceReport`, and the diagnostic
 tables and exports read `report.diagnostics.analysis.runs` directly.
 
+The API imports trace-session's headless public root, not its `/cli` entrypoint.
+Runtime SQL, session grouping, status aggregation, and navigation ordering live
+in trace-session. Workbench retains HTTP parameters/statuses, static serving,
+web display models, and Markdown export formatting.
+
+`/api/sessions?limit=N` retains the existing recent-root projection: `N` bounds
+root runs before grouping, not the number of complete session groups. A session
+may therefore have additional roots outside that navigation page. Session detail
+still loads all associated roots. The payload uses `RecentSessionListItem` and
+does not gain `title`/`name`/cursor fields; the CLI/sidecar's canonical `listSessions`
+projection remains distinct. No endpoint, response layout, or frontend rendering
+behavior changes in this relocation.
+
 ## Run locally
 
 ```bash

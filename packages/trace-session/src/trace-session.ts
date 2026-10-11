@@ -1,24 +1,7 @@
 #!/usr/bin/env bun
 
+export * from './index.js';
 export { main, parseArgs } from './trace-session/cli.js';
-export { inspectSessionSettings } from './trace-session/data.js';
-export type { HistoricalSettingsReport, HistoricalRunSettings } from './trace-session/settings.js';
-export { createTracePostgresPool, resolveTracePostgresConfig, resolveTraceRuntimeTarget, UnsupportedTraceRuntimeError } from './db.js';
-export type { TraceConfigOptions, TracePostgresConfig, TracePostgresPool, TraceRuntimeTarget } from './db.js';
-export { aggregateSessionPerformance, listSessionlessRuns, listSessionPerformance, listSessions, loadUsageForTraceTarget, traceSession } from './trace-session/data.js';
-export { PostgresTraceReader, SqliteTraceReader, TraceService } from './trace-session/reader.js';
-export type { TraceReader } from './trace-session/reader.js';
-export { TRACE_SIDECAR_PROTOCOL_VERSION, TRACE_SIDECAR_VERSION } from './sidecar/protocol.js';
-export type { TraceListSessionsResult } from './sidecar/protocol.js';
-export {
-  buildTraceAggregateReport,
-  buildTraceDiagnostics,
-  buildTraceComparison,
-  buildTimeline,
-  computeDelegateReason,
-  summarizePerformance,
-  summarizeTrace,
-} from './trace-session/report.js';
 export {
   renderDeleteEmptyGoalSessionsSql,
   renderSessionPerformanceList,
@@ -32,70 +15,6 @@ export {
   renderTraceReport,
   renderUsageReport,
 } from './trace-session/render.js';
-export type {
-  CliOptions,
-  DelegateRow,
-  EvidenceRef,
-  MessageView,
-  MilestoneEntry,
-  PerformanceBucketSummary,
-  PerformanceDigest,
-  PerformanceSummary,
-  PolicyBudgetGroupSummary,
-  PolicyDigest,
-  DataConfidence,
-  DataConfidenceLevel,
-  EventType,
-  RecoveryPressure,
-  ReliabilityClassification,
-  ReliabilityDiagnostics,
-  ReliabilityDimension,
-  ReliabilityDimensionStatus,
-  PlanRow,
-  ProviderModelUsageSummary,
-  ReportView,
-  RootRun,
-  RunMessageTrace,
-  RunSnapshotSummary,
-  RunTreeEntry,
-  SessionListCursor,
-  SessionListItem,
-  SessionPerformanceListItem,
-  SessionOverview,
-  SessionUsageSummary,
-  SessionlessRunListItem,
-  TimelineEntry,
-  ToolAccountingSummary,
-  TopRunUsage,
-  TopToolMetric,
-  TopToolSpan,
-  TraceBrief,
-  TraceAggregateDistribution,
-  TraceAggregateGroup,
-  TraceAggregateGroupBy,
-  TraceAggregateObservation,
-  TraceAggregateReport,
-  TraceAggregateRetryObservation,
-  TraceAggregateToolObservation,
-  TraceDiagnostics,
-  TraceAnalysis,
-  RunAnalysis,
-  TraceComparison,
-  ComparisonMetric,
-  ComparisonMixRow,
-  ContextGrowthSource,
-  TraceFinding,
-  TraceFindingCategory,
-  TraceFindingRole,
-  TraceFindingSeverity,
-  TraceMessage,
-  TraceMessageRole,
-  TraceReport,
-  TraceRow,
-  TraceTarget,
-  TraceToolCall,
-  UsageSummary,
-} from './trace-session/types.js';
 
 import { main } from './trace-session/cli.js';
 
