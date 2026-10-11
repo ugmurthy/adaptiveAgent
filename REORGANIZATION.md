@@ -187,3 +187,69 @@ Temporary smoke scripts and the standalone CLI binary are removed afterward.
 The packaged Tauri GUI and non-Linux terminal behavior were not manually tested
 in this phase. Durable scheduling/recovery relocation remains Phase 3; Phase 2
 does not claim the full monorepo reorganization is finished.
+
+## Phase 3 result
+
+Branch: `reorg/phase-3-core-orchestration`, stacked on
+`reorg/phase-2-host-neutral-sdk`. Store implementations, schemas, migrations,
+existing databases, CLI commands, desktop native/frontend source, and RPC
+versions are unchanged.
+
+- Core's new public `PreparedOrchestrationExecutor` owns prepared-plan scheduling,
+  stage claims, pause/resume, cancellation, recovery assessment and claims,
+  continuation identity updates, downstream recomputation, lifecycle events,
+  session/link projections, and result reconstruction.
+- SDK retains catalog loading/fingerprinting, profile availability, routing and
+  plan construction, attachment filtering, stage prompts/options, runner
+  creation/cache/cleanup, and lazy runtime-store adoption. Core receives narrow
+  host hooks and does not load profiles or import SDK.
+- Core's `recoverPreparedSession` owns logical session target selection,
+  continuation ambiguity, live run leases, dry-run classification, and recovery
+  outcome dispatch. SDK assembles historical profiles/swarm roles and checks
+  their identity, fingerprints, and model compatibility through handlers.
+- Shared persisted plan/result/event/session/link/routing-decision contracts now
+  live in core; SDK re-exports its existing names. Routing algorithms and profile
+  capability validation remain SDK-owned. Public SDK APIs and persisted JSON
+  layouts, including legacy saved-plan upgrades, are preserved.
+- Mechanical extraction is committed separately from core boundary validation.
+  Core rejects invalid fresh plans/requests before persistence and rejects saved
+  stage/plan mismatches before resume or recovery mutates the execution.
+
+### Verification
+
+| Command (package-local unless shown) | Result |
+| --- | --- |
+| Existing SDK orchestration/session recovery tests | 45 passed unchanged |
+| Root `bun run core:test` | 474 Vitest + 24 Bun passed |
+| Root `bun run agent:test` | 184 Vitest passed, 1 skipped; 3 Bun passed |
+| Root `bun run cli:test` | 107 passed, 1 Bun-only gateway case skipped under Node |
+| CLI `bunx --bun vitest run src/command-integration.test.ts` | All 3 passed, including gateway model/tool/model execution |
+| SDK `bunx --bun vitest run src/index.test.ts` | All 33 passed, including gateway integration |
+| Desktop bridge `bun run test` | 80 Vitest + 6 Bun passed |
+| Root `bun run trace-session:test` | 116 Vitest + 8 Bun passed |
+| Root `bun run jev-routing-study:test` | 9 passed |
+| Core / SDK / CLI / bridge / trace builds; trace workbench build | Passed |
+| Compiled Linux desktop bridge | Protocol 1.20 initialize + embedded CLI `--version` passed; JSON-RPC-only stdout, empty stderr |
+| Built CLI | `--help` and `--version` passed |
+| Source ownership inspection / `git diff --check` | Passed |
+
+The new real-core SQLite reopen case preserves a successful independent stage,
+recovers one failed stage into exactly one continuation, updates downstream run
+identities, and completes with the independently expected sum 48. Same-executor
+and separate-connection competing recoveries report `busy`; completed recovery
+does not repeat tool, sibling, or synthesis work. Dry-run leaves saved stages
+unchanged. The initial fixture used a retryable provider failure; replacing it
+with the existing non-retryable invalid-output case exercises continuation
+without changing production failure classification. Thirteen public boundary
+cases reject invalid prepared or persisted data without durable mutations.
+
+Typechecks still fail on inherited diagnostics: core has 76, SDK has 36, and
+CLI/bridge have 32 each. Core matches the original checkout after normalizing
+worktree paths and source locations; SDK/CLI match Phase 2 exactly after location
+normalization, and bridge matches the inherited CLI set. No failures are hidden.
+
+Tests use memory, local gateway stubs, isolated homes, and disposable SQLite
+files. No existing Postgres/SQLite database is migrated or written. The packaged
+Tauri GUI, Postgres restart/concurrency integration, and non-Linux executables
+were not manually exercised in this phase. Trace/workbench projection relocation
+remains Phase 4, and whole-repo dependency enforcement remains Phase 5.

@@ -228,6 +228,13 @@ IDs, and defaults used. Its `state` is `completed`, `waiting`, or `failed`;
 Orchestration routes inputs to capable profiles, runs stages, and optionally
 performs final synthesis. See [orchestration types](src/orchestration.ts).
 
+SDK owns catalog discovery/fingerprinting, routing, plan preparation, stage
+prompts/input filtering, and runner lifecycle. Core's `PreparedOrchestrationExecutor`
+owns scheduling, state transitions, session/link projections, cancellation, and
+saved-plan recovery. Shared plan/result/event types remain available from SDK
+through core re-exports; public SDK method signatures and persisted JSON layouts
+are unchanged. Core independently validates prepared execution data before use.
+
 | Call | Purpose |
 | --- | --- |
 | `createOrchestrationSdk(options?)` / `OrchestrationSdk.create(options?)` | Build an orchestration host and catalog. |
