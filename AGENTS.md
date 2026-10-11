@@ -105,6 +105,8 @@ These rules protect the package boundary established by `CORE-SESSION-SWARM-SPEC
 ## Package-specific notes
 
 - In `packages/trace-session`, keep gateway tables optional. Trace reporting must work against core runtime Postgres tables even when `gateway_sessions` and `gateway_session_run_links` are absent.
+- Trace-session's public root is headless; argument parsing and renderers belong to `/cli`, and JSON-RPC adaptation belongs to `/sidecar`. Keep runtime SQL/read projections in trace-session, not trace-workbench.
+- Preserve the distinction between workbench's recent-root navigation (`listRecentSessions`, limits before grouping) and canonical CLI/sidecar session listing (`listSessions`, labels/filtering/session cursors). Workbench owns HTTP and presentation, not a second runtime reader.
 
 ### Working on `packages/desktop-app`
 

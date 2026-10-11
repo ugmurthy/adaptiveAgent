@@ -11,6 +11,38 @@ optional, so reports continue to work for core-only runs.
 Reporting is read-only. `maintenance empty-goal-sql` prints reviewable SQL for
 empty-goal gateway sessions; it does not execute that SQL.
 
+## Public entrypoints and ownership
+
+- `@adaptive-agent/trace-session`: headless readers, database/settings resolution,
+  projections, report analysis, and public data contracts. Importing it does not
+  load argument parsing, terminal rendering, or stdin prompts.
+- `@adaptive-agent/trace-session/cli`: `main`, `parseArgs`, and report renderers,
+  including terminal/HTML rendering. Existing executable names and source/build
+  CLI entrypoints are unchanged.
+- `@adaptive-agent/trace-session/sidecar`: the existing bounded JSON-RPC adapter,
+  protocol contracts, and explicit sidecar startup API.
+
+This is a source API migration: callers importing CLI helpers/renderers from the
+package root must use `/cli`. Readers, report builders, and existing public data
+types remain at the root. `CliOptions` remains the legacy shared options contract;
+it does not import or execute CLI code.
+
+Trace-session owns runtime-schema reads and projections. Workbench owns HTTP,
+web presentation, and its Markdown export formatting; desktop owns its product
+records and native lifecycle. Neither consumer owns runtime SQL or execution
+authority. Trace-session uses only SDK's `/runtime-settings` for current backend
+resolution, not agent assembly or CLI workflows.
+
+`listRecentSessions(client, limit)` preserves the workbench navigation contract:
+it selects up to `limit` root runs by latest update, then groups them by session,
+keeps sessionless roots separate, and summarizes statuses. Its
+`RecentSessionListItem` contains the existing wire fields without canonical
+`title`/`name`/cursor fields. The typed contract now reflects that payload.
+This is intentionally distinct from `listSessions`/`TraceService.listSessions`,
+which provide canonical labels, filtering, and session-group cursor pagination.
+CLI/sidecar listing behavior is unchanged. Recent navigation is Postgres-only;
+the general reader/service API continues to support both Postgres and SQLite.
+
 ## Historical settings and agent profiles
 
 ```bash
