@@ -141,7 +141,6 @@ export interface AmbientStartOptions {
   model?: string;
   approvalMode?: ApprovalMode;
   clarificationMode?: ClarificationMode;
-  output?: 'pretty' | 'json' | 'jsonl';
   dryRun?: boolean;
   runOnce?: boolean;
   clock?: () => Date;
@@ -292,7 +291,7 @@ export async function runAmbientStart(options: AmbientStartOptions): Promise<Amb
   const sdkOptions = buildAmbientSdkOptions(config, options);
   if (options.dryRun) return { status: 'dry_run', config, sdkOptions, tasks: [] };
 
-  const logger = options.logger ?? createAmbientLogger(options.output ?? 'pretty');
+  const logger = options.logger ?? { info: () => undefined, warn: () => undefined, error: () => undefined };
   const sdk = await (options.createSdk ?? createDefaultAgentSdk)(sdkOptions);
   const supervisor = new AmbientSupervisor(config, sdk, logger, options.signal, options.clock);
 
@@ -1213,15 +1212,6 @@ async function uniqueDestinationPath(destinationDir: string, originalName: strin
 async function writeJson(path: string, value: JsonValue): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`);
-}
-
-function createAmbientLogger(output: 'pretty' | 'json' | 'jsonl'): AmbientLogger {
-  if (output !== 'pretty') return { info: () => undefined, warn: () => undefined, error: () => undefined };
-  return {
-    info: (message) => console.error(message),
-    warn: (message) => console.error(`warning: ${message}`),
-    error: (message) => console.error(`error: ${message}`),
-  };
 }
 
 function errorMessage(error: unknown): string {

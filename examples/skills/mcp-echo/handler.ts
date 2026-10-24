@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-import type { JsonValue, ToolContext } from '../../../packages/core/src/types.js';
+import type { JsonValue, ToolContext } from '@adaptive-agent/core/types';
 
 export const name = 'mcp_echo';
 export const description = 'Send a message to the demo MCP echo service.';

@@ -2,14 +2,14 @@ import { readFile } from 'node:fs/promises';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { homedir } from 'node:os';
 
-import type { ModelAdapterConfig } from '../packages/core/src/adapters/create-model-adapter.js';
+import type { ModelAdapterConfig } from '@adaptive-agent/core';
 import {
   DEFAULT_LOG_DESTINATION,
   DEFAULT_LOG_LEVEL,
   type AdaptiveAgentLogDestination,
   type AdaptiveAgentLogLevel,
-} from '../packages/core/src/logger.js';
-import type { CaptureMode, ResearchPolicyName, ToolBudget } from '../packages/core/src/types.js';
+} from '@adaptive-agent/core';
+import type { CaptureMode, ResearchPolicyName, ToolBudget } from '@adaptive-agent/core/types';
 
 type ModelProvider = ModelAdapterConfig['provider'];
 type WebSearchProvider = 'brave' | 'duckduckgo' | 'serper';

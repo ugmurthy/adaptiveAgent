@@ -47,13 +47,15 @@ import {
   decideAutomaticRun,
   agentSelectionMetadata,
   executionRoutingMetadata,
-} from './index.js';
+} from '@adaptive-agent/agent-sdk';
 import { doctorExitCode, renderDoctorReport, runDoctor } from './install/doctor.js';
 import { renderInitReport, runInit, type InitProfile } from './install/init.js';
 import { renderUninstallReport, runUninstall, uninstallExitCode } from './install/uninstall.js';
 import { renderUpdateReport, runUpdate, updateExitCode } from './install/update.js';
 import { getVersionInfo, renderVersion } from './install/version.js';
-import { renderAgentCreateReport, runAgentCreate } from './agent-create.js';
+import { runAgentCreate } from '@adaptive-agent/agent-sdk/agent-create';
+import { confirmAgentCreateInTerminal, renderAgentCreateReport } from './agent-create.js';
+import { promptText, promptYesNo } from './terminal-interactions.js';
 import { AgentEventLabelRegistry, formatAgentEventSummary, summarizeAgentEvent } from './agent-event-rendering.js';
 import {
   createProjectContextBundle,
@@ -66,9 +68,9 @@ import {
   parseContextRefFlag,
   projectContextBundleDirectory,
   type ProjectContextBundle,
-} from './context-bundles.js';
+} from '@adaptive-agent/agent-sdk';
 import { formatSwarmExecutionPlan, formatSwarmRunStatuses, formatSwarmSubtasks } from './swarm-format.js';
-import { resolveReadWebPageProvider, resolveWebSearchProvider } from './tool-registry.js';
+import { resolveReadWebPageProvider, resolveWebSearchProvider } from '@adaptive-agent/agent-sdk';
 import type {
   BenchmarkAttachmentType,
   BenchmarkCase,
@@ -490,7 +492,7 @@ Run the existing JSON spec format.
 Usage:
   adaptive-agent spec <path> [options]
   adaptive-agent --spec <path> [options]
-  bun run ./packages/agent-sdk/dist/adaptive-agent.js --spec <path> [options]
+  bun run ./packages/cli/dist/adaptive-agent.js --spec <path> [options]
 
 Spec options:
   --spec <path>           Path to the JSON spec file.
@@ -948,6 +950,7 @@ async function runAgentCreateCommand(cli: ManualTestCliOptions): Promise<number>
     yes: cli.yes,
     force: cli.force,
     dryRun: cli.dryRun,
+    confirm: confirmAgentCreateInTerminal,
   });
   console.log(renderAgentCreateReport(report, cli.output));
   return report.status === 'created' || report.status === 'overwritten' ? 0 : 1;
@@ -1101,7 +1104,11 @@ async function runAmbientCommand(cli: ManualTestCliOptions): Promise<number> {
       model: cli.model,
       approvalMode: cli.approvalMode,
       clarificationMode: cli.clarificationMode,
-      output: cli.output,
+      logger: cli.output === 'pretty' ? {
+        info: (message) => console.error(message),
+        warn: (message) => console.error(`warning: ${message}`),
+        error: (message) => console.error(`error: ${message}`),
+      } : undefined,
       dryRun: cli.dryRun,
       signal: controller.signal,
     });
@@ -3076,6 +3083,8 @@ export function collectProviderWarnings(spec: ManualTestSpec, provider: 'openrou
 function buildSdkOptions(cli: ManualTestCliOptions, cwd: string): AgentSdkOptions {
   return {
     cwd,
+    onApproval: (request) => promptYesNo(`Approve tool "${request.toolName}"? [y/N] `),
+    onClarification: (request) => promptText(`${request.message}\nClarification answer: `),
     agentConfigPath: cli.agentConfigPath,
     settingsConfigPath: cli.settingsConfigPath,
     runtimeMode: cli.runtimeMode,

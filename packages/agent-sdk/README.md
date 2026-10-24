@@ -3,11 +3,19 @@
 For the programmatic API and profile/settings file formats, see the
 [Agent SDK API reference](API.md).
 
-`@adaptive-agent/agent-sdk` is the CLI-facing package for running configured agents from the shell. It resolves `agent.json` and `agent.settings.json`, wires built-in tools, chooses a runtime store, and calls `@adaptive-agent/core` with CLI-friendly defaults.
+`@adaptive-agent/agent-sdk` resolves `agent.json` and `agent.settings.json`, wires built-in tools, chooses a runtime store, and assembles configured agents on top of `@adaptive-agent/core`. It owns profile discovery, selection, routing, and decomposition policy.
 
-Use this package when you want an executable command such as `adaptive-agent run`, `adaptive-agent chat`, `adaptive-agent swarm-run`, `adaptive-agent retry`, or `adaptive-agent eval`. Use `@adaptive-agent/core` directly when you are embedding the runtime in an application and want to provide stores, tools, model adapters, and event handling yourself.
+Use this package to embed configured agents. Executable commands, terminal presentation, installation, and evaluation now belong to [`@adaptive-agent/cli`](../cli/README.md). The SDK does not prompt on stdin: supply `onApproval`/`onClarification` callbacks or handle returned pending results, and supply explicit consent for profile creation. Use `@adaptive-agent/core` directly when you want to provide stores, tools, model adapters, and event handling yourself.
 
-## CLI API at a glance
+`OrchestrationSdk` prepares plans, stage prompts/inputs, and profile runners; core's
+[`PreparedOrchestrationExecutor`](../core/README.md#prepared-orchestration-boundary)
+owns durable scheduling and recovery. SDK public methods and persisted payloads
+are preserved, including re-exports of the shared core artifact types. Unified
+session recovery likewise supplies profile assembly and historical compatibility
+checks to core's `recoverPreparedSession`. See [the phased reorganization](../../REORGANIZATION.md)
+for remaining workspace boundaries.
+
+## CLI usage of the SDK at a glance
 
 ```bash
 adaptive-agent init [options]
@@ -447,4 +455,4 @@ What this exercises:
 - `doctor` validates installation, local config, runtime settings, and optional provider reachability.
 - `update` checks for or applies GitHub Release updates.
 
-The package also exports `createAgentSdk()`, `loadAgentSdkConfig()`, and `inspectAgentSdkResolution()` for hosts that want the same config resolution behavior without spawning the CLI, but the command line remains the primary API documented here.
+The SDK exports `createAgentSdk()`, `loadAgentSdkConfig()`, and `inspectAgentSdkResolution()` for hosts that want config resolution without spawning the CLI. Import command execution from `@adaptive-agent/cli` and command metadata from `@adaptive-agent/cli/commands`; the former SDK `/cli` export has been removed to keep dependencies pointing from CLI to SDK.

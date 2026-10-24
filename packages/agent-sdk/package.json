@@ -8,19 +8,10 @@
   "exports": {
     ".": "./src/index.ts",
     "./agent-create": "./src/agent-create.ts",
-    "./cli": "./src/cli-api.ts",
     "./runtime-settings": "./src/runtime-settings.ts"
   },
-  "bin": {
-    "adaptive-agent": "./dist/adaptive-agent.js",
-    "adaptive-agent-tui": "./dist/adaptive-agent-tui.js",
-    "adaptive-agent-gaia-eval": "./dist/evaluate-gaia-jsonl.js"
-  },
   "scripts": {
-    "build": "bun build ./src/index.ts ./src/agent-create.ts ./src/cli-api.ts ./src/adaptive-agent.ts ./src/adaptive-agent-tui.ts ./src/evaluate-gaia-jsonl.ts --outdir dist --target bun",
-    "adaptive-agent": "bun run ./dist/adaptive-agent.js",
-    "adaptive-agent:tui": "bun run ./src/adaptive-agent-tui.ts",
-    "link:global": "bun run ./scripts/link-global.ts",
+    "build": "bun build ./src/index.ts ./src/agent-create.ts ./src/runtime-settings.ts --outdir dist --target bun",
     "test": "bunx vitest run && bun test ./src/sqlite-runtime.bun.ts",
     "typecheck": "bunx tsc --noEmit"
   },
@@ -28,12 +19,8 @@
     "@adaptive-agent/core": "workspace:*",
     "@adaptive-agent/gateway-client": "workspace:*",
     "@e2b/code-interpreter": "^2.6.1",
-    "@earendil-works/pi-tui": "^0.75.4",
     "@typesafe-ai/sdk": "0.6.0",
     "ajv": "^8.17.1",
-    "chalk": "^5.5.0",
-    "marked": "^15.0.12",
-    "marked-terminal": "^7.3.0",
     "pg": "^8.20.0"
   },
   "devDependencies": {

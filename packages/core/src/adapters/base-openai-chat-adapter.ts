@@ -175,7 +175,7 @@ class ModelRequestGate {
       const waiter: GateWaiter = { resolve, reject, signal };
       waiter.onAbort = () => {
         this.removeWaiter(waiter);
-        reject(createAbortError(signal.reason));
+        reject(createAbortError(signal?.reason));
       };
 
       signal?.addEventListener('abort', waiter.onAbort, { once: true });
@@ -261,8 +261,8 @@ export class BaseOpenAIChatAdapter implements ModelAdapter {
   readonly capabilities: ModelCapabilities;
   readonly structuredOutputMode: StructuredOutputMode;
 
-  private readonly baseUrl: string;
-  private readonly apiKey: string | undefined;
+  protected readonly baseUrl: string;
+  protected readonly apiKey: string | undefined;
   private readonly defaultHeaders: Record<string, string>;
   private readonly requestGate: ModelRequestGate;
 
@@ -864,7 +864,7 @@ async function readOpenAICompatibleSseStream(
   try {
     while (!complete) {
       throwIfAborted();
-      let readResult: ReadableStreamReadResult<Uint8Array>;
+      let readResult: Awaited<ReturnType<typeof reader.read>>;
       try {
         readResult = await reader.read();
       } catch (error) {

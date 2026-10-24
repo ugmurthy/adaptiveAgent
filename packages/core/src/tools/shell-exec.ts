@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 
-import type { ToolDefinition } from '../types.js';
+import type { JsonValue, ToolDefinition } from '../types.js';
 
 export interface ShellExecToolConfig {
   /** Working directory for commands. Defaults to `process.cwd()`. */
@@ -16,7 +16,7 @@ interface ShellExecInput {
   cwd?: string;
 }
 
-interface ShellExecOutput {
+type ShellExecOutput = {
   stdout: string;
   stderr: string;
   exitCode: number;
@@ -25,7 +25,7 @@ interface ShellExecOutput {
   stderrBytes?: number;
   stdoutBytesAvailable?: number;
   stderrBytesAvailable?: number;
-}
+};
 
 const DEFAULT_MAX_OUTPUT = 102_400; // 100 KiB
 const DEFAULT_MODEL_RESULT_MAX_BYTES = 32 * 1024;
@@ -168,7 +168,7 @@ function buildShellExecOutput(stdout: BoundedTextBuffer, stderr: BoundedTextBuff
   };
 }
 
-function summarizeShellExecOutput(output: ShellExecOutput): unknown {
+function summarizeShellExecOutput(output: ShellExecOutput): JsonValue {
   if (typeof output.stdout !== 'string' || typeof output.stderr !== 'string') {
     return output;
   }
@@ -177,13 +177,13 @@ function summarizeShellExecOutput(output: ShellExecOutput): unknown {
     exitCode: output.exitCode,
     stdoutBytes: output.stdoutBytes ?? Buffer.byteLength(output.stdout, 'utf8'),
     stderrBytes: output.stderrBytes ?? Buffer.byteLength(output.stderr, 'utf8'),
-    stdoutBytesAvailable: output.stdoutBytesAvailable,
-    stderrBytesAvailable: output.stderrBytesAvailable,
+    ...(output.stdoutBytesAvailable === undefined ? {} : { stdoutBytesAvailable: output.stdoutBytesAvailable }),
+    ...(output.stderrBytesAvailable === undefined ? {} : { stderrBytesAvailable: output.stderrBytesAvailable }),
     truncated: output.truncated ?? false,
   };
 }
 
-function formatShellExecOutputForModel(output: ShellExecOutput, maxBytes: number): unknown {
+function formatShellExecOutputForModel(output: ShellExecOutput, maxBytes: number): JsonValue {
   if (typeof output.stdout !== 'string' || typeof output.stderr !== 'string') {
     return output;
   }

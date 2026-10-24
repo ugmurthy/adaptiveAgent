@@ -193,6 +193,9 @@ export interface SessionListItem {
   }>;
 }
 
+/** Bounded recently updated root runs grouped for workbench navigation, without canonical labels or cursors. */
+export type RecentSessionListItem = Pick<SessionListItem, 'sessionId' | 'startedAt' | 'status' | 'goals'>;
+
 export interface SessionlessRunListItem {
   sessionId?: string | null;
   rootRunId: string;

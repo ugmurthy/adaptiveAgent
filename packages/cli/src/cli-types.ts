@@ -15,9 +15,9 @@ import type {
   RuntimeMode,
   TaskPreparationMode,
   createAgentSdk,
-} from './index.js';
+} from '@adaptive-agent/agent-sdk';
 import type { AdaptiveAgentCliCommand } from './cli-command-metadata.js';
-import type { ContextBundleInput } from './context-bundles.js';
+import type { ContextBundleInput } from '@adaptive-agent/agent-sdk';
 import type { InitProfile } from './install/init.js';
 
 export interface ManualTestCliOptions {

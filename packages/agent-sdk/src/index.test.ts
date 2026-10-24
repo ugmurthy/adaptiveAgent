@@ -14,8 +14,7 @@ import {
   type ProviderAdapter,
 } from '@adaptive-agent/capability-gateway';
 
-import { main as runCli } from './adaptive-agent.js';
-import { AgentSettingsValidationError, createAgentSdk, inspectAgentSdkResolution, loadAgentSdkConfig } from './index.js';
+import { AgentSettingsValidationError, createAgentSdk, inspectAgentSdkResolution, loadAgentSdkConfig, type AgentSdkOptions } from './index.js';
 import { testEnvironment } from './test-environment.js';
 
 const bunIt = typeof Bun === 'undefined' ? it.skip : it;
@@ -344,6 +343,133 @@ describe('agent-sdk config resolution', () => {
   });
 });
 
+describe('agent-sdk host interactions', () => {
+  let tempDir: string;
+  let sdk: Awaited<ReturnType<typeof createAgentSdk>> | undefined;
+  let effects: string[];
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'agent-sdk-interactions-'));
+    effects = [];
+  });
+
+  afterEach(async () => {
+    await sdk?.close();
+    sdk = undefined;
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  async function createSdk(options: AgentSdkOptions = {}) {
+    sdk = await createAgentSdk({
+      cwd: tempDir,
+      env: testEnvironment(),
+      runtimeMode: 'memory',
+      settingsConfig: { interaction: { approvalMode: 'manual', clarificationMode: 'interactive' } },
+      agentConfig: {
+        id: 'interaction-agent', name: 'Interaction Agent',
+        invocationModes: ['run', 'chat'], defaultInvocationMode: 'run',
+        model: { provider: 'ollama', model: 'test' }, tools: ['secure_step'],
+      },
+      tools: [{
+        name: 'secure_step', description: 'Record a value with consent', requiresApproval: true,
+        inputSchema: { type: 'object', required: ['value'], properties: { value: { type: 'string' } } },
+        async execute(input: { value: string }) {
+          effects.push(input.value);
+          return { recorded: input.value };
+        },
+      }],
+      modelAdapter: {
+        provider: 'ollama', model: 'test',
+        capabilities: { toolCalling: true, jsonOutput: true, streaming: false, usage: false },
+        async generate(request) {
+          const completed = request.messages.filter((message) => message.role === 'tool').length;
+          if (completed >= 2) return { finishReason: 'stop', text: 'both steps complete' };
+          return {
+            finishReason: 'tool_calls',
+            toolCalls: [{ id: `step-${completed}`, name: 'secure_step', input: { value: completed === 0 ? 'first' : 'second' } }],
+          };
+        },
+      },
+      ...options,
+    });
+    return sdk;
+  }
+
+  it.each(['run', 'chat'] as const)('returns a durable pending approval from %s without a host callback', async (method) => {
+    const host = await createSdk();
+    const result = await host[method]('Perform both secure steps');
+    expect(result.status).toBe('approval_requested');
+    expect(effects).toEqual([]);
+    expect((await host.inspect(result.runId)).run?.status).toBe('awaiting_approval');
+    if (result.status !== 'approval_requested') throw new Error('Expected pending approval');
+    await host.agent.resolveApproval(result.runId, result.approvalId, true);
+    expect((await host.resume(result.runId)).status).toBe('approval_requested');
+    expect(effects).toEqual(['first']);
+  });
+
+  it.each([true, false])('uses asynchronous host approval %s through all pending steps', async (approved) => {
+    const host = await createSdk({ onApproval: async (request) => request.toolName === 'secure_step' && approved });
+    const result = await host.run('Perform both secure steps');
+    expect(result).toMatchObject(approved
+      ? { status: 'success', output: 'both steps complete' }
+      : { status: 'failure', code: 'APPROVAL_REJECTED' });
+    expect(effects).toEqual(approved ? ['first', 'second'] : []);
+  });
+
+  it.each(['auto', 'reject'] as const)('preserves %s policy without asking the host', async (approvalMode) => {
+    const host = await createSdk({
+      settingsConfig: { interaction: { approvalMode } },
+      onApproval: () => { throw new Error('Policy must not ask the host'); },
+    });
+    expect(await host.run('Perform both secure steps')).toMatchObject(approvalMode === 'auto'
+      ? { status: 'success', output: 'both steps complete' }
+      : { status: 'failure', code: 'APPROVAL_REJECTED' });
+    expect(effects).toEqual(approvalMode === 'auto' ? ['first', 'second'] : []);
+  });
+
+  it('keeps raw calls pending even with a host callback installed', async () => {
+    const host = await createSdk({ onApproval: () => { throw new Error('Raw calls must not ask the host'); } });
+    const result = await host.runRaw('Perform both secure steps');
+    expect(result.status).toBe('approval_requested');
+    expect(effects).toEqual([]);
+  });
+
+  it.each(['pending', 'callback', 'fail'] as const)('handles clarification using the %s contract', async (mode) => {
+    const host = await createSdk({
+      settingsConfig: { interaction: { clarificationMode: mode === 'fail' ? 'fail' : 'interactive' } },
+      ...(mode === 'callback' ? { onClarification: async () => 'Use markdown with headings' } : {}),
+      modelAdapter: {
+        provider: 'ollama', model: 'test',
+        capabilities: { toolCalling: true, jsonOutput: true, streaming: false, usage: false },
+        async generate(request) {
+          const message = request.messages.at(-1);
+          return { finishReason: 'stop', structuredOutput: { answer: typeof message?.content === 'string' ? message.content : '' } };
+        },
+      },
+    });
+    const run = await host.created.runtime.runStore.createRun({ goal: 'Prepare a report', status: 'clarification_requested' });
+    await host.created.runtime.snapshotStore.save({
+      runId: run.id, snapshotSeq: 1, status: 'clarification_requested', currentStepId: 'step-1',
+      summary: { status: 'clarification_requested', stepsUsed: 1 },
+      state: {
+        messages: [
+          { role: 'user', content: 'Prepare a report' },
+          { role: 'assistant', content: 'Which format?' },
+        ],
+        stepsUsed: 1,
+      },
+    });
+    if (mode === 'fail') {
+      await expect(host.resume(run.id)).rejects.toThrow('requested clarification');
+    } else {
+      expect(await host.resume(run.id)).toMatchObject(mode === 'callback'
+        ? { status: 'success', output: { answer: 'Use markdown with headings' } }
+        : { status: 'clarification_requested', runId: run.id });
+    }
+    expect((await host.inspect(run.id)).run?.status).toBe(mode === 'callback' ? 'succeeded' : 'clarification_requested');
+  });
+});
+
 describe('agent-sdk gateway integration', () => {
   it('uses an injected model adapter instead of the configured provider', async () => {
     const generate = vi.fn(async () => ({ finishReason: 'stop' as const, text: 'injected adapter result' }));
@@ -606,10 +732,7 @@ describe('agent-sdk gateway integration', () => {
     }
   });
 
-  bunIt('completes memory-runtime SDK and CLI WSS runs with local tools between model turns', async () => {
-    const cliDir = await mkdtemp(join(tmpdir(), 'agent-sdk-gateway-cli-'));
-    const cliInputPath = join(cliDir, 'gateway-input.txt');
-    await writeFile(cliInputPath, 'CLI-GATEWAY-CONTENT');
+  bunIt('completes memory-runtime SDK WSS runs with local tools between model turns', async () => {
     const billing = new InMemoryBillingStore();
     const providerRequests: Parameters<ProviderAdapter['generate']>[0][] = [];
     const provider: ProviderAdapter = {
@@ -639,16 +762,8 @@ describe('agent-sdk gateway integration', () => {
           onEvent({ type: 'text_delta', delta: 'gateway complete' });
           return { text: 'gateway complete', finishReason: 'stop', usage };
         }
-        const useSdkTool = request.tools?.some((tool) => tool.name === 'local_uppercase');
-        if (useSdkTool) {
-          return {
-            toolCalls: [{ id: 'local-tool-call', name: 'local_uppercase', input: { text: 'client-side' } }],
-            finishReason: 'tool_calls',
-            usage,
-          };
-        }
         return {
-          toolCalls: [{ id: 'local-tool-call', name: 'read_file', input: { path: cliInputPath } }],
+          toolCalls: [{ id: 'local-tool-call', name: 'local_uppercase', input: { text: 'client-side' } }],
           finishReason: 'tool_calls',
           usage,
         };
@@ -754,49 +869,9 @@ describe('agent-sdk gateway integration', () => {
       expect(JSON.stringify(inspection)).not.toContain(token);
       expect(JSON.stringify([...billing.records.values()])).not.toContain('Use the local uppercase tool');
       expect(JSON.stringify([...billing.records.values()])).not.toContain('CLIENT-SIDE');
-
-      await writeAgentConfig(join(cliDir, 'agent.json'), 'gateway-cli-agent');
-      await writeFile(join(cliDir, 'agent.settings.json'), JSON.stringify({
-        runtime: { mode: 'memory' },
-        gateway: { url: server.url, accessTokenEnv: 'PHASE_3_GATEWAY_CLI_TOKEN' },
-      }));
-      const previousToken = process.env.PHASE_3_GATEWAY_CLI_TOKEN;
-      process.env.PHASE_3_GATEWAY_CLI_TOKEN = token;
-      const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
-      try {
-        const exitCode = await runCli([
-          'run',
-          'Read the local gateway input file',
-          '--cwd', cliDir,
-          '--runtime', 'memory',
-          '--inference-mode', 'gateway',
-          '--tier', 'medium',
-          '--inspect',
-          '--output', 'json',
-        ]);
-        const cliOutput = JSON.parse(String(log.mock.calls.at(-1)?.[0])) as {
-          resolvedConfig: { inferenceMode: string; inferenceTier: string; runtimeMode: string };
-          result: { status: string; output: string };
-          inspection: { run: { executionContext: Record<string, unknown> }; eventTypes: Record<string, number> };
-        };
-
-        expect(exitCode).toBe(0);
-        expect(cliOutput.resolvedConfig).toMatchObject({ inferenceMode: 'gateway', inferenceTier: 'medium', runtimeMode: 'memory' });
-        expect(cliOutput.result).toMatchObject({ status: 'success', output: 'gateway complete' });
-        expect(cliOutput.inspection.run.executionContext).toMatchObject({ inferenceMode: 'gateway', inferenceTier: 'medium', routePolicyRef: 'policy-e2e' });
-        expect(cliOutput.inspection.eventTypes).toMatchObject({ 'tool.completed': 1, 'model.completed': 2 });
-        expect(providerRequests).toHaveLength(4);
-        expect(providerRequests[3]?.messages.some((message) => message.role === 'tool' && message.content.includes('CLI-GATEWAY-CONTENT'))).toBe(true);
-        expect(JSON.stringify(cliOutput)).not.toContain(token);
-      } finally {
-        log.mockRestore();
-        if (previousToken === undefined) delete process.env.PHASE_3_GATEWAY_CLI_TOKEN;
-        else process.env.PHASE_3_GATEWAY_CLI_TOKEN = previousToken;
-      }
     } finally {
       await sdk.close();
       await server.stop({ gracePeriodMs: 100 });
-      await rm(cliDir, { recursive: true, force: true });
     }
   });
 });

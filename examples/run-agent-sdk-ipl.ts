@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { createAgentSdk } from '../packages/agent-sdk/src/index.js';
+import { createAgentSdk } from '@adaptive-agent/agent-sdk';
 
 const task = process.argv.slice(2).join(' ').trim();
 

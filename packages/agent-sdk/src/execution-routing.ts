@@ -1,24 +1,18 @@
+import type {
+  OrchestrationRoutingAssignment,
+  OrchestrationRoutingDecision,
+  OrchestrationRoutingMode,
+  OrchestrationRoutingSource,
+} from '@adaptive-agent/core';
+
 import type { AgentConfigFile, SupportedModality } from './config-types.js';
 
-export type ExecutionRoutingMode = 'direct' | 'orchestration';
-export type ExecutionRoutingSource = 'deterministic' | 'agent' | 'typesafe';
-
-export interface ExecutionRoutingAssignment {
-  agentId: string;
-  modalities: SupportedModality[];
-  reason: string;
-}
-
-export interface ExecutionRoutingDecision {
-  mode: ExecutionRoutingMode;
-  primaryAgentId: string;
-  synthesisAgentId?: string;
-  assignments: ExecutionRoutingAssignment[];
-  selectedCatalogAgentIds: string[];
-  reason: string;
-  confidence?: number;
-  source: ExecutionRoutingSource;
-}
+// The serialized routing decision is a persisted orchestration contract owned by core.
+// Routing algorithms and validation remain SDK-owned below.
+export type ExecutionRoutingMode = OrchestrationRoutingMode;
+export type ExecutionRoutingSource = OrchestrationRoutingSource;
+export type ExecutionRoutingAssignment = OrchestrationRoutingAssignment;
+export type ExecutionRoutingDecision = OrchestrationRoutingDecision;
 
 export interface ExecutionRoutingCatalogEntry {
   agentId: string;

@@ -1,5 +1,5 @@
 import { describe, expect, test, vi } from 'vitest';
-import type { ModelRequest } from '@adaptive-agent/core/src/types.js';
+import type { ModelRequest } from '@adaptive-agent/core/types';
 import {
   StreamSequenceValidator,
   type JsonRpcRequest,

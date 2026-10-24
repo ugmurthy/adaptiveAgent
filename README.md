@@ -841,18 +841,39 @@ Don't:
 The current workspace packages are:
 
 - `@adaptive-agent/core` in `packages/core`: runtime semantics, durable stores, events, snapshots, tools, delegation, retry, and continuation.
-- `@adaptive-agent/agent-sdk` in `packages/agent-sdk`: user-facing `adaptive-agent` CLI, config loading, built-in tool registration, install/update flows, and evaluation helpers.
+- `@adaptive-agent/agent-sdk` in `packages/agent-sdk`: profile/settings loading, agent assembly, built-in tool registration, selection, routing, and decomposition policy.
+- `@adaptive-agent/cli` in `packages/cli`: user-facing `adaptive-agent` commands, terminal presentation, install/update flows, evaluation helpers, and executable packaging.
 - `@adaptive-agent/trace-session` in `packages/trace-session`: decision-oriented SQLite/Postgres trace reporter with a read-only NDJSON JSON-RPC 2.0 stdio sidecar for native and desktop trace consumers.
 - `@adaptive-agent/trace-workbench` in `packages/trace-workbench`: Bun + Svelte trace workbench for choosing persisted sessions/runs, exploring timelines, resource spend, messages, diagnostics, and exporting markdown/PDF reports.
 - `@adaptive-agent/gateway-protocol`, `@adaptive-agent/gateway-client`, and `@adaptive-agent/capability-gateway`: shared JSON-RPC contracts, client integration, and the authenticated capability/inference gateway.
 - `@adaptive-agent/desktop-bridge`: the NDJSON JSON-RPC 2.0 stdio sidecar for agent discovery and exact selection, runtime initialization, execution, run control, interactions, events, and safe CLI access.
 - `@adaptive-agent/desktop-app`: the Tauri 2 + Svelte desktop client backed by `desktop-bridge`.
 
+Cross-workspace consumers use declared public package exports, never another
+package's implementation paths. Core owns prepared durable scheduling/recovery;
+SDK owns profile preparation and routing policy; CLI owns terminal interactions.
+SDK hosts supply interaction callbacks or handle pending results explicitly.
+Trace-session's root is headless (`/cli` and `/sidecar` are explicit hosts), and
+workbench owns HTTP/presentation rather than runtime SQL. Gateway-client consumes
+the narrow `@adaptive-agent/core/types` contract. Fullscreen TUI is removed;
+plain CLI behavior is retained.
+
+See [AGENTS.md](AGENTS.md) for all workspace ownership/import rules and
+[REORGANIZATION.md](REORGANIZATION.md) for phase results, source API migration
+notes, verification evidence and outstanding integration limitations. Older
+design/proposal documents describe historical layouts, not current entrypoints.
+
 Useful local commands:
 
 ```bash
+bun run boundaries:test
+bun run boundaries:check
+bun run typecheck
 bun run core:test
 bun run agent:build
+bun run cli:build
+bun run cli:test
+bun run cli --help
 bun run trace-session list traces --limit 20
 bun run trace-session view run <run-id>
 bun run trace-session settings session <session-id> --json

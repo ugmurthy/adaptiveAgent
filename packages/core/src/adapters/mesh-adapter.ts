@@ -38,8 +38,8 @@ export interface MeshAdapterConfig {
 
 export class MeshAdapter extends BaseOpenAIChatAdapter {
   private readonly client: MeshAPI;
-  private readonly baseUrl: string;
-  private readonly apiKey: string;
+  declare protected readonly baseUrl: string;
+  declare protected readonly apiKey: string;
   private readonly reasoning: MeshReasoningConfig | undefined;
 
   constructor(config: MeshAdapterConfig) {

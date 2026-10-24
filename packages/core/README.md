@@ -2,7 +2,9 @@
 
 `@adaptive-agent/core` is the runtime API for AdaptiveAgent. It owns runs, sessions, child runs, tools, model calls, persistence contracts, events, snapshots, retries, continuation, and low-level orchestration primitives.
 
-Use this package when you are embedding an agent runtime in an application. If you only need a shell command that loads `agent.json`, use `@adaptive-agent/agent-sdk`.
+Use this package when you provide the runtime dependencies yourself. Use
+`@adaptive-agent/agent-sdk` to load profiles and settings and assemble configured
+agents, or `@adaptive-agent/cli` for shell commands.
 
 ## API at a glance
 
@@ -15,7 +17,7 @@ The package entrypoint exports:
 - Model adapters: `createModelAdapter`, `OpenRouterAdapter`, `OllamaAdapter`, `MistralAdapter`, and `MeshAdapter`.
 - Tool factories: `createReadFileTool`, `createListDirectoryTool`, `createWriteFileTool`, `createShellExecTool`, `createWebSearchTool`, and `createReadWebPageTool`.
 - Skill helpers: `loadSkillFromDirectory`, `skillToDelegate`, and related skill types.
-- Orchestration helpers: `SwarmCoordinator` and delegation support.
+- Orchestration helpers: `SwarmCoordinator`, `PreparedOrchestrationExecutor`, `recoverPreparedSession`, and delegation support.
 - Runtime contracts from `types.ts`, including `RunRequest`, `RunResult`, `ToolDefinition`, `ModelAdapter`, `RunStore`, `EventStore`, `SnapshotStore`, `PlanStore`, `ContinuationStore`, `AgentEvent`, and `AgentRun`.
 
 The central boundary is simple: `ToolDefinition` is the only first-class executable primitive. Plans, delegates, skills, and swarms eventually execute through tools and normal runs.
@@ -357,9 +359,13 @@ Use this shape when you need durable execution semantics: events, snapshots, lea
 `getSessionRecoveryTargets(stores, sessionId)` groups durable runs into ordinary
 run lineage, swarm coordinator executions, and catalog orchestration executions.
 It excludes delegate children and superseded attempts, and can find saved
-orchestration plans before their stage runs exist. The SDK's unified
-`recover({ sessionId })` loads the historical profiles and delegates recovery to
-these owners; core does not discover agent JSON files or depend on Agent SDK.
+orchestration plans before their stage runs exist. `recoverPreparedSession(stores,
+options, handlers)` owns target selection, ambiguity checks, run lease checks,
+dry-run classification, and recovery outcomes. Its handlers resolve already
+configured runs and orchestration/swarm hosts. The SDK's unified
+`recover({ sessionId })` supplies historical profile and model compatibility
+checks through those handlers; core does not discover agent JSON files or depend
+on Agent SDK.
 
 `SwarmCoordinator.recoverSession({ sessionId, coordinatorRunId?, dryRun?,
 requireApproval? })` owns swarm recovery. It preserves successful workers,
@@ -372,6 +378,35 @@ Custom orchestration stores must implement `listBySession(sessionId)` against
 saved plan identity and support `runId` patches in `updateStage` so continuation
 identity remains durable. The built-in memory, SQLite, and Postgres stores do so;
 this interface extension requires no database migration.
+
+## Prepared orchestration boundary
+
+`PreparedOrchestrationExecutor<TOptions, TRunner>` executes an already-prepared
+`OrchestrationPlan`; it does not choose profiles, build prompts, or discover a
+catalog. The SDK retains that preparation policy and delegates execution here.
+Persisted artifact types are exported by core and re-exported by SDK for
+compatibility; serialized routing decisions are data, not core routing policy.
+
+| Public operation | Core responsibility |
+| --- | --- |
+| `start(input)` | Validate the graph, request and identity before persistence, allocate stage run IDs, and schedule work. |
+| `resumeExecution(executionId)` | Validate saved plan/stage compatibility and continue paused work. |
+| `recoverExecution(executionId, options?)` | Assess and claim recovery, preserve successful stages, patch continuation identities, and recompute affected downstream stages. |
+| `interruptExecution(executionId)` | Cancel the execution and interrupt active stage runs. |
+| `inspectExecution(executionId)` / `inspectSession(sessionId)` | Read durable execution state and session projections. |
+
+The host supplies `getStore`, an opaque `catalogFingerprint`, `hasAgent`,
+`getRunner`, and `runNode`. The `runNode` hook constructs stage inputs/prompts and
+must use the allocated `runId` and `sessionId`. Runners expose inspection and,
+when supported, resume/recovery/interrupt capabilities; the host owns their
+creation and cleanup. Optional session/link stores, concurrency, clock,
+staleness threshold, and lifecycle listener preserve the existing contracts.
+Default session/link projections are process-local, not durable stores.
+
+Fresh malformed plans are rejected before any execution is persisted.
+Resume/recovery also reject mismatched saved stages.
+Legacy saved plans without routing decisions or fingerprints retain the existing
+upgrade path. No schema, migration, or persisted JSON layout changes are needed.
 
 ## Result handling pattern
 

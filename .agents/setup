@@ -44,6 +44,13 @@ if ! node_meets; then
 fi
 log "Node $(node --version) at $(command -v node)"
 
+# Cross-platform release packaging needs zip even when the orb runs on Linux.
+if ! command -v zip >/dev/null 2>&1; then
+  log "Installing zip for release packaging"
+  sudo apt-get update -y
+  sudo apt-get install -y zip
+fi
+
 # ─── Dependencies ───────────────────────────────────────────────────────────
 # Lockfile + patchedDependencies (patches/@openrouter/sdk) apply automatically.
 log "Installing dependencies (frozen lockfile)"
@@ -168,15 +175,17 @@ cat > "$HOME/.config/amp/AGENTS.md" <<MD
 ## Verification commands (Bun-native)
 - Core tests:        \`bun run core:test\`  (or \`bunx vitest run\` from packages/core)
 - Agent SDK tests:   \`bun run agent:test\`
+- CLI tests:         \`bun run cli:test\`
 - Trace tests:       \`bun run trace-session:test\`
 - Trace workbench:   \`bun run trace-workbench:typecheck\`
 - Typecheck a pkg:   \`cd packages/<pkg> && bunx tsc --noEmit\`
-- Run the CLI:        \`bun run ./packages/agent-sdk/src/adaptive-agent.ts\`
+- Run the CLI:        \`bun run cli\`
 
 ## Boundaries (from repo AGENTS.md)
 - \`@adaptive-agent/core\` owns durable runtime semantics; must not import
-  \`@adaptive-agent/agent-sdk\`.
-- Agent SDK owns CLI workflows, spec loading, coordinator prompts.
+  \`@adaptive-agent/agent-sdk\` or \`@adaptive-agent/cli\`.
+- Agent SDK owns spec loading, agent assembly, coordinator prompts, and routing policy.
+- CLI owns terminal workflows, install/update, and executable packaging.
 - Preserve terminology from agen-spec-v1.5.md / agen-contracts-v1.5.md.
 MD
 

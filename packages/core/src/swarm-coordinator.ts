@@ -1297,7 +1297,7 @@ function readSwarmExecutionDescriptor(run: AgentRun): SwarmExecutionDescriptor |
   if (raw.schemaVersion !== 1) return undefined;
   if (!isNonEmptyString(raw.sessionId) || !isNonEmptyString(raw.coordinatorRunId) || !isNonEmptyString(raw.topLevelObjective)) return undefined;
   if (!Array.isArray(raw.subtasks)) return undefined;
-  const subtasks = raw.subtasks.filter(isSwarmSubtask);
+  const subtasks = (raw.subtasks as unknown[]).filter(isSwarmSubtask);
   if (subtasks.length !== raw.subtasks.length) return undefined;
   const agents = isRecord(raw.agents) ? raw.agents : {};
   const workerAgentIds = isRecord(agents.workerAgentIds)
@@ -1309,7 +1309,7 @@ function readSwarmExecutionDescriptor(run: AgentRun): SwarmExecutionDescriptor |
     coordinatorRunId: raw.coordinatorRunId,
     topLevelObjective: raw.topLevelObjective,
     ...(isJsonValue(raw.input) ? { input: raw.input } : {}),
-    ...(Array.isArray(raw.contentParts) ? { contentParts: raw.contentParts as SwarmExecutionDescriptor['contentParts'] } : {}),
+    ...(Array.isArray(raw.contentParts) ? { contentParts: raw.contentParts as unknown as SwarmExecutionDescriptor['contentParts'] } : {}),
     maxWorkers: typeof raw.maxWorkers === 'number' && Number.isFinite(raw.maxWorkers) && raw.maxWorkers > 0 ? raw.maxWorkers : 4,
     subtasks,
     agents: {

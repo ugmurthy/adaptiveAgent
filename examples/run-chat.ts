@@ -15,14 +15,14 @@ import { createInterface } from 'node:readline/promises';
 import { marked } from 'marked';
 import { markedTerminal } from 'marked-terminal';
 
-import { createAdaptiveAgent } from '../packages/core/src/create-adaptive-agent.js';
+import { createAdaptiveAgent } from '@adaptive-agent/core';
 import {
   createAdaptiveAgentLogger,
   DEFAULT_LOG_DESTINATION,
   DEFAULT_LOG_LEVEL,
   type AdaptiveAgentLogDestination,
-} from '../packages/core/src/logger.js';
-import type { ChatMessage } from '../packages/core/src/types.js';
+} from '@adaptive-agent/core';
+import type { ChatMessage } from '@adaptive-agent/core/types';
 
 marked.use(markedTerminal());
 

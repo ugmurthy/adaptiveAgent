@@ -402,7 +402,7 @@ describe('orchestration sdk', () => {
     expect(interrupted).toHaveLength(1);
   });
 
-  it('allows synthesis after a failed dependency under the continue policy', async () => {
+  it('allows synthesis after a failed dependency under the wait_for_all policy', async () => {
     const calls: string[] = [];
     const sdk = await createOrchestrationSdk({
       agentCatalog: [
@@ -410,7 +410,7 @@ describe('orchestration sdk', () => {
         { agentId: 'image-analyst', agentConfig: agent('image-analyst', ['text', 'image'], ['image']) },
       ],
       requestedAgentConfig: agent('general', ['text']),
-      concurrency: { failurePolicy: 'continue' },
+      concurrency: { failurePolicy: 'wait_for_all' },
       agentRunnerFactory: async (agentId): Promise<OrchestrationAgentRunner> => ({
         async runRaw(_goal, options = {}) {
           calls.push(agentId);

@@ -442,7 +442,7 @@ describe('BaseOpenAIChatAdapter', () => {
       ),
     );
 
-    const result = await adapter.stream(simpleRequest(), (event) => events.push(event));
+    const result = await adapter.stream(simpleRequest(), (event) => { events.push(event); });
 
     expect(result.text).toBe('Hello world');
     expect(result.finishReason).toBe('stop');
@@ -497,7 +497,7 @@ describe('BaseOpenAIChatAdapter', () => {
       openAIStreamDelta({}, { finishReason: 'stop' }),
     ]);
 
-    const result = await adapter.stream(simpleRequest(), (event) => events.push(event));
+    const result = await adapter.stream(simpleRequest(), (event) => { events.push(event); });
 
     expect(result.reasoning).toBe('Checking sources.');
     expect(events).toContainEqual({ type: 'reasoning_delta', delta: 'Checking sources.' });
@@ -513,7 +513,7 @@ describe('BaseOpenAIChatAdapter', () => {
       openAIStreamDelta({}, { finishReason: 'tool_calls' }),
     ]);
 
-    const result = await adapter.stream(requestWithTools(), (event) => events.push(event));
+    const result = await adapter.stream(requestWithTools(), (event) => { events.push(event); });
 
     expect(result.finishReason).toBe('tool_calls');
     expect(result.text).toBeUndefined();
@@ -539,7 +539,7 @@ describe('BaseOpenAIChatAdapter', () => {
       openAIStreamDelta({}, { finishReason: 'tool_calls' }),
     ]);
 
-    const result = await adapter.stream(requestWithTools(), (event) => events.push(event));
+    const result = await adapter.stream(requestWithTools(), (event) => { events.push(event); });
 
     expect(result.toolCalls).toEqual([
       { id: 'call_0', name: 'lookup', input: { topic: 'testing' } },
@@ -569,7 +569,7 @@ describe('BaseOpenAIChatAdapter', () => {
       ),
     );
 
-    await expect(adapter.stream(simpleRequest(), (event) => events.push(event))).rejects.toMatchObject({
+    await expect(adapter.stream(simpleRequest(), (event) => { events.push(event); })).rejects.toMatchObject({
       message: 'stream broke',
       modelInvocationPhase: 'response_body',
       modelInvocationAttempt: 1,
@@ -752,7 +752,7 @@ describe('BaseOpenAIChatAdapter', () => {
     const events: ModelStreamEvent[] = [];
     mockFetchResponse(TOOL_CALL_RESPONSE_WITH_REASONING);
 
-    const response = await adapter.stream(requestWithTools(), (event) => events.push(event));
+    const response = await adapter.stream(requestWithTools(), (event) => { events.push(event); });
 
     expect(response.reasoning).toBe('Need to call the lookup tool first.');
     expect(JSON.stringify(events)).not.toContain('Need to call the lookup tool first.');
@@ -1437,7 +1437,7 @@ describe('OpenRouterAdapter', () => {
       openAIStreamDelta({}, { finishReason: 'tool_calls', usage: { prompt_tokens: 20, completion_tokens: 10, total_tokens: 30 } }),
     ]);
 
-    const result = await adapter.stream(requestWithDelegateTools(), (event) => events.push(event));
+    const result = await adapter.stream(requestWithDelegateTools(), (event) => { events.push(event); });
 
     expect(result.text).toBe('Preparing delegation. ');
     expect(result.finishReason).toBe('tool_calls');
@@ -1702,6 +1702,7 @@ describe('MistralAdapter', () => {
           schema?: unknown;
         };
       };
+      stream?: boolean;
     };
     expect(body.response_format).toMatchObject({
       type: 'json_schema',
@@ -1746,7 +1747,7 @@ describe('MistralAdapter', () => {
       mistralStreamDelta({}, { finishReason: 'tool_calls' }),
     ]);
 
-    const result = await adapter.stream(requestWithTools(), (event) => events.push(event));
+    const result = await adapter.stream(requestWithTools(), (event) => { events.push(event); });
 
     expect(result.finishReason).toBe('tool_calls');
     expect(result.toolCalls).toEqual([
@@ -2348,7 +2349,7 @@ describe('MeshAdapter', () => {
       meshDelta({}, { finishReason: 'tool_calls' }),
     ]);
 
-    const result = await adapter.stream(requestWithTools(), (event) => events.push(event));
+    const result = await adapter.stream(requestWithTools(), (event) => { events.push(event); });
 
     expect(result.finishReason).toBe('tool_calls');
     expect(result.text).toBeUndefined();

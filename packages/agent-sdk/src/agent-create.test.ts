@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { archiveAgentProfile, prepareAgentConfigSave, readAgentProfile, renderAgentCreatePreview, restoreAgentProfile, runAgentCreate, saveAgentConfig, type AgentCreateDraft } from './agent-create.js';
+import { archiveAgentProfile, prepareAgentConfigSave, readAgentProfile, restoreAgentProfile, runAgentCreate, saveAgentConfig, type AgentCreateDraft } from './agent-create.js';
 import type { AgentConfigFile } from './index.js';
 
 describe('agent-create', () => {
@@ -73,7 +73,7 @@ describe('agent-create', () => {
     });
   });
 
-  it('previews notes and recommendations and cancels without writing when confirmation is denied', async () => {
+  it('returns notes and recommendations and cancels without writing when confirmation is denied', async () => {
     const report = await runAgentCreate({
       cwd: tempDir,
       settingsConfigPath: settingsPath,
@@ -84,10 +84,18 @@ describe('agent-create', () => {
 
     expect(report.status).toBe('cancelled');
     await expect(readFile(join(agentsDir, 'docs-reviewer.json'), 'utf-8')).rejects.toThrow();
-    const preview = renderAgentCreatePreview(report.prepared);
-    expect(preview).toContain('Notes:');
-    expect(preview).toContain('Recommendations:');
-    expect(preview).toContain('Consider adding shell_exec only if this agent should run verification commands.');
+    expect(report.prepared.notes.length).toBeGreaterThan(0);
+    expect(report.prepared.recommendations).toContain('Consider adding shell_exec only if this agent should run verification commands.');
+  });
+
+  it('requires explicit consent without falling back to a terminal prompt', async () => {
+    await expect(runAgentCreate({
+      cwd: tempDir,
+      settingsConfigPath: settingsPath,
+      brief: 'Create a docs reviewer.',
+      generateDraft: async () => draft({ id: 'docs-reviewer', name: 'Docs Reviewer' }),
+    })).rejects.toThrow('requires a confirm callback or yes: true');
+    await expect(readFile(join(agentsDir, 'docs-reviewer.json'), 'utf-8')).rejects.toThrow();
   });
 
   it('refuses to overwrite an existing generated config without force', async () => {

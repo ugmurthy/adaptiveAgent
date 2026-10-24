@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@adaptive-agent/agent-sdk": "workspace:*",
+    "@adaptive-agent/cli": "workspace:*",
     "@adaptive-agent/core": "workspace:*",
     "@adaptive-agent/gateway-client": "workspace:*"
   },

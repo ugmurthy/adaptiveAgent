@@ -6,10 +6,12 @@
 - Primary packages currently include:
   - `@adaptive-agent/core` in `packages/core`
   - `@adaptive-agent/agent-sdk` in `packages/agent-sdk`
+  - `@adaptive-agent/cli` in `packages/cli`
   - `@adaptive-agent/trace-session` in `packages/trace-session`
 - Versioned specs and contract Markdown remain important architecture references. Preserve terminology and behavioral contracts when changing implementation code.
 - Treat `agen-spec-v1.5.md` and `agen-contracts-v1.5.md` as the newest versioned spec/contract sources unless a task explicitly targets v1.4 or earlier.
 - Treat `CORE-SESSION-SWARM-SPEC.md` as the reference for the core/session/swarm responsibility boundary between `@adaptive-agent/core` and `@adaptive-agent/agent-sdk`.
+- Follow `REORGANIZATION.md` for the phased CLI/SDK/core separation; do not change database schemas during these phases.
 
 ## Runtime and verification
 
@@ -22,6 +24,7 @@
   - `bunx vitest run -t "<name>"`
   - `bun run typecheck` when the package defines it
 - Root useful commands:
+  - `bun run typecheck` checks all ten workspaces; build gateway protocol/client/host declarations first on a fresh checkout.
   - `rg --files -uu` to inspect files
   - `rg -n "pattern" *.md` to trace terminology and contracts
 - Keep edits scoped. Do not rewrite historical docs unless the task is about migration, comparison, or historical context.
@@ -35,16 +38,56 @@ These rules protect the package boundary established by `CORE-SESSION-SWARM-SPEC
 - Core owns durable execution semantics: runs, sessions, child runs, retries, continuation, persistence, eventing, snapshots, and runtime metadata.
 - Core owns execution-time validation for data it is asked to run. It must not trust model output, CLI input, or SDK-prevalidated data.
 - Core owns generic orchestration primitives that are independent of a specific CLI UX or agent-spec loading flow.
+- `PreparedOrchestrationExecutor` owns prepared-plan scheduling and recovery; `recoverPreparedSession` owns logical session recovery selection and dispatch. Hosts supply configured runners, not profile-loading policy.
 - Core may expose strict programmatic APIs for already-prepared execution requests.
 - Core must remain usable without importing `@adaptive-agent/agent-sdk`.
 
-### `@adaptive-agent/agent-sdk` owns agent-profile and CLI setup
+### `@adaptive-agent/agent-sdk` owns agent-profile setup and policy
 
-- Agent SDK owns CLI-facing workflows and user-facing command behavior.
 - Agent SDK owns loading, resolving, and validating existing agent JSON specs.
-- Agent SDK owns coordinator/decomposer prompt construction, safe catalog summaries, default agent selection, and CLI-friendly error messages.
-- Agent SDK owns translating CLI/user intent into strict core execution requests.
+- Agent SDK owns agent assembly, coordinator/decomposer prompt construction, safe catalog summaries, default agent selection, and routing policy.
+- Agent SDK owns translating prepared user intent into strict core execution requests.
+- For catalog orchestration, SDK owns plan preparation, stage prompts/input filtering, and runner creation/cleanup; it delegates durable execution to core. Historical profile/model compatibility checks also remain SDK-owned.
 - Agent SDK may prevalidate inputs for usability, but core must still validate before execution.
+- Agent SDK must not open terminal prompts or render terminal reports. Hosts supply interaction callbacks or handle pending results; profile writes require explicit consent. Ambient logging is host-injected.
+
+### `@adaptive-agent/cli` owns terminal workflows and distribution
+
+- CLI owns argument parsing, command dispatch, terminal rendering/interactions, evaluation commands, install/update flows, and executable packaging.
+- CLI depends on SDK and core public APIs; SDK and core must not import CLI.
+- Desktop bridge may use CLI for its explicit CLI child integration, not as its runtime authority.
+- Do not restore the removed fullscreen TUI or its dependency.
+
+### Whole-workspace ownership
+
+| Workspace | Responsibility | Production workspace dependencies |
+| --- | --- | --- |
+| core | Durable execution, prepared orchestration, validation, runtime stores and recovery | None |
+| agent-sdk | Profiles/settings, assembly, discovery, selection/routing policy and plan preparation | core, gateway-client |
+| cli | Terminal workflows, evaluation, installation and executable distribution | agent-sdk, core |
+| desktop-bridge | Versioned RPC host, runtime lifecycle/events and explicit CLI child integration | agent-sdk, core, gateway-client, cli |
+| desktop-app | Native windows/processes, attachments, workbench records and product presentation | Agent and trace sidecar protocols, not TS runtime packages |
+| gateway-protocol | Transport-neutral wire contracts and validation | None |
+| gateway-client | Transport and gateway model adaptation | gateway-protocol, core/types |
+| capability-gateway | Authentication/authorization, permits, quotas, billing, provider routing and profile distribution | gateway-protocol, core |
+| trace-session | Read-only runtime readers/projections, reports and trace RPC host | agent-sdk/runtime-settings only |
+| trace-workbench | Trace HTTP/static adaptation and web presentation | trace-session headless root only |
+
+- Durable product records are not all core execution state: desktop workbench data and gateway billing remain host-owned.
+- Keep native and TypeScript sidecar protocol versions/payloads compatible; the desktop renderer must not import runtime implementations.
+- Provider adapters and built-in tools remain core-owned in this reorganization. Extracting them is a separate design decision.
+
+### Enforced public imports
+
+- Use package names and explicit `package.json` exports across workspaces, including in tests, scripts and examples. Do not reach into another package's `src`, `dist`, or internal files through relative paths or aliases.
+- Core exports its runtime API at `@adaptive-agent/core` and its narrow contracts at `@adaptive-agent/core/types`. Gateway-client consumes only the latter.
+- SDK has no `/cli` compatibility re-export. Use `@adaptive-agent/cli`, `/agent-create`, or `/commands` for the relevant CLI surface.
+- Trace-session's root is headless; `/cli` and `/sidecar` are explicit host entrypoints. Workbench imports only the root; trace-session imports only SDK `/runtime-settings`.
+- Production imports must be declared in `dependencies`, `peerDependencies`, or `optionalDependencies`, not just `devDependencies`. Only SDK, CLI and desktop-bridge tests may depend on the capability-gateway host.
+- Do not import test modules from production code. Keep test-only host dependencies out of helper modules used by production.
+- Build/release scripts may name executable source files as build inputs; that does not authorize cross-package implementation imports.
+- Run `bun run boundaries:test` and `bun run boundaries:check` after changing exports, dependencies or cross-package imports. The same checks run in the `workspace-boundaries` PR workflow; a new workspace needs an explicit checker policy.
+- The checker inspects literal TS/JS imports/re-exports, dynamic imports, `require`, import types and Svelte script blocks in `packages`, `scripts`, and `examples`. Generated build/native outputs, historical documents and root scratch scripts are not checked. Computed plugin imports and native protocol compatibility still require review and integration tests.
 
 ### Do not blur this boundary
 
@@ -94,6 +137,8 @@ These rules protect the package boundary established by `CORE-SESSION-SWARM-SPEC
 ## Package-specific notes
 
 - In `packages/trace-session`, keep gateway tables optional. Trace reporting must work against core runtime Postgres tables even when `gateway_sessions` and `gateway_session_run_links` are absent.
+- Trace-session's public root is headless; argument parsing and renderers belong to `/cli`, and JSON-RPC adaptation belongs to `/sidecar`. Keep runtime SQL/read projections in trace-session, not trace-workbench.
+- Preserve the distinction between workbench's recent-root navigation (`listRecentSessions`, limits before grouping) and canonical CLI/sidecar session listing (`listSessions`, labels/filtering/session cursors). Workbench owns HTTP and presentation, not a second runtime reader.
 
 ### Working on `packages/desktop-app`
 

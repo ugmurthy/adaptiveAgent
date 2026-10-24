@@ -15,6 +15,7 @@ import {
   type ModelAdapterConfig,
   type PlanStore,
   type RunRequest,
+  type RunResult,
   type RunStore,
   type SnapshotStore,
   type ToolDefinition,
@@ -304,6 +305,10 @@ export interface AgentSdkOptions {
   delegates?: DelegateDefinition[];
   logger?: ReturnType<typeof createAdaptiveAgentLogger>;
   eventListener?: (event: AgentEvent) => void;
+  /** Resolve manual approvals in non-raw calls; without a callback the request is returned. */
+  onApproval?: (request: Extract<RunResult, { status: 'approval_requested' }>) => boolean | Promise<boolean>;
+  /** Resolve interactive clarifications in non-raw calls; without a callback the request is returned. */
+  onClarification?: (request: Extract<RunResult, { status: 'clarification_requested' }>) => string | Promise<string>;
   clock?: () => Date;
 }
 

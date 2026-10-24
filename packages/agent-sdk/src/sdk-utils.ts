@@ -1,9 +1,7 @@
 import { access, readdir, readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
-import { createInterface } from 'node:readline/promises';
 import { homedir } from 'node:os';
 import { delimiter, extname, isAbsolute, resolve } from 'node:path';
-import { stdin, stderr } from 'node:process';
 
 import type { JsonObject } from '@adaptive-agent/core';
 
@@ -61,8 +59,6 @@ export function agentConfigurationFingerprint(config: ResolvedAgentSdkConfig): s
   };
   return createHash('sha256').update(stableJson(executionConfiguration)).digest('hex');
 }
-export async function promptYesNo(question: string): Promise<boolean> { return ['y', 'yes'].includes((await promptText(question)).trim().toLowerCase()); }
-export async function promptText(question: string): Promise<string> { const rl = createInterface({ input: stdin, output: stderr }); try { return await rl.question(question); } finally { rl.close(); } }
 
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;

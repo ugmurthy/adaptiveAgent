@@ -1,7 +1,5 @@
 import { access, link, mkdir, open, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
-import { createInterface } from 'node:readline/promises';
-import { stdin, stderr } from 'node:process';
 import { basename, dirname, resolve } from 'node:path';
 
 import type { JsonObject, JsonSchema, JsonValue, RunResult } from '@adaptive-agent/core';
@@ -19,7 +17,6 @@ import {
 } from './index.js';
 
 export type AgentCreateProvider = 'openrouter' | 'ollama' | 'mistral' | 'mesh';
-export type AgentCreateOutputFormat = 'pretty' | 'json' | 'jsonl';
 export type AgentCreateStatus = 'created' | 'overwritten' | 'exists' | 'cancelled';
 
 export interface AgentCreateDraft {
@@ -180,8 +177,11 @@ export async function runAgentCreate(options: AgentCreateOptions): Promise<Agent
 
   let prompted = false;
   if (dryRun || !yes) {
+    if (!options.confirm) {
+      throw new Error('agent-create requires a confirm callback or yes: true before writing; dryRun always requires confirmation.');
+    }
     prompted = true;
-    const confirmed = await (options.confirm ?? confirmAgentCreateInTerminal)(prepared);
+    const confirmed = await options.confirm(prepared);
     if (!confirmed) {
       return {
         command: 'agent-create',
@@ -233,7 +233,7 @@ export async function prepareAgentCreate(options: AgentCreateOptions): Promise<A
   const env = options.env ?? process.env;
   const brief = options.brief.trim();
   if (!brief) {
-    throw new Error('agent-create requires a non-empty agent description from positionals, --file, or stdin.');
+    throw new Error('agent-create requires a non-empty brief.');
   }
 
   const generatorAgent = options.generatorAgent ?? DEFAULT_GENERATOR_AGENT;
@@ -457,87 +457,6 @@ async function fileFingerprint(path: string): Promise<string> {
   }
 }
 
-export function renderAgentCreateReport(report: AgentCreateReport, output: AgentCreateOutputFormat = 'pretty'): string {
-  if (output === 'json') {
-    return JSON.stringify(agentCreateReportJson(report), null, 2);
-  }
-
-  if (output === 'jsonl') {
-    return JSON.stringify(agentCreateReportJson(report));
-  }
-
-  const lines = report.prompted
-    ? [
-        report.message,
-        `path: ${report.prepared.path}`,
-      ]
-    : [
-        renderAgentCreatePreview(report.prepared),
-        '',
-        report.message,
-      ];
-  return lines.join('\n');
-}
-
-export function renderAgentCreatePreview(prepared: AgentCreatePrepared): string {
-  const agent = prepared.agent;
-  const model = agent.model;
-  const lines = [
-    'New agent config',
-    '',
-    'Path:',
-    `  ${prepared.path}`,
-    '',
-    'Generator:',
-    `  ${prepared.generatorAgent.id} (${prepared.generatorAgent.name})`,
-    '',
-    'Identity:',
-    `  id: ${agent.id}`,
-    `  name: ${agent.name}`,
-    `  description: ${agent.description ?? '(none)'}`,
-    '',
-    'Runtime:',
-    `  provider: ${model.provider ?? '(from settings)'}`,
-    `  model: ${model.model ?? '(from settings)'}`,
-    `  invocationModes: ${agent.invocationModes.join(', ')}`,
-    `  defaultInvocationMode: ${agent.defaultInvocationMode}`,
-    `  workspaceRoot: ${agent.workspaceRoot ?? agent.workspace?.root ?? '(current workspace)'}`,
-    '',
-    'Tools:',
-    ...formatList(agent.tools),
-    '',
-    'Delegates:',
-    ...formatList(agent.delegates ?? []),
-    '',
-    'System instructions:',
-    ...indentBlock(agent.systemInstructions),
-  ];
-
-  if (prepared.notes.length > 0) {
-    lines.push('', 'Notes:', ...formatList(prepared.notes));
-  }
-
-  if (prepared.recommendations.length > 0) {
-    lines.push('', 'Recommendations:', ...formatList(prepared.recommendations));
-  }
-
-  return lines.join('\n');
-}
-
-export async function confirmAgentCreateInTerminal(prepared: AgentCreatePrepared): Promise<boolean> {
-  stderr.write(`${renderAgentCreatePreview(prepared)}\n\n`);
-  if (!stdin.isTTY) {
-    throw new Error('agent-create requires --yes to write in a non-interactive terminal.');
-  }
-  const rl = createInterface({ input: stdin, output: stderr });
-  try {
-    const answer = await rl.question('Write this agent config? [y/N] ');
-    return ['y', 'yes'].includes(answer.trim().toLowerCase());
-  } finally {
-    rl.close();
-  }
-}
-
 async function generateAgentCreateDraft(args: AgentCreateGenerateDraftArgs): Promise<AgentCreateDraft> {
   const sdkOptions: AgentSdkOptions = {
     cwd: args.cwd,
@@ -686,24 +605,6 @@ function defaultApiKeyEnv(provider: AgentCreateProvider): string | undefined {
   return undefined;
 }
 
-function agentCreateReportJson(report: AgentCreateReport): JsonObject {
-  return {
-    command: report.command,
-    status: report.status,
-    dryRun: report.dryRun,
-    yes: report.yes,
-    force: report.force,
-    prompted: report.prompted,
-    message: report.message,
-    path: report.prepared.path,
-    agentsDir: report.prepared.agentsDir,
-    generatorAgent: report.prepared.generatorAgent,
-    agent: report.prepared.agent as unknown as JsonValue,
-    notes: report.prepared.notes,
-    recommendations: report.prepared.recommendations,
-  };
-}
-
 function formatDraftGenerationFailure(result: Exclude<RunResult, { status: 'success' }>): string {
   if (result.status === 'failure') {
     return `agent-create generator failed: ${result.error}`;
@@ -790,21 +691,6 @@ function compactObject<T extends Record<string, unknown>>(value: T): Partial<T> 
 
 function cloneConfigValue<T>(value: T | undefined): T | undefined {
   return value === undefined ? value : JSON.parse(JSON.stringify(value)) as T;
-}
-
-function formatList(values: readonly string[]): string[] {
-  if (values.length === 0) {
-    return ['  none'];
-  }
-  return values.map((value) => `  - ${value}`);
-}
-
-function indentBlock(value: string | undefined): string[] {
-  const lines = value?.trim().split(/\r?\n/) ?? [];
-  if (lines.length === 0) {
-    return ['  (none)'];
-  }
-  return lines.map((line) => `  ${line}`);
 }
 
 async function pathExists(path: string): Promise<boolean> {

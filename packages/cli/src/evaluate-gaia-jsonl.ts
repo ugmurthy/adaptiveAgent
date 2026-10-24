@@ -5,7 +5,7 @@ import { createInterface } from 'node:readline/promises';
 
 import type { JsonObject, JsonValue, ModelAdapterConfig, UsageSummary } from '@adaptive-agent/core';
 
-import { createAgentSdk } from './index.js';
+import { createAgentSdk } from '@adaptive-agent/agent-sdk';
 
 const SYSTEM_PROMPT = `You are an expert, impartial evaluation judge for AI model outputs on question-answering tasks (GAIA benchmark style).
 
@@ -94,7 +94,7 @@ object, and writes judged JSONL output.
 
 Usage:
   adaptive-agent-gaia-eval <input.jsonl> <output.jsonl> [options]
-  bun run packages/agent-sdk/src/evaluate-gaia-jsonl.ts <input.jsonl> <output.jsonl> [options]
+  bun run packages/cli/src/evaluate-gaia-jsonl.ts <input.jsonl> <output.jsonl> [options]
 
 Options:
   --provider <name>         Model provider: ollama, openrouter, mistral, mesh.

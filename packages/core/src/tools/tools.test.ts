@@ -27,9 +27,12 @@ function stubToolContext(overrides?: Partial<ToolContext>): ToolContext {
   };
 }
 
-async function executeRecoverableTool(tool: { execute: (input: any, context: ToolContext) => Promise<unknown>; recoverError?: (error: unknown, input: unknown) => unknown }, input: unknown) {
+async function executeRecoverableTool<TInput>(
+  tool: { execute: (input: TInput, context: ToolContext) => Promise<unknown>; recoverError?: (error: unknown, input: TInput) => unknown },
+  input: NoInfer<TInput>,
+) {
   try {
-    return await tool.execute(input as any, stubToolContext());
+    return await tool.execute(input, stubToolContext());
   } catch (error) {
     return tool.recoverError?.(error, input);
   }
@@ -731,15 +734,14 @@ describe('createWriteFileTool', () => {
     const tool = createWriteFileTool();
     expect(tool.name).toBe('write_file');
     expect(tool.requiresApproval).toBe(true);
-    expect((tool.inputSchema.properties?.outputFormat as any).enum).toEqual([
-      'txt',
-      'plain',
-      'md',
-      'markdown',
-      'docx',
-      'pptx',
-      'latex',
-    ]);
+    // toMatchObject compares arrays strictly, so this still requires the exact enum list.
+    expect(tool.inputSchema).toMatchObject({
+      properties: {
+        outputFormat: {
+          enum: ['txt', 'plain', 'md', 'markdown', 'docx', 'pptx', 'latex'],
+        },
+      },
+    });
   });
 });
 

@@ -14,6 +14,7 @@ describe('ambient supervisor', () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await rm(tempDir, { recursive: true, force: true });
   });
 
@@ -83,6 +84,7 @@ describe('ambient supervisor', () => {
   });
 
   it('claims a pending markdown task, runs it, writes artifacts, and moves it to processed', async () => {
+    const terminalOutput = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const configPath = await writeAmbientConfig(tempDir);
     await mkdir(join(tempDir, 'agent_inbox', 'pending'), { recursive: true });
     await writeFile(join(tempDir, 'agent_inbox', 'pending', 'task.md'), 'Do the thing');
@@ -100,7 +102,6 @@ describe('ambient supervisor', () => {
       configPath,
       cwd: tempDir,
       runOnce: true,
-      output: 'json',
       createSdk: async () => ({ runRaw, close }),
     });
 
@@ -118,6 +119,7 @@ describe('ambient supervisor', () => {
 
     const ledger = await readFile(join(tempDir, 'agent_inbox', '.ambient', 'tasks.jsonl'), 'utf-8');
     expect(ledger.trim().split('\n').map((line) => JSON.parse(line).status)).toEqual(['claimed', 'running', 'succeeded']);
+    expect(terminalOutput).not.toHaveBeenCalled();
   });
 
   it('marks approval-requested runs as needing approval and moves the task to failed', async () => {
@@ -138,7 +140,6 @@ describe('ambient supervisor', () => {
       configPath,
       cwd: tempDir,
       runOnce: true,
-      output: 'json',
       createSdk: async () => ({ runRaw, close: async () => undefined }),
     });
 
@@ -165,7 +166,6 @@ describe('ambient supervisor', () => {
       configPath,
       cwd: tempDir,
       runOnce: true,
-      output: 'json',
       clock: () => new Date('2026-07-02T08:00:20.000Z'),
       createSdk: async () => ({ runRaw, close: async () => undefined }),
     });
@@ -217,8 +217,8 @@ describe('ambient supervisor', () => {
     const createSdk = async () => ({ runRaw, close: async () => undefined });
     const clock = () => new Date('2026-07-02T08:00:30.000Z');
 
-    const first = await runAmbientStart({ configPath, cwd: tempDir, runOnce: true, output: 'json', clock, createSdk });
-    const second = await runAmbientStart({ configPath, cwd: tempDir, runOnce: true, output: 'json', clock, createSdk });
+    const first = await runAmbientStart({ configPath, cwd: tempDir, runOnce: true, clock, createSdk });
+    const second = await runAmbientStart({ configPath, cwd: tempDir, runOnce: true, clock, createSdk });
 
     expect(first.tasks).toHaveLength(1);
     expect(second.tasks).toHaveLength(0);
@@ -252,7 +252,6 @@ describe('ambient supervisor', () => {
       configPath,
       cwd: tempDir,
       runOnce: true,
-      output: 'json',
       clock: () => new Date('2026-07-02T08:00:30.000Z'),
       createSdk: async () => ({ runRaw, inspect, close: async () => undefined }),
     });

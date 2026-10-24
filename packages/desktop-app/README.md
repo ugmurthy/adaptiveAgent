@@ -44,6 +44,11 @@ The renderer uses a narrow set of typed workbench commands for runs, chats, appr
 recovery, history, trace privacy, and shutdown. It receives simplified progress/final
 events. No shell capability or generic JSON-RPC command is granted to the webview.
 
+The native host and bundled `trace-session-sidecar` negotiate trace protocol `1.1`.
+The host requires the matching response version, a read-only backend, and sensitive-data
+capabilities matching its trusted privacy policy before marking trace healthy. There is
+no fallback to `1.0`; host and sidecar compatibility must be verified together.
+
 ## Product decisions and current limitations
 
 - **Create / Auto:** Auto is deterministic: prompts beginning with `chat:`, `discuss:`,

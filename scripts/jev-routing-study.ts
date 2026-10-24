@@ -20,7 +20,7 @@ import {
   type TypeSafeAgentSelectionPolicyConfig,
   type TypeSafeAgentSelectionResponse,
   type TypeSafePolicyProvenance,
-} from '../packages/agent-sdk/src/index.js';
+} from '@adaptive-agent/agent-sdk';
 
 type OutputFormat = 'table' | 'json' | 'jsonl';
 type AttachmentType = 'image' | 'file' | 'audio';

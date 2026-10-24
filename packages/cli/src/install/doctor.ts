@@ -3,7 +3,7 @@ import { resolve } from 'node:path';
 
 import { Pool, type PoolConfig } from 'pg';
 
-import { inspectAgentSdkResolution, type RuntimeMode } from '../index.js';
+import { inspectAgentSdkResolution, type RuntimeMode } from '@adaptive-agent/agent-sdk';
 import { getVersionInfo } from './version.js';
 
 export type DoctorStatus = 'pass' | 'warn' | 'fail' | 'skip';

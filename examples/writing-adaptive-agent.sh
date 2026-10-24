@@ -44,7 +44,7 @@ if [ -n "${ADAPTIVE_AGENT_BIN:-}" ]; then
 elif command -v adaptive-agent >/dev/null 2>&1; then
   ADAPTIVE_AGENT_CMD=(adaptive-agent)
 else
-  ADAPTIVE_AGENT_CMD=(bun run ./packages/agent-sdk/src/adaptive-agent.ts)
+  ADAPTIVE_AGENT_CMD=(bun run ./packages/cli/src/adaptive-agent.ts)
 fi
 
 "${ADAPTIVE_AGENT_CMD[@]}" run "$REQ" --approval auto --events --progress

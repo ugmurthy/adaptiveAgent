@@ -296,7 +296,7 @@ function extractErrorProperties(error: Error): Record<string, JsonValue> {
       continue;
     }
 
-    const value = (error as Record<string, unknown>)[key];
+    const value: unknown = Reflect.get(error, key);
     if (value === undefined) {
       continue;
     }

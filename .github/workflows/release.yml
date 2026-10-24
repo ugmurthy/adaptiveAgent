@@ -41,8 +41,9 @@ jobs:
         run: |
           mkdir -p "$HOME" "$ADAPTIVE_AGENT_HOME"
           bunx --bun vitest run \
-            packages/agent-sdk/src/install/install.test.ts \
-            packages/agent-sdk/src/adaptive-agent.test.ts \
+            packages/cli/src/install/install.test.ts \
+            packages/cli/src/adaptive-agent.test.ts \
+            packages/cli/src/command-integration.test.ts \
             packages/agent-sdk/src/index.test.ts
 
       - name: Build release assets

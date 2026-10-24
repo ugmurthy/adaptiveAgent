@@ -3,7 +3,7 @@ import { resolve } from 'node:path';
 
 import { Sandbox } from '@e2b/code-interpreter';
 
-import type { JsonValue, ToolContext } from '../../../packages/core/src/types.js';
+import type { JsonValue, ToolContext } from '@adaptive-agent/core/types';
 
 export const name = 'persistent_e2b_run_code';
 export const description =

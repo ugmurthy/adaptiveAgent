@@ -254,6 +254,7 @@ describe('Agent SDK SQLite runtime', () => {
       await sdk.close();
 
       expect(result).toMatchObject({ status: 'success', output: 'gateway complete' });
+      if (result.status !== 'success') throw new Error(`Expected a successful run, received ${result.status}.`);
       expect(result.usage).toMatchObject({
         promptTokens: 8,
         completionTokens: 4,

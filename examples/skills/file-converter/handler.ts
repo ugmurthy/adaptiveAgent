@@ -3,7 +3,7 @@ import { constants } from 'node:fs';
 import { access, mkdir } from 'node:fs/promises';
 import { basename, dirname, extname, join, resolve } from 'node:path';
 
-import type { JsonValue, ToolContext } from '../../../packages/core/src/types.js';
+import type { JsonValue, ToolContext } from '@adaptive-agent/core/types';
 
 export const name = 'convert_document_with_pandoc';
 export const description =
