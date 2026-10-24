@@ -4,6 +4,65 @@ All notable changes to this project will be documented in this file.
 
 This project follows semantic versioning for release notes.
 
+## [Unreleased]
+
+### Added
+
+- Added explicit SDK `onApproval` and `onClarification` host callbacks for
+  non-raw run/chat and run-level control calls. Without callbacks,
+  manual/interactive requests return pending instead of opening terminal prompts.
+- Added public core `PreparedOrchestrationExecutor` and `recoverPreparedSession`
+  APIs for already-prepared execution and logical session recovery.
+- Added workspace dependency/import boundary checks and a root
+  `bun run typecheck` command covering all ten workspaces, with PR CI gates.
+
+### Changed
+
+- Extracted terminal commands, rendering, installation/update flows, evaluation,
+  bundled assets, and executable packaging into `@adaptive-agent/cli`. Plain
+  CLI command names, output formats, and release asset layouts are preserved.
+- Made Agent SDK host-neutral: profile editing requires explicit consent, and
+  ambient processing is silent unless the host supplies a logger. CLI supplies
+  terminal prompts and presentation explicitly.
+- Moved prepared-plan scheduling, durable state transitions, cancellation, and
+  recovery into core. SDK retains catalog discovery, profile compatibility,
+  routing, plan preparation, stage prompts/inputs, and runner lifecycle.
+- Made trace-session's public root headless, with explicit `/cli` and `/sidecar`
+  entrypoints. Runtime SQL and recent-session projections now live in
+  trace-session; workbench retains HTTP and presentation. Recent-root navigation
+  remains distinct from canonical CLI/sidecar session listing.
+- Enforced declared public workspace exports and dependency directions,
+  including the narrow `@adaptive-agent/core/types` contract for gateway-client.
+- Removed the fullscreen `adaptive-agent-tui` executable and its `pi-tui`
+  dependency; plain CLI message styling remains supported.
+
+### Fixed
+
+- Rejected malformed prepared plans, requests, and identities before durable
+  execution creation, and rejected incompatible saved stages on resume/recovery.
+- Fixed desktop trace initialization to negotiate the sidecar's existing
+  protocol `1.1` instead of requesting unsupported `1.0`.
+- Resolved inherited workspace TypeScript errors without changing runtime
+  contracts or suppressing type checks.
+
+### Compatibility
+
+- **Breaking source API changes:** replace `@adaptive-agent/agent-sdk/cli`
+  imports with `@adaptive-agent/cli`, or `/commands` for command metadata.
+  Profile preview/report renderers, terminal confirmation, and
+  `AgentCreateOutputFormat` now come from `@adaptive-agent/cli/agent-create`.
+- SDK `runAgentCreate` requires a `confirm` callback or explicit `yes: true`;
+  `dryRun` still requires confirmation and writes if accepted. Use
+  `prepareAgentCreate` for a strictly non-writing preview. SDK ambient options
+  no longer include `output`; supply a logger for host-controlled logging.
+- Move trace CLI helpers/renderers imported from the package root to
+  `@adaptive-agent/trace-session/cli`. Private cross-package implementation
+  imports are no longer supported; use declared public exports.
+- SDK orchestration method signatures, persisted JSON layouts, and database
+  schemas are unchanged; no database migration is required. Desktop agent RPC
+  remains at `1.20`; the native trace host requires trace protocol `1.1` with
+  no fallback to `1.0`.
+
 ## [0.1.50] - 2026-10-09
 
 ### Added
